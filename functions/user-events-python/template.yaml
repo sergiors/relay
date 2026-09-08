@@ -10,6 +10,7 @@ events:
     pattern:
       event_name: [MODIFY]
       table_name: [users]
+    timeout: 20s
 
   - handler: events.deleted.handler
     pattern:

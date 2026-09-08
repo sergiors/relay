@@ -36,8 +36,6 @@ services:
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
       - REDIS_CONSUMER=worker-1
-      - FUNCTIONS_DIR=/app/functions
-      - FUNCTION_TIMEOUT=30s
       - DOCKER_HOST=tcp://socket-proxy:2375
     volumes:
       - ./functions:/app/functions:ro

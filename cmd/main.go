@@ -5,9 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -24,74 +22,30 @@ func envOr(key, def string) string {
 	return def
 }
 
-func envInt(key string, def int) (int, error) {
-	if v := os.Getenv(key); v != "" {
-		return strconv.Atoi(v)
-	}
-	return def, nil
-}
-
-func envDuration(key string, def time.Duration) (time.Duration, error) {
-	if v := os.Getenv(key); v != "" {
-		return time.ParseDuration(v)
-	}
-	return def, nil
-}
-
 func main() {
 	logger := log.New(os.Stdout, "relay: ", log.LstdFlags)
 
-	timeout := 30 * time.Second
-	if v := os.Getenv("FUNCTION_TIMEOUT"); v != "" {
-		parsed, err := time.ParseDuration(v)
-		if err != nil {
-			logger.Fatalf("FUNCTION_TIMEOUT: %v", err)
-		}
-		timeout = parsed
-	}
-
 	cfg := struct {
-		redisAddr       string
-		redisStream     string
-		redisGroup      string
-		redisCons       string
-		functionsDir    string
-		maxAttempts     int
-		reclaimInterval time.Duration
-		minPendingIdle  time.Duration
-		dlqStream       string
+		redisAddr   string
+		redisStream string
+		redisGroup  string
+		redisCons   string
 	}{
-		redisAddr:    envOr("REDIS_ADDR", "localhost:6379"),
-		redisStream:  envOr("REDIS_STREAM", "events"),
-		redisGroup:   envOr("REDIS_GROUP", "relay"),
-		redisCons:    envOr("REDIS_CONSUMER", "worker-1"),
-		functionsDir: envOr("FUNCTIONS_DIR", "./functions"),
-		dlqStream:    envOr("RELAY_DLQ_STREAM", ""),
-	}
-
-	var err error
-	if cfg.maxAttempts, err = envInt("RELAY_MAX_ATTEMPTS", 5); err != nil {
-		logger.Fatalf("RELAY_MAX_ATTEMPTS: %v", err)
-	}
-	if cfg.reclaimInterval, err = envDuration("RELAY_RECLAIM_INTERVAL", time.Minute); err != nil {
-		logger.Fatalf("RELAY_RECLAIM_INTERVAL: %v", err)
-	}
-	if cfg.minPendingIdle, err = envDuration("RELAY_MIN_PENDING_IDLE", time.Minute); err != nil {
-		logger.Fatalf("RELAY_MIN_PENDING_IDLE: %v", err)
-	}
-	if cfg.dlqStream == "" {
-		cfg.dlqStream = cfg.redisStream + ":dlq"
+		redisAddr:   envOr("REDIS_ADDR", "localhost:6379"),
+		redisStream: envOr("REDIS_STREAM", "events"),
+		redisGroup:  envOr("REDIS_GROUP", "relay"),
+		redisCons:   envOr("REDIS_CONSUMER", "worker-1"),
 	}
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
 	defer client.Close()
 
-	loader := function.NewLoader(cfg.functionsDir, logger)
+	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
 	if err != nil {
 		logger.Fatalf("load functions: %v", err)
 	}
-	logger.Printf("loaded %d function(s) from %s", len(functions), cfg.functionsDir)
+	logger.Printf("loaded %d function(s) from %s", len(functions), function.Dir)
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
@@ -115,15 +69,11 @@ func main() {
 	logger.Printf("prepared %d function(s)", preparedCount)
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
-		Client:          client,
-		Stream:          cfg.redisStream,
-		Group:           cfg.redisGroup,
-		Consumer:        cfg.redisCons,
-		MaxAttempts:     int64(cfg.maxAttempts),
-		ReclaimInterval: cfg.reclaimInterval,
-		MinPendingIdle:  cfg.minPendingIdle,
-		DLQStream:       cfg.dlqStream,
-		Log:             logger,
+		Client:   client,
+		Stream:   cfg.redisStream,
+		Group:    cfg.redisGroup,
+		Consumer: cfg.redisCons,
+		Log:      logger,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -133,7 +83,7 @@ func main() {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}
 
-	run := runner.New(prepared, timeout, logger)
+	run := runner.New(prepared, logger)
 
 	logger.Printf("consuming stream %q as group %q consumer %q",
 		cfg.redisStream,

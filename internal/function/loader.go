@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 )
 
+// Dir is the fixed application-convention root the loader reads functions from.
+const Dir = "/app/functions"
+
 // Function is a loaded function: its name (from the directory name), directory
 // path (used later for image building), and parsed template.
 type Function struct {

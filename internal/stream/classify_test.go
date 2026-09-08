@@ -80,8 +80,8 @@ func TestNewConsumerDefaults(t *testing.T) {
 	if c.minPendingIdle != time.Minute {
 		t.Errorf("minPendingIdle default = %s, want 1m", c.minPendingIdle)
 	}
-	if c.reclaimInterval != 0 {
-		t.Errorf("reclaimInterval default = %s, want 0 (disabled)", c.reclaimInterval)
+	if c.reclaimInterval != time.Minute {
+		t.Errorf("reclaimInterval default = %s, want 1m", c.reclaimInterval)
 	}
 }
 

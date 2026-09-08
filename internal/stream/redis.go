@@ -16,6 +16,17 @@ import (
 // should be acknowledged.
 type Handler func(ctx context.Context, msgID string, event map[string]any) error
 
+// Defaults for the retry/recovery settings. They are fixed application
+// constants, not env-configurable; zero-valued ConsumerConfig fields fall back
+// to these in NewConsumer.
+const (
+	DefaultBlock           = 5 * time.Second
+	DefaultCount           = int64(10)
+	DefaultMaxAttempts     = int64(5)
+	DefaultReclaimInterval = time.Minute
+	DefaultMinPendingIdle  = time.Minute
+)
+
 // ConsumerConfig configures the Consumer. Field-zero defaults are applied in
 // NewConsumer.
 type ConsumerConfig struct {
@@ -31,7 +42,7 @@ type ConsumerConfig struct {
 	// that keeps failing is routed to the DLQ. Defaults to 5 if zero.
 	MaxAttempts int64
 	// ReclaimInterval is how often the recovery loop scans for idle pending
-	// messages. Defaults to 1m if zero; zero disables the recovery loop.
+	// messages. Defaults to 1m if zero.
 	ReclaimInterval time.Duration
 	// MinPendingIdle is the minimum time a message must have sat pending before
 	// it is eligible for reclamation. Defaults to 1m if zero. It must comfortably
@@ -61,16 +72,19 @@ type Consumer struct {
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
 	if cfg.Block == 0 {
-		cfg.Block = 5 * time.Second
+		cfg.Block = DefaultBlock
 	}
 	if cfg.Count == 0 {
-		cfg.Count = 10
+		cfg.Count = DefaultCount
 	}
 	if cfg.MaxAttempts == 0 {
-		cfg.MaxAttempts = 5
+		cfg.MaxAttempts = DefaultMaxAttempts
+	}
+	if cfg.ReclaimInterval == 0 {
+		cfg.ReclaimInterval = DefaultReclaimInterval
 	}
 	if cfg.MinPendingIdle == 0 {
-		cfg.MinPendingIdle = time.Minute
+		cfg.MinPendingIdle = DefaultMinPendingIdle
 	}
 	if cfg.DLQStream == "" {
 		cfg.DLQStream = cfg.Stream + ":dlq"

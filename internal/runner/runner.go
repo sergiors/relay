@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
 	"relay/internal/function"
 	"relay/internal/runtime"
@@ -17,7 +16,6 @@ import (
 // delegated to the runtime executor.
 type Runner struct {
 	functions []*PreparedFunction
-	timeout   time.Duration
 	log       *log.Logger
 }
 
@@ -45,13 +43,13 @@ func NewUnavailable(fn function.Function) *PreparedFunction {
 	return &PreparedFunction{fn: fn, available: false}
 }
 
-// New creates a Runner over the given prepared functions. timeout bounds each
-// individual handler invocation.
-func New(prepared []*PreparedFunction, timeout time.Duration, logger *log.Logger) *Runner {
+// New creates a Runner over the given prepared functions. Each invocation is
+// bounded by the matching rule's own timeout.
+func New(prepared []*PreparedFunction, logger *log.Logger) *Runner {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Runner{functions: prepared, timeout: timeout, log: logger}
+	return &Runner{functions: prepared, log: logger}
 }
 
 // Handle evaluates the event against all loaded functions and executes every
@@ -70,7 +68,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			if err != nil {
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 			}
-			invokeCtx, cancel := context.WithTimeout(ctx, r.timeout)
+			invokeCtx, cancel := context.WithTimeout(ctx, rule.Timeout)
 			err = pf.executor.Execute(invokeCtx, pf.prepared, rule.Handler, eventJSON)
 			cancel()
 			if err != nil {

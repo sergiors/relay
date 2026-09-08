@@ -2,6 +2,7 @@ package function
 
 import (
 	"testing"
+	"time"
 )
 
 func TestParseRuntimePython(t *testing.T) {
@@ -238,6 +239,60 @@ events:
 	rules := tmpl.MatchingRules(map[string]any{"status": "FAILED"})
 	if len(rules) != 0 {
 		t.Fatalf("expected 0 matching rules, got %d", len(rules))
+	}
+}
+
+func TestParseRuleMissingTimeoutDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if got := tmpl.Rules[0].Timeout; got != DefaultTimeout {
+		t.Errorf("missing timeout rule = %s, want default %s", got, DefaultTimeout)
+	}
+}
+
+func TestParseRuleExplicitTimeout(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 20s
+`)
+	got := tmpl.Rules[0].Timeout
+	if want := 20 * time.Second; got != want {
+		t.Errorf("explicit timeout rule = %s, want %s", got, want)
+	}
+}
+
+func TestParseRuleTimeoutRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		timeout string
+	}{
+		{"zero", "0s"},
+		{"negative", "-5s"},
+		{"unparseable", "soon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: ` + tc.timeout + `
+`))
+			if err == nil {
+				t.Fatalf("expected error for timeout %q", tc.timeout)
+			}
+		})
 	}
 }
 

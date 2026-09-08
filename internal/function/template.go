@@ -3,9 +3,13 @@ package function
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// DefaultTimeout is applied to a rule that omits an explicit timeout.
+const DefaultTimeout = 6 * time.Second
 
 // operatorKeys are the only keys treated as operators when they are the only
 // keys present in a map; any other key is treated as a nested field.
@@ -27,10 +31,14 @@ type Template struct {
 	Rules   []Rule
 }
 
-// Rule pairs a handler (module.function) with a matching pattern.
+// Rule pairs a handler (module.function) with a matching pattern and a resolved
+// invocation timeout. Timeout is always non-zero after ParseTemplate; omitted
+// rules default to DefaultTimeout.
 type Rule struct {
 	Handler string
 	Pattern Pattern
+	// Timeout bounds a single invocation of this rule's handler.
+	Timeout time.Duration
 }
 
 // Pattern maps top-level event fields to their conditions.
@@ -109,6 +117,7 @@ func ParseTemplate(data []byte) (*Template, error) {
 		Events  []struct {
 			Handler string         `yaml:"handler"`
 			Pattern map[string]any `yaml:"pattern"`
+			Timeout string         `yaml:"timeout"`
 		} `yaml:"events"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -137,13 +146,33 @@ func ParseTemplate(data []byte) (*Template, error) {
 		if err := validateHandler(ev.Handler); err != nil {
 			return nil, err
 		}
+		timeout, err := resolveTimeout(ev.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
+		}
 		pattern := make(Pattern, len(ev.Pattern))
 		for field, cond := range ev.Pattern {
 			pattern[field] = parseFieldCondition(cond)
 		}
-		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern})
+		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout})
 	}
 	return t, nil
+}
+
+// resolveTimeout parses an optional rule timeout. An empty string yields the
+// default; zero, negative, or unparseable values are rejected.
+func resolveTimeout(raw string) (time.Duration, error) {
+	if raw == "" {
+		return DefaultTimeout, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid timeout %q", raw)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("timeout %q must be positive", raw)
+	}
+	return d, nil
 }
 
 // validateHandler requires the form module.function (splitting at the last dot)

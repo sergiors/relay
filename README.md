@@ -14,8 +14,9 @@ Event Producer → Redis Streams → Relay → Function Handler
 
 ## How it works
 
-At startup Relay discovers the functions in `FUNCTIONS_DIR`, builds one image
-per function, and creates (if missing) the Redis consumer group. It then blocks
+At startup Relay discovers the functions under `/app/functions` (one directory
+per function), builds one image per function, and creates (if missing) the Redis
+consumer group. It then blocks
 on the stream with a consumer group, decodes each message, and for every event:
 
 1. evaluates every function's rules (declarative patterns in `template.yaml`),
@@ -118,18 +119,19 @@ warning above); this is a dev-only convenience. Tear down with
 
 ## Configuration
 
-| Env var                  | Default            | Description                                       |
-| ------------------------ | ------------------ | ------------------------------------------------- |
-| `REDIS_ADDR`             | `localhost:6379`   | Redis address.                                    |
-| `REDIS_STREAM`           | `events`           | Redis stream to consume.                          |
-| `REDIS_GROUP`            | `relay`            | Consumer group name.                              |
-| `REDIS_CONSUMER`         | `worker-1`         | Consumer name within the group.                   |
-| `FUNCTIONS_DIR`          | `./functions`      | Directory containing function dirs.               |
-| `FUNCTION_TIMEOUT`       | `30s`              | Per-invocation timeout (Go duration).             |
-| `RELAY_MAX_ATTEMPTS`     | `5`                | Delivery attempts before a failing message is routed to the DLQ. |
-| `RELAY_RECLAIM_INTERVAL` | `1m`               | How often the recovery loop scans for idle pending messages (disabled if `0`). |
-| `RELAY_MIN_PENDING_IDLE` | `1m`               | Minimum time a message must sit pending before it is reclaimed (must exceed normal processing time). |
-| `RELAY_DLQ_STREAM`       | `<stream>:dlq`     | Dead-letter stream for exhausted or malformed messages. |
+| Env var          | Default          | Description                     |
+| ---------------- | ---------------- | ------------------------------- |
+| `REDIS_ADDR`     | `localhost:6379` | Redis address.                  |
+| `REDIS_STREAM`   | `events`         | Redis stream to consume.        |
+| `REDIS_GROUP`    | `relay`          | Consumer group name.            |
+| `REDIS_CONSUMER` | `worker-1`       | Consumer name within the group. |
+
+`DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
+`DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
+(see *Docker requirement*); Relay itself does not parse them.
+
+Relay's reliability settings — retry/delivery limits and the recovery loop — are
+fixed internals, not env-configurable. See *Reliability defaults* below.
 
 Multiple Relay instances may share the same `REDIS_GROUP` with different
 consumer names to scale out consuming. The consumer group is created
@@ -139,7 +141,7 @@ consumed.
 
 ## Functions
 
-Each direct subdirectory of `FUNCTIONS_DIR` is one function. The directory name
+Each direct subdirectory of `/app/functions` is one function. The directory name
 is the function name. Each function directory must contain a `template.yaml`
 that declares which runtime to use and which events it handles.
 
@@ -164,6 +166,7 @@ events:
     pattern:
       event_name: [MODIFY]
       table_name: [users]
+    timeout: 20s
 
   - handler: events.deleted.handler
     pattern:
@@ -174,7 +177,11 @@ events:
 - `runtime` (required) selects the execution runtime. Only `python3.14` and
   `node24` are supported; any other value fails validation.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
-  `module.function`) and a required `pattern`.
+  `module.function`), a required `pattern`, and an optional `timeout`.
+- `timeout` (optional, per rule) is a Go duration string bounding a single
+  invocation of that rule's handler (e.g. `20s`, `1m30s`). It must be positive.
+  Zero, negative, or unparseable values fail the function's template validation
+  (the function is logged and skipped). Omitted rules use a `6s` default.
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
@@ -249,8 +256,9 @@ to Relay's logs.
 - **Sequential execution**: for each event, functions are iterated in order,
   then rules in order, and each matching handler runs one at a time (no
   concurrency).
-- **Timeout**: each invocation is bounded by `FUNCTION_TIMEOUT`. A timeout
-  kills the invocation and is treated as an execution failure.
+- **Timeout**: each invocation is bounded by the matching rule's `timeout`
+  (default `6s`). A timeout kills the invocation and is treated as an execution
+  failure. Multiple matching rules each use their own rule's timeout.
 - **Failure**: any non-zero container exit is a failure; errors include the
   function and handler names. **Abort on first failure**: a failed invocation
   stops the remaining rules for that event and returns the message to the
@@ -287,18 +295,18 @@ message a consumer reads but never acknowledges — a crash, an outage, or a
 handler failure — stays in the PEL.
 
 - **Recovery loop** (`XAUTOCLAIM`): a background goroutine runs every
-  `RELAY_RECLAIM_INTERVAL` and reclaims messages that have sat pending for
-  longer than `RELAY_MIN_PENDING_IDLE`. Reclaiming takes ownership for the
+  `DefaultReclaimInterval` (1m) and reclaims messages that have sat pending for
+  longer than `DefaultMinPendingIdle` (1m). Reclaiming takes ownership for the
   current consumer and replays the message through the same processing path as a
   fresh read. This makes Relay survive restarts: a message left pending by a
   dead consumer is picked up and retried by a live one.
 - **Retry counting**: the per-message delivery count is read from Redis
   (`XPENDING` full form / retry counter), not kept in process memory, so the
   count survives restarts. Each reclaim of an idle message increments the count.
-- **Max attempts → DLQ**: once a message fails `RELAY_MAX_ATTEMPTS` times
-  (default 5), it is no longer re-processed. It is written to the dead-letter
-  stream `RELAY_DLQ_STREAM` (default `<stream>:dlq`) and the original is then
-  acknowledged, removing it from the PEL.
+- **Max attempts → DLQ**: once a message fails `DefaultMaxAttempts` (5) times,
+  it is no longer re-processed. It is written to the dead-letter stream
+  `<stream>:dlq` and the original is then acknowledged, removing it from the
+  PEL.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
   `attempts`, `timestamp` (RFC 3339).
@@ -309,6 +317,10 @@ handler failure — stays in the PEL.
   string, or is not a JSON object can never succeed. It is routed straight to
   the DLQ on first encounter — without running any handler — and acknowledged.
 - **Malformed input** never consumes retry cycles.
+
+These recovery defaults are a fixed part of the stream package and cannot be
+overridden by environment variables. A zero-valued `ConsumerConfig` field
+falls back to them in `NewConsumer`.
 
 The at-least-once contract from the ACK table above is unchanged: XACK happens
 only after all matching invocations succeed or the message is successfully
@@ -326,7 +338,8 @@ described above.
   table, each mapping an event to a module inside the `events/` namespace
   package (no `__init__.py`):
   - `events.created.handler` on `event_name: INSERT`.
-  - `events.updated.handler` on `event_name: MODIFY`.
+  - `events.updated.handler` on `event_name: MODIFY` (with an explicit
+    `timeout: 20s` demonstrating the per-rule timeout).
   - `events.deleted.handler` on `event_name: REMOVE`.
 
   Each module defines a single `handler(event)` function. `created`/`updated`
@@ -336,7 +349,8 @@ described above.
 - `functions/welcome-email-node/` (node24): a single rule
   `handler.handler` on `event_name: INSERT` / `table_name: users`. The handler
   reads `event.new_image` and logs a welcome email. No `package.json` is
-  provided, so Relay injects the ESM `package.json`.
+  provided, so Relay injects the ESM `package.json`. It omits `timeout`, so it
+  exercises the `6s` default.
 
 A single generic, cross-engine event matches both functions:
 
