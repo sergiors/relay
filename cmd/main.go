@@ -16,11 +16,14 @@ import (
 	"relay/internal/stream"
 )
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// mustEnv reads a required environment variable during startup, before any
+// other work, and fails fast if it is unset or empty.
+func mustEnv(logger *log.Logger, key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		logger.Fatalf("missing required environment variable: %s", key)
 	}
-	return def
+	return v
 }
 
 func main() {
@@ -32,10 +35,10 @@ func main() {
 		redisGroup  string
 		redisCons   string
 	}{
-		redisAddr:   envOr("REDIS_ADDR", "localhost:6379"),
-		redisStream: envOr("REDIS_STREAM", "events"),
-		redisGroup:  envOr("REDIS_GROUP", "relay"),
-		redisCons:   envOr("REDIS_CONSUMER", "worker-1"),
+		redisAddr:   mustEnv(logger, "REDIS_ADDR"),
+		redisStream: mustEnv(logger, "REDIS_STREAM"),
+		redisGroup:  mustEnv(logger, "REDIS_GROUP"),
+		redisCons:   mustEnv(logger, "REDIS_CONSUMER"),
 	}
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})

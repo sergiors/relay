@@ -120,12 +120,15 @@ warning above); this is a dev-only convenience. Tear down with
 
 ## Configuration
 
-| Env var          | Default          | Description                     |
-| ---------------- | ---------------- | ------------------------------- |
-| `REDIS_ADDR`     | `localhost:6379` | Redis address.                  |
-| `REDIS_STREAM`   | `events`         | Redis stream to consume.        |
-| `REDIS_GROUP`    | `relay`          | Consumer group name.            |
-| `REDIS_CONSUMER` | `worker-1`       | Consumer name within the group. |
+| Env var          | Required | Description                     |
+| ---------------- | -------- | ------------------------------- |
+| `REDIS_ADDR`     | yes      | Redis address.                  |
+| `REDIS_STREAM`   | yes      | Redis stream to consume.        |
+| `REDIS_GROUP`    | yes      | Consumer group name.            |
+| `REDIS_CONSUMER` | yes      | Consumer name within the group. |
+
+The four `REDIS_*` variables are required: Relay fails startup (exits
+immediately) if any of them is unset or empty.
 
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
@@ -407,8 +410,8 @@ welcome email).
 
 ## Try it
 
-With Relay running against the defaults (stream `events`, group `relay`), add
-the example event with `redis-cli`:
+With Relay consuming stream `events` in group `relay` (as configured in
+`compose.dev.yaml`), add the example event with `redis-cli`:
 
 ```
 redis-cli XADD events '*' event '{"event_id":"evt_123","event_name":"INSERT","table_name":"users","new_image":{"id":"user_123","name":"John Doe","email":"john@example.com"}}'
