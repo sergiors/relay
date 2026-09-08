@@ -71,6 +71,16 @@ func (l *Loader) Load() ([]Function, error) {
 		}
 		name := entry.Name()
 		dir := filepath.Join(l.dir, name)
+
+		// Validate the directory name before anything else: an invalid name can
+		// never be a valid function, and skipping it (like a broken template) is
+		// better than crashing on it. A stray non-function directory then simply
+		// logs and is ignored.
+		if err := ValidName(name); err != nil {
+			l.log.Printf("function %q: invalid name: %v; skipping", name, err)
+			continue
+		}
+
 		templatePath := filepath.Join(dir, "template.yaml")
 
 		data, err := os.ReadFile(templatePath)

@@ -196,6 +196,38 @@ events:
 	}
 }
 
+func TestLoadSkipsInvalidName(t *testing.T) {
+	dir := t.TempDir()
+	// A directory whose name violates the rule must be skipped (with a log),
+	// not crash the load.
+	writeTemplate(t, dir, "Invalid Name", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	writeTemplate(t, dir, "valid-fn", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+
+	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	fns, err := loader.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 {
+		t.Fatalf("expected 1 function (invalid name skipped), got %d", len(fns))
+	}
+	if fns[0].Name != "valid-fn" {
+		t.Errorf("expected 'valid-fn', got %q", fns[0].Name)
+	}
+}
+
 func TestLoadMissingRuntimeRejected(t *testing.T) {
 	dir := t.TempDir()
 	writeTemplate(t, dir, "no-runtime", `

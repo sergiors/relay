@@ -8,14 +8,15 @@ import (
 )
 
 func TestImageRef(t *testing.T) {
+	// imageRef is a plain concatenation: names are validated at load time, so
+	// every name below is already safe for a docker tag.
 	cases := []struct {
 		in   string
 		want string
 	}{
-		{"enrollment-events", "relay-fn-enrollment-events-17c33861"},
-		{"Enrollment Events", "relay-fn-enrollment-events-acb5e272"},
-		{"fn_1.2", "relay-fn-fn_1.2-5a5e6121"},
-		{"a/b:c", "relay-fn-a-b-c-379e35e6"},
+		{"user-events", "relay-fn-user-events"},
+		{"welcome_email", "relay-fn-welcome_email"},
+		{"jobs.v2", "relay-fn-jobs.v2"},
 	}
 	for _, tc := range cases {
 		if got := imageRef(tc.in); got != tc.want {
@@ -24,20 +25,12 @@ func TestImageRef(t *testing.T) {
 	}
 }
 
-func TestImageRefCollisionResistant(t *testing.T) {
-	// These two names sanitize to the same tag ("relay-fn-my-fn") but must
-	// produce distinct refs thanks to the deterministic hash suffix.
-	a := imageRef("my fn")
-	b := imageRef("my-fn")
-	if a == b {
-		t.Errorf("imageRef(%q) == imageRef(%q) == %q, want distinct refs", "my fn", "my-fn", a)
-	}
-}
-
-func TestImageRefDeterministic(t *testing.T) {
-	name := "Enrollment Events"
-	if got, want := imageRef(name), imageRef(name); got != want {
-		t.Errorf("imageRef(%q) not deterministic: %q != %q", name, got, want)
+func TestImageRefNoCollisionSanitization(t *testing.T) {
+	// Names that the old sanitizer would have collapsed together (e.g. "my fn"
+	// and "my-fn") are now rejected at load time rather than normalized, so
+	// imageRef never needs a disambiguating hash suffix.
+	if got, want := imageRef("my-fn"), "relay-fn-my-fn"; got != want {
+		t.Errorf("imageRef(my-fn) = %q, want %q", got, want)
 	}
 }
 

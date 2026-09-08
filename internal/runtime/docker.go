@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -23,26 +22,15 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// imageRef maps a function name to a docker tag: lowercase, disallowed
-// characters replaced by '-', prefixed "relay-fn-" to avoid reserved names, and
-// suffixed with a short deterministic hash so that different function names
-// that sanitize to the same image name still produce distinct refs.
+// imageRef maps a validated function name to its docker image tag. No sanitizing
+// is needed here: function names are validated at load time (internal/function)
+// to be [a-z0-9][a-z0-9._-]* and not end in '.', so they are already legal docker
+// tag names. Because validation rules out every name that could collide after a
+// transform, a plain concatenation is unambiguous. The "relay-fn-" prefix
+// namespaces all of Relay's images so they don't collide with unrelated images
+// on the same daemon.
 func imageRef(name string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(name) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return "relay-fn-" + b.String() + "-" + fnv1a8(name)
-}
-
-func fnv1a8(s string) string {
-	h := fnv.New32a()
-	h.Write([]byte(s))
-	return fmt.Sprintf("%08x", h.Sum32())
+	return "relay-fn-" + name
 }
 
 func buildImage(

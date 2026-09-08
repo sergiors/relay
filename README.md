@@ -146,10 +146,16 @@ consumed.
 ## Functions
 
 Each direct subdirectory of `/functions` is one function. The directory name
-is the function name. Each function directory must contain a `template.yaml`
-that declares which runtime to use and which events it handles.
+is the function name. Function names must be valid: they must match
+`[a-z0-9][a-z0-9._-]*`, be at most 63 characters, and not end in a dot (so
+`user-events`, `welcome_email`, and `jobs.v2` are fine, while `User Events`,
+`hello/world`, and `.hidden` are not). Validation happens at load time — a name
+is never silently sanitized — so valid names are already safe to use as docker
+image tags. Each function directory must contain a `template.yaml` that declares
+which runtime to use and which events it handles.
 
 - A directory without a `template.yaml` is ignored.
+- An invalid name is logged and skipped — it never prevents Relay from starting.
 - An invalid `template.yaml` is logged and skipped — it never prevents Relay
   from starting.
 - A function whose image cannot be built is logged and marked unavailable; the
