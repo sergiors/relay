@@ -104,12 +104,13 @@ func TestFunctionInspectDetail(t *testing.T) {
 		t.Fatal("expected function")
 	}
 	out := capture(t, func() { printInspect(st, d) })
+	// tabwriter pads to the longest label ("Last reconcile:") + minwidth
 	for _, want := range []string{
-		"Name:              user-events-python",
-		"Runtime:           python3.14",
-		"Status:            ready",
-		"Image:             relay-fn-user-events-python",
-		"Fingerprint:       abc123hash",
+		"Name:            user-events-python",
+		"Runtime:         python3.14",
+		"Status:          ready",
+		"Image:           relay-fn-user-events-python",
+		"Fingerprint:     abc123hash",
 		"Prepared:",
 		"Last reconcile:",
 		"events.created.handler",

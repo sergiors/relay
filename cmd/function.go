@@ -111,32 +111,39 @@ func printList(st *state.State) error {
 	return w.Flush()
 }
 
-// printInspect renders the full detail record to stdout.
+// printInspect renders the full detail record to stdout. Labels are
+// tab-aligned through a tabwriter so padding matches the longest label
+// without hand-maintained spaces. The Handlers section is rendered with
+// the same alignment, using a wider padding for visual grouping.
 func printInspect(st *state.State, d state.Detail) {
-	fmt.Fprintf(os.Stdout, "Name:              %s\n", d.Name)
-	fmt.Fprintf(os.Stdout, "Runtime:           %s\n", d.Runtime)
-	fmt.Fprintf(os.Stdout, "Status:            %s\n", d.Status)
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "Name:\t%s\n", d.Name)
+	fmt.Fprintf(w, "Runtime:\t%s\n", d.Runtime)
+	fmt.Fprintf(w, "Status:\t%s\n", d.Status)
 	if d.Image != "" {
-		fmt.Fprintf(os.Stdout, "Image:             %s\n", d.Image)
+		fmt.Fprintf(w, "Image:\t%s\n", d.Image)
 	}
 	if d.Fingerprint != "" {
-		fmt.Fprintf(os.Stdout, "Fingerprint:       %s\n", d.Fingerprint)
+		fmt.Fprintf(w, "Fingerprint:\t%s\n", d.Fingerprint)
 	}
 	if d.PreparedAt != "" {
-		fmt.Fprintf(os.Stdout, "Prepared:          %s (%s)\n", d.PreparedAt, state.RelativeAgo(d.PreparedAt))
+		fmt.Fprintf(w, "Prepared:\t%s (%s)\n", d.PreparedAt, state.RelativeAgo(d.PreparedAt))
 	}
 	if d.LastReconcileAt != "" {
-		fmt.Fprintf(os.Stdout, "Last reconcile:    %s (%s)\n", d.LastReconcileStatus, state.RelativeAgo(d.LastReconcileAt))
+		fmt.Fprintf(w, "Last reconcile:\t%s (%s)\n", d.LastReconcileStatus, state.RelativeAgo(d.LastReconcileAt))
 	}
 	if d.LastError != "" {
-		fmt.Fprintf(os.Stdout, "Last error:        %s\n", d.LastError)
+		fmt.Fprintf(w, "Last error:\t%s\n", d.LastError)
 	}
+	w.Flush()
 
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "Handlers:")
+	hw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
 	for _, h := range d.Handlers {
-		fmt.Fprintf(os.Stdout, "  %s   timeout=%s\n", h.Name, h.Timeout)
+		fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
 	}
+	hw.Flush()
 }
 
 // displayTime returns the UPDATED column value: prepared_at (if set) else
