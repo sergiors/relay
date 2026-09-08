@@ -26,6 +26,7 @@ services:
 
   relay:
     build: .
+    container_name: relay
     depends_on:
       redis:
         condition: service_healthy
@@ -38,7 +39,7 @@ services:
       - REDIS_CONSUMER=worker-1
       - DOCKER_HOST=tcp://socket-proxy:2375
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:80/health"]
+      test: ["CMD", "relay", "health"]
       interval: 10s
       timeout: 3s
       retries: 3

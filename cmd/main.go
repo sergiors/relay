@@ -31,17 +31,20 @@ func mustEnv(logger *log.Logger, key string) string {
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
-	// Minimal hand-rolled dispatch (no CLI framework): only the single
-	// `function` subcommand family is recognized; everything else is the daemon.
+	// Minimal hand-rolled dispatch (no CLI framework): only the `function` and
+	// `health` subcommands are recognized; everything else is the daemon.
 	if len(os.Args) > 1 && os.Args[1] == "function" {
 		os.Exit(runFunctionCommand(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "health" {
+		os.Exit(runHealthCommand())
 	}
 
 	runDaemon(logger)
 }
 
-// runDaemon is the original main body: startup wiring, then the health server,
-// reconciler, and stream consumer. It blocks in Consume until cancelled.
+// runDaemon is the original main body: startup wiring, then the reconciler and
+// stream consumer. It blocks in Consume until cancelled.
 func runDaemon(logger *log.Logger) {
 	cfg := struct {
 		redisAddr   string
@@ -130,11 +133,6 @@ func runDaemon(logger *log.Logger) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// Health endpoint for container orchestrators, fixed at port 80. It is an
-	// application convention, not configuration.
-	hs := newHealthServer(consumer.Healthy)
-	hs.start(ctx)
 
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Fatalf("ensure consumer group: %v", err)

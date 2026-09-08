@@ -1,36 +1,46 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"errors"
+	"strings"
 	"testing"
 )
 
-func TestHealthHandler(t *testing.T) {
+// checkHealth reports the first failing check (redis first) and prints
+// "healthy" only when both pass.
+func TestCheckHealth(t *testing.T) {
+	ok := func() error { return nil }
+	fail := func() error { return errors.New("boom") }
+
 	tests := []struct {
 		name       string
-		healthy    bool
-		method     string
-		path       string
-		wantStatus int
-		wantBody   string
+		redis      func() error
+		docker     func() error
+		wantCode   int
+		wantStderr string
+		wantStdout string
 	}{
-		{"healthy ok", true, http.MethodGet, "/health", http.StatusOK, "ok"},
-		{"unhealthy 503", false, http.MethodGet, "/health", http.StatusServiceUnavailable, ""},
-		{"wrong path 404", true, http.MethodGet, "/other", http.StatusNotFound, ""},
-		{"wrong method 405", true, http.MethodPost, "/health", http.StatusMethodNotAllowed, ""},
+		{"both pass", ok, ok, 0, "", "healthy\n"},
+		{"redis fails", fail, ok, 1, "boom", ""},
+		{"docker fails", ok, fail, 1, "boom", ""},
+		{"both fail reports redis", fail, fail, 1, "boom", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hs := newHealthServer(func() bool { return tt.healthy })
-			req := httptest.NewRequest(tt.method, tt.path, nil)
-			rec := httptest.NewRecorder()
-			hs.server.Handler.ServeHTTP(rec, req)
-			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			var code int
+			errOut := captureErr(t, func() {
+				out := capture(t, func() {
+					code = checkHealth(tt.redis, tt.docker)
+				})
+				if out != tt.wantStdout {
+					t.Fatalf("stdout = %q, want %q", out, tt.wantStdout)
+				}
+			})
+			if code != tt.wantCode {
+				t.Fatalf("exit = %d, want %d", code, tt.wantCode)
 			}
-			if tt.wantBody != "" && rec.Body.String() != tt.wantBody {
-				t.Fatalf("body = %q, want %q", rec.Body.String(), tt.wantBody)
+			if tt.wantStderr != "" && !strings.Contains(errOut, tt.wantStderr) {
+				t.Fatalf("stderr missing %q: %q", tt.wantStderr, errOut)
 			}
 		})
 	}

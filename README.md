@@ -115,7 +115,9 @@ endpoints Relay needs (ping/version, image build, and container create/attach/
 start/wait/kill/remove). Port `2375` is **not** exposed to the host, so the
 proxy is reachable only from the compose network. `./functions` is still
 mounted read-only into Relay at `/functions`. The socket mount is privileged (see the security
-warning above); this is a dev-only convenience. Tear down with
+warning above); this is a dev-only convenience. The Relay container's healthcheck
+runs `relay health` (see _Health check_), so `docker compose ps` reports it
+healthy only while both Redis and the Docker daemon are reachable. Tear down with
 `docker compose -f compose.dev.yaml down -v`.
 
 ## Configuration
@@ -133,6 +135,17 @@ immediately) if any of them is unset or empty.
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
 (see _Docker requirement_); Relay itself does not parse them.
+
+### Health check
+
+`relay health` is an operational/container healthcheck command. It checks the
+two dependencies the daemon needs at startup — Redis connectivity (a PING to
+`REDIS_ADDR`) and Docker daemon connectivity (an Engine API Ping) — and exits
+`0` when both are reachable, `1` otherwise (reporting the first failing check to
+stderr). It is **not** a public API and no HTTP server runs; it only creates
+clients and pings, so it never starts consumption, loads functions, builds
+images, or touches the state database. `compose.dev.yaml` uses it as the Relay
+container's healthcheck.
 
 Relay's reliability settings — retry/delivery limits and the recovery loop — are
 fixed internals, not env-configurable. See _Reliability defaults_ below.

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"os"
 	"strings"
@@ -631,10 +629,6 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		t.Fatalf("ensure group: %v", err)
 	}
 
-	// Health endpoint wired to the consumer.
-	hs := newHealthServerForTest(t, consumer.Healthy)
-	hsURL := hs.URL
-
 	// Consume an event before the outage.
 	firstID, err := rc.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"a":1}`}}).Result()
 	if err != nil {
@@ -654,8 +648,8 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		})
 	}()
 	<-firstDone
-	if code := healthCode(t, hsURL); code != http.StatusOK {
-		t.Fatalf("health before outage = %d, want 200", code)
+	if !consumer.Healthy() {
+		t.Fatalf("consumer should be healthy before outage")
 	}
 
 	// Stop redis: outage begins.
@@ -663,9 +657,6 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		t.Fatalf("stop redis: %v", err)
 	}
 	waitFor(t, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
-	if code := healthCode(t, hsURL); code != http.StatusServiceUnavailable {
-		t.Fatalf("health during outage = %d, want 503", code)
-	}
 	if !strings.Contains(buf.String(), "redis read failed") {
 		t.Fatalf("expected backoff log during outage, got: %q", buf.String())
 	}
@@ -682,9 +673,6 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		return probe.Ping(pctx).Err() == nil
 	})
 	waitFor(t, "consumer healthy after recovery", func() bool { return consumer.Healthy() })
-	if code := healthCode(t, hsURL); code != http.StatusOK {
-		t.Fatalf("health after recovery = %d, want 200", code)
-	}
 
 	secondID, err := rc.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"b":2}`}}).Result()
 	if err != nil {
@@ -718,35 +706,4 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("consumer did not stop")
 	}
-}
-
-// healthCode performs a GET on the health endpoint and returns the status code.
-func healthCode(t *testing.T, url string) int {
-	t.Helper()
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatalf("health get: %v", err)
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode
-}
-
-// newHealthServerForTest starts a health server on a random port and returns
-// its base URL. It is a test-local stand-in for cmd's healthServer.
-func newHealthServerForTest(t *testing.T, healthy func() bool) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if healthy() {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
 }

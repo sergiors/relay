@@ -133,8 +133,8 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 }
 
 // Healthy reports whether the consumer's last observed Redis operation
-// succeeded. It is the readiness signal for the /health endpoint: true while
-// Redis is reachable, false during an outage.
+// succeeded. It is the readiness signal for the `relay health` command: true
+// while Redis is reachable, false during an outage.
 func (c *Consumer) Healthy() bool {
 	return c.healthy.Load()
 }

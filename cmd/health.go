@@ -2,57 +2,71 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log"
-	"net/http"
+	"os"
 	"time"
+
+	"github.com/moby/moby/client"
+	"github.com/redis/go-redis/v9"
 )
 
-// healthAddr is the fixed listen address for the /health endpoint. It is an
-// application convention for container orchestrators, not configuration.
-const healthAddr = ":80"
+// healthTimeout bounds each dependency probe so a hung daemon or Redis does not
+// stall the healthcheck indefinitely.
+const healthTimeout = 2 * time.Second
 
-// healthServer serves a single GET /health endpoint used only as a container
-// healthcheck for orchestrators. It reports 200 while the consumer is healthy
-// and 503 otherwise. It is not a public API and exposes no other endpoints.
-type healthServer struct {
-	server *http.Server
-}
+// runHealthCommand implements the `relay health` subcommand. It checks the two
+// dependencies the daemon needs at startup — Redis connectivity and Docker
+// daemon connectivity — and exits 0 when both are reachable, 1 otherwise. It
+// never starts consumption, loads functions, builds images, or touches the
+// state database; it only creates clients and pings. Exit codes:
+//
+//	0  healthy
+//	1  a dependency is unavailable
+func runHealthCommand() int {
+	logger := log.New(os.Stderr, "", 0)
+	redisAddr := mustEnv(logger, "REDIS_ADDR")
 
-// newHealthServer builds an HTTP server on the fixed health port that reports
-// the consumer's health. healthy is a read-only probe (the Consumer's
-// Healthy()).
-func newHealthServer(healthy func() bool) *healthServer {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if healthy() {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-	})
-	return &healthServer{
-		server: &http.Server{Addr: healthAddr, Handler: mux},
-	}
-}
-
-// start runs the server in a goroutine and shuts it down (with a short timeout)
-// when ctx is cancelled. It returns immediately.
-func (h *healthServer) start(ctx context.Context) {
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	redisCheck := func() error {
+		cli := redis.NewClient(&redis.Options{Addr: redisAddr})
+		defer cli.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), healthTimeout)
 		defer cancel()
-		_ = h.server.Shutdown(shutdownCtx)
-	}()
-	go func() {
-		if err := h.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("health server: %v", err)
+		if err := cli.Ping(ctx).Err(); err != nil {
+			return fmt.Errorf("redis unavailable: %w", err)
 		}
-	}()
+		return nil
+	}
+
+	dockerCheck := func() error {
+		cli, err := client.New(client.FromEnv)
+		if err != nil {
+			return fmt.Errorf("docker unavailable: %w", err)
+		}
+		defer cli.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), healthTimeout)
+		defer cancel()
+		if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+			return fmt.Errorf("docker unavailable: %w", err)
+		}
+		return nil
+	}
+
+	return checkHealth(redisCheck, dockerCheck)
+}
+
+// checkHealth runs the two dependency checks in a fixed order (redis then
+// docker) and reports the first failure. It is separated from the real
+// implementation so unit tests can inject fakes without Redis or Docker.
+func checkHealth(redisCheck, dockerCheck func() error) int {
+	if err := redisCheck(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := dockerCheck(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println("healthy")
+	return 0
 }
