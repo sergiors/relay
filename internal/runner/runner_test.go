@@ -13,9 +13,8 @@ import (
 	"relay/internal/runtime"
 )
 
-// TestRegistryNamesDeterministic verifies Set and Replace keep the function set
-// sorted by name, so Names() and iteration order never depend on the order
-// functions were discovered or swapped in.
+// Set and Replace keep the function set sorted by name, so Names() and iteration
+// order never depend on the order functions were discovered or swapped in.
 func TestRegistryNamesDeterministic(t *testing.T) {
 	r := New(nil, log.New(nil, "", 0))
 	reg := r.Registry()
@@ -36,8 +35,8 @@ func TestRegistryNamesDeterministic(t *testing.T) {
 	}
 }
 
-// fakeExecutor records invocations without touching Docker, satisfying the
-// runner's local executor interface.
+// Records invocations without touching Docker, satisfying the runner's local
+// executor interface.
 type fakeExecutor struct {
 	mu    sync.Mutex
 	calls int
@@ -62,9 +61,8 @@ func newFn(t *testing.T, name string) *PreparedFunction {
 	)
 }
 
-// TestHandleVsSwapSnapshotConsistency runs Handle concurrently with registry
-// swaps under -race and asserts the runner neither panics nor errors while the
-// set is being replaced mid-iteration.
+// Runs Handle concurrently with registry swaps under -race and asserts the
+// runner neither panics nor errors while the set is being replaced mid-iteration.
 func TestHandleVsSwapSnapshotConsistency(t *testing.T) {
 	r := New(nil, log.New(nil, "", 0))
 

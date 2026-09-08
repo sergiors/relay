@@ -10,9 +10,9 @@ import (
 	"relay/internal/runner"
 )
 
-// TestDebounceCoalescesRapidEvents: many quick Enqueue calls for the same
-// function should fire exactly one reconcile (the pump consumes the debounced
-// name once). Distinct functions queue independently.
+// Many quick Enqueue calls for the same function should fire exactly one
+// reconcile (the pump consumes the debounced name once). Distinct functions
+// queue independently.
 func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "coalesced")
@@ -44,8 +44,7 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	}
 }
 
-// TestDebounceDistinctFunctionsIndependent ensures two functions each reconcile
-// independently after their own debounce windows.
+// Two functions each reconcile independently after their own debounce windows.
 func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "a")
@@ -70,7 +69,6 @@ func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
 	}
 }
 
-// TestFunctionForPath covers the event-path-to-function-name mapping.
 func TestFunctionForPath(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "functions")
 	if err := os.MkdirAll(root, 0o755); err != nil {

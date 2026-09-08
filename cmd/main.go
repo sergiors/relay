@@ -24,7 +24,7 @@ func envOr(key, def string) string {
 }
 
 func main() {
-	logger := log.New(os.Stdout, "relay: ", log.LstdFlags)
+	logger := log.New(os.Stdout, "", log.LstdFlags)
 
 	cfg := struct {
 		redisAddr   string
@@ -100,8 +100,7 @@ func main() {
 	}
 	logger.Printf("watching %s for changes", function.Dir)
 
-	// Reconciler watches /functions and swaps the registry live. It runs in its
-	// own goroutine and stops when ctx is cancelled.
+	// Runs in its own goroutine and stops when ctx is cancelled.
 	go reconciler.Start(ctx)
 
 	logger.Printf("consuming stream %q as group %q consumer %q",

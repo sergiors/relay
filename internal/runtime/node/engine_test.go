@@ -10,13 +10,21 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// testSpecs are two runtime versions served by the same Node engine. The
-// engine must produce identical build logic for both, differing only in the
-// base image taken from the spec. The second spec is test-only and is never
-// registered in the runtime registry.
+// Two runtime versions served by the same Node engine. The engine must produce
+// identical build logic for both, differing only in the base image taken from
+// the spec. The second spec is test-only and is never registered in the runtime
+// registry.
 var testSpecs = []plan.Spec{
-	{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"},
-	{Name: "node26", Engine: plan.EngineNode, BaseImage: "node:26-alpine"},
+	{
+		Name:      "node24",
+		Engine:    plan.EngineNode,
+		BaseImage: "node:24-alpine",
+	},
+	{
+		Name:      "node26",
+		Engine:    plan.EngineNode,
+		BaseImage: "node:26-alpine",
+	},
 }
 
 func TestPlanBootstrapAndBase(t *testing.T) {

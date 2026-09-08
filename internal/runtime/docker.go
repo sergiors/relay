@@ -1,8 +1,3 @@
-// Package runtime executes Relay functions in containers: one image per
-// function, one container per handler invocation, talking to the Docker Engine
-// API directly via the moby client. Runtime engines (python, node) produce
-// generic build plans; this package turns those plans into images and
-// invocations without knowing about Python imports or Node module resolution.
 package runtime
 
 import (
@@ -44,14 +39,20 @@ func imageRef(name string) string {
 	return "relay-fn-" + b.String() + "-" + fnv1a8(name)
 }
 
-// fnv1a8 is the deterministic 8-hex hash suffix used by imageRef.
 func fnv1a8(s string) string {
 	h := fnv.New32a()
 	h.Write([]byte(s))
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
-func buildImage(ctx context.Context, cli *client.Client, name string, fn function.Function, p plan.BuildPlan, image string) error {
+func buildImage(
+	ctx context.Context,
+	cli *client.Client,
+	name string,
+	fn function.Function,
+	p plan.BuildPlan,
+	image string,
+) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
 		return fmt.Errorf("function %q: create build context: %w", name, err)
@@ -136,8 +137,6 @@ func drainBuildResponse(r io.Reader) (string, error) {
 	return out.String(), nil
 }
 
-// tarContext walks a staged build-context directory and returns it as a tar
-// stream suitable for ImageBuild.
 func tarContext(ctxDir string) (io.Reader, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

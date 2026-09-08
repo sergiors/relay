@@ -20,8 +20,8 @@ type contextCanceledSentinel struct{}
 
 func (contextCanceledSentinel) Error() string { return "boom" }
 
-// fakeBuilder records Prepare calls and can be configured to fail or return a
-// prepared handle, without touching Docker or Redis.
+// Records Prepare calls and can be configured to fail or return a prepared
+// handle, without touching Docker or Redis.
 type fakeBuilder struct {
 	mu      sync.Mutex
 	prepCnt int
@@ -93,9 +93,8 @@ func newTestReconciler(t *testing.T, root string, builder Builder, initial []*ru
 	return r, reg
 }
 
-// startDebounceForTest launches just the debounce pump (the consumer of the
-// incoming queue) without the fsnotify watcher, so debounce semantics can be
-// tested deterministically.
+// Launches just the debounce pump (the consumer of the incoming queue) without
+// the fsnotify watcher, so debounce semantics can be tested deterministically.
 func (r *Reconciler) startDebounceForTest() {
 	go r.pump()
 }

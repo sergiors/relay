@@ -1,8 +1,3 @@
-// Package reconciler watches the functions root and swaps function images live
-// as their directories change. It owns no Docker/build logic; a Builder (satisfied
-// by the runtime Manager) performs the actual prepare, and a runner.Registry is
-// swapped atomically. This lets Relay pick up new functions, rebuild changed
-// ones, and drop removed ones without a restart.
 package reconciler
 
 import (
@@ -50,8 +45,8 @@ type Config struct {
 	Interval time.Duration
 }
 
-// Reconciler watches Root, debounces per-function events, and swaps the registry
-// when a function's content fingerprint changes.
+// Watches Root, debounces per-function events, and swaps the registry when a
+// function's content fingerprint changes.
 type Reconciler struct {
 	root     string
 	debounce time.Duration

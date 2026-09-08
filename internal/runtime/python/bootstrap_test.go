@@ -30,9 +30,9 @@ func TestBootstrapContent(t *testing.T) {
 	}
 }
 
-// runPython runs the real embedded bootstrap under python3 with PYTHONPATH
-// pointing at dir (which holds the handler module). It returns the combined
-// output and whether the process exited non-zero.
+// Runs the real embedded bootstrap under python3 with PYTHONPATH pointing at
+// dir (which holds the handler module). It returns the combined output and
+// whether the process exited non-zero.
 func runPython(t *testing.T, dir, handler, stdin string) (string, bool) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), Bootstrap, 0o644); err != nil {
@@ -48,8 +48,6 @@ func runPython(t *testing.T, dir, handler, stdin string) (string, bool) {
 	return string(out), err != nil
 }
 
-// writeHandler writes <module>.py into dir for the given module name (e.g.
-// "handler" -> handler.py, "src.email" -> src/email.py).
 func writeHandler(t *testing.T, dir, module, src string) {
 	t.Helper()
 	path := filepath.Join(dir, filepath.FromSlash(strings.ReplaceAll(module, ".", "/"))+".py")

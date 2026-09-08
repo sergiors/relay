@@ -11,12 +11,12 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// TestShutdownNoSendOnClosedChannel runs the full reconciler (real fsnotify)
-// with a tiny debounce, enqueues an event, cancels mid-debounce, then waits
-// beyond the debounce window. Under -race this would surface the old
-// send-on-closed-channel panic; the done-channel dispatch must swallow the
-// timer fire and the process must not crash. The timer is fired right at the
-// teardown boundary: enqueue, then cancel, then sleep past the debounce.
+// Runs the full reconciler (real fsnotify) with a tiny debounce, enqueues an
+// event, cancels mid-debounce, then waits beyond the debounce window. Under
+// -race this would surface the old send-on-closed-channel panic; the
+// done-channel dispatch must swallow the timer fire and the process must not
+// crash. The timer is fired right at the teardown boundary: enqueue, then
+// cancel, then sleep past the debounce.
 func TestShutdownNoSendOnClosedChannel(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "race-me")
@@ -40,10 +40,9 @@ func TestShutdownNoSendOnClosedChannel(t *testing.T) {
 	// If we got here without a panic, the dispatch path is safe on shutdown.
 }
 
-// TestWatchCleanupOnRenameRemovesDescendants verifies that renaming a parent
-// directory clears the stale watch handles beneath the old path (a rename is a
-// removal for the old path). It uses a real fsnotify watcher so we assert the
-// watches map reflects exactly what the OS watcher holds.
+// Renaming a parent directory clears the stale watch handles beneath the old
+// path (a rename is a removal for the old path). It uses a real fsnotify watcher
+// so we assert the watches map reflects exactly what the OS watcher holds.
 func TestWatchCleanupOnRenameRemovesDescendants(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "a") // root/a
@@ -81,8 +80,8 @@ func TestWatchCleanupOnRenameRemovesDescendants(t *testing.T) {
 	waitNoWatched(t, r, oldSub())
 }
 
-// TestWatchRecleanupOnRecreate verifies a recreated directory under the renamed
-// path gets re-watched (Create event -> addWatchRecursive).
+// A recreated directory under the renamed path gets re-watched (Create event ->
+// addWatchRecursive).
 func TestWatchRecleanupOnRecreate(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "a")
@@ -126,10 +125,9 @@ func TestWatchRecleanupOnRecreate(t *testing.T) {
 	}
 }
 
-// TestAddWatchRecursiveSymlinkLoopBounded ensures a symlink loop inside the
-// functions tree cannot hang addWatchRecursive: WalkDir does not follow links,
-// so the walk terminates and, per policy, the symlinked dir is simply not
-// watched.
+// A symlink loop inside the functions tree cannot hang addWatchRecursive:
+// WalkDir does not follow links, so the walk terminates and, per policy, the
+// symlinked dir is simply not watched.
 func TestAddWatchRecursiveSymlinkLoopBounded(t *testing.T) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {

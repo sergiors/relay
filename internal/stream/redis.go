@@ -336,7 +336,6 @@ func (c *Consumer) routeToDLQ(ctx context.Context, msg redis.XMessage, reason er
 	}
 }
 
-// isBusyGroup reports whether the error indicates the group already exists.
 func isBusyGroup(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
 }

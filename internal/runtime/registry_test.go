@@ -71,10 +71,10 @@ func TestLookup(t *testing.T) {
 	}
 }
 
-// TestLookupSharedEngine demonstrates that a test-only spec can be registered
-// temporarily through the same mechanism (the specs map) and share an engine
-// with an existing runtime, without enabling a real new runtime. It validates
-// that a single engine serves more than one version, in both directions.
+// A test-only spec can be registered temporarily through the same mechanism
+// (the specs map) and share an engine with an existing runtime, without enabling
+// a real new runtime. It validates that a single engine serves more than one
+// version, in both directions.
 func TestLookupSharedEngine(t *testing.T) {
 	const tempPython = "python3.15-test-only"
 	const tempNode = "node26-test-only"
@@ -108,9 +108,9 @@ func TestLookupSharedEngine(t *testing.T) {
 	}
 }
 
-// TestEngineForSharedEngine verifies that engineFor dispatches both the
-// production and the test-only specs to the same engine type, so the shared
-// engine property holds through the actual dispatch path, not just the registry.
+// engineFor dispatches both the production and the test-only specs to the same
+// engine type, so the shared engine property holds through the actual dispatch
+// path, not just the registry.
 func TestEngineForSharedEngine(t *testing.T) {
 	const tempPython = "python3.15-test-only"
 	const tempNode = "node26-test-only"

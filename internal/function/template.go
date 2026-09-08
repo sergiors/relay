@@ -51,7 +51,6 @@ type FieldCondition struct {
 	Children  map[string]FieldCondition
 }
 
-// ValueMatcher evaluates a single decoded value against a condition.
 type ValueMatcher interface {
 	Match(value any) bool
 }

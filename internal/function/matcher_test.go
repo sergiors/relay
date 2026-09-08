@@ -14,7 +14,6 @@ func mustParse(t *testing.T, yaml string) *Template {
 	return tmpl
 }
 
-// matches reports whether any rule in the template matches the event.
 func matches(t *testing.T, tmpl *Template, event map[string]any) bool {
 	t.Helper()
 	return len(tmpl.MatchingRules(event)) > 0

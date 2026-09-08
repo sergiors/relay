@@ -16,7 +16,12 @@ import (
 // small interface so Handle and PreparedFunction construction can be exercised
 // in tests without a Docker daemon; the concrete *runtime.Manager satisfies it.
 type Executor interface {
-	Execute(ctx context.Context, prepared *runtime.Prepared, handler string, eventJSON []byte) error
+	Execute(
+		ctx context.Context,
+		prepared *runtime.Prepared,
+		handler string,
+		eventJSON []byte,
+	) error
 }
 
 // Registry holds the current set of prepared functions behind a lock so swaps
@@ -98,7 +103,7 @@ func (r *Registry) Names() []string {
 	return out
 }
 
-// Runner orchestrates the flow: for each decoded event it evaluates all loaded
+// Orchestrates the flow: for each decoded event it evaluates all loaded
 // functions and, for every matching rule, executes the corresponding handler in
 // a container. It contains no Redis, matcher, or docker details; execution is
 // delegated to the runtime executor. The function set is an atomic snapshot so
@@ -108,9 +113,9 @@ type Runner struct {
 	log *log.Logger
 }
 
-// PreparedFunction pairs a loaded function with its prepared image and the
-// executor used to run invocations. A function whose image could not be built
-// is marked unavailable and skipped during execution.
+// Pairs a loaded function with its prepared image and the executor used to run
+// invocations. A function whose image could not be built is marked unavailable
+// and skipped during execution.
 type PreparedFunction struct {
 	fn        function.Function
 	prepared  *runtime.Prepared
@@ -118,21 +123,30 @@ type PreparedFunction struct {
 	available bool
 }
 
-// Name returns the function name.
-func (p *PreparedFunction) Name() string { return p.fn.Name }
+func (p *PreparedFunction) Name() string {
+	return p.fn.Name
+}
 
-// Function returns the underlying loaded function.
-func (p *PreparedFunction) Function() function.Function { return p.fn }
+func (p *PreparedFunction) Function() function.Function {
+	return p.fn
+}
 
 // Prepared returns the built image handle, or nil for an unavailable function.
-func (p *PreparedFunction) Prepared() *runtime.Prepared { return p.prepared }
+func (p *PreparedFunction) Prepared() *runtime.Prepared {
+	return p.prepared
+}
 
 func NewPrepared(
 	fn function.Function,
 	prepared *runtime.Prepared,
 	executor Executor,
 ) *PreparedFunction {
-	return &PreparedFunction{fn: fn, prepared: prepared, executor: executor, available: true}
+	return &PreparedFunction{
+		fn:        fn,
+		prepared:  prepared,
+		executor:  executor,
+		available: true,
+	}
 }
 
 // NewUnavailable wraps a function whose image could not be built so the runner

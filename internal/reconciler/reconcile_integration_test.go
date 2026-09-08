@@ -22,10 +22,18 @@ import (
 // Builder interface (the Manager already has both methods).
 type dockerManagerAdapter struct{ m *runtime.Manager }
 
-func (a dockerManagerAdapter) Prepare(ctx context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (a dockerManagerAdapter) Prepare(
+	ctx context.Context,
+	fn function.Function,
+) (*runtime.Prepared, error) {
 	return a.m.Prepare(ctx, fn)
 }
-func (a dockerManagerAdapter) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, eventJSON []byte) error {
+func (a dockerManagerAdapter) Execute(
+	ctx context.Context,
+	prepared *runtime.Prepared,
+	handler string,
+	eventJSON []byte,
+) error {
 	return a.m.Execute(ctx, prepared, handler, eventJSON)
 }
 
@@ -47,7 +55,14 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 }
 
 // runHandlerWith builds the image and executes one event, capturing stdout.
-func runHandlerWith(t *testing.T, m *runtime.Manager, buf *bytes.Buffer, fn function.Function, hndlr, eventJSON string) {
+func runHandlerWith(
+	t *testing.T,
+	m *runtime.Manager,
+	buf *bytes.Buffer,
+	fn function.Function,
+	hndlr,
+	eventJSON string,
+) {
 	t.Helper()
 	prepared, err := m.Prepare(context.Background(), fn)
 	if err != nil {
@@ -84,7 +99,16 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	writeNodeFn(t, root, "example", "hello-v1")
 	reg := &runner.Registry{}
 	reg.Set(nil)
-	r := New(Config{Root: root, Debounce: 20 * time.Millisecond, Interval: time.Hour}, reg, adapter, logger)
+	r := New(
+		Config{
+			Root:     root,
+			Debounce: 20 * time.Millisecond,
+			Interval: time.Hour,
+		},
+		reg,
+		adapter,
+		logger,
+	)
 	r.reconcileFunction("example")
 
 	if pf := reg.GetByName("example"); pf == nil || pf.Prepared() == nil {

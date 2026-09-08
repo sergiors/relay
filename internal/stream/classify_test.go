@@ -54,9 +54,8 @@ func TestDLQPayload(t *testing.T) {
 	}
 }
 
-// TestEventStringFallback verifies eventString never fails even when the event
-// field is missing or non-string (used when building DLQ entries for malformed
-// messages).
+// eventString never fails even when the event field is missing or non-string
+// (used when building DLQ entries for malformed messages).
 func TestEventStringFallback(t *testing.T) {
 	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"a":1}`}}); got != `{"a":1}` {
 		t.Fatalf("expected raw event string, got %q", got)

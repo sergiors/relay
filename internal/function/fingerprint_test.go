@@ -25,7 +25,6 @@ func fp(t *testing.T, dir string) string {
 	return f
 }
 
-// TestFingerprintUnchangedStable asserts an unchanged dir yields a stable digest.
 func TestFingerprintUnchangedStable(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
@@ -39,8 +38,7 @@ func TestFingerprintUnchangedStable(t *testing.T) {
 	}
 }
 
-// TestFingerprintDeterministicAcrossOrdering verifies the digest is independent
-// of directory iteration order because paths are sorted.
+// Deterministic across directory iteration order because paths are sorted.
 func TestFingerprintDeterministicAcrossOrdering(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
@@ -92,7 +90,7 @@ func TestFingerprintTemplateChangeDetected(t *testing.T) {
 	}
 }
 
-// TestFingerprintAddRemoveDetected covers file add, remove, and rename paths.
+// Covers file add, remove, and rename paths.
 func TestFingerprintAddRemoveDetected(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
@@ -119,8 +117,8 @@ func TestFingerprintAddRemoveDetected(t *testing.T) {
 	}
 }
 
-// TestFingerprintNestedDirs ensures nested directory contents are included and
-// their relative paths distinguish identical file names.
+// Nested directory contents are included and their relative paths distinguish
+// identical file names.
 func TestFingerprintNestedDirs(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")

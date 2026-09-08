@@ -43,7 +43,7 @@ func redisAvailable(t *testing.T) bool {
 	return true
 }
 
-// testEnv provisions a Consumer with a unique stream/group/consumer so tests are
+// Provisions a Consumer with a unique stream/group/consumer so tests are
 // isolated from each other and from any running dev relay. Recovery config
 // (MinIdle/Interval) is small so tests control timing without waiting a minute.
 type testEnv struct {

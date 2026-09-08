@@ -34,8 +34,6 @@ func TestBootstrapContent(t *testing.T) {
 	}
 }
 
-// appRoot returns a temp dir root for the current test. It creates the in-image
-// app and relay subdirectories and returns the root.
 func appRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -48,7 +46,6 @@ func appRoot(t *testing.T) string {
 	return root
 }
 
-// writeModule writes a module at root/app/<modPath> (e.g. modPath "src/email.mjs").
 func writeModule(t *testing.T, root, modPath, src string) {
 	t.Helper()
 	path := filepath.Join(root, "app", filepath.FromSlash(modPath))
@@ -60,9 +57,9 @@ func writeModule(t *testing.T, root, modPath, src string) {
 	}
 }
 
-// runNode runs the real embedded bootstrap under node. The bootstrap writes
-// the handler into root/app (mirroring the in-image /app layout) and runs it.
-// It returns the combined output and whether the process exited non-zero.
+// Runs the real embedded bootstrap under node. The bootstrap writes the handler
+// into root/app (mirroring the in-image /app layout) and runs it. It returns
+// the combined output and whether the process exited non-zero.
 func runNode(t *testing.T, root, handler, stdin string) (string, bool) {
 	t.Helper()
 	// Point the bootstrap at root/app instead of /app, mirroring the image.

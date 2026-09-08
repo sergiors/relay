@@ -11,8 +11,8 @@ import (
 	"relay/internal/runner"
 )
 
-// TestReconcileNewFunctionDiscovered: a dir present on disk but not in the
-// registry is built (Prepare called) and added.
+// A dir present on disk but not in the registry is built (Prepare called) and
+// added.
 func TestReconcileNewFunctionDiscovered(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "brand-new")
@@ -30,7 +30,7 @@ func TestReconcileNewFunctionDiscovered(t *testing.T) {
 	}
 }
 
-// TestReconcileUnchangedFingerprintSkipped: an identical function is not rebuilt.
+// An identical function is not rebuilt.
 func TestReconcileUnchangedFingerprintSkipped(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "stable")
@@ -49,8 +49,7 @@ func TestReconcileUnchangedFingerprintSkipped(t *testing.T) {
 	}
 }
 
-// TestReconcileChangedFunctionRebuilt: editing content changes the fingerprint,
-// triggering a rebuild and swap.
+// Editing content changes the fingerprint, triggering a rebuild and swap.
 func TestReconcileChangedFunctionRebuilt(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "changing")
@@ -74,8 +73,7 @@ func TestReconcileChangedFunctionRebuilt(t *testing.T) {
 	}
 }
 
-// TestReconcileInvalidTemplateKeepsOld: a broken template must NOT drop the
-// previously-active function or rebuild.
+// A broken template must NOT drop the previously-active function or rebuild.
 func TestReconcileInvalidTemplateKeepsOld(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
@@ -99,8 +97,8 @@ func TestReconcileInvalidTemplateKeepsOld(t *testing.T) {
 	}
 }
 
-// TestReconcileMissingDirsRetainsActive: a dir gone entirely is removed, but a
-// dir that only lacks a template (mid-copy) is left alone.
+// A dir gone entirely is removed, but a dir that only lacks a template
+// (mid-copy) is left alone.
 func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "tobe-removed")
@@ -136,9 +134,9 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 	}
 }
 
-// TestReconcileFailedBuildRetainsOld: a failed rebuild keeps the old active
-// version and does not drop the function; because the stored fingerprint stays
-// the old one, a later pass retries the build even without another file change.
+// A failed rebuild keeps the old active version and does not drop the function;
+// because the stored fingerprint stays the old one, a later pass retries the
+// build even without another file change.
 func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "flaky")
@@ -178,8 +176,8 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 	}
 }
 
-// TestUnavailableFunctionRetriedOnPeriodicReconcile ensures a function whose
-// startup build failed is retried by the reconciler without a source change.
+// A function whose startup build failed is retried by the reconciler without a
+// source change.
 func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "recover")

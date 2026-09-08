@@ -9,10 +9,10 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// testSpecs are two runtime versions served by the same Python engine. The
-// engine must produce identical build logic for both, differing only in the
-// base image taken from the spec. The second spec is test-only and is never
-// registered in the runtime registry.
+// Two runtime versions served by the same Python engine. The engine must
+// produce identical build logic for both, differing only in the base image
+// taken from the spec. The second spec is test-only and is never registered in
+// the runtime registry.
 var testSpecs = []plan.Spec{
 	{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"},
 	{Name: "python3.15", Engine: plan.EnginePython, BaseImage: "python:3.15-slim"},
