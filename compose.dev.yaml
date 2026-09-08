@@ -45,6 +45,8 @@ services:
       start_period: 10s
     volumes:
       - ./functions:/functions:ro
+      - relay-data:/var/lib/relay
 
 volumes:
   redis-data:
+  relay-data:

@@ -305,6 +305,77 @@ Functions are read-only to Relay (the directory is mounted read-only in the
 container); all rebuilds happen in temporary build contexts, so Relay never
 writes into `/functions`.
 
+## Local state database
+
+Relay keeps a small local **SQLite** database describing its current view of the
+loaded functions — a read-only state view, **not** the source of truth. The
+`/functions` directory remains authoritative; the local state database is
+rebuilt automatically when empty and never drives matching, image building, or
+reconciliation. It exists so operators can introspect what Relay has loaded and
+how the last reconcile of each function went without touching Redis or Docker.
+
+- **Location**: `/var/lib/relay/db.sqlite3` (a fixed internal path, not
+  env-configurable). The parent directory is created automatically, so the file
+  also works for host-side runs. It is **not** external infrastructure — it is
+  a local file you can volume-mount to persist across restarts. `compose.dev.yaml`
+  mounts a named volume `relay-data` at `/var/lib/relay`.
+- **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
+  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at)
+  plus a `handlers` table (function_name, handler, timeout).
+- **State model**: `status` is `ready` (an active version is built and serving)
+  or `pending` (loaded but not yet built). `last_reconcile_status` is
+  `success` / `failed` / `skipped`. A **failed rebuild never marks a whole
+  function unavailable**: the previously active image and fingerprint are
+  retained, so the last good version keeps serving while `last reconcile` shows
+  the failure. All timestamps are RFC3339.
+- **Fault-tolerance**: state errors are logged and never fatal — Relay runs
+  without the state database if the DB is missing or broken (Open recreates a
+  missing DB).
+
+The daemon persists state at startup and on every reconcile. Two read-only CLI
+commands expose it (no Redis, Docker, or `/functions` needed — they read the
+state database file only):
+
+```sh
+relay function ls
+```
+
+```
+NAME                  RUNTIME      STATUS    HANDLERS   UPDATED
+user-events-python    python3.14   ready     3          12s ago
+welcome-email-node    node24       ready     1          12s ago
+```
+
+The `UPDATED` column is `prepared_at` (else `updated_at`) as a relative age
+(`12s ago`, `3m ago`, `2h ago`, `5d ago`), falling back to an absolute date
+beyond ~30 days. Rows are sorted by name; fingerprints, images, and errors are
+deliberately omitted from `ls`.
+
+```sh
+relay function inspect user-events-python
+```
+
+```
+Name:              user-events-python
+Runtime:           python3.14
+Status:            ready
+Image:             relay-fn-user-events-python
+Fingerprint:       <sha256>
+Prepared:          2026-09-08T12:00:00Z (12s ago)
+Last reconcile:    success (12s ago)
+Last error:        <error>
+
+Handlers:
+  events.created.handler   timeout=6s
+  events.updated.handler   timeout=20s
+  events.deleted.handler   timeout=6s
+```
+
+The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function is
+`pending` (never built); the `Last error` line is omitted when there is none. A
+failed reconcile with an active version keeps `Status: ready` and shows
+`Last reconcile: failed (...)` — the function is never marked unavailable.
+
 ## Acknowledgment semantics
 
 A message is acknowledged (XACK) only after **all** matching invocations

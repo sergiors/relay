@@ -15,6 +15,7 @@ import (
 	"relay/internal/function"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/state"
 )
 
 // Defaults for debounce and periodic reconciliation. They are fixed application
@@ -43,6 +44,11 @@ type Config struct {
 	// Interval is the periodic reconciliation period, a backstop for watches that
 	// miss events. Defaults to DefaultInterval.
 	Interval time.Duration
+	// State is an optional state-view sink. When non-nil, reconcile outcomes
+	// (discovered/updated/removed/failed/skipped) are recorded in it; when nil
+	// the reconciler behaves exactly as before (no state writes). Errors from
+	// state calls are logged, never fatal.
+	State *state.State
 }
 
 // Watches Root, debounces per-function events, and swaps the registry when a
@@ -55,6 +61,7 @@ type Reconciler struct {
 	reg     *runner.Registry
 	builder Builder
 	log     *log.Logger
+	st      *state.State
 
 	mu          sync.Mutex
 	fingerprnts map[string]string // name -> last-reconciled fingerprint
@@ -88,6 +95,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *log.Logger) 
 		reg:         reg,
 		builder:     builder,
 		log:         logger,
+		st:          cfg.State,
 		fingerprnts: map[string]string{},
 		timers:      map[string]*time.Timer{},
 		incoming:    make(chan string, DefaultQueueSize),
@@ -383,6 +391,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// unchanged. A previously-failed build (unavailable) is retried even if the
 	// fingerprint is stable, so a broken function recovers without edits.
 	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp {
+		// The state's RecordSkipped only touches an existing row; a function
+		// never seeded (no row) is left alone. This writes the outcome view.
+		if r.st != nil {
+			r.st.RecordSkipped(name)
+		}
 		return
 	}
 
@@ -393,6 +406,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 		r.log.Printf("function %q reload failed (retaining previous version): %v", name, err)
 		// Keep the old active version AND the old fingerprint so a later change
 		// (which alters the fingerprint) triggers a fresh attempt.
+		if r.st != nil {
+			// The prior active version is retained in the state database; only
+			// the failure outcome is recorded.
+			r.st.RecordReconcileFailure(name, err)
+		}
 		return
 	}
 	pf := runner.NewPrepared(fn, built, r.builder)
@@ -401,6 +419,10 @@ func (r *Reconciler) reconcileFunction(name string) {
 	r.mu.Lock()
 	r.fingerprnts[name] = fp
 	r.mu.Unlock()
+
+	if r.st != nil {
+		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
+	}
 
 	if cur == nil {
 		r.log.Printf("function %q discovered", name)
@@ -415,6 +437,9 @@ func (r *Reconciler) remove(name string) {
 	r.mu.Lock()
 	delete(r.fingerprnts, name)
 	r.mu.Unlock()
+	if r.st != nil {
+		r.st.RecordRemoved(name)
+	}
 	r.log.Printf("function %q removed", name)
 }
 

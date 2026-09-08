@@ -16,6 +16,11 @@
 //
 // Usage: New, then Seed the startup functions, then Start.
 //
+// When Config.State is set, reconcile outcomes are recorded into the local
+// state database (a read-only state view) — success, failure (retaining the
+// prior active version), unchanged-skip, and removal. State writes never drive
+// decisions and never fail the reconcile loop; errors are only logged.
+//
 // The package does NOT build images; it delegates image preparation and
 // invocation to a Builder.
 package reconciler

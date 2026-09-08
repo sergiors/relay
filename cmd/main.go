@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -13,6 +14,7 @@ import (
 	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/state"
 	"relay/internal/stream"
 )
 
@@ -29,6 +31,18 @@ func mustEnv(logger *log.Logger, key string) string {
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
+	// Minimal hand-rolled dispatch (no CLI framework): only the single
+	// `function` subcommand family is recognized; everything else is the daemon.
+	if len(os.Args) > 1 && os.Args[1] == "function" {
+		os.Exit(runFunctionCommand(os.Args[2:]))
+	}
+
+	runDaemon(logger)
+}
+
+// runDaemon is the original main body: startup wiring, then the health server,
+// reconciler, and stream consumer. It blocks in Consume until cancelled.
+func runDaemon(logger *log.Logger) {
 	cfg := struct {
 		redisAddr   string
 		redisStream string
@@ -51,6 +65,27 @@ func main() {
 	}
 	logger.Printf("loaded %d function(s) from %s", len(functions), function.Dir)
 
+	// The state database is a read-only local state view (see internal/state).
+	// It is NOT the source of truth and never drives matching or building. Open
+	// recreates a missing DB; RebuildFromFS repopulates an empty one from
+	// /functions; then startup discovery records each loaded function. All
+	// state errors are logged and non-fatal — Relay runs without the state DB
+	// if it is broken.
+	st, err := state.Open(state.DBPath)
+	if err != nil {
+		logger.Printf("state: open (continuing without): %v", err)
+		st = nil
+	}
+	if st != nil {
+		defer st.Close()
+		if err := st.RebuildFromFS(function.Dir); err != nil {
+			logger.Printf("state: rebuild from fs (continuing): %v", err)
+		}
+		for _, fn := range functions {
+			st.RecordDiscovered(fn)
+		}
+	}
+
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
 	manager, err := runtime.NewManager(logger)
@@ -64,8 +99,21 @@ func main() {
 		p, err := manager.Prepare(context.Background(), fn)
 		if err != nil {
 			logger.Printf("function %q: prepare: %v", fn.Name, err)
+			if st != nil {
+				st.RecordReconcileFailure(fn.Name, err)
+			}
 			prepared = append(prepared, runner.NewUnavailable(fn))
 			continue
+		}
+		if st != nil {
+			// Fingerprint may differ from the discovery-time value if content
+			// changed between load and build; the state DB records the final state.
+			fp, fperr := function.Fingerprint(fn.Dir)
+			if fperr != nil {
+				logger.Printf("function %q: fingerprint: %v", fn.Name, fperr)
+				fp = ""
+			}
+			st.RecordReconcileSuccess(fn.Name, p.Image, fp, time.Now(), fn)
 		}
 		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
 		preparedCount++
@@ -98,7 +146,7 @@ func main() {
 	// discover new ones, drop removed ones. The runner's registry is swapped
 	// atomically behind the snapshots the consumer already uses.
 	reconciler := reconciler.New(
-		reconciler.Config{Root: function.Dir},
+		reconciler.Config{Root: function.Dir, State: st},
 		run.Registry(),
 		manager,
 		logger,
