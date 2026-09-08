@@ -1,3 +1,6 @@
+// relay-worker is the long-running Relay process. It loads functions, builds
+// their images, reconciles them live, and consumes the Redis stream, blocking
+// until signalled. Configuration comes entirely from the environment.
 package main
 
 import (
@@ -18,6 +21,11 @@ import (
 	"relay/internal/stream"
 )
 
+func main() {
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+	run(logger)
+}
+
 // mustEnv reads a required environment variable during startup, before any
 // other work, and fails fast if it is unset or empty.
 func mustEnv(logger *log.Logger, key string) string {
@@ -28,24 +36,9 @@ func mustEnv(logger *log.Logger, key string) string {
 	return v
 }
 
-func main() {
-	logger := log.New(os.Stdout, "", log.LstdFlags)
-
-	// Minimal hand-rolled dispatch (no CLI framework): only the `function` and
-	// `health` subcommands are recognized; everything else is the daemon.
-	if len(os.Args) > 1 && os.Args[1] == "function" {
-		os.Exit(runFunctionCommand(os.Args[2:]))
-	}
-	if len(os.Args) > 1 && os.Args[1] == "health" {
-		os.Exit(runHealthCommand())
-	}
-
-	runDaemon(logger)
-}
-
-// runDaemon is the original main body: startup wiring, then the reconciler and
-// stream consumer. It blocks in Consume until cancelled.
-func runDaemon(logger *log.Logger) {
+// run wires the whole worker: startup state, then the reconciler and stream
+// consumer. It blocks in Consume until the process is signalled.
+func run(logger *log.Logger) {
 	cfg := struct {
 		redisAddr   string
 		redisStream string
@@ -138,31 +131,31 @@ func runDaemon(logger *log.Logger) {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}
 
-	run := runner.New(prepared, logger)
+	runWorker := runner.New(prepared, logger)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped
 	// atomically behind the snapshots the consumer already uses.
-	reconciler := reconciler.New(
+	rec := reconciler.New(
 		reconciler.Config{Root: function.Dir, State: st},
-		run.Registry(),
+		runWorker.Registry(),
 		manager,
 		logger,
 	)
 	for _, fn := range functions {
-		reconciler.Seed(fn)
+		rec.Seed(fn)
 	}
 	logger.Printf("watching %s for changes", function.Dir)
 
 	// Runs in its own goroutine and stops when ctx is cancelled.
-	go reconciler.Start(ctx)
+	go rec.Start(ctx)
 
 	logger.Printf("consuming stream %q as group %q consumer %q",
 		cfg.redisStream,
 		cfg.redisGroup,
 		cfg.redisCons,
 	)
-	if err := consumer.Consume(ctx, run.Handle); err != nil {
+	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
 		logger.Fatalf("consume: %v", err)
 	}
 	logger.Printf("shutdown complete")

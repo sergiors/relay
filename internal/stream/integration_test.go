@@ -132,7 +132,14 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 		_ = cli.Del(ctx, c.stream, c.dlqStream).Err()
 		_ = cli.Close()
 	})
-	return &testEnv{client: cli, consumer: c, stream: cfg.Stream, group: cfg.Group, ctx: ctx, cancel: cancel}
+	return &testEnv{
+		client:   cli,
+		consumer: c,
+		stream:   cfg.Stream,
+		group:    cfg.Group,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
 }
 
 func (e *testEnv) start(handler Handler) {

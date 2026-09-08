@@ -15,8 +15,19 @@ import (
 // stall the healthcheck indefinitely.
 const healthTimeout = 2 * time.Second
 
+// mustEnv reads a required environment variable and fails fast (exit 1) when
+// it is unset or empty — the health command runs against the same deployment
+// configuration as the worker.
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("missing required environment variable: %s", key)
+	}
+	return v
+}
+
 // runHealthCommand implements the `relay health` subcommand. It checks the two
-// dependencies the daemon needs at startup — Redis connectivity and Docker
+// dependencies the worker needs at startup — Redis connectivity and Docker
 // daemon connectivity — and exits 0 when both are reachable, 1 otherwise. It
 // never starts consumption, loads functions, builds images, or touches the
 // state database; it only creates clients and pings. Exit codes:
@@ -24,8 +35,7 @@ const healthTimeout = 2 * time.Second
 //	0  healthy
 //	1  a dependency is unavailable
 func runHealthCommand() int {
-	logger := log.New(os.Stderr, "", 0)
-	redisAddr := mustEnv(logger, "REDIS_ADDR")
+	redisAddr := mustEnv("REDIS_ADDR")
 
 	redisCheck := func() error {
 		cli := redis.NewClient(&redis.Options{Addr: redisAddr})

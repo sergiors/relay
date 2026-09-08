@@ -25,16 +25,31 @@ on the stream with a consumer group, decodes each message, and for every event:
 3. acknowledges the message (XACK) only after **all** matching invocations
    succeed.
 
+Relay is distributed as **two** binaries:
+
+- `relay` — the read-only command-line interface (`relay function ls`,
+  `relay function inspect <name>`, `relay health`). It never starts the
+  long-running process.
+- `relay-worker` — the long-running process that consumes events, loads
+  functions, builds images, and reconciles `/functions` live.
+
 ## How to run
 
 ```sh
-go build -o relay ./cmd && ./relay
-# or
-go run ./cmd
+# build both binaries
+go build -o relay ./cmd/cli
+go build -o relay-worker ./cmd/worker
+# or, from the module root with defaults
+go build ./...
+
+# run the long-running process (reads REDIS_* from the environment)
+./relay-worker
 ```
 
 Requirements: Go 1.27+, a reachable Redis, and a local Docker daemon (see
-below). No events are processed until a producer XADDs to the stream.
+below). No events are processed until a producer XADDs to the stream. The daemon
+reads the mandatory `REDIS_ADDR`/`REDIS_STREAM`/`REDIS_GROUP`/`REDIS_CONSUMER`
+variables at startup and fails fast if any is unset.
 
 ## Docker requirement
 
@@ -92,9 +107,10 @@ services:
 
 ### Development with Compose
 
-`compose.dev.yaml` runs Relay in a container alongside a Redis service and a
-Docker-socket proxy, so you can develop against the same containerized
-deployment the README above describes without installing Go or Redis locally:
+`compose.dev.yaml` runs the Relay **daemon** in a container (the image's
+`CMD` is `relay-worker`) alongside a Redis service and a Docker-socket proxy, so
+you can develop against the same containerized deployment the README above
+describes without installing Go or Redis locally:
 
 ```sh
 docker compose -f compose.dev.yaml up --build -d

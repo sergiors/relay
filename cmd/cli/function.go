@@ -17,7 +17,7 @@ var statePath = state.DBPath
 
 // runFunctionCommand implements the read-only `relay function ...` subcommand
 // family. It touches the local state database only — never Redis, Docker, or
-// the /functions loader — so it works with no REDIS_ADDR and no daemon
+// the /functions loader — so it works with no REDIS_ADDR and no worker
 // reachable. Exit codes:
 //
 //	0  success

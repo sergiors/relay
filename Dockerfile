@@ -9,12 +9,19 @@ RUN go mod download
 
 COPY . .
 
-# CGO_ENABLED=0 keeps the binary static and self-contained.
+# CGO_ENABLED=0 keeps the binaries static and self-contained. Two binaries are
+# built: `relay` (the read-only CLI) and `relay-worker` (the long-running
+# process).
 RUN CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /relay \
-    ./cmd
+    ./cmd/cli && \
+    CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /relay-worker \
+    ./cmd/worker
 
 # Runtime stage.
 FROM alpine:3.22
@@ -22,7 +29,8 @@ FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=build /relay /usr/local/bin/relay
+COPY --from=build /relay-worker /usr/local/bin/relay-worker
 
 WORKDIR /app
 
-CMD ["relay"]
+CMD ["relay-worker"]
