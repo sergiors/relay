@@ -1,0 +1,80 @@
+services:
+  redis:
+    image: redis:8-alpine
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - redis-data:/data
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    restart: unless-stopped
+    # Endpoint allow-list for the Docker operations Relay performs
+    # (internal/runtime/docker.go): ping + version negotiation, image build,
+    # and container create/attach/start/wait/kill/remove. The socket is
+    # mounted read-only and ONLY here.
+    #
+    # The proxy denies by default; every other endpoint is explicitly 0 below
+    # (EVENTS ships as 1 in the image, so it must be zeroed explicitly).
+    #
+    # POST=1 is the proxy's method gate: without it, all non-GET requests are
+    # denied and no POST-based operation (build, create, start, wait, kill,
+    # remove) can work. POST is NOT endpoint-specific; path ACLs below still
+    # restrict what those requests may target.
+    environment:
+      PING: "1"
+      VERSION: "1"
+      BUILD: "1"
+      CONTAINERS: "1"
+      POST: "1"
+      ALLOW_RESTARTS: "0"
+      ALLOW_STOP: "0"
+      ALLOW_START: "0"
+      AUTH: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EVENTS: "0"
+      EXEC: "0"
+      GRPC: "0"
+      IMAGES: "0"
+      INFO: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  relay:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      socket-proxy:
+        condition: service_started
+    environment:
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM: events
+      REDIS_GROUP: relay
+      REDIS_CONSUMER: worker-1
+      FUNCTIONS_DIR: /app/functions
+      FUNCTION_TIMEOUT: 30s
+      DOCKER_HOST: tcp://socket-proxy:2375
+    volumes:
+      - ./functions:/app/functions:ro
+
+volumes:
+  redis-data:

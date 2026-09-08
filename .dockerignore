@@ -1,0 +1,18 @@
+.git
+.gitignore
+.ropeproject
+bin/
+*.out
+.env*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+compose.dev.yaml
+# functions/ is mounted at runtime, not needed to compile the relay binary.
+functions/

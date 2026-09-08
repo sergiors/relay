@@ -1,0 +1,7 @@
+runtime: node24
+
+events:
+  - handler: handler.handler
+    pattern:
+      event_name: [INSERT]
+      table_name: [users]

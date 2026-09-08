@@ -1,0 +1,17 @@
+runtime: python3.14
+
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+      table_name: [users]
+
+  - handler: events.updated.handler
+    pattern:
+      event_name: [MODIFY]
+      table_name: [users]
+
+  - handler: events.deleted.handler
+    pattern:
+      event_name: [REMOVE]
+      table_name: [users]
