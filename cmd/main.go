@@ -83,6 +83,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Health endpoint for container orchestrators, fixed at port 80. It is an
+	// application convention, not configuration.
+	hs := newHealthServer(consumer.Healthy)
+	hs.start(ctx)
+
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}

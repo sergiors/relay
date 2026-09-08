@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -52,6 +53,10 @@ type ConsumerConfig struct {
 	// Defaults to "<Stream>:dlq" if empty.
 	DLQStream string
 	Log       *log.Logger
+	// backoffTable and backoffJitter override the retry backoff for tests. They
+	// are unexported so production always uses the fixed defaults.
+	backoffTable  []time.Duration
+	backoffJitter func(float64) float64
 }
 
 // Consumer reads events from a Redis stream and hands each decoded event to a
@@ -68,6 +73,8 @@ type Consumer struct {
 	minPendingIdle  time.Duration
 	dlqStream       string
 	log             *log.Logger
+	backoff         *backoff
+	healthy         atomic.Bool
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -92,7 +99,7 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 	if cfg.Log == nil {
 		cfg.Log = log.Default()
 	}
-	return &Consumer{
+	c := &Consumer{
 		client:          cfg.Client,
 		stream:          cfg.Stream,
 		group:           cfg.Group,
@@ -104,7 +111,10 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		minPendingIdle:  cfg.MinPendingIdle,
 		dlqStream:       cfg.DLQStream,
 		log:             cfg.Log,
+		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
 	}
+	c.healthy.Store(true)
+	return c
 }
 
 // EnsureGroup creates the consumer group if it does not exist, tolerating a
@@ -120,6 +130,33 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 		return nil
 	}
 	return fmt.Errorf("create consumer group %q on stream %q: %w", c.group, c.stream, err)
+}
+
+// Healthy reports whether the consumer's last observed Redis operation
+// succeeded. It is the readiness signal for the /health endpoint: true while
+// Redis is reachable, false during an outage.
+func (c *Consumer) Healthy() bool {
+	return c.healthy.Load()
+}
+
+// noteOutcome feeds a single Redis operation result into the health state and
+// logs only on state transitions. On failure it marks the consumer unhealthy
+// (logging once on the healthy→unhealthy transition); on success it marks it
+// healthy (logging once on the unhealthy→healthy transition) and resets the
+// backoff. redis.Nil counts as success because connectivity is fine. delay is
+// the retry delay the caller is about to wait, used only in the failure log.
+func (c *Consumer) noteOutcome(err error, delay time.Duration) {
+	if err != nil && !errors.Is(err, redis.Nil) {
+		if c.healthy.Swap(false) {
+			c.log.Printf("redis read failed: %v; retrying in %s", err, delay)
+		}
+		return
+	}
+	// Success (or redis.Nil): mark healthy and reset backoff on the transition.
+	if !c.healthy.Swap(true) {
+		c.log.Printf("redis connection recovered")
+	}
+	c.backoff.reset()
 }
 
 // Consume reads messages from the stream and calls handler for each decoded
@@ -158,21 +195,25 @@ func (c *Consumer) Consume(
 				return nil
 			}
 			if errors.Is(err, redis.Nil) {
-				// Block timed out with no messages; keep looping.
+				// Block timed out with no messages; connectivity is fine.
+				c.noteOutcome(nil, 0)
 				continue
 			}
 			// A transient Redis failure (restart, flaky network) should not kill the
-			// process; go-redis re-establishes connections. Sleep a bit so we do not
-			// hammer Redis while it is down, then keep looping.
-			c.log.Printf("read group from stream %q: %v; retrying", c.stream, err)
+			// process; go-redis re-establishes connections. Back off with jitter so
+			// replicas do not retry in lockstep, and wait context-aware so shutdown
+			// interrupts a pending retry promptly.
+			delay := c.backoff.next()
+			c.noteOutcome(err, delay)
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(c.block):
+			case <-time.After(delay):
 			}
 			continue
 		}
 
+		c.noteOutcome(nil, 0)
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
 				// A message read fresh from XREADGROUP is on its first delivery.
@@ -185,7 +226,12 @@ func (c *Consumer) Consume(
 // process hands a freshly-read message to the shared processMessage path. Since
 // XPendingExt is the source of truth for retry counts (see reclaimTick), fresh
 // XREADGROUP reads are always treated as delivery attempt 1.
-func (c *Consumer) process(ctx context.Context, msg redis.XMessage, deliveryNum int64, handler Handler) {
+func (c *Consumer) process(
+	ctx context.Context,
+	msg redis.XMessage,
+	deliveryNum int64,
+	handler Handler,
+) {
 	c.processMessage(ctx, msg, deliveryNum, handler)
 }
 
@@ -220,9 +266,13 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 		Count:  c.count,
 	}).Result()
 	if err != nil {
-		c.log.Printf("recovery tick failed: %v", err)
+		// The recovery loop is paced by its own ticker, so it only feeds the
+		// health state (transition-log + mark unhealthy) and does not run a
+		// second backoff mechanism.
+		c.noteOutcome(err, c.backoff.peek())
 		return
 	}
+	c.noteOutcome(nil, 0)
 	byID := make(map[string]redis.XPendingExt, len(pending))
 	for _, pe := range pending {
 		byID[pe.ID] = pe
@@ -244,7 +294,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			Count:    c.count,
 		}).Result()
 		if err != nil {
-			c.log.Printf("recovery tick failed: %v", err)
+			c.noteOutcome(err, c.backoff.peek())
 			return
 		}
 		for _, msg := range msgs {
@@ -273,7 +323,12 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 // whose retry count already equals or exceeds the limit is routed to the DLQ
 // without re-running the handler (its attempts are exhausted). Otherwise this
 // is delivery attempt retryCount+1.
-func (c *Consumer) deliverClaimed(ctx context.Context, msg redis.XMessage, retryCount int64, handler Handler) {
+func (c *Consumer) deliverClaimed(
+	ctx context.Context,
+	msg redis.XMessage,
+	retryCount int64,
+	handler Handler,
+) {
 	if retryCount >= c.maxAttempts {
 		c.log.Printf("message %q: retry %d/%d failed: max attempts reached",
 			msg.ID, retryCount+1, c.maxAttempts)
@@ -287,7 +342,12 @@ func (c *Consumer) deliverClaimed(ctx context.Context, msg redis.XMessage, retry
 // the recovery loop. It decodes, classifies, and either ACKs on success, routes
 // to the DLQ on a non-retryable failure or when retries are exhausted, or leaves
 // the message pending for a later retry.
-func (c *Consumer) processMessage(ctx context.Context, msg redis.XMessage, deliveryNum int64, handler Handler) {
+func (c *Consumer) processMessage(
+	ctx context.Context,
+	msg redis.XMessage,
+	deliveryNum int64,
+	handler Handler,
+) {
 	event, err := classifyMessage(msg)
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on
@@ -313,6 +373,7 @@ func (c *Consumer) processMessage(ctx context.Context, msg redis.XMessage, deliv
 
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Printf("message %q: ack: %v", msg.ID, err)
+		c.noteOutcome(err, 0)
 	}
 }
 
@@ -320,19 +381,29 @@ func (c *Consumer) processMessage(ctx context.Context, msg redis.XMessage, deliv
 // XADD-before-XACK ordering matters: if the DLQ write fails the original stays
 // pending so the next recovery cycle retries the DLQ write rather than losing
 // the message.
-func (c *Consumer) routeToDLQ(ctx context.Context, msg redis.XMessage, reason error, attempts int64) {
+func (c *Consumer) routeToDLQ(
+	ctx context.Context,
+	msg redis.XMessage,
+	reason error,
+	attempts int64,
+) {
 	entry := dlqPayload(
 		c.stream, msg.ID, c.group, c.consumer,
 		eventString(msg), reason.Error(), attempts,
 	)
-	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{Stream: c.dlqStream, Values: entry}).Result(); err != nil {
+	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: c.dlqStream,
+		Values: entry,
+	}).Result(); err != nil {
 		c.log.Printf("message %q: DLQ write failed (leaving pending): %v", msg.ID, err)
+		c.noteOutcome(err, 0)
 		return
 	}
 	c.log.Printf("message %q: routed to DLQ stream %q after %d attempts: %v",
 		msg.ID, c.dlqStream, attempts, reason)
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Printf("message %q: ack after DLQ: %v", msg.ID, err)
+		c.noteOutcome(err, 0)
 	}
 }
 

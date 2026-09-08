@@ -37,6 +37,12 @@ services:
       - REDIS_GROUP=relay
       - REDIS_CONSUMER=worker-1
       - DOCKER_HOST=tcp://socket-proxy:2375
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     volumes:
       - ./functions:/functions:ro
 

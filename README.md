@@ -257,7 +257,7 @@ to Relay's logs.
 
 - **One image per function**, never per handler or event. A function's single
   image is built at startup and, afterwards, rebuilt only when its directory
-  changes (see *Hot reload* below); the rebuilt image serves all of its
+  changes (see _Hot reload_ below); the rebuilt image serves all of its
   handlers.
 - **Sequential execution**: for each event, functions are iterated in order,
   then rules in order, and each matching handler runs one at a time (no
@@ -282,7 +282,7 @@ fly, without a restart:
 - **Auto-discovery**: a new directory under `/functions` is detected and its
   image built, then it starts matching events.
 - **Per-function rebuild on change**: edits to a function's template, source, or
-  dependency files trigger a rebuild of *that function's* image only. Events are
+  dependency files trigger a rebuild of _that function's_ image only. Events are
   debounced (750ms) so a burst of editor saves coalesces into one rebuild.
 - **Fingerprinting**: each function's content is hashed (`SHA-256` over file
   paths + bytes); an unchanged function is skipped, so a rebuild happens only
@@ -432,7 +432,7 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 
 Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
 concurrency, warm containers, build caching, source hashing, git,
-registries, k8s, retry *policies per rule* (delays/attempt counts — only a global
+registries, k8s, retry _policies per rule_ (delays/attempt counts — only a global
 max-attempts is implemented), idempotency, exactly-once, per-function
 env/secrets/resource limits/networking, HTTP API, UI, metrics, tracing, and
 additional operators (numeric/exists/anything-but/regex/glob/scripts) are not

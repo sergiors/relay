@@ -12,6 +12,10 @@
 //   - A message is acknowledged only after the handler succeeds or the DLQ
 //     write succeeds (at-least-once, never exactly-once)
 //   - Transient Redis failures are logged and retried, never fatal
+//   - Redis outages are survived: the consume loop backs off with bounded,
+//     jittered exponential backoff (1s..30s cap) and the consumer exposes a
+//     health state (Healthy) fed by real operations, so orchestrators can probe
+//     readiness without a separate PING
 //   - Shutdown cancellation leaves messages pending, not counted as attempts
 //
 // Usage: NewConsumer, then EnsureGroup, then Consume with a Handler.

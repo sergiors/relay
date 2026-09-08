@@ -6,11 +6,19 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -22,6 +30,38 @@ func redisAddr() string {
 		return v
 	}
 	return "localhost:6379"
+}
+
+// dockerAvailable reports whether the Docker daemon is reachable via the Engine
+// API, so docker-backed tests skip cleanly when it is not (mirrors the helper
+// in internal/runtime).
+func dockerAvailable(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
+		return false
+	}
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Logf("docker client: %v", err)
+		return false
+	}
+	defer cli.Close()
+	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
+		t.Logf("docker unavailable: %v", err)
+		return false
+	}
+	return true
+}
+
+// freePort returns an available TCP port on the loopback interface.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 // redisAvailable reports whether a real Redis is reachable, so the integration
@@ -468,4 +508,245 @@ func TestIntegrationRestartResilience(t *testing.T) {
 		return !ok
 	})
 	envB.stop(t)
+}
+
+// TestIntegrationConsumeSurvivesOutage verifies that a consumer pointed at a
+// Redis address with no listener keeps running (backing off) rather than
+// exiting, and returns nil on cancellation.
+func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
+	// A port with no listener: connect will fail, exercising the backoff path.
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	cli := redis.NewClient(&redis.Options{Addr: addr})
+	defer cli.Close()
+
+	var buf strings.Builder
+	c := NewConsumer(ConsumerConfig{
+		Client:        cli,
+		Stream:        "outage-stream",
+		Group:         "outage-group",
+		Consumer:      "outage-consumer",
+		Log:           log.New(&buf, "", 0),
+		backoffTable:  []time.Duration{50 * time.Millisecond},
+		backoffJitter: func(f float64) float64 { return f },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var err error
+	go func() {
+		defer close(done)
+		err = c.Consume(ctx, func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
+	}()
+
+	// Give the loop time to fail and back off repeatedly; it must stay up.
+	time.Sleep(3 * time.Second)
+	select {
+	case <-done:
+		t.Fatalf("consumer exited during outage: %v", err)
+	default:
+	}
+	if c.Healthy() {
+		t.Fatalf("consumer should be unhealthy during outage")
+	}
+	if !strings.Contains(buf.String(), "redis read failed") {
+		t.Fatalf("expected backoff failure log, got: %q", buf.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("consumer did not stop on cancellation")
+	}
+	if err != nil {
+		t.Fatalf("consume returned error: %v", err)
+	}
+}
+
+// TestIntegrationReconnectAndResume drives a disposable Redis container through
+// an outage: consume an event, stop Redis, observe backoff + unhealthy, start
+// Redis again, XADD an event, and assert the handler runs and exactly one
+// recovery line is logged.
+func TestIntegrationReconnectAndResume(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker client: %v", err)
+	}
+	defer cli.Close()
+
+	// Start a disposable redis on a free host port.
+	port := freePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	create, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config: &container.Config{Image: "redis:8-alpine"},
+		HostConfig: &container.HostConfig{
+			PortBindings: network.PortMap{
+				network.MustParsePort("6379/tcp"): []network.PortBinding{{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: fmt.Sprintf("%d", port)}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create redis container: %v", err)
+	}
+	containerID := create.ID
+	defer func() {
+		rmCtx, c := context.WithTimeout(context.Background(), 10*time.Second)
+		defer c()
+		_, _ = cli.ContainerRemove(rmCtx, containerID, client.ContainerRemoveOptions{Force: true})
+	}()
+	if _, err := cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+		t.Fatalf("start redis container: %v", err)
+	}
+
+	// Wait for redis to accept connections.
+	waitFor(t, "redis container accepting connections", func() bool {
+		probe := redis.NewClient(&redis.Options{Addr: addr})
+		defer probe.Close()
+		pctx, c := context.WithTimeout(context.Background(), time.Second)
+		defer c()
+		return probe.Ping(pctx).Err() == nil
+	})
+
+	prefix := fmt.Sprintf("outage-%d", time.Now().UnixNano())
+	stream, group := prefix+"-stream", prefix+"-group"
+	var buf strings.Builder
+	rc := redis.NewClient(&redis.Options{Addr: addr})
+	defer rc.Close()
+	consumer := NewConsumer(ConsumerConfig{
+		Client:        rc,
+		Stream:        stream,
+		Group:         group,
+		Consumer:      prefix + "-consumer",
+		Log:           log.New(&buf, "", 0),
+		Block:         200 * time.Millisecond,
+		backoffTable:  []time.Duration{100 * time.Millisecond},
+		backoffJitter: func(f float64) float64 { return f },
+	})
+	if err := consumer.EnsureGroup(context.Background()); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
+
+	// Health endpoint wired to the consumer.
+	hs := newHealthServerForTest(t, consumer.Healthy)
+	hsURL := hs.URL
+
+	// Consume an event before the outage.
+	firstID, err := rc.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"a":1}`}}).Result()
+	if err != nil {
+		t.Fatalf("xadd: %v", err)
+	}
+	firstDone := make(chan struct{})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = consumer.Consume(ctx2, func(ctx context.Context, msgID string, ev map[string]any) error {
+			if msgID == firstID {
+				close(firstDone)
+			}
+			return nil
+		})
+	}()
+	<-firstDone
+	if code := healthCode(t, hsURL); code != http.StatusOK {
+		t.Fatalf("health before outage = %d, want 200", code)
+	}
+
+	// Stop redis: outage begins.
+	if _, err := cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{}); err != nil {
+		t.Fatalf("stop redis: %v", err)
+	}
+	waitFor(t, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
+	if code := healthCode(t, hsURL); code != http.StatusServiceUnavailable {
+		t.Fatalf("health during outage = %d, want 503", code)
+	}
+	if !strings.Contains(buf.String(), "redis read failed") {
+		t.Fatalf("expected backoff log during outage, got: %q", buf.String())
+	}
+
+	// Restart redis and add a new event; the handler must run and recovery logs once.
+	if _, err := cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+		t.Fatalf("restart redis: %v", err)
+	}
+	waitFor(t, "redis accepting connections after restart", func() bool {
+		probe := redis.NewClient(&redis.Options{Addr: addr})
+		defer probe.Close()
+		pctx, c := context.WithTimeout(context.Background(), time.Second)
+		defer c()
+		return probe.Ping(pctx).Err() == nil
+	})
+	waitFor(t, "consumer healthy after recovery", func() bool { return consumer.Healthy() })
+	if code := healthCode(t, hsURL); code != http.StatusOK {
+		t.Fatalf("health after recovery = %d, want 200", code)
+	}
+
+	secondID, err := rc.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"b":2}`}}).Result()
+	if err != nil {
+		t.Fatalf("xadd after recovery: %v", err)
+	}
+	// The running Consume picks up the new message; assert it is processed (gone
+	// from the PEL) rather than re-registering a handler.
+	waitFor(t, "second message processed (gone from PEL)", func() bool {
+		entries, err := rc.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+			Stream: stream, Group: group, Start: "-", End: "+", Count: 100,
+		}).Result()
+		if err != nil {
+			return false
+		}
+		for _, pe := range entries {
+			if pe.ID == secondID {
+				return false
+			}
+		}
+		return true
+	})
+
+	// Exactly one recovery line across the whole run.
+	if got := strings.Count(buf.String(), "redis connection recovered"); got != 1 {
+		t.Fatalf("expected exactly one recovery line, got %d: %q", got, buf.String())
+	}
+
+	cancel2()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("consumer did not stop")
+	}
+}
+
+// healthCode performs a GET on the health endpoint and returns the status code.
+func healthCode(t *testing.T, url string) int {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("health get: %v", err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// newHealthServerForTest starts a health server on a random port and returns
+// its base URL. It is a test-local stand-in for cmd's healthServer.
+func newHealthServerForTest(t *testing.T, healthy func() bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if healthy() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
