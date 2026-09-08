@@ -118,14 +118,18 @@ warning above); this is a dev-only convenience. Tear down with
 
 ## Configuration
 
-| Env var            | Default          | Description                           |
-| ------------------ | ---------------- | ------------------------------------- |
-| `REDIS_ADDR`       | `localhost:6379` | Redis address.                        |
-| `REDIS_STREAM`     | `events`         | Redis stream to consume.              |
-| `REDIS_GROUP`      | `relay`          | Consumer group name.                  |
-| `REDIS_CONSUMER`   | `worker-1`       | Consumer name within the group.       |
-| `FUNCTIONS_DIR`    | `./functions`    | Directory containing function dirs.   |
-| `FUNCTION_TIMEOUT` | `30s`            | Per-invocation timeout (Go duration). |
+| Env var                  | Default            | Description                                       |
+| ------------------------ | ------------------ | ------------------------------------------------- |
+| `REDIS_ADDR`             | `localhost:6379`   | Redis address.                                    |
+| `REDIS_STREAM`           | `events`           | Redis stream to consume.                          |
+| `REDIS_GROUP`            | `relay`            | Consumer group name.                              |
+| `REDIS_CONSUMER`         | `worker-1`         | Consumer name within the group.                   |
+| `FUNCTIONS_DIR`          | `./functions`      | Directory containing function dirs.               |
+| `FUNCTION_TIMEOUT`       | `30s`              | Per-invocation timeout (Go duration).             |
+| `RELAY_MAX_ATTEMPTS`     | `5`                | Delivery attempts before a failing message is routed to the DLQ. |
+| `RELAY_RECLAIM_INTERVAL` | `1m`               | How often the recovery loop scans for idle pending messages (disabled if `0`). |
+| `RELAY_MIN_PENDING_IDLE` | `1m`               | Minimum time a message must sit pending before it is reclaimed (must exceed normal processing time). |
+| `RELAY_DLQ_STREAM`       | `<stream>:dlq`     | Dead-letter stream for exhausted or malformed messages. |
 
 Multiple Relay instances may share the same `REDIS_GROUP` with different
 consumer names to scale out consuming. The consumer group is created
@@ -244,11 +248,13 @@ to Relay's logs.
   image is built at startup and serves all of its handlers.
 - **Sequential execution**: for each event, functions are iterated in order,
   then rules in order, and each matching handler runs one at a time (no
-  concurrency). Execution does not stop at the first match.
+  concurrency).
 - **Timeout**: each invocation is bounded by `FUNCTION_TIMEOUT`. A timeout
   kills the invocation and is treated as an execution failure.
-- **Failure**: any non-zero container exit is a failure. Relay does not stop at
-  the first failure; errors include the function and handler names.
+- **Failure**: any non-zero container exit is a failure; errors include the
+  function and handler names. **Abort on first failure**: a failed invocation
+  stops the remaining rules for that event and returns the message to the
+  pending entries list (no XACK). See *Acknowledgment semantics* below.
 
 For example, `functions/user-events-python/` declares three handlers
 (`events.created.handler`, `events.updated.handler`,
@@ -272,7 +278,43 @@ event → handler A ✗ → STOP → no XACK (message stays pending)
 
 An event that matches no rules is a success and is acknowledged. Because
 delivery is at-least-once, handlers should tolerate duplicate delivery.
-Retries, dead-letter queues, and `XAUTOCLAIM` are not implemented yet.
+
+### Recovery and retries
+
+Relay consumes with a consumer group, so every delivered message records an
+entry in the group's Pending Entries List (PEL) until it is acknowledged. A
+message a consumer reads but never acknowledges — a crash, an outage, or a
+handler failure — stays in the PEL.
+
+- **Recovery loop** (`XAUTOCLAIM`): a background goroutine runs every
+  `RELAY_RECLAIM_INTERVAL` and reclaims messages that have sat pending for
+  longer than `RELAY_MIN_PENDING_IDLE`. Reclaiming takes ownership for the
+  current consumer and replays the message through the same processing path as a
+  fresh read. This makes Relay survive restarts: a message left pending by a
+  dead consumer is picked up and retried by a live one.
+- **Retry counting**: the per-message delivery count is read from Redis
+  (`XPENDING` full form / retry counter), not kept in process memory, so the
+  count survives restarts. Each reclaim of an idle message increments the count.
+- **Max attempts → DLQ**: once a message fails `RELAY_MAX_ATTEMPTS` times
+  (default 5), it is no longer re-processed. It is written to the dead-letter
+  stream `RELAY_DLQ_STREAM` (default `<stream>:dlq`) and the original is then
+  acknowledged, removing it from the PEL.
+- **DLQ entry format** (flat fields): `original_stream`, `original_id`,
+  `group`, `consumer`, `event` (the original payload string), `reason`,
+  `attempts`, `timestamp` (RFC 3339).
+- **DLQ write ordering**: the DLQ is written *before* the original is
+  acknowledged. If the DLQ write fails, the original is left pending so the next
+  recovery cycle retries the DLQ write instead of losing the message.
+- **Non-retryable failures**: a message whose `event` field is missing, is not a
+  string, or is not a JSON object can never succeed. It is routed straight to
+  the DLQ on first encounter — without running any handler — and acknowledged.
+- **Malformed input** never consumes retry cycles.
+
+The at-least-once contract from the ACK table above is unchanged: XACK happens
+only after all matching invocations succeed or the message is successfully
+routed to the DLQ. Because redelivery is now a live mechanism (not a stranding
+hole), a partial failure that is redelivered re-runs *every* matching handler —
+including ones that already succeeded — so handlers must be idempotent.
 
 ## Example functions
 
@@ -339,7 +381,8 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 
 Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
 concurrency, warm containers, build caching, source hashing, hot reload, git,
-registries, k8s, retries, dead-letter queues, `XAUTOCLAIM`, idempotency,
-per-function env/secrets/resource limits/networking, HTTP API, UI, metrics,
-tracing, and additional operators (numeric/exists/anything-but/regex/glob/
-scripts) are not implemented in this iteration.
+registries, k8s, retry *policies per rule* (delays/attempt counts — only a global
+max-attempts is implemented), idempotency, exactly-once, per-function
+env/secrets/resource limits/networking, HTTP API, UI, metrics, tracing, and
+additional operators (numeric/exists/anything-but/regex/glob/scripts) are not
+implemented in this iteration.

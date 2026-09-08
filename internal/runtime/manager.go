@@ -43,7 +43,7 @@ func NewManager(logger *log.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}

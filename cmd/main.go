@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,6 +24,20 @@ func envOr(key, def string) string {
 	return def
 }
 
+func envInt(key string, def int) (int, error) {
+	if v := os.Getenv(key); v != "" {
+		return strconv.Atoi(v)
+	}
+	return def, nil
+}
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	if v := os.Getenv(key); v != "" {
+		return time.ParseDuration(v)
+	}
+	return def, nil
+}
+
 func main() {
 	logger := log.New(os.Stdout, "relay: ", log.LstdFlags)
 
@@ -36,17 +51,36 @@ func main() {
 	}
 
 	cfg := struct {
-		redisAddr    string
-		redisStream  string
-		redisGroup   string
-		redisCons    string
-		functionsDir string
+		redisAddr       string
+		redisStream     string
+		redisGroup      string
+		redisCons       string
+		functionsDir    string
+		maxAttempts     int
+		reclaimInterval time.Duration
+		minPendingIdle  time.Duration
+		dlqStream       string
 	}{
 		redisAddr:    envOr("REDIS_ADDR", "localhost:6379"),
 		redisStream:  envOr("REDIS_STREAM", "events"),
 		redisGroup:   envOr("REDIS_GROUP", "relay"),
 		redisCons:    envOr("REDIS_CONSUMER", "worker-1"),
 		functionsDir: envOr("FUNCTIONS_DIR", "./functions"),
+		dlqStream:    envOr("RELAY_DLQ_STREAM", ""),
+	}
+
+	var err error
+	if cfg.maxAttempts, err = envInt("RELAY_MAX_ATTEMPTS", 5); err != nil {
+		logger.Fatalf("RELAY_MAX_ATTEMPTS: %v", err)
+	}
+	if cfg.reclaimInterval, err = envDuration("RELAY_RECLAIM_INTERVAL", time.Minute); err != nil {
+		logger.Fatalf("RELAY_RECLAIM_INTERVAL: %v", err)
+	}
+	if cfg.minPendingIdle, err = envDuration("RELAY_MIN_PENDING_IDLE", time.Minute); err != nil {
+		logger.Fatalf("RELAY_MIN_PENDING_IDLE: %v", err)
+	}
+	if cfg.dlqStream == "" {
+		cfg.dlqStream = cfg.redisStream + ":dlq"
 	}
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
@@ -81,11 +115,15 @@ func main() {
 	logger.Printf("prepared %d function(s)", preparedCount)
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
-		Client:   client,
-		Stream:   cfg.redisStream,
-		Group:    cfg.redisGroup,
-		Consumer: cfg.redisCons,
-		Log:      logger,
+		Client:          client,
+		Stream:          cfg.redisStream,
+		Group:           cfg.redisGroup,
+		Consumer:        cfg.redisCons,
+		MaxAttempts:     int64(cfg.maxAttempts),
+		ReclaimInterval: cfg.reclaimInterval,
+		MinPendingIdle:  cfg.minPendingIdle,
+		DLQStream:       cfg.dlqStream,
+		Log:             logger,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
