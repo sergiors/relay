@@ -13,6 +13,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/config"
 	"relay/internal/function"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
@@ -26,16 +27,6 @@ func main() {
 	run(logger)
 }
 
-// mustEnv reads a required environment variable during startup, before any
-// other work, and fails fast if it is unset or empty.
-func mustEnv(logger *log.Logger, key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		logger.Fatalf("missing required environment variable: %s", key)
-	}
-	return v
-}
-
 // run wires the whole worker: startup state, then the reconciler and stream
 // consumer. It blocks in Consume until the process is signalled.
 func run(logger *log.Logger) {
@@ -45,10 +36,10 @@ func run(logger *log.Logger) {
 		redisGroup  string
 		redisCons   string
 	}{
-		redisAddr:   mustEnv(logger, "REDIS_ADDR"),
-		redisStream: mustEnv(logger, "REDIS_STREAM"),
-		redisGroup:  mustEnv(logger, "REDIS_GROUP"),
-		redisCons:   mustEnv(logger, "REDIS_CONSUMER"),
+		redisAddr:   config.MustEnv("REDIS_ADDR"),
+		redisStream: config.MustEnv("REDIS_STREAM"),
+		redisGroup:  config.MustEnv("REDIS_GROUP"),
+		redisCons:   config.MustEnv("REDIS_CONSUMER"),
 	}
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})

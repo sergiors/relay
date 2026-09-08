@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -43,25 +41,6 @@ func openForTest(t *testing.T) *state.State {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
-}
-
-// capture runs fn capturing stdout to a string.
-func capture(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = buf.ReadFrom(r)
-		close(done)
-	}()
-	fn()
-	_ = w.Close()
-	os.Stdout = old
-	<-done
-	return buf.String()
 }
 
 // ls prints the header plus both rows with correct status/handlers, sorted.
@@ -159,25 +138,6 @@ func TestFunctionCommandExitCodes(t *testing.T) {
 	}
 }
 
-// captureErr runs fn capturing stderr (for the unknown-function message).
-func captureErr(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = buf.ReadFrom(r)
-		close(done)
-	}()
-	fn()
-	_ = w.Close()
-	os.Stderr = old
-	<-done
-	return buf.String()
-}
-
 // An inspect of an unknown function writes the expected message to stderr.
 func TestFunctionInspectUnknownMessage(t *testing.T) {
 	_ = seedTestState(t)
@@ -186,5 +146,100 @@ func TestFunctionInspectUnknownMessage(t *testing.T) {
 	})
 	if !strings.Contains(errOut, `Error: unknown function "no-such-fn"`) {
 		t.Fatalf("stderr missing unknown-function message: %q", errOut)
+	}
+}
+
+// `relay function --help` prints the function help to stdout and exits 0.
+func TestFunctionHelp(t *testing.T) {
+	var code int
+	out := capture(t, func() {
+		code = runFunctionCommand([]string{"--help"})
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"relay function COMMAND",
+		"ls",
+		"inspect",
+		"Run 'relay function COMMAND --help' for more information on a command.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// `relay function ls --help` and `relay function inspect --help` print their
+// focused usage to stdout and exit 0.
+func TestFunctionCommandHelp(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"ls", "--help"}, "relay function ls"},
+		{[]string{"inspect", "--help"}, "relay function inspect NAME"},
+	}
+	for _, c := range cases {
+		var code int
+		out := capture(t, func() {
+			code = runFunctionCommand(c.args)
+		})
+		if code != 0 {
+			t.Fatalf("%v: exit = %d, want 0", c.args, code)
+		}
+		if !strings.Contains(out, c.want) {
+			t.Fatalf("%v: stdout missing %q:\n%s", c.args, c.want, out)
+		}
+	}
+}
+
+// Misplaced --help in a function subcommand is a usage error: exit 2 with
+// error+usage on stderr.
+func TestFunctionHelpMisplaced(t *testing.T) {
+	cases := [][]string{
+		{"ls", "--help", "extra"},
+		{"inspect", "--help", "name"},
+		{"--help", "bogus"},
+	}
+	for _, args := range cases {
+		var code int
+		errOut := captureErr(t, func() {
+			code = runFunctionCommand(args)
+		})
+		if code != 2 {
+			t.Fatalf("%v: exit = %d, want 2", args, code)
+		}
+		if !strings.Contains(errOut, "Error:") {
+			t.Fatalf("%v: stderr missing error line: %q", args, errOut)
+		}
+	}
+}
+
+// `relay health --help` prints the health usage to stdout and exits 0.
+func TestHealthHelp(t *testing.T) {
+	var code int
+	out := capture(t, func() {
+		code = runCLI([]string{"health", "--help"})
+	})
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "relay health") {
+		t.Fatalf("stdout missing health usage:\n%s", out)
+	}
+}
+
+// `relay health` takes no positional args; any arg is a usage error.
+func TestHealthArgError(t *testing.T) {
+	var code int
+	errOut := captureErr(t, func() {
+		code = runCLI([]string{"health", "extra"})
+	})
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(errOut, "relay health") {
+		t.Fatalf("stderr missing health usage: %q", errOut)
 	}
 }

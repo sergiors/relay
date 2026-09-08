@@ -25,30 +25,37 @@ var statePath = state.DBPath
 //	2  usage error
 func runFunctionCommand(args []string) int {
 	if len(args) == 0 {
-		return functionUsage("function: missing subcommand")
+		return printUsageError("function: missing subcommand", functionHelp())
 	}
 
 	switch args[0] {
 	case "ls":
+		if len(args) == 2 && isHelp(args[1]) {
+			fmt.Fprint(os.Stdout, functionLsUsage())
+			return 0
+		}
 		if len(args) != 1 {
-			return functionUsage("function ls: too many arguments")
+			return printUsageError("function ls: too many arguments", functionLsUsage())
 		}
 		return functionList()
 	case "inspect":
+		if len(args) == 2 && isHelp(args[1]) {
+			fmt.Fprint(os.Stdout, functionInspectUsage())
+			return 0
+		}
 		if len(args) != 2 {
-			return functionUsage("function inspect: expected a function name")
+			return printUsageError("function inspect: expected a function name", functionInspectUsage())
 		}
 		return functionInspect(args[1])
+	case "--help", "-h":
+		if len(args) == 1 {
+			fmt.Fprint(os.Stdout, functionHelp())
+			return 0
+		}
+		return printUsageError(fmt.Sprintf("function: unknown subcommand %q", args[0]), functionHelp())
 	default:
-		return functionUsage(fmt.Sprintf("function: unknown subcommand %q", args[0]))
+		return printUsageError(fmt.Sprintf("function: unknown subcommand %q", args[0]), functionHelp())
 	}
-}
-
-// functionUsage prints a usage line to stderr and returns the usage exit code.
-func functionUsage(msg string) int {
-	fmt.Fprintln(os.Stderr, "Error:", msg)
-	fmt.Fprintln(os.Stderr, "Usage: relay function <ls|inspect <name>>")
-	return 2
 }
 
 // openState opens the local state DB (creating it if absent) and returns it
