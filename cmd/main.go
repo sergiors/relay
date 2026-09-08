@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/function"
+	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -84,6 +85,24 @@ func main() {
 	}
 
 	run := runner.New(prepared, logger)
+
+	// Watch /functions and reconcile functions live: rebuild changed images,
+	// discover new ones, drop removed ones. The runner's registry is swapped
+	// atomically behind the snapshots the consumer already uses.
+	reconciler := reconciler.New(
+		reconciler.Config{Root: function.Dir},
+		run.Registry(),
+		manager,
+		logger,
+	)
+	for _, fn := range functions {
+		reconciler.Seed(fn)
+	}
+	logger.Printf("watching %s for changes", function.Dir)
+
+	// Reconciler watches /functions and swaps the registry live. It runs in its
+	// own goroutine and stops when ctx is cancelled.
+	go reconciler.Start(ctx)
 
 	logger.Printf("consuming stream %q as group %q consumer %q",
 		cfg.redisStream,

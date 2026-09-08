@@ -14,9 +14,10 @@ Event Producer → Redis Streams → Relay → Function Handler
 
 ## How it works
 
-At startup Relay discovers the functions under `/app/functions` (one directory
+At startup Relay discovers the functions under `/functions` (one directory
 per function), builds one image per function, and creates (if missing) the Redis
-consumer group. It then blocks
+consumer group. It then watches `/functions` for changes and reconciles each
+function on the fly. It then blocks
 on the stream with a consumer group, decodes each message, and for every event:
 
 1. evaluates every function's rules (declarative patterns in `template.yaml`),
@@ -60,11 +61,11 @@ services:
   socket-proxy:
     image: tecnativa/docker-socket-proxy
     environment:
-      PING: "1"
-      VERSION: "1"
-      BUILD: "1"
-      CONTAINERS: "1"
-      POST: "1"
+      - PING=1
+      - VERSION=1
+      - BUILD=1
+      - CONTAINERS=1
+      - POST=1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
@@ -113,7 +114,7 @@ into the `socket-proxy` container**, which forwards just the Engine API
 endpoints Relay needs (ping/version, image build, and container create/attach/
 start/wait/kill/remove). Port `2375` is **not** exposed to the host, so the
 proxy is reachable only from the compose network. `./functions` is still
-mounted read-only into Relay. The socket mount is privileged (see the security
+mounted read-only into Relay at `/functions`. The socket mount is privileged (see the security
 warning above); this is a dev-only convenience. Tear down with
 `docker compose -f compose.dev.yaml down -v`.
 
@@ -128,10 +129,10 @@ warning above); this is a dev-only convenience. Tear down with
 
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
-(see *Docker requirement*); Relay itself does not parse them.
+(see _Docker requirement_); Relay itself does not parse them.
 
 Relay's reliability settings — retry/delivery limits and the recovery loop — are
-fixed internals, not env-configurable. See *Reliability defaults* below.
+fixed internals, not env-configurable. See _Reliability defaults_ below.
 
 Multiple Relay instances may share the same `REDIS_GROUP` with different
 consumer names to scale out consuming. The consumer group is created
@@ -141,7 +142,7 @@ consumed.
 
 ## Functions
 
-Each direct subdirectory of `/app/functions` is one function. The directory name
+Each direct subdirectory of `/functions` is one function. The directory name
 is the function name. Each function directory must contain a `template.yaml`
 that declares which runtime to use and which events it handles.
 
@@ -252,7 +253,9 @@ to Relay's logs.
 ## Execution
 
 - **One image per function**, never per handler or event. A function's single
-  image is built at startup and serves all of its handlers.
+  image is built at startup and, afterwards, rebuilt only when its directory
+  changes (see *Hot reload* below); the rebuilt image serves all of its
+  handlers.
 - **Sequential execution**: for each event, functions are iterated in order,
   then rules in order, and each matching handler runs one at a time (no
   concurrency).
@@ -262,11 +265,42 @@ to Relay's logs.
 - **Failure**: any non-zero container exit is a failure; errors include the
   function and handler names. **Abort on first failure**: a failed invocation
   stops the remaining rules for that event and returns the message to the
-  pending entries list (no XACK). See *Acknowledgment semantics* below.
+  pending entries list (no XACK). See _Acknowledgment semantics_ below.
 
 For example, `functions/user-events-python/` declares three handlers
 (`events.created.handler`, `events.updated.handler`,
 `events.deleted.handler`), all served by the same function image.
+
+## Hot reload
+
+Relay watches `/functions` (with `fsnotify`) and reconciles each function on the
+fly, without a restart:
+
+- **Auto-discovery**: a new directory under `/functions` is detected and its
+  image built, then it starts matching events.
+- **Per-function rebuild on change**: edits to a function's template, source, or
+  dependency files trigger a rebuild of *that function's* image only. Events are
+  debounced (750ms) so a burst of editor saves coalesces into one rebuild.
+- **Fingerprinting**: each function's content is hashed (`SHA-256` over file
+  paths + bytes); an unchanged function is skipped, so a rebuild happens only
+  when its inputs actually changed.
+- **Failure safety**: if a rebuild fails (invalid template or failed image
+  build), the previous, still-working version is retained and keeps serving
+  events. It is retried on the next change or periodic pass.
+- **Removal**: deleting a function's directory removes it from matching.
+  In-flight invocations are never interrupted; they finish against the snapshot
+  they started with.
+- **Missing template**: a directory present but with no `template.yaml` yet is
+  treated as "not ready" — Relay waits for more events rather than dropping a
+  previously-active function.
+- **Periodic fallback**: a 30s reconciliation pass re-scans `/functions` as a
+  backstop for watch events that were missed.
+- **Nested directories**: the watcher covers files in nested subdirectories of a
+  function, so sources split into packages are tracked too.
+
+Functions are read-only to Relay (the directory is mounted read-only in the
+container); all rebuilds happen in temporary build contexts, so Relay never
+writes into `/functions`.
 
 ## Acknowledgment semantics
 
@@ -310,7 +344,7 @@ handler failure — stays in the PEL.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
   `attempts`, `timestamp` (RFC 3339).
-- **DLQ write ordering**: the DLQ is written *before* the original is
+- **DLQ write ordering**: the DLQ is written _before_ the original is
   acknowledged. If the DLQ write fails, the original is left pending so the next
   recovery cycle retries the DLQ write instead of losing the message.
 - **Non-retryable failures**: a message whose `event` field is missing, is not a
@@ -325,7 +359,7 @@ falls back to them in `NewConsumer`.
 The at-least-once contract from the ACK table above is unchanged: XACK happens
 only after all matching invocations succeed or the message is successfully
 routed to the DLQ. Because redelivery is now a live mechanism (not a stranding
-hole), a partial failure that is redelivered re-runs *every* matching handler —
+hole), a partial failure that is redelivered re-runs _every_ matching handler —
 including ones that already succeeded — so handlers must be idempotent.
 
 ## Example functions
@@ -394,7 +428,7 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 ## Out of scope
 
 Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
-concurrency, warm containers, build caching, source hashing, hot reload, git,
+concurrency, warm containers, build caching, source hashing, git,
 registries, k8s, retry *policies per rule* (delays/attempt counts — only a global
 max-attempts is implemented), idempotency, exactly-once, per-function
 env/secrets/resource limits/networking, HTTP API, UI, metrics, tracing, and

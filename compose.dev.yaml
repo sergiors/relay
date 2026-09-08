@@ -38,7 +38,7 @@ services:
       - REDIS_CONSUMER=worker-1
       - DOCKER_HOST=tcp://socket-proxy:2375
     volumes:
-      - ./functions:/app/functions:ro
+      - ./functions:/functions:ro
 
 volumes:
   redis-data:
