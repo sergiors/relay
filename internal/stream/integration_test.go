@@ -450,23 +450,23 @@ func TestIntegrationNoMatchAcked(t *testing.T) {
 	e.stop(t)
 }
 
-func TestIntegrationProgressRetainedOnFailureClearedOnAck(t *testing.T) {
+func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
 	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
 	id := e.xadd(t, `{"a":1}`)
-	key := progressKey(e.stream, e.group, id)
+	key := invocationStateKey(e.stream, e.group, id)
 
 	// First delivery: mark the invocation succeeded but return an error so the
-	// message stays pending. The progress must be retained for the redelivery.
+	// message stays pending. The state must be retained for the redelivery.
 	var first atomic.Bool
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID != id {
 			return nil
 		}
-		if p, ok := InvocationProgressFrom(ctx); ok {
-			p.MarkSuccess("fn/h")
+		if p, ok := InvocationStateFrom(ctx); ok {
+			p.MarkComplete("fn/h")
 		}
 		if !first.Swap(true) {
 			return fmt.Errorf("fail first delivery")
@@ -474,14 +474,14 @@ func TestIntegrationProgressRetainedOnFailureClearedOnAck(t *testing.T) {
 		return nil
 	})
 	e.waitDelivered(t, id)
-	waitFor(t, "progress retained after failed delivery", func() bool {
+	waitFor(t, "invocation state retained after failed delivery", func() bool {
 		v, err := e.client.HGet(context.Background(), key, "fn/h").Result()
 		return err == nil && v == "ok"
 	})
 
 	// The recovery loop reclaims the idle message; the handler sees the invocation
-	// already done and returns nil, so the message is acked and progress cleared.
-	waitFor(t, "message acked and progress cleared", func() bool {
+	// already done and returns nil, so the message is acked and state cleared.
+	waitFor(t, "message acked and invocation state cleared", func() bool {
 		_, ok := e.pending()[id]
 		if ok {
 			return false
@@ -492,21 +492,21 @@ func TestIntegrationProgressRetainedOnFailureClearedOnAck(t *testing.T) {
 	e.stop(t)
 }
 
-func TestIntegrationProgressClearedOnDLQ(t *testing.T) {
+func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
 	e := newEnv(t, ConsumerConfig{MaxAttempts: 2})
 	id := e.xadd(t, `{"a":1}`)
-	key := progressKey(e.stream, e.group, id)
+	key := invocationStateKey(e.stream, e.group, id)
 
 	// Every delivery marks the invocation succeeded but returns an error, so the
-	// message exhausts attempts and routes to the DLQ. Progress must be cleared
+	// message exhausts attempts and routes to the DLQ. State must be cleared
 	// after the DLQ write + ACK.
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID == id {
-			if p, ok := InvocationProgressFrom(ctx); ok {
-				p.MarkSuccess("fn/h")
+			if p, ok := InvocationStateFrom(ctx); ok {
+				p.MarkComplete("fn/h")
 			}
 		}
 		return fmt.Errorf("always fail")
@@ -516,19 +516,19 @@ func TestIntegrationProgressClearedOnDLQ(t *testing.T) {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	waitFor(t, "progress cleared after DLQ", func() bool {
+	waitFor(t, "invocation state cleared after DLQ", func() bool {
 		n, err := e.client.Exists(context.Background(), key).Result()
 		return err == nil && n == 0
 	})
 	e.stop(t)
 }
 
-// TestIntegrationProcessMessageClearsProgressOnlyAfterAck drives the shared
+// TestIntegrationProcessMessageClearsStateOnlyAfterAck drives the shared
 // processMessage path directly (no Consume loop) against a real Redis: a
 // message is XADDed and read into the group's PEL, then processMessage runs a
-// succeeding handler. The progress key must be cleared only after the ACK, and
-// the message must be gone from the PEL.
-func TestIntegrationProcessMessageClearsProgressOnlyAfterAck(t *testing.T) {
+// succeeding handler. The invocation-state key must be cleared only after the
+// ACK, and the message must be gone from the PEL.
+func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
@@ -554,11 +554,11 @@ func TestIntegrationProcessMessageClearsProgressOnlyAfterAck(t *testing.T) {
 		t.Fatalf("read message %s, want %s", msg.ID, id)
 	}
 
-	// Mark progress, then process with a succeeding handler: the message is
-	// acked and the progress key cleared.
-	key := progressKey(e.stream, e.group, id)
+	// Mark invocation state, then process with a succeeding handler: the message
+	// is acked and the invocation-state key cleared.
+	key := invocationStateKey(e.stream, e.group, id)
 	if err := e.client.HSet(context.Background(), key, "fn/h", "ok").Err(); err != nil {
-		t.Fatalf("hset progress: %v", err)
+		t.Fatalf("hset invocation state: %v", err)
 	}
 	e.consumer.processMessage(context.Background(), msg, 1, func(ctx context.Context, msgID string, ev map[string]any) error {
 		return nil
@@ -568,16 +568,16 @@ func TestIntegrationProcessMessageClearsProgressOnlyAfterAck(t *testing.T) {
 		t.Fatalf("message %s should be acked (gone from PEL)", id)
 	}
 	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("progress key should be cleared after ACK (exists=%d err=%v)", n, err)
+		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
 	}
 }
 
-// TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure verifies the
+// TestIntegrationRouteToDLQKeepsStateOnDLQWriteFailure verifies the
 // clear-ordering contract in routeToDLQ: when the DLQ XADD fails (the DLQ stream
-// name is a wrong-type key), the original message stays pending and its progress
-// key is retained; once the DLQ write succeeds, the message is acked and the
-// progress key is cleared.
-func TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure(t *testing.T) {
+// name is a wrong-type key), the original message stays pending and its
+// invocation-state key is retained; once the DLQ write succeeds, the message is
+// acked and the invocation-state key is cleared.
+func TestIntegrationRouteToDLQKeepsStateOnDLQWriteFailure(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
@@ -596,9 +596,9 @@ func TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure(t *testing.T) {
 		t.Fatalf("xreadgroup: %v", err)
 	}
 	msg := msgs[0].Messages[0]
-	key := progressKey(e.stream, e.group, id)
+	key := invocationStateKey(e.stream, e.group, id)
 	if err := e.client.HSet(context.Background(), key, "fn/h", "ok").Err(); err != nil {
-		t.Fatalf("hset progress: %v", err)
+		t.Fatalf("hset invocation state: %v", err)
 	}
 
 	// Force the DLQ XADD to fail by making the DLQ stream name a wrong-type key.
@@ -607,12 +607,12 @@ func TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure(t *testing.T) {
 	}
 	e.consumer.routeToDLQ(context.Background(), msg, fmt.Errorf("boom"), 1)
 
-	// DLQ write failed: message stays pending and progress is retained.
+	// DLQ write failed: message stays pending and invocation state is retained.
 	if _, ok := e.pending()[id]; !ok {
 		t.Fatalf("message %s must stay pending when DLQ write fails", id)
 	}
 	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 1 {
-		t.Fatalf("progress key must be retained on DLQ write failure (exists=%d err=%v)", n, err)
+		t.Fatalf("invocation-state key must be retained on DLQ write failure (exists=%d err=%v)", n, err)
 	}
 
 	// Now let the DLQ write succeed: delete the wrong-type key and re-route.
@@ -621,12 +621,13 @@ func TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure(t *testing.T) {
 	}
 	e.consumer.routeToDLQ(context.Background(), msg, fmt.Errorf("boom"), 1)
 
-	// DLQ write + ACK succeeded: message gone from PEL and progress cleared.
+	// DLQ write + ACK succeeded: message gone from PEL and invocation state
+	// cleared.
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked after successful DLQ write", id)
 	}
 	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("progress key should be cleared after DLQ (exists=%d err=%v)", n, err)
+		t.Fatalf("invocation-state key should be cleared after DLQ (exists=%d err=%v)", n, err)
 	}
 }
 

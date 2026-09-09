@@ -58,17 +58,17 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 		alwaysMatchFn(t, "beta", beta),
 	}, silentLogger(), nil)
 
-	prog := newFakeProgress()
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Delivery 1: alpha succeeds, beta fails. Handle returns an error.
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 1 to fail (beta)")
 	}
-	if !prog.Done("alpha/index.run") {
+	if !prog.IsComplete("alpha/index.run") {
 		t.Errorf("alpha should be marked after success")
 	}
-	if prog.Done("beta/index.run") {
+	if prog.IsComplete("beta/index.run") {
 		t.Errorf("beta should NOT be marked after failure")
 	}
 	if alpha.count() != 1 || beta.count() != 1 {
@@ -86,7 +86,7 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 	if beta.count() != 2 {
 		t.Errorf("beta should be retried (calls=%d, want 2)", beta.count())
 	}
-	if !prog.Done("beta/index.run") {
+	if !prog.IsComplete("beta/index.run") {
 		t.Errorf("beta should be marked after delivery-2 success")
 	}
 
@@ -100,7 +100,7 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 }
 
 // TestHandleSkippedInvocationsDoNotCountMetrics verifies that a skipped
-// invocation (already succeeded on a previous delivery) is not counted as an
+// invocation (already completed on a previous delivery) is not counted as an
 // execution: handler_success_total and function_handler_success_total only
 // count real executions, while function_events_total still counts the function
 // as engaged on every match (attribution, not execution).
@@ -113,8 +113,8 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 		alwaysMatchFn(t, "beta", beta),
 	}, silentLogger(), m)
 
-	prog := newFakeProgress()
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Delivery 1: alpha succeeds, beta fails.
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
@@ -152,19 +152,19 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	}
 }
 
-// TestHandleMarksProgressOnlyAfterSuccess verifies that a failing invocation is
+// TestHandleMarksStateOnlyAfterSuccess verifies that a failing invocation is
 // never marked, and a later success marks it.
-func TestHandleMarksProgressOnlyAfterSuccess(t *testing.T) {
+func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 	exec := &scriptedExecutor{fail: true}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
-	prog := newFakeProgress()
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Failure: not marked.
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected failure")
 	}
-	if prog.Done("user-events/index.run") {
+	if prog.IsComplete("user-events/index.run") {
 		t.Errorf("invocation must not be marked after failure")
 	}
 	if len(prog.marks) != 0 {
@@ -176,15 +176,15 @@ func TestHandleMarksProgressOnlyAfterSuccess(t *testing.T) {
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("success: %v", err)
 	}
-	if !prog.Done("user-events/index.run") {
+	if !prog.IsComplete("user-events/index.run") {
 		t.Errorf("invocation should be marked after success")
 	}
 }
 
-// TestHandleWithoutProgressUnchanged verifies the legacy behavior: with no
-// progress in ctx, every matching handler runs on every Handle call, nothing is
-// marked, and there is no panic.
-func TestHandleWithoutProgressUnchanged(t *testing.T) {
+// TestHandleWithoutStateUnchanged verifies the legacy behavior: with no
+// invocation state in ctx, every matching handler runs on every Handle call,
+// nothing is marked, and there is no panic.
+func TestHandleWithoutStateUnchanged(t *testing.T) {
 	a := &scriptedExecutor{}
 	b := &scriptedExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{
@@ -202,12 +202,12 @@ func TestHandleWithoutProgressUnchanged(t *testing.T) {
 	}
 }
 
-// TestHandleMultipleFunctionsIndependentProgress verifies that each function's
-// progress is tracked independently across redeliveries. Names are chosen so the
-// always-failing function (Z) sorts last: the runner iterates in sorted order
-// and returns on the first failure, so Z must come after C for C to be retried
-// on delivery 2.
-func TestHandleMultipleFunctionsIndependentProgress(t *testing.T) {
+// TestHandleMultipleFunctionsIndependentState verifies that each function's
+// invocation state is tracked independently across redeliveries. Names are
+// chosen so the always-failing function (Z) sorts last: the runner iterates in
+// sorted order and returns on the first failure, so Z must come after C for C
+// to be retried on delivery 2.
+func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	a := &scriptedExecutor{}           // A: always succeeds
 	c := &scriptedExecutor{fail: true} // C: fails delivery 1, succeeds delivery 2
 	z := &scriptedExecutor{fail: true} // Z: always fails
@@ -216,20 +216,20 @@ func TestHandleMultipleFunctionsIndependentProgress(t *testing.T) {
 		alwaysMatchFn(t, "C", c),
 		alwaysMatchFn(t, "Z", z),
 	}, silentLogger(), nil)
-	prog := newFakeProgress()
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Delivery 1: A succeeds (marked), C fails (unmarked), Z never runs (unmarked).
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 1 to fail")
 	}
-	if !prog.Done("A/index.run") {
+	if !prog.IsComplete("A/index.run") {
 		t.Errorf("A should be marked")
 	}
-	if prog.Done("C/index.run") {
+	if prog.IsComplete("C/index.run") {
 		t.Errorf("C should not be marked after failure")
 	}
-	if prog.Done("Z/index.run") {
+	if prog.IsComplete("Z/index.run") {
 		t.Errorf("Z should not be marked")
 	}
 	if a.count() != 1 || c.count() != 1 || z.count() != 0 {
@@ -250,10 +250,10 @@ func TestHandleMultipleFunctionsIndependentProgress(t *testing.T) {
 	if z.count() != 1 {
 		t.Errorf("Z calls = %d, want 1 (retried)", z.count())
 	}
-	if !prog.Done("C/index.run") {
+	if !prog.IsComplete("C/index.run") {
 		t.Errorf("C should be marked after success")
 	}
-	if prog.Done("Z/index.run") {
+	if prog.IsComplete("Z/index.run") {
 		t.Errorf("Z should still be unmarked")
 	}
 

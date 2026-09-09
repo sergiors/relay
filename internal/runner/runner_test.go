@@ -150,40 +150,40 @@ func (f *countingExecutor) count() int {
 	return f.calls
 }
 
-// fakeProgress is an in-memory InvocationProgress for runner tests, avoiding a
-// Redis dependency. It records which invocations have succeeded.
-type fakeProgress struct {
+// fakeInvocationState is an in-memory InvocationState for runner tests,
+// avoiding a Redis dependency. It records which invocations have completed.
+type fakeInvocationState struct {
 	mu    sync.Mutex
 	done  map[string]bool
 	marks []string
 }
 
-func newFakeProgress() *fakeProgress {
-	return &fakeProgress{done: map[string]bool{}}
+func newFakeInvocationState() *fakeInvocationState {
+	return &fakeInvocationState{done: map[string]bool{}}
 }
 
-func (p *fakeProgress) Done(invocation string) bool {
+func (p *fakeInvocationState) IsComplete(invocation string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.done[invocation]
 }
 
-func (p *fakeProgress) MarkSuccess(invocation string) {
+func (p *fakeInvocationState) MarkComplete(invocation string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.done[invocation] = true
 	p.marks = append(p.marks, invocation)
 }
 
-// TestHandleSkipsCompletedInvocation verifies that when invocation progress is
-// present in ctx and an invocation already succeeded, Handle skips it: the
+// TestHandleSkipsCompletedInvocation verifies that when invocation state is
+// present in ctx and an invocation already completed, Handle skips it: the
 // executor is not called and no success/failure metrics are recorded for it.
 func TestHandleSkipsCompletedInvocation(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), m)
 
-	// First delivery: no progress, so the handler runs and records success.
+	// First delivery: no invocation state, so the handler runs and records success.
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -191,11 +191,12 @@ func TestHandleSkipsCompletedInvocation(t *testing.T) {
 		t.Fatalf("executor calls = %d, want 1", exec.count())
 	}
 
-	// Second delivery with progress marking the invocation already done: the
-	// handler must be skipped (not executed) and not counted as a success.
-	prog := newFakeProgress()
+	// Second delivery with invocation state marking the invocation already
+	// complete: the handler must be skipped (not executed) and not counted as a
+	// success.
+	prog := newFakeInvocationState()
 	prog.done["user-events/index.run"] = true
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	ctx := stream.WithInvocationState(context.Background(), prog)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -213,28 +214,29 @@ func TestHandleSkipsCompletedInvocation(t *testing.T) {
 	}
 }
 
-// TestHandleMarksSuccessOnExecution verifies that a successful execution records
-// the invocation via MarkSuccess so a later redelivery can skip it.
-func TestHandleMarksSuccessOnExecution(t *testing.T) {
+// TestHandleMarksCompleteOnExecution verifies that a successful execution
+// records the invocation via MarkComplete so a later redelivery can skip it.
+func TestHandleMarksCompleteOnExecution(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
 
-	prog := newFakeProgress()
-	ctx := stream.WithInvocationProgress(context.Background(), prog)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if len(prog.marks) != 1 || prog.marks[0] != "user-events/index.run" {
 		t.Fatalf("marks = %v, want [user-events/index.run]", prog.marks)
 	}
-	if !prog.Done("user-events/index.run") {
-		t.Fatalf("invocation should be marked done")
+	if !prog.IsComplete("user-events/index.run") {
+		t.Fatalf("invocation should be marked complete")
 	}
 }
 
-// TestHandleNoProgressBehavesAsBefore verifies that Handle without progress in
-// ctx runs every matching handler (nil-safe, backward compatible).
-func TestHandleNoProgressBehavesAsBefore(t *testing.T) {
+// TestHandleNoInvocationStateBehavesAsBefore verifies that Handle without
+// invocation state in ctx runs every matching handler (nil-safe, backward
+// compatible).
+func TestHandleNoInvocationStateBehavesAsBefore(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
