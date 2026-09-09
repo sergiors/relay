@@ -48,7 +48,7 @@ go build ./...
 
 Requirements: Go 1.27+, a reachable Redis, and a local Docker daemon (see
 below). No events are processed until a producer XADDs to the stream. The daemon
-reads the mandatory `REDIS_ADDR`/`REDIS_STREAM`/`REDIS_GROUP`/`REDIS_CONSUMER`
+reads the mandatory `REDIS_ADDR`/`REDIS_STREAM`/`REDIS_GROUP`
 variables at startup and fails fast if any is unset.
 
 ## Docker requirement
@@ -143,10 +143,9 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_ADDR`     | yes      | Redis address.                  |
 | `REDIS_STREAM`   | yes      | Redis stream to consume.        |
 | `REDIS_GROUP`    | yes      | Consumer group name.            |
-| `REDIS_CONSUMER` | yes      | Consumer name within the group. |
 | `METRICS_ADDR`   | no       | Metrics listen address (default `:9090`). |
 
-The four `REDIS_*` variables are required: Relay fails startup (exits
+The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `METRICS_ADDR` is optional and
 must be a non-empty listen address when set (an empty value falls back to the
 default); an unbindable address is logged and retried, never fatal.
@@ -170,10 +169,12 @@ Relay's reliability settings — retry/delivery limits and the recovery loop —
 fixed internals, not env-configurable. See _Reliability defaults_ below.
 
 Multiple Relay instances may share the same `REDIS_GROUP` with different
-consumer names to scale out consuming. The consumer group is created
-automatically (with `MKSTREAM`) if the stream or group does not exist; the
-group is created at position `0`, so only messages added after startup are
-consumed.
+consumer names to scale out consuming; each worker uses its hostname as its
+consumer name automatically (the container ID / pod name under
+Docker/Kubernetes), so replicas are distinct without any configuration. The
+consumer group is created automatically (with `MKSTREAM`) if the stream or
+group does not exist; the group is created at position `0`, so only messages
+added after startup are consumed.
 
 ## Functions
 

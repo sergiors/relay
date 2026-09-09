@@ -52,8 +52,15 @@ func run(logger *log.Logger) {
 		redisAddr:   config.MustEnv("REDIS_ADDR"),
 		redisStream: config.MustEnv("REDIS_STREAM"),
 		redisGroup:  config.MustEnv("REDIS_GROUP"),
-		redisCons:   config.MustEnv("REDIS_CONSUMER"),
 	}
+
+	// Resolve the consumer identity explicitly so startup fails fast with a
+	// clear message when the hostname is unavailable or empty.
+	consumerName, err := config.ConsumerName()
+	if err != nil {
+		logger.Fatalf("consumer identity: %v", err)
+	}
+	cfg.redisCons = consumerName
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
 	defer client.Close()
