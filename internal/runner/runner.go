@@ -275,8 +275,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
 					})
-				// Unlabeled total feeding the SQLite snapshot; the labeled counter
-				// above remains for Prometheus, this one is simpler to aggregate.
+				// Unlabeled total for the SQLite snapshot; the labeled counter
+				// above stays for Prometheus.
 				r.metrics.Inc("handler_failure_total")
 				// Per-function failure attribution (per rule execution).
 				r.metrics.IncLabels("function_handler_failure_total",
@@ -328,8 +328,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					{Name: "function", Value: pf.fn.Name},
 					{Name: "handler", Value: rule.Handler},
 				})
-			// Unlabeled total feeding the SQLite snapshot; the labeled counter
-			// above remains for Prometheus, this one is simpler to aggregate.
+			// Unlabeled total for the SQLite snapshot; the labeled counter above
+			// stays for Prometheus.
 			r.metrics.Inc("handler_success_total")
 			// Per-function success attribution (per rule execution).
 			r.metrics.IncLabels("function_handler_success_total",

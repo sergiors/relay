@@ -270,7 +270,7 @@ func (c *Consumer) Consume(
 	}
 }
 
-// process hands a freshly-read message to the shared processMessage path. Since
+// process routes a freshly-read message to the shared processMessage path. Since
 // XPendingExt is the source of truth for retry counts (see reclaimTick), fresh
 // XREADGROUP reads are always treated as delivery attempt 1.
 func (c *Consumer) process(
@@ -285,8 +285,8 @@ func (c *Consumer) process(
 // metricsLoop samples the XPENDING pending-depth gauges once per interval until
 // ctx is cancelled. It is decoupled from health/backoff/processing: a Redis
 // failure just skips the pending gauges for that tick and is logged quietly. The
-// overall registry snapshot (counters, durations, and these gauges) is exposed
-// by the worker's LogLoop; this goroutine only produces the pending gauges.
+// overall registry snapshot is exposed by the worker's LogLoop; this goroutine
+// only produces the pending gauges.
 func (c *Consumer) metricsLoop(ctx context.Context) {
 	t := time.NewTicker(c.metricsInterval)
 	defer t.Stop()
@@ -339,7 +339,7 @@ func pendingAge(id string) (time.Duration, bool) {
 }
 
 // reclaimLoop paces the recovery loop with a ticker so idle pending messages are
-// re-delivered without busy-spinning. It returns when ctx is cancelled.
+// re-delivered without busy-spinning.
 func (c *Consumer) reclaimLoop(ctx context.Context, handler Handler) {
 	ticker := time.NewTicker(c.reclaimInterval)
 	defer ticker.Stop()

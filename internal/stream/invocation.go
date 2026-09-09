@@ -63,7 +63,7 @@ type invocationStore struct {
 }
 
 // completed reports whether the invocation has already completed for this
-// message. redis.Nil (field absent) means not completed.
+// message; redis.Nil (field absent) means not completed.
 func (p *invocationStore) completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error) {
 	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
@@ -117,10 +117,7 @@ func (p *invocationStore) completedSet(ctx context.Context, stream, group, msgID
 // that already completed on a previous delivery. The invocation argument is the
 // full "<function>/<handler>" ID; the stream layer never parses it.
 type InvocationState interface {
-	// IsComplete reports whether the invocation already completed for this
-	// message.
 	IsComplete(invocation string) bool
-	// MarkComplete records that the invocation completed for this message.
 	MarkComplete(invocation string)
 }
 
@@ -162,9 +159,8 @@ type invocationState struct {
 	log    *log.Logger
 }
 
-// IsComplete reads the invocation's completion state. On a Redis read error it
-// logs and treats the invocation as not completed (fail-open): the runner re-runs
-// it, preserving at-least-once semantics.
+// IsComplete treats a Redis read error as not completed (fail-open): the runner
+// re-runs the invocation, preserving at-least-once semantics.
 func (p *invocationState) IsComplete(invocation string) bool {
 	done, err := p.store.completed(p.ctx, p.stream, p.group, p.msgID, invocation)
 	if err != nil {
@@ -174,10 +170,9 @@ func (p *invocationState) IsComplete(invocation string) bool {
 	return done
 }
 
-// MarkComplete records the invocation as completed. On a write error it logs but
-// does not fail the handler: the message will simply be re-run later, preserving
-// at-least-once semantics. State bookkeeping must never become a new failure
-// source.
+// MarkComplete logs but does not fail the handler on a write error: the message
+// will simply be re-run later, preserving at-least-once semantics. State
+// bookkeeping must never become a new failure source.
 func (p *invocationState) MarkComplete(invocation string) {
 	if err := p.store.markComplete(p.ctx, p.stream, p.group, p.msgID, invocation); err != nil {
 		p.log.Printf("invocation state: mark %q: %v; message will be re-run later", invocation, err)

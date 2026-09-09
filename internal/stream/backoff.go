@@ -65,7 +65,6 @@ func (b *backoff) peek() time.Duration {
 	return b.table[b.step]
 }
 
-// reset returns the progression to its first value.
 func (b *backoff) reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()

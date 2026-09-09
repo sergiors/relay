@@ -232,10 +232,10 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 }
 
 // ObserveDuration records a single duration observation against the labeled
-// histogram for name (see ObserveDurationLabels). A nil receiver is a no-op;
-// the only caller that once used the unlabeled form (function_build_seconds in
-// runtime/manager.go) now records the labeled version, so an unlabeled
-// histogram is unnecessary and this method routes to the labeled one.
+// histogram for name (see ObserveDurationLabels). A nil receiver is a no-op.
+// The only caller that once used the unlabeled form (function_build_seconds in
+// runtime/manager.go) now records the labeled version, so an unlabeled histogram
+// is unnecessary and this method routes to the labeled one.
 func (r *Registry) ObserveDuration(name string, d time.Duration) {
 	r.ObserveDurationLabels(name, nil, d)
 }
@@ -251,8 +251,8 @@ func (r *Registry) ObserveDurationLabels(name string, labels []Label, d time.Dur
 	}
 }
 
-// SetGauge sets the named gauge to v (replacing any previous value).
-// A nil receiver is a no-op.
+// SetGauge sets the named gauge to v (replacing any previous value). A nil
+// receiver is a no-op.
 func (r *Registry) SetGauge(name string, v float64) {
 	r.SetGaugeLabels(name, nil, v)
 }

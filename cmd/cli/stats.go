@@ -9,7 +9,6 @@ import (
 	"relay/internal/state"
 )
 
-// statsUsage returns the usage text for `relay stats`.
 func statsUsage() string {
 	return "Usage:\n  relay stats\n\nShow current operational statistics.\n"
 }

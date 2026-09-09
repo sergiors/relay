@@ -7,7 +7,6 @@ import (
 	"text/tabwriter"
 )
 
-// isHelp reports whether arg is a help flag.
 func isHelp(arg string) bool {
 	return arg == "--help" || arg == "-h"
 }
@@ -24,7 +23,6 @@ func helpWriter(rows [][2]string) string {
 	return b.String()
 }
 
-// rootHelp returns the top-level CLI help text.
 func rootHelp() string {
 	return "Usage:\n  relay COMMAND\n\nManage and inspect Relay.\n\nCommands:\n" +
 		helpWriter([][2]string{
@@ -35,7 +33,6 @@ func rootHelp() string {
 		"\nRun 'relay COMMAND --help' for more information on a command.\n"
 }
 
-// functionHelp returns the `relay function` help text.
 func functionHelp() string {
 	return "Usage:\n  relay function COMMAND\n\nManage Relay functions.\n\nCommands:\n" +
 		helpWriter([][2]string{
@@ -45,17 +42,14 @@ func functionHelp() string {
 		"\nRun 'relay function COMMAND --help' for more information on a command.\n"
 }
 
-// functionLsUsage returns the usage text for `relay function ls`.
 func functionLsUsage() string {
 	return "Usage:\n  relay function ls\n\nList functions.\n"
 }
 
-// functionInspectUsage returns the usage text for `relay function inspect`.
 func functionInspectUsage() string {
 	return "Usage:\n  relay function inspect NAME\n\nShow detailed information about a function.\n"
 }
 
-// healthUsage returns the usage text for `relay health`.
 func healthUsage() string {
 	return "Usage:\n  relay health\n\nCheck Relay dependencies.\n"
 }
