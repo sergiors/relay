@@ -1,8 +1,11 @@
 // relay-worker is the long-running Relay process. It loads functions, builds
 // their images, reconciles them live, and consumes the Redis stream, blocking
 // until signalled. Configuration comes entirely from the environment. It also
-// exposes a Prometheus /metrics endpoint (see internal/metrics) and periodically
-// snapshots the registry into the local state database.
+// exposes a Prometheus /metrics endpoint (see internal/metrics) and flushes the
+// registry into the local state database on a fixed 5-second cadence: stats
+// accumulate in memory (the registry is the single source of truth), Prometheus
+// reflects them immediately, and SQLite receives the current absolute snapshot
+// every interval.
 package main
 
 import (
@@ -25,10 +28,12 @@ import (
 	"relay/internal/stream"
 )
 
-// statsSnapshotInterval is how often the worker maps the metrics registry into
-// the state database's stats row. It aligns with the metrics
-// LogLoop interval so both observability views refresh on the same cadence.
-const statsSnapshotInterval = 30 * time.Second
+// statsFlushInterval is the fixed SQLite snapshot cadence. Telemetry, not
+// event-processing state: Prometheus stays live in-process, while SQLite
+// receives the current absolute snapshot every interval. Deliberately NOT
+// env/flag-configurable — a fixed cadence keeps the durability model simple
+// (a hard crash loses at most one interval of telemetry).
+const statsFlushInterval = 5 * time.Second
 
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -163,10 +168,10 @@ func run(logger *log.Logger) {
 	logger.Printf("metrics http server listening on %s", metricsAddr)
 	go m.ServeHTTP(ctx, metricsAddr, logger.Printf)
 
-	// Snapshot the registry into the state database on the same cadence as the
-	// metrics LogLoop. It is nil-safe on both the registry and the state handle
-	// and stops when ctx is cancelled.
-	go statsLoop(ctx, m, st, statsSnapshotInterval)
+	// Flush the registry into the state database on the fixed 5-second cadence.
+	// It is nil-safe on both the registry and the state handle and stops when
+	// ctx is cancelled.
+	go statsLoop(ctx, m, st, statsFlushInterval)
 
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Fatalf("ensure consumer group: %v", err)
@@ -199,6 +204,12 @@ func run(logger *log.Logger) {
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
 		logger.Fatalf("consume: %v", err)
 	}
+
+	// Final flush of the registry into SQLite before the deferred st.Close()
+	// runs. Bounded by a short timeout so a wedged SQLite cannot hang shutdown;
+	// failure is logged and shutdown continues (telemetry, not state).
+	finalStatsFlush(m, st)
+
 	logger.Printf("shutdown complete")
 }
 
@@ -274,16 +285,19 @@ func funcSnapshotStats(m *metrics.Registry) []state.FunctionStats {
 	return out
 }
 
-// statsLoop snapshots the registry into the state database on a fixed interval
-// until ctx is cancelled. The first snapshot runs immediately so the
-// stats row exists before the first tick. It is nil-safe on both the
-// registry and the state handle, so observability can never break processing.
+// statsLoop is the flush loop: it mirrors the in-memory metrics registry into
+// the state database on a fixed interval until ctx is cancelled. The first
+// flush runs immediately so the stats row exists before the first tick (this
+// also makes `relay stats` useful right after startup). It is nil-safe on both
+// the registry and the state handle, so observability can never break
+// processing. The loop's ctx is the shutdown ctx; periodic flushes use it
+// directly (a cancelled ctx simply stops the loop).
 func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interval time.Duration) {
 	if st == nil {
 		<-ctx.Done()
 		return
 	}
-	recordSnapshots(st, m)
+	recordSnapshots(ctx, st, m)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -291,17 +305,39 @@ func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interv
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			recordSnapshots(st, m)
+			recordSnapshots(ctx, st, m)
 		}
 	}
 }
 
-// recordSnapshots writes the global stats row and one function_stats row per
-// function with any attributed activity. Per-function writes are bounded by the
-// function count, so the 30s cadence keeps them small.
-func recordSnapshots(st *state.State, m *metrics.Registry) {
-	st.RecordStats(snapshotStats(m))
-	for _, fs := range funcSnapshotStats(m) {
-		st.RecordFunctionStats(fs)
+// finalStatsFlush performs a bounded final flush of the registry into SQLite on
+// graceful shutdown, so the last interval of telemetry is not lost. It is
+// bounded by a short timeout so a wedged SQLite cannot hang shutdown; on
+// timeout or error it logs and returns (telemetry, not state). It is nil-safe
+// on both the registry and the state handle.
+func finalStatsFlush(m *metrics.Registry, st *state.State) {
+	if m == nil || st == nil {
+		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	recordSnapshots(ctx, st, m)
+}
+
+// recordSnapshots writes the whole stats snapshot — the global stats row and
+// one function_stats row per function with any attributed activity — in a
+// single short transaction (see state.RecordStatsSnapshot). The transaction
+// first prunes orphaned function_stats rows (a removed function's row is not
+// re-created even though its registry counters linger until process restart:
+// the registry is the in-memory store and we deliberately do not delete its
+// counters on removal — the flush simply stops persisting the removed function
+// because its functions row is gone). Per-function writes are bounded by the
+// function count, so the 5s cadence keeps them small. A failed flush is logged
+// and retried next tick with the current absolute values; no path resets
+// counters on failure.
+func recordSnapshots(ctx context.Context, st *state.State, m *metrics.Registry) {
+	// RecordStatsSnapshot logs internally on error (matching the state package's
+	// non-fatal style); the returned error is only for the caller to bound the
+	// write with a context.
+	_ = st.RecordStatsSnapshot(ctx, snapshotStats(m), funcSnapshotStats(m))
 }

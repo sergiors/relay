@@ -429,7 +429,9 @@ func (c *Consumer) deliverClaimed(
 		return
 	}
 	// A reclaimed (redelivered) message is an additional delivery attempt: it is a
-	// retry/redelivery event, counted here at the stream layer.
+	// retry/redelivery event, counted here at the stream layer. This is the
+	// message-level retry counter, distinct from the per-function
+	// function_retries_total (runner), which counts every failing rule execution.
 	c.metrics.Inc("retries_total")
 	c.processMessage(ctx, msg, retryCount+1, handler)
 }
@@ -455,7 +457,12 @@ func (c *Consumer) processMessage(
 	}
 
 	// The message decoded successfully and is about to be handed to the handler.
-	// This is the single message-level "processed" counter in the stream layer.
+	// This is the single message-level "processed" counter in the stream layer:
+	// an event matching N functions counts once globally here (per-function
+	// attribution lives in function_events_total). It is incremented on EVERY
+	// delivery attempt that reaches the handler handoff, including redeliveries,
+	// so retries increment it too — it is a delivery-attempt counter, not a
+	// unique-event counter.
 	c.metrics.Inc("events_processed_total")
 
 	if err := handler(WithDeliveryAttempt(ctx, deliveryNum), msg.ID, event); err != nil {

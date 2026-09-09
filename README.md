@@ -373,6 +373,15 @@ how the last reconcile of each function went without touching Redis or Docker.
 - **Fault-tolerance**: state errors are logged and never fatal — Relay runs
   without the state database if the DB is missing or broken (Open recreates a
   missing DB).
+- **Stats data flow**: operational stats accumulate **in memory** in the
+  Prometheus registry (the single source of truth); `GET /metrics` reflects
+  them immediately. SQLite receives the current **absolute snapshot** every
+  5 seconds (fixed, non-configurable) — snapshots, not history. `relay stats`
+  reads the latest global snapshot (may lag live Prometheus by up to ~5s);
+  `relay function inspect <name>` reads the latest persisted per-function
+  stats. Graceful shutdown performs a final bounded flush; a hard crash may
+  lose up to ~5s of telemetry. Redis event-processing correctness never depends
+  on SQLite stats.
 
 The daemon persists state at startup and on every reconcile. Three read-only CLI
 commands expose it (no Redis, Docker, or `/functions` needed — they read the
@@ -458,8 +467,11 @@ remains the health check.
   shutdown is graceful. Prometheus is the source for time-series metrics.
 - **SQLite operational snapshots**: the local state database also keeps the
   **current** operational counters (`stats`) and per-function counters
-  (`function_stats`) — latest totals only, never history or per-event rows. A
-  read-only CLI command renders the global snapshot:
+  (`function_stats`) — latest totals only, never history or per-event rows. The
+  worker flushes the in-memory registry into SQLite every 5 seconds (fixed,
+  non-configurable), so these rows may lag live Prometheus by up to ~5s; a
+  graceful shutdown performs a final bounded flush, while a hard crash may lose
+  up to ~5s of telemetry. A read-only CLI command renders the global snapshot:
 
 ```sh
 relay stats

@@ -134,10 +134,11 @@ func (c *State) initSchema(ctx context.Context) error {
 		// was considered but rejected: it would require PRAGMA foreign_keys=ON on
 		// every pooled connection (modernc applies DSN pragmas per connection) and
 		// migrating existing databases, and — decisively — the data model lets
-		// function_stats rows exist for a name without a functions row (the
-		// worker's snapshot loop writes them before any functions row exists),
-		// which FK enforcement would reject. Keep the explicit deletes: they are
-		// the tested contract.
+		// function_stats rows exist for a name without a functions row
+		// (RecordFunctionStats is a standalone upsert used by the CLI/tests and by
+		// callers that snapshot per-function counters directly), which FK
+		// enforcement would reject. Keep the explicit deletes: they are the tested
+		// contract.
 		`CREATE TABLE IF NOT EXISTS handlers (
 			function_name TEXT,
 			handler TEXT,

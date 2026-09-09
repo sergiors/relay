@@ -89,6 +89,9 @@ func TestRestorePersistedStatsNilSafe(t *testing.T) {
 // totals.
 func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
 	st := openTempState(t)
+	// alpha needs a functions row so its function_stats survives the flush's
+	// orphan pruning (a function_stats row with no functions row is pruned).
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	st.RecordStats(state.Stats{
 		EventsProcessedTotal: 100,
 		RetryTotal:           5,
@@ -106,7 +109,7 @@ func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
 	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
 
 	// The worker's statsLoop snapshots immediately on start.
-	recordSnapshots(st, m)
+	recordSnapshots(context.Background(), st, m)
 
 	gs, ok := st.Stats()
 	if !ok {
@@ -133,7 +136,7 @@ func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
 	// A second snapshot with no further activity must be idempotent: counters
 	// stay put while the gauge is refreshed.
 	m.SetGauge("pending_entries", 9)
-	recordSnapshots(st, m)
+	recordSnapshots(context.Background(), st, m)
 
 	gs, ok = st.Stats()
 	if !ok {
@@ -248,6 +251,10 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 	st.PruneRemoved(root)
+	// The real startup path records each loaded function (RecordDiscovered),
+	// giving "kept" a functions row so its function_stats survives the flush's
+	// orphan pruning.
+	st.RecordDiscovered(stateFunction("kept", keptDir))
 	m := metrics.New()
 	restorePersistedStats(m, st)
 
@@ -276,7 +283,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	// Run recordSnapshots (exactly what statsLoop does immediately) and confirm
 	// the persisted function_stats still has exactly one row and the global
 	// counters were written from the seeded registry.
-	recordSnapshots(st, m)
+	recordSnapshots(context.Background(), st, m)
 	all = st.AllFunctionStats()
 	if len(all) != 1 {
 		t.Fatalf("AllFunctionStats after snapshot len = %d, want 1: %+v", len(all), all)

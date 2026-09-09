@@ -20,6 +20,14 @@
 // event IDs, message IDs, container IDs, or fingerprints must never be used as
 // labels.
 //
+// Single source of truth: stats are accumulated IN MEMORY in this registry —
+// the runner, stream consumer, and runtime manager record against it directly,
+// and Prometheus /metrics reflects the current values immediately. There is no
+// second parallel counter store. The worker periodically snapshots this same
+// store into SQLite (a fixed 5-second cadence); SQLite stores snapshots, not
+// history. A hard crash loses at most the last unflushed interval of telemetry;
+// graceful shutdown performs a final bounded flush.
+//
 // Invariant: metrics are best-effort and must never interfere with event
 // processing. Every method on *Registry is safe to call on a nil receiver
 // (a no-op), so a missing or broken metrics pipeline never blocks or crashes the

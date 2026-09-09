@@ -185,6 +185,12 @@ func (r *Runner) Registry() *Registry { return r.reg }
 // matching rule's handler. It returns nil only when every invocation succeeded
 // (or nothing matched); otherwise it returns an error so the stream layer does
 // not acknowledge the message.
+//
+// At-least-once semantics: Handle returns an error after partial successes, so
+// a retried message re-runs the handlers that already succeeded. events_received
+// and events_processed count each delivery attempt that reaches the handler
+// handoff, so retries increment them too — they are delivery-attempt counters,
+// not unique-event counters.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
 	// A message received at the runner is one logical event handled across all
 	// matching rules. This is the message-level counter.
@@ -245,6 +251,9 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// A failing rule execution is a retry driver: the message will be
 				// retried or, once attempts are exhausted, routed to the DLQ. Both
 				// are downstream of this failure, so every failure counts here.
+				// This is the per-function retry driver, distinct from the
+				// message-level retries_total (stream layer), which counts
+				// redelivery/retry events once per message.
 				r.metrics.IncLabels("function_retries_total",
 					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 				// When this failure is the one that exhausts the delivery attempts

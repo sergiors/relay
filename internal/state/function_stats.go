@@ -27,15 +27,21 @@ type FunctionStats struct {
 	UpdatedAt            string
 }
 
-// RecordFunctionStats upserts the function_stats row for s.Function, replacing
-// every counter column with the supplied value and setting updated_at to now().
-// There is no accumulation: the worker hands over the CURRENT cumulative
-// registry values, so the row always mirrors the latest known totals. Callers
-// must pass CURRENT cumulative values; the worker seeds the fresh process
-// registry from this table at startup so the first snapshot never resets
-// counters. It is non-fatal on error: it logs and returns.
+// RecordFunctionStats upserts the function_stats row for s.Function. It is a
+// thin wrapper over RecordFunctionStatsContext using a background context, kept
+// for callers (tests, CLI) that do not need to bound the write.
 func (c *State) RecordFunctionStats(s FunctionStats) {
-	ctx := context.Background()
+	c.RecordFunctionStatsContext(context.Background(), s)
+}
+
+// RecordFunctionStatsContext upserts the function_stats row for s.Function,
+// replacing every counter column with the supplied value and setting updated_at
+// to now(). There is no accumulation: the worker hands over the CURRENT
+// cumulative registry values, so the row always mirrors the latest known
+// totals. Callers must pass CURRENT cumulative values; the worker seeds the
+// fresh process registry from this table at startup so the first snapshot
+// never resets counters. It is non-fatal on error: it logs and returns.
+func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats) {
 	ts := now()
 	_, err := c.db.ExecContext(ctx,
 		`INSERT INTO function_stats
