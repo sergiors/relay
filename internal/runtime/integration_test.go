@@ -5,6 +5,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -342,4 +343,165 @@ export function run(event) {
 	}
 	t.Logf("execute error: %v", err)
 	t.Logf("container logs: %s", logs)
+}
+
+// imageExistsInDaemon reports whether a local image carries exactly ref.
+func imageExistsInDaemon(cli *client.Client, ctx context.Context, ref string) bool {
+	_, err := cli.ImageInspect(ctx, ref)
+	return err == nil
+}
+
+// TestIntegrationFingerprintedImageLifecycle exercises the fingerprint-versioned
+// image lifecycle against a real Docker daemon: build v1 -> build v2 (changed
+// source) -> the two are distinct images and v1 still present -> cleanup keeping
+// only v2 retires v1 -> an unrelated (non-relay-owned) image is untouched. It
+// also asserts the unrelated image is NOT removed by the sweep.
+func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.hi
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v1'); }\n")
+
+	fn := function.Function{Name: "fn-ver", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fp1, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint v1: %v", err)
+	}
+	ref1 := ImageRef(fn.Name, fp1)
+	if imageExistsInDaemon(cli, ctx, ref1) {
+		t.Fatalf("image %s already exists before build", ref1)
+	}
+
+	p1, err := mPrepare(ctx, t, fn)
+	if err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+	if p1.Image != ref1 {
+		t.Fatalf("prepare image = %q, want %q", p1.Image, ref1)
+	}
+	if !imageExistsInDaemon(cli, ctx, ref1) {
+		t.Fatalf("image %s should exist after v1 build", ref1)
+	}
+
+	// Change source -> distinct fingerprint -> distinct image.
+	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v2'); }\n")
+	fp2, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint v2: %v", err)
+	}
+	ref2 := ImageRef(fn.Name, fp2)
+	if ref1 == ref2 {
+		t.Fatalf("v1 and v2 references must differ, both = %s", ref1)
+	}
+
+	p2, err := mPrepare(ctx, t, fn)
+	if err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	if p2.Image != ref2 {
+		t.Fatalf("prepare image = %q, want %q", p2.Image, ref2)
+	}
+	// v1 is still around (not clobbered by v2).
+	if !imageExistsInDaemon(cli, ctx, ref1) {
+		t.Fatalf("v1 image %s still expected to exist alongside v2", ref1)
+	}
+
+	// An unrelated, non-relay image we create: it must never be touched by the
+	// sweep. Build a tiny tagged image ourselves (not relay-namespaced) via the
+	// Manager's ImageBuild against an inline one-line Dockerfile.
+	unrelated := buildTestImage(ctx, t, "relay-unrelated-guard", `FROM scratch
+CMD []
+`)
+	defer cleanupImage(cli, ctx, unrelated)
+
+	// Conservative sweep keeping only ref2: ref1 (superseded) is removed, the
+	// unrelated image survives.
+	removed, err := mRemoveImagesExcept(ctx, t, map[string]bool{ref2: true})
+	if err != nil {
+		t.Fatalf("remove images except: %v", err)
+	}
+	if imageExistsInDaemon(cli, ctx, ref1) {
+		t.Errorf("v1 image %s should have been removed by the sweep", ref1)
+	}
+	if removed == 0 {
+		t.Errorf("expected at least one image removed (v1 %s)", ref1)
+	}
+	if !imageExistsInDaemon(cli, ctx, ref2) {
+		t.Errorf("kept v2 image %s must survive the sweep", ref2)
+	}
+	if !imageExistsInDaemon(cli, ctx, unrelated) {
+		t.Errorf("unrelated image %s must not be removed", unrelated)
+	}
+}
+
+// mPrepare builds a function via a fresh Manager wired to a discard logger.
+func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepared, error) {
+	t.Helper()
+	m, err := NewManager(log.New(io.Discard, "", 0), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m.Close()
+	return m.Prepare(ctx, fn)
+}
+
+// mRemoveImagesExcept runs the conservative sweep via a fresh Manager.
+func mRemoveImagesExcept(ctx context.Context, t *testing.T, keep map[string]bool) (int, error) {
+	t.Helper()
+	m, err := NewManager(log.New(io.Discard, "", 0), nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m.Close()
+	return m.RemoveImagesExcept(ctx, keep)
+}
+
+// buildTestImage builds a tiny image with the given tag and an inline Dockerfile
+// via the Engine API, used to create a non-relay-owned image to prove the sweep
+// never touches it.
+func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) string {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctxDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		t.Fatalf("write dockerfile: %v", err)
+	}
+	reader, err := tarContext(ctxDir)
+	if err != nil {
+		t.Fatalf("tar context: %v", err)
+	}
+	resp, err := cli.ImageBuild(ctx, reader, client.ImageBuildOptions{Tags: []string{ref}, Dockerfile: "Dockerfile"})
+	if err != nil {
+		t.Fatalf("build unrelated image: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err := drainBuildResponse(resp.Body); err != nil {
+		t.Fatalf("build unrelated image output: %v", err)
+	}
+	return ref
+}
+
+// cleanupImage removes an image, best-effort.
+func cleanupImage(cli *client.Client, ctx context.Context, ref string) {
+	_, _ = cli.ImageRemove(ctx, ref, client.ImageRemoveOptions{Force: true})
 }

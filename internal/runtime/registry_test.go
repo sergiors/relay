@@ -7,30 +7,46 @@ import (
 	"relay/internal/runtime/plan"
 )
 
+// TestImageRef verifies the fingerprint-versioned format
+// "relay-fn-<name>:<16hex>" and that it is deterministic.
 func TestImageRef(t *testing.T) {
-	// imageRef is a plain concatenation: names are validated at load time, so
-	// every name below is already safe for a docker tag.
+	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cases := []struct {
-		in   string
-		want string
+		name, fp, want string
 	}{
-		{"user-events", "relay-fn-user-events"},
-		{"welcome_email", "relay-fn-welcome_email"},
-		{"jobs.v2", "relay-fn-jobs.v2"},
+		{"user-events", fp, "relay-fn-user-events:0123456789abcdef"},
+		{"welcome_email", fp, "relay-fn-welcome_email:0123456789abcdef"},
+		{"jobs.v2", fp, "relay-fn-jobs.v2:0123456789abcdef"},
+		// The tag is only the first 16 hex chars; the rest is dropped.
+		{"a", "abcdef1234567890xyz", "relay-fn-a:abcdef1234567890"},
 	}
 	for _, tc := range cases {
-		if got := imageRef(tc.in); got != tc.want {
-			t.Errorf("imageRef(%q) = %q, want %q", tc.in, got, tc.want)
+		if got := ImageRef(tc.name, tc.fp); got != tc.want {
+			t.Errorf("ImageRef(%q) = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
 
-func TestImageRefNoCollisionSanitization(t *testing.T) {
-	// Names that the old sanitizer would have collapsed together (e.g. "my fn"
-	// and "my-fn") are now rejected at load time rather than normalized, so
-	// imageRef never needs a disambiguating hash suffix.
-	if got, want := imageRef("my-fn"), "relay-fn-my-fn"; got != want {
-		t.Errorf("imageRef(my-fn) = %q, want %q", got, want)
+// TestImageRefDeterministic asserts the same (name, fingerprint) always maps to
+// the same reference, and distinct fingerprints map to distinct references (so
+// two source versions can never collide on one image tag).
+func TestImageRefDeterministic(t *testing.T) {
+	fp1 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	fp2 := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if ImageRef("fn", fp1) != ImageRef("fn", fp1) {
+		t.Fatal("same fingerprint must yield the same reference")
+	}
+	if ImageRef("fn", fp1) == ImageRef("fn", fp2) {
+		t.Fatal("distinct fingerprints must yield distinct references")
+	}
+}
+
+// TestImageRefShortFingerprint verifies no panic and a sensible prefix when the
+// fingerprint is shorter than 16 chars (defensive; production fingerprints are
+// always 64 hex chars).
+func TestImageRefShortFingerprint(t *testing.T) {
+	if got, want := ImageRef("fn", "abc"), "relay-fn-fn:abc"; got != want {
+		t.Errorf("ImageRef(fn, abc) = %q, want %q", got, want)
 	}
 }
 

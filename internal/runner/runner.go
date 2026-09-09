@@ -116,6 +116,30 @@ type Runner struct {
 	reg     *Registry
 	log     *log.Logger
 	metrics *metrics.Registry
+	// refs tracks which relay images are currently executing and which have been
+	// retired but cannot be removed yet. It is what lets the runner retire
+	// superseded function versions without interrupting an in-flight execution
+	// (see ImageInUse / RetireImage).
+	refs *imageRefCounter
+	// cleaner resolves to the optional image lifecycle capability of the
+	// executor, resolved once and reused. A nil cleaner (fake executors in tests)
+	// makes every retirement a no-op.
+	cleanerOnce sync.Once
+	cleaner     ImageCleaner
+}
+
+// ImageCleaner is the subset of the runtime Manager that image retirement
+// needs. It is a small interface so the runner can retire superseded function
+// images without depending on the runtime package concretely; test fakes that
+// do not implement it simply yield a nil cleaner (no retirement).
+type ImageCleaner interface {
+	// RemoveImage removes a single relay-owned image, treating an already-gone
+	// image as success.
+	RemoveImage(ctx context.Context, image string) error
+	// FunctionImageTags lists every local image tag (full references) belonging
+	// to a function's repository, so the runner can retire each version with
+	// in-flight safety.
+	FunctionImageTags(ctx context.Context, name string) ([]string, error)
 }
 
 // Pairs a loaded function with its prepared image and the executor used to run
@@ -172,14 +196,136 @@ func NewWithMetrics(prepared []*PreparedFunction, logger *log.Logger, m *metrics
 	if logger == nil {
 		logger = log.Default()
 	}
-	r := &Runner{reg: &Registry{}, log: logger, metrics: m}
+	r := &Runner{reg: &Registry{}, log: logger, metrics: m, refs: newImageRefCounter()}
+	// When a retired image's last in-flight execution releases it, run the async
+	// removal automatically. r is fully built before any goroutine can run, and
+	// imageRemovedIdle is nil-safe on a nil cleaner.
+	r.refs.setOnIdle(r.imageRemovedIdle)
 	r.reg.Set(prepared)
 	return r
+}
+
+// imageRemovedIdle is the onIdle hook: a retired image just became idle, so
+// remove it off the event path.
+func (r *Runner) imageRemovedIdle(image string) {
+	r.removeImageAsync(image)
 }
 
 // Registry exposes the runner's mutable snapshot set so the reconciler can swap
 // functions live without round-tripping through New.
 func (r *Runner) Registry() *Registry { return r.reg }
+
+// resolver returns the runner's resolved image cleaner, or nil when the executor
+// does not implement retirement (tests, unavailable-only runners). It is resolved
+// once and cached; resolution scanning the registry is cheap and safe.
+func (r *Runner) resolver() ImageCleaner {
+	r.cleanerOnce.Do(func() {
+		for _, pf := range r.reg.snapshot() {
+			if c, ok := pf.executor.(ImageCleaner); ok {
+				r.cleaner = c
+				return
+			}
+		}
+	})
+	return r.cleaner
+}
+
+// ImageInUse reports whether any execution is currently holding a reference to
+// the given image (in-flight Handle). It is the guard the reconciler consults
+// before removing a superseded image, and Release uses it to know when a retired
+// image becomes removable.
+func (r *Runner) ImageInUse(image string) bool {
+	return r.refs.inUse(image)
+}
+
+// RetireImage retires the given image reference so it can be removed once it is
+// no longer in use. When nothing holds it now, it is removed immediately off the
+// event path; otherwise it is marked pending and removed once the last in-flight
+// execution releases it (see imageRefCounter.release → imageRemovedIdle). A nil
+// cleaner (no ImageCleaner executor) makes this a no-op, which is correct for
+// test fakes and unavailable-only runners.
+func (r *Runner) RetireImage(image string) {
+	if image == "" {
+		return
+	}
+	if !r.refs.recordRetired(image) {
+		// Already retired (first retirement owns removal); nothing to do.
+		return
+	}
+	if !r.ImageInUse(image) {
+		// Idle right now: remove immediately instead of waiting for a release
+		// that will only ever fire if a new execution picks this image up.
+		r.removeImageAsync(image)
+	}
+}
+
+// RemoveFunctionImages retires every local version of a function's images so
+// that, once idle, each is removed. It is the function-removal path: the
+// reconciler calls it when a function directory vanishes, and all of its version
+// images become garbage. A nil cleaner makes this a no-op.
+func (r *Runner) RemoveFunctionImages(name string) {
+	cleaner := r.resolver()
+	if cleaner == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	tags, err := cleaner.FunctionImageTags(ctx, name)
+	if err != nil {
+		r.log.Printf("image cleanup: list function %q versions: %v", name, err)
+		return
+	}
+	for _, tag := range tags {
+		r.RetireImage(tag)
+	}
+}
+
+// removeImageAsync removes a retired image off the event path so a docker round
+// trip can never add latency (or failure) to Handle. It re-checks in-use just
+// before removing because an execution may have (re)claimed the image after it
+// was retired; if so it is left in place for that execution and its own release
+// path. A nil cleaner is a no-op.
+func (r *Runner) removeImageAsync(image string) {
+	cleaner := r.resolver()
+	if cleaner == nil {
+		return
+	}
+	go func() {
+		// A retirement that is superseded by a new execution must not remove an
+		// image a container is about to start; skip removal if it became in-use.
+		if r.ImageInUse(image) {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		if err := cleaner.RemoveImage(ctx, image); err != nil {
+			r.log.Printf("image cleanup: remove retired %s: %v", image, err)
+		}
+	}()
+}
+
+// toImage returns the image a prepared function executes, or "" when it is
+// unavailable/nil so refcount and retirement stay nil-safe for fake and
+// unavailable paths.
+func toImage(pf *PreparedFunction) string {
+	if pf == nil || pf.prepared == nil {
+		return ""
+	}
+	return pf.prepared.Image
+}
+
+// executeWithRefs runs one rule's handler while holding a reference to the
+// function's image for the duration of the invocation, so a concurrent
+// RetireImage cannot remove the image an in-flight execution still needs
+// (at-least-once safety). The release is deferred so it runs even if the
+// executor panics; the helper is called per rule so the defer scope is
+// per-invocation rather than accumulating across a long rule loop.
+func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context, handler string, eventJSON []byte) error {
+	image := toImage(pf)
+	r.refs.acquire(image)
+	defer r.refs.release(image)
+	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON)
+}
 
 // Handle evaluates the event against all loaded functions and executes every
 // matching rule's handler. It returns nil only when every invocation succeeded
@@ -265,7 +411,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			}
 			invokeCtx, cancel := context.WithTimeout(ctx, rule.Timeout)
 			start := time.Now()
-			err = pf.executor.Execute(invokeCtx, pf.prepared, rule.Handler, eventJSON)
+			err = r.executeWithRefs(pf, invokeCtx, rule.Handler, eventJSON)
 			d := time.Since(start)
 			cancel()
 			if err != nil {
@@ -372,4 +518,108 @@ func stringify(v any) string {
 		return s
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// cleanupTimeout bounds every docker image-removal call made off the event path
+// (see removeImageAsync), so a wedged daemon cannot hold a goroutine or block
+// shutdown indefinitely. It is deliberately short: retirement is best-effort
+// cleanup, never on the critical path.
+const cleanupTimeout = 10 * time.Second
+
+// imageRefCounter tracks how many in-flight executions hold each image and which
+// images have been retired (superseded) but can only be removed once idle.
+//
+// acquire/release bracket a single invocation: the count for prepared.Image is
+// bumped on entry and dropped on return, so ImageInUse reports live executions
+// even while a swap concurrently replaces the registry entry. RetireImage marks
+// an image retired; when its count reaches zero, release triggers its
+// asynchronous removal via the runner (which owns the cleaner). A retired image
+// that is never in flight (count already zero at retire time) is removed
+// immediately by RetireImage instead.
+type imageRefCounter struct {
+	mu      sync.Mutex
+	uses    map[string]int64
+	retired map[string]bool
+	onIdle  func(image string)
+}
+
+// newImageRefCounter builds an empty counter whose onIdle hook fires removal.
+func newImageRefCounter() *imageRefCounter {
+	return &imageRefCounter{
+		uses:    map[string]int64{},
+		retired: map[string]bool{},
+	}
+}
+
+func (c *imageRefCounter) setOnIdle(fn func(string)) {
+	c.mu.Lock()
+	c.onIdle = fn
+	c.mu.Unlock()
+}
+
+func (c *imageRefCounter) acquire(image string) {
+	if image == "" {
+		return
+	}
+	c.mu.Lock()
+	c.uses[image]++
+	// A retired image was idle when its removal fired but is being (re)claimed by
+	// a new execution; drop the retirement mark so the pending removal aborts.
+	// The image cannot vanish mid-invocation: retire is guarded by in-use, and
+	// removing is guarded by in-use again under the same lock discipline.
+	delete(c.retired, image)
+	c.mu.Unlock()
+}
+
+// release drops a reference and, when a retired image's count just reached zero,
+// fires onIdle so the runner can remove it. Retired-but-idle images are removed
+// exactly once, and only after the last in-flight execution has finished.
+func (c *imageRefCounter) release(image string) {
+	if image == "" {
+		return
+	}
+	c.mu.Lock()
+	left := c.uses[image] - 1
+	if left <= 0 {
+		delete(c.uses, image)
+		left = 0
+	}
+	// If the image was marked retired and is now idle, ownership of its removal
+	// has transferred to this release: clear the mark (so no other release fires
+	// a duplicate) and report the idle transition.
+	becameIdle := left == 0 && c.retired[image]
+	if becameIdle {
+		delete(c.retired, image)
+	}
+	onIdle := c.onIdle
+	c.mu.Unlock()
+	if becameIdle && onIdle != nil {
+		onIdle(image)
+	}
+}
+
+// inUse reports whether an execution currently holds the image.
+func (c *imageRefCounter) inUse(image string) bool {
+	if image == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.uses[image] > 0
+}
+
+// recordRetired marks image as retired (superseded). It returns true when the
+// image was not already retired, so the caller knows whether this retirement
+// owns removal.
+func (c *imageRefCounter) recordRetired(image string) bool {
+	if image == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.retired[image] {
+		return false
+	}
+	c.retired[image] = true
+	return true
 }

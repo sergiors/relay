@@ -149,6 +149,41 @@ func run(logger *log.Logger) {
 	}
 	logger.Printf("prepared %d function(s)", preparedCount)
 
+	// Conservative startup image sweep. After every current function's image is
+	// built (reused if unchanged), remove Relay-owned images that no longer
+	// correspond to a live function version: superseded versions of current
+	// functions and versions of functions deleted while the worker was down.
+	//
+	// The keep set holds (a) each current function's expected fingerprinted
+	// image and (b) any last-active image the state DB recorded for a function
+	// that is still on disk. The latter guards the race where state recorded an
+	// image just before a swap that has not yet landed here (e.g. a crash
+	// between reg.Replace and RecordReconcileSuccess): the recorded image may
+	// still be the one serving, so it is never removed even if its fingerprint
+	// no longer matches. Images belonging to names absent from both /functions
+	// AND state (the DB pruned them earlier in startup) are genuinely removed
+	// and dropped. When state is nil (DB failed to open) we cannot distinguish
+	// a removed function from a mis-fingerprinted one, so orphan removal is
+	// skipped entirely and only the (self-evidently current) prepared images
+	// are kept; this is conservative: nothing is removed that might still serve.
+	keep := make(map[string]bool)
+	for _, fn := range functions {
+		if fp, err := function.Fingerprint(fn.Dir); err == nil {
+			keep[runtime.ImageRef(fn.Name, fp)] = true
+		}
+	}
+	// stateSweep is only armed when the DB was available.
+	if st != nil {
+		for _, fn := range functions {
+			if d, ok := st.GetFunction(fn.Name); ok && d.Image != "" {
+				keep[d.Image] = true
+			}
+		}
+		if _, err := manager.RemoveImagesExcept(context.Background(), keep); err != nil {
+			logger.Printf("image cleanup: startup sweep: %v", err)
+		}
+	}
+
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
 		Client:   client,
 		Stream:   cfg.redisStream,
@@ -188,9 +223,16 @@ func run(logger *log.Logger) {
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped
-	// atomically behind the snapshots the consumer already uses.
+	// atomically behind the snapshots the consumer already uses. The retire
+	// hooks hand superseded function images back to the runner so it can remove
+	// them once no in-flight execution uses them.
 	rec := reconciler.New(
-		reconciler.Config{Root: function.Dir, State: st},
+		reconciler.Config{
+			Root:           function.Dir,
+			State:          st,
+			Retire:         func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
+			RemoveFunction: runWorker.RemoveFunctionImages,
+		},
 		runWorker.Registry(),
 		manager,
 		logger,

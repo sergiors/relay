@@ -22,15 +22,38 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// imageRef maps a validated function name to its docker image tag. No sanitizing
-// is needed here: function names are validated at load time (internal/function)
-// to be [a-z0-9][a-z0-9._-]* and not end in '.', so they are already legal docker
-// tag names. Because validation rules out every name that could collide after a
-// transform, a plain concatenation is unambiguous. The "relay-fn-" prefix
-// namespaces all of Relay's images so they don't collide with unrelated images
-// on the same daemon.
-func imageRef(name string) string {
-	return "relay-fn-" + name
+// tagPrefixLen is the number of hex fingerprint characters used as the docker
+// tag. The full fingerprint is a 64-hex SHA-256 over the function directory;
+// that remains authoritative everywhere it is persisted (SQLite, Prepared). The
+// tag prefix is an opaque, collision-safe short handle: 16 hex chars = 64 bits,
+// and a birthday collision at the function-version counts Relay deals with (a
+// handful per function, tens of functions) is astronomically unlikely. Git's
+// default short-hash length is 7–12 chars (28–48 bits); 16 chars is comfortably
+// beyond that while staying well inside docker's tag length limit combined with
+// a validated name (name ≤ 63 chars, "relay-fn-" prefix, ":<16hex>" suffix → ≤
+// ~89 chars < 128). A full-fingerprint tag would add nothing but length: the
+// fingerprint still uniquely determines the tag, so equality on the tag is
+// equality on the source.
+const tagPrefixLen = 16
+
+// ImageRef maps a validated function name and its content fingerprint to the
+// docker image reference for that exact source version. No sanitizing is needed
+// for the name: function names are validated at load time (internal/function) to
+// be [a-z0-9][a-z0-9._-]* and not end in '.', so they are already legal docker
+// repository names. The reference always carries the short fingerprint tag, so
+// every distinct source version of a function is a distinct docker image and can
+// be built, reused, and retired independently without ever clobbering a sibling
+// version. The "relay-fn-" prefix namespaces all of Relay's images so they never
+// collide with unrelated images on the same daemon.
+//
+// Defensive on short input: fingerprints are always 64 chars in practice, but a
+// caller (or a truncated persisted value) passing fewer hex chars must not panic;
+// the tag is simply the first min(len, tagPrefixLen) chars.
+func ImageRef(name, fingerprint string) string {
+	if len(fingerprint) > tagPrefixLen {
+		fingerprint = fingerprint[:tagPrefixLen]
+	}
+	return "relay-fn-" + name + ":" + fingerprint
 }
 
 func buildImage(

@@ -50,6 +50,17 @@ type Config struct {
 	// the reconciler behaves exactly as before (no state writes). Errors from
 	// state calls are logged, never fatal.
 	State *state.State
+	// Retire, when set, is called after a function's registry entry is swapped
+	// to a new image, passing the function name and the superseded image
+	// reference (the version being replaced). It is how the runner learns to
+	// retire an image once it is no longer in use. Nil-safe; a stale or equal
+	// image is skipped by the caller. Ignoring the name is fine — the image
+	// reference already embeds it.
+	Retire func(name, oldImage string)
+	// RemoveFunction, when set, is called after a function directory vanishes
+	// (and its registry entry and state are dropped) so the runner can retire
+	// every version of that function's images. Nil-safe.
+	RemoveFunction func(name string)
 }
 
 // Watches Root, debounces per-function events, and swaps the registry when a
@@ -63,6 +74,9 @@ type Reconciler struct {
 	builder Builder
 	log     *log.Logger
 	st      *state.State
+	// retire/removeFunction are optional image-lifecycle hooks (see Config).
+	retire         func(name, oldImage string)
+	removeFunction func(name string)
 
 	mu          sync.Mutex
 	fingerprnts map[string]string // name -> last-reconciled fingerprint
@@ -90,17 +104,19 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *log.Logger) 
 		cfg.Interval = DefaultInterval
 	}
 	return &Reconciler{
-		root:        cfg.Root,
-		debounce:    cfg.Debounce,
-		interval:    cfg.Interval,
-		reg:         reg,
-		builder:     builder,
-		log:         logger,
-		st:          cfg.State,
-		fingerprnts: map[string]string{},
-		timers:      map[string]*time.Timer{},
-		incoming:    make(chan string, DefaultQueueSize),
-		done:        make(chan struct{}),
+		root:           cfg.Root,
+		debounce:       cfg.Debounce,
+		interval:       cfg.Interval,
+		reg:            reg,
+		builder:        builder,
+		log:            logger,
+		st:             cfg.State,
+		retire:         cfg.Retire,
+		removeFunction: cfg.RemoveFunction,
+		fingerprnts:    map[string]string{},
+		timers:         map[string]*time.Timer{},
+		incoming:       make(chan string, DefaultQueueSize),
+		done:           make(chan struct{}),
 	}
 }
 
@@ -418,10 +434,26 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 	pf := runner.NewPrepared(fn, built, r.builder)
 
+	// Determine the superseded image before swapping so we can retire it after
+	// the registry points at the new version. In-flight Handles keep the old
+	// snapshot's image; the runner's refcount guards removal until idle.
+	var oldImage string
+	if cur != nil && cur.Prepared() != nil {
+		oldImage = cur.Prepared().Image
+	}
+
 	r.reg.Replace(name, pf)
 	r.mu.Lock()
 	r.fingerprnts[name] = fp
 	r.mu.Unlock()
+
+	// Retire the superseded version now that the registry serves the new one.
+	// The hook (when wired) defers removal until the old image is no longer in
+	// use. Skip a nil hook and an equal image (an unavailable->unavailable
+	// retry, or a same-image re-prepare).
+	if r.retire != nil && oldImage != "" && oldImage != built.Image {
+		r.retire(name, oldImage)
+	}
 
 	if r.st != nil {
 		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
@@ -444,6 +476,11 @@ func (r *Reconciler) remove(name string) {
 	r.mu.Unlock()
 	if r.st != nil {
 		r.st.RecordRemoved(name)
+	}
+	// The directory is gone, so every version of this function's images is now
+	// garbage. Let the runner retire all of them (once idle) when wired.
+	if r.removeFunction != nil {
+		r.removeFunction(name)
 	}
 	r.log.Printf("function %q removed", name)
 }

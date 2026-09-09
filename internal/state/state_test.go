@@ -265,6 +265,29 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	}
 }
 
+// RecordReconcileSuccess round-trips a fingerprint-versioned image reference
+// like "relay-fn-user-events:3f8a2c1d..." exactly, since the state DB is the
+// authoritative persisted holder of the full fingerprinted image.
+func TestRecordReconcileSuccessRoundTripsFingerprintedImage(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	img := "relay-fn-user-events:3f8a2c1d9b6e4a17"
+	fp := "3f8a2c1d9b6e4a1700aa11bb22cc33dd44ee55ff66778899aabbccddeeff0011"
+	c.RecordReconcileSuccess("user-events", img, fp, time.Now(), fnFor(t, "user-events", tmpl))
+
+	d, ok := c.GetFunction("user-events")
+	if !ok {
+		t.Fatal("expected row after success")
+	}
+	if d.Image != img {
+		t.Fatalf("image = %q, want %q", d.Image, img)
+	}
+	if d.Fingerprint != fp {
+		t.Fatalf("fingerprint = %q, want %q", d.Fingerprint, fp)
+	}
+}
+
 // relativeAgo renders short relative ages and falls back to absolute dates.
 // Uses fixed Unix timestamps so sub-second truncation cannot make the test
 // flaky: the "now" reference is chosen to land each age on an exact second.

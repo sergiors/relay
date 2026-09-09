@@ -194,6 +194,24 @@ which runtime to use and which events it handles.
 - A function whose image cannot be built is logged and marked unavailable; the
   other functions continue to be served.
 
+### Image lifecycle
+
+Function images are **versioned by source fingerprint**. Each function's content
+is hashed (SHA-256 over file paths + bytes) and the image is tagged
+`relay-fn-<name>:<first-16-hex-of-fingerprint>`; the full 64-hex fingerprint
+stays authoritative in the local state database and on the prepared function.
+
+- A rebuild produces a **new immutable image version**; an existing image for
+  the exact fingerprint is reused without rebuilding.
+- Relay swaps to the new version only after preparation succeeds — the old
+  version keeps serving until then, and a failed build leaves the old version
+  active.
+- Old Relay-owned images are removed only once they are no longer in use
+  (in-flight executions are protected), including on function removal and at
+  startup.
+- Relay manages **only its own `relay-fn-*` images** — it never prunes globally
+  or touches other apps' images or layers.
+
 ## Template format
 
 ```yaml
