@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/state"
 )
@@ -210,4 +212,93 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 	if gs.DLQTotal != 2 {
 		t.Fatalf("dlq = %d, want 2", gs.DLQTotal)
 	}
+}
+
+// TestStartupSweepPrunesBeforeSeeding proves the startup ordering contract
+// end-to-end at the worker level: PruneRemoved must run BEFORE
+// restorePersistedStats so a function removed while the worker was down is
+// pruned before its stale function_stats row could be re-seeded into metrics.
+func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
+	st := openTempState(t)
+
+	// A real functions root with ONE function dir ("kept"); "stale" has no dir.
+	root := t.TempDir()
+	keptDir := filepath.Join(root, "kept")
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
+		t.Fatalf("mkdir kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "template.yaml"), []byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"), 0o644); err != nil {
+		t.Fatalf("write kept template: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
+		t.Fatalf("write kept index: %v", err)
+	}
+
+	// Seed the DB as if a prior process had run: "stale" succeeded (no dir on
+	// disk now) and both functions have per-function counters.
+	st.RecordReconcileSuccess("stale", "img", "fp", time.Now(), stateFunction("stale", keptDir))
+	st.RecordFunctionStats(state.FunctionStats{Function: "stale", EventsProcessedTotal: 5})
+	st.RecordFunctionStats(state.FunctionStats{Function: "kept", EventsProcessedTotal: 7})
+	// A cumulative global row, so restorePersistedStats seeds the registry's
+	// global counter and the first snapshot writes it back unchanged.
+	st.RecordStats(state.Stats{EventsProcessedTotal: 7})
+
+	// Simulate the worker startup order: rebuild, prune, then seed the registry.
+	if err := st.RebuildFromFS(root); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	st.PruneRemoved(root)
+	m := metrics.New()
+	restorePersistedStats(m, st)
+
+	// AllFunctionStats now returns only "kept"; "stale" is absent.
+	all := st.AllFunctionStats()
+	if len(all) != 1 {
+		t.Fatalf("AllFunctionStats len = %d, want 1 (only kept): %+v", len(all), all)
+	}
+	if all[0].Function != "kept" || all[0].EventsProcessedTotal != 7 {
+		t.Fatalf("AllFunctionStats = %+v, want only kept events 7", all[0])
+	}
+	if _, ok := st.FunctionStats("stale"); ok {
+		t.Fatal("stale function_stats must be pruned before seeding")
+	}
+
+	// The seeded registry contains ONLY kept's counters: the pruned "stale" row
+	// was NOT re-seeded into metrics.
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 {
+		t.Fatalf("FunctionStatsSnapshot len = %d, want 1: %+v", len(fs), fs)
+	}
+	if fs[0].Function != "kept" || fs[0].Events != 7 {
+		t.Fatalf("seeded registry = %+v, want only kept events 7", fs[0])
+	}
+
+	// Run recordSnapshots (exactly what statsLoop does immediately) and confirm
+	// the persisted function_stats still has exactly one row and the global
+	// counters were written from the seeded registry.
+	recordSnapshots(st, m)
+	all = st.AllFunctionStats()
+	if len(all) != 1 {
+		t.Fatalf("AllFunctionStats after snapshot len = %d, want 1: %+v", len(all), all)
+	}
+	if all[0].Function != "kept" || all[0].EventsProcessedTotal != 7 {
+		t.Fatalf("function_stats after snapshot = %+v, want only kept events 7", all[0])
+	}
+	gs, ok := st.Stats()
+	if !ok {
+		t.Fatal("expected global stats row after snapshot")
+	}
+	if gs.EventsProcessedTotal != 7 {
+		t.Fatalf("global events = %d, want 7 (from seeded kept registry)", gs.EventsProcessedTotal)
+	}
+}
+
+// stateFunction builds a minimal function.Function for seeding state rows in
+// worker tests without importing the reconciler's helpers.
+func stateFunction(name, dir string) function.Function {
+	tmpl, err := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
+	if err != nil {
+		panic(err)
+	}
+	return function.Function{Name: name, Dir: dir, Template: tmpl}
 }

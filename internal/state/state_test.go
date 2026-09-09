@@ -292,3 +292,77 @@ func TestRelativeAgo(t *testing.T) {
 		}
 	}
 }
+
+// PruneRemoved removes state for functions missing from the authoritative dir,
+// INCLUDING handlers and function_stats, while keeping functions that still
+// exist on disk and leaving the global stats row untouched.
+func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
+	// rows (handlers + function_stats) so the sweep must clean them inclusively.
+	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), fnFor(t, "gone", tmpl))
+	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsProcessedTotal: 5})
+	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), fnFor(t, "kept", tmpl))
+	c.RecordFunctionStats(FunctionStats{Function: "kept", EventsProcessedTotal: 9})
+	// The global stats row must never be touched by pruning.
+	want := Stats{EventsProcessedTotal: 55}
+	c.RecordStats(want)
+
+	// Real roots: create "kept", leave "gone" out, plus a stray non-function
+	// file to confirm only dirs matter.
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+		t.Fatalf("mkdir kept: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write stray: %v", err)
+	}
+
+	c.PruneRemoved(root)
+
+	// "gone" fully removed.
+	if _, ok := c.GetFunction("gone"); ok {
+		t.Fatal("gone function row must be pruned")
+	}
+	if _, ok := c.FunctionStats("gone"); ok {
+		t.Fatal("gone function_stats must be pruned")
+	}
+
+	// "kept" survives with its function_stats.
+	if _, ok := c.GetFunction("kept"); !ok {
+		t.Fatal("kept function row must survive")
+	}
+	ks, ok := c.FunctionStats("kept")
+	if !ok || ks.EventsProcessedTotal != 9 {
+		t.Fatalf("kept function_stats = %+v, ok=%v; want events 9", ks, ok)
+	}
+
+	// Global stats untouched.
+	gs, ok := c.Stats()
+	if !ok {
+		t.Fatal("global stats row must survive pruning")
+	}
+	if gs.EventsProcessedTotal != 55 {
+		t.Fatalf("global stats changed by prune: %+v", gs)
+	}
+}
+
+// PruneRemoved is a no-op when the DB is empty and never drops a function that
+// still exists on disk even if its state row predates the disk contents.
+func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
+	c := openTestState(t)
+	root := t.TempDir()
+	c.PruneRemoved(root) // empty DB: no-op, must not error or log fatally
+
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	c.RecordDiscovered(fnFor(t, "demo", tmpl))
+	if err := os.MkdirAll(filepath.Join(root, "demo"), 0o755); err != nil {
+		t.Fatalf("mkdir demo: %v", err)
+	}
+	c.PruneRemoved(root)
+	if _, ok := c.GetFunction("demo"); !ok {
+		t.Fatal("demo must survive pruning while present on disk")
+	}
+}

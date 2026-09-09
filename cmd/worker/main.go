@@ -83,6 +83,12 @@ func run(logger *log.Logger) {
 		if err := st.RebuildFromFS(function.Dir); err != nil {
 			logger.Printf("state: rebuild from fs (continuing): %v", err)
 		}
+		// Prune state rows for functions that no longer exist on disk. This
+		// must run BEFORE restorePersistedStats so a pruned function's
+		// function_stats row is gone before the fresh registry is seeded from
+		// it: a function removed while this worker was down must not be re-seeded
+		// into metrics.
+		st.PruneRemoved(function.Dir)
 		for _, fn := range functions {
 			st.RecordDiscovered(fn)
 		}

@@ -129,6 +129,15 @@ func (c *State) initSchema(ctx context.Context) error {
 			last_error TEXT,
 			updated_at TEXT
 		)`,
+		// handlers is keyed by function_name but carries no foreign key: cleanup
+		// is explicit (removeTx), not relational. A relational ON DELETE CASCADE
+		// was considered but rejected: it would require PRAGMA foreign_keys=ON on
+		// every pooled connection (modernc applies DSN pragmas per connection) and
+		// migrating existing databases, and — decisively — the data model lets
+		// function_stats rows exist for a name without a functions row (the
+		// worker's snapshot loop writes them before any functions row exists),
+		// which FK enforcement would reject. Keep the explicit deletes: they are
+		// the tested contract.
 		`CREATE TABLE IF NOT EXISTS handlers (
 			function_name TEXT,
 			handler TEXT,
@@ -325,18 +334,78 @@ func (c *State) RecordSkipped(name string) {
 func (c *State) RecordRemoved(name string) {
 	ctx := context.Background()
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM functions WHERE name = ?`, name)
-		return err
+		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
 		c.log.Printf("state: record removed %q: %v", name, err)
 	}
+}
+
+// PruneRemoved removes state rows for every function recorded in the database
+// that no longer exists in dir (the authoritative /functions root), including
+// its handlers and function_stats. The filesystem is the source of truth; this
+// only removes rows for functions genuinely absent from disk. Transient stat
+// errors (permissions/I/O) are skipped — a flaky read must not drop a function
+// that is still on disk, mirroring the reconciler's removal tolerance. The
+// global single-row stats table is deliberately untouched. It is intended to
+// run at startup, before the fresh registry's counters are seeded from the
+// persisted function_stats (restorePersistedStats), so a function removed while
+// the worker was down is pruned before its stale function_stats row could be
+// re-seeded into metrics.
+func (c *State) PruneRemoved(dir string) {
+	ctx := context.Background()
+
+	// Collect every recorded name up front and close the rows before deleting:
+	// the delete transaction below acquires its own connection from the pool, and
+	// fully consuming the query first keeps the read and write paths independent.
+	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
+	if err != nil {
+		c.log.Printf("state: prune removed: list functions: %v", err)
+		return
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			c.log.Printf("state: prune removed: scan name: %v", err)
+			_ = rows.Close()
+			return
+		}
+		names = append(names, name)
+	}
+	_ = rows.Close()
+
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
+			// Reuse the same single-function removal path as RecordRemoved so the
+			// live reconciler and the startup sweep behave identically.
+			if rerr := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+				return removeTx(ctx, tx, name)
+			}); rerr != nil {
+				c.log.Printf("state: prune removed %q: %v", name, rerr)
+				continue
+			}
+			c.log.Printf("state: function %q removed (pruned at startup)", name)
+		}
+		// Any other stat error (permissions/I/O) is skipped: only a genuine
+		// os.IsNotExist means the function was removed from the filesystem.
+	}
+}
+
+// removeTx deletes a function and all of its state rows — handlers,
+// function_stats, and the functions row itself — inside tx. It is shared by the
+// live reconciler removal (RecordRemoved) and the startup sweep (PruneRemoved)
+// so both are behaviorally identical: a removed function never leaves a stale
+// handlers or function_stats row behind.
+func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM functions WHERE name = ?`, name)
+	return err
 }
 
 // ListFunctions returns the function summaries sorted by name. A nil/empty
