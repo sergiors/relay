@@ -55,7 +55,9 @@ func run(logger *log.Logger) {
 
 	// The metrics registry is wired into the runner, the runtime manager, and
 	// the stream consumer. It is nil-safe throughout, so observability can never
-	// break processing.
+	// break processing. It is process-lifetime-scoped: its counters start at 0,
+	// so after the state DB opens below we seed it from the persisted cumulative
+	// snapshot (see restorePersistedStats) before the snapshot loop starts.
 	m := metrics.New()
 
 	loader := function.NewLoader(function.Dir, logger)
@@ -85,6 +87,15 @@ func run(logger *log.Logger) {
 			st.RecordDiscovered(fn)
 		}
 	}
+
+	// Restore the persisted cumulative counters into the fresh registry before
+	// the snapshot loop starts. The registry only knows this process's lifetime,
+	// while the SQLite stats rows are cumulative history; seeding bridges them so
+	// the immediate first snapshot (see statsLoop) writes back the restored
+	// values instead of zeroing the persisted totals. Gauges are deliberately
+	// NOT restored — they are point-in-time backlog snapshots refreshed each
+	// snapshot.
+	restorePersistedStats(m, st)
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
@@ -183,6 +194,36 @@ func run(logger *log.Logger) {
 		logger.Fatalf("consume: %v", err)
 	}
 	logger.Printf("shutdown complete")
+}
+
+// restorePersistedStats seeds the fresh process-lifetime metrics registry with
+// the cumulative counters persisted in the state database, so the first
+// snapshot never resets them. The registry only knows this process's lifetime,
+// while the SQLite stats rows are cumulative history; seeding bridges them. It
+// is nil-safe on both the registry and the state handle (a nil st means the DB
+// failed to open, so there is nothing to restore). Gauges are deliberately NOT
+// restored: they are point-in-time backlog snapshots refreshed each snapshot.
+func restorePersistedStats(m *metrics.Registry, st *state.State) {
+	if m == nil || st == nil {
+		return
+	}
+	if gs, ok := st.Stats(); ok {
+		m.SeedCounter("events_processed_total", gs.EventsProcessedTotal)
+		m.SeedCounter("handler_success_total", gs.HandlerSuccessTotal)
+		m.SeedCounter("handler_failure_total", gs.HandlerFailureTotal)
+		m.SeedCounter("retries_total", gs.RetryTotal)
+		m.SeedCounter("dlq_entries_total", gs.DLQTotal)
+	}
+	for _, fs := range st.AllFunctionStats() {
+		m.SeedFunctionStat(metrics.FunctionStat{
+			Function:            fs.Function,
+			Events:              fs.EventsProcessedTotal,
+			HandlerSuccessTotal: fs.HandlerSuccessTotal,
+			HandlerFailureTotal: fs.HandlerFailureTotal,
+			RetriesTotal:        fs.RetryTotal,
+			DLQTotal:            fs.DLQTotal,
+		})
+	}
 }
 
 // snapshotStats maps the metrics registry into the state database's Stats row.

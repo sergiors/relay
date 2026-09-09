@@ -26,7 +26,9 @@ type Stats struct {
 // updated_at is set to now(). There is no accumulation: the worker hands over
 // the CURRENT cumulative registry values for the counters and current gauge
 // snapshots for the backlog, so the row always mirrors the latest known totals.
-// It is non-fatal on error: it logs and returns.
+// Callers must pass CURRENT cumulative values; the worker seeds the fresh
+// process registry from this table at startup so the first snapshot never
+// resets counters. It is non-fatal on error: it logs and returns.
 func (c *State) RecordStats(s Stats) {
 	ctx := context.Background()
 	ts := now()

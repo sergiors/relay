@@ -185,17 +185,50 @@ func (r *Registry) Inc(name string) {
 	r.Add(name, 1)
 }
 
+// AddLabels adds n to the labeled counter for name. The label subset is mapped
+// onto the metric's canonical label order (values are picked by name, so the
+// caller's argument order does not matter). A nil receiver is a no-op; an
+// unknown metric name is ignored.
+func (r *Registry) AddLabels(name string, labels []Label, n int64) {
+	if r == nil {
+		return
+	}
+	if lc, ok := r.counterVecs[name]; ok {
+		lc.vec.WithLabelValues(r.values(lc.order, labels)...).Add(float64(n))
+	}
+}
+
 // IncLabels increments the labeled counter by one. The label subset is mapped
 // onto the metric's canonical label order (values are picked by name, so the
 // caller's argument order does not matter). A nil receiver is a no-op; an
 // unknown metric name is ignored.
 func (r *Registry) IncLabels(name string, labels []Label) {
+	r.AddLabels(name, labels, 1)
+}
+
+// SeedCounter sets the unlabeled counter name to v by adding v to it. It is
+// used at worker startup to bridge the process-lifetime registry onto the
+// cumulative totals persisted in the state database, so the first snapshot
+// never resets them. A nil receiver is a no-op; an unknown name is ignored.
+func (r *Registry) SeedCounter(name string, v int64) {
+	r.Add(name, v)
+}
+
+// SeedFunctionStat restores a function's persisted cumulative counters into the
+// per-function CounterVecs. It is the labeled counterpart of SeedCounter: the
+// worker calls it at startup for every function_stats row so idle functions keep
+// their prior totals instead of being reset by the first snapshot. A nil
+// receiver is a no-op.
+func (r *Registry) SeedFunctionStat(f FunctionStat) {
 	if r == nil {
 		return
 	}
-	if lc, ok := r.counterVecs[name]; ok {
-		lc.vec.WithLabelValues(r.values(lc.order, labels)...).Inc()
-	}
+	labels := []Label{{Name: "function", Value: f.Function}}
+	r.AddLabels("function_events_total", labels, f.Events)
+	r.AddLabels("function_handler_success_total", labels, f.HandlerSuccessTotal)
+	r.AddLabels("function_handler_failure_total", labels, f.HandlerFailureTotal)
+	r.AddLabels("function_retries_total", labels, f.RetriesTotal)
+	r.AddLabels("function_dlq_total", labels, f.DLQTotal)
 }
 
 // ObserveDuration records a single duration observation against the labeled

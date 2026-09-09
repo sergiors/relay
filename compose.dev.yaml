@@ -32,6 +32,8 @@ services:
         condition: service_healthy
       socket-proxy:
         condition: service_started
+    ports:
+      - 9090:9090
     environment:
       - REDIS_ADDR=redis:6379
       - REDIS_STREAM=events

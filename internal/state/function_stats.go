@@ -30,8 +30,10 @@ type FunctionStats struct {
 // RecordFunctionStats upserts the function_stats row for s.Function, replacing
 // every counter column with the supplied value and setting updated_at to now().
 // There is no accumulation: the worker hands over the CURRENT cumulative
-// registry values, so the row always mirrors the latest known totals. It is
-// non-fatal on error: it logs and returns.
+// registry values, so the row always mirrors the latest known totals. Callers
+// must pass CURRENT cumulative values; the worker seeds the fresh process
+// registry from this table at startup so the first snapshot never resets
+// counters. It is non-fatal on error: it logs and returns.
 func (c *State) RecordFunctionStats(s FunctionStats) {
 	ctx := context.Background()
 	ts := now()
@@ -75,4 +77,34 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 		return FunctionStats{}, false
 	}
 	return s, true
+}
+
+// AllFunctionStats returns every function_stats row ordered by function name.
+// The worker uses it at startup to restore counters for functions that have
+// persisted stats even when the fresh registry snapshot is empty (e.g. a
+// function idle this process but active last process). It returns nil on error
+// (which is logged), matching the file's non-fatal style.
+func (c *State) AllFunctionStats() []FunctionStats {
+	ctx := context.Background()
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT function_name, events_processed_total, handler_success_total,
+		        handler_failure_total, retry_total, dlq_total, updated_at
+		 FROM function_stats ORDER BY function_name`)
+	if err != nil {
+		c.log.Printf("state: list function stats: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var out []FunctionStats
+	for rows.Next() {
+		var s FunctionStats
+		if err := rows.Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
+			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal, &s.UpdatedAt); err != nil {
+			c.log.Printf("state: scan function stats: %v", err)
+			return out
+		}
+		out = append(out, s)
+	}
+	return out
 }
