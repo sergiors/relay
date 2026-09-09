@@ -10,7 +10,7 @@ import (
 
 // renderDockerfile is the ONLY Dockerfile renderer, shared by every engine; an
 // engine must express its concerns as plan data rather than generate a
-// Dockerfile. It emits FROM/WORKDIR/COPY/RUN/ENTRYPOINT from the plan.
+// Dockerfile. It emits FROM/WORKDIR/COPY/RUN/USER/ENTRYPOINT from the plan.
 func renderDockerfile(p plan.BuildPlan) string {
 	var b strings.Builder
 
@@ -42,6 +42,16 @@ func renderDockerfile(p plan.BuildPlan) string {
 		if cmd != "" {
 			b.WriteString("RUN " + cmd + "\n")
 		}
+	}
+
+	// UserSetup runs as root after Install so dependency installation (which
+	// needs root for site-packages/node_modules) is unaffected by the runtime
+	// user. It creates the user and hands the writable paths to it.
+	if p.UserSetup != "" {
+		b.WriteString("RUN " + p.UserSetup + "\n")
+	}
+	if p.User != "" {
+		b.WriteString("USER " + p.User + "\n")
 	}
 
 	if len(p.Entrypoint) > 0 {

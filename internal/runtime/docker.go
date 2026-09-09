@@ -37,6 +37,11 @@ import (
 // equality on the source.
 const tagPrefixLen = 16
 
+// ptr returns a pointer to v. It is a tiny helper for the pointer-typed fields
+// in the container HostConfig (e.g. PidsLimit) so the hardening values read as
+// literals rather than requiring a local variable.
+func ptr[T any](v T) *T { return &v }
+
 // ImageRef maps a validated function name and its content fingerprint to the
 // docker image reference for that exact source version. No sanitizing is needed
 // for the name: function names are validated at load time (internal/function) to
@@ -165,9 +170,17 @@ func tarContext(ctxDir string) (io.Reader, error) {
 		}
 		name := filepath.ToSlash(rel)
 		if info.IsDir() {
-			return tw.WriteHeader(&tar.Header{Name: name + "/", Mode: int64(info.Mode().Perm()), Typeflag: tar.TypeDir})
+			return tw.WriteHeader(&tar.Header{
+				Name:     name + "/",
+				Mode:     int64(info.Mode().Perm()),
+				Typeflag: tar.TypeDir,
+			})
 		}
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: int64(info.Mode().Perm()), Size: info.Size()}); err != nil {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: int64(info.Mode().Perm()),
+			Size: info.Size(),
+		}); err != nil {
 			return err
 		}
 		f, err := os.Open(path)
@@ -235,21 +248,35 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 // container exit status is the result: 0 is success, non-zero is failure. A
 // cancelled context is reported as cancellation, not as a docker error. meta is
 // the diagnostic metadata stamped as container labels (purely for triage; see
-// RunMeta). The container is created with AutoRemove so the daemon removes it
-// the moment it exits; Relay's deferred removal only cleans up the paths where
-// the container never exits on its own (e.g. a failed start).
+// RunMeta). env are the function's runtime environment variables (from the
+// engine's plan), merged after the base RELAY_HANDLER var. The container is
+// created with AutoRemove so the daemon removes it the moment it exits; Relay's
+// deferred removal only cleans up the paths where the container never exits on
+// its own (e.g. a failed start).
+//
+// Every execution container is hardened: it runs as a non-root user (set at
+// build time via the plan's USER), drops all Linux capabilities, is memory/CPU/
+// pids-limited, has a read-only rootfs, and gets a bounded /tmp tmpfs. These are
+// internal defaults, not configuration. Networking is left enabled: outbound
+// access is a legitimate function need, and network policy is a documented
+// residual limitation rather than something this layer enforces.
 func runContainer(
 	ctx context.Context,
 	cli *client.Client,
 	log func(format string, args ...any),
-	name, image, handler string,
+	name, image string,
+	env []string,
+	handler string,
 	eventJSON []byte,
 	meta RunMeta,
 ) error {
+	// Merge the base handler var with the function's plan env. The plan env is
+	// per-function (not per-run), so it is applied uniformly to every invocation.
+	containerEnv := append([]string{"RELAY_HANDLER=" + handler}, env...)
 	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image:        image,
-			Env:          []string{"RELAY_HANDLER=" + handler},
+			Env:          containerEnv,
 			OpenStdin:    true,
 			StdinOnce:    true,
 			AttachStdin:  true,
@@ -262,7 +289,25 @@ func runContainer(
 		// still deliver output and exit code first; the daemon removes it once
 		// the process has stopped). This is the normal cleanup path: Relay no
 		// longer needs to remove normally-exited containers itself.
-		HostConfig: &container.HostConfig{AutoRemove: true},
+		//
+		// Hardening: non-root user (set in the image), all capabilities dropped,
+		// memory/CPU/pids limits, read-only rootfs, and a bounded /tmp tmpfs.
+		// /tmp is the one writable path handlers get: Python's tempfile and
+		// Node's temp-file helpers default to it, so a bounded tmpfs keeps
+		// normal library behavior working without giving the container a
+		// writable rootfs. The tmpfs is size-bounded and mounted nosuid/noexec
+		// so it cannot be used to escalate or execute dropped binaries.
+		HostConfig: &container.HostConfig{
+			AutoRemove: true,
+			Resources: container.Resources{
+				Memory:    512 << 20,     // 512 MiB
+				NanoCPUs:  1_000_000_000, // 1 CPU
+				PidsLimit: ptr(int64(128)),
+			},
+			CapDrop:        []string{"ALL"},
+			ReadonlyRootfs: true,
+			Tmpfs:          map[string]string{"/tmp": "rw,nosuid,noexec,size=64m"},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("docker run: create container: %w", err)

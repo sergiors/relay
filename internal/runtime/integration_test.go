@@ -734,6 +734,206 @@ export async function sleeper(event) {
 	}
 }
 
+// TestIntegrationContainerHardening drives a real execution of both a Python
+// and a Node function whose handlers assert the hardening from inside the
+// container (non-root uid, read-only rootfs, writable /tmp, dropped caps), and
+// mid-flight inspects the running container to assert the resource limits and
+// host-config hardening are actually applied by the daemon. It also asserts
+// networking is not disabled (outbound access is a legitimate function need).
+func TestIntegrationContainerHardening(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+
+	// Python handler: asserts non-root uid, read-only rootfs (write to / must
+	// fail with EROFS), writable /tmp, and dropped capabilities (CapEff == 0).
+	// It exits non-zero on any failed assertion so Execute surfaces the failure.
+	pyDir := t.TempDir()
+	writeFile(t, pyDir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.check
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, pyDir, "handler.py", `
+import os
+import tempfile
+
+def check(event):
+    # Non-root: the runtime user is uid 10001.
+    if os.geteuid() != 10001:
+        raise SystemExit("expected euid 10001, got %d" % os.geteuid())
+
+    # Read-only rootfs: writing to / must fail with EROFS.
+    try:
+        with open("/probe-rootfs", "w") as f:
+            f.write("x")
+        raise SystemExit("expected write to / to fail on read-only rootfs")
+    except OSError as e:
+        if e.errno != 30:  # EROFS
+            raise SystemExit("expected EROFS writing to /, got errno %d" % e.errno)
+
+    # /tmp is the writable tmpfs: write, read back, unlink.
+    fd, path = tempfile.mkstemp(dir="/tmp")
+    with os.fdopen(fd, "w") as f:
+        f.write("tmp-ok")
+    with open(path) as f:
+        if f.read() != "tmp-ok":
+            raise SystemExit("tmpfs readback mismatch")
+    os.unlink(path)
+
+    # Dropped capabilities: CapEff must be 0 (CapDrop ALL).
+    cap_eff = None
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("CapEff:"):
+                cap_eff = line.split()[1]
+                break
+    if cap_eff != "0000000000000000":
+        raise SystemExit("expected CapEff 0, got %s" % cap_eff)
+
+    print("python hardening ok")
+`)
+	writeFile(t, pyDir, "requirements.txt", "# no deps\n")
+
+	// Node handler: same assertions via process.getuid(), fs write to /, /tmp
+	// write, and /proc/self/status CapEff.
+	ndDir := t.TempDir()
+	writeFile(t, ndDir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.check
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, ndDir, "index.js", `
+import { writeFileSync, readFileSync, unlinkSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+export function check(event) {
+  // Non-root: the runtime user is uid 10001.
+  if (process.getuid() !== 10001) {
+    throw new Error("expected uid 10001, got " + process.getuid());
+  }
+
+  // Read-only rootfs: writing to / must fail with EROFS.
+  try {
+    writeFileSync("/probe-rootfs", "x");
+    throw new Error("expected write to / to fail on read-only rootfs");
+  } catch (e) {
+    if (e.code !== "EROFS") {
+      throw new Error("expected EROFS writing to /, got " + e.code);
+    }
+  }
+
+  // /tmp is the writable tmpfs: write, read back, unlink.
+  const dir = mkdtempSync(join(tmpdir(), "relay-"));
+  const p = join(dir, "f");
+  writeFileSync(p, "tmp-ok");
+  if (readFileSync(p, "utf8") !== "tmp-ok") {
+    throw new Error("tmpfs readback mismatch");
+  }
+  unlinkSync(p);
+
+  // Dropped capabilities: CapEff must be 0 (CapDrop ALL).
+  const status = readFileSync("/proc/self/status", "utf8");
+  const m = status.match(/^CapEff:\s+(\S+)/m);
+  if (!m || m[1] !== "0000000000000000") {
+    throw new Error("expected CapEff 0, got " + (m && m[1]));
+  }
+
+  console.log("node hardening ok");
+}
+`)
+
+	// Run both functions. Each Prepare builds a fresh image; the in-handler
+	// assertions run inside the hardened container and Execute returns nil only
+	// if every assertion passed.
+	for _, tc := range []struct {
+		name    string
+		dir     string
+		runtime string
+		handler string
+		event   []byte
+	}{
+		{"python", pyDir, "python3.14", "handler.check", []byte(`{"status":"COMPLETED"}`)},
+		{"node", ndDir, "node24", "index.check", []byte(`{"event_name":"INSERT"}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := function.Function{Name: "harden-" + tc.name, Dir: tc.dir, Template: &function.Template{Runtime: tc.runtime}}
+			m, buf := newManager(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			prepared, err := m.Prepare(ctx, fn)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+
+			// Run the handler in a goroutine so we can inspect the container
+			// mid-flight while it runs.
+			execCtx := context.WithValue(context.Background(), runMetaKey{},
+				RunMeta{Hostname: "test-host", Function: "harden-" + tc.name, Handler: tc.handler, Image: prepared.Image})
+			done := make(chan error, 1)
+			go func() {
+				done <- m.Execute(execCtx, prepared, tc.handler, tc.event)
+			}()
+
+			// Poll for the running container, then inspect it to assert the
+			// host-config hardening is actually applied by the daemon.
+			id := ""
+			deadline := time.Now().Add(15 * time.Second)
+			for time.Now().Before(deadline) {
+				if id = findContainerByLabel(ctx, m.cli, labelHandler, tc.handler); id != "" {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if id == "" {
+				t.Fatal("container not found during execution")
+			}
+			insp, err := m.cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+			if err != nil {
+				t.Fatalf("inspect container: %v", err)
+			}
+			hc := insp.Container.HostConfig
+			if hc == nil {
+				t.Fatal("inspect returned nil HostConfig")
+			}
+			if hc.Memory != 512<<20 {
+				t.Errorf("memory limit = %d, want %d", hc.Memory, 512<<20)
+			}
+			if hc.NanoCPUs != 1_000_000_000 {
+				t.Errorf("nano cpus = %d, want %d", hc.NanoCPUs, 1_000_000_000)
+			}
+			if hc.PidsLimit == nil || *hc.PidsLimit != 128 {
+				t.Errorf("pids limit = %v, want 128", hc.PidsLimit)
+			}
+			if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" {
+				t.Errorf("cap drop = %v, want [ALL]", hc.CapDrop)
+			}
+			if !hc.ReadonlyRootfs {
+				t.Error("expected read-only rootfs")
+			}
+			if hc.Tmpfs["/tmp"] != "rw,nosuid,noexec,size=64m" {
+				t.Errorf("tmpfs = %v, want /tmp rw,nosuid,noexec,size=64m", hc.Tmpfs)
+			}
+			if insp.Container.Config == nil || insp.Container.Config.NetworkDisabled {
+				t.Error("expected networking to remain enabled (NetworkDisabled false)")
+			}
+
+			if err := <-done; err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.name+" hardening ok") {
+				t.Errorf("expected in-handler hardening assertions to pass, got logs:\n%s", buf.String())
+			}
+		})
+	}
+}
+
 // createOrphanContainer creates and starts a node:24-alpine container carrying
 // the given labels and command, returning its ID. t.Cleanup force-removes it so
 // the sweep tests never leak.

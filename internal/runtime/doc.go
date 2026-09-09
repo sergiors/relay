@@ -15,5 +15,14 @@
 //     imports or Node module resolution
 //   - The package knows nothing about matching or Redis
 //
+// Security baseline: every execution container is hardened. It runs as a
+// non-root user created at build time (the engines set the plan's User/UserSetup),
+// drops all Linux capabilities, is memory/CPU/pids-limited, has a read-only
+// rootfs, and gets a bounded /tmp tmpfs as its only writable path. These are
+// internal defaults, not configuration. Networking stays enabled (outbound
+// access is a legitimate function need; network policy is a documented residual
+// limitation). The function code is unaware of all of this: the hardening is
+// applied entirely by the engines and the container runner.
+//
 // Usage: NewManager, then Prepare per function, then Execute per invocation.
 package runtime

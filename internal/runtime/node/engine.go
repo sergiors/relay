@@ -29,6 +29,23 @@ const workDir = "/app"
 const pkgFile = "package.json"
 const lockFile = "package-lock.json"
 
+// The runtime user is a fixed numeric identity (10001:10001) shared by every
+// Relay function so the container never runs as root and the identity is stable
+// across images and rebuilds; the numeric id is what the kernel enforces, so the
+// user/group name is cosmetic. node:24-alpine (BusyBox) has no pre-created user,
+// so the Dockerfile creates one at build time via UserSetup. Node needs only read
+// access to /app (ESM modules are read, not compiled to a cache by default), so
+// /app is chowned to the user for symmetry with the Python engine; the read-only
+// rootfs is never written at runtime.
+const (
+	userID   = "10001:10001"
+	userName = "app"
+	// userSetup runs as root at build time. /relay holds the bootstrap, which the
+	// user only needs to read. chown uses the numeric id so it is independent of
+	// the user/group name.
+	userSetup = "addgroup -g 10001 app && adduser -D -u 10001 -G app -h /home/app -s /sbin/nologin app && chown -R 10001:10001 /app /relay"
+)
+
 // esmPackageJSON is a minimal package.json injected when the function has none,
 // so that .js files are interpreted as ESM.
 var esmPackageJSON = func() []byte {
@@ -74,6 +91,8 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		WorkDir:    workDir,
 		Files:      files,
 		Install:    install,
+		UserSetup:  userSetup,
+		User:       userID,
 		Entrypoint: entrypoint,
 	}, nil
 }

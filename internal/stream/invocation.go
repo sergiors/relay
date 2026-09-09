@@ -64,7 +64,13 @@ type invocationStore struct {
 
 // completed reports whether the invocation has already completed for this
 // message; redis.Nil (field absent) means not completed.
-func (p *invocationStore) completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error) {
+func (p *invocationStore) completed(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) (bool, error) {
 	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
 		return false, nil
@@ -78,7 +84,13 @@ func (p *invocationStore) completed(ctx context.Context, stream, group, msgID, i
 // markComplete records that the invocation completed for this message. HSET and
 // EXPIRE are pipelined so the TTL is refreshed on every write without an extra
 // round trip.
-func (p *invocationStore) markComplete(ctx context.Context, stream, group, msgID, invocation string) error {
+func (p *invocationStore) markComplete(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) error {
 	key := invocationStateKey(stream, group, msgID)
 	pipe := p.client.Pipeline()
 	pipe.HSet(ctx, key, invocation, "ok")
@@ -97,7 +109,13 @@ func (p *invocationStore) clear(ctx context.Context, stream, group, msgID string
 // completedSet reads the completion state of many invocations in one HMGET,
 // returning a map keyed by invocation. It avoids per-invocation round trips when
 // the caller knows the full set of invocations for a delivery up front.
-func (p *invocationStore) completedSet(ctx context.Context, stream, group, msgID string, invocations []string) (map[string]bool, error) {
+func (p *invocationStore) completedSet(
+	ctx context.Context,
+	stream,
+	group,
+	msgID string,
+	invocations []string,
+) (map[string]bool, error) {
 	if len(invocations) == 0 {
 		return map[string]bool{}, nil
 	}

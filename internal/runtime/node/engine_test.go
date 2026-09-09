@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay/internal/runtime/plan"
@@ -47,6 +48,15 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			}
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" {
 				t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs]", p.Entrypoint)
+			}
+			if p.User != "10001:10001" {
+				t.Errorf("user = %q, want 10001:10001", p.User)
+			}
+			if !strings.Contains(p.UserSetup, "adduser -D -u 10001") {
+				t.Errorf("user setup = %q, want an adduser for uid 10001", p.UserSetup)
+			}
+			if len(p.Env) != 0 {
+				t.Errorf("env = %v, want none for node", p.Env)
 			}
 
 			var foundBootstrap bool

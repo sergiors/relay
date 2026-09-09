@@ -41,6 +41,19 @@ type BuildPlan struct {
 	// Install are shell commands run inside the image at build time (e.g. "pip
 	// install ..."). Empty when there is nothing to install.
 	Install []string
+	// UserSetup is a single RUN command that creates the runtime user and
+	// prepares the writable paths it needs (e.g. "groupadd ... && useradd ...
+	// && chown ..."). It runs as root AFTER Install so dependency installation
+	// is unaffected. Empty when the image should keep its default user.
+	UserSetup string
+	// User is the USER instruction rendered after UserSetup (e.g. "10001:10001").
+	// Empty when no USER line should be emitted (back-compat with unhardened
+	// plans).
+	User string
+	// Env are environment variables applied to the execution container at
+	// runtime (not build time). They are merged after the base RELAY_HANDLER
+	// variable. Empty when the runtime needs no extra environment.
+	Env []string
 	// Entrypoint is the container entrypoint as a JSON-array ENTRYPOINT.
 	Entrypoint []string
 }

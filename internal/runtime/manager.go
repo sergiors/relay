@@ -81,6 +81,10 @@ type Prepared struct {
 	Name        string
 	Image       string
 	Fingerprint string
+	// Env are the runtime environment variables the function's engine requires
+	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
+	// execution container for this function, after the base RELAY_HANDLER var.
+	Env []string
 }
 
 // Prepare builds exactly ONE image for the function's current content (never per
@@ -123,7 +127,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// comparison is needed.
 	if m.imageExists(ctx, image) {
 		m.log.Printf("function %q: image %s exists; reusing", fn.Name, image)
-		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp}, nil
+		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 	}
 
 	start := time.Now()
@@ -146,7 +150,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
 	m.log.Printf("function %q: built%s",
 		fn.Name, logging.Fields("function", fn.Name, "duration", d, "result", "success"))
-	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp}, nil
+	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 }
 
 // Execute runs the container for one invocation of the given handler with the
@@ -175,6 +179,7 @@ func (m *Manager) Execute(
 		m.log.Printf,
 		prepared.Name,
 		prepared.Image,
+		prepared.Env,
 		handler,
 		eventJSON,
 		meta,

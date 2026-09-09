@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay/internal/runtime/plan"
@@ -38,6 +39,15 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			}
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "python" || p.Entrypoint[1] != "/relay/bootstrap.py" {
 				t.Errorf("entrypoint = %v, want [python /relay/bootstrap.py]", p.Entrypoint)
+			}
+			if p.User != "10001:10001" {
+				t.Errorf("user = %q, want 10001:10001", p.User)
+			}
+			if !strings.Contains(p.UserSetup, "useradd -u 10001") {
+				t.Errorf("user setup = %q, want a useradd for uid 10001", p.UserSetup)
+			}
+			if len(p.Env) != 1 || p.Env[0] != "PYTHONDONTWRITEBYTECODE=1" {
+				t.Errorf("env = %v, want [PYTHONDONTWRITEBYTECODE=1]", p.Env)
 			}
 
 			var found bool

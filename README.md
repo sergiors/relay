@@ -237,6 +237,12 @@ containers (running ones are force-removed/stopped). It **never** touches
 containers owned by other hostnames (another replica's property, live or crashed)
 or any non-Relay container, and does no global pruning.
 
+Every execution container is hardened: it runs as a non-root user (uid 10001,
+baked into the generated image), is limited to 512 MiB memory / 1 CPU / 128 PIDs,
+drops all Linux capabilities, has a read-only root filesystem with a bounded
+`/tmp` tmpfs, and keeps outbound networking enabled (a documented residual, not a
+sandbox for untrusted code).
+
 ## Template format
 
 ```yaml
