@@ -39,14 +39,23 @@ type Manager struct {
 	// metrics is an optional observability registry. A nil registry disables
 	// all metric recording; every call is a no-op.
 	metrics *metrics.Registry
+	// hostname identifies this worker for container ownership. It is the same
+	// value as the Redis consumer identity (config.ConsumerName), so Relay's
+	// container-label hostname and its stream consumer identity are one and the
+	// same. The startup orphan sweep uses it to distinguish this worker's
+	// stalled containers from those of every other worker sharing the daemon.
+	hostname string
 }
 
 // NewManager connects to the Docker daemon so failures surface at startup
 // rather than per event. The client is configured from the environment
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
 // version automatically. m is an optional observability registry; a nil registry
-// disables metric recording (every call is a no-op).
-func NewManager(logger *log.Logger, m *metrics.Registry) (*Manager, error) {
+// disables metric recording (every call is a no-op). hostname is this worker's
+// hostname-scoped container ownership identity (e.g. config.ConsumerName()); it
+// is stamped as the relay.hostname label on every execution container and gates
+// the startup orphan sweep.
+func NewManager(logger *log.Logger, m *metrics.Registry, hostname string) (*Manager, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -58,7 +67,7 @@ func NewManager(logger *log.Logger, m *metrics.Registry) (*Manager, error) {
 		_ = cli.Close()
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
-	return &Manager{log: logger, cli: cli, metrics: m}, nil
+	return &Manager{log: logger, cli: cli, metrics: m, hostname: hostname}, nil
 }
 
 // Close releases the Docker Engine client. It is safe to call once during
@@ -142,13 +151,24 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 
 // Execute runs the container for one invocation of the given handler with the
 // event JSON on stdin. The context must carry the per-invocation timeout; a
-// timeout kills the invocation and is treated as a failure.
+// timeout kills the invocation and is treated as a failure. The invocation's
+// diagnostic RunMeta is read from ctx (see WithRunMeta); when absent the labels
+// are empty, which is harmless (labels are diagnostic-only).
 func (m *Manager) Execute(
 	ctx context.Context,
 	prepared *Prepared,
 	handler string,
 	eventJSON []byte,
 ) error {
+	meta := RunMetaFrom(ctx)
+	if meta.Hostname == "" {
+		// Fall back to the manager's worker identity so a direct caller that
+		// did not inject RunMeta still stamps the container's owner (and so an
+		// orphaned container from this worker is still attributable at sweep
+		// time). The runner always injects the full meta; this is the safety
+		// net for direct/integration callers.
+		meta.Hostname = m.hostname
+	}
 	return runContainer(
 		ctx,
 		m.cli,
@@ -157,5 +177,6 @@ func (m *Manager) Execute(
 		prepared.Image,
 		handler,
 		eventJSON,
+		meta,
 	)
 }

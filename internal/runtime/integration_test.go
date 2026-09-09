@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
@@ -46,12 +47,13 @@ func writeFile(t *testing.T, dir, name, content string) {
 }
 
 // newManager returns a Manager wired to a logger that writes into the returned
-// buffer, so container output is captured for assertions.
+// buffer, so container output is captured for assertions. The manager owns
+// hostname "test-host" so container-ownership tests are deterministic.
 func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	l := log.New(&buf, "", 0)
-	m, err := NewManager(l, nil)
+	m, err := NewManager(l, nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -453,7 +455,7 @@ CMD []
 // mPrepare builds a function via a fresh Manager wired to a discard logger.
 func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepared, error) {
 	t.Helper()
-	m, err := NewManager(log.New(io.Discard, "", 0), nil)
+	m, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -464,7 +466,7 @@ func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepare
 // mRemoveImagesExcept runs the conservative sweep via a fresh Manager.
 func mRemoveImagesExcept(ctx context.Context, t *testing.T, keep map[string]bool) (int, error) {
 	t.Helper()
-	m, err := NewManager(log.New(io.Discard, "", 0), nil)
+	m, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -504,4 +506,306 @@ func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) s
 // cleanupImage removes an image, best-effort.
 func cleanupImage(cli *client.Client, ctx context.Context, ref string) {
 	_, _ = cli.ImageRemove(ctx, ref, client.ImageRemoveOptions{Force: true})
+}
+
+// findContainerByLabel scans All containers for one carrying the exact
+// relay.<key>=<value> label, returning its ID or "". It is a client-side filter
+// matching the sweep's own ownership predicate.
+func findContainerByLabel(ctx context.Context, cli *client.Client, key, value string) string {
+	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return ""
+	}
+	for _, c := range list.Items {
+		if c.Labels[key] == value {
+			return c.ID
+		}
+	}
+	return ""
+}
+
+// waitForContainerGone polls until no running-or-exited container carries the
+// given label pair, or the deadline passes. AutoRemove removes the container on
+// exit asynchronously: ContainerWait delivers the exit code the moment the
+// process stops, but the daemon's removal completes a beat later, so callers
+// must await removal rather than assert it at the instant Execute returns.
+// It returns true once the container is gone.
+func waitForContainerGone(ctx context.Context, cli *client.Client, key, value string) bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if findContainerByLabel(ctx, cli, key, value) == "" {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// TestIntegrationContainerLabelsAndAutoRemove drives a real execution while
+// verifying the seven diagnostic labels are present mid-flight (polled while the
+// handler runs), that AutoRemove removes the container the moment it exits, that
+// stdout is still captured, and that a non-zero exit code surfaces as an error
+// while the container is still removed.
+func TestIntegrationContainerLabelsAndAutoRemove(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, buf := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.slow
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function slow(event) {
+  await new Promise(r => setTimeout(r, 1500));
+  console.log("completed " + event.event_id);
+}
+`)
+	fn := function.Function{Name: "labels-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{
+			Function:  "labels-e2e",
+			Handler:   "index.slow",
+			MessageID: "1791234567890-0",
+			EventID:   "evt_777",
+			EventName: "INSERT",
+			Hostname:  "test-host",
+			Image:     prepared.Image,
+		})
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Execute(execCtx, prepared, "index.slow", []byte(`{"event_id":"evt_777","event_name":"INSERT"}`))
+	}()
+
+	// Poll while the handler runs (sleeep 1.5s) for the container carrying our
+	// handler label, then assert the full label set before it exits.
+	id := ""
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if id = findContainerByLabel(ctx, m.cli, labelHandler, "index.slow"); id != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if id == "" {
+		t.Fatal("container with relay.handler=index.slow not found during execution")
+	}
+	// Inspect what we saw to assert all seven labels.
+	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		t.Fatalf("list containers: %v", err)
+	}
+	var summaryLabels map[string]string
+	for _, c := range list.Items {
+		if c.ID == id {
+			summaryLabels = c.Labels
+		}
+	}
+	if summaryLabels == nil {
+		t.Fatalf("container %s not in listing", id)
+	}
+	for k, want := range map[string]string{
+		labelFunction:  "labels-e2e",
+		labelHandler:   "index.slow",
+		labelMessageID: "1791234567890-0",
+		labelEventID:   "evt_777",
+		labelEventName: "INSERT",
+		labelHostname:  "test-host",
+		labelImage:     prepared.Image,
+	} {
+		if got := summaryLabels[k]; got != want {
+			t.Errorf("label %q = %q, want %q", k, got, want)
+		}
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(buf.String(), "completed evt_777") {
+		t.Errorf("expected stdout to contain %q, got: %s", "completed evt_777", buf.String())
+	}
+	// AutoRemove: the container must vanish after exit (asynchronously on the
+	// daemon side, so poll).
+	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.slow") {
+		t.Error("container should have been auto-removed after exit")
+	}
+}
+
+// TestIntegrationNonZeroExitAutoRemove verifies a handler that exits non-zero
+// surfaces as an Execute error AND is still auto-removed (attach + exit code
+// handling preserve the existing contract with AutoRemove enabled).
+func TestIntegrationNonZeroExitAutoRemove(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.fail
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function fail(event) {
+  console.error("boom");
+  process.exit(1);
+}
+`)
+	fn := function.Function{Name: "fail-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
+	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`))
+	if err == nil {
+		t.Fatal("expected execute to fail for non-zero exit")
+	}
+	if !strings.Contains(err.Error(), "exited with status 1") {
+		t.Errorf("expected exit-status error, got: %v", err)
+	}
+	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.fail") {
+		t.Error("container should have been auto-removed after non-zero exit")
+	}
+}
+
+// TestIntegrationTimeoutAutoRemove verifies the existing per-rule timeout path
+// still works with AutoRemove: an over-long handler is killed on cancellation,
+// the error surfaces, and the killed container is removed.
+func TestIntegrationTimeoutAutoRemove(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.sleeper
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function sleeper(event) {
+  await new Promise(r => setTimeout(r, 10000));
+  console.log("done");
+}
+`)
+	fn := function.Function{Name: "timeout-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Timeout the invocation after 1s: the handler sleeps 10s, so the ctx
+	// cancel path must kill the container.
+	invokeCtx, invokeCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer invokeCancel()
+	execCtx := context.WithValue(invokeCtx, runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image})
+	err = m.Execute(execCtx, prepared, "index.sleeper", []byte(`{"event_name":"INSERT"}`))
+	if err == nil {
+		t.Fatal("expected execute to fail on timeout")
+	}
+	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.sleeper") {
+		t.Error("timed-out container should have been auto-removed after kill/exit")
+	}
+}
+
+// createOrphanContainer creates and starts a node:24-alpine container carrying
+// the given labels and command, returning its ID. t.Cleanup force-removes it so
+// the sweep tests never leak.
+func createOrphanContainer(t *testing.T, cli *client.Client, ctx context.Context, labels map[string]string) string {
+	t.Helper()
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     &container.Config{Image: "node:24-alpine", Labels: labels, Cmd: []string{"sh", "-c", "sleep 300"}},
+		HostConfig: &container.HostConfig{},
+	})
+	if err != nil {
+		t.Fatalf("create orphan container: %v", err)
+	}
+	id := resp.ID
+	t.Cleanup(func() {
+		_ = removeContainer(cli, id)
+	})
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+		t.Fatalf("start orphan container %s: %v", id, err)
+	}
+	return id
+}
+
+// TestIntegrationSweepOrphanContainers verifies the startup sweep removes a
+// stalled Relay container owned by the current hostname, leaves another worker's
+// container alone, and never touches an unrelated (non-Relay-labeled) container.
+func TestIntegrationSweepOrphanContainers(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+
+	// Our orphan: relay labels + our hostname, left running (as a crashed prior
+	// process would leave a mid-invocation container).
+	ours := createOrphanContainer(t, cli, ctx, map[string]string{
+		labelFunction: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
+	})
+	// Another worker's orphan: different hostname, must survive.
+	theirs := createOrphanContainer(t, cli, ctx, map[string]string{
+		labelFunction: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
+	})
+	// Unrelated container: no relay labels, must survive.
+	unrelated := createOrphanContainer(t, cli, ctx, map[string]string{"app": "whatever"})
+
+	if _, err := m.SweepOrphanContainers(ctx, "test-host"); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	// Our hostname's orphan is gone...
+	list, _ := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	for _, c := range list.Items {
+		if c.ID == ours {
+			t.Errorf("orphan container %s (ours) should have been swept", ours)
+		}
+	}
+	// ...while the other worker's and the unrelated container survive.
+	for _, cid := range []string{theirs, unrelated} {
+		found := false
+		for _, c := range list.Items {
+			if c.ID == cid {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("container %s should NOT have been swept", cid)
+		}
+	}
 }

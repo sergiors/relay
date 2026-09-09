@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/jsonstream"
@@ -199,6 +200,21 @@ func killContainer(cli *client.Client, id string) {
 	_, _ = cli.ContainerKill(killCtx, id, client.ContainerKillOptions{})
 }
 
+// removeContainer removes a container, treating an already-removed container as
+// success. With AutoRemove the daemon removes the container as soon as it exits,
+// so Relay's deferred best-effort removal routinely races the daemon and hits a
+// not-found; that is the intended outcome and must not be logged as noise. Only
+// a real (non-not-found) removal failure is surfaced so the caller can log it.
+func removeContainer(cli *client.Client, id string) error {
+	rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
+	if errors.Is(err, cerrdefs.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // drainWait consumes the eventual ContainerWait delivery on either channel so
 // the client's per-request goroutine (which writes to these channels) can exit
 // instead of blocking forever. It is called only after the container has been
@@ -217,8 +233,19 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 // runContainer runs the image once for a single handler invocation, writing the
 // event JSON to stdin. Container stdout/stderr are forwarded to Relay logs. The
 // container exit status is the result: 0 is success, non-zero is failure. A
-// cancelled context is reported as cancellation, not as a docker error.
-func runContainer(ctx context.Context, cli *client.Client, log func(format string, args ...any), name, image, handler string, eventJSON []byte) error {
+// cancelled context is reported as cancellation, not as a docker error. meta is
+// the diagnostic metadata stamped as container labels (purely for triage; see
+// RunMeta). The container is created with AutoRemove so the daemon removes it
+// the moment it exits; Relay's deferred removal only cleans up the paths where
+// the container never exits on its own (e.g. a failed start).
+func runContainer(
+	ctx context.Context,
+	cli *client.Client,
+	log func(format string, args ...any),
+	name, image, handler string,
+	eventJSON []byte,
+	meta RunMeta,
+) error {
 	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image:        image,
@@ -229,18 +256,26 @@ func runContainer(ctx context.Context, cli *client.Client, log func(format strin
 			AttachStdout: true,
 			AttachStderr: true,
 			Tty:          false,
+			Labels:       runLabels(meta),
 		},
+		// AutoRemove removes the container as soon as it exits (attach and wait
+		// still deliver output and exit code first; the daemon removes it once
+		// the process has stopped). This is the normal cleanup path: Relay no
+		// longer needs to remove normally-exited containers itself.
+		HostConfig: &container.HostConfig{AutoRemove: true},
 	})
 	if err != nil {
 		return fmt.Errorf("docker run: create container: %w", err)
 	}
 	id := createResp.ID
 	// Best-effort cleanup on every path; a leaked container is worse than a
-	// failed remove.
+	// failed remove. With AutoRemove the daemon has usually removed the
+	// container already, so removeContainer treats not-found as success; only
+	// genuine failures are logged.
 	defer func() {
-		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
+		if err := removeContainer(cli, id); err != nil {
+			log("docker run: remove container %s: %v", id, err)
+		}
 	}()
 
 	// Attach before start so the hijacked stream is ready to receive stdin and

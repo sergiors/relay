@@ -117,11 +117,27 @@ func run(logger *log.Logger) {
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
-	manager, err := runtime.NewManager(logger, m)
+	manager, err := runtime.NewManager(logger, m, consumerName)
 	if err != nil {
 		logger.Fatalf("runtime: %v", err)
 	}
 	defer manager.Close()
+
+	// Conservative startup orphan sweep. Before any function is prepared or any
+	// execution container is created, remove execution containers left behind by
+	// a previous Relay process on THIS hostname (a crash mid-invocation, or a
+	// never-exited container). It is label- and hostname-scoped, so other
+	// workers' containers and non-Relay containers are never touched. A bounded
+	// context guarantees the sweep can never hang startup; on timeout or error
+	// we log and continue, leaving the orphans for a later restart.
+	sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, consumerName)
+	sweepCancel()
+	if sweepErr != nil {
+		logger.Printf("startup: orphan container sweep: %v", sweepErr)
+	} else if n > 0 {
+		logger.Printf("startup: removed %d orphan container(s) from a previous relay process", n)
+	}
 	preparedCount := 0
 	var prepared []*runner.PreparedFunction
 	for _, fn := range functions {
@@ -220,6 +236,10 @@ func run(logger *log.Logger) {
 	}
 
 	runWorker := runner.NewWithMetrics(prepared, logger, m)
+	// Stamp the relay.hostname label (the worker/consumer identity) on every
+	// execution container. Must be set before Consume begins; it is wired right
+	// after construction so all invocations carry it.
+	runWorker.SetHostname(consumerName)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped

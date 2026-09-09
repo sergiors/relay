@@ -212,6 +212,31 @@ stays authoritative in the local state database and on the prepared function.
 - Relay manages **only its own `relay-fn-*` images** — it never prunes globally
   or touches other apps' images or layers.
 
+### Execution container lifecycle
+
+Every function execution container is created with Docker **AutoRemove**, so the
+daemon removes a container itself the moment its process exits — even if Relay
+is crash-killed/OOM-killed/SIGKILL'd mid-run. Relay's deferred removal remains
+only as a backstop for paths where the container never exits on its own (e.g. a
+failed start), and treats the daemon's now-async auto-removal (a not-found
+error) as success.
+
+Every execution container also carries seven **diagnostic-only** Docker labels —
+`relay.function`, `relay.handler`, `relay.message_id`, `relay.event_id`,
+`relay.event_name`, `relay.hostname`, `relay.image` — so an orphan container can
+be attributed to its function/handler/message/event/worker/image. They carry no
+payload contents (only bounded IDs and function/handler names) and Relay's
+event-processing correctness never depends on them.
+
+At startup, before any function is prepared or any container created, Relay runs
+a conservative **orphan sweep** (bounded to 30s): it lists containers and removes
+only those carrying the `relay.function` label **and** a `relay.hostname` label
+matching its own hostname (= its Redis consumer name) — leftovers from a previous
+crashed process on the same host. It removes both exited and running stale
+containers (running ones are force-removed/stopped). It **never** touches
+containers owned by other hostnames (another replica's property, live or crashed)
+or any non-Relay container, and does no global pruning.
+
 ## Template format
 
 ```yaml

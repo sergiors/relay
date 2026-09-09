@@ -126,6 +126,12 @@ type Runner struct {
 	// makes every retirement a no-op.
 	cleanerOnce sync.Once
 	cleaner     ImageCleaner
+	// hostname is this worker's container-ownership identity, stamped as the
+	// relay.hostname label on every execution container via RunMeta. It is the
+	// same value as the Redis consumer identity. It must be set (via
+	// SetHostname) before Consume begins; when unset, an empty hostname label is
+	// emitted, which is diagnostic-only and harmless.
+	hostname string
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
@@ -214,6 +220,18 @@ func (r *Runner) imageRemovedIdle(image string) {
 // Registry exposes the runner's mutable snapshot set so the reconciler can swap
 // functions live without round-tripping through New.
 func (r *Runner) Registry() *Registry { return r.reg }
+
+// SetHostname sets this worker's container-ownership hostname, stamped as the
+// relay.hostname label on every execution container. It is nil-safe (a nil
+// Runner is a no-op) and must be called before Consume begins processing; it
+// takes effect on the next Handle, so setting it right after construction (as
+// cmd/worker/main.go does) labels every invocation.
+func (r *Runner) SetHostname(h string) {
+	if r == nil {
+		return
+	}
+	r.hostname = h
+}
 
 // resolver returns the runner's resolved image cleaner, or nil when the executor
 // does not implement retirement (tests, unavailable-only runners). It is resolved
@@ -410,6 +428,18 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 			}
 			invokeCtx, cancel := context.WithTimeout(ctx, rule.Timeout)
+			// Stamp the invocation's diagnostic metadata into the context so the
+			// executor can attach it as container labels. This keeps the
+			// Executor interface (and every test fake) unchanged.
+			invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+				Function:  pf.fn.Name,
+				Handler:   rule.Handler,
+				MessageID: msgID,
+				EventID:   eventID,
+				EventName: eventName,
+				Hostname:  r.hostname,
+				Image:     toImage(pf),
+			})
 			start := time.Now()
 			err = r.executeWithRefs(pf, invokeCtx, rule.Handler, eventJSON)
 			d := time.Since(start)

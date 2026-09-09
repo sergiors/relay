@@ -88,7 +88,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := log.New(&buf, "", 0)
-	m, err := runtime.NewManager(logger, nil)
+	m, err := runtime.NewManager(logger, nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
