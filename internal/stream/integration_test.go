@@ -18,6 +18,8 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/metrics"
 )
 
 // redisAddr is the Redis address used by integration tests, overridable via
@@ -713,4 +715,43 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("consumer did not stop")
 	}
+}
+
+// TestIntegrationPendingGauge verifies the metrics sampler records the
+// XPENDING depth gauge and the retries_total counter when a message stays
+// pending across redeliveries.
+func TestIntegrationPendingGauge(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	m := metrics.New()
+	e := newEnv(t, ConsumerConfig{
+		MaxAttempts:     100, // keep the message pending (never exhaust to DLQ)
+		Metrics:         m,
+		MetricsInterval: 100 * time.Millisecond,
+	})
+	e.xadd(t, `{"a":1}`)
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		return fmt.Errorf("always fail to keep pending")
+	})
+
+	// The sampler records pending_entries once the failed message is in the PEL.
+	waitFor(t, "pending_entries gauge set", func() bool {
+		return strings.Contains(m.Snapshot(), "pending_entries value=1")
+	})
+
+	got := m.Snapshot()
+	if !strings.Contains(got, "pending_entries value=1") {
+		t.Fatalf("pending_entries not set; snapshot:\n%s", got)
+	}
+	// The oldest-pending age must be recorded (the just-added message is young
+	// but its parseable age is > 0).
+	if !strings.Contains(got, "pending_oldest_age_seconds value=") {
+		t.Fatalf("pending_oldest_age_seconds not set; snapshot:\n%s", got)
+	}
+	// A reclaimed/redelivered pending message counts as a retry event.
+	waitFor(t, "retries_total increments", func() bool {
+		return strings.Contains(m.Snapshot(), "retries_total count=")
+	})
+	e.stop(t)
 }

@@ -42,6 +42,7 @@ func TestRootHelp(t *testing.T) {
 			"relay COMMAND",
 			"function",
 			"health",
+			"stats",
 			"Run 'relay COMMAND --help' for more information on a command.",
 		} {
 			if !strings.Contains(out, want) {

@@ -145,6 +145,17 @@ func printInspect(st *state.State, d state.Detail) {
 	w.Flush()
 
 	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "Stats:")
+	sw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+	fs, _ := st.FunctionStats(d.Name)
+	fmt.Fprintf(sw, "  Events processed:\t%d\n", fs.EventsProcessedTotal)
+	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
+	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
+	fmt.Fprintf(sw, "  Retries:\t%d\n", fs.RetryTotal)
+	fmt.Fprintf(sw, "  DLQ entries:\t%d\n", fs.DLQTotal)
+	sw.Flush()
+
+	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "Handlers:")
 	hw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
 	for _, h := range d.Handlers {

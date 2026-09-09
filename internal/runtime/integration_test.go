@@ -50,7 +50,7 @@ func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	l := log.New(&buf, "", 0)
-	m, err := NewManager(l)
+	m, err := NewManager(l, nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}

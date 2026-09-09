@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
+	"relay/internal/logging"
+	"relay/internal/metrics"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
@@ -33,13 +36,17 @@ func engineFor(spec plan.Spec) (interface {
 type Manager struct {
 	log *log.Logger
 	cli *client.Client
+	// metrics is an optional observability registry. A nil registry disables
+	// all metric recording; every call is a no-op.
+	metrics *metrics.Registry
 }
 
 // NewManager connects to the Docker daemon so failures surface at startup
 // rather than per event. The client is configured from the environment
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
-// version automatically.
-func NewManager(logger *log.Logger) (*Manager, error) {
+// version automatically. m is an optional observability registry; a nil registry
+// disables metric recording (every call is a no-op).
+func NewManager(logger *log.Logger, m *metrics.Registry) (*Manager, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -51,7 +58,7 @@ func NewManager(logger *log.Logger) (*Manager, error) {
 		_ = cli.Close()
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
-	return &Manager{log: logger, cli: cli}, nil
+	return &Manager{log: logger, cli: cli, metrics: m}, nil
 }
 
 // Close releases the Docker Engine client. It is safe to call once during
@@ -85,15 +92,45 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	}
 
 	image := imageRef(fn.Name)
+	start := time.Now()
 	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image); err != nil {
+		d := time.Since(start)
+		m.metrics.ObserveDurationLabels("function_build_seconds", []metrics.Label{
+			{Name: "function", Value: fn.Name},
+		}, d)
+		m.metrics.IncLabels("build_failures_total", []metrics.Label{
+			{Name: "function", Value: fn.Name},
+		})
+		// Function names are validated to [a-z0-9][a-z0-9._-]* (bounded by
+		// function count), so using them as labels is low-cardinality.
+		m.log.Printf("function %q: build failed%s", fn.Name,
+			logging.Fields("function", fn.Name, "duration", d, "result", "failed"))
 		return nil, err
 	}
+	d := time.Since(start)
+	m.metrics.ObserveDurationLabels("function_build_seconds",
+		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
+	m.log.Printf("function %q: built%s",
+		fn.Name, logging.Fields("function", fn.Name, "duration", d, "result", "success"))
 	return &Prepared{Name: fn.Name, Image: image}, nil
 }
 
 // Execute runs the container for one invocation of the given handler with the
 // event JSON on stdin. The context must carry the per-invocation timeout; a
 // timeout kills the invocation and is treated as a failure.
-func (m *Manager) Execute(ctx context.Context, prepared *Prepared, handler string, eventJSON []byte) error {
-	return runContainer(ctx, m.cli, m.log.Printf, prepared.Name, prepared.Image, handler, eventJSON)
+func (m *Manager) Execute(
+	ctx context.Context,
+	prepared *Prepared,
+	handler string,
+	eventJSON []byte,
+) error {
+	return runContainer(
+		ctx,
+		m.cli,
+		m.log.Printf,
+		prepared.Name,
+		prepared.Image,
+		handler,
+		eventJSON,
+	)
 }

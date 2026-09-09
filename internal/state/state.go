@@ -135,6 +135,35 @@ func (c *State) initSchema(ctx context.Context) error {
 			timeout TEXT,
 			PRIMARY KEY (function_name, handler)
 		)`,
+		// stats holds the single "current operational snapshot" consumed by
+		// Relay itself: monotonically increasing counters persisted across
+		// restarts plus gauge snapshots of the pending backlog, never a
+		// time-series. All columns are INTEGER except updated_at TEXT.
+		`CREATE TABLE IF NOT EXISTS stats (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			events_processed_total INTEGER NOT NULL DEFAULT 0,
+			handler_success_total INTEGER NOT NULL DEFAULT 0,
+			handler_failure_total INTEGER NOT NULL DEFAULT 0,
+			retry_total INTEGER NOT NULL DEFAULT 0,
+			dlq_total INTEGER NOT NULL DEFAULT 0,
+			pending_entries INTEGER NOT NULL DEFAULT 0,
+			oldest_pending_age_seconds INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT
+		)`,
+		// function_stats holds the per-function operational snapshot, keyed by
+		// function name. It mirrors the global stats table but attributes each
+		// counter to a single function (see FunctionStats for the semantics).
+		// Backlog metrics (pending_entries/oldest_pending_age) stay global-only
+		// in stats: they describe the stream backlog, not any one function.
+		`CREATE TABLE IF NOT EXISTS function_stats (
+			function_name TEXT PRIMARY KEY,
+			events_processed_total INTEGER NOT NULL DEFAULT 0,
+			handler_success_total INTEGER NOT NULL DEFAULT 0,
+			handler_failure_total INTEGER NOT NULL DEFAULT 0,
+			retry_total INTEGER NOT NULL DEFAULT 0,
+			dlq_total INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := c.db.ExecContext(ctx, s); err != nil {
@@ -290,11 +319,16 @@ func (c *State) RecordSkipped(name string) {
 	}
 }
 
-// RecordRemoved deletes a function and its handlers from the state database.
+// RecordRemoved deletes a function, its handlers, and its per-function stats
+// from the state database, so a removed function never leaves a stale stats row
+// behind.
 func (c *State) RecordRemoved(name string) {
 	ctx := context.Background()
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx, `DELETE FROM functions WHERE name = ?`, name)

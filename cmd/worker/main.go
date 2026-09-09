@@ -1,6 +1,8 @@
 // relay-worker is the long-running Relay process. It loads functions, builds
 // their images, reconciles them live, and consumes the Redis stream, blocking
-// until signalled. Configuration comes entirely from the environment.
+// until signalled. Configuration comes entirely from the environment. It also
+// exposes a Prometheus /metrics endpoint (see internal/metrics) and periodically
+// snapshots the registry into the local state database.
 package main
 
 import (
@@ -15,12 +17,18 @@ import (
 
 	"relay/internal/config"
 	"relay/internal/function"
+	"relay/internal/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/stream"
 )
+
+// statsSnapshotInterval is how often the worker maps the metrics registry into
+// the state database's stats row. It aligns with the metrics
+// LogLoop interval so both observability views refresh on the same cadence.
+const statsSnapshotInterval = 30 * time.Second
 
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -44,6 +52,11 @@ func run(logger *log.Logger) {
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
 	defer client.Close()
+
+	// The metrics registry is wired into the runner, the runtime manager, and
+	// the stream consumer. It is nil-safe throughout, so observability can never
+	// break processing.
+	m := metrics.New()
 
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
@@ -75,7 +88,7 @@ func run(logger *log.Logger) {
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
-	manager, err := runtime.NewManager(logger)
+	manager, err := runtime.NewManager(logger, m)
 	if err != nil {
 		logger.Fatalf("runtime: %v", err)
 	}
@@ -113,16 +126,36 @@ func run(logger *log.Logger) {
 		Group:    cfg.redisGroup,
 		Consumer: cfg.redisCons,
 		Log:      logger,
+		Metrics:  m,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Expose the metrics snapshot on a fixed interval until shutdown. It runs in
+	// its own goroutine and exits when ctx is cancelled.
+	go m.LogLoop(ctx, 30*time.Second, logger.Printf)
+
+	// Expose the Prometheus /metrics endpoint. METRICS_ADDR is optional and
+	// defaults to the conventional 9090 port. ServeHTTP logs its own bind
+	// failures and retries, so a temporarily occupied port heals instead of
+	// crashing the worker; it returns nil on a clean shutdown (or ctx.Err on
+	// the retry-bind path). It starts before EnsureGroup/Consume so Prometheus
+	// can scrape during startup builds.
+	metricsAddr := config.Env("METRICS_ADDR", metrics.DefaultAddr)
+	logger.Printf("metrics http server listening on %s", metricsAddr)
+	go m.ServeHTTP(ctx, metricsAddr, logger.Printf)
+
+	// Snapshot the registry into the state database on the same cadence as the
+	// metrics LogLoop. It is nil-safe on both the registry and the state handle
+	// and stops when ctx is cancelled.
+	go statsLoop(ctx, m, st, statsSnapshotInterval)
+
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}
 
-	runWorker := runner.New(prepared, logger)
+	runWorker := runner.NewWithMetrics(prepared, logger, m)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped
@@ -150,4 +183,78 @@ func run(logger *log.Logger) {
 		logger.Fatalf("consume: %v", err)
 	}
 	logger.Printf("shutdown complete")
+}
+
+// snapshotStats maps the metrics registry into the state database's Stats row.
+// The registry counter names feed the SQLite columns directly, with one rename
+// (retries_total → RetryTotal) and the float gauges truncated to int64. It is
+// nil-safe: a nil registry yields a zero Stats so the snapshot path can never
+// panic or block processing.
+func snapshotStats(m *metrics.Registry) state.Stats {
+	if m == nil {
+		return state.Stats{}
+	}
+	return state.Stats{
+		EventsProcessedTotal:    m.Counter("events_processed_total"),
+		HandlerSuccessTotal:     m.Counter("handler_success_total"),
+		HandlerFailureTotal:     m.Counter("handler_failure_total"),
+		RetryTotal:              m.Counter("retries_total"),
+		DLQTotal:                m.Counter("dlq_entries_total"),
+		PendingEntries:          int64(m.Gauge("pending_entries")),
+		OldestPendingAgeSeconds: int64(m.Gauge("pending_oldest_age_seconds")),
+	}
+}
+
+// funcSnapshotStats maps the registry's per-function counters into the state
+// layer's FunctionStats rows. It is nil-safe: a nil registry yields an empty
+// slice so the snapshot path can never panic or block processing.
+func funcSnapshotStats(m *metrics.Registry) []state.FunctionStats {
+	if m == nil {
+		return nil
+	}
+	stats := m.FunctionStatsSnapshot()
+	out := make([]state.FunctionStats, 0, len(stats))
+	for _, fs := range stats {
+		out = append(out, state.FunctionStats{
+			Function:             fs.Function,
+			EventsProcessedTotal: fs.Events,
+			HandlerSuccessTotal:  fs.HandlerSuccessTotal,
+			HandlerFailureTotal:  fs.HandlerFailureTotal,
+			RetryTotal:           fs.RetriesTotal,
+			DLQTotal:             fs.DLQTotal,
+		})
+	}
+	return out
+}
+
+// statsLoop snapshots the registry into the state database on a fixed interval
+// until ctx is cancelled. The first snapshot runs immediately so the
+// stats row exists before the first tick. It is nil-safe on both the
+// registry and the state handle, so observability can never break processing.
+func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interval time.Duration) {
+	if st == nil {
+		<-ctx.Done()
+		return
+	}
+	recordSnapshots(st, m)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			recordSnapshots(st, m)
+		}
+	}
+}
+
+// recordSnapshots writes the global stats row and one function_stats row per
+// function with any attributed activity. Per-function writes are bounded by the
+// function count, so the 30s cadence keeps them small.
+func recordSnapshots(st *state.State, m *metrics.Registry) {
+	st.RecordStats(snapshotStats(m))
+	for _, fs := range funcSnapshotStats(m) {
+		st.RecordFunctionStats(fs)
+	}
 }

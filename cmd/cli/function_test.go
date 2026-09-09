@@ -116,6 +116,67 @@ func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
 	}
 }
 
+// printInspect appends a per-function stats section between the metadata block
+// and the Handlers section, using the same wider padding as Handlers for visual
+// grouping. The long label "Handler successes:" drives the value column.
+func TestFunctionInspectStatsSection(t *testing.T) {
+	st := seedTestState(t)
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "user-events-python",
+		EventsProcessedTotal: 12493,
+		HandlerSuccessTotal:  12470,
+		HandlerFailureTotal:  23,
+		RetryTotal:           17,
+		DLQTotal:             2,
+	})
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	out := capture(t, func() { printInspect(st, d) })
+	for _, want := range []string{
+		"Stats:",
+		"  Events processed:    12493",
+		"  Handler successes:   12470",
+		"  Handler failures:    23",
+		"  Retries:             17",
+		"  DLQ entries:         2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+	// The Stats section sits between the metadata and Handlers, so Handlers
+	// still renders after it.
+	si, hi := strings.Index(out, "Stats:"), strings.Index(out, "Handlers:")
+	if si == -1 || hi == -1 || si > hi {
+		t.Fatalf("Stats section should precede Handlers:\n%s", out)
+	}
+}
+
+// A function with no recorded stats still renders a predictable zero Stats
+// section rather than omitting it.
+func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
+	st := seedTestState(t)
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	out := capture(t, func() { printInspect(st, d) })
+	for _, want := range []string{
+		"Stats:",
+		"  Events processed:    0",
+		"  Handler successes:   0",
+		"  Handler failures:    0",
+		"  Retries:             0",
+		"  DLQ entries:         0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+}
+
 // Arg handling: bad args -> exit 2; unknown function -> exit 1 + message.
 func TestFunctionCommandExitCodes(t *testing.T) {
 	_ = seedTestState(t)

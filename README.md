@@ -144,9 +144,12 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_STREAM`   | yes      | Redis stream to consume.        |
 | `REDIS_GROUP`    | yes      | Consumer group name.            |
 | `REDIS_CONSUMER` | yes      | Consumer name within the group. |
+| `METRICS_ADDR`   | no       | Metrics listen address (default `:9090`). |
 
 The four `REDIS_*` variables are required: Relay fails startup (exits
-immediately) if any of them is unset or empty.
+immediately) if any of them is unset or empty. `METRICS_ADDR` is optional and
+must be a non-empty listen address when set (an empty value falls back to the
+default); an unbindable address is logged and retried, never fatal.
 
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
@@ -355,8 +358,12 @@ how the last reconcile of each function went without touching Redis or Docker.
   a local file you can volume-mount to persist across restarts. `compose.dev.yaml`
   mounts a named volume `relay-data` at `/var/lib/relay`.
 - **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
-  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at)
-  plus a `handlers` table (function_name, handler, timeout).
+  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at),
+  a `handlers` table (function_name, handler, timeout), a single-row `stats`
+  table (current global operational counters plus backlog gauges and
+  `updated_at`), and a `function_stats` table (per-function counters and
+  `updated_at`). These are **current snapshots only** — no per-event rows, no
+  metric history (Prometheus is the time-series source).
 - **State model**: `status` is `ready` (an active version is built and serving)
   or `pending` (loaded but not yet built). `last_reconcile_status` is
   `success` / `failed` / `skipped`. A **failed rebuild never marks a whole
@@ -367,7 +374,7 @@ how the last reconcile of each function went without touching Redis or Docker.
   without the state database if the DB is missing or broken (Open recreates a
   missing DB).
 
-The daemon persists state at startup and on every reconcile. Two read-only CLI
+The daemon persists state at startup and on every reconcile. Three read-only CLI
 commands expose it (no Redis, Docker, or `/functions` needed — they read the
 state database file only):
 
@@ -410,6 +417,70 @@ The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function is
 `pending` (never built); the `Last error` line is omitted when there is none. A
 failed reconcile with an active version keeps `Status: ready` and shows
 `Last reconcile: failed (...)` — the function is never marked unavailable.
+
+`relay function inspect <name>` also includes the current per-function
+operational stats (zeros until the function has processed events):
+
+```
+Stats:
+  Events processed:    12493
+  Handler successes:   12470
+  Handler failures:    23
+  Retries:             17
+  DLQ entries:         2
+```
+
+## Observability
+
+Relay's observability is logs plus Prometheus metrics plus the local state
+snapshot. There is no HTTP health/readiness endpoint — `relay health` (above)
+remains the health check.
+
+- **Structured logs** (`relay-worker`): execution, retry, failure, DLQ,
+  reconciliation, and build lines carry logfmt fields — `function`, `handler`,
+  `message_id`, `event_id`, `event_name`, `attempt`, `duration`, and container
+  `exit_code` where available. Handler stdout/stderr is still forwarded
+  verbatim.
+- **Prometheus metrics**: `relay-worker` exposes `GET /metrics` on
+  `METRICS_ADDR` (default `:9090`) in Prometheus text format via the official
+  Prometheus client. Counters: `events_received_total`, `events_processed_total`,
+  `handler_success_total`, `handler_failure_total`, `retries_total`,
+  `dlq_entries_total`, `handler_invocations_total{outcome,function,handler}`,
+  `build_failures_total{function}`, and per-function
+  `function_*_total{function}` counters. Histograms:
+  `handler_duration_seconds{function,handler}`,
+  `function_build_seconds{function}`. Gauges: `pending_entries`,
+  `pending_oldest_age_seconds` — sampled from the Redis consumer group
+  (`XPENDING`) every 15s, not per event. Labels are bounded to
+  `function`/`handler`/`outcome`; IDs (message, event, container, fingerprint)
+  are never labels. The metrics server is operationally isolated: bind failures
+  are logged and retried, scrape errors never stop event consumption, and
+  shutdown is graceful. Prometheus is the source for time-series metrics.
+- **SQLite operational snapshots**: the local state database also keeps the
+  **current** operational counters (`stats`) and per-function counters
+  (`function_stats`) — latest totals only, never history or per-event rows. A
+  read-only CLI command renders the global snapshot:
+
+```sh
+relay stats
+```
+
+```
+Events processed:    152934
+Handler successes:   152801
+Handler failures:    133
+Retries:             82
+DLQ entries:         4
+Pending entries:     17
+Oldest pending age:  2m14s
+Updated:             10s ago
+```
+
+`relay stats` reads the state database file only (no Redis, Docker, or
+`/functions`); it works even when the worker is down. A fresh database renders
+zeroes with `Updated: never`. Backlog gauges (`pending_entries`,
+`oldest_pending_age_seconds`) are global — the consumer-group backlog is not
+attributed to individual functions.
 
 ## Acknowledgment semantics
 
@@ -540,6 +611,8 @@ Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
 concurrency, warm containers, build caching, source hashing, git,
 registries, k8s, retry _policies per rule_ (delays/attempt counts — only a global
 max-attempts is implemented), idempotency, exactly-once, per-function
-env/secrets/resource limits/networking, HTTP API, UI, metrics, tracing, and
-additional operators (numeric/exists/anything-but/regex/glob/scripts) are not
-implemented in this iteration.
+env/secrets/resource limits/networking, HTTP API (beyond the Prometheus
+`/metrics` scrape endpoint), UI, full observability platforms (tracing, log
+shippers), and additional operators
+(numeric/exists/anything-but/regex/glob/scripts) are not implemented in this
+iteration.

@@ -5,11 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/logging"
+	"relay/internal/metrics"
 )
 
 // Handler is the contract between the stream layer and the runner. It receives
@@ -26,6 +30,10 @@ const (
 	DefaultMaxAttempts     = int64(5)
 	DefaultReclaimInterval = time.Minute
 	DefaultMinPendingIdle  = time.Minute
+	// DefaultMetricsInterval is how often the pending-gauge sampler samples
+	// XPENDING depth and logs the metrics snapshot. It is overridable via
+	// ConsumerConfig.MetricsInterval (used by tests).
+	DefaultMetricsInterval = 15 * time.Second
 )
 
 // ConsumerConfig configures the Consumer. Field-zero defaults are applied in
@@ -53,6 +61,12 @@ type ConsumerConfig struct {
 	// Defaults to "<Stream>:dlq" if empty.
 	DLQStream string
 	Log       *log.Logger
+	// Metrics is an optional metrics registry. A nil registry disables all
+	// observability: every metric call is a no-op.
+	Metrics *metrics.Registry
+	// MetricsInterval is how often the pending-gauge sampler runs and the
+	// metrics snapshot is logged. Defaults to DefaultMetricsInterval if zero.
+	MetricsInterval time.Duration
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -73,6 +87,8 @@ type Consumer struct {
 	minPendingIdle  time.Duration
 	dlqStream       string
 	log             *log.Logger
+	metrics         *metrics.Registry
+	metricsInterval time.Duration
 	backoff         *backoff
 	healthy         atomic.Bool
 }
@@ -99,6 +115,9 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 	if cfg.Log == nil {
 		cfg.Log = log.Default()
 	}
+	if cfg.MetricsInterval == 0 {
+		cfg.MetricsInterval = DefaultMetricsInterval
+	}
 	c := &Consumer{
 		client:          cfg.Client,
 		stream:          cfg.Stream,
@@ -111,6 +130,8 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		minPendingIdle:  cfg.MinPendingIdle,
 		dlqStream:       cfg.DLQStream,
 		log:             cfg.Log,
+		metrics:         cfg.Metrics,
+		metricsInterval: cfg.MetricsInterval,
 		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
 	}
 	c.healthy.Store(true)
@@ -182,6 +203,21 @@ func (c *Consumer) Consume(
 		}()
 	}
 
+	// The metrics sampler runs in its own goroutine and never affects health,
+	// backoff, or processing. It is stopped and joined before Consume returns.
+	if c.metrics != nil {
+		sctx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.metricsLoop(sctx)
+		}()
+		defer func() {
+			stop()
+			<-done
+		}()
+	}
+
 	for {
 		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.group,
@@ -233,6 +269,62 @@ func (c *Consumer) process(
 	handler Handler,
 ) {
 	c.processMessage(ctx, msg, deliveryNum, handler)
+}
+
+// metricsLoop samples the XPENDING pending-depth gauges once per interval until
+// ctx is cancelled. It is decoupled from health/backoff/processing: a Redis
+// failure just skips the pending gauges for that tick and is logged quietly. The
+// overall registry snapshot (counters, durations, and these gauges) is exposed
+// by the worker's LogLoop; this goroutine only produces the pending gauges.
+func (c *Consumer) metricsLoop(ctx context.Context) {
+	t := time.NewTicker(c.metricsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.samplePending(ctx)
+		}
+	}
+}
+
+// samplePending reads the XPENDING summary (Count and the oldest pending ID) and
+// records the pending-depth gauges. It never blocks processing: it runs in its
+// own goroutine, holds no locks across the Redis call, and any error is logged
+// and skipped, never propagated.
+func (c *Consumer) samplePending(ctx context.Context) {
+	// The summary form (no Start/End/Count) is O(1)-ish and returns the total
+	// Count plus the oldest pending message ID in Lower.
+	p, err := c.client.XPending(ctx, c.stream, c.group).Result()
+	if err != nil {
+		c.log.Printf("metrics: xpending %q/%q: %v", c.stream, c.group, err)
+		return
+	}
+	c.metrics.SetGauge("pending_entries", float64(p.Count))
+	if age, ok := pendingAge(p.Lower); ok {
+		c.metrics.SetGauge("pending_oldest_age_seconds", age.Seconds())
+	}
+}
+
+// pendingAge computes the age of a Redis stream ID (the "<ms>-<seq>" form) as
+// the elapsed duration since its millisecond timestamp. It returns ok=false when
+// the ID cannot be parsed, in which case the caller skips the age gauge rather
+// than logging or failing.
+func pendingAge(id string) (time.Duration, bool) {
+	msStr, _, ok := strings.Cut(id, "-")
+	if !ok {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(msStr, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	age := time.Since(time.UnixMilli(ms))
+	if age < 0 {
+		age = 0
+	}
+	return age, true
 }
 
 // reclaimLoop paces the recovery loop with a ticker so idle pending messages are
@@ -330,11 +422,15 @@ func (c *Consumer) deliverClaimed(
 	handler Handler,
 ) {
 	if retryCount >= c.maxAttempts {
-		c.log.Printf("message %q: retry %d/%d failed: max attempts reached",
-			msg.ID, retryCount+1, c.maxAttempts)
+		c.log.Printf("message %q: retry %d/%d failed: max attempts reached%s",
+			msg.ID, retryCount+1, c.maxAttempts,
+			logging.Fields("message_id", msg.ID, "attempt", retryCount+1, "attempts_total", c.maxAttempts))
 		c.routeToDLQ(ctx, msg, fmt.Errorf("max attempts reached after %d deliveries", retryCount), retryCount+1)
 		return
 	}
+	// A reclaimed (redelivered) message is an additional delivery attempt: it is a
+	// retry/redelivery event, counted here at the stream layer.
+	c.metrics.Inc("retries_total")
 	c.processMessage(ctx, msg, retryCount+1, handler)
 }
 
@@ -352,22 +448,33 @@ func (c *Consumer) processMessage(
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on
 		// first encounter rather than consuming retry cycles.
-		c.log.Printf("message %q: non-retryable failure (%v); routing to DLQ", msg.ID, err)
+		c.log.Printf("message %q: non-retryable failure (%v); routing to DLQ%s",
+			msg.ID, err, logging.Fields("message_id", msg.ID, "attempt", deliveryNum, "reason", err))
 		c.routeToDLQ(ctx, msg, err, deliveryNum)
 		return
 	}
 
-	if err := handler(ctx, msg.ID, event); err != nil {
+	// The message decoded successfully and is about to be handed to the handler.
+	// This is the single message-level "processed" counter in the stream layer.
+	c.metrics.Inc("events_processed_total")
+
+	if err := handler(WithDeliveryAttempt(ctx, deliveryNum), msg.ID, event); err != nil {
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
 		if ctx.Err() != nil {
 			c.log.Printf("message %q: handler canceled during shutdown; leaving pending", msg.ID)
 			return
 		}
-		c.log.Printf("message %q: retry %d/%d failed: %v", msg.ID, deliveryNum, c.maxAttempts, err)
+		c.log.Printf("message %q: retry %d/%d failed: %v%s",
+			msg.ID, deliveryNum, c.maxAttempts, err,
+			logging.Fields("message_id", msg.ID, "attempt", deliveryNum, "attempts_total", c.maxAttempts))
 		if deliveryNum >= c.maxAttempts {
 			c.routeToDLQ(ctx, msg, err, deliveryNum)
+			return
 		}
+		// A retryable failure: this delivery will be retried, so it counts as a
+		// retry event.
+		c.metrics.Inc("retries_total")
 		return
 	}
 
@@ -395,12 +502,15 @@ func (c *Consumer) routeToDLQ(
 		Stream: c.dlqStream,
 		Values: entry,
 	}).Result(); err != nil {
-		c.log.Printf("message %q: DLQ write failed (leaving pending): %v", msg.ID, err)
+		c.log.Printf("message %q: DLQ write failed (leaving pending): %v%s",
+			msg.ID, err, logging.Fields("message_id", msg.ID, "attempt", attempts))
 		c.noteOutcome(err, 0)
 		return
 	}
-	c.log.Printf("message %q: routed to DLQ stream %q after %d attempts: %v",
-		msg.ID, c.dlqStream, attempts, reason)
+	c.metrics.Inc("dlq_entries_total")
+	c.log.Printf("message %q: routed to DLQ stream %q after %d attempts: %v%s",
+		msg.ID, c.dlqStream, attempts, reason,
+		logging.Fields("message_id", msg.ID, "attempt", attempts, "reason", reason))
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Printf("message %q: ack after DLQ: %v", msg.ID, err)
 		c.noteOutcome(err, 0)

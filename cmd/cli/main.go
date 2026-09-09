@@ -30,6 +30,7 @@ func rootHelp() string {
 		helpWriter([][2]string{
 			{"function", "Manage functions"},
 			{"health", "Check Relay dependencies"},
+			{"stats", "Show current operational statistics"},
 		}) +
 		"\nRun 'relay COMMAND --help' for more information on a command.\n"
 }
@@ -95,6 +96,15 @@ func runCLI(args []string) int {
 			return printUsageError("health: too many arguments", healthUsage())
 		}
 		return runHealthCommand()
+	case "stats":
+		if len(args) == 2 && isHelp(args[1]) {
+			fmt.Fprint(os.Stdout, statsUsage())
+			return 0
+		}
+		if len(args) != 1 {
+			return printUsageError("stats: too many arguments", statsUsage())
+		}
+		return runStatsCommand()
 	case "--help", "-h":
 		if len(args) == 1 {
 			fmt.Fprint(os.Stdout, rootHelp())

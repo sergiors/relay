@@ -7,9 +7,13 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"time"
 
 	"relay/internal/function"
+	"relay/internal/logging"
+	"relay/internal/metrics"
 	"relay/internal/runtime"
+	"relay/internal/stream"
 )
 
 // Executor is the subset of the runtime Manager that invocations need. It is a
@@ -109,8 +113,9 @@ func (r *Registry) Names() []string {
 // delegated to the runtime executor. The function set is an atomic snapshot so
 // it can be reconciled (swapped) live without disrupting in-flight invocations.
 type Runner struct {
-	reg *Registry
-	log *log.Logger
+	reg     *Registry
+	log     *log.Logger
+	metrics *metrics.Registry
 }
 
 // Pairs a loaded function with its prepared image and the executor used to run
@@ -156,12 +161,18 @@ func NewUnavailable(fn function.Function) *PreparedFunction {
 }
 
 // New creates a Runner over the given prepared functions. Each invocation is
-// bounded by the matching rule's own timeout.
+// bounded by the matching rule's own timeout. Metrics are nil (disabled).
 func New(prepared []*PreparedFunction, logger *log.Logger) *Runner {
+	return NewWithMetrics(prepared, logger, nil)
+}
+
+// NewWithMetrics is like New but wires an optional metrics registry. A nil
+// registry is safe: every metric call is a no-op.
+func NewWithMetrics(prepared []*PreparedFunction, logger *log.Logger, m *metrics.Registry) *Runner {
 	if logger == nil {
 		logger = log.Default()
 	}
-	r := &Runner{reg: &Registry{}, log: logger}
+	r := &Runner{reg: &Registry{}, log: logger, metrics: m}
 	r.reg.Set(prepared)
 	return r
 }
@@ -175,28 +186,140 @@ func (r *Runner) Registry() *Registry { return r.reg }
 // (or nothing matched); otherwise it returns an error so the stream layer does
 // not acknowledge the message.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
+	// A message received at the runner is one logical event handled across all
+	// matching rules. This is the message-level counter.
+	r.metrics.Inc("events_received_total")
+	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
+	// it (e.g. when the runner is driven directly in tests).
+	attempt := stream.DeliveryAttemptFrom(ctx)
+
 	// Take one consistent snapshot for the whole call so a concurrent registry
 	// swap mid-execution cannot reorder or drop functions under us.
 	for _, pf := range r.reg.snapshot() {
 		if !pf.available {
 			continue
 		}
+		eventID, eventName := eventFields(event)
 		rules := pf.fn.Template.MatchingRules(event)
+		// A function is "involved" in an event when at least one of its rules
+		// matches, regardless of whether the execution later fails. This is the
+		// functions-engaged counter: an event matching two functions counts once
+		// per function here, while the message-level events_processed_total
+		// (stream) and events_received_total (above) count it once globally.
+		if len(rules) > 0 {
+			r.metrics.IncLabels("function_events_total",
+				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+		}
 		for _, rule := range rules {
-			r.log.Printf("function %q rule %q matched event %q", pf.fn.Name, rule.Handler, msgID)
+			r.log.Printf("function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
+				logging.Fields(
+					"function", pf.fn.Name,
+					"handler", rule.Handler,
+					"message_id", msgID,
+					"event_id", eventID,
+					"event_name", eventName,
+					"attempt", attempt,
+				))
 			eventJSON, err := json.Marshal(event)
 			if err != nil {
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 			}
 			invokeCtx, cancel := context.WithTimeout(ctx, rule.Timeout)
+			start := time.Now()
 			err = pf.executor.Execute(invokeCtx, pf.prepared, rule.Handler, eventJSON)
+			d := time.Since(start)
 			cancel()
 			if err != nil {
-				r.log.Printf("function %q handler %q execution failed for event %q: %v", pf.fn.Name, rule.Handler, msgID, err)
+				r.metrics.IncLabels("handler_invocations_total",
+					[]metrics.Label{
+						{Name: "outcome", Value: "failure"},
+						{Name: "function", Value: pf.fn.Name},
+						{Name: "handler", Value: rule.Handler},
+					})
+				// Unlabeled total feeding the SQLite snapshot; the labeled counter
+				// above remains for Prometheus, this one is simpler to aggregate.
+				r.metrics.Inc("handler_failure_total")
+				// Per-function failure attribution (per rule execution).
+				r.metrics.IncLabels("function_handler_failure_total",
+					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+				// A failing rule execution is a retry driver: the message will be
+				// retried or, once attempts are exhausted, routed to the DLQ. Both
+				// are downstream of this failure, so every failure counts here.
+				r.metrics.IncLabels("function_retries_total",
+					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+				// When this failure is the one that exhausts the delivery attempts
+				// (attempt >= stream.DefaultMaxAttempts), the message is routed to
+				// the DLQ. This mirrors the stream layer's DLQ threshold; the
+				// authoritative global count remains dlq_entries_total.
+				if attempt >= stream.DefaultMaxAttempts {
+					r.metrics.IncLabels("function_dlq_total",
+						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+				}
+				r.metrics.ObserveDurationLabels("handler_duration_seconds",
+					[]metrics.Label{
+						{Name: "function", Value: pf.fn.Name},
+						{Name: "handler", Value: rule.Handler},
+					}, d)
+				r.log.Printf("function %q handler %q execution failed for event %q: %v%s", pf.fn.Name, rule.Handler, msgID, err,
+					logging.Fields(
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+						"duration", d,
+					))
 				return err
 			}
-			r.log.Printf("function %q handler %q executed for event %q", pf.fn.Name, rule.Handler, msgID)
+			r.metrics.IncLabels("handler_invocations_total",
+				[]metrics.Label{
+					{Name: "outcome", Value: "success"},
+					{Name: "function", Value: pf.fn.Name},
+					{Name: "handler", Value: rule.Handler},
+				})
+			// Unlabeled total feeding the SQLite snapshot; the labeled counter
+			// above remains for Prometheus, this one is simpler to aggregate.
+			r.metrics.Inc("handler_success_total")
+			// Per-function success attribution (per rule execution).
+			r.metrics.IncLabels("function_handler_success_total",
+				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+			r.metrics.ObserveDurationLabels("handler_duration_seconds",
+				[]metrics.Label{
+					{Name: "function", Value: pf.fn.Name},
+					{Name: "handler", Value: rule.Handler},
+				}, d)
+			r.log.Printf("function %q handler %q executed for event %q%s", pf.fn.Name, rule.Handler, msgID,
+				logging.Fields(
+					"function", pf.fn.Name,
+					"handler", rule.Handler,
+					"message_id", msgID,
+					"event_id", eventID,
+					"event_name", eventName,
+					"attempt", attempt,
+					"duration", d,
+				),
+			)
 		}
 	}
 	return nil
+}
+
+// eventFields extracts the low-cardinality, label-safe event_id and event_name
+// for structured logging. These are never used as metric labels.
+func eventFields(event map[string]any) (eventID, eventName string) {
+	if v, ok := event["event_id"]; ok {
+		eventID = stringify(v)
+	}
+	if v, ok := event["event_name"]; ok {
+		eventName = stringify(v)
+	}
+	return eventID, eventName
+}
+
+func stringify(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
 }

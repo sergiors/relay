@@ -13,6 +13,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"relay/internal/function"
+	"relay/internal/logging"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -401,9 +402,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 
 	r.log.Printf("function %q changed; rebuilding", name)
 
+	start := time.Now()
 	built, err := r.builder.Prepare(r.rctx(), fn)
 	if err != nil {
-		r.log.Printf("function %q reload failed (retaining previous version): %v", name, err)
+		r.log.Printf("function %q reload failed (retaining previous version): %v%s",
+			name, err, logging.Fields("function", name, "duration", time.Since(start), "outcome", "failed"))
 		// Keep the old active version AND the old fingerprint so a later change
 		// (which alters the fingerprint) triggers a fresh attempt.
 		if r.st != nil {
@@ -425,9 +428,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	if cur == nil {
-		r.log.Printf("function %q discovered", name)
+		r.log.Printf("function %q discovered%s",
+			name, logging.Fields("function", name, "duration", time.Since(start), "outcome", "discovered"))
 	} else {
-		r.log.Printf("function %q updated", name)
+		r.log.Printf("function %q updated%s",
+			name, logging.Fields("function", name, "duration", time.Since(start), "outcome", "updated"))
 	}
 }
 
