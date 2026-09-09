@@ -191,6 +191,15 @@ func (r *Runner) Registry() *Registry { return r.reg }
 // and events_processed count each delivery attempt that reaches the handler
 // handoff, so retries increment them too — they are delivery-attempt counters,
 // not unique-event counters.
+//
+// Invocation progress: when the stream layer injects an InvocationProgress into
+// ctx (see stream.WithInvocationProgress), Handle skips any matching invocation
+// whose "<function>/<handler>" ID is already recorded as succeeded on a previous
+// delivery. Skipped invocations are not executions: they do not touch the
+// handler_* or function_handler_* metrics. function_events_total still counts
+// the function as engaged (it matched), which is attribution, not execution
+// counting. When no progress is present (direct Handle callers/tests, or
+// progress disabled) Handle behaves exactly as before.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
 	// A message received at the runner is one logical event handled across all
 	// matching rules. This is the message-level counter.
@@ -198,6 +207,9 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
 	// it (e.g. when the runner is driven directly in tests).
 	attempt := stream.DeliveryAttemptFrom(ctx)
+	// Best-effort invocation progress, absent when the stream did not inject it
+	// (direct Handle callers/tests, or progress disabled).
+	progress, hasProgress := stream.InvocationProgressFrom(ctx)
 
 	// Take one consistent snapshot for the whole call so a concurrent registry
 	// swap mid-execution cannot reorder or drop functions under us.
@@ -217,6 +229,26 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 		}
 		for _, rule := range rules {
+			// The invocation identity is stable across restarts and config
+			// reloads as long as the rule still exists: the function name and the
+			// rule handler string. Renaming either invalidates old progress —
+			// old entries simply never match, and the msg-level set of required
+			// invocations is recomputed each delivery from current templates, so
+			// a rule removed from the template no longer gates the ACK.
+			invocation := pf.fn.Name + "/" + rule.Handler
+			if hasProgress && progress.Done(invocation) {
+				r.log.Printf("function %q handler %q already succeeded for event %q; skipping%s",
+					pf.fn.Name, rule.Handler, msgID,
+					logging.Fields(
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+					))
+				continue
+			}
 			r.log.Printf("function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
 				logging.Fields(
 					"function", pf.fn.Name,
@@ -280,6 +312,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"duration", d,
 					))
 				return err
+			}
+			// Record the invocation as succeeded so a redelivery skips it. This
+			// happens BEFORE the success metrics so a crash between the side
+			// effect and markSuccess re-runs the handler (at-least-once; the
+			// handler must remain idempotent). A mark failure is logged by the
+			// handle and does not fail the invocation.
+			if hasProgress {
+				progress.MarkSuccess(invocation)
 			}
 			r.metrics.IncLabels("handler_invocations_total",
 				[]metrics.Label{

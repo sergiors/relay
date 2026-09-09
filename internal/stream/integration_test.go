@@ -450,6 +450,186 @@ func TestIntegrationNoMatchAcked(t *testing.T) {
 	e.stop(t)
 }
 
+func TestIntegrationProgressRetainedOnFailureClearedOnAck(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+	key := progressKey(e.stream, e.group, id)
+
+	// First delivery: mark the invocation succeeded but return an error so the
+	// message stays pending. The progress must be retained for the redelivery.
+	var first atomic.Bool
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		if p, ok := InvocationProgressFrom(ctx); ok {
+			p.MarkSuccess("fn/h")
+		}
+		if !first.Swap(true) {
+			return fmt.Errorf("fail first delivery")
+		}
+		return nil
+	})
+	e.waitDelivered(t, id)
+	waitFor(t, "progress retained after failed delivery", func() bool {
+		v, err := e.client.HGet(context.Background(), key, "fn/h").Result()
+		return err == nil && v == "ok"
+	})
+
+	// The recovery loop reclaims the idle message; the handler sees the invocation
+	// already done and returns nil, so the message is acked and progress cleared.
+	waitFor(t, "message acked and progress cleared", func() bool {
+		_, ok := e.pending()[id]
+		if ok {
+			return false
+		}
+		n, err := e.client.Exists(context.Background(), key).Result()
+		return err == nil && n == 0
+	})
+	e.stop(t)
+}
+
+func TestIntegrationProgressClearedOnDLQ(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 2})
+	id := e.xadd(t, `{"a":1}`)
+	key := progressKey(e.stream, e.group, id)
+
+	// Every delivery marks the invocation succeeded but returns an error, so the
+	// message exhausts attempts and routes to the DLQ. Progress must be cleared
+	// after the DLQ write + ACK.
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID == id {
+			if p, ok := InvocationProgressFrom(ctx); ok {
+				p.MarkSuccess("fn/h")
+			}
+		}
+		return fmt.Errorf("always fail")
+	})
+	e.waitGone(t, id)
+	waitFor(t, "message in DLQ", func() bool {
+		_, ok := e.dlq()[id]
+		return ok
+	})
+	waitFor(t, "progress cleared after DLQ", func() bool {
+		n, err := e.client.Exists(context.Background(), key).Result()
+		return err == nil && n == 0
+	})
+	e.stop(t)
+}
+
+// TestIntegrationProcessMessageClearsProgressOnlyAfterAck drives the shared
+// processMessage path directly (no Consume loop) against a real Redis: a
+// message is XADDed and read into the group's PEL, then processMessage runs a
+// succeeding handler. The progress key must be cleared only after the ACK, and
+// the message must be gone from the PEL.
+func TestIntegrationProcessMessageClearsProgressOnlyAfterAck(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+
+	// Read the message into the group's PEL so XAck has an entry to remove.
+	msgs, err := e.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group:    e.group,
+		Consumer: e.consumer.consumer,
+		Streams:  []string{e.stream, ">"},
+		Count:    1,
+		Block:    time.Second,
+	}).Result()
+	if err != nil {
+		t.Fatalf("xreadgroup: %v", err)
+	}
+	if len(msgs) != 1 || len(msgs[0].Messages) != 1 {
+		t.Fatalf("expected one message in PEL, got %+v", msgs)
+	}
+	msg := msgs[0].Messages[0]
+	if msg.ID != id {
+		t.Fatalf("read message %s, want %s", msg.ID, id)
+	}
+
+	// Mark progress, then process with a succeeding handler: the message is
+	// acked and the progress key cleared.
+	key := progressKey(e.stream, e.group, id)
+	if err := e.client.HSet(context.Background(), key, "fn/h", "ok").Err(); err != nil {
+		t.Fatalf("hset progress: %v", err)
+	}
+	e.consumer.processMessage(context.Background(), msg, 1, func(ctx context.Context, msgID string, ev map[string]any) error {
+		return nil
+	})
+
+	if _, ok := e.pending()[id]; ok {
+		t.Fatalf("message %s should be acked (gone from PEL)", id)
+	}
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
+		t.Fatalf("progress key should be cleared after ACK (exists=%d err=%v)", n, err)
+	}
+}
+
+// TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure verifies the
+// clear-ordering contract in routeToDLQ: when the DLQ XADD fails (the DLQ stream
+// name is a wrong-type key), the original message stays pending and its progress
+// key is retained; once the DLQ write succeeds, the message is acked and the
+// progress key is cleared.
+func TestIntegrationRouteToDLQKeepsProgressOnDLQWriteFailure(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+
+	// Read the message into the PEL so XAck has an entry to remove.
+	msgs, err := e.client.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+		Group:    e.group,
+		Consumer: e.consumer.consumer,
+		Streams:  []string{e.stream, ">"},
+		Count:    1,
+		Block:    time.Second,
+	}).Result()
+	if err != nil {
+		t.Fatalf("xreadgroup: %v", err)
+	}
+	msg := msgs[0].Messages[0]
+	key := progressKey(e.stream, e.group, id)
+	if err := e.client.HSet(context.Background(), key, "fn/h", "ok").Err(); err != nil {
+		t.Fatalf("hset progress: %v", err)
+	}
+
+	// Force the DLQ XADD to fail by making the DLQ stream name a wrong-type key.
+	if r := e.client.Set(context.Background(), e.consumer.dlqStream, "not-a-stream", 0); r.Err() != nil {
+		t.Fatalf("set wrong-type key: %v", r.Err())
+	}
+	e.consumer.routeToDLQ(context.Background(), msg, fmt.Errorf("boom"), 1)
+
+	// DLQ write failed: message stays pending and progress is retained.
+	if _, ok := e.pending()[id]; !ok {
+		t.Fatalf("message %s must stay pending when DLQ write fails", id)
+	}
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 1 {
+		t.Fatalf("progress key must be retained on DLQ write failure (exists=%d err=%v)", n, err)
+	}
+
+	// Now let the DLQ write succeed: delete the wrong-type key and re-route.
+	if err := e.client.Del(context.Background(), e.consumer.dlqStream).Err(); err != nil {
+		t.Fatalf("del wrong-type key: %v", err)
+	}
+	e.consumer.routeToDLQ(context.Background(), msg, fmt.Errorf("boom"), 1)
+
+	// DLQ write + ACK succeeded: message gone from PEL and progress cleared.
+	if _, ok := e.pending()[id]; ok {
+		t.Fatalf("message %s should be acked after successful DLQ write", id)
+	}
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
+		t.Fatalf("progress key should be cleared after DLQ (exists=%d err=%v)", n, err)
+	}
+}
+
 func TestIntegrationRecoveryLoopStopsOnCancel(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")

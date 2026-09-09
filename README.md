@@ -550,9 +550,21 @@ falls back to them in `NewConsumer`.
 
 The at-least-once contract from the ACK table above is unchanged: XACK happens
 only after all matching invocations succeed or the message is successfully
-routed to the DLQ. Because redelivery is now a live mechanism (not a stranding
-hole), a partial failure that is redelivered re-runs _every_ matching handler —
-including ones that already succeeded — so handlers must be idempotent.
+routed to the DLQ. To avoid re-running work that already succeeded, Relay records
+per-handler invocation progress in Redis: each successful invocation is written
+to a TTL'd hash keyed by message (`relay:progress:{stream}:{group}:{msgID}`,
+field `<function>/<handler>` → `ok`; stream/group names are percent-encoded in
+the key). On redelivery, an invocation whose
+`<function>/<handler>` is already recorded as succeeded is skipped; only failed
+or pending ones retry. The message is acknowledged once all matching invocations
+are complete, and the progress key is cleared on completion or DLQ routing. The
+keys expire after 7 days as a fallback cleanup for abandoned messages.
+
+This is still at-least-once, not exactly-once: there is a crash window between a
+handler's side effect and its progress being recorded, so a handler can still
+run twice. Handlers must therefore remain idempotent. Renaming a function or
+handler invalidates old progress (old entries simply never match), and a rule
+removed from a template no longer gates the acknowledgment.
 
 ## Example functions
 

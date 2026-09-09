@@ -67,6 +67,11 @@ type ConsumerConfig struct {
 	// MetricsInterval is how often the pending-gauge sampler runs and the
 	// metrics snapshot is logged. Defaults to DefaultMetricsInterval if zero.
 	MetricsInterval time.Duration
+	// DisableProgress disables per-handler invocation progress tracking. When
+	// true, redelivered messages re-run every matching handler exactly as before
+	// (at-least-once, no skip). Test/ops hook: progress is enabled by default
+	// (zero value); set true only in tests.
+	DisableProgress bool
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -90,6 +95,7 @@ type Consumer struct {
 	metrics         *metrics.Registry
 	metricsInterval time.Duration
 	backoff         *backoff
+	progress        *progressStore
 	healthy         atomic.Bool
 }
 
@@ -133,6 +139,11 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		metrics:         cfg.Metrics,
 		metricsInterval: cfg.MetricsInterval,
 		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
+	}
+	// Progress tracking is always constructed when a client is present (the
+	// consumer always has one). DisableProgress turns it off for tests.
+	if !cfg.DisableProgress {
+		c.progress = &progressStore{client: cfg.Client}
 	}
 	c.healthy.Store(true)
 	return c
@@ -465,7 +476,24 @@ func (c *Consumer) processMessage(
 	// unique-event counter.
 	c.metrics.Inc("events_processed_total")
 
-	if err := handler(WithDeliveryAttempt(ctx, deliveryNum), msg.ID, event); err != nil {
+	// Inject a per-message progress handle so the runner can skip invocations
+	// that already succeeded on a previous delivery. The handle is bound to this
+	// (stream, group, msgID) and reads/writes the progress hash in Redis. When
+	// progress is disabled (tests) the context carries none and the runner
+	// behaves exactly as before.
+	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
+	if c.progress != nil {
+		handlerCtx = WithInvocationProgress(handlerCtx, &invocationProgress{
+			ctx:    ctx,
+			store:  c.progress,
+			stream: c.stream,
+			group:  c.group,
+			msgID:  msg.ID,
+			log:    c.log,
+		})
+	}
+
+	if err := handler(handlerCtx, msg.ID, event); err != nil {
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
 		if ctx.Err() != nil {
@@ -488,6 +516,17 @@ func (c *Consumer) processMessage(
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Printf("message %q: ack: %v", msg.ID, err)
 		c.noteOutcome(err, 0)
+		return
+	}
+	// The message is fully processed and acknowledged: eagerly clear its progress
+	// hash. Ordering matters — clear only AFTER a successful ACK. If the ACK
+	// failed (handled above) the message stays in the PEL and may be redelivered,
+	// so its progress must remain for the redelivery to skip completed handlers.
+	// A clear failure is logged only; the TTL is the fallback cleanup.
+	if c.progress != nil {
+		if err := c.progress.clear(ctx, c.stream, c.group, msg.ID); err != nil {
+			c.log.Printf("message %q: clear progress: %v", msg.ID, err)
+		}
 	}
 }
 
@@ -521,6 +560,17 @@ func (c *Consumer) routeToDLQ(
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Printf("message %q: ack after DLQ: %v", msg.ID, err)
 		c.noteOutcome(err, 0)
+		return
+	}
+	// The message is dead-lettered and the original acked: eagerly clear its
+	// progress hash. Ordering matters — clear only after BOTH the DLQ write and
+	// the ACK succeed. If the ACK failed (handled above) the message stays in the
+	// PEL and may be redelivered, so its progress must remain. A clear failure is
+	// logged only; the TTL is the fallback cleanup.
+	if c.progress != nil {
+		if err := c.progress.clear(ctx, c.stream, c.group, msg.ID); err != nil {
+			c.log.Printf("message %q: clear progress after DLQ: %v", msg.ID, err)
+		}
 	}
 }
 
