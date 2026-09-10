@@ -38,7 +38,7 @@ func (f *fakeBuilder) Prepare(ctx context.Context, fn function.Function) (*runti
 	return &runtime.Prepared{Name: fn.Name, Image: "img-" + fn.Name}, nil
 }
 
-func (f *fakeBuilder) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (f *fakeBuilder) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	return nil
 }
 

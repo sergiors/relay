@@ -27,9 +27,10 @@ on the stream with a consumer group, decodes each message, and for every event:
 
 Relay is distributed as **two** binaries:
 
-- `relay` — the read-only command-line interface (`relay function ls`,
-  `relay function inspect <name>`, `relay health`). It never starts the
-  long-running process.
+- `relay` — the command-line interface (`relay function ls`,
+  `relay function inspect <name>`, `relay health`, `relay secret ls/set/rm`). It
+  never starts the long-running process; the only thing it writes is the local
+  secrets store (`relay secret set/rm`).
 - `relay-worker` — the long-running process that consumes events, loads
   functions, builds images, and reconciles `/functions` live.
 
@@ -285,6 +286,44 @@ events:
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
 
+### Environment variables and secrets
+
+A template may define per-function environment variables and secret references:
+
+```yaml
+runtime: python3.14
+env:
+  API_URL: https://api.example.com
+secrets:
+  DATABASE_URL: database-url
+
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+```
+
+- `env` (optional) maps an env-var name to a **literal string value**, injected
+  into every execution container at runtime. Values are literal — never masked,
+  never treated as secret-looking. Empty values are allowed (flag-like
+  variables). Env-var names must match `[A-Za-z_][A-Za-z0-9_]*`.
+- `secrets` (optional) maps an env-var name to a **secret reference name**. The
+  reference is resolved to a value immediately before each execution and
+  injected into the container. Secret references must be valid secret names
+  (lowercase letters, digits, `.`, `_`, `-`; no leading or trailing `.`; at
+  most 63 chars).
+- A variable may not be defined in both `env` and `secrets`.
+- `RELAY_HANDLER` is reserved by Relay (it carries the rule's handler identity);
+  a template may not set it.
+- **Never put secret VALUES in `template.yaml`.** The template holds only the
+  reference name; the value lives in the secrets store (see `relay secret`
+  below). Editing `template.yaml` (including env values) changes the function's
+  fingerprint and triggers a rebuild by design; rotating a secret **value**
+  never changes the fingerprint and never requires a rebuild or restart.
+- Env values and secret references are injected at runtime only — they are never
+  baked into the function image (template.yaml is excluded from the build
+  context), never stored in the state database, and never logged.
+
 A pattern is a tree of field conditions:
 
 - A plain YAML list is implicit equality: `status: [COMPLETED, FAILED]`.
@@ -420,12 +459,14 @@ how the last reconcile of each function went without touching Redis or Docker.
   a local file you can volume-mount to persist across restarts. `compose.dev.yaml`
   mounts a named volume `relay-data` at `/var/lib/relay`.
 - **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
-  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at),
-  a `handlers` table (function_name, handler, timeout), a single-row `stats`
-  table (current global operational counters plus backlog gauges and
-  `updated_at`), and a `function_stats` table (per-function counters and
-  `updated_at`). These are **current snapshots only** — no per-event rows, no
-  metric history (Prometheus is the time-series source).
+  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at,
+  env, secrets), a `handlers` table (function_name, handler, timeout), a
+  single-row `stats` table (current global operational counters plus backlog
+  gauges and `updated_at`), and a `function_stats` table (per-function counters
+  and `updated_at`). The `env` and `secrets` columns store the function's
+  env/secret **mappings** (JSON) — never secret values. These are **current
+  snapshots only** — no per-event rows, no metric history (Prometheus is the
+  time-series source).
 - **State model**: `status` is `ready` (an active version is built and serving)
   or `pending` (loaded but not yet built). `last_reconcile_status` is
   `success` / `failed` / `skipped`. A **failed rebuild never marks a whole
@@ -500,6 +541,77 @@ Stats:
   Retries:             17
   DLQ entries:         2
 ```
+
+`relay function inspect <name>` also shows the function's env and secret
+**mappings** (from its template) when it defines any — literal env values and
+secret references, never secret values:
+
+```
+Environment:
+  API_URL=https://api.example.com
+
+Secrets:
+  DATABASE_URL=database-url
+```
+
+## Secrets
+
+Relay stores secrets as files on disk, one per secret, under a fixed directory.
+Templates reference secrets by name; the worker resolves each reference to its
+value immediately before an execution and injects it into the container's
+environment. Resolved values live only in the container's `Config.Env` — they
+are never baked into images, never stored in the state database, never logged,
+and never shown by `relay function inspect` (which shows only the reference).
+
+- **Location**: `/var/lib/relay/secrets` (a fixed internal path, not
+  env-configurable). The directory is created on first write with mode `0700`;
+  each secret file is written atomically with mode `0600`. `compose.dev.yaml`
+  mounts the named volume `relay-data` at `/var/lib/relay`, so secrets survive
+  container restarts. **Deleting the volume deletes the secrets.**
+- **Rotation**: changing a secret's value takes effect on the next invocation —
+  no rebuild, no restart, no fingerprint change. Secrets are resolved per
+  execution.
+- **Provider**: the local filesystem provider is the current (single-host, beta)
+  implementation. The provider interface is deliberately tiny so a future
+  external provider (Vault, a secrets API, ...) can be added without changing
+  templates or the runner.
+
+Manage secrets with the `relay` CLI:
+
+```sh
+relay secret ls
+```
+
+```
+NAME
+database-url
+api-key
+```
+
+```sh
+relay secret set database-url
+```
+
+`relay secret set NAME` reads the value from the terminal with echo disabled
+(hidden), or — when stdin is not a terminal — from all of stdin (the safe
+non-interactive path, e.g. `printf 'value' | relay secret set foo`). The value
+is never echoed and never printed.
+
+```sh
+relay secret rm database-url
+```
+
+### Security model
+
+- Secret **values** are never stored in SQLite, never baked into images, never
+  in labels, logs, metrics, or `relay function inspect` output. They exist only
+  as files under `/var/lib/relay/secrets` (mode `0600`) and, transiently, in the
+  environment of a **running** execution container (visible via
+  `docker inspect` of that running container only).
+- Secret **references** (the names) are configuration metadata: they appear in
+  `template.yaml`, in the fingerprint, and in `relay function inspect`.
+- **Never put secret VALUES in `template.yaml`** — the template is copied into
+  the function's build context and its content is fingerprinted.
 
 ## Observability
 
@@ -735,10 +847,12 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 
 Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
 concurrency, warm containers, build caching, source hashing, git,
-registries, k8s, retry _policies per rule_ (delays/attempt counts — only a global
-max-attempts is implemented), idempotency, exactly-once, per-function
-env/secrets/resource limits/networking, HTTP API (beyond the Prometheus
-`/metrics` scrape endpoint), UI, full observability platforms (tracing, log
-shippers), and additional operators
+registries, k8s, configurable retry _policies per rule_ (delays/attempt counts
+are fixed internals — a rule's `retries` count is configurable, the backoff
+schedule is not), idempotency, exactly-once, per-function
+resource limits/networking, external secret-management providers (Vault/AWS/K8s
+— the local file provider is the current backend), HTTP API (beyond the
+Prometheus `/metrics` scrape endpoint), UI, full observability platforms
+(tracing, log shippers), and additional operators
 (numeric/exists/anything-but/regex/glob/scripts) are not implemented in this
 iteration.

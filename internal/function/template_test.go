@@ -408,6 +408,191 @@ events:
 	}
 }
 
+// TestParseEnvAndSecrets verifies both maps parse and that the secrets map
+// holds SecretRef values (a distinct type from a plain string).
+func TestParseEnvAndSecrets(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+env:
+  API_URL: https://api.example.com
+  FLAG: ""
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Env["API_URL"] != "https://api.example.com" {
+		t.Errorf("env API_URL = %q, want https://api.example.com", tmpl.Env["API_URL"])
+	}
+	// Empty env values are allowed (flag-like variables).
+	if v, ok := tmpl.Env["FLAG"]; !ok || v != "" {
+		t.Errorf("env FLAG = %q, ok=%v; want empty value present", v, ok)
+	}
+	ref, ok := tmpl.Secrets["DATABASE_URL"]
+	if !ok {
+		t.Fatal("expected secrets DATABASE_URL")
+	}
+	if ref.String() != "database-url" {
+		t.Errorf("secret ref = %q, want database-url", ref.String())
+	}
+	// The value must be a SecretRef, not a plain string.
+	if _, isRef := any(ref).(SecretRef); !isRef {
+		t.Errorf("secrets value is %T, want SecretRef", ref)
+	}
+}
+
+// TestParseEnvSecretsDuplicateRejected verifies a variable defined in both env
+// and secrets fails validation.
+func TestParseEnvSecretsDuplicateRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+env:
+  FOO: bar
+secrets:
+  FOO: some-secret
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+	if err == nil {
+		t.Fatal("expected error for duplicate env/secrets variable")
+	}
+	if !strings.Contains(err.Error(), "FOO") {
+		t.Errorf("expected error to name FOO, got: %v", err)
+	}
+}
+
+// TestParseReservedEnvVarRejected verifies that Relay-reserved variables
+// (RELAY_HANDLER — the platform-owned handler identity) cannot be set by a
+// template's env or secrets maps.
+func TestParseReservedEnvVarRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, block string
+	}{
+		{"env", "env:\n  RELAY_HANDLER: evil"},
+		{"secrets", "secrets:\n  RELAY_HANDLER: some-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+` + tc.block + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatal("expected error for reserved env var")
+			}
+			if !strings.Contains(err.Error(), "reserved") {
+				t.Errorf("expected error to mention reserved, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseEnvVarNameInvalid verifies invalid env-var names are rejected.
+func TestParseEnvVarNameInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"leading dash", "-bad"},
+		{"leading digit", "1bad"},
+		{"space", "A B"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+env:
+  ` + tc.key + `: value
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for env var name %q", tc.key)
+			}
+			if !strings.Contains(err.Error(), "env var name") {
+				t.Errorf("expected error to mention env var name, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseSecretRefInvalid verifies invalid secret references are rejected.
+func TestParseSecretRefInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  string
+	}{
+		{"path traversal", "../etc"},
+		{"absolute", "/abs"},
+		{"uppercase with slash", "UPPER-with-slash"},
+		{"empty", ""},
+		{"trailing dot", "trail."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+secrets:
+  TOKEN: ` + tc.ref + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for secret ref %q", tc.ref)
+			}
+		})
+	}
+}
+
+// TestTemplateEnvPairsSorted verifies EnvList and SecretList return
+// name-ordered slices regardless of YAML map ordering.
+func TestTemplateEnvPairsSorted(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+env:
+  ZETA: z
+  ALPHA: a
+  MID: m
+secrets:
+  BETA: beta-secret
+  ALPHA_SECRET: alpha-secret
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	env := tmpl.EnvList()
+	if len(env) != 3 {
+		t.Fatalf("env list len = %d, want 3", len(env))
+	}
+	for i, want := range []string{"ALPHA", "MID", "ZETA"} {
+		if env[i].Name != want {
+			t.Errorf("env[%d].Name = %q, want %q", i, env[i].Name, want)
+		}
+	}
+	sec := tmpl.SecretList()
+	if len(sec) != 2 {
+		t.Fatalf("secret list len = %d, want 2", len(sec))
+	}
+	if sec[0].Name != "ALPHA_SECRET" || sec[1].Name != "BETA" {
+		t.Errorf("secret list order = %q,%q; want ALPHA_SECRET,BETA", sec[0].Name, sec[1].Name)
+	}
+	if sec[0].Ref.String() != "alpha-secret" {
+		t.Errorf("secret ref = %q, want alpha-secret", sec[0].Ref.String())
+	}
+}
+
 func TestMatchingRulesANDSemantics(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14

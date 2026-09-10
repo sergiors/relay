@@ -33,8 +33,9 @@ func (a dockerManagerAdapter) Execute(
 	prepared *runtime.Prepared,
 	handler string,
 	eventJSON []byte,
+	extraEnv []string,
 ) error {
-	return a.m.Execute(ctx, prepared, handler, eventJSON)
+	return a.m.Execute(ctx, prepared, handler, eventJSON, extraEnv)
 }
 
 // writeFn writes a node function directory: template + handler.
@@ -68,7 +69,7 @@ func runHandlerWith(
 	if err != nil {
 		t.Fatalf("prepare %s: %v", fn.Name, err)
 	}
-	if err := m.Execute(context.Background(), prepared, hndlr, []byte(eventJSON)); err != nil {
+	if err := m.Execute(context.Background(), prepared, hndlr, []byte(eventJSON), nil); err != nil {
 		t.Fatalf("execute %s: %v", fn.Name, err)
 	}
 }

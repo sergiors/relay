@@ -158,11 +158,20 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 // timeout kills the invocation and is treated as a failure. The invocation's
 // diagnostic RunMeta is read from ctx (see WithRunMeta); when absent the labels
 // are empty, which is harmless (labels are diagnostic-only).
+//
+// extraEnv are additional environment variables applied to the container after
+// the function's plan env (and after the base RELAY_HANDLER var). They carry the
+// template's literal env values and the resolved secret values for this single
+// invocation. They are resolved per execution by the runner and never stored on
+// Prepared, so rotating a secret value never requires a rebuild. Later entries
+// win on duplicate names (container env semantics), so a template env var may
+// intentionally override a runtime default like PYTHONDONTWRITEBYTECODE.
 func (m *Manager) Execute(
 	ctx context.Context,
 	prepared *Prepared,
 	handler string,
 	eventJSON []byte,
+	extraEnv []string,
 ) error {
 	meta := RunMetaFrom(ctx)
 	if meta.Hostname == "" {
@@ -180,6 +189,7 @@ func (m *Manager) Execute(
 		prepared.Name,
 		prepared.Image,
 		prepared.Env,
+		extraEnv,
 		handler,
 		eventJSON,
 		meta,

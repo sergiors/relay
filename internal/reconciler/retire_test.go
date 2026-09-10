@@ -69,7 +69,7 @@ func (v *versionedBuilder) Prepare(ctx context.Context, fn function.Function) (*
 	return &runtime.Prepared{Name: fn.Name, Image: "img-" + fn.Name + "-v" + strconv.Itoa(ver)}, nil
 }
 
-func (v *versionedBuilder) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (v *versionedBuilder) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	return nil
 }
 

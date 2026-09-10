@@ -17,6 +17,14 @@
 // active image/fingerprint/prepared_at are retained so the last good version
 // still serves. All timestamps are RFC3339 strings.
 //
+// Env and secrets columns: the functions table stores the env/secret MAPPINGS
+// from each function's template (env-var name → literal value, and env-var name
+// → secret reference) as JSON object strings. These are configuration metadata
+// like the handler timeouts — never secret VALUES. A secret's value is never
+// stored in SQLite; only the reference name is. The columns are added
+// idempotently to pre-existing databases by a small PRAGMA table_info migration
+// in initSchema.
+//
 // Design Constraint:
 //   - State errors are never fatal. Callers (main, reconciler) log them and
 //     continue; the state database degrades to "no state available" on failure.

@@ -2,6 +2,8 @@ package function
 
 import (
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,11 +40,43 @@ var supportedRuntimes = map[string]bool{
 	"node24":     true,
 }
 
+// SecretRef is a reference to a secret by name. It is a distinct type from a
+// plain string so a secret reference can never be confused with a literal env
+// value: the two maps (Env and Secrets) are structurally different, and the
+// compiler enforces it. String() returns the reference name.
+type SecretRef string
+
+// String returns the secret reference name.
+func (s SecretRef) String() string { return string(s) }
+
+// EnvVar is one literal environment variable: the env-var name and its literal
+// string value. It is returned (name-ordered) by Template.EnvList.
+type EnvVar struct {
+	Name  string
+	Value string
+}
+
+// SecretBinding is one secret binding: the env-var name it is exposed as and
+// the secret reference it resolves to. It is returned (name-ordered) by
+// Template.SecretList.
+type SecretBinding struct {
+	Name string
+	Ref  SecretRef
+}
+
 // Template is a parsed template.yaml file: the runtime plus a list of rules,
 // each pairing a handler with a pattern invoked when the pattern matches.
 type Template struct {
 	Runtime string
 	Rules   []Rule
+	// Env maps an env-var name to a literal string value, injected into every
+	// execution container at runtime. It is never baked into the image.
+	Env map[string]string
+	// Secrets maps an env-var name to a secret reference name, resolved to a
+	// value immediately before each execution and injected into the container
+	// at runtime. The reference name (never the resolved value) is part of the
+	// function's configuration; the value lives outside template.yaml.
+	Secrets map[string]SecretRef
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -132,7 +166,9 @@ func (m suffixMatcher) Match(value any) bool {
 // every rule's handler.
 func ParseTemplate(data []byte) (*Template, error) {
 	var raw struct {
-		Runtime string `yaml:"runtime"`
+		Runtime string            `yaml:"runtime"`
+		Env     map[string]string `yaml:"env"`
+		Secrets map[string]string `yaml:"secrets"`
 		Events  []struct {
 			Handler string         `yaml:"handler"`
 			Pattern map[string]any `yaml:"pattern"`
@@ -149,6 +185,14 @@ func ParseTemplate(data []byte) (*Template, error) {
 	}
 
 	t := &Template{Runtime: raw.Runtime}
+
+	// Parse and validate env/secrets. Both are optional; when present, every
+	// key must be a valid env-var name, every secret reference a valid secret
+	// name, and no variable may be defined in both maps (a duplicate would be
+	// ambiguous — which value wins?).
+	if err := parseEnvSecrets(t, raw.Env, raw.Secrets); err != nil {
+		return nil, err
+	}
 
 	if t.Runtime == "" {
 		return nil, fmt.Errorf("runtime is required")
@@ -185,6 +229,116 @@ func ParseTemplate(data []byte) (*Template, error) {
 		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
 	}
 	return t, nil
+}
+
+// envVarNamePattern restricts the characters an env-var name may contain. It is
+// the POSIX-ish shell variable charset: a letter or underscore first, then
+// letters, digits, or underscores. This is deliberately stricter than what the
+// OS would accept so a template cannot smuggle a name that a shell or a
+// container runtime would interpret differently (e.g. one containing '=' or a
+// path separator).
+var envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedEnvVarNames are env-var names Relay owns; a template may never set
+// them. RELAY_HANDLER carries the rule's handler identity from the platform —
+// letting a template override it would let the template redefine which handler
+// the runtime invokes, subverting the per-rule invocation contract.
+var reservedEnvVarNames = map[string]bool{"RELAY_HANDLER": true}
+
+// parseEnvSecrets validates and stores the template's env and secrets maps.
+// Both are optional. Rules:
+//   - env keys must be valid env-var names; values are literal strings (empty
+//     values are allowed — flag-like variables are legitimate).
+//   - secrets keys must be valid env-var names; the reference (the value) must
+//     be a valid secret name and non-empty.
+//   - a variable may not be defined in both env and secrets.
+//   - Relay-reserved variable names (RELAY_HANDLER) may not be set.
+//
+// All errors are value-free: they name the offending key/reference but never
+// any secret value.
+func parseEnvSecrets(t *Template, env, secrets map[string]string) error {
+	if len(env) > 0 {
+		t.Env = make(map[string]string, len(env))
+		for name, value := range env {
+			if err := validateEnvVarName(name); err != nil {
+				return err
+			}
+			if reservedEnvVarNames[name] {
+				return fmt.Errorf("env var %q is reserved by Relay", name)
+			}
+			t.Env[name] = value
+		}
+	}
+	if len(secrets) > 0 {
+		t.Secrets = make(map[string]SecretRef, len(secrets))
+		for name, ref := range secrets {
+			if err := validateEnvVarName(name); err != nil {
+				return err
+			}
+			if reservedEnvVarNames[name] {
+				return fmt.Errorf("secret variable %q is reserved by Relay", name)
+			}
+			if err := ValidSecretName(ref); err != nil {
+				return fmt.Errorf("secret reference for %q: %w", name, err)
+			}
+			t.Secrets[name] = SecretRef(ref)
+		}
+	}
+	// A variable defined in both maps is ambiguous: reject it.
+	for name := range t.Env {
+		if _, dup := t.Secrets[name]; dup {
+			return fmt.Errorf("env and secrets define the same variable %q", name)
+		}
+	}
+	return nil
+}
+
+// validateEnvVarName reports whether name is a legal env-var name. It rejects
+// empty names and anything outside the POSIX-ish charset.
+func validateEnvVarName(name string) error {
+	if name == "" {
+		return fmt.Errorf("env var name is empty")
+	}
+	if !envVarNamePattern.MatchString(name) {
+		return fmt.Errorf("env var name %q is invalid", name)
+	}
+	return nil
+}
+
+// EnvList returns the template's literal env variables as a name-ordered slice,
+// so callers iterate deterministically regardless of YAML map ordering.
+func (t *Template) EnvList() []EnvVar {
+	if len(t.Env) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(t.Env))
+	for name := range t.Env {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]EnvVar, 0, len(names))
+	for _, name := range names {
+		out = append(out, EnvVar{Name: name, Value: t.Env[name]})
+	}
+	return out
+}
+
+// SecretList returns the template's secret bindings as a name-ordered slice, so
+// callers iterate deterministically regardless of YAML map ordering.
+func (t *Template) SecretList() []SecretBinding {
+	if len(t.Secrets) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(t.Secrets))
+	for name := range t.Secrets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]SecretBinding, 0, len(names))
+	for _, name := range names {
+		out = append(out, SecretBinding{Name: name, Ref: t.Secrets[name]})
+	}
+	return out
 }
 
 // resolveTimeout parses an optional rule timeout. An empty string yields the

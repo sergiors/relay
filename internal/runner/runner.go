@@ -15,6 +15,7 @@ import (
 	"relay/internal/logging"
 	"relay/internal/metrics"
 	"relay/internal/runtime"
+	"relay/internal/secrets"
 	"relay/internal/stream"
 )
 
@@ -27,6 +28,7 @@ type Executor interface {
 		prepared *runtime.Prepared,
 		handler string,
 		eventJSON []byte,
+		extraEnv []string,
 	) error
 }
 
@@ -142,6 +144,11 @@ type Runner struct {
 	// persists as the invocation's running deadline, so the persisted deadline
 	// matches the local timer by construction.
 	maxHandlerTimeout atomic.Int64
+	// secrets resolves secret references to values immediately before each
+	// execution. It is nil when no provider is configured (a template that
+	// references secrets then fails the invocation with a clear error). It is
+	// set via SetSecretProvider; the worker wires the production local provider.
+	secrets secrets.Provider
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
@@ -258,6 +265,18 @@ func (r *Runner) SetMaxHandlerTimeout(d time.Duration) {
 	r.maxHandlerTimeout.Store(int64(d))
 }
 
+// SetSecretProvider wires the provider that resolves secret references to
+// values at execution time. It is nil-safe (a nil Runner is a no-op) and takes
+// effect on the next Handle. A nil provider means no secrets are available: a
+// template that references a secret then fails the invocation with a clear
+// error. The worker wires the production local provider after construction.
+func (r *Runner) SetSecretProvider(p secrets.Provider) {
+	if r == nil {
+		return
+	}
+	r.secrets = p
+}
+
 // resolver returns the runner's resolved image cleaner, or nil when the executor
 // does not implement retirement (tests, unavailable-only runners). It is resolved
 // once and cached; resolution scanning the registry is cheap and safe.
@@ -362,12 +381,13 @@ func toImage(pf *PreparedFunction) string {
 // RetireImage cannot remove the image an in-flight execution still needs
 // (at-least-once safety). The release is deferred so it runs even if the
 // executor panics; the helper is called per rule so the defer scope is
-// per-invocation rather than accumulating across a long rule loop.
-func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context, handler string, eventJSON []byte) error {
+// per-invocation rather than accumulating across a long rule loop. extraEnv are
+// the per-invocation env vars (template env values + resolved secrets).
+func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context, handler string, eventJSON []byte, extraEnv []string) error {
 	image := toImage(pf)
 	r.refs.acquire(image)
 	defer r.refs.release(image)
-	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON)
+	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON, extraEnv)
 }
 
 // runInvocation runs one rule's handler while holding a reference to the
@@ -390,6 +410,7 @@ func (r *Runner) runInvocation(
 	cancel context.CancelFunc,
 	handler string,
 	eventJSON []byte,
+	extraEnv []string,
 ) (err error, panicked bool, panicValue any) {
 	defer cancel()
 	defer func() {
@@ -399,7 +420,7 @@ func (r *Runner) runInvocation(
 			err = fmt.Errorf("executor panic: %v", pv)
 		}
 	}()
-	err = r.executeWithRefs(pf, invokeCtx, handler, eventJSON)
+	err = r.executeWithRefs(pf, invokeCtx, handler, eventJSON, extraEnv)
 	return err, false, nil
 }
 
@@ -604,9 +625,48 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// same backoff rules as an execution failure (it IS a failed
 				// attempt). If the attempt is exhausted, mark it terminal.
 				if hasState {
-					return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+					return r.recordFailure(
+						invState,
+						invocation,
+						attempt,
+						rule.Retries,
+						matched,
+						pf.fn.Name,
+						rule.Handler,
+						msgID,
+						eventID,
+						eventName,
+						err,
+					)
 				}
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
+			}
+			// Resolve the template's env values and secret references into the
+			// per-invocation extra env, immediately before container creation.
+			// Secret values are resolved per execution (never cached on Prepared,
+			// never in the fingerprint), so rotating a secret value never requires
+			// a rebuild. A resolution failure is a failed attempt (the invocation
+			// was already claimed by TryStart), so it flows through the same
+			// retry/exhaustion machinery as an execution failure. The error names
+			// the secret REFERENCE only — never any value.
+			extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
+			if err != nil {
+				if hasState {
+					return r.recordFailure(
+						invState,
+						invocation,
+						attempt,
+						rule.Retries,
+						matched,
+						pf.fn.Name,
+						rule.Handler,
+						msgID,
+						eventID,
+						eventName,
+						err,
+					)
+				}
+				return fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 			}
 			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
 			// Stamp the invocation's diagnostic metadata into the context so the
@@ -622,7 +682,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				Image:     toImage(pf),
 			})
 			start := time.Now()
-			err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON)
+			err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
 			d := time.Since(start)
 			if panicked {
 				// A panicking execution is a misbehaving handler, not a healthy
@@ -852,6 +912,33 @@ func stringify(v any) string {
 		return s
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// resolveExtraEnv builds the per-invocation extra env for a template: the
+// literal env values followed by the resolved secret values, both name-ordered.
+// Secret values are resolved here, immediately before execution, so they are
+// never cached on Prepared or baked into the fingerprint. A template that
+// references a secret but has no provider configured fails with a clear error
+// naming the reference. The returned slice is the ONLY place a resolved secret
+// value lives before it is handed to the executor (and from there to the
+// container's Config.Env); it is never logged or persisted.
+func (r *Runner) resolveExtraEnv(ctx context.Context, tmpl *function.Template) ([]string, error) {
+	var extra []string
+	for _, ev := range tmpl.EnvList() {
+		extra = append(extra, ev.Name+"="+ev.Value)
+	}
+	for _, sb := range tmpl.SecretList() {
+		if r.secrets == nil {
+			return nil, fmt.Errorf("function references secret %q but no secret provider is configured", sb.Ref)
+		}
+		val, err := r.secrets.Resolve(ctx, sb.Ref.String())
+		if err != nil {
+			// The provider's error carries the reference name only, never a value.
+			return nil, fmt.Errorf("resolve secret %q: %w", sb.Ref, err)
+		}
+		extra = append(extra, sb.Name+"="+val)
+	}
+	return extra, nil
 }
 
 // cleanupTimeout bounds every docker image-removal call made off the event path

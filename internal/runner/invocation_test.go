@@ -24,7 +24,7 @@ type scriptedExecutor struct {
 	fail  bool
 }
 
-func (s *scriptedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (s *scriptedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	s.mu.Lock()
 	s.calls++
 	fail := s.fail

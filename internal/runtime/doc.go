@@ -8,6 +8,15 @@
 //   - Execute: one disposable container per handler invocation, event JSON on
 //     stdin
 //
+// Env and secrets injection: each execution container's environment is the base
+// RELAY_HANDLER var, then the function's plan env (runtime needs), then the
+// per-invocation extra env (the template's literal env values and resolved
+// secret values, passed to Execute). Secret values are resolved by the runner
+// immediately before each execution and live only in the container's Config.Env
+// — never in Prepared, never in the fingerprint, never in the image, and never
+// in the state database. template.yaml is excluded from the build context so env
+// values and secret references are never baked into image layers.
+//
 // Key Features:
 //   - A single reused Docker Engine client for every build and invocation
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;

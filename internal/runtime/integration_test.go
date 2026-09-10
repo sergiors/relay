@@ -91,7 +91,7 @@ def completed(event):
 	}
 
 	eventJSON := []byte(`{"event_id":"1757-0","status":"COMPLETED"}`)
-	if err := m.Execute(ctx, prepared, "handler.completed", eventJSON); err != nil {
+	if err := m.Execute(ctx, prepared, "handler.completed", eventJSON, nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 }
@@ -129,7 +129,7 @@ async def completed(event):
 	}
 
 	eventJSON := []byte(`{"event_id":"1757-0","status":"COMPLETED"}`)
-	if err := m.Execute(ctx, prepared, "handler.completed", eventJSON); err != nil {
+	if err := m.Execute(ctx, prepared, "handler.completed", eventJSON, nil); err != nil {
 		t.Fatalf("execute async: %v", err)
 	}
 }
@@ -166,7 +166,7 @@ export async function created(event) {
 	}
 
 	eventJSON := []byte(`{"event_id":"1757-0","event_name":"INSERT"}`)
-	if err := m.Execute(ctx, prepared, "index.created", eventJSON); err != nil {
+	if err := m.Execute(ctx, prepared, "index.created", eventJSON, nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 }
@@ -225,7 +225,7 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 	}
 
 	// INSERT -> events.created.handler uses new_image.id.
-	if err := m.Execute(ctx, prepared, "events.created.handler", []byte(devEventJSON)); err != nil {
+	if err := m.Execute(ctx, prepared, "events.created.handler", []byte(devEventJSON), nil); err != nil {
 		t.Fatalf("execute events.created.handler: %v", err)
 	}
 
@@ -236,7 +236,7 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 	  "table_name": "users",
 	  "new_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 	}`)
-	if err := m.Execute(ctx, prepared, "events.updated.handler", modifiedJSON); err != nil {
+	if err := m.Execute(ctx, prepared, "events.updated.handler", modifiedJSON, nil); err != nil {
 		t.Fatalf("execute events.updated.handler: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 	  "table_name": "users",
 	  "old_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 	}`)
-	if err := m.Execute(ctx, prepared, "events.deleted.handler", deletedJSON); err != nil {
+	if err := m.Execute(ctx, prepared, "events.deleted.handler", deletedJSON, nil); err != nil {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	if err := m.Execute(ctx, prepared, "handler.handler", []byte(devEventJSON)); err != nil {
+	if err := m.Execute(ctx, prepared, "handler.handler", []byte(devEventJSON), nil); err != nil {
 		t.Fatalf("execute handler.handler: %v", err)
 	}
 
@@ -332,7 +332,7 @@ export function run(event) {
 	}
 
 	eventJSON := []byte(`{"event_id":"1","event_name":"INSERT"}`)
-	err = m.Execute(ctx, prepared, "index.run", eventJSON)
+	err = m.Execute(ctx, prepared, "index.run", eventJSON, nil)
 	if err == nil {
 		t.Fatalf("expected execute to fail for broken dependency")
 	}
@@ -541,6 +541,166 @@ func waitForContainerGone(ctx context.Context, cli *client.Client, key, value st
 	return false
 }
 
+// TestIntegrationFunctionEnvInjection verifies template env values are injected
+// into the execution container's environment, and that template.yaml is NOT
+// baked into the image (it is Relay configuration, not function source).
+func TestIntegrationFunctionEnvInjection(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+env:
+  GREETING: hello
+events:
+  - handler: index.env
+    pattern:
+      event_name: [INSERT]
+`)
+	// The handler prints its env and lists the /app directory so the test can
+	// assert both the injected value and the absence of template.yaml.
+	writeFile(t, dir, "index.js", `
+import { readdirSync } from "node:fs";
+export function env(event) {
+  console.log("GREETING=" + process.env.GREETING);
+  console.log("FILES=" + readdirSync("/app").join(","));
+}
+`)
+	fn := function.Function{Name: "env-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	m, buf := newManager(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Inject the template env value via extraEnv (the runner's per-invocation
+	// path).
+	if err := m.Execute(ctx, prepared, "index.env", []byte(`{"event_name":"INSERT"}`), []string{"GREETING=hello"}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "GREETING=hello") {
+		t.Errorf("expected container env to contain GREETING=hello, got: %s", logs)
+	}
+	// template.yaml must NOT be in the image.
+	if strings.Contains(logs, "template.yaml") {
+		t.Errorf("template.yaml must not be baked into the image, got: %s", logs)
+	}
+}
+
+// TestIntegrationSecretInjectionAndRotation verifies secret values are injected
+// per invocation and that rotating the value between executions takes effect
+// without a rebuild (the image is prepared once; the fingerprint is unchanged).
+func TestIntegrationSecretInjectionAndRotation(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+secrets:
+  TOKEN: relay-itest-token
+events:
+  - handler: index.secret
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export function secret(event) {
+  console.log("TOKEN=" + process.env.TOKEN);
+}
+`)
+	fn := function.Function{Name: "secret-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	m, buf := newManager(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	fp1 := prepared.Fingerprint
+
+	// First execution with secret value v1.
+	if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=v1"}); err != nil {
+		t.Fatalf("execute v1: %v", err)
+	}
+	if !strings.Contains(buf.String(), "TOKEN=v1") {
+		t.Errorf("expected TOKEN=v1, got: %s", buf.String())
+	}
+
+	// Rotate the value; the second execution sees v2 with NO rebuild (the
+	// prepared image and fingerprint are unchanged).
+	if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=v2"}); err != nil {
+		t.Fatalf("execute v2: %v", err)
+	}
+	if !strings.Contains(buf.String(), "TOKEN=v2") {
+		t.Errorf("expected TOKEN=v2 after rotation, got: %s", buf.String())
+	}
+	if prepared.Fingerprint != fp1 {
+		t.Errorf("fingerprint changed across secret rotation: %s -> %s", fp1, prepared.Fingerprint)
+	}
+}
+
+// TestIntegrationMultipleFunctionsSameSecret verifies two functions referencing
+// the same secret both resolve it (the provider is shared, resolution is
+// per-invocation).
+func TestIntegrationMultipleFunctionsSameSecret(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+
+	// Both functions reference the same secret name; the runner resolves it per
+	// invocation. This test drives the runtime layer directly with the resolved
+	// value, proving the container receives it for each function.
+	for _, tc := range []struct {
+		name string
+	}{
+		{"multi-a"},
+		{"multi-b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "template.yaml", `
+runtime: node24
+secrets:
+  TOKEN: relay-itest-token
+events:
+  - handler: index.secret
+    pattern:
+      event_name: [INSERT]
+`)
+			writeFile(t, dir, "index.js", `
+export function secret(event) {
+  console.log("TOKEN=" + process.env.TOKEN);
+}
+`)
+			fn := function.Function{Name: tc.name, Dir: dir, Template: &function.Template{Runtime: "node24"}}
+			m, buf := newManager(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			prepared, err := m.Prepare(ctx, fn)
+			if err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=shared-value"}); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+			if !strings.Contains(buf.String(), "TOKEN=shared-value") {
+				t.Errorf("expected TOKEN=shared-value, got: %s", buf.String())
+			}
+		})
+	}
+}
+
 // TestIntegrationContainerLabelsAndAutoRemove drives a real execution while
 // verifying the seven diagnostic labels are present mid-flight (polled while the
 // handler runs), that AutoRemove removes the container the moment it exits, that
@@ -586,7 +746,7 @@ export async function slow(event) {
 		})
 	done := make(chan error, 1)
 	go func() {
-		done <- m.Execute(execCtx, prepared, "index.slow", []byte(`{"event_id":"evt_777","event_name":"INSERT"}`))
+		done <- m.Execute(execCtx, prepared, "index.slow", []byte(`{"event_id":"evt_777","event_name":"INSERT"}`), nil)
 	}()
 
 	// Poll while the handler runs (sleeep 1.5s) for the container carrying our
@@ -676,7 +836,7 @@ export async function fail(event) {
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
 		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
-	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`))
+	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
 		t.Fatal("expected execute to fail for non-zero exit")
 	}
@@ -725,7 +885,7 @@ export async function sleeper(event) {
 	defer invokeCancel()
 	execCtx := context.WithValue(invokeCtx, runMetaKey{},
 		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image})
-	err = m.Execute(execCtx, prepared, "index.sleeper", []byte(`{"event_name":"INSERT"}`))
+	err = m.Execute(execCtx, prepared, "index.sleeper", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
 		t.Fatal("expected execute to fail on timeout")
 	}
@@ -878,7 +1038,7 @@ export function check(event) {
 				RunMeta{Hostname: "test-host", Function: "harden-" + tc.name, Handler: tc.handler, Image: prepared.Image})
 			done := make(chan error, 1)
 			go func() {
-				done <- m.Execute(execCtx, prepared, tc.handler, tc.event)
+				done <- m.Execute(execCtx, prepared, tc.handler, tc.event, nil)
 			}()
 
 			// Poll for the running container, then inspect it to assert the

@@ -31,8 +31,17 @@ const (
 // a concrete-need interface so reconcile logic can be unit-tested without Docker
 // or a Redis stream; the runtime Manager satisfies it in production.
 type Builder interface {
-	Prepare(ctx context.Context, fn function.Function) (*runtime.Prepared, error)
-	Execute(ctx context.Context, prepared *runtime.Prepared, handler string, eventJSON []byte) error
+	Prepare(
+		ctx context.Context,
+		fn function.Function,
+	) (*runtime.Prepared, error)
+	Execute(
+		ctx context.Context,
+		prepared *runtime.Prepared,
+		handler string,
+		eventJSON []byte,
+		extraEnv []string,
+	) error
 }
 
 // Config tunes the reconciler. A zero value applies the package defaults.
@@ -422,7 +431,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	built, err := r.builder.Prepare(r.rctx(), fn)
 	if err != nil {
 		r.log.Printf("function %q reload failed (retaining previous version): %v%s",
-			name, err, logging.Fields("function", name, "duration", time.Since(start), "outcome", "failed"))
+			name, err, logging.Fields(
+				"function", name,
+				"duration", time.Since(start),
+				"outcome", "failed",
+			))
 		// Keep the old active version AND the old fingerprint so a later change
 		// (which alters the fingerprint) triggers a fresh attempt.
 		if r.st != nil {
@@ -461,10 +474,18 @@ func (r *Reconciler) reconcileFunction(name string) {
 
 	if cur == nil {
 		r.log.Printf("function %q discovered%s",
-			name, logging.Fields("function", name, "duration", time.Since(start), "outcome", "discovered"))
+			name, logging.Fields(
+				"function", name,
+				"duration", time.Since(start),
+				"outcome", "discovered",
+			))
 	} else {
 		r.log.Printf("function %q updated%s",
-			name, logging.Fields("function", name, "duration", time.Since(start), "outcome", "updated"))
+			name, logging.Fields(
+				"function", name,
+				"duration", time.Since(start),
+				"outcome", "updated",
+			))
 	}
 }
 

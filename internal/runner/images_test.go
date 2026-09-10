@@ -28,7 +28,7 @@ type blockExecutor struct {
 	tags        map[string][]string
 }
 
-func (f *blockExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (f *blockExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	if f.startBlocks {
 		f.mu.Lock()
 		select {
@@ -122,7 +122,7 @@ func TestHandleCountsImageRefs(t *testing.T) {
 // panicExecutor panics inside Execute to exercise the release-on-panic path.
 type panicExecutor struct{}
 
-func (panicExecutor) Execute(context.Context, *runtime.Prepared, string, []byte) error {
+func (panicExecutor) Execute(context.Context, *runtime.Prepared, string, []byte, []string) error {
 	panic("executor boom")
 }
 

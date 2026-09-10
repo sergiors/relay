@@ -25,6 +25,13 @@
 //     failure. The image refcount is still released and the invocation context
 //     cancel is deferred, so no reference or timer leaks. Panics elsewhere
 //     (startup, reconciler, Redis client) are not recovered and stay fatal
+//   - Secrets: a template's secret references are resolved to values immediately
+//     before each execution (via the provider set with SetSecretProvider) and
+//     passed to the executor as extra env. Resolved values are never cached on
+//     Prepared, never baked into images, and never logged; a resolution failure
+//     is a failed attempt that flows through the normal retry/exhaustion
+//     machinery. A template that references a secret with no provider configured
+//     fails the invocation with a clear error naming the reference.
 //
 // Key Guarantees:
 //   - Handle holds one registry snapshot for the whole call, so in-flight

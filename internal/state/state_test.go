@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -387,5 +388,106 @@ func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 	c.PruneRemoved(root)
 	if _, ok := c.GetFunction("demo"); !ok {
 		t.Fatal("demo must survive pruning while present on disk")
+	}
+}
+
+// TestEnvSecretsMappingsPersisted verifies the env/secret MAPPINGS (never
+// values) round-trip through the functions table, including env values that
+// contain '=' (which is why JSON, not logfmt, is used).
+func TestEnvSecretsMappingsPersisted(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, `runtime: python3.14
+env:
+  API_URL: https://api.example.com
+  CONN: postgres://user:pass@host/db
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+`)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+
+	d, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row")
+	}
+	if d.Env["API_URL"] != "https://api.example.com" {
+		t.Errorf("env API_URL = %q, want https://api.example.com", d.Env["API_URL"])
+	}
+	// An env value containing '=' must survive intact.
+	if d.Env["CONN"] != "postgres://user:pass@host/db" {
+		t.Errorf("env CONN = %q, want the full connection string", d.Env["CONN"])
+	}
+	if d.Secrets["DATABASE_URL"] != "database-url" {
+		t.Errorf("secrets DATABASE_URL = %q, want database-url (the reference, never a value)", d.Secrets["DATABASE_URL"])
+	}
+}
+
+// TestEnvSecretsMappingsNilWhenAbsent verifies a template with no env/secrets
+// yields nil maps (not empty non-nil maps).
+func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+
+	d, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row")
+	}
+	if d.Env != nil {
+		t.Errorf("env = %v, want nil when absent", d.Env)
+	}
+	if d.Secrets != nil {
+		t.Errorf("secrets = %v, want nil when absent", d.Secrets)
+	}
+}
+
+// TestEnvSecretsMigrationAddsColumns verifies a database created before the
+// env/secrets columns existed is migrated idempotently: the columns are added
+// and existing rows read back with nil maps.
+func TestEnvSecretsMigrationAddsColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	// Create a DB with the OLD schema (no env/secrets columns).
+	old, err := Open(path)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	// Drop the columns to simulate a pre-migration database.
+	if _, err := old.db.ExecContext(context.Background(), `ALTER TABLE functions DROP COLUMN env`); err != nil {
+		t.Fatalf("drop env: %v", err)
+	}
+	if _, err := old.db.ExecContext(context.Background(), `ALTER TABLE functions DROP COLUMN secrets`); err != nil {
+		t.Fatalf("drop secrets: %v", err)
+	}
+	_ = old.Close()
+
+	// Reopen: the migration must re-add the columns.
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c.Close()
+	tmpl := mustTemplate(t, `runtime: python3.14
+env:
+  API_URL: https://api.example.com
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+`)
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
+	d, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after migration")
+	}
+	if d.Env["API_URL"] != "https://api.example.com" {
+		t.Errorf("env API_URL = %q after migration, want https://api.example.com", d.Env["API_URL"])
+	}
+	if d.Secrets["DATABASE_URL"] != "database-url" {
+		t.Errorf("secrets DATABASE_URL = %q after migration, want database-url", d.Secrets["DATABASE_URL"])
 	}
 }

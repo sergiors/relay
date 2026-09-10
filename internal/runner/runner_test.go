@@ -45,7 +45,7 @@ type fakeExecutor struct {
 	calls int
 }
 
-func (f *fakeExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (f *fakeExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
@@ -138,7 +138,7 @@ type countingExecutor struct {
 	calls int
 }
 
-func (f *countingExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (f *countingExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	f.mu.Lock()
 	f.calls++
 	f.mu.Unlock()
@@ -159,7 +159,7 @@ type metaCaptureExecutor struct {
 	meta runtime.RunMeta
 }
 
-func (m *metaCaptureExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte) error {
+func (m *metaCaptureExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte, _ []string) error {
 	m.mu.Lock()
 	m.meta = runtime.RunMetaFrom(ctx)
 	m.mu.Unlock()
@@ -418,7 +418,7 @@ func TestHandleNoInvocationStateBehavesAsBefore(t *testing.T) {
 // error, so a test can observe the deadline the runner actually imposed.
 type ctxAwareExecutor struct{}
 
-func (ctxAwareExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte) error {
+func (ctxAwareExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte, _ []string) error {
 	<-ctx.Done()
 	return ctx.Err()
 }

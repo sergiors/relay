@@ -21,6 +21,18 @@
 //     attempt). The per-invocation attempt count and retry backoff are owned by
 //     the stream/runner layers, not here.
 //
+// Env and secrets:
+//   - `env` maps an env-var name to a literal string value, injected into every
+//     execution container at runtime. Values are literal — never masked, never
+//     treated as secret-looking. Empty values are allowed (flag-like variables).
+//   - `secrets` maps an env-var name to a secret reference name (a SecretRef).
+//     The reference is resolved to a value immediately before each execution by
+//     the runner; the value never lives in this package, in the image, or in the
+//     fingerprint. A variable may not be defined in both `env` and `secrets`.
+//   - Env-var names must match [A-Za-z_][A-Za-z0-9_]*; secret references must
+//     be valid secret names (see ValidSecretName). All validation errors are
+//     value-free.
+//
 // The package has no side effects beyond reading the filesystem; building,
 // execution, and Redis are owned elsewhere.
 package function

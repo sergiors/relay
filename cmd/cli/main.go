@@ -28,6 +28,7 @@ func rootHelp() string {
 		helpWriter([][2]string{
 			{"function", "Manage functions"},
 			{"health", "Check Relay dependencies"},
+			{"secret", "Manage local secrets"},
 			{"stats", "Show current operational statistics"},
 		}) +
 		"\nRun 'relay COMMAND --help' for more information on a command.\n"
@@ -67,8 +68,10 @@ func main() {
 }
 
 // runCLI dispatches the CLI's subcommands. It is separated from main so tests
-// can exercise the exit codes directly. The CLI is read-only and never starts
-// the worker (a separate relay-worker binary). Exit codes:
+// can exercise the exit codes directly. The CLI is read-only with respect to
+// Relay's runtime: it never starts the worker (a separate relay-worker binary)
+// and never touches Redis or Docker. It does manage local secret files under
+// the secrets directory (see `relay secret`). Exit codes:
 //
 //	0  success
 //	1  runtime error (from a subcommand)
@@ -90,6 +93,8 @@ func runCLI(args []string) int {
 			return printUsageError("health: too many arguments", healthUsage())
 		}
 		return runHealthCommand()
+	case "secret":
+		return runSecretCommand(args[1:])
 	case "stats":
 		if len(args) == 2 && isHelp(args[1]) {
 			fmt.Fprint(os.Stdout, statsUsage())

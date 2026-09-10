@@ -24,6 +24,7 @@ import (
 	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/secrets"
 	"relay/internal/state"
 	"relay/internal/stream"
 )
@@ -240,6 +241,15 @@ func run(logger *log.Logger) {
 	// execution container. Must be set before Consume begins; it is wired right
 	// after construction so all invocations carry it.
 	runWorker.SetHostname(consumerName)
+	// Wire the local secrets provider. It is infallible to construct (the
+	// directory is created lazily on Set, never on Resolve), and a missing
+	// secret surfaces as a per-invocation Resolve error rather than a startup
+	// failure — startup does not validate that referenced secrets exist.
+	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
+	if err != nil {
+		logger.Fatalf("secrets: %v", err)
+	}
+	runWorker.SetSecretProvider(secretProvider)
 	// Cap every rule's handler timeout at the same value template validation
 	// enforces (function.MaxTimeout). Defense in depth: a misconfigured or
 	// hot-swapped template can never run a handler past the cap. The capped

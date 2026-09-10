@@ -20,6 +20,36 @@ const maxNameLen = 63
 // from directory names.
 var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
+// secretNamePattern restricts the characters a secret name may contain. It is
+// deliberately the same shape as a function name (lowercase letters, digits,
+// '.', '_', '-', no leading '.', no trailing '.') so a secret reference is
+// always a safe, single path component: it can never contain a path separator,
+// an absolute path, or "..", which is what lets the local store resolve it to a
+// file under the secrets directory without any escaping risk. The rule is
+// duplicated in internal/secrets (which cannot import this leaf package); the
+// two are pinned equivalent by a cross-check test in the secrets package.
+var secretNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
+// ValidSecretName reports whether name is a legal secret reference, returning
+// nil when it is and a descriptive error otherwise. It rejects empty names,
+// names over maxNameLen characters, names containing path separators or "..",
+// and names ending in '.'. The value is never included in the error.
+func ValidSecretName(name string) error {
+	if name == "" {
+		return fmt.Errorf("invalid secret name: must not be empty")
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("invalid secret name: must be at most %d characters", maxNameLen)
+	}
+	if !secretNamePattern.MatchString(name) {
+		return fmt.Errorf("invalid secret name %q: must match [a-z0-9][a-z0-9._-]*", name)
+	}
+	if name[len(name)-1] == '.' {
+		return fmt.Errorf("invalid secret name %q: must not end with '.'", name)
+	}
+	return nil
+}
+
 // ValidName reports whether name is a legal function name, returning nil when it
 // is and a descriptive error otherwise. Names are validated at load time (never
 // sanitized), so the value used for the docker image tag is guaranteed to be

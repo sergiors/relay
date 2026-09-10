@@ -177,6 +177,51 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	}
 }
 
+// TestFunctionInspectShowsEnvSecretsMappings verifies inspect renders the
+// env/secret MAPPINGS (literal env values and secret references) but never a
+// secret VALUE.
+func TestFunctionInspectShowsEnvSecretsMappings(t *testing.T) {
+	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
+env:
+  API_URL: https://api.example.com
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+`))
+	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	out := capture(t, func() { printInspect(st, d) })
+	for _, want := range []string{
+		"Environment:",
+		"API_URL=https://api.example.com",
+		"Secrets:",
+		"DATABASE_URL=database-url",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+	// The secret VALUE must never appear — only the reference.
+	if strings.Contains(out, "postgres://") {
+		t.Errorf("inspect leaked a secret value:\n%s", out)
+	}
+}
+
 // Arg handling: bad args -> exit 2; unknown function -> exit 1 + message.
 func TestFunctionCommandExitCodes(t *testing.T) {
 	_ = seedTestState(t)

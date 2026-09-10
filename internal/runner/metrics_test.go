@@ -46,7 +46,7 @@ type fixedExecutor struct {
 	ops int
 }
 
-func (f *fixedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte) error {
+func (f *fixedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
 	if f.err {
 		return fmt.Errorf("boom")
 	}

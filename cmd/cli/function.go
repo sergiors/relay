@@ -162,6 +162,38 @@ func printInspect(st *state.State, d state.Detail) {
 		fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
 	}
 	hw.Flush()
+
+	// Env and secrets sections render the template's MAPPINGS only: literal env
+	// values (not secret) and secret references (never values). Both are
+	// omitted when the template defines none. Keys are sorted.
+	if len(d.Env) > 0 {
+		fmt.Fprintln(os.Stdout, "")
+		fmt.Fprintln(os.Stdout, "Environment:")
+		ew := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+		for _, k := range sortedKeys(d.Env) {
+			fmt.Fprintf(ew, "  %s=%s\n", k, d.Env[k])
+		}
+		ew.Flush()
+	}
+	if len(d.Secrets) > 0 {
+		fmt.Fprintln(os.Stdout, "")
+		fmt.Fprintln(os.Stdout, "Secrets:")
+		sw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+		for _, k := range sortedKeys(d.Secrets) {
+			fmt.Fprintf(sw, "  %s=%s\n", k, d.Secrets[k])
+		}
+		sw.Flush()
+	}
+}
+
+// sortedKeys returns the map's keys sorted, for deterministic inspect output.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // displayTime returns the UPDATED column value: prepared_at (if set) else

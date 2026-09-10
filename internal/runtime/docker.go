@@ -76,9 +76,14 @@ func buildImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	// Copy the function directory into the context. Generated plan files are
-	// written separately, so the user's function directory is never modified.
-	if err := copyDir(fn.Dir, ctxDir); err != nil {
+	// Copy the function directory into the context, EXCLUDING template.yaml.
+	// The template is Relay configuration (runtime, rules, env values, secret
+	// references), not function source: baking it into the image would embed env
+	// values and secret references in the image layers. The fingerprint still
+	// covers template.yaml (its content gates rebuilds), but the image never
+	// contains it. Generated plan files are written separately, so the user's
+	// function directory is never modified.
+	if err := copyDir(fn.Dir, ctxDir, map[string]bool{"template.yaml": true}); err != nil {
 		return fmt.Errorf("function %q: copy sources: %w", name, err)
 	}
 
@@ -249,7 +254,9 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 // cancelled context is reported as cancellation, not as a docker error. meta is
 // the diagnostic metadata stamped as container labels (purely for triage; see
 // RunMeta). env are the function's runtime environment variables (from the
-// engine's plan), merged after the base RELAY_HANDLER var. The container is
+// engine's plan), merged after the base RELAY_HANDLER var. extraEnv are the
+// per-invocation variables (template env values + resolved secret values),
+// merged after env; later entries win on duplicate names. The container is
 // created with AutoRemove so the daemon removes it the moment it exits; Relay's
 // deferred removal only cleans up the paths where the container never exits on
 // its own (e.g. a failed start).
@@ -266,13 +273,19 @@ func runContainer(
 	log func(format string, args ...any),
 	name, image string,
 	env []string,
+	extraEnv []string,
 	handler string,
 	eventJSON []byte,
 	meta RunMeta,
 ) error {
-	// Merge the base handler var with the function's plan env. The plan env is
-	// per-function (not per-run), so it is applied uniformly to every invocation.
+	// Merge the base handler var, the function's plan env, and the per-invocation
+	// extra env. The plan env is per-function (not per-run), so it is applied
+	// uniformly to every invocation; the extra env carries this invocation's
+	// template env values and resolved secrets. Later entries win on duplicates
+	// (container env semantics), so a template env var may intentionally override
+	// a runtime default.
 	containerEnv := append([]string{"RELAY_HANDLER=" + handler}, env...)
+	containerEnv = append(containerEnv, extraEnv...)
 	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image:        image,
@@ -432,7 +445,14 @@ func runContainer(
 	return nil
 }
 
-func copyDir(src, dst string) error {
+// copyDir copies src into dst, skipping any file whose slash-separated relative
+// path is in skip AND any file named template.yaml anywhere in the tree (the
+// exclusion is by base name so a nested template.yaml can never leak Relay
+// configuration — including env values and secret references — into an image;
+// the loader only ever reads the top-level one, so nested copies are dead
+// weight at best). It is used to stage a function directory into a build
+// context.
+func copyDir(src, dst string, skip map[string]bool) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -442,6 +462,12 @@ func copyDir(src, dst string) error {
 			return err
 		}
 		if rel == "." {
+			return nil
+		}
+		if skip[filepath.ToSlash(rel)] || filepath.Base(rel) == "template.yaml" {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		target := filepath.Join(dst, rel)
