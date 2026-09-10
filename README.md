@@ -272,8 +272,9 @@ events:
   `module.function`), a required `pattern`, and an optional `timeout`.
 - `timeout` (optional, per rule) is a Go duration string bounding a single
   invocation of that rule's handler (e.g. `20s`, `1m30s`). It must be positive.
-  Zero, negative, or unparseable values fail the function's template validation
-  (the function is logged and skipped). Omitted rules use a `6s` default.
+  Zero, negative, unparseable, or values above `5m` (`MaxTimeout`) fail the
+  function's template validation (the function is logged and skipped). Omitted
+  rules use a `6s` default.
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
@@ -572,9 +573,13 @@ handler failure — stays in the PEL.
 
 - **Recovery loop** (`XAUTOCLAIM`): a background goroutine runs every
   `DefaultReclaimInterval` (1m) and reclaims messages that have sat pending for
-  longer than `DefaultMinPendingIdle` (1m). Reclaiming takes ownership for the
-  current consumer and replays the message through the same processing path as a
-  fresh read. This makes Relay survive restarts: a message left pending by a
+  longer than `3 × MaxRuleTimeout` (15m). This is a message-level retry-pacing
+  backstop, not the concurrency guard: reclaiming transfers ownership of the
+  message and replays it through the same processing path as a fresh read, but
+  whether an individual handler actually executes is decided per-invocation from
+  the invocation state (see below). Rule timeouts are capped at 5m (`timeout`
+  values above `5m` fail template validation), which is what the threshold
+  derives from. This makes Relay survive restarts: a message left pending by a
   dead consumer is picked up and retried by a live one.
 - **Retry counting**: the per-message delivery count is read from Redis
   (`XPENDING` full form / retry counter), not kept in process memory, so the
@@ -601,15 +606,30 @@ falls back to them in `NewConsumer`.
 The at-least-once contract from the ACK table above is unchanged: XACK happens
 only after all matching invocations succeed or the message is successfully
 routed to the DLQ. To avoid re-running work that already succeeded, Relay records
-per-handler invocation state in Redis: each successful invocation is written
-to a TTL'd hash keyed by message (`relay:invocation:{stream}:{group}:{msgID}`,
-field `<function>/<handler>` → `ok`; stream/group names are percent-encoded in
-the key). On redelivery, an invocation whose
-`<function>/<handler>` is already recorded as succeeded is skipped; only failed
-or pending ones retry. The message is acknowledged once all matching invocations
-are complete, and the invocation-state key is cleared on completion or DLQ
-routing. The keys expire after 7 days as a fallback cleanup for abandoned
-messages.
+per-handler invocation state in Redis: each message has a TTL'd hash keyed by
+message (`relay:invocation:{stream}:{group}:{msgID}`, field
+`<function>/<handler>`; stream/group names are percent-encoded in the key). The
+field value describes the invocation's lifecycle for this message:
+
+- `ok` — the invocation completed on a previous delivery; redeliveries skip it.
+- `running:<unix-nano deadline>` — an attempt is (or was) executing, protected
+  until that absolute deadline.
+- absent — eligible to execute.
+
+Before executing an invocation, the runner claims it via `TryStart`, which
+persists `running:<now+timeout>` — the same capped timeout the local
+`context.WithTimeout` enforces, so the persisted deadline and the local timer
+match by construction. On success `MarkComplete` overwrites the marker with `ok`;
+on failure or timeout `EndRunning` clears it so a later delivery is eligible
+again. Another worker that redelivers the message while `now < running_until`
+skips that invocation, because a live attempt (this or another replica) may be
+executing it. A crashed worker's marker self-expires at its deadline, so
+recovery waits it out (bounded by at most one timeout) instead of racing a live
+attempt. Bookkeeping failures fail open: a Redis error on the read or write
+never blocks delivery, preserving at-least-once. The message is acknowledged
+once all matching invocations are complete, and the invocation-state key is
+cleared on completion or DLQ routing. The keys expire after 7 days as a fallback
+cleanup for abandoned messages.
 
 This is still at-least-once, not exactly-once: there is a crash window between a
 handler's side effect and its state being recorded, so a handler can still run

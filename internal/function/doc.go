@@ -10,7 +10,9 @@
 //
 // Key Features:
 //   - A rule that omits a timeout resolves to DefaultTimeout; zero, negative,
-//     or unparseable values are rejected
+//     unparseable, or over-MaxTimeout values are rejected. MaxTimeout caps every
+//     rule's handler timeout; it bounds the running deadline an invocation may
+//     persist (stream layer) and the message-reclaim backstop derived from it.
 //
 // The package has no side effects beyond reading the filesystem; building,
 // execution, and Redis are owned elsewhere.

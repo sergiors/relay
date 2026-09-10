@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // TestInvocationStateKeyLayout pins the exact Redis key layout so a change to
@@ -59,5 +60,59 @@ func TestInvocationStateContextRoundTrip(t *testing.T) {
 	ctxNil := WithInvocationState(context.Background(), nilP)
 	if p3, ok := InvocationStateFrom(ctxNil); ok || p3 != nil {
 		t.Fatalf("nil interface in ctx: got (%v, %v), want (nil, false)", p3, ok)
+	}
+}
+
+// TestRunningValueRoundTrip pins the "running:<unixnano>" field-value encoding:
+// runningValue encodes an absolute deadline and parseRunning decodes it back.
+// The "running:" prefix distinguishes the marker from the "ok" completion
+// sentinel; the Unix-nano suffix is the deadline at which the attempt is
+// considered abandoned.
+func TestRunningValueRoundTrip(t *testing.T) {
+	dl := time.Unix(0, 1757000000000000000)
+	v := runningValue(dl)
+	if v != "running:1757000000000000000" {
+		t.Fatalf("runningValue = %q, want %q", v, "running:1757000000000000000")
+	}
+	got, ok := parseRunning(v)
+	if !ok {
+		t.Fatalf("parseRunning(%q) ok = false, want true", v)
+	}
+	if !got.Equal(dl) {
+		t.Fatalf("parseRunning(%q) = %v, want %v", v, got, dl)
+	}
+}
+
+// TestParseRunningRejectsNonMarkers verifies parseRunning returns ok=false for
+// any value that is not a well-formed running marker: the "ok" completion
+// sentinel, a corrupt marker, and a future richer value are all treated as
+// eligible (not protected).
+func TestParseRunningRejectsNonMarkers(t *testing.T) {
+	for _, v := range []string{
+		"ok",
+		"",
+		"running:",
+		"running:notanumber",
+		"next_attempt_at:123",
+	} {
+		if _, ok := parseRunning(v); ok {
+			t.Errorf("parseRunning(%q) ok = true, want false", v)
+		}
+	}
+}
+
+// TestNewInvocationStateClockOption verifies the WithClock option wires the
+// injected clock into the handle, so tests can freeze/advance time without
+// changing production semantics (production passes no option → time.Now).
+func TestNewInvocationStateClockOption(t *testing.T) {
+	frozen := time.Unix(0, 1757000000000000000)
+	p := NewInvocationState(context.Background(), &invocationStore{}, "s", "g", "m", nil,
+		WithClock(func() time.Time { return frozen }))
+	ip, ok := p.(*invocationState)
+	if !ok {
+		t.Fatalf("NewInvocationState returned %T, want *invocationState", p)
+	}
+	if got := ip.now(); !got.Equal(frozen) {
+		t.Fatalf("injected clock = %v, want %v", got, frozen)
 	}
 }

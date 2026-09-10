@@ -19,8 +19,10 @@ services:
       - PING=1
       - VERSION=1
       - BUILD=1
+      - IMAGES=1
       - CONTAINERS=1
       - POST=1
+      - DELETE=1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 

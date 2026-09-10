@@ -936,3 +936,309 @@ func TestIntegrationPendingGauge(t *testing.T) {
 	})
 	e.stop(t)
 }
+
+// TestIntegrationInvocationRunningUntilBlocksReexecution verifies the
+// timeout-driven eligibility model end to end: a handler that claims the
+// invocation via TryStart (persisting a running deadline) and then blocks keeps
+// the invocation protected; a redelivery that calls TryStart again within the
+// deadline is skipped (the executor is not called). After the deadline expires,
+// a later delivery executes it.
+func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+
+	// The handler simulates the runner: TryStart with a short timeout, then
+	// block so the invocation stays protected for a controlled window.
+	release := make(chan struct{})
+	var calls atomic.Int64
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if !p.TryStart("fn/h", 2*time.Second) {
+			// Protected by an active attempt deadline: skip (no execution).
+			return nil
+		}
+		calls.Add(1)
+		<-release
+		return nil
+	})
+
+	// The first delivery claims and blocks; the invocation is protected.
+	waitFor(t, "invocation claimed and running", func() bool {
+		return calls.Load() >= 1
+	})
+	// A redelivery (reclaim) within the deadline must be skipped: TryStart
+	// returns false, so the executor is not called again.
+	time.Sleep(500 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("executor called %d times while invocation protected; want 1", got)
+	}
+
+	// Release the handler; it acks and the message leaves the PEL.
+	close(release)
+	waitFor(t, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.stop(t)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("executor called %d times, want exactly 1", got)
+	}
+}
+
+// TestIntegrationInvocationStateSurvivesRestart verifies that a running marker
+// persisted in Redis survives a consumer restart: a new consumer on the same
+// stream/group skips the invocation while within the deadline and runs it after
+// the deadline expires.
+func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	prefix := fmt.Sprintf("restart-inv-%d", time.Now().UnixNano())
+	stream, group := prefix+"-stream", prefix+"-group"
+
+	// Consumer A delivers the message and marks the invocation running with a
+	// future deadline, then stops (simulating a restart).
+	envA := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "restart-inv-A",
+		MaxAttempts: 100,
+	})
+	id := envA.xadd(t, `{"a":1}`)
+	key := invocationStateKey(stream, group, id)
+	deliveredA := make(chan struct{})
+	envA.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID == id {
+			close(deliveredA)
+		}
+		return fmt.Errorf("leave pending")
+	})
+	<-deliveredA
+	waitFor(t, "message pending under consumer A", func() bool {
+		_, ok := envA.pending()[id]
+		return ok
+	})
+	// Mark running with a deadline ~1s in the future, then stop A.
+	deadline := time.Now().Add(time.Second)
+	if err := envA.client.HSet(context.Background(), key, "fn/h", runningValue(deadline)).Err(); err != nil {
+		t.Fatalf("hset running marker: %v", err)
+	}
+	envA.stop(t)
+
+	// Consumer B (new consumer, same stream/group) reclaims the idle message.
+	// Within the deadline it must skip the invocation; after expiry it runs it.
+	// MaxAttempts is high so B keeps reclaiming until the protected window (the
+	// persisted deadline plus the clock-skew tolerance) expires instead of
+	// exhausting into the DLQ first.
+	envB := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "restart-inv-B",
+		MaxAttempts: 100,
+	})
+	var calls atomic.Int64
+	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if !p.TryStart("fn/h", time.Second) {
+			// Protected by the persisted deadline: skip execution but keep the
+			// message pending (return an error) so a later reclaim can run it
+			// once the deadline expires. This mirrors the runner's skip path
+			// without acknowledging a message whose invocation is still
+			// protected.
+			return fmt.Errorf("invocation protected; keep pending")
+		}
+		calls.Add(1)
+		return nil
+	})
+	// Give B's reclaim loop time to run while the deadline is still in the
+	// future; the invocation must be skipped.
+	time.Sleep(500 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("executor called %d times while invocation protected after restart; want 0", got)
+	}
+	// After the deadline expires, B executes it.
+	waitFor(t, "invocation executed after deadline expiry on restart", func() bool {
+		return calls.Load() >= 1
+	})
+	envB.stop(t)
+}
+
+// TestIntegrationSuccessThenCleanup verifies the success path: a successful
+// invocation marks "ok", the message is acked, and the invocation-state key is
+// cleared.
+func TestIntegrationSuccessThenCleanup(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	acked := make(chan struct{})
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID == id {
+			close(acked)
+		}
+		return nil
+	})
+	<-acked
+	waitFor(t, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	waitFor(t, "invocation-state key cleared after ack", func() bool {
+		n, err := e.client.Exists(context.Background(), key).Result()
+		return err == nil && n == 0
+	})
+	e.stop(t)
+}
+
+// TestIntegrationFailureClearsRunningMarker verifies the failure path: an
+// attempt that fails clears its running marker (EndRunning), so an immediate
+// redelivery re-runs it without waiting for the deadline.
+func TestIntegrationFailureClearsRunningMarker(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	var attempts atomic.Int64
+	acked := make(chan struct{})
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if !p.TryStart("fn/h", time.Hour) {
+			return nil
+		}
+		n := attempts.Add(1)
+		if n >= 2 {
+			close(acked)
+			return nil
+		}
+		// Simulate the runner's failure path: clear the running marker.
+		p.EndRunning("fn/h")
+		return fmt.Errorf("fail first delivery")
+	})
+	<-acked
+	waitFor(t, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.stop(t)
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("expected at least 2 delivery attempts, got %d", got)
+	}
+	// The running marker must be gone (EndRunning cleared it on the failure), so
+	// the immediate redelivery was eligible without waiting for a deadline.
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
+		t.Fatalf("invocation-state key should be cleared after ack (exists=%d err=%v)", n, err)
+	}
+}
+
+// TestIntegrationConcurrentReplicasNoDuplicate verifies that two consumers (A/B)
+// on the same stream/group do not run the same invocation concurrently: while
+// A's handler is blocked (in flight, protected by its running deadline), B's
+// reclaim redelivery must skip the invocation. Across both replicas, the
+// executor runs exactly once during the protected window.
+func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	prefix := fmt.Sprintf("conc-%d", time.Now().UnixNano())
+	stream, group := prefix+"-stream", prefix+"-group"
+
+	// Consumer A: its handler claims the invocation (TryStart) and blocks on a
+	// channel so the invocation stays in flight (protected by its running
+	// deadline) for a controlled window.
+	envA := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "conc-A",
+		MaxAttempts: 100,
+	})
+	id := envA.xadd(t, `{"a":1}`)
+	releaseA := make(chan struct{})
+	deliveredA := make(chan struct{})
+	var aCalls atomic.Int64
+	envA.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if !p.TryStart("fn/h", 5*time.Second) {
+			return nil
+		}
+		aCalls.Add(1)
+		close(deliveredA)
+		// Block until the test releases us, keeping the invocation in flight.
+		<-releaseA
+		return nil
+	})
+	<-deliveredA
+
+	// Consumer B: reclaims the idle message while A's handler is still blocked.
+	// Its redelivery must skip the invocation while protected.
+	envB := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "conc-B",
+		MinPendingIdle:  150 * time.Millisecond,
+		ReclaimInterval: 100 * time.Millisecond,
+		MaxAttempts:     1000,
+	})
+	var bCalls atomic.Int64
+	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if !p.TryStart("fn/h", 5*time.Second) {
+			return nil
+		}
+		bCalls.Add(1)
+		return nil
+	})
+
+	// Let B's reclaim loop run against A's in-flight invocation; it must skip it
+	// while protected (A's running deadline is still in the future).
+	time.Sleep(800 * time.Millisecond)
+	if got := bCalls.Load(); got != 0 {
+		t.Fatalf("consumer B executed %d times while A's invocation was protected; want 0", got)
+	}
+
+	// Release A's handler; it acks and the message leaves the PEL.
+	close(releaseA)
+	waitFor(t, "message acked by A (gone from PEL)", func() bool {
+		_, ok := envA.pending()[id]
+		return !ok
+	})
+	envA.stop(t)
+	envB.stop(t)
+
+	if got := aCalls.Load(); got != 1 {
+		t.Fatalf("consumer A executed %d times, want exactly 1", got)
+	}
+	if got := bCalls.Load(); got != 0 {
+		t.Fatalf("consumer B executed %d times, want 0", got)
+	}
+}

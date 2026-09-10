@@ -4,15 +4,22 @@
 //   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP
 //   - Consumption: an XREADGROUP loop that hands each decoded event to a Handler
 //   - Recovery: XAUTOCLAIM reclaims idle pending messages, with retry counts
-//     sourced from XPENDING so delivery counts survive restarts
+//     sourced from XPENDING so delivery counts survive restarts. Reclaim is
+//     message-ownership recovery only; whether a reclaimed message's invocation
+//     is actually executed is decided at run time from per-invocation state
+//     (complete / running-until-deadline / eligible). MinPendingIdle is derived
+//     from the rule-timeout cap (3 * MaxRuleTimeout) and remains a message-level
+//     retry-pacing backstop.
 //   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
 //     before the original is acknowledged
-//   - Invocation state: per-handler success is recorded in a Redis hash
+//   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<function>/<handler>" →
-//     "ok", TTL'd; stream/group names are percent-encoded in the key) so a
-//     redelivered message skips handlers that already completed; the message is
-//     acknowledged when all matching invocations are complete, and the invocation
-//     state key is eagerly cleared on completion or DLQ
+//     "ok" when complete or "running:<deadline>" while an attempt is protected,
+//     TTL'd; stream/group names are percent-encoded in the key) so a
+//     redelivered message skips handlers that already completed or are still
+//     within an active attempt deadline; the message is acknowledged when all
+//     matching invocations are complete, and the invocation state key is eagerly
+//     cleared on completion or DLQ
 //
 // Key Guarantees:
 //   - A message is acknowledged only after the handler succeeds or the DLQ

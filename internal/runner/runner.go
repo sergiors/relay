@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"relay/internal/function"
@@ -132,6 +133,14 @@ type Runner struct {
 	// SetHostname) before Consume begins; when unset, an empty hostname label is
 	// emitted, which is diagnostic-only and harmless.
 	hostname string
+	// maxHandlerTimeout caps every rule's handler timeout (0 = uncapped), stored
+	// as nanoseconds in an atomic.Int64. It is defense in depth: template
+	// validation enforces the cap at load, and this runtime cap guarantees a
+	// misconfigured or hot-swapped template can never run a handler longer than
+	// the stream layer's MaxRuleTimeout. The capped value is also what TryStart
+	// persists as the invocation's running deadline, so the persisted deadline
+	// matches the local timer by construction.
+	maxHandlerTimeout atomic.Int64
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
@@ -231,6 +240,21 @@ func (r *Runner) SetHostname(h string) {
 		return
 	}
 	r.hostname = h
+}
+
+// SetMaxHandlerTimeout caps every rule's handler timeout to at most d. A value
+// of 0 (the default) leaves rule timeouts uncapped. It is nil-safe (a nil
+// Runner is a no-op) and takes effect on the next Handle. It is defense in
+// depth: template validation enforces the cap at load, and this runtime cap
+// guarantees a misconfigured or hot-swapped template can never run a handler
+// longer than the stream layer's MaxRuleTimeout. The capped value is also what
+// TryStart persists as the invocation's running deadline, so the persisted
+// deadline matches the local timer by construction.
+func (r *Runner) SetMaxHandlerTimeout(d time.Duration) {
+	if r == nil {
+		return
+	}
+	r.maxHandlerTimeout.Store(int64(d))
 }
 
 // resolver returns the runner's resolved image cleaner, or nil when the executor
@@ -359,7 +383,9 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 // Invocation state: when the stream layer injects an InvocationState into ctx
 // (see stream.WithInvocationState), Handle skips any matching invocation whose
 // "<function>/<handler>" ID is already recorded as completed on a previous
-// delivery. Skipped invocations are not executions: they do not touch the
+// delivery, OR is protected by an active attempt deadline (a running marker
+// whose persisted deadline has not yet passed — this or another replica may be
+// executing it). Skipped invocations are not executions: they do not touch the
 // handler_* or function_handler_* metrics. function_events_total still counts
 // the function as engaged (it matched), which is attribution, not execution
 // counting. When no invocation state is present (direct Handle callers/tests,
@@ -414,6 +440,39 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					))
 				continue
 			}
+			// Cap the rule timeout at the configured maximum (defense in depth;
+			// template validation enforces the cap at load). This guarantees a
+			// handler can never run longer than the stream layer's MaxRuleTimeout,
+			// and the same capped value is what TryStart persists as the running
+			// deadline, so the persisted deadline matches the local timer by
+			// construction.
+			timeout := rule.Timeout
+			if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
+				timeout = cap
+			}
+			// Claim the invocation for this execution before running it. TryStart
+			// persists an absolute running deadline (now + timeout) and returns
+			// false when the invocation is already complete (handled above) or
+			// protected by an active attempt deadline — this or another replica may
+			// be executing it, so we must not run it concurrently. The IsComplete
+			// check above is the fast path that avoids an HSET on completed
+			// invocations; TryStart's own HGET also reads "ok" and covers the same
+			// case, so the two are consistent.
+			if hasState {
+				if !invState.TryStart(invocation, timeout) {
+					r.log.Printf("function %q handler %q still running within its timeout for event %q; skipping%s",
+						pf.fn.Name, rule.Handler, msgID,
+						logging.Fields(
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"event_id", eventID,
+							"event_name", eventName,
+							"attempt", attempt,
+						))
+					continue
+				}
+			}
 			r.log.Printf("function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
 				logging.Fields(
 					"function", pf.fn.Name,
@@ -425,9 +484,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				))
 			eventJSON, err := json.Marshal(event)
 			if err != nil {
+				// The invocation was already claimed (TryStart above) but will not
+				// execute: clear the running marker so the failure does not protect
+				// a deterministic failure for the whole timeout window. Same
+				// contract as the execution-failure path below.
+				if hasState {
+					invState.EndRunning(invocation)
+				}
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 			}
-			invokeCtx, cancel := context.WithTimeout(ctx, rule.Timeout)
+			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
 			// Stamp the invocation's diagnostic metadata into the context so the
 			// executor can attach it as container labels. This keeps the
 			// Executor interface (and every test fake) unchanged.
@@ -488,6 +554,19 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"attempt", attempt,
 						"duration", d,
 					))
+				// Clear the running marker on failure (normal failure or timeout):
+				// the message goes pending and will be reclaimed, and the marker
+				// must not block a later delivery. On a timeout the executor
+				// returns a ctx.Err-wrapped error, so EndRunning also runs here;
+				// the invocation becomes eligible again only on a LATER delivery,
+				// and the current delivery has already failed the message (no ACK),
+				// so the "eligible only after deadline" nuance is naturally
+				// satisfied: the reclaim cadence plus any leftover deadline gates
+				// the next execution. If EndRunning is lost (crash after the
+				// failure), the marker self-expires at its deadline anyway.
+				if hasState {
+					invState.EndRunning(invocation)
+				}
 				return err
 			}
 			// Record the invocation as completed so a redelivery skips it. This

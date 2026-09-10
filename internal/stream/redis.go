@@ -29,12 +29,19 @@ const (
 	DefaultCount           = int64(10)
 	DefaultMaxAttempts     = int64(5)
 	DefaultReclaimInterval = time.Minute
-	DefaultMinPendingIdle  = time.Minute
 	// DefaultMetricsInterval is how often the pending-gauge sampler samples
 	// XPENDING depth and logs the metrics snapshot. It is overridable via
 	// ConsumerConfig.MetricsInterval (used by tests).
 	DefaultMetricsInterval = 15 * time.Second
 )
+
+// MaxRuleTimeout is the upper bound on any rule's handler timeout. It is the
+// same value as function.MaxTimeout (kept in sync; function is a leaf package
+// and stream may import it, not the reverse). It feeds two things: the runner's
+// runtime cap (see runner.SetMaxHandlerTimeout, wired in cmd/worker/main.go),
+// which becomes the maximum persisted running deadline an invocation can carry,
+// and the derived MinPendingIdle backstop below.
+const MaxRuleTimeout = 5 * time.Minute
 
 // ConsumerConfig configures the Consumer. Field-zero defaults are applied in
 // NewConsumer.
@@ -54,8 +61,13 @@ type ConsumerConfig struct {
 	// messages. Defaults to 1m if zero.
 	ReclaimInterval time.Duration
 	// MinPendingIdle is the minimum time a message must have sat pending before
-	// it is eligible for reclamation. Defaults to 1m if zero. It must comfortably
-	// exceed normal processing time so in-flight messages are not reclaimed.
+	// it is eligible for reclamation. Defaults to 3 * MaxRuleTimeout (15m) if
+	// zero. It is a message-level retry-pacing backstop: it must comfortably
+	// exceed normal processing time so a message is not reclaimed while its
+	// handler is still running. Per-invocation execution eligibility is decided
+	// separately at run time from the invocation's persisted running deadline
+	// (see InvocationState.TryStart), so MinPendingIdle no longer needs to be
+	// the sole guard against in-flight reclamation.
 	MinPendingIdle time.Duration
 	// DLQStream is the stream that exhausted/poison messages are written to.
 	// Defaults to "<Stream>:dlq" if empty.
@@ -112,8 +124,12 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 	if cfg.ReclaimInterval == 0 {
 		cfg.ReclaimInterval = DefaultReclaimInterval
 	}
+	// MinPendingIdle defaults to 3 * MaxRuleTimeout so a handler that runs up to
+	// the rule-timeout cap is never reclaimed mid-flight (see the constant
+	// comment). It remains a message-level retry-pacing backstop; per-invocation
+	// execution eligibility is decided separately at run time.
 	if cfg.MinPendingIdle == 0 {
-		cfg.MinPendingIdle = DefaultMinPendingIdle
+		cfg.MinPendingIdle = 3 * MaxRuleTimeout
 	}
 	if cfg.DLQStream == "" {
 		cfg.DLQStream = cfg.Stream + ":dlq"
@@ -353,12 +369,20 @@ func (c *Consumer) reclaimLoop(ctx context.Context, handler Handler) {
 	}
 }
 
-// reclaimTick finds pending messages idle beyond MinPendingIdle, takes ownership
+// reclaimTick finds messages pending idle beyond MinPendingIdle, takes ownership
 // of them for this consumer, and runs them through the shared processing path.
 //
 // XPendingExt (the full form) is used for the per-message retry count because
 // XAUTOCLAIM (RESP2) does not return delivery counts; the retry counter must
 // come from Redis (survives restarts), not from in-process state.
+//
+// Reclaim is message-ownership recovery only: it transfers idle pending messages
+// to this consumer. Whether a transferred message's invocation is actually
+// executed is decided later, at run time, from the invocation's persisted
+// running deadline (see InvocationState.TryStart): a message whose invocation is
+// still protected by an active attempt deadline is skipped, so an in-flight
+// handler on another replica is never run concurrently. MinPendingIdle remains a
+// message-level retry-pacing backstop.
 func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 	pending, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream: c.stream,
@@ -410,7 +434,24 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 				}
 				continue
 			}
-			pe := byID[msg.ID]
+			pe, ok := byID[msg.ID]
+			if !ok {
+				// XAUTOCLAIM walks the whole PEL with a cursor, but byID comes
+				// from a Count-truncated XPendingExt. Under backlog (more pending
+				// than Count) messages beyond the window miss byID; recover the
+				// TRUE pending entry with a targeted single-ID query so DLQ
+				// accounting is never fabricated. On failure, skip this tick
+				// (leave pending; retried next tick) rather than fabricating
+				// attempt 1.
+				entries, err := c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
+				}).Result()
+				if err != nil || len(entries) == 0 {
+					c.log.Printf("message %q: beyond reclaim window and pending lookup failed (%v); skipping this tick", msg.ID, err)
+					continue
+				}
+				pe = entries[0]
+			}
 			c.log.Printf("reclaimed message %q for consumer %q (idle %s, attempts %d)",
 				msg.ID, c.consumer, pe.Idle, pe.RetryCount)
 			c.deliverClaimed(ctx, msg, pe.RetryCount, handler)
@@ -435,7 +476,11 @@ func (c *Consumer) deliverClaimed(
 	if retryCount >= c.maxAttempts {
 		c.log.Printf("message %q: retry %d/%d failed: max attempts reached%s",
 			msg.ID, retryCount+1, c.maxAttempts,
-			logging.Fields("message_id", msg.ID, "attempt", retryCount+1, "attempts_total", c.maxAttempts))
+			logging.Fields(
+				"message_id", msg.ID,
+				"attempt", retryCount+1,
+				"attempts_total", c.maxAttempts,
+			))
 		c.routeToDLQ(ctx, msg, fmt.Errorf("max attempts reached after %d deliveries", retryCount), retryCount+1)
 		return
 	}
@@ -462,7 +507,11 @@ func (c *Consumer) processMessage(
 		// A malformed message can never succeed, so it goes straight to the DLQ on
 		// first encounter rather than consuming retry cycles.
 		c.log.Printf("message %q: non-retryable failure (%v); routing to DLQ%s",
-			msg.ID, err, logging.Fields("message_id", msg.ID, "attempt", deliveryNum, "reason", err))
+			msg.ID, err, logging.Fields(
+				"message_id", msg.ID,
+				"attempt", deliveryNum,
+				"reason", err,
+			))
 		c.routeToDLQ(ctx, msg, err, deliveryNum)
 		return
 	}
@@ -477,20 +526,15 @@ func (c *Consumer) processMessage(
 	c.metrics.Inc("events_processed_total")
 
 	// Inject a per-message invocation-state handle so the runner can skip
-	// invocations that already completed on a previous delivery. The handle is
-	// bound to this (stream, group, msgID) and reads/writes the invocation-state
-	// hash in Redis. When invocation-state tracking is disabled (tests) the
-	// context carries none and the runner behaves exactly as before.
+	// invocations that already completed on a previous delivery or are protected
+	// by an active attempt deadline. The handle is bound to this (stream, group,
+	// msgID) and reads/writes the invocation-state hash in Redis. When
+	// invocation-state tracking is disabled (tests) the context carries none and
+	// the runner behaves exactly as before.
 	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
 	if c.invocationStore != nil {
-		handlerCtx = WithInvocationState(handlerCtx, &invocationState{
-			ctx:    ctx,
-			store:  c.invocationStore,
-			stream: c.stream,
-			group:  c.group,
-			msgID:  msg.ID,
-			log:    c.log,
-		})
+		handlerCtx = WithInvocationState(handlerCtx,
+			NewInvocationState(ctx, c.invocationStore, c.stream, c.group, msg.ID, c.log))
 	}
 
 	if err := handler(handlerCtx, msg.ID, event); err != nil {
@@ -502,7 +546,11 @@ func (c *Consumer) processMessage(
 		}
 		c.log.Printf("message %q: retry %d/%d failed: %v%s",
 			msg.ID, deliveryNum, c.maxAttempts, err,
-			logging.Fields("message_id", msg.ID, "attempt", deliveryNum, "attempts_total", c.maxAttempts))
+			logging.Fields(
+				"message_id", msg.ID,
+				"attempt", deliveryNum,
+				"attempts_total", c.maxAttempts,
+			))
 		if deliveryNum >= c.maxAttempts {
 			c.routeToDLQ(ctx, msg, err, deliveryNum)
 			return

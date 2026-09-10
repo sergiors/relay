@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,14 @@ import (
 // Redis even if the eager clear on completion never runs. The eager clear (see
 // processMessage/routeToDLQ) is the primary cleanup; the TTL is the safety net.
 const invocationStateTTL = 7 * 24 * time.Hour
+
+// clockSkewTolerance widens the expiry evaluation of a running marker by this
+// much: deadline comparisons across replicas depend on synchronized clocks, and
+// treating a marker as expired slightly early costs at most one extra attempt of
+// overlap (allowed under at-least-once) while never lengthening the protected
+// window by unbounded skew. It must stay far smaller than the minimum sensible
+// handler timeout.
+const clockSkewTolerance = time.Second
 
 // invocationStateKey returns the Redis key holding a message's invocation-state
 // hash. The key is scoped by stream and group so multiple groups/consumers
@@ -54,7 +63,16 @@ func encodeComponent(s string) string {
 
 // invocationStore is a thin Redis-backed store for per-message invocation
 // state. Each key is a HASH mapping an invocation ID ("<function>/<handler>")
-// to "ok" once that invocation has completed. It is the stream layer's domain
+// to a short value describing that invocation's lifecycle for this message:
+//
+//	"ok"              → the invocation completed on a previous delivery
+//	"running:<nano>"  → an attempt is (or was) executing, protected until the
+//	                    absolute Unix-nano deadline it carries
+//	(absent)          → eligible to execute
+//
+// The value is deliberately a short string so the same field convention can
+// later carry richer values (e.g. a "next_attempt_at:<nano>" retry gate) without
+// changing the key layout or the read path. It is the stream layer's domain
 // (Redis), but the runner decides which invocations match, so the store is
 // exposed to the runner through the InvocationState interface carried in the
 // delivery context.
@@ -83,7 +101,9 @@ func (p *invocationStore) completed(
 
 // markComplete records that the invocation completed for this message. HSET and
 // EXPIRE are pipelined so the TTL is refreshed on every write without an extra
-// round trip.
+// round trip. Writing "ok" overwrites any "running:<nano>" marker the same
+// invocation carried, so a successful attempt atomically transitions the field
+// from protected to complete.
 func (p *invocationStore) markComplete(
 	ctx context.Context,
 	stream,
@@ -97,6 +117,77 @@ func (p *invocationStore) markComplete(
 	pipe.Expire(ctx, key, invocationStateTTL)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// tryStart attempts to claim the invocation for a new execution. It reads the
+// current field value and decides eligibility:
+//
+//	"ok"            → already complete; not started
+//	"running:<nano>" with now < deadline → a protected attempt is in flight
+//	                  (this or another replica); not started
+//	absent, expired, or unparseable → eligible: HSET "running:<deadline>" and
+//	                  report started
+//
+// The decision is read-then-write (atomic-ish): two replicas can both read
+// "absent" and both start, which is safe under at-least-once (duplicates are
+// allowed; handlers must be idempotent). The deadline is the absolute time at
+// which the attempt is considered abandoned, so a crashed worker's marker
+// self-expires and recovery waits it out rather than racing the live attempt.
+//
+// An attempt is protected until the deadline minus clockSkewTolerance: the
+// tolerance absorbs cross-replica clock skew in the safe direction. A slightly
+// fast replica writes an inflated deadline; a slower replica evaluating later
+// would otherwise see it still-active longer than intended. Treating a marker
+// as expired slightly early costs at most one extra attempt of overlap within
+// the tolerance (allowed under at-least-once, and handlers are idempotent),
+// while never lengthening the protected window by unbounded skew. The
+// tolerance must stay far smaller than the minimum sensible handler timeout.
+func (p *invocationStore) tryStart(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+	now,
+	deadline time.Time,
+) (started bool, err error) {
+	key := invocationStateKey(stream, group, msgID)
+	v, err := p.client.HGet(ctx, key, invocation).Result()
+	if err == redis.Nil {
+		// Field absent: eligible.
+	} else if err != nil {
+		return false, err
+	} else if v == "ok" {
+		return false, nil
+	} else if dl, ok := parseRunning(v); ok && now.Add(-clockSkewTolerance).Before(dl) {
+		// A protected attempt is still within its persisted deadline (minus the
+		// clock-skew tolerance, so a slightly-fast replica's inflated deadline
+		// does not block a slower replica beyond the intended window).
+		return false, nil
+	}
+	// Absent, expired, or unparseable: start a new attempt. HSET + EXPIRE are
+	// pipelined so the TTL is refreshed on the write without an extra round trip.
+	pipe := p.client.Pipeline()
+	pipe.HSet(ctx, key, invocation, runningValue(deadline))
+	pipe.Expire(ctx, key, invocationStateTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// endRunning removes the running marker for the invocation (normal failure or
+// timeout cleanup), leaving the field absent so a later delivery is eligible
+// again. It is a plain HDEL: if the field was already overwritten to "ok" by a
+// concurrent MarkComplete, HDEL is a no-op and the completion stands.
+func (p *invocationStore) endRunning(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) error {
+	return p.client.HDel(ctx, invocationStateKey(stream, group, msgID), invocation).Err()
 }
 
 // clear deletes the message's invocation-state hash entirely. It is called
@@ -130,13 +221,48 @@ func (p *invocationStore) completedSet(
 	return out, nil
 }
 
+// runningValue encodes a protected attempt's absolute deadline as the field
+// value "running:<unixnano>". The "running:" prefix distinguishes it from the
+// "ok" completion sentinel; the Unix-nano suffix is the deadline at which the
+// attempt is considered abandoned.
+func runningValue(deadline time.Time) string {
+	return "running:" + strconv.FormatInt(deadline.UnixNano(), 10)
+}
+
+// parseRunning decodes a "running:<unixnano>" field value into its deadline. It
+// returns ok=false for any value that is not a well-formed running marker (e.g.
+// "ok", a future richer value, or a corrupt marker), which the caller treats as
+// eligible.
+func parseRunning(v string) (time.Time, bool) {
+	const prefix = "running:"
+	if !strings.HasPrefix(v, prefix) {
+		return time.Time{}, false
+	}
+	n, err := strconv.ParseInt(v[len(prefix):], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, n), true
+}
+
 // InvocationState is the read/write view of a single message's invocation
-// state, carried in the delivery context so the runner can skip invocations
-// that already completed on a previous delivery. The invocation argument is the
-// full "<function>/<handler>" ID; the stream layer never parses it.
+// state, carried in the delivery context so the runner can decide whether to
+// execute an invocation. The invocation argument is the full
+// "<function>/<handler>" ID; the stream layer never parses it.
+//
+// The lifecycle of a single invocation's field value:
+//
+//	attempt starts  → "running:<deadline>"   (TryStart)
+//	completes       → "ok"                   (MarkComplete, overwrites running)
+//	fails/times out → (absent)               (EndRunning, HDEL)
+//
+// A crash mid-attempt leaves "running:<deadline>", which self-expires at its
+// deadline; recovery waits it out (bounded staleness of at most one timeout).
 type InvocationState interface {
 	IsComplete(invocation string) bool
 	MarkComplete(invocation string)
+	TryStart(invocation string, timeout time.Duration) bool
+	EndRunning(invocation string)
 }
 
 // invocationStateContextKey is the context key carrying the per-message
@@ -146,8 +272,8 @@ type invocationStateContextKey struct{}
 
 // WithInvocationState returns a child of ctx carrying the per-message
 // InvocationState. The stream layer sets this before invoking the Handler so
-// the runner can skip already-completed invocations without changing the Handler
-// signature.
+// the runner can skip already-completed or in-flight invocations without
+// changing the Handler signature.
 func WithInvocationState(ctx context.Context, p InvocationState) context.Context {
 	return context.WithValue(ctx, invocationStateContextKey{}, p)
 }
@@ -162,12 +288,48 @@ func InvocationStateFrom(ctx context.Context) (InvocationState, bool) {
 	return p, ok
 }
 
+// Option configures an invocationState built by NewInvocationState. Options are
+// test hooks; production passes none and uses the real clock.
+type Option func(*invocationState)
+
+// WithClock overrides the clock used for deadline comparisons and computation.
+// It lets tests freeze or advance time without changing production semantics;
+// production passes no option, so the real time.Now is used.
+func WithClock(next func() time.Time) Option {
+	return func(p *invocationState) { p.now = next }
+}
+
+// NewInvocationState builds the concrete per-message InvocationState handle the
+// stream layer injects. It binds an invocationStore to one (stream, group,
+// msgID) and captures the delivery context so the runner's calls hit the right
+// key. Reads are lazy per-invocation (one HGET per call), which is acceptable
+// for v1; the batch completedSet is available for callers that know the full set
+// up front.
+func NewInvocationState(
+	ctx context.Context,
+	store *invocationStore,
+	stream,
+	group,
+	msgID string,
+	log *log.Logger,
+	opts ...Option,
+) InvocationState {
+	p := &invocationState{
+		ctx:    ctx,
+		store:  store,
+		stream: stream,
+		group:  group,
+		msgID:  msgID,
+		log:    log,
+		now:    time.Now,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
 // invocationState is the concrete per-message handle the stream layer injects.
-// It binds an invocationStore to one (stream, group, msgID) and captures the
-// delivery context so the runner's IsComplete/MarkComplete calls hit the right
-// key. Reads are lazy per-invocation (one HGET per IsComplete call), which is
-// acceptable for v1; the batch completedSet is available for callers that know
-// the full set up front.
 type invocationState struct {
 	ctx    context.Context
 	store  *invocationStore
@@ -175,6 +337,7 @@ type invocationState struct {
 	group  string
 	msgID  string
 	log    *log.Logger
+	now    func() time.Time
 }
 
 // IsComplete treats a Redis read error as not completed (fail-open): the runner
@@ -194,5 +357,35 @@ func (p *invocationState) IsComplete(invocation string) bool {
 func (p *invocationState) MarkComplete(invocation string) {
 	if err := p.store.markComplete(p.ctx, p.stream, p.group, p.msgID, invocation); err != nil {
 		p.log.Printf("invocation state: mark %q: %v; message will be re-run later", invocation, err)
+	}
+}
+
+// TryStart attempts to claim the invocation for a new execution, persisting the
+// attempt's absolute deadline (now + timeout) as the running marker. It returns
+// true when the caller should execute, false when the invocation is already
+// complete or protected by an active attempt deadline (this or another replica).
+//
+// On a Redis error it fails OPEN (returns true, writes no state): bookkeeping
+// being down must not break at-least-once delivery, and running a duplicate is
+// safe (handlers are idempotent) while never blocking recovery. The persisted
+// deadline matches the local timer by construction: the runner passes the same
+// capped timeout to TryStart and to context.WithTimeout.
+func (p *invocationState) TryStart(invocation string, timeout time.Duration) bool {
+	now := p.now()
+	started, err := p.store.tryStart(p.ctx, p.stream, p.group, p.msgID, invocation, now, now.Add(timeout))
+	if err != nil {
+		p.log.Printf("invocation state: try-start %q: %v; failing open (running)", invocation, err)
+		return true
+	}
+	return started
+}
+
+// EndRunning clears the running marker after a normal failure or timeout, so a
+// later delivery is eligible again. A write error is logged only: if the marker
+// is lost (e.g. a crash after the failure), it self-expires at its deadline
+// anyway, bounding staleness to at most one timeout.
+func (p *invocationState) EndRunning(invocation string) {
+	if err := p.store.endRunning(p.ctx, p.stream, p.group, p.msgID, invocation); err != nil {
+		p.log.Printf("invocation state: end-running %q: %v", invocation, err)
 	}
 }

@@ -1,6 +1,7 @@
 package function
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -278,6 +279,7 @@ func TestParseRuleTimeoutRejected(t *testing.T) {
 		{"zero", "0s"},
 		{"negative", "-5s"},
 		{"unparseable", "soon"},
+		{"above max", "6m"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,6 +295,39 @@ events:
 				t.Fatalf("expected error for timeout %q", tc.timeout)
 			}
 		})
+	}
+}
+
+// TestParseRuleTimeoutMaxBoundary verifies the MaxTimeout cap: exactly MaxTimeout
+// parses, while anything above it is rejected with an error mentioning the max.
+func TestParseRuleTimeoutMaxBoundary(t *testing.T) {
+	// Exactly MaxTimeout is accepted.
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 5m
+`)
+	if got := tmpl.Rules[0].Timeout; got != MaxTimeout {
+		t.Errorf("timeout = %s, want MaxTimeout %s", got, MaxTimeout)
+	}
+
+	// One second over MaxTimeout is rejected and the error mentions the max.
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 5m1s
+`))
+	if err == nil {
+		t.Fatal("expected error for timeout above MaxTimeout")
+	}
+	if !strings.Contains(err.Error(), "max") {
+		t.Errorf("expected error to mention the max, got: %v", err)
 	}
 }
 

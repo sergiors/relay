@@ -240,6 +240,13 @@ func run(logger *log.Logger) {
 	// execution container. Must be set before Consume begins; it is wired right
 	// after construction so all invocations carry it.
 	runWorker.SetHostname(consumerName)
+	// Cap every rule's handler timeout at the same value template validation
+	// enforces (function.MaxTimeout). Defense in depth: a misconfigured or
+	// hot-swapped template can never run a handler past the cap. The capped
+	// value is the maximum persisted running deadline an invocation can carry
+	// (see runner.SetMaxHandlerTimeout / stream.InvocationState.TryStart);
+	// template validation enforces it at load.
+	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped

@@ -76,8 +76,8 @@ func TestNewConsumerDefaults(t *testing.T) {
 	if c.dlqStream != "events:dlq" {
 		t.Errorf("dlqStream default = %q, want events:dlq", c.dlqStream)
 	}
-	if c.minPendingIdle != time.Minute {
-		t.Errorf("minPendingIdle default = %s, want 1m", c.minPendingIdle)
+	if c.minPendingIdle != 3*MaxRuleTimeout {
+		t.Errorf("minPendingIdle default = %s, want 3*MaxRuleTimeout = %s", c.minPendingIdle, 3*MaxRuleTimeout)
 	}
 	if c.reclaimInterval != time.Minute {
 		t.Errorf("reclaimInterval default = %s, want 1m", c.reclaimInterval)

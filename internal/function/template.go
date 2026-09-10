@@ -11,6 +11,13 @@ import (
 // DefaultTimeout is applied to a rule that omits an explicit timeout.
 const DefaultTimeout = 6 * time.Second
 
+// MaxTimeout is the upper bound on any rule's handler timeout. It is the same
+// value as stream.MaxRuleTimeout (kept in sync; function is a leaf package and
+// stream may import it, not the reverse). The stream layer derives its
+// MinPendingIdle reclaim threshold from this cap so a handler that legitimately
+// runs up to the cap is never reclaimed mid-flight.
+const MaxTimeout = 5 * time.Minute
+
 // operatorKeys are the only keys treated as operators when they are the only
 // keys present in a map; any other key is treated as a nested field.
 var operatorKeys = map[string]bool{
@@ -37,7 +44,8 @@ type Template struct {
 type Rule struct {
 	Handler string
 	Pattern Pattern
-	// Timeout bounds a single invocation of this rule's handler.
+	// Timeout bounds a single invocation of this rule's handler. It is always
+	// positive and never exceeds MaxTimeout after ParseTemplate.
 	Timeout time.Duration
 }
 
@@ -159,7 +167,7 @@ func ParseTemplate(data []byte) (*Template, error) {
 }
 
 // resolveTimeout parses an optional rule timeout. An empty string yields the
-// default; zero, negative, or unparseable values are rejected.
+// default; zero, negative, unparseable, or over-MaxTimeout values are rejected.
 func resolveTimeout(raw string) (time.Duration, error) {
 	if raw == "" {
 		return DefaultTimeout, nil
@@ -170,6 +178,9 @@ func resolveTimeout(raw string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("timeout %q must be positive", raw)
+	}
+	if d > MaxTimeout {
+		return 0, fmt.Errorf("timeout %q exceeds max %s", raw, MaxTimeout)
 	}
 	return d, nil
 }
