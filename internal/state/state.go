@@ -73,6 +73,12 @@ type State struct {
 // database, applies concurrency-friendly PRAGMAs, and initializes the schema
 // idempotently. It always returns a usable *State; schema errors surface via
 // method calls, keeping the local state non-fatal to Relay at startup.
+//
+// Concurrency model: the pool is capped at one connection (SetMaxOpenConns(1)),
+// so all in-process access is serialized by database/sql — callers queue on the
+// single connection rather than ever hitting SQLITE_BUSY. WAL + busy_timeout
+// cover cross-process access (a CLI process reading the same file while the
+// worker runs). See doc.go "Concurrency model" for the full rationale.
 func Open(path string) (*State, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
@@ -83,10 +89,29 @@ func Open(path string) (*State, error) {
 	}
 	c := &State{db: db, log: log.Default()}
 
+	// Serialize all access through a single pooled connection. Relay's local
+	// state is a tiny, low-frequency, single-file workload (reconciler writes, a
+	// 5s stats flush, CLI reads): a pool of 1 makes SQLITE_BUSY structurally
+	// impossible — database/sql queues callers on the single connection instead
+	// of letting SQLite reject concurrent writers. WAL+busy_timeout remain as
+	// defense in depth (and for the CLI process opening the same file while the
+	// worker runs: cross-PROCESS access still relies on them).
+	db.SetMaxOpenConns(1)
+	// With MaxOpenConns(1) the default MaxIdleConns(2) already exceeds the pool
+	// size, so the single idle connection is retained automatically; no
+	// SetMaxIdleConns needed. SetConnMaxLifetime/SetConnMaxIdleTime are skipped
+	// too: there is no connection-rotation benefit for a single in-process
+	// connection, and modernc sqlite has no server-side connection lifetime.
+
 	// PRAGMAs tune SQLite for concurrent single-writer access: a busy timeout
 	// bounds how long a writer waits for a lock, and WAL lets readers see the
 	// last committed state while a write is in flight (relay's readers and the
-	// single reconciler writer are distinct paths).
+	// single reconciler writer are distinct paths). Because MaxOpenConns(1) keeps
+	// exactly one connection open for the pool's lifetime, these ExecContext
+	// PRAGMAs run on that single connection and are effectively global for this
+	// handle. busy_timeout is per-connection, so it still matters cross-process
+	// (the CLI's own Open sets its own); journal_mode=WAL is persistent in the
+	// DB file and survives close, so a concurrently-opening CLI also gets WAL.
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
 		_ = db.Close()
@@ -230,18 +255,31 @@ func (c *State) RebuildFromFS(dir string) error {
 		return fmt.Errorf("load functions for state: %w", err)
 	}
 
+	// Compute every fingerprint BEFORE opening the write transaction: the
+	// transaction must hold no external I/O (filesystem reads) while it is open,
+	// so the tx body only writes. Fingerprint errors are logged and fall back to
+	// fp="" exactly as before.
+	type fpFn struct {
+		fn function.Function
+		fp string
+	}
+	prepared := make([]fpFn, 0, len(fns))
+	for _, fn := range fns {
+		fp, ferr := function.Fingerprint(fn.Dir)
+		if ferr != nil {
+			c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
+			fp = ""
+		}
+		prepared = append(prepared, fpFn{fn: fn, fp: fp})
+	}
+
 	return c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		for _, fn := range fns {
-			fp, ferr := function.Fingerprint(fn.Dir)
-			if ferr != nil {
-				c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
-				fp = ""
-			}
+		for _, p := range prepared {
 			ts := now()
-			if err := insertStmt(tx)(fn.Name, fn.Template.Runtime, StatusPending, "", fp, "", "", "", "", ts); err != nil {
+			if err := insertStmt(tx)(p.fn.Name, p.fn.Template.Runtime, StatusPending, "", p.fp, "", "", "", "", ts); err != nil {
 				return err
 			}
-			if err := replaceHandlers(tx, fn.Name, fn.Template); err != nil {
+			if err := replaceHandlers(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
 		}
@@ -256,12 +294,15 @@ func (c *State) RebuildFromFS(dir string) error {
 func (c *State) RecordDiscovered(fn function.Function) {
 	ctx := context.Background()
 	ts := now()
+	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
+	// external I/O (filesystem reads), so the closure only writes. Fingerprint
+	// errors are logged and fall back to fp="" exactly as before.
+	fp, ferr := function.Fingerprint(fn.Dir)
+	if ferr != nil {
+		c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
+		fp = ""
+	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		fp, ferr := function.Fingerprint(fn.Dir)
-		if ferr != nil {
-			c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
-			fp = ""
-		}
 		if err := insertStmt(tx)(fn.Name, fn.Template.Runtime, StatusPending, "", fp, "", "", "", "", ts); err != nil {
 			return err
 		}

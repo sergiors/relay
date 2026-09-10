@@ -39,4 +39,25 @@
 // The driver is modernc.org/sqlite (pure Go, CGO-free) so the binary stays
 // static under CGO_ENABLED=0 and the CLI is fully read-only with no external
 // dependencies.
+//
+// Concurrency model:
+//
+//   - In-process access is serialized through a single pooled connection
+//     (SetMaxOpenConns(1) in Open). Relay's local state is a tiny,
+//     low-frequency, single-file workload — reconciler writes, a 5s stats flush,
+//     CLI reads — so a pool of 1 makes SQLITE_BUSY structurally impossible:
+//     database/sql queues callers on the single connection instead of letting
+//     SQLite reject concurrent writers. No write queue is needed because
+//     database/sql itself provides the queueing.
+//   - Cross-process access (a CLI process opening the same file while the
+//     worker runs) is covered by WAL + busy_timeout: WAL is persistent in the DB
+//     file and survives close, and each process sets its own busy_timeout on its
+//     own connection. One cross-process edge remains: Open always initializes
+//     the schema (CREATE TABLE IF NOT EXISTS — a brief write) even for read-only
+//     CLI commands, so a CLI may wait on the worker's in-flight flush for up to
+//     its busy_timeout; the worker's transactions are short (milliseconds), so
+//     this surfaces at worst as a brief startup pause, never a failure.
+//   - Transactions are short and hold no external I/O: fingerprints are computed
+//     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
+//     write transaction never blocks on the filesystem.
 package state
