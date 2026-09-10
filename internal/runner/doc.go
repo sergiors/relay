@@ -18,6 +18,13 @@
 //     stream.ErrInvocationNotEligible so the message stays pending (never acked
 //     while another replica may still be processing it); a fully-exhausted
 //     message returns stream.ErrInvocationExhausted so it is routed to the DLQ
+//   - Panic boundary: each invocation's execution runs inside runInvocation,
+//     which recovers an executor/runtime panic and converts it into a normal
+//     failed attempt (metrics + recordFailure), so a panicking execution is
+//     isolated and retried via the same retry/exhaustion machinery as any other
+//     failure. The image refcount is still released and the invocation context
+//     cancel is deferred, so no reference or timer leaks. Panics elsewhere
+//     (startup, reconciler, Redis client) are not recovered and stay fatal
 //
 // Key Guarantees:
 //   - Handle holds one registry snapshot for the whole call, so in-flight

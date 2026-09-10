@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -369,6 +370,39 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON)
 }
 
+// runInvocation runs one rule's handler while holding a reference to the
+// function's image for the duration of the invocation, converting an
+// executor/runtime panic into a failed-attempt error instead of letting it
+// escape Handle and kill the worker. This is the single panic boundary for
+// message processing: panics inside executor/runtime code are a misbehaving
+// execution (isolated, retried via the normal pending/reclaim flow), while
+// panics elsewhere (startup, reconciler, Redis client) stay fatal and visible.
+//
+// The invocation context's cancel is deferred here so it always runs, even when
+// the executor panics: without this, a panic that unwinds past the call site
+// would skip the explicit cancel() and leak the context's timer until it fired
+// on its own. executeWithRefs's own defers (image refcount release) run during
+// panic unwinding BEFORE the recover here, so the image reference is never
+// leaked; the returned panic value is logged by the caller.
+func (r *Runner) runInvocation(
+	pf *PreparedFunction,
+	invokeCtx context.Context,
+	cancel context.CancelFunc,
+	handler string,
+	eventJSON []byte,
+) (err error, panicked bool, panicValue any) {
+	defer cancel()
+	defer func() {
+		if pv := recover(); pv != nil {
+			panicked = true
+			panicValue = pv
+			err = fmt.Errorf("executor panic: %v", pv)
+		}
+	}()
+	err = r.executeWithRefs(pf, invokeCtx, handler, eventJSON)
+	return err, false, nil
+}
+
 // Handle evaluates the event against all loaded functions and executes every
 // matching rule's handler. It returns nil only when every invocation succeeded
 // (or nothing matched); otherwise it returns an error so the stream layer does
@@ -408,6 +442,15 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 //   - the plain execution error otherwise (a retryable failure, or an exhausted
 //     invocation while other matched invocations may still run), so the message
 //     stays pending.
+//
+// Panic boundary: each invocation's execution runs inside runInvocation, which
+// recovers an executor/runtime panic and converts it into a normal failed
+// attempt (see runInvocation). A panicking execution is therefore isolated and
+// retried via the same failure/backoff/exhaustion machinery as any other
+// failure — it never escapes Handle to kill the worker. The image refcount is
+// still released (executeWithRefs's defer runs during unwinding) and the
+// invocation's context cancel is deferred so no timer leaks. Panics elsewhere
+// (startup, reconciler, Redis client) are not recovered here and stay fatal.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
 	// A message received at the runner is one logical event handled across all
 	// matching rules. This is the message-level counter.
@@ -579,9 +622,27 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				Image:     toImage(pf),
 			})
 			start := time.Now()
-			err = r.executeWithRefs(pf, invokeCtx, rule.Handler, eventJSON)
+			err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON)
 			d := time.Since(start)
-			cancel()
+			if panicked {
+				// A panicking execution is a misbehaving handler, not a healthy
+				// failure: log the panic value and the full stack so the bug is
+				// visible and attributable, then funnel it through the SAME
+				// failure branch below (metrics + recordFailure) so retry and
+				// exhaustion accounting stay per-invocation. The stack is kept in
+				// the message body (multi-line) since logging.Fields values must
+				// stay single-line.
+				r.log.Printf("function %q handler %q PANICKED for event %q: %v\n%s%s",
+					pf.fn.Name, rule.Handler, msgID, panicValue, debug.Stack(),
+					logging.Fields(
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+					))
+			}
 			if err != nil {
 				r.metrics.IncLabels("handler_invocations_total",
 					[]metrics.Label{

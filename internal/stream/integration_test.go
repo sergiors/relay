@@ -3,6 +3,7 @@
 package stream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -1421,4 +1422,133 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("exhausted invocation executed %d times; want 0 (terminal skip)", got)
 	}
+}
+
+// TestIntegrationPanicLeavesPendingAndRetries verifies the stream-level panic
+// boundary: a handler that panics is caught by processMessage's recover, the
+// message is left pending (not acked), and a later reclaim retries it. On the
+// retry the handler succeeds (non-panicking path) and the message is acked.
+// Consume must survive the panic and keep running.
+func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
+	ctx, cancel := context.WithCancel(context.Background())
+	prefix := fmt.Sprintf("panic-%d", time.Now().UnixNano())
+	stream, group, consumer := prefix+"-stream", prefix+"-group", prefix+"-consumer"
+
+	var buf bytes.Buffer
+	c := NewConsumer(ConsumerConfig{
+		Client:          cli,
+		Stream:          stream,
+		Group:           group,
+		Consumer:        consumer,
+		Block:           300 * time.Millisecond,
+		MinPendingIdle:  300 * time.Millisecond,
+		ReclaimInterval: 200 * time.Millisecond,
+		Log:             log.New(&buf, "", 0),
+	})
+	if err := c.EnsureGroup(ctx); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = cli.Del(ctx, stream, c.dlqStream).Err()
+		_ = cli.Close()
+	})
+
+	id, err := cli.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: stream,
+		Values: map[string]any{"event": `{"a":1}`},
+	}).Result()
+	if err != nil {
+		t.Fatalf("xadd: %v", err)
+	}
+
+	// The handler panics on the first delivery of the target message and
+	// succeeds on subsequent deliveries (the panic is the boundary substitute:
+	// the stream-level net catches it).
+	var attempts atomic.Int64
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		errCh <- c.Consume(ctx, func(ctx context.Context, msgID string, ev map[string]any) error {
+			if msgID != id {
+				return nil
+			}
+			if attempts.Add(1) == 1 {
+				panic("boom")
+			}
+			return nil
+		})
+	}()
+
+	// Wait for the message to be delivered into the PEL (attempt 1 panicked).
+	waitFor(t, "message "+id+" delivered into PEL", func() bool {
+		entries, err := cli.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+			Stream: stream, Group: group, Start: "-", End: "+", Count: 100,
+		}).Result()
+		if err != nil {
+			return false
+		}
+		for _, pe := range entries {
+			if pe.ID == id {
+				return true
+			}
+		}
+		return false
+	})
+
+	// The panic must have been logged and the message must NOT have been acked
+	// (still pending right after the panic log line appears).
+	waitFor(t, "panic log line", func() bool {
+		return strings.Contains(buf.String(), "PANIC in handler")
+	})
+	if _, ok := pendingOf(cli, stream, group, id); !ok {
+		t.Fatalf("message was acked after the panicking attempt; want it left pending")
+	}
+
+	// Consume must still be alive after the panic.
+	select {
+	case <-done:
+		t.Fatalf("Consume exited after the handler panic; want it to keep running")
+	default:
+	}
+
+	// A later reclaim retries the message; the handler succeeds and it is acked.
+	waitFor(t, "message "+id+" gone from PEL", func() bool {
+		_, ok := pendingOf(cli, stream, group, id)
+		return !ok
+	})
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("handler attempts = %d, want >= 2 (panic then retry)", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("consumer did not stop on cancellation")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("consume returned error: %v", err)
+	}
+}
+
+// pendingOf returns the pending entry for id, or ok=false when absent.
+func pendingOf(cli *redis.Client, stream, group, id string) (int64, bool) {
+	entries, err := cli.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		Stream: stream, Group: group, Start: "-", End: "+", Count: 100,
+	}).Result()
+	if err != nil {
+		return 0, false
+	}
+	for _, pe := range entries {
+		if pe.ID == id {
+			return pe.RetryCount, true
+		}
+	}
+	return 0, false
 }

@@ -43,6 +43,15 @@
 //     health state (Healthy) fed by real operations, so the `relay health`
 //     command and orchestrators can observe readiness without a separate PING
 //   - Shutdown cancellation leaves messages pending, not counted as attempts
+//   - Panic boundary: processMessage registers a recover so a panic in the
+//     handler handoff (including runner code outside its per-invocation
+//     recover) is converted into the standard failure path — the message is
+//     left pending (no ACK) and a later reclaim retries it (at-least-once).
+//     This is defense in depth behind the runner's per-invocation boundary,
+//     which already converts executor panics into normal failed attempts so
+//     retry/exhaustion state machinery runs. Panics in Consume/reclaimLoop/
+//     metricsLoop are outside message processing and are deliberately NOT
+//     recovered: they remain fatal
 //
 // Usage: NewConsumer, then EnsureGroup, then Consume with a Handler.
 //

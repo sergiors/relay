@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,9 +127,10 @@ func (panicExecutor) Execute(context.Context, *runtime.Prepared, string, []byte)
 }
 
 // A panicking executor must still release the image reference, otherwise the
-// image stays "in use" forever and can never be retired. Handle propagates the
-// panic (existing behavior), so the test runs Handle in a goroutine and recovers
-// there, then asserts the refcount was released.
+// image stays "in use" forever and can never be retired. With the runner's
+// per-invocation panic boundary, Handle now RETURNS an error (wrapping the
+// panic) instead of propagating it, so the test calls Handle directly and
+// asserts both the error and the refcount release.
 func TestImageRefsReleasedOnExecutorPanic(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{NewPrepared(
 		function.Function{
@@ -142,15 +144,13 @@ func TestImageRefsReleasedOnExecutorPanic(t *testing.T) {
 		panicExecutor{},
 	)}, silentLogger(), nil)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer func() {
-			_ = recover() // Handle propagates the executor panic; swallow it here.
-		}()
-		_ = r.Handle(context.Background(), "m", map[string]any{"status": "ok"})
-	}()
-	<-done
+	err := r.Handle(context.Background(), "m", map[string]any{"status": "ok"})
+	if err == nil {
+		t.Fatal("expected Handle to return an error wrapping the executor panic")
+	}
+	if !strings.Contains(err.Error(), "executor panic") {
+		t.Fatalf("error = %v, want it to mention the executor panic", err)
+	}
 
 	if r.ImageInUse("relay-fn-a:old") {
 		t.Fatal("expected image not in use after executor panic")

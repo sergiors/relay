@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -482,12 +483,38 @@ func (c *Consumer) deliverClaimed(
 // the recovery loop. It decodes, classifies, and either ACKs on success, routes
 // to the DLQ on a non-retryable failure or when every non-complete invocation is
 // exhausted, or leaves the message pending for a later retry.
+//
+// Panic boundary: a recover is registered at the top of the function so a panic
+// anywhere in the handler handoff (including the runner's matching/pre-pass code
+// that sits OUTSIDE its per-invocation recover) is converted into the standard
+// failure path: the message is left pending (no ACK) and a later reclaim retries
+// it (at-least-once). This is defense in depth behind the runner's per-invocation
+// boundary, which already converts executor panics into normal failed attempts
+// so retry/exhaustion state machinery runs. A panic here is a programming bug and
+// stays visible (logged every cycle) rather than killing the worker. Panics in
+// Consume/reclaimLoop/metricsLoop are outside message processing (startup or
+// programming) and are deliberately NOT recovered: they remain fatal.
 func (c *Consumer) processMessage(
 	ctx context.Context,
 	msg redis.XMessage,
 	deliveryNum int64,
 	handler Handler,
 ) {
+	// Register the panic boundary before any handler work so a panic in the
+	// handler handoff (or in classifyMessage, which is pure JSON parsing and
+	// practically cannot panic) is caught. The delivery is treated as failed:
+	// leave pending, no ACK, no counters; a later reclaim retries it. A
+	// panicking non-handler code path is a bug to fix, and it stays visible
+	// (logged every cycle). One edge to know: a panic AFTER a successful DLQ
+	// write but before the ACK leaves the message pending, so the DLQ write
+	// repeats on the retry cycle — a duplicate DLQ entry. That is the normal
+	// at-least-once window (the DLQ entry carries the original message ID), not
+	// a new failure class.
+	defer func() {
+		if pv := recover(); pv != nil {
+			c.log.Printf("message %q: PANIC in handler: %v\n%s", msg.ID, pv, debug.Stack())
+		}
+	}()
 	event, err := classifyMessage(msg)
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on
