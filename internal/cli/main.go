@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"fmt"
@@ -24,12 +24,13 @@ func helpWriter(rows [][2]string) string {
 }
 
 func rootHelp() string {
-	return "Usage:\n  relay COMMAND\n\nManage and inspect Relay.\n\nCommands:\n" +
+	return "Usage:\n  relay COMMAND\n\nRun and manage Relay.\n\nCommands:\n" +
 		helpWriter([][2]string{
+			{"start", "Start Relay"},
 			{"function", "Manage functions"},
-			{"health", "Check Relay dependencies"},
 			{"secret", "Manage local secrets"},
 			{"stats", "Show current operational statistics"},
+			{"health", "Check Relay dependencies"},
 		}) +
 		"\nRun 'relay COMMAND --help' for more information on a command.\n"
 }
@@ -63,13 +64,18 @@ func printUsageError(msg, usage string) int {
 	return 2
 }
 
-func main() {
-	os.Exit(runCLI(os.Args[1:]))
+// Run parses and dispatches the command line, returning the process exit code.
+// It is the package's public entry point; everything below it is unexported so
+// the command surface stays internal.
+func Run(args []string) int {
+	return runCLI(args)
 }
 
 // runCLI dispatches the CLI's subcommands. It is separated from main so tests
-// can exercise the exit codes directly. The CLI is read-only with respect to
-// Relay's runtime: it never starts the worker (a separate relay-worker binary)
+// can exercise the exit codes directly. The CLI parses commands and owns exit
+// codes; `relay start` is the one command that starts the long-running Relay
+// runtime (delegating to internal/worker), while every other command is a
+// read-only administrative/inspection command that never starts the runtime
 // and never touches Redis or Docker. It does manage local secret files under
 // the secrets directory (see `relay secret`). Exit codes:
 //
@@ -82,6 +88,17 @@ func runCLI(args []string) int {
 	}
 
 	switch args[0] {
+	case "start":
+		if len(args) == 2 && isHelp(args[1]) {
+			fmt.Fprint(os.Stdout, startUsage())
+			return 0
+		}
+		if len(args) != 1 {
+			return printUsageError("start: too many arguments", startUsage())
+		}
+		// Delegation, not implementation: the CLI only parses commands; the
+		// long-running Relay lifecycle lives in internal/worker.
+		return runStartCommand()
 	case "function":
 		return runFunctionCommand(args[1:])
 	case "health":

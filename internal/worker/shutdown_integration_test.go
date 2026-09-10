@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package worker
 
 import (
 	"context"
@@ -98,7 +98,7 @@ func (b *syncBuffer) String() string {
 }
 
 // workerConfig carries the test-controlled constants that replace the package
-// CONSTANTS (function.Dir, state.DBPath) and the env-derived values in run().
+// CONSTANTS (function.Dir, state.DBPath) and the env-derived values in Run().
 // The worker binary reads the literal "/functions" and "/var/lib/relay/...",
 // which are not writable on the host, so the test forks the wiring IN-PROCESS
 // with these values instead (the same pattern TestIntegrationMetricsEndpoint
@@ -131,7 +131,7 @@ type workerEnv struct {
 	statsDone    chan struct{}
 }
 
-// startWorker replicates the ordering of run() (cmd/worker/main.go) with
+// startWorker replicates the ordering of Run() (internal/worker/worker.go) with
 // test-controlled constants, but WITHOUT signal.NotifyContext: the test owns
 // ctx/cancel, and cancel() is the exact runtime effect of SIGTERM (NotifyContext
 // cancels its ctx when the signal arrives). Sending the real signal to the test
@@ -139,7 +139,7 @@ type workerEnv struct {
 // is the faithful substitute.
 //
 // Consume runs in a goroutine writing to consumeDone so the test can observe
-// when it returns after cancel, exactly as run()'s blocking Consume would return
+// when it returns after cancel, exactly as Run()'s blocking Consume would return
 // on SIGTERM.
 func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Helper()
@@ -494,7 +494,7 @@ export async function slow(event) {
 	}
 	t.Logf("Consume returned cleanly after %v", shutdownElapsed)
 
-	// finalStatsFlush runs after Consume returns, exactly like run(). Assert it
+	// finalStatsFlush runs after Consume returns, exactly like Run(). Assert it
 	// completes within its 2s bound and that a stats row exists.
 	flushStart := time.Now()
 	finalStatsFlush(env.m, env.st)

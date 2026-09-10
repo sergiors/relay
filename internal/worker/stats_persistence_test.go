@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 
 // openTempState opens a state DB at a fresh temp-dir path and registers a
 // cleanup that closes it. It mirrors openTestState in internal/state but lives
-// here because the worker tests are in package main.
+// here because the worker tests are in package worker.
 func openTempState(t *testing.T) *state.State {
 	t.Helper()
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))

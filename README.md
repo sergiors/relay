@@ -25,32 +25,40 @@ on the stream with a consumer group, decodes each message, and for every event:
 3. acknowledges the message (XACK) only after **all** matching invocations
    succeed.
 
-Relay is distributed as **two** binaries:
+Relay is distributed as **one** binary. `relay start` runs the long-running
+process — it consumes events, loads functions, builds images, and reconciles
+`/functions` live, blocking in the foreground until signalled. The remaining
+subcommands are administrative/inspection commands around the same binary;
+they never start the runtime. The only things they write are the local secrets
+store (`relay secret set/rm`) and — read-only otherwise — the state database
+they read from.
 
-- `relay` — the command-line interface (`relay function ls`,
-  `relay function inspect <name>`, `relay health`, `relay secret ls/set/rm`). It
-  never starts the long-running process; the only thing it writes is the local
-  secrets store (`relay secret set/rm`).
-- `relay-worker` — the long-running process that consumes events, loads
-  functions, builds images, and reconciles `/functions` live.
+```
+relay start                # start Relay in the foreground
+relay health               # check Relay dependencies (Redis, Docker)
+relay stats                # show current operational statistics
+relay function ls          # list functions
+relay function inspect <name>
+relay secret ls|set|rm     # manage local secrets
+```
 
 ## How to run
 
 ```sh
-# build both binaries
-go build -o relay ./cmd/cli
-go build -o relay-worker ./cmd/worker
+# build the single binary
+go build -o relay ./cmd
 # or, from the module root with defaults
 go build ./...
 
-# run the long-running process (reads REDIS_* from the environment)
-./relay-worker
+# run Relay in the foreground (reads REDIS_* from the environment)
+./relay start
 ```
 
-Requirements: Go 1.27+, a reachable Redis, and a local Docker daemon (see
-below). No events are processed until a producer XADDs to the stream. The daemon
-reads the mandatory `REDIS_ADDR`/`REDIS_STREAM`/`REDIS_GROUP`
-variables at startup and fails fast if any is unset.
+Relay runs **in the foreground** by design: `relay start` blocks until the
+process is interrupted (SIGINT/SIGTERM). It does not background itself, write a
+PID file, or fork. Background execution and supervision belong to Docker,
+systemd, Kubernetes, etc. — e.g. `docker compose up -d`, `docker run -d ...`, or
+`systemctl start relay` — not to Relay itself.
 
 ## Docker requirement
 
@@ -108,8 +116,8 @@ services:
 
 ### Development with Compose
 
-`compose.dev.yaml` runs the Relay **daemon** in a container (the image's
-`CMD` is `relay-worker`) alongside a Redis service and a Docker-socket proxy, so
+`compose.dev.yaml` runs the Relay runtime in a container (the image's `CMD` is
+`relay start`) alongside a Redis service and a Docker-socket proxy, so
 you can develop against the same containerized deployment the README above
 describes without installing Go or Redis locally:
 
@@ -158,7 +166,7 @@ default); an unbindable address is logged and retried, never fatal.
 ### Health check
 
 `relay health` is an operational/container healthcheck command. It checks the
-two dependencies the daemon needs at startup — Redis connectivity (a PING to
+two dependencies the runtime needs at startup — Redis connectivity (a PING to
 `REDIS_ADDR`) and Docker daemon connectivity (an Engine API Ping) — and exits
 `0` when both are reachable, `1` otherwise (reporting the first failing check to
 stderr). It is **not** a public API and no HTTP server runs; it only creates
@@ -486,7 +494,7 @@ how the last reconcile of each function went without touching Redis or Docker.
   lose up to ~5s of telemetry. Redis event-processing correctness never depends
   on SQLite stats.
 
-The daemon persists state at startup and on every reconcile. Three read-only CLI
+Relay persists state at startup and on every reconcile. Three read-only CLI
 commands expose it (no Redis, Docker, or `/functions` needed — they read the
 state database file only):
 
@@ -557,7 +565,7 @@ Secrets:
 ## Secrets
 
 Relay stores secrets as files on disk, one per secret, under a fixed directory.
-Templates reference secrets by name; the worker resolves each reference to its
+Templates reference secrets by name; the runtime resolves each reference to its
 value immediately before an execution and injects it into the container's
 environment. Resolved values live only in the container's `Config.Env` — they
 are never baked into images, never stored in the state database, never logged,
@@ -619,12 +627,12 @@ Relay's observability is logs plus Prometheus metrics plus the local state
 snapshot. There is no HTTP health/readiness endpoint — `relay health` (above)
 remains the health check.
 
-- **Structured logs** (`relay-worker`): execution, retry, failure, DLQ,
+- **Structured logs**: execution, retry, failure, DLQ,
   reconciliation, and build lines carry logfmt fields — `function`, `handler`,
   `message_id`, `event_id`, `event_name`, `attempt`, `duration`, and container
   `exit_code` where available. Handler stdout/stderr is still forwarded
   verbatim.
-- **Prometheus metrics**: `relay-worker` exposes `GET /metrics` on
+- **Prometheus metrics**: the Relay runtime exposes `GET /metrics` on
   `METRICS_ADDR` (default `:9090`) in Prometheus text format via the official
   Prometheus client. Counters: `events_received_total`, `events_processed_total`,
   `handler_success_total`, `handler_failure_total`, `retries_total`,
@@ -663,7 +671,7 @@ Updated:             10s ago
 ```
 
 `relay stats` reads the state database file only (no Redis, Docker, or
-`/functions`); it works even when the worker is down. A fresh database renders
+`/functions`); it works even when the runtime is down. A fresh database renders
 zeroes with `Updated: never`. Backlog gauges (`pending_entries`,
 `oldest_pending_age_seconds`) are global — the consumer-group backlog is not
 attributed to individual functions.

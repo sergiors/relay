@@ -40,7 +40,7 @@ const (
 // MaxRuleTimeout is the upper bound on any rule's handler timeout. It is the
 // same value as function.MaxTimeout (kept in sync; function is a leaf package
 // and stream may import it, not the reverse). It feeds the runner's runtime cap
-// (see runner.SetMaxHandlerTimeout, wired in cmd/worker/main.go), which becomes
+// (see runner.SetMaxHandlerTimeout, wired in internal/worker), which becomes
 // the maximum persisted running deadline an invocation can carry.
 const MaxRuleTimeout = 5 * time.Minute
 

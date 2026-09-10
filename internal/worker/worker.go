@@ -1,17 +1,16 @@
-// relay-worker is the long-running Relay process. It loads functions, builds
-// their images, reconciles them live, and consumes the Redis stream, blocking
-// until signalled. Configuration comes entirely from the environment. It also
-// exposes a Prometheus /metrics endpoint (see internal/metrics) and flushes the
-// registry into the local state database on a fixed 5-second cadence: stats
-// accumulate in memory (the registry is the single source of truth), Prometheus
-// reflects them immediately, and SQLite receives the current absolute snapshot
-// every interval.
-package main
+// Package worker is the long-running Relay runtime, started via `relay start`.
+// It loads functions, builds their images, reconciles them live, and consumes
+// the Redis stream, blocking until signalled. Configuration comes entirely
+// from the environment. It also exposes a Prometheus /metrics endpoint (see
+// internal/metrics) and flushes the registry into the local state database on
+// a fixed 5-second cadence: stats accumulate in memory (the registry is the
+// single source of truth), Prometheus reflects them immediately, and SQLite
+// receives the current absolute snapshot every interval.
+package worker
 
 import (
 	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -36,14 +35,9 @@ import (
 // (a hard crash loses at most one interval of telemetry).
 const statsFlushInterval = 5 * time.Second
 
-func main() {
-	logger := log.New(os.Stdout, "", log.LstdFlags)
-	run(logger)
-}
-
-// run wires the whole worker: startup state, then the reconciler and stream
+// Run wires the whole worker: startup state, then the reconciler and stream
 // consumer. It blocks in Consume until the process is signalled.
-func run(logger *log.Logger) {
+func Run(logger *log.Logger) {
 	cfg := struct {
 		redisAddr   string
 		redisStream string

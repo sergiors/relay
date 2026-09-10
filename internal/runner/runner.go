@@ -242,7 +242,7 @@ func (r *Runner) Registry() *Registry { return r.reg }
 // relay.hostname label on every execution container. It is nil-safe (a nil
 // Runner is a no-op) and must be called before Consume begins processing; it
 // takes effect on the next Handle, so setting it right after construction (as
-// cmd/worker/main.go does) labels every invocation.
+// internal/worker does) labels every invocation.
 func (r *Runner) SetHostname(h string) {
 	if r == nil {
 		return
