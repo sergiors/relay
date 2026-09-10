@@ -147,13 +147,13 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                     | Required | Description                        |
-| --------------------------- | -------- | ---------------------------------- |
-| `REDIS_ADDR`                | yes      | Redis address or DSN (see below).  |
-| `REDIS_STREAM`              | yes      | Redis stream to consume.           |
-| `REDIS_GROUP`               | yes      | Consumer group name.               |
-| `REDIS_STREAM_RETENTION`    | no       | Stream retention window; unset disables trimming. |
-| `METRICS_ADDR`              | no       | Metrics listen address (default `:9090`). |
+| Env var                  | Required | Description                                       |
+| ------------------------ | -------- | ------------------------------------------------- |
+| `REDIS_ADDR`             | yes      | Redis address or DSN (see below).                 |
+| `REDIS_STREAM`           | yes      | Redis stream to consume.                          |
+| `REDIS_GROUP`            | yes      | Consumer group name.                              |
+| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming. |
+| `METRICS_ADDR`           | no       | Metrics listen address (default `:9090`).         |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -194,9 +194,9 @@ startup like any other configuration error.
 
 `REDIS_ADDR` accepts either a plain address or a Redis DSN:
 
-- `host:port`  (e.g. `redis:6379`)
+- `host:port` (e.g. `redis:6379`)
 - `redis://user:password@host:port`
-- `rediss://user:password@host:port`  (TLS)
+- `rediss://user:password@host:port` (TLS)
 
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup
@@ -263,11 +263,15 @@ stays authoritative in the local state database and on the prepared function.
 ### Execution container lifecycle
 
 Every function execution container is created with Docker **AutoRemove**, so the
-daemon removes a container itself the moment its process exits — even if Relay
-is crash-killed/OOM-killed/SIGKILL'd mid-run. Relay's deferred removal remains
-only as a backstop for paths where the container never exits on its own (e.g. a
-failed start), and treats the daemon's now-async auto-removal (a not-found
-error) as success.
+daemon removes the container once its process exits. Relay relies on AutoRemove
+for the normal execution path and does not explicitly remove containers that
+exit on their own.
+
+Explicit removal is used only as a backstop for abnormal lifecycle paths where a
+container may still be running or may never have started correctly, such as
+start failures, timeouts, cancellation, or wait errors. Backstop removal is
+idempotent: a container that was already removed, or is already being removed by
+the daemon, is treated as successfully cleaned up.
 
 Every execution container also carries seven **diagnostic-only** Docker labels —
 `relay.function`, `relay.handler`, `relay.message_id`, `relay.event_id`,

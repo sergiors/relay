@@ -701,6 +701,201 @@ export function secret(event) {
 	}
 }
 
+// TestIntegrationSuccessfulRunNoExplicitRemove verifies the normal completion
+// path does NOT issue an explicit container removal: a handler that exits 0 is
+// cleaned up by AutoRemove alone, so no "remove container" log line is emitted
+// (the previous blanket deferred remove logged a spurious 409 "removal already
+// in progress" on this path) and the container is gone.
+func TestIntegrationSuccessfulRunNoExplicitRemove(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, buf := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.ok
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export function ok(event) {
+  console.log("ok " + event.event_id);
+}
+`)
+	fn := function.Function{Name: "no-remove-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
+	if err := m.Execute(execCtx, prepared, "index.ok", []byte(`{"event_id":"evt_1","event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "ok evt_1") {
+		t.Errorf("expected handler output, got: %s", logs)
+	}
+	// The normal path must NOT emit an explicit removal log line.
+	if strings.Contains(logs, "remove container") {
+		t.Errorf("normal completion path must not log an explicit container removal, got: %s", logs)
+	}
+	// AutoRemove: the container must vanish after exit.
+	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.ok") {
+		t.Error("container should have been auto-removed after successful exit")
+	}
+}
+
+// TestIntegrationPanicDuringOutputNoRemovalNoise drives runContainer with a log
+// func that panics while forwarding handler output — a panic AFTER the container
+// exited on its own (wait.Result disarmed the backstop). The panic must
+// propagate (recovered by the test), the container must still be gone via
+// AutoRemove, and no removal log line may appear (the backstop must stay
+// disarmed on the normal path even under unwinding).
+func TestIntegrationPanicDuringOutputNoRemoval(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.paniclog
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export function paniclog(event) {
+  console.log("output before panic");
+}
+`)
+	fn := function.Function{Name: "paniclog-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Drive runContainer directly so the log func can panic on the first
+	// forwarded output line — simulating a Relay bug surfacing during output
+	// handling while the deferred cleanup is in scope.
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = runContainer(ctx, m.cli,
+			func(format string, args ...any) { panic("log func exploded") },
+			"paniclog-e2e", prepared.Image, nil, nil, "index.paniclog",
+			[]byte(`{"event_name":"INSERT"}`),
+			RunMeta{Hostname: "test-host", Function: "paniclog-e2e", Handler: "index.paniclog", Image: prepared.Image},
+		)
+	}()
+	select {
+	case pv := <-panicked:
+		if pv == nil {
+			t.Fatal("expected log-func panic to propagate out of runContainer")
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("runContainer did not return after panic")
+	}
+
+	// The container exited on its own; AutoRemove (not the backstop) removed it.
+	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.paniclog") {
+		t.Error("container should have been auto-removed after exit despite the log panic")
+	}
+}
+
+// TestIntegrationFailedStartRemovesContainer verifies the backstop contract for
+// the failed-start path: a container that is created but never started (so it
+// will never exit on its own) is removed by removeContainer. A genuine
+// ContainerStart failure inside runContainer is hard to force deterministically
+// (the relay images' entrypoint always starts; a missing handler is a normal
+// non-zero exit handled by AutoRemove), so this drives the backstop directly on
+// a created-but-never-started container — the exact state the start-failure path
+// leaves behind. The container must be gone afterward.
+func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Create a container that is never started, carrying the relay labels so it
+	// is attributable and greppable.
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     &container.Config{Image: "node:24-alpine", Labels: runLabels(RunMeta{Hostname: "test-host", Function: "fail-start-e2e", Handler: "index.run", Image: "node:24-alpine"})},
+		HostConfig: &container.HostConfig{},
+	})
+	if err != nil {
+		t.Fatalf("create container: %v", err)
+	}
+	id := resp.ID
+	t.Cleanup(func() { _ = removeContainer(cli, id) })
+
+	// Never started: removeContainer must remove it (the backstop path).
+	if err := removeContainer(cli, id); err != nil {
+		t.Fatalf("removeContainer on never-started container: %v", err)
+	}
+	if !waitForContainerGone(ctx, cli, labelHandler, "index.run") {
+		t.Error("created-but-never-started container should have been removed")
+	}
+}
+
+// TestIntegrationRemoveContainerTwiceBenign verifies removeContainer is
+// idempotent: removing an already-removed container (not-found) is benign and
+// returns no error, so a backstop remove that races AutoRemove never surfaces a
+// spurious failure.
+func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
+	if !dockerAvailable(t) {
+		t.Skip("docker not available")
+	}
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Create a short-lived container that exits immediately, so AutoRemove
+	// removes it on its own.
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     &container.Config{Image: "node:24-alpine", Cmd: []string{"true"}},
+		HostConfig: &container.HostConfig{AutoRemove: true},
+	})
+	if err != nil {
+		t.Fatalf("create container: %v", err)
+	}
+	id := resp.ID
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
+		t.Fatalf("start container: %v", err)
+	}
+
+	// First remove: either the daemon already auto-removed it (not-found) or
+	// it is being removed (conflict); both are benign.
+	if err := removeContainer(cli, id); err != nil {
+		t.Fatalf("first removeContainer: %v", err)
+	}
+	// Second remove: the container is definitely gone now; must be benign.
+	if err := removeContainer(cli, id); err != nil {
+		t.Fatalf("second removeContainer on already-removed container: %v", err)
+	}
+}
+
 // TestIntegrationContainerLabelsAndAutoRemove drives a real execution while
 // verifying the seven diagnostic labels are present mid-flight (polled while the
 // handler runs), that AutoRemove removes the container the moment it exits, that

@@ -236,19 +236,54 @@ func killContainer(cli *client.Client, id string) {
 	_, _ = cli.ContainerKill(killCtx, id, client.ContainerKillOptions{})
 }
 
-// removeContainer removes a container, treating an already-removed container as
-// success. With AutoRemove the daemon removes the container as soon as it exits,
-// so Relay's deferred best-effort removal routinely races the daemon and hits a
-// not-found; that is the intended outcome and must not be logged as noise. Only
-// a real (non-not-found) removal failure is surfaced so the caller can log it.
+// benignRemovalErr reports whether a container-removal error means the container
+// will not outlive the call, which is the only contract a best-effort removal
+// has. Two daemon responses are benign:
+//
+//   - not-found (cerrdefs.ErrNotFound): the daemon already removed the container
+//     (AutoRemove finished, or a previous remove succeeded). Nothing left to do.
+//   - conflict (cerrdefs.ErrConflict, HTTP 409): the daemon is removing the
+//     container right now (AutoRemove in flight). The container still exists in
+//     the daemon's map until the removal completes, so a DELETE issued in that
+//     window races the daemon's own removal and answers 409 rather than 404; the
+//     container will still be gone.
+//
+// A nil error (no error) is trivially benign. Any other error (permission
+// denied, internal, ...) is a genuine failure and is NOT benign. Matching is
+// typed (errors.Is against the errdefs sentinels), never on the error string.
+func benignRemovalErr(err error) bool {
+	return err == nil || errors.Is(err, cerrdefs.ErrNotFound) || errors.Is(err, cerrdefs.ErrConflict)
+}
+
+// removeContainer removes a container, treating an already-removed container and
+// a removal already in progress as success. With AutoRemove the daemon removes
+// the container as soon as it exits, so Relay's best-effort removal routinely
+// races the daemon: it either finds the container already gone (not-found) or
+// already being removed (conflict/409). Both mean "the container will not outlive
+// this call", which is the only contract a best-effort remove has, so neither is
+// logged as noise. Only a real (non-benign) removal failure is surfaced so the
+// caller can log it.
 func removeContainer(cli *client.Client, id string) error {
 	rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
-	if errors.Is(err, cerrdefs.ErrNotFound) {
+	if benignRemovalErr(err) {
 		return nil
 	}
 	return err
+}
+
+// removeBackstop best-effort removes a container and logs a genuine failure. It
+// is called only on the paths where the container may still be alive or never
+// exited on its own (failed start, kill/timeout/cancel cleanup, wait error). On
+// the normal path the container exits on its own and AutoRemove removes it, so
+// no explicit remove is issued there. removeContainer is idempotent w.r.t. the
+// benign races (not-found, removal-in-progress), so this is safe to call even
+// when the daemon is already removing the container.
+func removeBackstop(cli *client.Client, log func(format string, args ...any), id string) {
+	if err := removeContainer(cli, id); err != nil {
+		log("docker run: remove container %s: %v", id, err)
+	}
 }
 
 // drainWait consumes the eventual ContainerWait delivery on either channel so
@@ -276,8 +311,10 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 // per-invocation variables (template env values + resolved secret values),
 // merged after env; later entries win on duplicate names. The container is
 // created with AutoRemove so the daemon removes it the moment it exits; Relay's
-// deferred removal only cleans up the paths where the container never exits on
-// its own (e.g. a failed start).
+// explicit removal is only a backstop for the paths where the container never
+// exits on its own (failed start, kill/timeout/cancel cleanup, wait error). The
+// normal path — the container exits on its own — has no explicit remove and
+// relies entirely on AutoRemove.
 //
 // Every execution container is hardened: it runs as a non-root user (set at
 // build time via the plan's USER), drops all Linux capabilities, is memory/CPU/
@@ -344,13 +381,13 @@ func runContainer(
 		return fmt.Errorf("docker run: create container: %w", err)
 	}
 	id := createResp.ID
-	// Best-effort cleanup on every path; a leaked container is worse than a
-	// failed remove. With AutoRemove the daemon has usually removed the
-	// container already, so removeContainer treats not-found as success; only
-	// genuine failures are logged.
+	// Normal exits rely on AutoRemove. The backstop is armed only while an
+	// abnormal return could leave the container behind, and is disarmed once
+	// wait.Result confirms the container has exited.
+	armedRemove := false
 	defer func() {
-		if err := removeContainer(cli, id); err != nil {
-			log("docker run: remove container %s: %v", id, err)
+		if armedRemove {
+			removeBackstop(cli, log, id)
 		}
 	}()
 
@@ -363,9 +400,17 @@ func runContainer(
 		Stderr: true,
 	})
 	if err != nil {
+		// Created but never started: AutoRemove can never fire, so the backstop
+		// must remove the container before this path returns.
+		armedRemove = true
 		return fmt.Errorf("docker run: attach: %w", err)
 	}
 	defer attach.Close()
+
+	// From this point onward any abnormal exit (or panic unwind) requires
+	// explicit cleanup: the container is started or about to start, and only a
+	// confirmed exit via wait.Result hands cleanup back to AutoRemove.
+	armedRemove = true
 
 	// Demultiplex the non-TTY attach stream (stdout/stderr are multiplexed) into
 	// separate buffers. Reading runs concurrently so a chatty container cannot
@@ -381,7 +426,8 @@ func runContainer(
 	// once the container is actually running.
 	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		// Start failed; the container never ran and no wait request was issued.
-		// Close the hijacked conn so the reader goroutine can join.
+		// Close the hijacked conn so the reader goroutine can join; the armed
+		// backstop removes the created-but-never-started container on return.
 		attach.Close()
 		<-readerDone
 		return fmt.Errorf("docker run: start: %w", err)
@@ -390,7 +436,9 @@ func runContainer(
 	// Open the wait request while the container is running. Every path below
 	// that returns after this point must drain both channels so the client's
 	// per-request goroutine can exit.
-	wait := cli.ContainerWait(ctx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	wait := cli.ContainerWait(ctx, id, client.ContainerWaitOptions{
+		Condition: container.WaitConditionNotRunning,
+	})
 
 	// Write the event JSON to the container's stdin, then half-close so the
 	// process sees EOF and can exit. On an early failure, kill the container
@@ -422,6 +470,7 @@ func runContainer(
 		// ctx is already cancelled, so use a detached, bounded context for the
 		// kill, then close the attach conn and drain the wait channels so that
 		// path's client goroutine unblocks and the reader goroutine can join.
+		// The armed backstop removes the killed container on return.
 		killContainer(cli, id)
 		attach.Close()
 		drainWait(wait, 3*time.Second)
@@ -429,9 +478,8 @@ func runContainer(
 		return fmt.Errorf("docker run: %w", ctx.Err())
 	case err := <-wait.Error:
 		waitErr = err
-		// The wait request failed; the container may still be running. Kill it,
-		// close the attach stream so the reader goroutine can exit, and drain
-		// the other wait channel so no client goroutine is left blocked.
+		// The wait request failed and the container state is uncertain. Kill it and
+		// keep the backstop armed so cleanup remains best-effort and idempotent.
 		killContainer(cli, id)
 		attach.Close()
 		drainWait(wait, 5*time.Second)
@@ -440,6 +488,10 @@ func runContainer(
 		if res.Error != nil {
 			waitErr = errors.New(res.Error.Message)
 		}
+		// The container exited on its own (success, non-zero exit, or a wait
+		// error it reported): AutoRemove owns the cleanup from here, so the
+		// backstop is disarmed and no explicit remove is issued.
+		armedRemove = false
 	}
 	<-readerDone
 
