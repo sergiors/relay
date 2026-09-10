@@ -269,12 +269,18 @@ events:
 - `runtime` (required) selects the execution runtime. Only `python3.14` and
   `node24` are supported; any other value fails validation.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
-  `module.function`), a required `pattern`, and an optional `timeout`.
+  `module.function`), a required `pattern`, and optional `timeout` and `retries`.
 - `timeout` (optional, per rule) is a Go duration string bounding a single
   invocation of that rule's handler (e.g. `20s`, `1m30s`). It must be positive.
   Zero, negative, unparseable, or values above `5m` (`MaxTimeout`) fail the
   function's template validation (the function is logged and skipped). Omitted
   rules use a `6s` default.
+- `retries` (optional, per rule) is the number of additional executions attempted
+  after the initial one (`0` = only the initial attempt). It must be a
+  non-negative integer; a negative or non-integer value (e.g. `-1`, `abc`,
+  `1.5`) fails template validation. Omitted rules use a `4` default, so a
+  failing invocation is attempted `1 + 4 = 5` times in total before it is
+  considered exhausted and the message is routed to the DLQ.
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
@@ -354,6 +360,11 @@ to Relay's logs.
 - **Timeout**: each invocation is bounded by the matching rule's `timeout`
   (default `6s`). A timeout kills the invocation and is treated as an execution
   failure. Multiple matching rules each use their own rule's timeout.
+- **Retries**: each rule's `retries` (default `4`) controls how many additional
+  executions are attempted after the initial one. A failing invocation is
+  retried with a per-invocation backoff (1m, 2m, 5m, then 10m capped) until its
+  `1 + retries` attempts are exhausted, at which point the message is routed to
+  the DLQ (see _Recovery and retries_ below).
 - **Failure**: any non-zero container exit is a failure; errors include the
   function and handler names. **Abort on first failure**: a failed invocation
   stops the remaining rules for that event and returns the message to the
@@ -573,21 +584,32 @@ handler failure — stays in the PEL.
 
 - **Recovery loop** (`XAUTOCLAIM`): a background goroutine runs every
   `DefaultReclaimInterval` (1m) and reclaims messages that have sat pending for
-  longer than `3 × MaxRuleTimeout` (15m). This is a message-level retry-pacing
-  backstop, not the concurrency guard: reclaiming transfers ownership of the
-  message and replays it through the same processing path as a fresh read, but
-  whether an individual handler actually executes is decided per-invocation from
-  the invocation state (see below). Rule timeouts are capped at 5m (`timeout`
-  values above `5m` fail template validation), which is what the threshold
-  derives from. This makes Relay survive restarts: a message left pending by a
+  longer than `MinPendingIdle` (default 1m). This is a message-level
+  recovery-pacing backstop, not the concurrency guard and not the retry timer:
+  reclaiming transfers ownership of the message and replays it through the same
+  processing path as a fresh read, but whether an individual handler actually
+  executes is decided per-invocation from the invocation state (see below). Rule
+  timeouts are capped at 5m (`timeout` values above `5m` fail template
+  validation). This makes Relay survive restarts: a message left pending by a
   dead consumer is picked up and retried by a live one.
 - **Retry counting**: the per-message delivery count is read from Redis
   (`XPENDING` full form / retry counter), not kept in process memory, so the
   count survives restarts. Each reclaim of an idle message increments the count.
-- **Max attempts → DLQ**: once a message fails `DefaultMaxAttempts` (5) times,
-  it is no longer re-processed. It is written to the dead-letter stream
-  `<stream>:dlq` and the original is then acknowledged, removing it from the
-  PEL.
+  Retry timing is defined per-invocation, not by the reclaim cadence: a failed
+  attempt records a `next_attempt_at` deadline in the invocation state, and a
+  redelivery before that deadline is skipped. Actual retry timing is quantized
+  by the reclaim cadence (~1m granularity), so a 1m backoff effectively fires at
+  the first redelivery after 1m.
+- **Per-invocation retries and backoff**: each rule's `retries` (default `4`)
+  bounds the number of additional executions after the initial one. A failing
+  invocation is retried with a fixed backoff schedule — 1m after attempt 1, 2m
+  after attempt 2, 5m after attempt 3, then 10m (capped) — persisted as a
+  `next_attempt_at` marker in the invocation state. Once `1 + retries` attempts
+  are exhausted, the invocation is marked `exhausted` (terminal).
+- **Exhaustion → DLQ**: when every non-complete matched invocation is exhausted,
+  the whole message is written to the dead-letter stream `<stream>:dlq` and the
+  original is then acknowledged, removing it from the PEL. Per-invocation DLQ is
+  not claimed; exhaustion of the last runnable invocation routes the message.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
   `attempts`, `timestamp` (RFC 3339).
@@ -612,24 +634,33 @@ message (`relay:invocation:{stream}:{group}:{msgID}`, field
 field value describes the invocation's lifecycle for this message:
 
 - `ok` — the invocation completed on a previous delivery; redeliveries skip it.
-- `running:<unix-nano deadline>` — an attempt is (or was) executing, protected
-  until that absolute deadline.
+- `running:<unix-nano deadline>#<attempts>` — an attempt is (or was) executing,
+  protected until that absolute deadline; `<attempts>` is the 1-based attempt
+  number. A deadline marker without `#<attempts>` does not parse (treated as
+  absent/eligible).
+- `next_attempt_at:<unix-nano deadline>#<attempts>` — a failed attempt is
+  waiting out its retry backoff, protected until that absolute deadline.
+- `exhausted:<attempts>` — the invocation's attempts are exhausted; it is
+  terminal and never eligible again (skipped like complete, but distinct so the
+  runner can tell a message whose invocations are all terminal).
 - absent — eligible to execute.
 
 Before executing an invocation, the runner claims it via `TryStart`, which
-persists `running:<now+timeout>` — the same capped timeout the local
+persists `running:<now+timeout>#<attempts>` — the same capped timeout the local
 `context.WithTimeout` enforces, so the persisted deadline and the local timer
 match by construction. On success `MarkComplete` overwrites the marker with `ok`;
-on failure or timeout `EndRunning` clears it so a later delivery is eligible
-again. Another worker that redelivers the message while `now < running_until`
-skips that invocation, because a live attempt (this or another replica) may be
-executing it. A crashed worker's marker self-expires at its deadline, so
-recovery waits it out (bounded by at most one timeout) instead of racing a live
-attempt. Bookkeeping failures fail open: a Redis error on the read or write
-never blocks delivery, preserving at-least-once. The message is acknowledged
-once all matching invocations are complete, and the invocation-state key is
-cleared on completion or DLQ routing. The keys expire after 7 days as a fallback
-cleanup for abandoned messages.
+on failure `RecordFailure` persists `next_attempt_at:<now+backoff>#<attempts>`
+with the rule's backoff (1m/2m/5m/10m); once attempts are exhausted
+`MarkExhausted` writes `exhausted:<attempts>`. Another worker that redelivers
+the message while `now < running_until` or `now < next_attempt_at` skips that
+invocation, because a live attempt (this or another replica) may be executing it
+or it is waiting out its backoff. A crashed worker's marker self-expires at its
+deadline, so recovery waits it out (bounded by at most one timeout) instead of
+racing a live attempt. Bookkeeping failures fail open: a Redis error on the read
+or write never blocks delivery, preserving at-least-once. The message is
+acknowledged once all matching invocations are complete, and the invocation-state
+key is cleared on completion or DLQ routing. The keys expire after 7 days as a
+fallback cleanup for abandoned messages.
 
 This is still at-least-once, not exactly-once: there is a crash window between a
 handler's side effect and its state being recorded, so a handler can still run

@@ -23,6 +23,8 @@ func silentLogger() *log.Logger {
 
 // alwaysMatch returns a prepared function whose single rule matches any event
 // (empty pattern). Its handler invocations record a short, observable duration.
+// The rule carries the default retry count so failing invocations are retried
+// (matching production template defaults).
 func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFunction {
 	t.Helper()
 	return NewPrepared(
@@ -30,7 +32,7 @@ func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFuncti
 			Name: name,
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second}},
+				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: function.DefaultRetries}},
 			},
 		},
 		&runtime.Prepared{Name: name, Image: "x"},
@@ -150,7 +152,8 @@ func TestHandleFunctionLevelCounters(t *testing.T) {
 }
 
 func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
-	// Failure with attempt < DefaultMaxAttempts: counts a retry, not a DLQ.
+	// Without invocation state, a failure counts a retry but never a DLQ: the
+	// DLQ decision needs a Redis-backed attempt count to know exhaustion.
 	m := metrics.New()
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &fixedExecutor{err: true})}, silentLogger(), m)
 	ctx := stream.WithDeliveryAttempt(context.Background(), 2)
@@ -165,28 +168,10 @@ func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
 		t.Fatalf("retries = %d, want 1", fs[0].RetriesTotal)
 	}
 	if fs[0].DLQTotal != 0 {
-		t.Fatalf("dlq = %d, want 0 (attempt < max)", fs[0].DLQTotal)
+		t.Fatalf("dlq = %d, want 0 (no invocation state, no exhaustion decision)", fs[0].DLQTotal)
 	}
 	if fs[0].HandlerFailureTotal != 1 {
 		t.Fatalf("failure = %d, want 1", fs[0].HandlerFailureTotal)
-	}
-
-	// Failure with attempt >= DefaultMaxAttempts: counts a DLQ too.
-	m2 := metrics.New()
-	r2 := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &fixedExecutor{err: true})}, silentLogger(), m2)
-	ctx2 := stream.WithDeliveryAttempt(context.Background(), stream.DefaultMaxAttempts)
-	if err := r2.Handle(ctx2, "1757-0", map[string]any{"status": "ok"}); err == nil {
-		t.Fatal("expected handle to fail")
-	}
-	fs2 := m2.FunctionStatsSnapshot()
-	if len(fs2) != 1 {
-		t.Fatalf("function stats len = %d, want 1: %+v", len(fs2), fs2)
-	}
-	if fs2[0].RetriesTotal != 1 {
-		t.Fatalf("retries = %d, want 1", fs2[0].RetriesTotal)
-	}
-	if fs2[0].DLQTotal != 1 {
-		t.Fatalf("dlq = %d, want 1 (attempt >= max)", fs2[0].DLQTotal)
 	}
 }
 

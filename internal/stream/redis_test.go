@@ -18,10 +18,10 @@ func TestNewConsumerDerivedDefaults(t *testing.T) {
 		return ConsumerConfig{Client: redis.NewClient(&redis.Options{Addr: "localhost:6379"})}
 	}
 
-	// Unset MinPendingIdle → 3 * MaxRuleTimeout (15m).
+	// Unset MinPendingIdle → DefaultReclaimInterval (1m).
 	c := NewConsumer(cfg())
-	if got := c.minPendingIdle; got != 3*MaxRuleTimeout {
-		t.Errorf("minPendingIdle = %s, want 3*MaxRuleTimeout = %s", got, 3*MaxRuleTimeout)
+	if got := c.minPendingIdle; got != DefaultReclaimInterval {
+		t.Errorf("minPendingIdle = %s, want DefaultReclaimInterval = %s", got, DefaultReclaimInterval)
 	}
 
 	// Unset ReclaimInterval → DefaultReclaimInterval (1m).

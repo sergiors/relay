@@ -256,6 +256,83 @@ events:
 	}
 }
 
+// TestParseRuleMissingRetriesDefaults pins the default retry count for a rule
+// that omits `retries`.
+func TestParseRuleMissingRetriesDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if got := tmpl.Rules[0].Retries; got != DefaultRetries {
+		t.Errorf("missing retries rule = %d, want default %d", got, DefaultRetries)
+	}
+}
+
+// TestParseRuleExplicitRetries verifies an explicit non-negative `retries` is
+// honored, including zero (only the initial attempt).
+func TestParseRuleExplicitRetries(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: 2
+`)
+	if got := tmpl.Rules[0].Retries; got != 2 {
+		t.Errorf("explicit retries = %d, want 2", got)
+	}
+
+	zero := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: 0
+`)
+	if got := zero.Rules[0].Retries; got != 0 {
+		t.Errorf("retries: 0 = %d, want 0", got)
+	}
+}
+
+// TestParseRuleRetriesRejected verifies that a negative or non-integer `retries`
+// fails template validation with a clear message. yaml.v3 decodes "1.5" as a
+// float and "abc"/"true" as non-integers, so they must be rejected rather than
+// silently truncated or coerced.
+func TestParseRuleRetriesRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		retries string
+	}{
+		{"negative", "-1"},
+		{"string", "abc"},
+		{"float", "1.5"},
+		{"bool", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: ` + tc.retries + `
+`))
+			if err == nil {
+				t.Fatalf("expected error for retries %q", tc.retries)
+			}
+			if !strings.Contains(err.Error(), "retries") {
+				t.Errorf("expected error to mention retries, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestParseRuleExplicitTimeout(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14

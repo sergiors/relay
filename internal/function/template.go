@@ -11,6 +11,13 @@ import (
 // DefaultTimeout is applied to a rule that omits an explicit timeout.
 const DefaultTimeout = 6 * time.Second
 
+// DefaultRetries is the number of additional executions a rule attempts after
+// its initial attempt (0 = only the initial attempt). A rule that omits
+// `retries` resolves to this value, so by default a failing invocation is
+// attempted 1 + DefaultRetries = 5 times in total before it is considered
+// exhausted and the message is routed to the DLQ.
+const DefaultRetries = 4
+
 // MaxTimeout is the upper bound on any rule's handler timeout. It is the same
 // value as stream.MaxRuleTimeout (kept in sync; function is a leaf package and
 // stream may import it, not the reverse). The stream layer derives its
@@ -47,6 +54,11 @@ type Rule struct {
 	// Timeout bounds a single invocation of this rule's handler. It is always
 	// positive and never exceeds MaxTimeout after ParseTemplate.
 	Timeout time.Duration
+	// Retries is the number of additional executions attempted after the
+	// initial one (0 = only the initial attempt). It is always non-negative
+	// after ParseTemplate; omitted rules default to DefaultRetries. The total
+	// number of attempts for a failing invocation is 1 + Retries.
+	Retries int
 }
 
 // Pattern maps top-level event fields to their conditions.
@@ -125,6 +137,11 @@ func ParseTemplate(data []byte) (*Template, error) {
 			Handler string         `yaml:"handler"`
 			Pattern map[string]any `yaml:"pattern"`
 			Timeout string         `yaml:"timeout"`
+			// Retries is decoded as `any` (not `*int`) so a non-integer value
+			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
+			// and rejected with a clear message instead of being silently
+			// truncated or coerced by yaml.v3.
+			Retries any `yaml:"retries"`
 		} `yaml:"events"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -157,11 +174,15 @@ func ParseTemplate(data []byte) (*Template, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
 		}
+		retries, err := resolveRetries(ev.Retries)
+		if err != nil {
+			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
+		}
 		pattern := make(Pattern, len(ev.Pattern))
 		for field, cond := range ev.Pattern {
 			pattern[field] = parseFieldCondition(cond)
 		}
-		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout})
+		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
 	}
 	return t, nil
 }
@@ -183,6 +204,23 @@ func resolveTimeout(raw string) (time.Duration, error) {
 		return 0, fmt.Errorf("timeout %q exceeds max %s", raw, MaxTimeout)
 	}
 	return d, nil
+}
+
+// resolveRetries parses an optional rule retry count. A nil value (omitted)
+// yields the default; any non-integer value (a string, a float, a bool, ...) or
+// a negative integer is rejected. Zero is valid (only the initial attempt).
+func resolveRetries(raw any) (int, error) {
+	if raw == nil {
+		return DefaultRetries, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, fmt.Errorf("retries must be a non-negative integer, got %v", raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("retries %d must be non-negative", n)
+	}
+	return n, nil
 }
 
 // validateHandler requires the form module.function (splitting at the last dot)

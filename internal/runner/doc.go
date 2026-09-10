@@ -6,9 +6,18 @@
 //   - Execute: matching handlers run sequentially, bounded by their rule's timeout
 //   - Skip: when the stream layer injects invocation state into the context,
 //     a matching handler whose "<function>/<rule-handler>" invocation already
-//     succeeded on a previous delivery is skipped (not executed, not counted)
+//     succeeded on a previous delivery, is protected by an active attempt
+//     deadline or a retry backoff, or is exhausted is skipped (not executed, not
+//     counted)
+//   - Retry: a failing invocation records a per-invocation retry backoff
+//     (1m/2m/5m/10m, capped at 10m) and counts function_retries_total; once its
+//     attempts (1 + rule.Retries) are exhausted it is marked terminal and, when
+//     every matched invocation is terminal, the message is routed to the DLQ
 //   - Outcome: an error is returned when any invocation fails, so the stream
-//     layer does not acknowledge the message
+//     layer does not acknowledge the message. A protected-only skip returns
+//     stream.ErrInvocationNotEligible so the message stays pending (never acked
+//     while another replica may still be processing it); a fully-exhausted
+//     message returns stream.ErrInvocationExhausted so it is routed to the DLQ
 //
 // Key Guarantees:
 //   - Handle holds one registry snapshot for the whole call, so in-flight

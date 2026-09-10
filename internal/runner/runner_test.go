@@ -219,23 +219,32 @@ func TestHandleRunMetaEmptyHostnameWhenUnset(t *testing.T) {
 }
 
 // fakeInvocationState is an in-memory InvocationState for runner tests,
-// avoiding a Redis dependency. It records which invocations have completed and
-// which are protected by an active running deadline, mirroring the real
-// stream.invocationState semantics (TryStart/EndRunning/MarkComplete).
+// avoiding a Redis dependency. It records which invocations have completed,
+// which are protected by an active running deadline or a retry backoff, and
+// which are exhausted, mirroring the real stream.invocationState semantics
+// (TryStart/RecordFailure/MarkComplete/MarkExhausted/IsTerminal).
 type fakeInvocationState struct {
-	mu      sync.Mutex
-	done    map[string]bool
-	marks   []string
-	running map[string]time.Time // invocation -> running deadline
-	now     func() time.Time
-	endRuns []string
+	mu        sync.Mutex
+	done      map[string]bool
+	marks     []string
+	running   map[string]time.Time // invocation -> running deadline
+	nextAt    map[string]time.Time // invocation -> next-attempt deadline
+	exhausted map[string]int       // invocation -> attempts
+	attempts  map[string]int       // invocation -> highest attempt started
+	now       func() time.Time
+	// failures records the backoff passed to RecordFailure, for tests to assert
+	// the retry schedule.
+	failures []time.Duration
 }
 
 func newFakeInvocationState() *fakeInvocationState {
 	return &fakeInvocationState{
-		done:    map[string]bool{},
-		running: map[string]time.Time{},
-		now:     time.Now,
+		done:      map[string]bool{},
+		running:   map[string]time.Time{},
+		nextAt:    map[string]time.Time{},
+		exhausted: map[string]int{},
+		attempts:  map[string]int{},
+		now:       time.Now,
 	}
 }
 
@@ -244,6 +253,16 @@ func (p *fakeInvocationState) setClock(now func() time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.now = now
+}
+
+// advance moves the fake's clock forward by d, so a retry backoff or running
+// deadline that has not yet elapsed can be made to expire. It is a test hook
+// mirroring the real store's injectable clock. Successive advances accumulate.
+func (p *fakeInvocationState) advance(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	prev := p.now
+	p.now = func() time.Time { return prev().Add(d) }
 }
 
 func (p *fakeInvocationState) IsComplete(invocation string) bool {
@@ -257,31 +276,61 @@ func (p *fakeInvocationState) MarkComplete(invocation string) {
 	defer p.mu.Unlock()
 	p.done[invocation] = true
 	delete(p.running, invocation)
+	delete(p.nextAt, invocation)
+	delete(p.exhausted, invocation)
 	p.marks = append(p.marks, invocation)
 }
 
-// TryStart claims the invocation for a new execution unless it is complete or
-// protected by an active running deadline. It mirrors the real store's
-// read-then-write semantics.
-func (p *fakeInvocationState) TryStart(invocation string, timeout time.Duration) bool {
+// TryStart claims the invocation for a new execution unless it is complete,
+// exhausted, or protected by an active running deadline or retry backoff. It
+// mirrors the real store's read-then-write semantics, returning the 1-based
+// attempt number and the wait until eligible when not started.
+func (p *fakeInvocationState) TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.done[invocation] {
-		return false
+		return false, 0, 0
+	}
+	if n, ok := p.exhausted[invocation]; ok {
+		return false, n, 0
 	}
 	if dl, ok := p.running[invocation]; ok && p.now().Before(dl) {
-		return false
+		return false, p.attempts[invocation], dl.Sub(p.now())
 	}
+	if dl, ok := p.nextAt[invocation]; ok && p.now().Before(dl) {
+		return false, p.attempts[invocation], dl.Sub(p.now())
+	}
+	// Eligible: start the next attempt (1 + the highest attempt so far).
+	attempt = p.attempts[invocation] + 1
+	p.attempts[invocation] = attempt
 	p.running[invocation] = p.now().Add(timeout)
-	return true
+	return true, attempt, 0
 }
 
-// EndRunning clears the running marker so a later delivery is eligible again.
-func (p *fakeInvocationState) EndRunning(invocation string) {
+// RecordFailure records the retry backoff for a failed attempt, gating the
+// invocation until now+backoff.
+func (p *fakeInvocationState) RecordFailure(invocation string, backoff time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failures = append(p.failures, backoff)
+	delete(p.running, invocation)
+	p.nextAt[invocation] = p.now().Add(backoff)
+}
+
+// MarkExhausted records that the invocation's attempts are exhausted.
+func (p *fakeInvocationState) MarkExhausted(invocation string, attempts int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.running, invocation)
-	p.endRuns = append(p.endRuns, invocation)
+	delete(p.nextAt, invocation)
+	p.exhausted[invocation] = attempts
+}
+
+// IsTerminal reports whether the invocation is complete or exhausted.
+func (p *fakeInvocationState) IsTerminal(invocation string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done[invocation] || p.exhausted[invocation] > 0
 }
 
 // runningDeadline returns the persisted running deadline for an invocation, for
@@ -352,8 +401,8 @@ func TestHandleMarksCompleteOnExecution(t *testing.T) {
 }
 
 // TestHandleNoInvocationStateBehavesAsBefore verifies that Handle without
-// invocation state in ctx runs every matching handler (nil-safe, backward
-// compatible).
+// invocation state in ctx runs every matching handler (nil-safe, no state
+// bookkeeping).
 func TestHandleNoInvocationStateBehavesAsBefore(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
@@ -375,7 +424,7 @@ func (ctxAwareExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ stri
 }
 
 // fnWithTimeout builds a prepared function whose single rule matches any event
-// and carries the given handler timeout.
+// and carries the given handler timeout and the default retry count.
 func fnWithTimeout(t *testing.T, name string, timeout time.Duration, executor Executor) *PreparedFunction {
 	t.Helper()
 	return NewPrepared(
@@ -383,7 +432,7 @@ func fnWithTimeout(t *testing.T, name string, timeout time.Duration, executor Ex
 			Name: name,
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: timeout}},
+				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: timeout, Retries: function.DefaultRetries}},
 			},
 		},
 		&runtime.Prepared{Name: name, Image: "x"},
@@ -438,6 +487,9 @@ func TestSetMaxHandlerTimeoutUncappedByDefault(t *testing.T) {
 // TestHandleTryStartGuardsInFlightInvocation verifies that when an invocation is
 // protected by an active running deadline (a future deadline), Handle skips the
 // executor: another replica may be executing it, so it must not run concurrently.
+// Because nothing executed and the invocation is protected, Handle returns
+// ErrInvocationNotEligible so the stream layer leaves the message pending (the
+// cross-replica ACK-hazard fix).
 func TestHandleTryStartGuardsInFlightInvocation(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
@@ -449,8 +501,9 @@ func TestHandleTryStartGuardsInFlightInvocation(t *testing.T) {
 	prog.running["user-events/index.run"] = now.Add(time.Hour)
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
-		t.Fatalf("handle: %v", err)
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle error = %v, want ErrInvocationNotEligible", err)
 	}
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0 (in-flight invocation skipped)", exec.count())
@@ -478,41 +531,47 @@ func TestHandleExecutesAfterDeadlineExpires(t *testing.T) {
 	}
 }
 
-// TestHandleFailureEndsRunning verifies that a failing invocation clears its
-// running marker via EndRunning, so an immediate second attempt is allowed
-// (no waiting for the deadline).
-func TestHandleFailureEndsRunning(t *testing.T) {
+// TestHandleFailureSchedulesRetry verifies that a failing invocation records a
+// retry backoff (RecordFailure) instead of clearing the marker: the invocation
+// is gated until the backoff elapses, so an immediate second delivery is skipped
+// (not eligible) rather than re-run.
+func TestHandleFailureSchedulesRetry(t *testing.T) {
 	exec := &scriptedExecutor{fail: true}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// First delivery fails: the running marker must be cleared.
+	// First delivery fails: a retry backoff is recorded (not an endRunning).
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected failure")
 	}
 	if _, ok := prog.runningDeadline("user-events/index.run"); ok {
 		t.Fatalf("running marker should be cleared after failure")
 	}
-	if len(prog.endRuns) != 1 || prog.endRuns[0] != "user-events/index.run" {
-		t.Fatalf("endRuns = %v, want [user-events/index.run]", prog.endRuns)
+	if len(prog.failures) != 1 {
+		t.Fatalf("failures = %v, want one RecordFailure", prog.failures)
+	}
+	if prog.failures[0] != time.Minute {
+		t.Fatalf("first retry backoff = %s, want 1m", prog.failures[0])
 	}
 
-	// Second delivery (immediate, no clock advance): must run again.
+	// Second delivery (immediate, no clock advance): the invocation is gated by
+	// the retry backoff, so it is not eligible and Handle returns
+	// ErrInvocationNotEligible.
 	exec.setFail(false)
-	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
-		t.Fatalf("second delivery: %v", err)
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("second delivery error = %v, want ErrInvocationNotEligible (backoff gating)", err)
 	}
-	if exec.count() != 2 {
-		t.Fatalf("executor calls = %d, want 2 (immediate retry allowed)", exec.count())
+	if exec.count() != 1 {
+		t.Fatalf("executor calls = %d, want 1 (backoff-gated retry skipped)", exec.count())
 	}
 }
 
-// TestHandleTimeoutCancelsAndClears verifies that a handler that times out
-// (executor returns ctx.Err) causes Handle to error and EndRunning to be called,
-// clearing the running marker.
-func TestHandleTimeoutCancelsAndClears(t *testing.T) {
+// TestHandleTimeoutSchedulesRetry verifies that a handler that times out
+// (executor returns ctx.Err) causes Handle to error and RecordFailure to be
+// called, scheduling a retry backoff.
+func TestHandleTimeoutSchedulesRetry(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{fnWithTimeout(t, "user-events", 50*time.Millisecond, ctxAwareExecutor{})}, silentLogger(), nil)
 
 	prog := newFakeInvocationState()
@@ -528,17 +587,17 @@ func TestHandleTimeoutCancelsAndClears(t *testing.T) {
 	if _, ok := prog.runningDeadline("user-events/index.run"); ok {
 		t.Fatalf("running marker should be cleared after timeout")
 	}
-	if len(prog.endRuns) != 1 || prog.endRuns[0] != "user-events/index.run" {
-		t.Fatalf("endRuns = %v, want [user-events/index.run]", prog.endRuns)
+	if len(prog.failures) != 1 {
+		t.Fatalf("failures = %v, want one RecordFailure after timeout", prog.failures)
 	}
 }
 
-// TestHandleMarshalErrorClearsRunning verifies that when json.Marshal fails
-// after TryStart has already claimed the invocation, Handle clears the running
-// marker (EndRunning) so the deterministic marshal failure does not protect the
-// invocation for the whole timeout window. The event carries a value json.Marshal
-// cannot encode (a chan), which errors with "unsupported type".
-func TestHandleMarshalErrorClearsRunning(t *testing.T) {
+// TestHandleMarshalErrorSchedulesRetry verifies that when json.Marshal fails
+// after TryStart has already claimed the invocation, Handle records a retry
+// backoff (RecordFailure) so the deterministic marshal failure is treated as a
+// failed attempt. The event carries a value json.Marshal cannot encode (a chan),
+// which errors with "unsupported type".
+func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
 
@@ -551,13 +610,12 @@ func TestHandleMarshalErrorClearsRunning(t *testing.T) {
 	if err := r.Handle(ctx, "1757-0", event); err == nil {
 		t.Fatal("expected a marshal error")
 	}
-	// The running marker must be cleared (EndRunning called), so a later delivery
-	// is eligible immediately rather than waiting out the timeout.
+	// The running marker must be cleared and a retry backoff recorded.
 	if _, ok := prog.runningDeadline("user-events/index.run"); ok {
 		t.Fatalf("running marker should be cleared after marshal error")
 	}
-	if len(prog.endRuns) != 1 || prog.endRuns[0] != "user-events/index.run" {
-		t.Fatalf("endRuns = %v, want [user-events/index.run]", prog.endRuns)
+	if len(prog.failures) != 1 {
+		t.Fatalf("failures = %v, want one RecordFailure after marshal error", prog.failures)
 	}
 	// The executor must never have been reached (marshal failed before handoff).
 	if exec.count() != 0 {

@@ -383,27 +383,70 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 // Invocation state: when the stream layer injects an InvocationState into ctx
 // (see stream.WithInvocationState), Handle skips any matching invocation whose
 // "<function>/<handler>" ID is already recorded as completed on a previous
-// delivery, OR is protected by an active attempt deadline (a running marker
-// whose persisted deadline has not yet passed — this or another replica may be
-// executing it). Skipped invocations are not executions: they do not touch the
-// handler_* or function_handler_* metrics. function_events_total still counts
-// the function as engaged (it matched), which is attribution, not execution
-// counting. When no invocation state is present (direct Handle callers/tests,
-// or invocation tracking disabled) Handle behaves exactly as before.
+// delivery, is protected by an active attempt deadline or a retry backoff (a
+// running or next_attempt_at marker whose persisted deadline has not yet passed
+// — this or another replica may be executing it, or it is waiting out its
+// backoff), or is exhausted (terminal). Skipped invocations are not executions:
+// they do not touch the handler_* or function_handler_* metrics.
+// function_events_total still counts the function as engaged (it matched), which
+// is attribution, not execution counting. When no invocation state is present
+// (direct Handle callers/tests, or invocation tracking disabled) Handle behaves
+// exactly as before.
+//
+// Return contract (with invocation state):
+//   - nil when every matched invocation is complete (or nothing matched).
+//   - a wrapped stream.ErrInvocationNotEligible when at least one matched
+//     invocation was skipped because it is protected (running or waiting out a
+//     retry backoff) and nothing executed. The stream layer leaves the message
+//     pending without counting a retry or routing to the DLQ — this is what
+//     fixes the cross-replica ACK hazard: a replica that reclaims a message
+//     whose invocation is still in flight on another replica must not ACK it.
+//   - a wrapped stream.ErrInvocationExhausted when a failing invocation's
+//     attempts are exhausted AND every other matched invocation is complete or
+//     also exhausted, so the message is terminal and the stream layer routes it
+//     to the DLQ.
+//   - the plain execution error otherwise (a retryable failure, or an exhausted
+//     invocation while other matched invocations may still run), so the message
+//     stays pending.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
 	// A message received at the runner is one logical event handled across all
 	// matching rules. This is the message-level counter.
 	r.metrics.Inc("events_received_total")
 	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
-	// it (e.g. when the runner is driven directly in tests).
-	attempt := stream.DeliveryAttemptFrom(ctx)
+	// it (e.g. when the runner is driven directly in tests). It is used for
+	// logging and as the per-invocation attempt number when no invocation state
+	// is present (each direct call is then treated as attempt 1).
+	deliveryAttempt := stream.DeliveryAttemptFrom(ctx)
 	// Best-effort invocation state, absent when the stream did not inject it
 	// (direct Handle callers/tests, or invocation tracking disabled).
 	invState, hasState := stream.InvocationStateFrom(ctx)
 
+	// Track whether any invocation actually executed and whether any matched
+	// invocation was skipped because it is protected (running or waiting out a
+	// retry backoff). These drive the return contract above.
+	executed := false
+	skippedPending := false
+
 	// Take one consistent snapshot for the whole call so a concurrent registry
 	// swap mid-execution cannot reorder or drop functions under us.
-	for _, pf := range r.reg.snapshot() {
+	snapshot := r.reg.snapshot()
+
+	// Pre-pass: collect every matched invocation ID so an exhausted attempt can
+	// decide whether the whole message is terminal (all matched invocations
+	// complete or exhausted). This must be complete before any execution, because
+	// a rule that exhausts early must still see the full set of matched
+	// invocations (including ones that sort later).
+	var matched []string
+	for _, pf := range snapshot {
+		if !pf.available {
+			continue
+		}
+		for _, rule := range pf.fn.Template.MatchingRules(event) {
+			matched = append(matched, pf.fn.Name+"/"+rule.Handler)
+		}
+	}
+
+	for _, pf := range snapshot {
 		if !pf.available {
 			continue
 		}
@@ -436,7 +479,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"message_id", msgID,
 						"event_id", eventID,
 						"event_name", eventName,
-						"attempt", attempt,
+						"attempt", deliveryAttempt,
 					))
 				continue
 			}
@@ -450,29 +493,58 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
 				timeout = cap
 			}
+			// The per-invocation attempt number. With invocation state it comes
+			// from TryStart (Redis-backed, incremented per actual execution);
+			// without it, each direct call is simply attempt 1.
+			attempt := int(deliveryAttempt)
 			// Claim the invocation for this execution before running it. TryStart
 			// persists an absolute running deadline (now + timeout) and returns
-			// false when the invocation is already complete (handled above) or
-			// protected by an active attempt deadline — this or another replica may
-			// be executing it, so we must not run it concurrently. The IsComplete
-			// check above is the fast path that avoids an HSET on completed
-			// invocations; TryStart's own HGET also reads "ok" and covers the same
-			// case, so the two are consistent.
+			// started=false when the invocation is already complete (handled
+			// above), exhausted, or protected by an active attempt deadline or a
+			// retry backoff — this or another replica may be executing it, or it
+			// is waiting out its backoff, so we must not run it concurrently. The
+			// IsComplete check above is the fast path that avoids an HSET on
+			// completed invocations; TryStart's own HGET also reads "ok" and
+			// covers the same case, so the two are consistent.
 			if hasState {
-				if !invState.TryStart(invocation, timeout) {
-					r.log.Printf("function %q handler %q still running within its timeout for event %q; skipping%s",
-						pf.fn.Name, rule.Handler, msgID,
-						logging.Fields(
-							"function", pf.fn.Name,
-							"handler", rule.Handler,
-							"message_id", msgID,
-							"event_id", eventID,
-							"event_name", eventName,
-							"attempt", attempt,
-						))
+				started, n, wait := invState.TryStart(invocation, timeout)
+				if !started {
+					if wait > 0 {
+						// Protected by an active running deadline or a retry
+						// backoff. The message must stay pending (the protected
+						// invocation may still complete or fail on its own), so
+						// this is a "not eligible" skip, not a completion.
+						skippedPending = true
+						r.log.Printf("function %q handler %q not eligible for event %q (running or waiting for retry; eligible in %s)%s",
+							pf.fn.Name, rule.Handler, msgID, wait,
+							logging.Fields(
+								"function", pf.fn.Name,
+								"handler", rule.Handler,
+								"message_id", msgID,
+								"event_id", eventID,
+								"event_name", eventName,
+								"attempt", n,
+								"next_attempt_in", wait,
+							))
+					} else {
+						// Terminal (exhausted): skipped like complete, never
+						// eligible again.
+						r.log.Printf("function %q handler %q exhausted for event %q; skipping%s",
+							pf.fn.Name, rule.Handler, msgID,
+							logging.Fields(
+								"function", pf.fn.Name,
+								"handler", rule.Handler,
+								"message_id", msgID,
+								"event_id", eventID,
+								"event_name", eventName,
+								"attempt", n,
+							))
+					}
 					continue
 				}
+				attempt = n
 			}
+			executed = true
 			r.log.Printf("function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
 				logging.Fields(
 					"function", pf.fn.Name,
@@ -485,11 +557,11 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			eventJSON, err := json.Marshal(event)
 			if err != nil {
 				// The invocation was already claimed (TryStart above) but will not
-				// execute: clear the running marker so the failure does not protect
-				// a deterministic failure for the whole timeout window. Same
-				// contract as the execution-failure path below.
+				// execute: this is a failed attempt, so schedule a retry with the
+				// same backoff rules as an execution failure (it IS a failed
+				// attempt). If the attempt is exhausted, mark it terminal.
 				if hasState {
-					invState.EndRunning(invocation)
+					return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 				}
 				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 			}
@@ -523,22 +595,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// Per-function failure attribution (per rule execution).
 				r.metrics.IncLabels("function_handler_failure_total",
 					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-				// A failing rule execution is a retry driver: the message will be
-				// retried or, once attempts are exhausted, routed to the DLQ. Both
-				// are downstream of this failure, so every failure counts here.
-				// This is the per-function retry driver, distinct from the
-				// message-level retries_total (stream layer), which counts
-				// redelivery/retry events once per message.
-				r.metrics.IncLabels("function_retries_total",
-					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-				// When this failure is the one that exhausts the delivery attempts
-				// (attempt >= stream.DefaultMaxAttempts), the message is routed to
-				// the DLQ. This mirrors the stream layer's DLQ threshold; the
-				// authoritative global count remains dlq_entries_total.
-				if attempt >= stream.DefaultMaxAttempts {
-					r.metrics.IncLabels("function_dlq_total",
-						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-				}
 				r.metrics.ObserveDurationLabels("handler_duration_seconds",
 					[]metrics.Label{
 						{Name: "function", Value: pf.fn.Name},
@@ -554,19 +610,21 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"attempt", attempt,
 						"duration", d,
 					))
-				// Clear the running marker on failure (normal failure or timeout):
-				// the message goes pending and will be reclaimed, and the marker
-				// must not block a later delivery. On a timeout the executor
-				// returns a ctx.Err-wrapped error, so EndRunning also runs here;
-				// the invocation becomes eligible again only on a LATER delivery,
-				// and the current delivery has already failed the message (no ACK),
-				// so the "eligible only after deadline" nuance is naturally
-				// satisfied: the reclaim cadence plus any leftover deadline gates
-				// the next execution. If EndRunning is lost (crash after the
-				// failure), the marker self-expires at its deadline anyway.
+				// Record the failure and decide retry vs exhaustion. This is the
+				// per-invocation retry driver: a retryable failure schedules a
+				// backoff and counts function_retries_total; an exhausted attempt
+				// marks the invocation terminal and, when the whole message is
+				// terminal, routes it to the DLQ.
 				if hasState {
-					invState.EndRunning(invocation)
+					return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 				}
+				// No invocation state (direct callers/tests): every failure counts
+				// as a retry driver, but there is no Redis-backed attempt count to
+				// decide exhaustion — so no DLQ attribution here either. The DLQ
+				// metric is only meaningful with invocation state, where
+				// exhaustion is actually persisted and observable.
+				r.metrics.IncLabels("function_retries_total",
+					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 				return err
 			}
 			// Record the invocation as completed so a redelivery skips it. This
@@ -607,7 +665,113 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			)
 		}
 	}
+	// Return contract: nil when something executed successfully (or nothing
+	// matched); ErrInvocationNotEligible when nothing executed and at least one
+	// matched invocation is protected (running or waiting out a retry backoff).
+	if executed {
+		return nil
+	}
+	if skippedPending {
+		return stream.ErrInvocationNotEligible
+	}
 	return nil
+}
+
+// recordFailure handles a failed invocation attempt: it decides whether the
+// attempt is retryable or exhausted, updates the invocation state and metrics
+// accordingly, and returns the error Handle should propagate. It is used for
+// both execution failures and marshal failures (both are failed attempts).
+//
+// A retryable attempt (attempt < 1+retries) schedules a retry backoff via
+// RecordFailure and counts function_retries_total. An exhausted attempt
+// (attempt >= 1+retries) marks the invocation terminal via MarkExhausted; if
+// every other matched invocation is also terminal, the whole message is
+// terminal and the returned error wraps stream.ErrInvocationExhausted so the
+// stream layer routes it to the DLQ. Otherwise the plain error is returned so
+// the message stays pending and the other invocations continue.
+func (r *Runner) recordFailure(
+	invState stream.InvocationState,
+	invocation string,
+	attempt int,
+	retries int,
+	matched []string,
+	fnName, handler, msgID, eventID, eventName string,
+	origErr error,
+) error {
+	maxAttempts := 1 + retries
+	if attempt >= maxAttempts {
+		// Exhausted: mark the invocation terminal.
+		invState.MarkExhausted(invocation, attempt)
+		r.metrics.IncLabels("function_dlq_total",
+			[]metrics.Label{{Name: "function", Value: fnName}})
+		r.log.Printf("function %q handler %q exhausted after %d/%d attempts for event %q%s",
+			fnName, handler, attempt, maxAttempts, msgID,
+			logging.Fields(
+				"function", fnName,
+				"handler", handler,
+				"message_id", msgID,
+				"event_id", eventID,
+				"event_name", eventName,
+				"attempt", attempt,
+				"attempts_total", maxAttempts,
+			))
+		// If every matched invocation is now terminal, the message is terminal
+		// and must be routed to the DLQ. Otherwise leave it pending so the other
+		// invocations continue.
+		if allMatchedTerminal(invState, matched) {
+			return fmt.Errorf("%w: function %q handler %q exhausted after %d attempts: %w", stream.ErrInvocationExhausted, fnName, handler, attempt, origErr)
+		}
+		return fmt.Errorf("function %q handler %q exhausted after %d attempts: %w", fnName, handler, attempt, origErr)
+	}
+	// Retryable: schedule a retry backoff and count the retry.
+	backoff := retryBackoff(attempt)
+	invState.RecordFailure(invocation, backoff)
+	r.metrics.IncLabels("function_retries_total",
+		[]metrics.Label{{Name: "function", Value: fnName}})
+	r.log.Printf("function %q handler %q failed attempt %d/%d for event %q; retrying in %s%s",
+		fnName, handler, attempt, maxAttempts, msgID, backoff,
+		logging.Fields(
+			"function", fnName,
+			"handler", handler,
+			"message_id", msgID,
+			"event_id", eventID,
+			"event_name", eventName,
+			"attempt", attempt,
+			"attempts_total", maxAttempts,
+			"retry_delay", backoff,
+		))
+	return fmt.Errorf("function %q handler %q: attempt %d failed: %w", fnName, handler, attempt, origErr)
+}
+
+// allMatchedTerminal reports whether every matched invocation is terminal
+// (complete or exhausted). It is used to decide whether a message whose last
+// failing invocation just exhausted has any runnable invocation left: if none,
+// the message is terminal and must be routed to the DLQ. A read error fails
+// open to false (not terminal), so the message is conservatively left pending.
+func allMatchedTerminal(invState stream.InvocationState, matched []string) bool {
+	for _, inv := range matched {
+		if !invState.IsTerminal(inv) {
+			return false
+		}
+	}
+	return true
+}
+
+// retryBackoff returns the retry delay to apply after a failed attempt with the
+// given completed attempt number. The schedule is fixed and non-configurable:
+// attempt 1 → 1m, 2 → 2m, 3 → 5m, 4+ → 10m (capped). The runner owns rule
+// semantics, so the schedule lives here, not in the stream store.
+func retryBackoff(completedAttempts int) time.Duration {
+	switch {
+	case completedAttempts <= 1:
+		return time.Minute
+	case completedAttempts == 2:
+		return 2 * time.Minute
+	case completedAttempts == 3:
+		return 5 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
 }
 
 // eventFields extracts the low-cardinality, label-safe event_id and event_name

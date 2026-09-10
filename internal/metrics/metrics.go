@@ -115,10 +115,11 @@ func New() *Registry {
 	// once per event for which at least one of its rules matched — a
 	// functions-engaged counter, distinct from the message-level
 	// events_processed_total. handler success/failure are per rule execution.
-	// function_retries_total counts every failing rule execution (a retry
-	// driver); function_dlq_total counts a function once when its failing rule
-	// execution is the one that exhausts the delivery attempts (attempt >=
-	// stream.DefaultMaxAttempts) and the message is routed to the DLQ.
+	// function_retries_total counts every failing rule execution that will be
+	// retried (a retry driver); function_dlq_total counts a function once when
+	// its failing rule execution is the one that exhausts the rule's retry
+	// budget (attempt >= 1+retries, per-invocation) and the message is routed
+	// to the DLQ.
 	for _, name := range []string{
 		"function_events_total",
 		"function_handler_success_total",

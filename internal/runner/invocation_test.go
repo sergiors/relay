@@ -2,10 +2,13 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
+	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -75,7 +78,9 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 		t.Fatalf("delivery1 calls: alpha=%d beta=%d, want 1/1", alpha.count(), beta.count())
 	}
 
-	// Delivery 2 (redelivery): alpha skipped, beta retried and now succeeds.
+	// Delivery 2 (redelivery): alpha skipped, beta retried and now succeeds. The
+	// retry backoff from delivery 1 must have elapsed for beta to be eligible.
+	prog.advance(2 * time.Minute)
 	beta.setFail(false)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("delivery 2: %v", err)
@@ -120,7 +125,9 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 1 to fail")
 	}
-	// Delivery 2: alpha skipped, beta succeeds.
+	// Delivery 2: alpha skipped, beta succeeds. The retry backoff from delivery 1
+	// must have elapsed for beta to be eligible.
+	prog.advance(2 * time.Minute)
 	beta.setFail(false)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("delivery 2: %v", err)
@@ -171,7 +178,8 @@ func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 		t.Errorf("marks = %v, want none after failure", prog.marks)
 	}
 
-	// Later success: marked.
+	// Later success: marked. The retry backoff from the failure must have elapsed.
+	prog.advance(2 * time.Minute)
 	exec.setFail(false)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("success: %v", err)
@@ -181,9 +189,9 @@ func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 	}
 }
 
-// TestHandleWithoutStateUnchanged verifies the legacy behavior: with no
-// invocation state in ctx, every matching handler runs on every Handle call,
-// nothing is marked, and there is no panic.
+// TestHandleWithoutStateUnchanged verifies that with no invocation state in
+// ctx, every matching handler runs on every Handle call, nothing is marked,
+// and there is no panic.
 func TestHandleWithoutStateUnchanged(t *testing.T) {
 	a := &scriptedExecutor{}
 	b := &scriptedExecutor{}
@@ -236,7 +244,9 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 		t.Fatalf("delivery1 calls: A=%d C=%d Z=%d, want 1/1/0", a.count(), c.count(), z.count())
 	}
 
-	// Delivery 2: A skipped, C retried (succeeds, marked), Z retried (fails).
+	// Delivery 2: A skipped, C retried (succeeds, marked), Z retried (fails). The
+	// retry backoffs from delivery 1 must have elapsed for C and Z to be eligible.
+	prog.advance(2 * time.Minute)
 	c.setFail(false)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 2 to fail (Z)")
@@ -257,7 +267,9 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 		t.Errorf("Z should still be unmarked")
 	}
 
-	// Delivery 3: A+C skipped, Z retried (fails).
+	// Delivery 3: A+C skipped, Z retried (fails). Z's backoff from delivery 2
+	// must have elapsed.
+	prog.advance(2 * time.Minute)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 3 to fail (Z)")
 	}
@@ -269,5 +281,195 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	}
 	if z.count() != 2 {
 		t.Errorf("Z calls = %d, want 2 (retried)", z.count())
+	}
+}
+
+// TestRetryBackoffSchedule pins the fixed retry backoff schedule: attempt 1 →
+// 1m, 2 → 2m, 3 → 5m, 4+ → 10m (capped).
+func TestRetryBackoffSchedule(t *testing.T) {
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, time.Minute},
+		{2, 2 * time.Minute},
+		{3, 5 * time.Minute},
+		{4, 10 * time.Minute},
+		{5, 10 * time.Minute},
+		{10, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		if got := retryBackoff(tc.attempt); got != tc.want {
+			t.Errorf("retryBackoff(%d) = %s, want %s", tc.attempt, got, tc.want)
+		}
+	}
+}
+
+// fnWithRetries builds a prepared function whose single rule matches any event
+// and carries the given retry count (additional attempts after the first).
+func fnWithRetries(t *testing.T, name string, retries int, executor Executor) *PreparedFunction {
+	t.Helper()
+	return NewPrepared(
+		function.Function{
+			Name: name,
+			Template: &function.Template{
+				Runtime: "node24",
+				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: retries}},
+			},
+		},
+		&runtime.Prepared{Name: name, Image: "x"},
+		executor,
+	)
+}
+
+// TestHandleRetriesZeroExhaustsAfterOneAttempt verifies that a rule with
+// retries:0 (only the initial attempt) exhausts after a single failure: the
+// invocation is marked exhausted and Handle returns ErrInvocationExhausted (the
+// sole invocation is terminal).
+func TestHandleRetriesZeroExhaustsAfterOneAttempt(t *testing.T) {
+	exec := &scriptedExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, want ErrInvocationExhausted", err)
+	}
+	if exec.count() != 1 {
+		t.Fatalf("executor calls = %d, want 1", exec.count())
+	}
+	if !prog.IsTerminal("user-events/index.run") {
+		t.Fatalf("invocation should be terminal (exhausted) after retries:0 failure")
+	}
+	if len(prog.failures) != 0 {
+		t.Fatalf("failures = %v, want none (exhausted, not retried)", prog.failures)
+	}
+}
+
+// TestHandleDefaultRetriesFiveAttempts verifies that a rule with the default
+// retry count (4) allows 5 total attempts before exhaustion, with the backoff
+// schedule 1m/2m/5m/10m applied after attempts 1..4.
+func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
+	exec := &scriptedExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Attempts 1..4 are retryable (each schedules a backoff); attempt 5 exhausts.
+	for i := 1; i <= 4; i++ {
+		err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+		if err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
+			t.Fatalf("attempt %d: expected a retryable failure, got %v", i, err)
+		}
+		// Advance past the just-scheduled backoff so the next attempt is eligible.
+		prog.advance(retryBackoff(i))
+	}
+	if exec.count() != 4 {
+		t.Fatalf("executor calls after 4 retryable attempts = %d, want 4", exec.count())
+	}
+	// Attempt 5 exhausts.
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("attempt 5 error = %v, want ErrInvocationExhausted", err)
+	}
+	if exec.count() != 5 {
+		t.Fatalf("executor calls = %d, want 5", exec.count())
+	}
+	if !prog.IsTerminal("user-events/index.run") {
+		t.Fatalf("invocation should be terminal after 5 attempts")
+	}
+	// Backoff schedule: 1m, 2m, 5m, 10m.
+	want := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
+	if len(prog.failures) != len(want) {
+		t.Fatalf("failures = %v, want %v", prog.failures, want)
+	}
+	for i, w := range want {
+		if prog.failures[i] != w {
+			t.Errorf("failure[%d] backoff = %s, want %s", i, prog.failures[i], w)
+		}
+	}
+}
+
+// TestHandleExhaustedWithOtherRunnableKeepsPending verifies that when a failing
+// invocation exhausts but another matched invocation is still runnable (not
+// terminal), Handle returns the plain error (not ErrInvocationExhausted) so the
+// message stays pending and the other invocation continues.
+func TestHandleExhaustedWithOtherRunnableKeepsPending(t *testing.T) {
+	alpha := &scriptedExecutor{fail: true} // exhausts
+	beta := &scriptedExecutor{}            // succeeds
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "alpha", 0, alpha),
+		fnWithRetries(t, "beta", 0, beta),
+	}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// alpha exhausts (retries:0) but beta is still runnable, so the message is
+	// NOT terminal: Handle returns a plain error, not ErrInvocationExhausted.
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, want a plain (non-exhausted) error", err)
+	}
+	if !prog.IsTerminal("alpha/index.run") {
+		t.Fatalf("alpha should be terminal (exhausted)")
+	}
+	if prog.IsTerminal("beta/index.run") {
+		t.Fatalf("beta should NOT be terminal (it succeeded and is complete)")
+	}
+}
+
+// TestHandleNotEligibleWhenProtected verifies that when the sole matched
+// invocation is protected (running or waiting out a retry backoff) and nothing
+// executes, Handle returns ErrInvocationNotEligible so the stream layer leaves
+// the message pending.
+func TestHandleNotEligibleWhenProtected(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	// Mark the invocation waiting out a retry backoff (future next-attempt).
+	prog.nextAt["user-events/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle error = %v, want ErrInvocationNotEligible", err)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (protected invocation skipped)", exec.count())
+	}
+}
+
+// TestHandleRetriesTotalOnlyOnRetryable verifies that function_retries_total
+// increments only on retryable failures, not on the exhausting failure.
+func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
+	m := metrics.New()
+	exec := &scriptedExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 1, exec)}, silentLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Attempt 1: retryable → function_retries_total increments.
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
+		t.Fatal("expected attempt 1 to fail")
+	}
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].RetriesTotal != 1 {
+		t.Fatalf("retries after attempt 1 = %+v, want 1", fs)
+	}
+	// Attempt 2: exhausts → function_retries_total does NOT increment, but
+	// function_dlq_total does.
+	prog.advance(retryBackoff(1))
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("attempt 2 error = %v, want ErrInvocationExhausted", err)
+	}
+	fs = m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].RetriesTotal != 1 {
+		t.Fatalf("retries after exhaustion = %+v, want still 1", fs)
+	}
+	if fs[0].DLQTotal != 1 {
+		t.Fatalf("dlq after exhaustion = %d, want 1", fs[0].DLQTotal)
 	}
 }

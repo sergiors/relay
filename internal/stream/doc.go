@@ -7,23 +7,32 @@
 //     sourced from XPENDING so delivery counts survive restarts. Reclaim is
 //     message-ownership recovery only; whether a reclaimed message's invocation
 //     is actually executed is decided at run time from per-invocation state
-//     (complete / running-until-deadline / eligible). MinPendingIdle is derived
-//     from the rule-timeout cap (3 * MaxRuleTimeout) and remains a message-level
-//     retry-pacing backstop.
+//     (complete / running-until-deadline / next-attempt-until-deadline /
+//     exhausted / eligible). MinPendingIdle defaults to DefaultReclaimInterval
+//     (1m) and is a message-level recovery-pacing backstop; it never defines
+//     retry timing.
 //   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
-//     before the original is acknowledged
+//     before the original is acknowledged. Exhaustion is per-invocation: when
+//     every non-complete matched invocation is exhausted, the whole message is
+//     routed to the DLQ (see ErrInvocationExhausted).
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<function>/<handler>" →
-//     "ok" when complete or "running:<deadline>" while an attempt is protected,
+//     "ok" when complete, "running:<deadline>#<attempts>" while an attempt is
+//     protected, "next_attempt_at:<deadline>#<attempts>" while a failed attempt
+//     waits out its retry backoff, or "exhausted:<attempts>" when terminal;
 //     TTL'd; stream/group names are percent-encoded in the key) so a
-//     redelivered message skips handlers that already completed or are still
-//     within an active attempt deadline; the message is acknowledged when all
-//     matching invocations are complete, and the invocation state key is eagerly
-//     cleared on completion or DLQ
+//     redelivered message skips handlers that already completed, are still
+//     within an active attempt deadline or retry backoff, or are exhausted; the
+//     message is acknowledged when all matching invocations are complete, and
+//     the invocation state key is eagerly cleared on completion or DLQ
 //
 // Key Guarantees:
 //   - A message is acknowledged only after the handler succeeds or the DLQ
 //     write succeeds (at-least-once, never exactly-once)
+//   - A message whose invocation is protected (running on another replica or
+//     waiting out a retry backoff) is left pending, never acknowledged — this
+//     is what prevents the cross-replica ACK hazard where a reclaiming replica
+//     could ack a message another replica is still processing
 //   - Invocation state is at-least-once, not exactly-once: a crash between a
 //     handler's side effect and its MarkComplete re-runs the handler, so handlers
 //     must remain idempotent. State read/mark/clear failures are logged and

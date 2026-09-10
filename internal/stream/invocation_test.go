@@ -9,9 +9,7 @@ import (
 // TestInvocationStateKeyLayout pins the exact Redis key layout so a change to
 // the namespace is a deliberate, reviewed decision. Colon-free names keep their
 // readable form; colons in stream/group names are percent-encoded so two
-// distinct (stream, group) pairs can never alias onto one key. The prefix
-// superseded "relay:progress:" — state from older binaries is not migrated:
-// pending messages simply re-run their handlers (at-least-once).
+// distinct (stream, group) pairs can never alias onto one key.
 func TestInvocationStateKeyLayout(t *testing.T) {
 	got := invocationStateKey("orders", "orders-group", "1757-0")
 	want := "relay:invocation:orders:orders-group:1757-0"
@@ -63,41 +61,92 @@ func TestInvocationStateContextRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRunningValueRoundTrip pins the "running:<unixnano>" field-value encoding:
-// runningValue encodes an absolute deadline and parseRunning decodes it back.
-// The "running:" prefix distinguishes the marker from the "ok" completion
-// sentinel; the Unix-nano suffix is the deadline at which the attempt is
-// considered abandoned.
+// TestRunningValueRoundTrip pins the "running:<unixnano>#<attempts>" field-value
+// encoding: runningValue encodes an absolute deadline and attempt number and
+// parseInvocationState decodes it back. The "running:" prefix distinguishes the
+// marker from the "ok" completion sentinel; the Unix-nano suffix is the deadline
+// at which the attempt is considered abandoned.
 func TestRunningValueRoundTrip(t *testing.T) {
 	dl := time.Unix(0, 1757000000000000000)
-	v := runningValue(dl)
-	if v != "running:1757000000000000000" {
-		t.Fatalf("runningValue = %q, want %q", v, "running:1757000000000000000")
+	v := runningValue(dl, 3)
+	if v != "running:1757000000000000000#3" {
+		t.Fatalf("runningValue = %q, want %q", v, "running:1757000000000000000#3")
 	}
-	got, ok := parseRunning(v)
+	kind, got, attempts, ok := parseInvocationState(v)
 	if !ok {
-		t.Fatalf("parseRunning(%q) ok = false, want true", v)
+		t.Fatalf("parseInvocationState(%q) ok = false, want true", v)
+	}
+	if kind != kindRunning {
+		t.Fatalf("parseInvocationState(%q) kind = %v, want kindRunning", v, kind)
 	}
 	if !got.Equal(dl) {
-		t.Fatalf("parseRunning(%q) = %v, want %v", v, got, dl)
+		t.Fatalf("parseInvocationState(%q) deadline = %v, want %v", v, got, dl)
+	}
+	if attempts != 3 {
+		t.Fatalf("parseInvocationState(%q) attempts = %d, want 3", v, attempts)
 	}
 }
 
-// TestParseRunningRejectsNonMarkers verifies parseRunning returns ok=false for
-// any value that is not a well-formed running marker: the "ok" completion
-// sentinel, a corrupt marker, and a future richer value are all treated as
-// eligible (not protected).
-func TestParseRunningRejectsNonMarkers(t *testing.T) {
+// TestParseInvocationStateValueGrammar pins the full value grammar: ok, running,
+// next_attempt_at, exhausted, and unparseable values (treated as eligible). The
+// attempt count is mandatory in deadline markers: a bare "<prefix>:<deadline>"
+// without "#<attempts>" does not parse.
+func TestParseInvocationStateValueGrammar(t *testing.T) {
+	dl := time.Unix(0, 1757000000000000000)
+
+	// ok → complete.
+	if kind, _, _, ok := parseInvocationState("ok"); !ok || kind != kindComplete {
+		t.Fatalf("parseInvocationState(\"ok\") = kind %v ok %v, want kindComplete true", kind, ok)
+	}
+
+	// running with attempts.
+	if kind, got, n, ok := parseInvocationState("running:1757000000000000000#2"); !ok || kind != kindRunning || !got.Equal(dl) || n != 2 {
+		t.Fatalf("running#2 = kind %v dl %v n %d ok %v", kind, got, n, ok)
+	}
+
+	// next_attempt_at with attempts.
+	if kind, got, n, ok := parseInvocationState("next_attempt_at:1757000000000000000#4"); !ok || kind != kindNextAttempt || !got.Equal(dl) || n != 4 {
+		t.Fatalf("next_attempt_at#4 = kind %v dl %v n %d ok %v", kind, got, n, ok)
+	}
+
+	// exhausted.
+	if kind, _, n, ok := parseInvocationState("exhausted:5"); !ok || kind != kindExhausted || n != 5 {
+		t.Fatalf("exhausted:5 = kind %v n %d ok %v", kind, n, ok)
+	}
+
+	// Unparseable values → eligible (ok=false). A deadline marker without the
+	// mandatory "#<attempts>" part also does not parse.
 	for _, v := range []string{
-		"ok",
 		"",
 		"running:",
 		"running:notanumber",
-		"next_attempt_at:123",
+		"running:1757000000000000000",
+		"running:123#",
+		"running:123#0",
+		"running:123#abc",
+		"next_attempt_at:",
+		"next_attempt_at:notanumber",
+		"next_attempt_at:1757000000000000000",
+		"exhausted:",
+		"exhausted:0",
+		"exhausted:abc",
+		"bogus",
 	} {
-		if _, ok := parseRunning(v); ok {
-			t.Errorf("parseRunning(%q) ok = true, want false", v)
+		if _, _, _, ok := parseInvocationState(v); ok {
+			t.Errorf("parseInvocationState(%q) ok = true, want false (eligible)", v)
 		}
+	}
+}
+
+// TestNextAttemptAndExhaustedValueRoundTrip pins the next_attempt_at and
+// exhausted encodings.
+func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
+	dl := time.Unix(0, 1757000000000000000)
+	if v := nextAttemptValue(dl, 2); v != "next_attempt_at:1757000000000000000#2" {
+		t.Fatalf("nextAttemptValue = %q", v)
+	}
+	if v := exhaustedValue(5); v != "exhausted:5" {
+		t.Fatalf("exhaustedValue = %q", v)
 	}
 }
 

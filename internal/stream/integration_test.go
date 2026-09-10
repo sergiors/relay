@@ -275,9 +275,7 @@ func TestIntegrationHandlerFailureStaysPending(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	// High MaxAttempts keeps the message pending across recovery redeliveries so
-	// we can assert it stays in the PEL rather than exhausting into the DLQ.
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	delivered := make(chan struct{}, 1)
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -301,7 +299,7 @@ func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
 	acked := make(chan struct{})
@@ -327,21 +325,46 @@ func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
 	}
 }
 
+// TestIntegrationExhaustRetriesRoutesToDLQ verifies that a handler returning
+// ErrInvocationExhausted (the runner's per-invocation exhaustion signal) routes
+// the whole message to the DLQ. The handler simulates the runner: it claims the
+// invocation, and on the final attempt marks it exhausted and returns
+// ErrInvocationExhausted.
 func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 3})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
-		if msgID == id {
-			attempts.Add(1)
+		if msgID != id {
+			return nil
 		}
-		return fmt.Errorf("always fail")
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		started, n, _ := p.TryStart("fn/h", time.Hour)
+		if !started {
+			return ErrInvocationNotEligible
+		}
+		attempts.Store(int64(n))
+		// Simulate the runner's exhaustion: mark the invocation terminal and
+		// return ErrInvocationExhausted so the message routes to the DLQ.
+		p.MarkExhausted("fn/h", n)
+		return ErrInvocationExhausted
 	})
-	e.waitDelivered(t, id)
-	e.waitGone(t, id)
+	// The message is routed to the DLQ (and acked) on the first delivery, so it
+	// may never linger in the PEL; wait for the DLQ entry instead.
+	waitFor(t, "message routed to DLQ", func() bool {
+		_, ok := e.dlq()[id]
+		return ok
+	})
+	waitFor(t, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
 	e.stop(t)
 
 	m, ok := e.dlq()[id]
@@ -358,9 +381,6 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	if m.Values["event"] != `{"a":1}` {
 		t.Errorf("event = %v", m.Values["event"])
 	}
-	if m.Values["attempts"] != "3" {
-		t.Errorf("attempts = %v, want 3", m.Values["attempts"])
-	}
 	if m.Values["reason"] == "" {
 		t.Errorf("reason missing")
 	}
@@ -370,7 +390,7 @@ func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 10})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{not json`)
 	var handlerRan atomic.Bool
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -404,9 +424,10 @@ func TestIntegrationDLQWriteFailureLeavesPending(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 3})
-	// Make the DLQ stream name a wrong-type key so XADD fails. The handler always
-	// fails to force DLQ routing, but the DLQ write itself must fail.
+	e := newEnv(t, ConsumerConfig{})
+	// Make the DLQ stream name a wrong-type key so XADD fails. The handler
+	// returns ErrInvocationExhausted to force DLQ routing, but the DLQ write
+	// itself must fail.
 	if r := e.client.Set(context.Background(), e.consumer.dlqStream, "not-a-stream", 0); r.Err() != nil {
 		t.Fatalf("set wrong-type key: %v", r.Err())
 	}
@@ -419,7 +440,7 @@ func TestIntegrationDLQWriteFailureLeavesPending(t *testing.T) {
 			default:
 			}
 		}
-		return fmt.Errorf("fail")
+		return ErrInvocationExhausted
 	})
 	<-delivered
 	time.Sleep(800 * time.Millisecond)
@@ -454,7 +475,7 @@ func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
 
@@ -496,20 +517,19 @@ func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 2})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
 
-	// Every delivery marks the invocation succeeded but returns an error, so the
-	// message exhausts attempts and routes to the DLQ. State must be cleared
-	// after the DLQ write + ACK.
+	// The handler returns ErrInvocationExhausted to route the message to the
+	// DLQ. State must be cleared after the DLQ write + ACK.
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID == id {
 			if p, ok := InvocationStateFrom(ctx); ok {
-				p.MarkComplete("fn/h")
+				p.MarkExhausted("fn/h", 1)
 			}
 		}
-		return fmt.Errorf("always fail")
+		return ErrInvocationExhausted
 	})
 	e.waitGone(t, id)
 	waitFor(t, "message in DLQ", func() bool {
@@ -532,7 +552,7 @@ func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
 	// Read the message into the group's PEL so XAck has an entry to remove.
@@ -581,7 +601,7 @@ func TestIntegrationRouteToDLQKeepsStateOnDLQWriteFailure(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
 	// Read the message into the PEL so XAck has an entry to remove.
@@ -655,7 +675,7 @@ func TestIntegrationRestartResilience(t *testing.T) {
 	// disabled and a huge min-idle so it does not interfere.
 	envA := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "restart-A",
-		ReclaimInterval: 0, MinPendingIdle: time.Hour, MaxAttempts: 100,
+		ReclaimInterval: 0, MinPendingIdle: time.Hour,
 	})
 	id := envA.xadd(t, event)
 	deliveredA := make(chan struct{})
@@ -677,7 +697,6 @@ func TestIntegrationRestartResilience(t *testing.T) {
 	// pending message and processes it successfully.
 	envB := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "restart-B",
-		MaxAttempts: 5,
 	})
 	acked := make(chan struct{})
 	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -907,7 +926,6 @@ func TestIntegrationPendingGauge(t *testing.T) {
 	}
 	m := metrics.New()
 	e := newEnv(t, ConsumerConfig{
-		MaxAttempts:     100, // keep the message pending (never exhaust to DLQ)
 		Metrics:         m,
 		MetricsInterval: 100 * time.Millisecond,
 	})
@@ -947,7 +965,7 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
 	// The handler simulates the runner: TryStart with a short timeout, then
@@ -962,9 +980,11 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
 		}
-		if !p.TryStart("fn/h", 2*time.Second) {
-			// Protected by an active attempt deadline: skip (no execution).
-			return nil
+		if started, _, _ := p.TryStart("fn/h", 2*time.Second); !started {
+			// Protected by an active attempt deadline: skip (no execution) and
+			// keep the message pending (the protected invocation may still
+			// complete or fail on its own).
+			return ErrInvocationNotEligible
 		}
 		calls.Add(1)
 		<-release
@@ -1009,7 +1029,6 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	// future deadline, then stops (simulating a restart).
 	envA := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "restart-inv-A",
-		MaxAttempts: 100,
 	})
 	id := envA.xadd(t, `{"a":1}`)
 	key := invocationStateKey(stream, group, id)
@@ -1027,19 +1046,15 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	})
 	// Mark running with a deadline ~1s in the future, then stop A.
 	deadline := time.Now().Add(time.Second)
-	if err := envA.client.HSet(context.Background(), key, "fn/h", runningValue(deadline)).Err(); err != nil {
+	if err := envA.client.HSet(context.Background(), key, "fn/h", runningValue(deadline, 1)).Err(); err != nil {
 		t.Fatalf("hset running marker: %v", err)
 	}
 	envA.stop(t)
 
 	// Consumer B (new consumer, same stream/group) reclaims the idle message.
 	// Within the deadline it must skip the invocation; after expiry it runs it.
-	// MaxAttempts is high so B keeps reclaiming until the protected window (the
-	// persisted deadline plus the clock-skew tolerance) expires instead of
-	// exhausting into the DLQ first.
 	envB := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "restart-inv-B",
-		MaxAttempts: 100,
 	})
 	var calls atomic.Int64
 	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -1050,13 +1065,13 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
 		}
-		if !p.TryStart("fn/h", time.Second) {
+		if started, _, _ := p.TryStart("fn/h", time.Second); !started {
 			// Protected by the persisted deadline: skip execution but keep the
-			// message pending (return an error) so a later reclaim can run it
-			// once the deadline expires. This mirrors the runner's skip path
-			// without acknowledging a message whose invocation is still
-			// protected.
-			return fmt.Errorf("invocation protected; keep pending")
+			// message pending (return ErrInvocationNotEligible) so a later
+			// reclaim can run it once the deadline expires. This mirrors the
+			// runner's skip path without acknowledging a message whose
+			// invocation is still protected.
+			return ErrInvocationNotEligible
 		}
 		calls.Add(1)
 		return nil
@@ -1081,7 +1096,7 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
 
@@ -1104,19 +1119,19 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 	e.stop(t)
 }
 
-// TestIntegrationFailureClearsRunningMarker verifies the failure path: an
-// attempt that fails clears its running marker (EndRunning), so an immediate
-// redelivery re-runs it without waiting for the deadline.
-func TestIntegrationFailureClearsRunningMarker(t *testing.T) {
+// TestIntegrationFailureSchedulesRetryBackoff verifies the failure path: an
+// attempt that fails records a next_attempt_at marker (RecordFailure) gating the
+// invocation by its retry backoff, so a redelivery within the backoff is skipped
+// (not eligible) rather than re-run.
+func TestIntegrationFailureSchedulesRetryBackoff(t *testing.T) {
 	if !redisAvailable(t) {
 		t.Skip("redis not available")
 	}
-	e := newEnv(t, ConsumerConfig{MaxAttempts: 100})
+	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
 
 	var attempts atomic.Int64
-	acked := make(chan struct{})
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID != id {
 			return nil
@@ -1125,32 +1140,32 @@ func TestIntegrationFailureClearsRunningMarker(t *testing.T) {
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
 		}
-		if !p.TryStart("fn/h", time.Hour) {
-			return nil
+		started, _, _ := p.TryStart("fn/h", time.Hour)
+		if !started {
+			// Gated by the retry backoff: skip and keep pending.
+			return ErrInvocationNotEligible
 		}
 		n := attempts.Add(1)
 		if n >= 2 {
-			close(acked)
 			return nil
 		}
-		// Simulate the runner's failure path: clear the running marker.
-		p.EndRunning("fn/h")
+		// Simulate the runner's failure path: record a retry backoff.
+		p.RecordFailure("fn/h", time.Minute)
 		return fmt.Errorf("fail first delivery")
 	})
-	<-acked
-	waitFor(t, "message acked (gone from PEL)", func() bool {
-		_, ok := e.pending()[id]
-		return !ok
+	e.waitDelivered(t, id)
+	// The failure must have recorded a next_attempt_at marker.
+	waitFor(t, "next_attempt_at marker recorded after failure", func() bool {
+		v, err := e.client.HGet(context.Background(), key, "fn/h").Result()
+		return err == nil && strings.HasPrefix(v, "next_attempt_at:")
 	})
+	// A redelivery within the backoff is skipped (not eligible), so the executor
+	// is not called again.
+	time.Sleep(500 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("executor called %d times while gated by retry backoff; want 1", got)
+	}
 	e.stop(t)
-	if got := attempts.Load(); got < 2 {
-		t.Fatalf("expected at least 2 delivery attempts, got %d", got)
-	}
-	// The running marker must be gone (EndRunning cleared it on the failure), so
-	// the immediate redelivery was eligible without waiting for a deadline.
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after ack (exists=%d err=%v)", n, err)
-	}
 }
 
 // TestIntegrationConcurrentReplicasNoDuplicate verifies that two consumers (A/B)
@@ -1170,7 +1185,6 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 	// deadline) for a controlled window.
 	envA := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "conc-A",
-		MaxAttempts: 100,
 	})
 	id := envA.xadd(t, `{"a":1}`)
 	releaseA := make(chan struct{})
@@ -1184,8 +1198,8 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
 		}
-		if !p.TryStart("fn/h", 5*time.Second) {
-			return nil
+		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+			return ErrInvocationNotEligible
 		}
 		aCalls.Add(1)
 		close(deliveredA)
@@ -1201,7 +1215,6 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		Stream: stream, Group: group, Consumer: "conc-B",
 		MinPendingIdle:  150 * time.Millisecond,
 		ReclaimInterval: 100 * time.Millisecond,
-		MaxAttempts:     1000,
 	})
 	var bCalls atomic.Int64
 	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -1212,8 +1225,8 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
 		}
-		if !p.TryStart("fn/h", 5*time.Second) {
-			return nil
+		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+			return ErrInvocationNotEligible
 		}
 		bCalls.Add(1)
 		return nil
@@ -1240,5 +1253,172 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 	}
 	if got := bCalls.Load(); got != 0 {
 		t.Fatalf("consumer B executed %d times, want 0", got)
+	}
+}
+
+// TestIntegrationCrossReplicaNotEligibleKeepsPending is the regression test for
+// the cross-replica ACK hazard: while consumer A holds a message in flight
+// (its invocation is protected by a running deadline), consumer B reclaims it
+// and its handler returns ErrInvocationNotEligible (the runner's skip path for
+// a protected invocation). B must NOT acknowledge the message — it must stay in
+// the PEL so A's eventual completion or failure is not lost.
+func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	prefix := fmt.Sprintf("ackhazard-%d", time.Now().UnixNano())
+	stream, group := prefix+"-stream", prefix+"-group"
+
+	// Consumer A: claims the invocation and blocks, keeping it in flight.
+	envA := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "ackhazard-A",
+	})
+	id := envA.xadd(t, `{"a":1}`)
+	releaseA := make(chan struct{})
+	deliveredA := make(chan struct{})
+	envA.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+			return ErrInvocationNotEligible
+		}
+		close(deliveredA)
+		<-releaseA
+		return nil
+	})
+	<-deliveredA
+
+	// Consumer B: reclaims the idle message while A is in flight. Its handler
+	// returns ErrInvocationNotEligible (protected), so B must leave the message
+	// pending rather than ack it.
+	envB := newEnv(t, ConsumerConfig{
+		Stream: stream, Group: group, Consumer: "ackhazard-B",
+		MinPendingIdle:  150 * time.Millisecond,
+		ReclaimInterval: 100 * time.Millisecond,
+	})
+	envB.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+			return ErrInvocationNotEligible
+		}
+		return nil
+	})
+
+	// Let B's reclaim loop run against A's in-flight invocation. The message
+	// must STAY in the PEL (B must not ack it).
+	time.Sleep(800 * time.Millisecond)
+	if _, ok := envB.pending()[id]; !ok {
+		t.Fatalf("message %s must stay pending while A's invocation is in flight (B must not ack)", id)
+	}
+
+	// Release A; it acks and the message leaves the PEL.
+	close(releaseA)
+	waitFor(t, "message acked by A (gone from PEL)", func() bool {
+		_, ok := envA.pending()[id]
+		return !ok
+	})
+	envA.stop(t)
+	envB.stop(t)
+}
+
+// TestIntegrationNextAttemptAtGatesExecution verifies the retry-backoff gate
+// end to end: a next_attempt_at marker in the future skips the invocation
+// (ErrInvocationNotEligible), and once it is in the past the invocation
+// executes.
+func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	// Pre-write a next_attempt_at marker ~1s in the future.
+	future := time.Now().Add(time.Second)
+	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(future, 2)).Err(); err != nil {
+		t.Fatalf("hset next_attempt_at marker: %v", err)
+	}
+
+	var calls atomic.Int64
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		if started, _, _ := p.TryStart("fn/h", time.Second); !started {
+			// Gated by the retry backoff: skip and keep pending.
+			return ErrInvocationNotEligible
+		}
+		calls.Add(1)
+		return nil
+	})
+	// While the marker is in the future, the invocation is skipped.
+	time.Sleep(500 * time.Millisecond)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("executor called %d times while gated by next_attempt_at; want 0", got)
+	}
+	// After the marker expires, the invocation executes.
+	waitFor(t, "invocation executed after next_attempt_at expiry", func() bool {
+		return calls.Load() >= 1
+	})
+	e.stop(t)
+}
+
+// TestIntegrationExhaustedSkipsWithoutRerun verifies that an exhausted marker is
+// terminal: a redelivery skips the invocation (never re-runs it) and, because
+// nothing executed and the invocation is terminal (not protected), Handle would
+// return nil — but here the handler simulates the runner by returning nil for a
+// terminal skip, so the message is acked.
+func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
+	if !redisAvailable(t) {
+		t.Skip("redis not available")
+	}
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	// Pre-write an exhausted marker.
+	if err := e.client.HSet(context.Background(), key, "fn/h", exhaustedValue(5)).Err(); err != nil {
+		t.Fatalf("hset exhausted marker: %v", err)
+	}
+
+	var calls atomic.Int64
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		started, _, _ := p.TryStart("fn/h", time.Second)
+		if started {
+			calls.Add(1)
+		}
+		// Terminal skip: return nil so the message is acked (all invocations
+		// complete-or-exhausted).
+		return nil
+	})
+	waitFor(t, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.stop(t)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("exhausted invocation executed %d times; want 0 (terminal skip)", got)
 	}
 }

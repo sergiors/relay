@@ -70,14 +70,11 @@ func TestEventStringFallback(t *testing.T) {
 
 func TestNewConsumerDefaults(t *testing.T) {
 	c := NewConsumer(ConsumerConfig{Client: redis.NewClient(&redis.Options{}), Stream: "events"})
-	if c.maxAttempts != 5 {
-		t.Errorf("maxAttempts default = %d, want 5", c.maxAttempts)
-	}
 	if c.dlqStream != "events:dlq" {
 		t.Errorf("dlqStream default = %q, want events:dlq", c.dlqStream)
 	}
-	if c.minPendingIdle != 3*MaxRuleTimeout {
-		t.Errorf("minPendingIdle default = %s, want 3*MaxRuleTimeout = %s", c.minPendingIdle, 3*MaxRuleTimeout)
+	if c.minPendingIdle != DefaultReclaimInterval {
+		t.Errorf("minPendingIdle default = %s, want DefaultReclaimInterval = %s", c.minPendingIdle, DefaultReclaimInterval)
 	}
 	if c.reclaimInterval != time.Minute {
 		t.Errorf("reclaimInterval default = %s, want 1m", c.reclaimInterval)
