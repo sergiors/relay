@@ -147,17 +147,50 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var          | Required | Description                        |
-| ---------------- | -------- | ---------------------------------- |
-| `REDIS_ADDR`     | yes      | Redis address or DSN (see below).  |
-| `REDIS_STREAM`   | yes      | Redis stream to consume.           |
-| `REDIS_GROUP`    | yes      | Consumer group name.               |
-| `METRICS_ADDR`   | no       | Metrics listen address (default `:9090`). |
+| Env var                     | Required | Description                        |
+| --------------------------- | -------- | ---------------------------------- |
+| `REDIS_ADDR`                | yes      | Redis address or DSN (see below).  |
+| `REDIS_STREAM`              | yes      | Redis stream to consume.           |
+| `REDIS_GROUP`               | yes      | Consumer group name.               |
+| `REDIS_STREAM_RETENTION`    | no       | Stream retention window; unset disables trimming. |
+| `METRICS_ADDR`              | no       | Metrics listen address (default `:9090`). |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
-immediately) if any of them is unset or empty. `METRICS_ADDR` is optional and
-must be a non-empty listen address when set (an empty value falls back to the
-default); an unbindable address is logged and retried, never fatal.
+immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
+optional and enables internal stream retention (see below). `METRICS_ADDR` is
+optional and must be a non-empty listen address when set (an empty value falls
+back to the default); an unbindable address is logged and retried, never fatal.
+
+### Stream retention
+
+`REDIS_STREAM_RETENTION` is an optional duration (e.g. `6h`) that enables
+internal, periodic trimming of the configured `REDIS_STREAM`. Relay runs the
+retention job **internally** — there is no external cronjob and no per-message
+timer. While `relay start` runs, a single goroutine with a periodic
+`time.Ticker` trims the stream with `XTRIM <stream> MINID ~ <cutoff-id>`, where
+`cutoff-id` is `<unix-milliseconds>-0` for `now - retention`. One initial trim
+runs shortly after startup so an already-large stream does not wait a full
+interval.
+
+The tick interval is derived automatically from the retention window
+(`retention / 24`, clamped to `[1m, 1h]`) — it is **not** another environment
+variable. For `6h` that is 15 minutes. Trim failures are logged and retried on
+the next tick; they never stop the worker.
+
+The trim is **approximate** (`~`): Redis removes whole internal stream nodes
+(listpack blocks of up to `stream-node-max-entries`, default 100), so entries
+older than the window that share a node with fresh entries are removed on a
+later pass rather than immediately. Repeated ticks make progress toward the
+cutoff one node at a time; an entry may linger at most about one tick interval
+plus one node past its expiry.
+
+> **Warning: retention applies to the WHOLE stream, not just Relay's consumer
+> group.** Other consumer groups on the same stream may lose unprocessed entries
+> older than the window. Fan-out is preserved for entries inside the window.
+
+Unset or empty `REDIS_STREAM_RETENTION` disables retention entirely (no
+goroutine, no trims). A malformed duration or a zero/negative value fails
+startup like any other configuration error.
 
 `REDIS_ADDR` accepts either a plain address or a Redis DSN:
 

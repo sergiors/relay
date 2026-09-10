@@ -231,6 +231,20 @@ func Run(logger *log.Logger) {
 	// ctx is cancelled.
 	go statsLoop(ctx, m, st, statsFlushInterval)
 
+	// Optional internal stream retention. When REDIS_STREAM_RETENTION is set,
+	// a single goroutine periodically trims the configured stream with
+	// XTRIM MINID ~ so entries older than the window are removed. It is
+	// completely separate from ACK/retry/DLQ semantics and never touches
+	// message processing. A malformed or non-positive value fails startup like
+	// any other config error; unset/empty disables retention entirely.
+	retention, err := config.StreamRetention()
+	if err != nil {
+		logger.Fatalf("redis config: %v", err)
+	}
+	if retention > 0 {
+		go retentionLoop(ctx, client, cfg.redisStream, retention, logger)
+	}
+
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}
