@@ -116,10 +116,7 @@ func buildImage(
 		return fmt.Errorf("function %q: tar build context: %w", name, err)
 	}
 
-	resp, err := cli.ImageBuild(ctx, contextTar, client.ImageBuildOptions{
-		Tags:       []string{image},
-		Dockerfile: "Dockerfile",
-	})
+	resp, err := cli.ImageBuild(ctx, contextTar, buildImageOptions(image))
 	if err != nil {
 		return fmt.Errorf("function %q: docker build: %w", name, err)
 	}
@@ -133,6 +130,27 @@ func buildImage(
 		return fmt.Errorf("function %q: docker build: %w\n%s", name, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// buildImageOptions returns the ImageBuildOptions Relay uses for every function
+// build. Remove is set to true deliberately: the moby client v0.6.0 emits
+// rm=0 when Remove is false (it only sends the value when opting out of the
+// daemon's default), which suppresses the daemon's default cleanup of
+// intermediate containers after a successful classic-builder build. Remove:true
+// restores rm=1, so the daemon prunes the intermediate RUN and metadata-step
+// containers (and the dangling parent-chain head image) once a build succeeds.
+//
+// Failed builds intentionally keep their intermediates: the daemon only removes
+// intermediates when the build completed successfully (Remove && retErr == nil),
+// so a failed build leaves its intermediate state in place for debugging.
+// ForceRemove is deliberately not used: it would also remove intermediates on
+// failure, which we do not want.
+func buildImageOptions(image string) client.ImageBuildOptions {
+	return client.ImageBuildOptions{
+		Tags:       []string{image},
+		Dockerfile: "Dockerfile",
+		Remove:     true,
+	}
 }
 
 // drainBuildResponse reads the JSON message stream returned by ImageBuild,

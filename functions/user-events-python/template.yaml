@@ -1,5 +1,8 @@
 runtime: python3.14
 
+secrets:
+  POSTGRES_DSN: postgres-dsn
+
 events:
   - handler: events.created.handler
     pattern:
