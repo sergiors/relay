@@ -147,17 +147,23 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var          | Required | Description                     |
-| ---------------- | -------- | ------------------------------- |
-| `REDIS_ADDR`     | yes      | Redis address.                  |
-| `REDIS_STREAM`   | yes      | Redis stream to consume.        |
-| `REDIS_GROUP`    | yes      | Consumer group name.            |
+| Env var          | Required | Description                        |
+| ---------------- | -------- | ---------------------------------- |
+| `REDIS_ADDR`     | yes      | Redis address or DSN (see below).  |
+| `REDIS_STREAM`   | yes      | Redis stream to consume.           |
+| `REDIS_GROUP`    | yes      | Consumer group name.               |
 | `METRICS_ADDR`   | no       | Metrics listen address (default `:9090`). |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `METRICS_ADDR` is optional and
 must be a non-empty listen address when set (an empty value falls back to the
 default); an unbindable address is logged and retried, never fatal.
+
+`REDIS_ADDR` accepts either a plain address or a Redis DSN:
+
+- `host:port`  (e.g. `redis:6379`)
+- `redis://user:password@host:port`
+- `rediss://user:password@host:port`  (TLS)
 
 `DOCKER_HOST` (and the other Docker client variables `DOCKER_TLS_VERIFY`,
 `DOCKER_CERT_PATH`) are consumed by Relay through the Docker client at startup

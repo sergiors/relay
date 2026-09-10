@@ -45,3 +45,24 @@ func TestCheckHealth(t *testing.T) {
 		})
 	}
 }
+
+// TestHealthRedisConfigErrorRedactsCredentials pins that a malformed REDIS_ADDR
+// DSN reported by `relay health` never leaks the password to stderr. The
+// redis config error path (RedisOptions) is redacted, and this test exercises
+// the full runHealthCommand path to guard the wiring end to end.
+func TestHealthRedisConfigErrorRedactsCredentials(t *testing.T) {
+	t.Setenv("REDIS_ADDR", "redis://default:s3cr3t-pw@:63799x")
+	var code int
+	errOut := captureErr(t, func() {
+		code = runHealthCommand()
+	})
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if strings.Contains(errOut, "s3cr3t-pw") {
+		t.Fatalf("stderr leaks password: %q", errOut)
+	}
+	if !strings.Contains(errOut, "redis config") {
+		t.Fatalf("stderr missing redis config error: %q", errOut)
+	}
+}

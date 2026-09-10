@@ -39,12 +39,10 @@ const statsFlushInterval = 5 * time.Second
 // consumer. It blocks in Consume until the process is signalled.
 func Run(logger *log.Logger) {
 	cfg := struct {
-		redisAddr   string
 		redisStream string
 		redisGroup  string
 		redisCons   string
 	}{
-		redisAddr:   config.MustEnv("REDIS_ADDR"),
 		redisStream: config.MustEnv("REDIS_STREAM"),
 		redisGroup:  config.MustEnv("REDIS_GROUP"),
 	}
@@ -57,7 +55,14 @@ func Run(logger *log.Logger) {
 	}
 	cfg.redisCons = consumerName
 
-	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
+	// Resolve the Redis client options from REDIS_ADDR (a plain address or a
+	// redis(s):// DSN). A malformed DSN fails fast with a clear, redacted
+	// message rather than silently connecting to the wrong host.
+	redisOpts, err := config.RedisOptions()
+	if err != nil {
+		logger.Fatalf("redis config: %v", err)
+	}
+	client := redis.NewClient(redisOpts)
 	defer client.Close()
 
 	// The metrics registry is wired into the runner, the runtime manager, and

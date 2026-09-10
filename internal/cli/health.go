@@ -24,10 +24,12 @@ const healthTimeout = 2 * time.Second
 //	0  healthy
 //	1  a dependency is unavailable
 func runHealthCommand() int {
-	redisAddr := config.MustEnv("REDIS_ADDR")
-
 	redisCheck := func() error {
-		cli := redis.NewClient(&redis.Options{Addr: redisAddr})
+		opts, err := config.RedisOptions()
+		if err != nil {
+			return fmt.Errorf("redis config: %w", err)
+		}
+		cli := redis.NewClient(opts)
 		defer cli.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), healthTimeout)
 		defer cancel()
