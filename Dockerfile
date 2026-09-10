@@ -1,5 +1,7 @@
-# Build stage: golang image must satisfy go.mod's `go 1.27.0`.
-FROM golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -9,21 +11,19 @@ RUN go mod download
 
 COPY . .
 
-# CGO_ENABLED=0 keeps the binaries static and self-contained. Two binaries are
-# built: `relay` (the read-only CLI) and `relay-worker` (the long-running
-# process).
-RUN CGO_ENABLED=0 go build \
+# CGO_ENABLED=0 keeps the binaries static and allows native Go
+# cross-compilation for the requested target architecture.
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /relay \
     ./cmd/cli && \
-    CGO_ENABLED=0 go build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /relay-worker \
     ./cmd/worker
 
-# Runtime stage.
 FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates tzdata
