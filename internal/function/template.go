@@ -33,6 +33,7 @@ var operatorKeys = map[string]bool{
 	"equals": true,
 	"prefix": true,
 	"suffix": true,
+	"exists": true,
 }
 
 var supportedRuntimes = map[string]bool{
@@ -162,6 +163,27 @@ func (m suffixMatcher) Match(value any) bool {
 	return false
 }
 
+// existsMatcher matches key presence only. It ignores the value entirely:
+// null, false, 0, "", {}, [] all count as existing. The boolean records the
+// polarity: true = key present, false = key absent.
+//
+// The matcher never inspects the value because the dispatcher loop routes it
+// through presenceMatcher (MatchPresent), which resolves the polarity from the
+// presence flag alone — the value is irrelevant to a presence test. Match here
+// is only reachable when the key is present (an absent key never reaches a
+// value operator), so returning want outright yields the correct result: a
+// present key with want=true matches and want=false does not.
+type existsMatcher struct{ want bool }
+
+// Match fulfills ValueMatcher. See the type comment: this is value-independent
+// and is only invoked on a present key, so it returns the polarity directly.
+func (m existsMatcher) Match(value any) bool { return m.want }
+
+// MatchPresent fulfills presenceMatcher. An absent key with want=false (exists:
+// false) matches; an absent key with want=true (exists: true) does not, and a
+// present key matches exactly when want is true.
+func (m existsMatcher) MatchPresent(present bool) bool { return present == m.want }
+
 // ParseTemplate builds a Template from raw YAML, validating the runtime and
 // every rule's handler.
 func ParseTemplate(data []byte) (*Template, error) {
@@ -224,7 +246,11 @@ func ParseTemplate(data []byte) (*Template, error) {
 		}
 		pattern := make(Pattern, len(ev.Pattern))
 		for field, cond := range ev.Pattern {
-			pattern[field] = parseFieldCondition(cond)
+			parsed, err := parseFieldCondition(field, cond)
+			if err != nil {
+				return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
+			}
+			pattern[field] = parsed
 		}
 		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
 	}
@@ -403,25 +429,64 @@ func validateHandler(handler string) error {
 
 // parseFieldCondition converts a decoded YAML node into a FieldCondition.
 //   - a plain list -> implicit equality (OR across the values)
-//   - a map with only operator keys (equals/prefix/suffix) -> operators
+//   - a map with only operator keys (equals/prefix/suffix/exists) -> operators
 //   - a map with other keys -> nested field conditions (AND with siblings)
-func parseFieldCondition(v any) FieldCondition {
+//
+// path is the dotted field path (e.g. "new_image.cnpj") used to give errors from
+// strict operator validation (exists) enough context to locate the offending
+// value. It must be non-empty for every field; nested fields append their name.
+func parseFieldCondition(path string, v any) (FieldCondition, error) {
 	switch val := v.(type) {
 	case []any:
-		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: val}}}
+		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: val}}}, nil
 	case map[string]any:
 		if isOperatorMap(val) {
-			return FieldCondition{Operators: parseOperators(val)}
+			return buildOperators(val, path)
 		}
 		children := make(map[string]FieldCondition, len(val))
 		for field, child := range val {
-			children[field] = parseFieldCondition(child)
+			childCond, err := parseFieldCondition(path+"."+field, child)
+			if err != nil {
+				return FieldCondition{}, err
+			}
+			children[field] = childCond
 		}
-		return FieldCondition{Children: children}
+		return FieldCondition{Children: children}, nil
 	default:
 		// A bare scalar is treated as implicit equality with a single value.
-		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: []any{val}}}}
+		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: []any{val}}}}, nil
 	}
+}
+
+// buildOperators converts an operator-only map into a FieldCondition of
+// operators. equals/prefix/suffix reuse the legacy silent-skip convention: a
+// malformed value (e.g. prefix: "x" instead of a list) is dropped, never an
+// error. exists is validated strictly instead: its value must be a YAML boolean
+// (a Go bool after yaml.v3 decode — YAML true/false), and anything else is
+// rejected with a pointing error rather than silently ignored. This asymmetry is
+// deliberate: a missing operator key is a legitimate "this operator not used";
+// a non-boolean exists value is almost certainly a template authoring mistake.
+func buildOperators(m map[string]any, path string) (FieldCondition, error) {
+	var matchers []ValueMatcher
+	if vals, ok := m["equals"].([]any); ok {
+		matchers = append(matchers, equalityMatcher{values: vals})
+	}
+	if vals, ok := m["prefix"].([]any); ok {
+		matchers = append(matchers, prefixMatcher{prefixes: toStrings(vals)})
+	}
+	if vals, ok := m["suffix"].([]any); ok {
+		matchers = append(matchers, suffixMatcher{suffixes: toStrings(vals)})
+	}
+	if raw, ok := m["exists"]; ok {
+		want, ok := raw.(bool)
+		if !ok {
+			// yaml.v3 decodes YAML booleans into Go bool, so any non-bool here is
+			// a "true", 1, 1.5, null, list, or similar — none is a valid polarity.
+			return FieldCondition{}, fmt.Errorf("%s: exists must be a boolean, got %v", path, raw)
+		}
+		matchers = append(matchers, existsMatcher{want: want})
+	}
+	return FieldCondition{Operators: matchers}, nil
 }
 
 // isOperatorMap reports whether the map has only operator keys. If so, it is a
@@ -436,21 +501,6 @@ func isOperatorMap(m map[string]any) bool {
 		}
 	}
 	return true
-}
-
-// parseOperators converts a map of operator keys to ValueMatchers.
-func parseOperators(m map[string]any) []ValueMatcher {
-	var matchers []ValueMatcher
-	if vals, ok := m["equals"].([]any); ok {
-		matchers = append(matchers, equalityMatcher{values: vals})
-	}
-	if vals, ok := m["prefix"].([]any); ok {
-		matchers = append(matchers, prefixMatcher{prefixes: toStrings(vals)})
-	}
-	if vals, ok := m["suffix"].([]any); ok {
-		matchers = append(matchers, suffixMatcher{suffixes: toStrings(vals)})
-	}
-	return matchers
 }
 
 // toStrings converts decoded YAML values to strings, skipping non-strings.

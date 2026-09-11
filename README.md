@@ -378,8 +378,8 @@ events:
 A pattern is a tree of field conditions:
 
 - A plain YAML list is implicit equality: `status: [COMPLETED, FAILED]`.
-- A map with only operator keys (`equals`, `prefix`, `suffix`) holds operators,
-  each with a list of values.
+- A map with only operator keys (`equals`, `prefix`, `suffix`, `exists`) holds
+  operators.
 - A nested map without operator keys holds nested field conditions.
 
 ### Operators
@@ -389,6 +389,34 @@ A pattern is a tree of field conditions:
 | `equals` | Value equals any of the listed values (type-preserving). |
 | `prefix` | String value starts with any of the listed prefixes.     |
 | `suffix` | String value ends with any of the listed suffixes.       |
+| `exists` | Key presence check. Takes a boolean, not a list.         |
+
+`exists` checks **key presence only** — the value is irrelevant. `null` still
+counts as "exists":
+
+```yaml
+pattern:
+  new_image:
+    name:
+      exists: true # new_image.name must be present (any value, incl. null)
+```
+
+```yaml
+pattern:
+  new_image:
+    name:
+      exists: false # new_image.name must be absent from new_image
+```
+
+`exists` works recursively at any nesting depth: `new_image: { exists: true }`
+checks the top-level `new_image` key; `new_image: { name: { exists: true } }`
+checks `name` inside `new_image`. A nested `exists: true` fails when a parent is
+missing (the nested key cannot be present). A nested `exists: false` matches
+when the nested key is absent — including when the parent map itself is missing
+(a missing parent means the nested key is necessarily absent).
+
+The value must be a strict boolean; `exists: "true"`, `exists: 1`, and
+`exists: null` fail template validation.
 
 ### Semantics
 
@@ -401,10 +429,13 @@ A pattern is a tree of field conditions:
 - A missing event field fails that condition.
 - Extra event fields are ignored.
 - `prefix` and `suffix` only match string values; non-string values never match.
+- `exists` composes with other operators on the same field under the normal OR
+  rule: `name: { exists: false, prefix: ["12"] }` matches when `name` is absent
+  **or** present with a value starting with `12`.
 
 For example, a rule with `status: [COMPLETED, FAILED]` matches while
 `id: { prefix: ["user_"] }` matches `user_123` but not `123`. Only
-`equals`/`prefix`/`suffix` are implemented.
+`equals`/`prefix`/`suffix`/`exists` are implemented.
 
 ## Supported runtimes
 

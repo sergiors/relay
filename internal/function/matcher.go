@@ -18,25 +18,59 @@ func (t *Template) MatchingRules(event map[string]any) []Rule {
 }
 
 // match reports whether the pattern matches. All top-level fields are ANDed.
+//
+// Instead of failing immediately on a missing top-level field, each field is
+// evaluated with its presence flag: a missing key is a "present, but the value
+// is nil" condition to every condition. This lets presence-aware operators
+// (exists) see absence, while ordinary value operators still fail on a missing
+// key (they are not presence-aware, so a non-present key yields no match). The
+// short-circuit on the first non-matching field is preserved.
 func (p Pattern) match(event map[string]any) bool {
 	for field, cond := range p {
 		value, ok := event[field]
 		if !ok {
-			return false
+			value = nil
 		}
-		if !cond.match(value) {
+		if !cond.match(value, ok) {
 			return false
 		}
 	}
 	return true
 }
 
-// match evaluates a FieldCondition against a decoded value.
-func (c FieldCondition) match(value any) bool {
+// presenceMatcher is implemented by value matchers that care about the presence
+// of a key rather than (or in addition to) its value. MatchPresent receives the
+// presence flag only — the matcher resolves entirely from whether the key was
+// found. Only existsMatcher implements it. Value-dependent operators do not, and
+// therefore never match an absent key, exactly as before.
+type presenceMatcher interface {
+	MatchPresent(present bool) bool
+}
+
+// match evaluates a FieldCondition against a decoded value and its presence
+// flag. Operators are alternatives (OR); children are ANDed with each other
+// and with the operators. A parent that is absent or not a map still evaluates
+// its children against (nil, absent) so that presence-oriented child conditions
+// (exists: false) can succeed on a missing nested field.
+func (c FieldCondition) match(value any, present bool) bool {
 	// Operators on the same field are alternatives (OR).
 	if len(c.Operators) > 0 {
 		matched := false
 		for _, op := range c.Operators {
+			if pm, ok := op.(presenceMatcher); ok {
+				// Presence-aware operators (exists) resolve from the
+				// key-presence flag alone.
+				if pm.MatchPresent(present) {
+					matched = true
+					break
+				}
+				continue
+			}
+			// A plain value operator never matches an absent key. This preserves
+			// the historical behavior where a missing field failed the pattern.
+			if !present {
+				continue
+			}
 			if op.Match(value) {
 				matched = true
 				break
@@ -47,18 +81,25 @@ func (c FieldCondition) match(value any) bool {
 		}
 	}
 
-	// Nested children are ANDed; the value must be a map.
+	// Nested children are ANDed. They are only looked up in the parent map when
+	// the parent is present and actually a map; otherwise every child is
+	// evaluated against an absent key, so an `exists: false` child can still
+	// match when its parent map is missing.
 	if len(c.Children) > 0 {
-		obj, ok := value.(map[string]any)
-		if !ok {
-			return false
+		var obj map[string]any
+		if present {
+			obj, _ = value.(map[string]any)
 		}
 		for field, child := range c.Children {
-			childValue, ok := obj[field]
-			if !ok {
-				return false
+			var childValue any
+			childPresent := false
+			if obj != nil {
+				childValue, childPresent = obj[field]
+				if !childPresent {
+					childValue = nil
+				}
 			}
-			if !child.match(childValue) {
+			if !child.match(childValue, childPresent) {
 				return false
 			}
 		}
