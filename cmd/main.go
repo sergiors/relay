@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -28,7 +29,7 @@ func main() {
 	defer stop()
 
 	if err := cli.Run(ctx, os.Args, logger); err != nil {
-		logger.Print(err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

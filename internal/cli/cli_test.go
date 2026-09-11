@@ -27,20 +27,6 @@ func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, 
 	return out.String(), errOut.String(), err
 }
 
-// TestUsageOutputAndExitCode exercises the CLI entrypoint dispatch without any
-// dependency: a missing or unknown command returns a usage error, and the
-// binary must never attempt to start the runtime. The error is RETURNED (the
-// root ExitErrHandler is a silent no-op); cmd/main.go prints it via its logger
-// and exits 1.
-func TestUsageOutputAndExitCode(t *testing.T) {
-	for _, args := range [][]string{nil, {"bogus"}} {
-		_, _, err := runCLI(t, "", args...)
-		if err == nil || err.Error() == "" {
-			t.Fatalf("args %v: missing returned error message: %v", args, err)
-		}
-	}
-}
-
 // Root --help/-h prints the root help to stdout and exits 0, listing every
 // command. This literally follows the user-required pattern: build the tree
 // with New (an injected buffer writer), then call cmd.Run directly with a

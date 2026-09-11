@@ -8,6 +8,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -26,7 +27,7 @@ import (
 func New(logger *log.Logger, writer io.Writer) *cli.Command {
 	return &cli.Command{
 		Name:            "relay",
-		Usage:           "Relay is a Redis Streams \u2192 function event relay",
+		Usage:           "Relay event-driven function runner",
 		HideHelpCommand: true,
 		HideVersion:     true,
 		Writer:          writer,
@@ -37,6 +38,16 @@ func New(logger *log.Logger, writer io.Writer) *cli.Command {
 			secretCommand(),
 			statsCommand(),
 			healthCommand(),
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if !cmd.Args().Present() {
+				return cli.ShowAppHelp(cmd)
+			}
+
+			return fmt.Errorf(
+				"relay: unknown command: relay %s\n\nRun 'relay --help' for more information",
+				cmd.Args().First(),
+			)
 		},
 	}
 }
