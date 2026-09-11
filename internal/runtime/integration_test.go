@@ -172,7 +172,7 @@ export async function created(event) {
 }
 
 // repoRoot is the repository root (the dir of internal/runtime/..), used to
-// resolve the real example function directories under functions/.
+// resolve the real example function directories under examples/functions/.
 var repoRoot = func() string {
 	abs, err := filepath.Abs(".")
 	if err != nil {
@@ -185,7 +185,7 @@ var repoRoot = func() string {
 // function directories and returns the parsed template alongside its dir.
 func readRealTemplate(t *testing.T, relDir string) (string, *function.Template) {
 	t.Helper()
-	dir := filepath.Join(repoRoot, "functions", relDir)
+	dir := filepath.Join(repoRoot, "examples", "functions", relDir)
 	data, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read real template %s: %v", relDir, err)
@@ -204,8 +204,9 @@ const devEventJSON = `{
   "new_image": {"id": "user_123", "name": "John Doe", "email": "john@example.com"}
 }`
 
-// TestRealUserEventsPythonEndToEnd drives the real functions/user-events-python
-// example: three rules whose handlers live in the events/ namespace package
+// TestRealUserEventsPythonEndToEnd drives the real
+// examples/functions/user-events-python example: three rules whose handlers
+// live in the events/ namespace package
 // (events.created / events.updated / events.deleted).
 func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 	if !dockerAvailable(t) {
@@ -265,8 +266,9 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 	t.Logf("captured handler output:\n%s", logs)
 }
 
-// TestRealWelcomeEmailNodeEndToEnd drives the real functions/welcome-email-node
-// example: a single rule whose handler resolves as handler.handler -> module
+// TestRealWelcomeEmailNodeEndToEnd drives the real
+// examples/functions/welcome-email-node example: a single rule whose handler
+// resolves as handler.handler -> module
 // "handler" -> /app/handler.js. No package.json is present, exercising the
 // injected ESM package.json path.
 func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {

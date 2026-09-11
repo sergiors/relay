@@ -48,7 +48,7 @@ services:
       retries: 3
       start_period: 10s
     volumes:
-      - ./functions:/functions:ro
+      - ./examples/functions:/functions:ro
       - relay-data:/var/lib/relay
 
 volumes:

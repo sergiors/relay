@@ -14,5 +14,5 @@ bin/
 .DS_Store
 Thumbs.db
 compose.dev.yaml
-# functions/ is mounted at runtime, not needed to compile the relay binary.
-functions/
+# examples/functions/ is mounted at runtime, not needed to compile the relay binary.
+examples/

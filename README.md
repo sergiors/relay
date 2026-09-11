@@ -138,7 +138,7 @@ network with `DOCKER_HOST=tcp://socket-proxy:2375` (Relay's moby client honors
 into the `socket-proxy` container**, which forwards just the Engine API
 endpoints Relay needs (ping/version, image build, and container create/attach/
 start/wait/kill/remove). Port `2375` is **not** exposed to the host, so the
-proxy is reachable only from the compose network. `./functions` is still
+proxy is reachable only from the compose network. `./examples/functions` is still
 mounted read-only into Relay at `/functions`. The socket mount is privileged (see the security
 warning above); this is a dev-only convenience. The Relay container's healthcheck
 runs `relay health` (see _Health check_), so `docker compose ps` reports it
@@ -460,7 +460,7 @@ to Relay's logs.
   stops the remaining rules for that event and returns the message to the
   pending entries list (no XACK). See _Acknowledgment semantics_ below.
 
-For example, `functions/user-events-python/` declares three handlers
+For example, `examples/functions/user-events-python/` declares three handlers
 (`events.created.handler`, `events.updated.handler`,
 `events.deleted.handler`), all served by the same function image.
 
@@ -833,13 +833,18 @@ removed from a template no longer gates the acknowledgment.
 
 ## Example functions
 
-The root-level `functions/` directory contains development / example functions
-to copy and adapt. Each direct subdirectory is one function, deployed as
-described above.
+The repository's `examples/functions/` directory contains development / example
+functions to copy and adapt. These are **samples for local development and the
+README examples — not the production function directory**. Relay always reads
+its functions from `/functions` inside the container; for production, mount
+your own function directory there (see the deployment section above).
+`examples/functions/` exists only so the repository ships working, testable
+examples; each direct subdirectory is one function, deployed as described
+above.
 
-- `functions/user-events-python/` (python3.14): three rules on the `users`
-  table, each mapping an event to a module inside the `events/` namespace
-  package (no `__init__.py`):
+- `examples/functions/user-events-python/` (python3.14): three rules on the
+  `users` table, each mapping an event to a module inside the `events/`
+  namespace package (no `__init__.py`):
   - `events.created.handler` on `event_name: INSERT`.
   - `events.updated.handler` on `event_name: MODIFY` (with an explicit
     `timeout: 20s` demonstrating the per-rule timeout).
@@ -849,7 +854,7 @@ described above.
   read `event["new_image"]`; `deleted` reads `event["old_image"]`. Plain stdlib
   only, no `requirements.txt`.
 
-- `functions/welcome-email-node/` (node24): a single rule
+- `examples/functions/welcome-email-node/` (node24): a single rule
   `handler.handler` on `event_name: INSERT` / `table_name: users`. The handler
   reads `event.new_image` and logs a welcome email. No `package.json` is
   provided, so Relay injects the ESM `package.json`. It omits `timeout`, so it
