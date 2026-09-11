@@ -10,6 +10,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/urfave/cli/v3 v3.11.0
 	golang.org/x/term v0.28.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0

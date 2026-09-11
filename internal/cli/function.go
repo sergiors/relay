@@ -1,11 +1,15 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
 	"text/tabwriter"
+
+	"github.com/urfave/cli/v3"
 
 	"relay/internal/state"
 )
@@ -15,138 +19,140 @@ import (
 // touch /var/lib/relay.
 var statePath = state.DBPath
 
-// runFunctionCommand implements the read-only `relay function ...` subcommand
-// family. It touches the local state database only — never Redis, Docker, or
-// the /functions loader — so it works with no REDIS_ADDR and no worker
-// reachable. Exit codes:
-//
-//	0  success
-//	1  runtime error (e.g. unknown function)
-//	2  usage error
-func runFunctionCommand(args []string) int {
-	if len(args) == 0 {
-		return printUsageError("function: missing subcommand", functionHelp())
-	}
-
-	switch args[0] {
-	case "ls":
-		if len(args) == 2 && isHelp(args[1]) {
-			fmt.Fprint(os.Stdout, functionLsUsage())
-			return 0
-		}
-		if len(args) != 1 {
-			return printUsageError("function ls: too many arguments", functionLsUsage())
-		}
-		return functionList()
-	case "inspect":
-		if len(args) == 2 && isHelp(args[1]) {
-			fmt.Fprint(os.Stdout, functionInspectUsage())
-			return 0
-		}
-		if len(args) != 2 {
-			return printUsageError("function inspect: expected a function name", functionInspectUsage())
-		}
-		return functionInspect(args[1])
-	case "--help", "-h":
-		if len(args) == 1 {
-			fmt.Fprint(os.Stdout, functionHelp())
-			return 0
-		}
-		return printUsageError(fmt.Sprintf("function: unknown subcommand %q", args[0]), functionHelp())
-	default:
-		return printUsageError(fmt.Sprintf("function: unknown subcommand %q", args[0]), functionHelp())
+// functionCommand builds the read-only `relay function ...` subcommand family.
+// It touches the local state database only — never Redis, Docker, or the
+// /functions loader — so it works with no REDIS_ADDR and no worker reachable.
+func functionCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "function",
+		Usage: "Manage functions",
+		Description: "List and inspect the functions Relay has discovered and " +
+			"reconciled, reading the local state database.",
+		// Unknown or missing subcommands are usage errors; a non-nil Action here
+		// keeps an unknown token from falling through to the built-in help.
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			switch {
+			case !cmd.Args().Present():
+				return cli.Exit("function: missing subcommand", 2)
+			default:
+				return cli.Exit(fmt.Sprintf("function: unknown subcommand %q", cmd.Args().First()), 2)
+			}
+		},
+		Commands: []*cli.Command{
+			{
+				Name:        "ls",
+				Usage:       "List functions",
+				Description: "List all functions Relay has discovered, sorted by name.",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if cmd.Args().Present() {
+						return cli.Exit("function ls: too many arguments", 2)
+					}
+					return functionList(ctx, cmd.Writer)
+				},
+			},
+			{
+				Name:      "inspect",
+				Usage:     "Show detailed information about a function",
+				UsageText: "relay function inspect NAME",
+				Description: "Show the full detail record for a single function, including " +
+					"its runtime, status, handlers, and env/secret mappings.",
+				Arguments: []cli.Argument{
+					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
+				},
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if cmd.Args().Present() {
+						return cli.Exit("function inspect: too many arguments", 2)
+					}
+					return functionInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0])
+				},
+			},
+		},
 	}
 }
 
 // openState opens the local state DB (creating it if absent) and returns it
-// with a cleanup func. Any failure is reported on stderr with exit 1.
-func openState() (*state.State, func(), int) {
+// with a cleanup func. Any failure is returned as an error for the root
+// ExitErrHandler to print once.
+func openState() (*state.State, func(), error) {
 	st, err := state.Open(statePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: open state: %v\n", err)
-		return nil, nil, 1
+		return nil, nil, fmt.Errorf("open state: %w", err)
 	}
 	st.SetLogger(log.New(os.Stderr, "", 0))
-	return st, func() { _ = st.Close() }, 0
+	return st, func() { _ = st.Close() }, nil
 }
 
 // functionList prints a Docker-like table of functions sorted by name.
-func functionList() int {
-	st, cleanup, code := openState()
-	if code != 0 {
-		return code
+func functionList(ctx context.Context, w io.Writer) error {
+	st, cleanup, err := openState()
+	if err != nil {
+		return err
 	}
 	defer cleanup()
-
-	if err := printList(st); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-	return 0
+	return printList(w, st)
 }
 
 // functionInspect prints the full detail for one function. An unknown name
-// reports to stderr and returns 1.
-func functionInspect(name string) int {
-	st, cleanup, code := openState()
-	if code != 0 {
-		return code
+// returns a runtime error (exit 1 via main).
+func functionInspect(ctx context.Context, w io.Writer, name string) error {
+	st, cleanup, err := openState()
+	if err != nil {
+		return err
 	}
 	defer cleanup()
 
 	d, ok := st.GetFunction(name)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: unknown function %q\n", name)
-		return 1
+		return fmt.Errorf("unknown function %q", name)
 	}
-	printInspect(st, d)
-	return 0
+	printInspect(w, st, d)
+	return nil
 }
 
-// printList renders the ls table to stdout. It is separated from the command
+// printList renders the ls table to w. It is separated from the command
 // plumbing so tests can invoke it against a temp state DB directly.
-func printList(st *state.State) error {
+func printList(w io.Writer, st *state.State) error {
 	rows := st.ListFunctions()
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tRUNTIME\tSTATUS\tHANDLERS\tUPDATED")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tRUNTIME\tSTATUS\tHANDLERS\tUPDATED")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
 			r.Name, r.Runtime, r.Status, r.HandlerCount, displayTime(r))
 	}
-	return w.Flush()
+	return tw.Flush()
 }
 
-// printInspect renders the full detail record to stdout. Labels are
-// tab-aligned through a tabwriter so padding matches the longest label
-// without hand-maintained spaces. The Handlers section is rendered with
-// the same alignment, using a wider padding for visual grouping.
-func printInspect(st *state.State, d state.Detail) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "Name:\t%s\n", d.Name)
-	fmt.Fprintf(w, "Runtime:\t%s\n", d.Runtime)
-	fmt.Fprintf(w, "Status:\t%s\n", d.Status)
+// printInspect renders the full detail record to w. Labels are tab-aligned
+// through a tabwriter so padding matches the longest label without hand-
+// maintained spaces. The Handlers section is rendered with the same alignment,
+// using a wider padding for visual grouping.
+func printInspect(w io.Writer, st *state.State, d state.Detail) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
+	fmt.Fprintf(tw, "Runtime:\t%s\n", d.Runtime)
+	fmt.Fprintf(tw, "Status:\t%s\n", d.Status)
 	if d.Image != "" {
-		fmt.Fprintf(w, "Image:\t%s\n", d.Image)
+		fmt.Fprintf(tw, "Image:\t%s\n", d.Image)
 	}
 	if d.Fingerprint != "" {
-		fmt.Fprintf(w, "Fingerprint:\t%s\n", d.Fingerprint)
+		fmt.Fprintf(tw, "Fingerprint:\t%s\n", d.Fingerprint)
 	}
 	if d.PreparedAt != "" {
-		fmt.Fprintf(w, "Prepared:\t%s (%s)\n", d.PreparedAt, state.RelativeAgo(d.PreparedAt))
+		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", d.PreparedAt, state.RelativeAgo(d.PreparedAt))
 	}
 	if d.LastReconcileAt != "" {
-		fmt.Fprintf(w, "Last reconcile:\t%s (%s)\n", d.LastReconcileStatus, state.RelativeAgo(d.LastReconcileAt))
+		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", d.LastReconcileStatus, state.RelativeAgo(d.LastReconcileAt))
 	}
 	if d.LastError != "" {
-		fmt.Fprintf(w, "Last error:\t%s\n", d.LastError)
+		fmt.Fprintf(tw, "Last error:\t%s\n", d.LastError)
 	}
-	w.Flush()
+	tw.Flush()
 
-	fmt.Fprintln(os.Stdout, "")
-	fmt.Fprintln(os.Stdout, "Stats:")
-	sw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Stats:")
+	sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 	fs, _ := st.FunctionStats(d.Name)
 	fmt.Fprintf(sw, "  Events processed:\t%d\n", fs.EventsProcessedTotal)
 	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
@@ -155,9 +161,9 @@ func printInspect(st *state.State, d state.Detail) {
 	fmt.Fprintf(sw, "  DLQ entries:\t%d\n", fs.DLQTotal)
 	sw.Flush()
 
-	fmt.Fprintln(os.Stdout, "")
-	fmt.Fprintln(os.Stdout, "Handlers:")
-	hw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Handlers:")
+	hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 	for _, h := range d.Handlers {
 		fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
 	}
@@ -167,18 +173,18 @@ func printInspect(st *state.State, d state.Detail) {
 	// values (not secret) and secret references (never values). Both are
 	// omitted when the template defines none. Keys are sorted.
 	if len(d.Env) > 0 {
-		fmt.Fprintln(os.Stdout, "")
-		fmt.Fprintln(os.Stdout, "Environment:")
-		ew := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Environment:")
+		ew := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, k := range sortedKeys(d.Env) {
 			fmt.Fprintf(ew, "  %s=%s\n", k, d.Env[k])
 		}
 		ew.Flush()
 	}
 	if len(d.Secrets) > 0 {
-		fmt.Fprintln(os.Stdout, "")
-		fmt.Fprintln(os.Stdout, "Secrets:")
-		sw := tabwriter.NewWriter(os.Stdout, 0, 4, 3, ' ', 0)
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Secrets:")
+		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, k := range sortedKeys(d.Secrets) {
 			fmt.Fprintf(sw, "  %s=%s\n", k, d.Secrets[k])
 		}

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,12 +47,11 @@ func openForTest(t *testing.T) *state.State {
 // ls prints the header plus both rows with correct status/handlers, sorted.
 func TestFunctionListColumns(t *testing.T) {
 	seedTestState(t)
-	out := capture(t, func() {
-		if err := printList(openForTest(t)); err != nil {
-			t.Fatalf("printList: %v", err)
-		}
-	})
-	lines := strings.Split(strings.TrimSpace(out), "\n")
+	var w bytes.Buffer
+	if err := printList(&w, openForTest(t)); err != nil {
+		t.Fatalf("printList: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(w.String()), "\n")
 	hdr := lines[0]
 	for _, col := range []string{"NAME", "RUNTIME", "STATUS", "HANDLERS", "UPDATED"} {
 		if !strings.Contains(hdr, col) {
@@ -82,7 +82,9 @@ func TestFunctionInspectDetail(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	out := capture(t, func() { printInspect(st, d) })
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
 	// tabwriter pads to the longest label ("Last reconcile:") + minwidth
 	for _, want := range []string{
 		"Name:            user-events-python",
@@ -110,7 +112,9 @@ func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
 	if !ok {
 		t.Fatal("expected pending function")
 	}
-	out := capture(t, func() { printInspect(st, d) })
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
 	if strings.Contains(out, "Image:") || strings.Contains(out, "Prepared:") || strings.Contains(out, "Fingerprint:") {
 		t.Fatalf("pending function should omit Image/Fingerprint/Prepared:\n%s", out)
 	}
@@ -133,7 +137,9 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	out := capture(t, func() { printInspect(st, d) })
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
 	for _, want := range []string{
 		"Stats:",
 		"  Events processed:    12493",
@@ -162,7 +168,9 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	out := capture(t, func() { printInspect(st, d) })
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
 	for _, want := range []string{
 		"Stats:",
 		"  Events processed:    0",
@@ -205,7 +213,9 @@ events:
 	if !ok {
 		t.Fatal("expected function")
 	}
-	out := capture(t, func() { printInspect(st, d) })
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
 	for _, want := range []string{
 		"Environment:",
 		"API_URL=https://api.example.com",
@@ -222,53 +232,45 @@ events:
 	}
 }
 
-// Arg handling: bad args -> exit 2; unknown function -> exit 1 + message.
-func TestFunctionCommandExitCodes(t *testing.T) {
+// Arg handling: usage errors and the unknown-function error are returned with
+// their messages (cmd/main.go prints them and exits 1).
+func TestFunctionCommandErrors(t *testing.T) {
 	_ = seedTestState(t)
 
-	if code := runFunctionCommand(nil); code != 2 {
-		t.Fatalf("no args: exit = %d, want 2", code)
-	}
-	if code := runFunctionCommand([]string{"bogus"}); code != 2 {
-		t.Fatalf("unknown subcommand: exit = %d, want 2", code)
-	}
-	if code := runFunctionCommand([]string{"ls", "extra"}); code != 2 {
-		t.Fatalf("ls extra arg: exit = %d, want 2", code)
-	}
-	if code := runFunctionCommand([]string{"inspect"}); code != 2 {
-		t.Fatalf("inspect no name: exit = %d, want 2", code)
-	}
-
-	if code := runFunctionCommand([]string{"inspect", "ghost"}); code != 1 {
-		t.Fatalf("unknown function: exit = %d, want 1", code)
+	for _, args := range [][]string{
+		{"function"},
+		{"function", "bogus"},
+		{"function", "ls", "extra"},
+		{"function", "inspect"},
+		{"function", "inspect", "ghost"},
+	} {
+		_, _, err := runCLI(t, "", args...)
+		if err == nil || err.Error() == "" {
+			t.Fatalf("args %v: missing returned error message", args)
+		}
 	}
 }
 
-// An inspect of an unknown function writes the expected message to stderr.
+// An inspect of an unknown function writes the expected message to the
+// returned error (the ExitErrHandler is a silent no-op); cmd/main.go prints it
+// and exits 1.
 func TestFunctionInspectUnknownMessage(t *testing.T) {
 	_ = seedTestState(t)
-	errOut := captureErr(t, func() {
-		_ = runFunctionCommand([]string{"inspect", "no-such-fn"})
-	})
-	if !strings.Contains(errOut, `Error: unknown function "no-such-fn"`) {
-		t.Fatalf("stderr missing unknown-function message: %q", errOut)
+	_, _, err := runCLI(t, "", "function", "inspect", "no-such-fn")
+	if err == nil || !strings.Contains(err.Error(), `unknown function "no-such-fn"`) {
+		t.Fatalf("returned error missing unknown-function message: %v", err)
 	}
 }
 
 // `relay function --help` prints the function help to stdout and exits 0.
 func TestFunctionHelp(t *testing.T) {
-	var code int
-	out := capture(t, func() {
-		code = runFunctionCommand([]string{"--help"})
-	})
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+	out, _, err := runCLI(t, "", "function", "--help")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
 	for _, want := range []string{
-		"relay function COMMAND",
 		"ls",
 		"inspect",
-		"Run 'relay function COMMAND --help' for more information on a command.",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, out)
@@ -276,76 +278,55 @@ func TestFunctionHelp(t *testing.T) {
 	}
 }
 
-// `relay function ls --help` and `relay function inspect --help` print their
-// focused usage to stdout and exit 0.
+// `relay function ls` renders the table via the command path and exits 0.
+func TestFunctionLsCommand(t *testing.T) {
+	_ = seedTestState(t)
+	out, _, err := runCLI(t, "", "function", "ls")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "user-events-python") || !strings.Contains(out, "welcome-email-node") {
+		t.Fatalf("ls missing rows:\n%s", out)
+	}
+}
+
+// `relay function inspect NAME` renders the detail via the command path.
+func TestFunctionInspectCommand(t *testing.T) {
+	_ = seedTestState(t)
+	out, _, err := runCLI(t, "", "function", "inspect", "user-events-python")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "Name:            user-events-python") {
+		t.Fatalf("inspect missing detail:\n%s", out)
+	}
+}
+
+// `relay function inspect name extra` is a usage error (exit 2).
+func TestFunctionInspectTooManyArgs(t *testing.T) {
+	_ = seedTestState(t)
+	_, _, err := runCLI(t, "", "function", "inspect", "user-events-python", "extra")
+	if err == nil || !strings.Contains(err.Error(), "function inspect: too many arguments") {
+		t.Fatalf("returned error missing usage error: %v", err)
+	}
+}
+
+// `relay function ls --help` and `relay function inspect --help` exit 0.
 func TestFunctionCommandHelp(t *testing.T) {
 	cases := []struct {
 		args []string
 		want string
 	}{
-		{[]string{"ls", "--help"}, "relay function ls"},
-		{[]string{"inspect", "--help"}, "relay function inspect NAME"},
+		{[]string{"function", "ls", "--help"}, "function ls"},
+		{[]string{"function", "inspect", "--help"}, "relay function inspect NAME"},
 	}
 	for _, c := range cases {
-		var code int
-		out := capture(t, func() {
-			code = runFunctionCommand(c.args)
-		})
-		if code != 0 {
-			t.Fatalf("%v: exit = %d, want 0", c.args, code)
+		out, _, err := runCLI(t, "", c.args...)
+		if err != nil {
+			t.Fatalf("%v: err = %v, want nil", c.args, err)
 		}
 		if !strings.Contains(out, c.want) {
 			t.Fatalf("%v: stdout missing %q:\n%s", c.args, c.want, out)
 		}
-	}
-}
-
-// Misplaced --help in a function subcommand is a usage error: exit 2 with
-// error+usage on stderr.
-func TestFunctionHelpMisplaced(t *testing.T) {
-	cases := [][]string{
-		{"ls", "--help", "extra"},
-		{"inspect", "--help", "name"},
-		{"--help", "bogus"},
-	}
-	for _, args := range cases {
-		var code int
-		errOut := captureErr(t, func() {
-			code = runFunctionCommand(args)
-		})
-		if code != 2 {
-			t.Fatalf("%v: exit = %d, want 2", args, code)
-		}
-		if !strings.Contains(errOut, "Error:") {
-			t.Fatalf("%v: stderr missing error line: %q", args, errOut)
-		}
-	}
-}
-
-// `relay health --help` prints the health usage to stdout and exits 0.
-func TestHealthHelp(t *testing.T) {
-	var code int
-	out := capture(t, func() {
-		code = Run([]string{"health", "--help"})
-	})
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
-	}
-	if !strings.Contains(out, "relay health") {
-		t.Fatalf("stdout missing health usage:\n%s", out)
-	}
-}
-
-// `relay health` takes no positional args; any arg is a usage error.
-func TestHealthArgError(t *testing.T) {
-	var code int
-	errOut := captureErr(t, func() {
-		code = Run([]string{"health", "extra"})
-	})
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2", code)
-	}
-	if !strings.Contains(errOut, "relay health") {
-		t.Fatalf("stderr missing health usage: %q", errOut)
 	}
 }

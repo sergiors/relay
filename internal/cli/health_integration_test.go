@@ -14,6 +14,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -73,13 +74,14 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 
 	// Point the command at the real test Redis.
 	t.Setenv("REDIS_ADDR", config.Env("REDIS_TEST_ADDR", "localhost:6379"))
-	if code := runHealthCommand(); code != 0 {
-		t.Fatalf("health with reachable redis+docker = %d, want 0", code)
+	var writer bytes.Buffer
+	if err := runHealthCommand(context.Background(), &writer); err != nil {
+		t.Fatalf("health with reachable redis+docker failed: %v", err)
 	}
 
-	// A dead Redis address must fail the redis check (exit 1).
+	// A dead Redis address must fail the redis check.
 	t.Setenv("REDIS_ADDR", "127.0.0.1:1")
-	if code := runHealthCommand(); code != 1 {
-		t.Fatalf("health with unreachable redis = %d, want 1", code)
+	if err := runHealthCommand(context.Background(), &writer); err == nil {
+		t.Fatal("health with unreachable redis should have failed")
 	}
 }

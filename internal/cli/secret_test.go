@@ -29,9 +29,9 @@ func seedSecretStore(t *testing.T) *secrets.LocalStore {
 func TestSecretSetViaStdinPipe(t *testing.T) {
 	store := seedSecretStore(t)
 	var out bytes.Buffer
-	code := secretSetValue(store, "db", strings.NewReader("s3cr3t\n"), &out)
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+	err := secretSetValue(context.Background(), store, "db", strings.NewReader("s3cr3t\n"), &out)
+	if err != nil {
+		t.Fatalf("secretSetValue: %v", err)
 	}
 	if strings.Contains(out.String(), "s3cr3t") {
 		t.Fatalf("output leaked the secret value: %q", out.String())
@@ -60,11 +60,11 @@ func TestSecretSetViaStdinPipe(t *testing.T) {
 func TestSecretSetAtomicUpdate(t *testing.T) {
 	store := seedSecretStore(t)
 	var out bytes.Buffer
-	if code := secretSetValue(store, "tok", strings.NewReader("v1\n"), &out); code != 0 {
-		t.Fatalf("set v1 exit = %d", code)
+	if err := secretSetValue(context.Background(), store, "tok", strings.NewReader("v1\n"), &out); err != nil {
+		t.Fatalf("set v1: %v", err)
 	}
-	if code := secretSetValue(store, "tok", strings.NewReader("v2\n"), &out); code != 0 {
-		t.Fatalf("set v2 exit = %d", code)
+	if err := secretSetValue(context.Background(), store, "tok", strings.NewReader("v2\n"), &out); err != nil {
+		t.Fatalf("set v2: %v", err)
 	}
 	got, _ := store.Resolve(context.Background(), "tok")
 	if got != "v2" {
@@ -79,14 +79,14 @@ func TestSecretSetAtomicUpdate(t *testing.T) {
 	}
 }
 
-// TestSecretRmMissingError verifies removing a missing secret is an error.
+// TestSecretRmMissingError verifies removing a missing secret is a runtime
+// error (exit class 1). The message flows into the returned error (the
+// ExitErrHandler is a silent no-op); cmd/main.go prints it and exits 1.
 func TestSecretRmMissingError(t *testing.T) {
 	_ = seedSecretStore(t)
-	errOut := captureErr(t, func() {
-		_ = runSecretCommand([]string{"rm", "ghost"})
-	})
-	if !strings.Contains(errOut, "Error:") {
-		t.Fatalf("stderr missing error: %q", errOut)
+	_, _, err := runCLI(t, "", "secret", "rm", "ghost")
+	if err == nil || err.Error() == "" {
+		t.Fatalf("returned error missing message: %v", err)
 	}
 }
 
@@ -99,11 +99,10 @@ func TestSecretLsNamesOnly(t *testing.T) {
 			t.Fatalf("set %s: %v", n, err)
 		}
 	}
-	out := capture(t, func() {
-		if code := runSecretCommand([]string{"ls"}); code != 0 {
-			t.Fatalf("ls exit = %d", code)
-		}
-	})
+	out, _, err := runCLI(t, "", "secret", "ls")
+	if err != nil {
+		t.Fatalf("secret ls: err = %v, want nil", err)
+	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if lines[0] != "NAME" {
 		t.Fatalf("header = %q, want NAME", lines[0])
@@ -113,50 +112,68 @@ func TestSecretLsNamesOnly(t *testing.T) {
 	}
 }
 
-// TestSecretCommandExitCodes verifies arg handling: no subcommand, unknown
-// subcommand, and missing name are usage errors (exit 2).
-func TestSecretCommandExitCodes(t *testing.T) {
+// TestSecretSetViaCommandPipe drives the full command path: the value always
+// comes from the injected Reader, never from a positional argument.
+func TestSecretSetViaCommandPipe(t *testing.T) {
 	_ = seedSecretStore(t)
-	if code := runSecretCommand(nil); code != 2 {
-		t.Fatalf("no args: exit = %d, want 2", code)
+	out, _, err := runCLI(t, "v4lue\n", "secret", "set", "db")
+	if err != nil {
+		t.Fatalf("secret set: err = %v, want nil", err)
 	}
-	if code := runSecretCommand([]string{"bogus"}); code != 2 {
-		t.Fatalf("unknown subcommand: exit = %d, want 2", code)
+	if strings.Contains(out, "v4lue") {
+		t.Fatalf("output leaked the secret value: %q", out)
 	}
-	if code := runSecretCommand([]string{"set"}); code != 2 {
-		t.Fatalf("set no name: exit = %d, want 2", code)
+	if !strings.Contains(out, `Successfully set secret "db"`) {
+		t.Fatalf("output missing success message: %q", out)
 	}
-	if code := runSecretCommand([]string{"set", "a", "extra"}); code != 2 {
-		t.Fatalf("set extra arg: exit = %d, want 2", code)
+}
+
+// TestSecretCommandErrors verifies arg handling: no subcommand, unknown
+// subcommand, missing name, and an extra value are all returned as errors —
+// the extra value case is the critical safety regression (a value passed as a
+// positional argument is never accepted).
+func TestSecretCommandErrors(t *testing.T) {
+	_ = seedSecretStore(t)
+	for _, args := range [][]string{
+		{"secret"},
+		{"secret", "bogus"},
+		{"secret", "set"},
+		{"secret", "rm"},
+	} {
+		_, _, err := runCLI(t, "", args...)
+		if err == nil || err.Error() == "" {
+			t.Fatalf("args %v: missing returned error message", args)
+		}
 	}
-	if code := runSecretCommand([]string{"rm"}); code != 2 {
-		t.Fatalf("rm no name: exit = %d, want 2", code)
+
+	// The critical safety regression: a value passed as a positional argument
+	// is never accepted.
+	_, _, err := runCLI(t, "", "secret", "set", "a", "extra")
+	if err == nil || !strings.Contains(err.Error(), "secret set: too many arguments") {
+		t.Fatalf("set a extra: missing rejection error: %v", err)
 	}
 }
 
 // TestSecretHelp verifies the secret help and subcommand help render.
 func TestSecretHelp(t *testing.T) {
-	var code int
-	out := capture(t, func() {
-		code = runSecretCommand([]string{"--help"})
-	})
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+	out, _, err := runCLI(t, "", "secret", "--help")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{"relay secret COMMAND", "ls", "set", "rm"} {
+	for _, want := range []string{"ls", "set", "rm"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout missing %q:\n%s", want, out)
 		}
 	}
 }
 
-// TestSecretSetInvalidName verifies an invalid secret name is rejected early.
+// TestSecretSetInvalidName verifies an invalid secret name is rejected early as
+// a runtime error (exit class 1). The message flows into the returned error;
+// cmd/main.go prints it and exits 1.
 func TestSecretSetInvalidName(t *testing.T) {
 	_ = seedSecretStore(t)
-	errOut := captureErr(t, func() {
-		_ = runSecretCommand([]string{"set", "../etc"})
-	})
-	if !strings.Contains(errOut, "Error:") {
-		t.Fatalf("stderr missing error: %q", errOut)
+	_, _, err := runCLI(t, "", "secret", "set", "../etc")
+	if err == nil || err.Error() == "" {
+		t.Fatalf("returned error missing message: %v", err)
 	}
 }

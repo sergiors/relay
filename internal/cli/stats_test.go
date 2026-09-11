@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,7 +37,9 @@ func seedStatsState(t *testing.T) *state.State {
 // age formatting, and a relative Updated timestamp.
 func TestPrintStats(t *testing.T) {
 	st := seedStatsState(t)
-	out := capture(t, func() { printStats(st) })
+	var w bytes.Buffer
+	printStats(&w, st)
+	out := w.String()
 
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 8 {
@@ -82,7 +85,7 @@ func TestHumanAge(t *testing.T) {
 }
 
 // A fresh state DB has no stats row; printStats renders all zeros, "0s" age,
-// and "never" for Updated, and runStatsCommand exits 0.
+// and "never" for Updated, and the command exits 0.
 func TestPrintStatsEmptyDB(t *testing.T) {
 	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
 	st, err := state.Open(statePath)
@@ -91,7 +94,9 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	out := capture(t, func() { printStats(st) })
+	var w bytes.Buffer
+	printStats(&w, st)
+	out := w.String()
 	for _, want := range []string{
 		"Events processed:    0",
 		"Handler successes:   0",
@@ -107,9 +112,8 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 		}
 	}
 
-	// The command path exits 0 on an empty DB, not an error.
-	if code := Run([]string{"stats"}); code != 0 {
-		t.Fatalf("stats on empty DB: exit = %d, want 0", code)
+	if _, _, err := runCLI(t, "", "stats"); err != nil {
+		t.Fatalf("stats on empty DB: err = %v, want nil", err)
 	}
 }
 
@@ -117,22 +121,19 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 // usage error exiting 2; `relay stats --help` prints usage to stdout and exits 0.
 func TestStatsCommand(t *testing.T) {
 	seedStatsState(t)
-	if code := Run([]string{"stats"}); code != 0 {
-		t.Fatalf("stats: exit = %d, want 0", code)
+	if _, _, err := runCLI(t, "", "stats"); err != nil {
+		t.Fatalf("stats: err = %v, want nil", err)
 	}
 
-	if code := Run([]string{"stats", "extra"}); code != 2 {
-		t.Fatalf("stats extra: exit = %d, want 2", code)
+	if _, _, err := runCLI(t, "", "stats", "extra"); err == nil || !strings.Contains(err.Error(), "stats: too many arguments") {
+		t.Fatalf("stats extra: missing rejection error: %v", err)
 	}
 
-	var code int
-	out := capture(t, func() {
-		code = Run([]string{"stats", "--help"})
-	})
-	if code != 0 {
-		t.Fatalf("stats --help: exit = %d, want 0", code)
+	out, _, err := runCLI(t, "", "stats", "--help")
+	if err != nil {
+		t.Fatalf("stats --help: err = %v, want nil", err)
 	}
-	if !strings.Contains(out, "relay stats") {
-		t.Fatalf("stats --help: stdout missing usage:\n%s", out)
+	if !strings.Contains(out, "stats") {
+		t.Fatalf("stats --help: stdout missing stats usage:\n%s", out)
 	}
 }

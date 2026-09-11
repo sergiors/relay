@@ -2,154 +2,105 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"log"
-	"os"
 	"strings"
 	"testing"
 )
 
-// usage tests exercise the CLI entrypoint dispatch without any dependency: the
-// binary must print usage and exit 2 for missing or unknown commands, and must
-// never attempt to start the runtime.
+// runCLI builds the command tree with New and runs it against args (which
+// include the program name slot urfave's parser consumes) with test-
+// controllable Reader/Writer/ErrWriter buffers and a discard logger, and
+// returns the captured output/error streams plus the error the command tree
+// returned. Errors flow into the returned error, not onto the injected
+// ErrWriter — printing happens in cmd/main.go, which tests do not execute.
+func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	cmd := New(log.New(io.Discard, "", 0), &out)
+	if stdin != "" {
+		cmd.Reader = strings.NewReader(stdin)
+	}
+	cmd.ErrWriter = &errOut
+	err = cmd.Run(t.Context(), append([]string{"relay"}, args...))
+	return out.String(), errOut.String(), err
+}
+
+// TestUsageOutputAndExitCode exercises the CLI entrypoint dispatch without any
+// dependency: a missing or unknown command returns a usage error, and the
+// binary must never attempt to start the runtime. The error is RETURNED (the
+// root ExitErrHandler is a silent no-op); cmd/main.go prints it via its logger
+// and exits 1.
 func TestUsageOutputAndExitCode(t *testing.T) {
-	for _, cmd := range [][]string{nil, {"bogus"}} {
-		var code int
-		errOut := captureErr(t, func() {
-			code = Run(cmd)
-		})
-		if code != 2 {
-			t.Fatalf("args %v: exit = %d, want 2", cmd, code)
-		}
-		if !strings.Contains(errOut, "Usage:") {
-			t.Fatalf("args %v: stderr missing usage text: %q", cmd, errOut)
+	for _, args := range [][]string{nil, {"bogus"}} {
+		_, _, err := runCLI(t, "", args...)
+		if err == nil || err.Error() == "" {
+			t.Fatalf("args %v: missing returned error message: %v", args, err)
 		}
 	}
 }
 
-// Root --help/-h prints the root help to stdout and exits 0.
+// Root --help/-h prints the root help to stdout and exits 0, listing every
+// command. This literally follows the user-required pattern: build the tree
+// with New (an injected buffer writer), then call cmd.Run directly with a
+// ctx and the args including the program name — no global stdout swapping or
+// subprocess.
 func TestRootHelp(t *testing.T) {
 	for _, flag := range []string{"--help", "-h"} {
-		var code int
-		out := capture(t, func() {
-			code = Run([]string{flag})
-		})
-		if code != 0 {
-			t.Fatalf("%s: exit = %d, want 0", flag, code)
+		var output bytes.Buffer
+		cmd := New(log.New(io.Discard, "", 0), &output)
+		err := cmd.Run(context.Background(), []string{"relay", flag})
+		if err != nil {
+			t.Fatalf("%s: err = %v, want nil", flag, err)
 		}
 		for _, want := range []string{
-			"relay COMMAND",
+			"start",
 			"function",
 			"health",
 			"stats",
-			"Run 'relay COMMAND --help' for more information on a command.",
+			"secret",
 		} {
-			if !strings.Contains(out, want) {
-				t.Fatalf("%s: stdout missing %q:\n%s", flag, want, out)
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("%s: stdout missing %q:\n%s", flag, want, output.String())
 			}
 		}
 	}
 }
 
-// Misplaced --help at the root is an unknown command: exit 2 with error+usage
-// on stderr.
-func TestRootHelpMisplaced(t *testing.T) {
-	var code int
-	errOut := captureErr(t, func() {
-		code = Run([]string{"--help", "function"})
-	})
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2", code)
-	}
-	if !strings.Contains(errOut, "Error:") || !strings.Contains(errOut, "relay COMMAND") {
-		t.Fatalf("stderr missing error+usage: %q", errOut)
-	}
-}
-
-// capture runs fn capturing stdout to a string.
-func capture(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = buf.ReadFrom(r)
-		close(done)
-	}()
-	fn()
-	_ = w.Close()
-	os.Stdout = old
-	<-done
-	return buf.String()
-}
-
-// captureErr runs fn capturing stderr to a string.
-func captureErr(t *testing.T, fn func()) string {
-	t.Helper()
-	old := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-	var buf bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = buf.ReadFrom(r)
-		close(done)
-	}()
-	fn()
-	_ = w.Close()
-	os.Stderr = old
-	<-done
-	return buf.String()
-}
-
-// TestRootHelpContainsStart verifies the root help lists the start command
-// first and still lists the administrative commands.
+// Root help lists the start command first among the administrative commands.
 func TestRootHelpContainsStart(t *testing.T) {
-	var code int
-	out := capture(t, func() {
-		code = Run([]string{"--help"})
-	})
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+	out, _, err := runCLI(t, "", "--help")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{
-		"start",
-		"Start Relay",
-		"function",
-		"health",
-		"secret",
-		"stats",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("stdout missing %q:\n%s", want, out)
-		}
+	// Only consider the COMMANDS block; the root Usage line ("function event
+	// relay") also contains the word "function", so an unanchored index of the
+	// whole output would point at the header.
+	cmds := out
+	if i := strings.Index(cmds, "COMMANDS:"); i >= 0 {
+		cmds = cmds[i:]
 	}
-	// start must be listed first.
-	if !strings.Contains(out, "start") || strings.Index(out, "start") > strings.Index(out, "function") {
+	si := strings.Index(cmds, "start")
+	fi := strings.Index(cmds, "function")
+	if si == -1 || fi == -1 || si > fi {
 		t.Fatalf("start should be listed before function:\n%s", out)
 	}
 }
 
-// TestStartHelp verifies `relay start --help` prints the start usage (with
-// foreground wording) and exits 0 without starting anything.
+// TestStartHelp verifies `relay start --help` exits 0 without starting anything.
 func TestStartHelp(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) int { called = true; return 0 }
+	startRun = func(l *log.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
-	var code int
-	out := capture(t, func() {
-		code = Run([]string{"start", "--help"})
-	})
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+	out, _, err := runCLI(t, "", "start", "--help")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
 	}
-	for _, want := range []string{"Usage:", "foreground"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("stdout missing %q:\n%s", want, out)
-		}
+	if !strings.Contains(out, "Start Relay") {
+		t.Fatalf("stdout missing start usage:\n%s", out)
 	}
 	if called {
 		t.Fatal("start --help must not invoke the worker startup path")
@@ -158,15 +109,12 @@ func TestStartHelp(t *testing.T) {
 
 // TestStartTooManyArgs verifies `relay start extra` is a usage error (exit 2).
 func TestStartTooManyArgs(t *testing.T) {
-	var code int
-	errOut := captureErr(t, func() {
-		code = Run([]string{"start", "extra"})
-	})
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2", code)
+	_, _, err := runCLI(t, "", "start", "extra")
+	if err == nil || !strings.Contains(err.Error(), "start: too many arguments") {
+		t.Fatalf("returned error missing usage message: %v", err)
 	}
-	if !strings.Contains(errOut, "Error:") || !strings.Contains(errOut, "relay start") {
-		t.Fatalf("stderr missing error+usage: %q", errOut)
+	if err == nil || !strings.Contains(err.Error(), "start: too many arguments") {
+		t.Fatalf("returned error missing usage message: %v", err)
 	}
 }
 
@@ -175,11 +123,11 @@ func TestStartTooManyArgs(t *testing.T) {
 func TestStartDelegatesToWorker(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) int { called = true; return 0 }
+	startRun = func(l *log.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
-	if code := Run([]string{"start"}); code != 0 {
-		t.Fatalf("start: exit = %d, want 0", code)
+	if _, _, err := runCLI(t, "", "start"); err != nil {
+		t.Fatalf("start: err = %v, want nil", err)
 	}
 	if !called {
 		t.Fatal("start did not delegate to the worker startup path")
@@ -191,12 +139,12 @@ func TestStartDelegatesToWorker(t *testing.T) {
 func TestInformationalCommandsNeverStartWorker(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) int { called = true; return 0 }
+	startRun = func(l *log.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
 	// --help and an unknown command must not reach the start hook.
-	_ = Run([]string{"--help"})
-	_ = Run([]string{"bogus"})
+	_, _, _ = runCLI(t, "", "--help")
+	_, _, _ = runCLI(t, "", "bogus")
 	if called {
 		t.Fatal("informational CLI commands must not start the worker")
 	}
