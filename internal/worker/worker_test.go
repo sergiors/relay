@@ -101,8 +101,20 @@ func TestMetricsServerSurvivesBadAddr(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- m.ServeHTTP(ctx, "crap", logger.Printf) }()
 
-	// Give the retry loop a moment to attempt (and fail) the bind.
-	time.Sleep(50 * time.Millisecond)
+	// ServeHTTP synchronously fails the invalid-address bind and enters its
+	// retry loop. There is no external observable for "the bind failed" (the
+	// logger is io.Discard), so bounded-yield the scheduler until the goroutine
+	// has started before cancelling, then assert the loop returned
+	// context.Canceled rather than hanging — the actual contract under test.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			t.Fatalf("ServeHTTP returned %v before cancel, want it to keep retrying", err)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
 
 	select {

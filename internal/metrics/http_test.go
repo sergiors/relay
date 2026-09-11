@@ -108,16 +108,22 @@ func TestServeShutsDownOnCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Serve(ctx, ln, nil) }()
 
-	// Give the server a moment to start, then scrape it.
-	time.Sleep(50 * time.Millisecond)
-	resp, err := http.Get("http://" + ln.Addr().String() + "/metrics")
-	if err != nil {
-		t.Fatalf("scrape: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !strings.Contains(string(body), "pending_entries 1") {
-		t.Fatalf("scrape body missing metric:\n%s", body)
+	// The server starts asynchronously; scrape-retry instead of a fixed sleep.
+	for {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/metrics")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if !strings.Contains(string(body), "pending_entries 1") {
+				t.Fatalf("scrape body missing metric:\n%s", body)
+			}
+			break
+		}
+		select {
+		case <-done:
+			t.Fatalf("Serve returned before becoming scrapeable: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
 	cancel()
@@ -147,15 +153,22 @@ func TestServeHTTPAddrConvenience(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.ServeHTTP(ctx, addr, nil) }()
 
-	time.Sleep(50 * time.Millisecond)
-	resp, err := http.Get("http://" + addr + "/metrics")
-	if err != nil {
-		t.Fatalf("scrape: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !strings.Contains(string(body), "pending_entries 1") {
-		t.Fatalf("scrape body missing metric:\n%s", body)
+	// The server starts asynchronously; scrape-retry instead of a fixed sleep.
+	for {
+		resp, err := http.Get("http://" + addr + "/metrics")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if !strings.Contains(string(body), "pending_entries 1") {
+				t.Fatalf("scrape body missing metric:\n%s", body)
+			}
+			break
+		}
+		select {
+		case <-done:
+			t.Fatalf("ServeHTTP returned before becoming scrapeable: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
 	cancel()

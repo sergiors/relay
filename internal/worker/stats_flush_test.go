@@ -9,6 +9,22 @@ import (
 	"relay/internal/metrics"
 )
 
+// waitForStatsRow polls cond until it holds or a generous deadline passes. It
+// is the bounded-poll replacement for fixed sleeps that awaited the async SQLite
+// statsLoop flush, so the first flush and the >1-tick tracking are observed
+// deterministically instead of timing out on slow CI.
+func waitForStatsRow(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 // TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly pins the hot-path contract:
 // updates go to the Prometheus registry only and the registry reflects them
 // immediately, while NO write reaches SQLite until recordSnapshots runs once.
@@ -100,9 +116,12 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 		statsLoop(ctx, m, st, 20*time.Millisecond)
 	}()
 
-	// Wait well past several ticks so repeated flushes have occurred while the
-	// loop is still running.
-	time.Sleep(150 * time.Millisecond)
+	// Wait (bounded) for the first flush to persist a stats row while the loop
+	// is still running, instead of a fixed sleep.
+	waitForStatsRow(t, "statsLoop to persist first snapshot", func() bool {
+		_, ok := st.Stats()
+		return ok
+	})
 
 	snap := snapshotStats(m)
 	gs, ok := st.Stats()
@@ -118,7 +137,10 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 	// running; the persisted absolute total must track the new value (repeated
 	// flushes track absolutes, not deltas).
 	m.Inc("events_processed_total")
-	time.Sleep(60 * time.Millisecond)
+	waitForStatsRow(t, "statsLoop to flush the incremented value", func() bool {
+		gs, ok := st.Stats()
+		return ok && gs.EventsProcessedTotal == 11
+	})
 	gs, ok = st.Stats()
 	if !ok {
 		t.Fatal("expected stats row after second window")

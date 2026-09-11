@@ -1,5 +1,16 @@
 //go:build integration
 
+// This file exercises the reconciler's hot-reload flow end to end against a
+// real Docker daemon: discover -> change & rebuild -> broken template retained
+// -> fix -> remove.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES a reachable Docker
+// daemon; a missing dependency fails the affected tests rather than skipping
+// them. Start the documented dev dependencies with
+// `docker compose -f compose.dev.yaml up -d`. The daemon is located via
+// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
+// respected.
 package reconciler
 
 import (
@@ -8,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +33,25 @@ import (
 // dockerManagerAdapter wraps a runtime.Manager to satisfy the reconciler's
 // Builder interface (the Manager already has both methods).
 type dockerManagerAdapter struct{ m *runtime.Manager }
+
+// requireDocker fails the test immediately when the Docker Engine API daemon
+// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
+// all respected). Integration tests fundamentally require Docker; missing
+// infrastructure fails rather than skips.
+func requireDocker(t *testing.T) *client.Client {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
 
 func (a dockerManagerAdapter) Prepare(
 	ctx context.Context,
@@ -78,9 +109,7 @@ func runHandlerWith(
 // Docker daemon: discover -> change & rebuild -> broken template retained ->
 // fix -> remove. It mirrors the compose verification from the task.
 func TestReconcilerReloadIntegration(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -94,6 +123,36 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m.Close()
+
+	// Track the relay-fn-example:* images this test builds (v1/v2/v3 via
+	// fingerprint-tagged refs) so t.Cleanup removes them; the reconciler's
+	// rebuilds leave superseded versions behind. Removal is scoped strictly to
+	// the function name this test creates ("example"), never unrelated images.
+	cleanupCli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker client for cleanup: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		defer cleanupCli.Close()
+		imgs, err := cleanupCli.ImageList(cleanupCtx, client.ImageListOptions{All: true})
+		if err != nil {
+			t.Logf("cleanup: image list: %v", err)
+			return
+		}
+		for _, img := range imgs.Items {
+			for _, tag := range img.RepoTags {
+				if strings.HasPrefix(tag, "relay-fn-example:") {
+					if _, err := cleanupCli.ImageRemove(cleanupCtx, tag, client.ImageRemoveOptions{Force: true}); err != nil {
+						t.Logf("cleanup: remove %s: %v", tag, err)
+					}
+					break
+				}
+			}
+		}
+	})
+
 	adapter := dockerManagerAdapter{m}
 
 	// a) Discover a brand-new function via reconcile.
@@ -167,26 +226,6 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	if reg.GetByName("example") != nil {
 		t.Fatal("example should be removed from the registry when its dir vanishes")
 	}
-}
-
-// dockerAvailable mirrors the runtime package's guard and skips when the daemon
-// is unreachable.
-func dockerAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
-		return false
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Logf("docker client: %v", err)
-		return false
-	}
-	defer cli.Close()
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
-		t.Logf("docker unavailable: %v", err)
-		return false
-	}
-	return true
 }
 
 func templateWithInsert() string {

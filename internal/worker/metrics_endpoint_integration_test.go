@@ -1,5 +1,15 @@
 //go:build integration
 
+// This file exercises the metrics HTTP endpoint against a real Redis: it boots
+// the worker-style metrics wiring (a metrics server on a free port fed from a
+// real Redis) and scrapes /metrics to assert the Prometheus text exposition
+// works end to end.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
+// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
+// the affected tests rather than skipping them. Start the documented dev
+// dependencies with `docker compose -f compose.dev.yaml up -d`.
 package worker
 
 import (
@@ -14,8 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"relay/internal/metrics"
 )
 
@@ -24,13 +32,7 @@ import (
 // real Redis, then scrapes /metrics and asserts the Prometheus exposition works
 // end-to-end.
 func TestIntegrationMetricsEndpoint(t *testing.T) {
-	probe := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	defer probe.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := probe.Ping(ctx).Err(); err != nil {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 
 	// Free port for the metrics server.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -48,18 +50,29 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 	m.SetGauge("pending_entries", 3)
 
 	sctx, scancel := context.WithCancel(context.Background())
+	t.Cleanup(scancel)
 	done := make(chan error, 1)
 	go func() { done <- m.ServeHTTP(sctx, fmt.Sprintf("127.0.0.1:%d", port), log.New(os.Stderr, "", 0).Printf) }()
-	time.Sleep(300 * time.Millisecond)
 
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
-	if err != nil {
-		t.Fatalf("scrape /metrics: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d", resp.StatusCode)
+	// Bounded scrape-retry: the server starts asynchronously, so poll until it
+	// responds rather than sleeping a fixed amount.
+	var body string
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+		if err == nil && resp.StatusCode == 200 {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body = string(b)
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metrics server never became scrapeable: %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	for _, want := range []string{
 		"events_processed_total 1",
@@ -68,7 +81,7 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		"pending_entries 3",
 		"# TYPE",
 	} {
-		if !strings.Contains(string(body), want) {
+		if !strings.Contains(body, want) {
 			t.Fatalf("/metrics missing %q:\n%s", want, body)
 		}
 	}

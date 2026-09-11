@@ -1,5 +1,17 @@
 //go:build integration
 
+// This file exercises the worker's graceful-shutdown path against real
+// external services: real Docker execution (an in-flight handler container)
+// and real Redis (PEL state, invocation keys, SQLite flush).
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES both a reachable
+// Docker daemon AND Redis at REDIS_TEST_ADDR (default localhost:6379, matching
+// compose.dev.yaml); a missing dependency fails the affected tests rather than
+// skipping them. Start the documented dev dependencies with
+// `docker compose -f compose.dev.yaml up -d`. The Docker daemon is located via
+// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
+// respected.
 package worker
 
 import (
@@ -19,6 +31,7 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/config"
 	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/reconciler"
@@ -27,54 +40,6 @@ import (
 	"relay/internal/state"
 	"relay/internal/stream"
 )
-
-// redisAddr is the Redis address used by integration tests, overridable via
-// REDIS_TEST_ADDR. The default matches the compose.dev.yaml redis and any
-// disposable `docker run` redis exposed on the host.
-func redisAddr() string {
-	if v := os.Getenv("REDIS_TEST_ADDR"); v != "" {
-		return v
-	}
-	return "localhost:6379"
-}
-
-// redisAvailable reports whether a real Redis is reachable, so the integration
-// suite skips cleanly when none is present.
-func redisAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_REDIS") != "" {
-		return false
-	}
-	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
-	defer cli.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := cli.Ping(ctx).Err(); err != nil {
-		t.Logf("redis unavailable: %v", err)
-		return false
-	}
-	return true
-}
-
-// dockerAvailable reports whether the Docker daemon is reachable via the Engine
-// API, so docker-backed tests skip cleanly when it is not.
-func dockerAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
-		return false
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Logf("docker client: %v", err)
-		return false
-	}
-	defer cli.Close()
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
-		t.Logf("docker unavailable: %v", err)
-		return false
-	}
-	return true
-}
 
 // syncBuffer is a bytes.Buffer safe for concurrent writes and reads. The worker
 // wiring logs from several goroutines (LogLoop, ServeHTTP, statsLoop, the
@@ -95,6 +60,67 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
+// localhost:6379) is not reachable, instead of skipping: the graceful-shutdown
+// wiring is meaningless without real Redis state.
+func requireRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	opts, _ := config.RedisOptions(addr)
+	cli := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.Ping(ctx).Err(); err != nil {
+		_ = cli.Close()
+		t.Fatalf(
+			"redis integration test requires a reachable Redis at %s (ping: %v); start one with `docker compose -f compose.dev.yaml up -d`",
+			addr,
+			err,
+		)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// requireDocker fails the test immediately when the Docker Engine API daemon
+// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
+// all respected). The graceful-shutdown path runs a real in-flight handler
+// container; missing infrastructure fails rather than skips.
+func requireDocker(t *testing.T) *client.Client {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// WaitFor polls pred until it returns true or the deadline passes. It is a
+// bounded poll: a generous budget avoids spurious CI flakes while the loop
+// never spins forever. On timeout it fails the test with what as context.
+func WaitFor(t *testing.T, timeout time.Duration, what string, pred func() bool) {
+	t.Helper()
+	deadline := time.After(timeout)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if pred() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-tick.C:
+		}
+	}
 }
 
 // workerConfig carries the test-controlled constants that replace the package
@@ -258,26 +284,6 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	}
 }
 
-// waitFor polls pred until it returns true or the deadline passes. A single
-// ticker is reused across iterations instead of a fresh time.After per loop, so
-// a slow predicate cannot accumulate timers.
-func waitFor(t *testing.T, timeout time.Duration, what string, pred func() bool) {
-	t.Helper()
-	deadline := time.After(timeout)
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if pred() {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", what)
-		case <-tick.C:
-		}
-	}
-}
-
 // xadd appends an event to the stream and returns the message ID.
 func xadd(t *testing.T, cli *redis.Client, stream, event string) string {
 	t.Helper()
@@ -387,14 +393,10 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 // the final SQLite flush runs within its bound, and the message is recoverable
 // through the normal reclaim path by a second consumer.
 func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireRedis(t)
+	dcli := requireDocker(t)
 
-	redisAddr := redisAddr()
+	redisAddr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
 	prefix := fmt.Sprintf("shutdown-itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
@@ -442,12 +444,6 @@ export async function slow(event) {
 		metricsAddr: metricsAddr,
 	})
 
-	dcli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("docker client: %v", err)
-	}
-	defer dcli.Close()
-
 	// XADD an event matching the rule.
 	msgID := xadd(t, env.client, streamName, `{"event_id":"evt_shutdown","event_name":"INSERT"}`)
 
@@ -461,7 +457,7 @@ export async function slow(event) {
 	t.Logf("in-flight container %s observed", containerID)
 
 	// The message is in the PEL (delivered to consumer A) with retry count 1.
-	waitFor(t, 8*time.Second, "message in PEL", func() bool {
+	WaitFor(t, 8*time.Second, "message in PEL", func() bool {
 		_, ok := pendingEntry(env.client, streamName, groupName, msgID)
 		return ok
 	})
@@ -590,7 +586,7 @@ export async function slow(event) {
 	}()
 
 	// Wait for the message to be reclaimed and acked (gone from the PEL).
-	waitFor(t, 8*time.Second, "message reclaimed and acked by consumer B", func() bool {
+	WaitFor(t, 8*time.Second, "message reclaimed and acked by consumer B", func() bool {
 		_, ok := pendingEntry(env.client, streamName, groupName, msgID)
 		return !ok
 	})

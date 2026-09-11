@@ -10,6 +10,21 @@ import (
 	"relay/internal/runner"
 )
 
+// assertNoSpurious holds the observed prepare count at want across a bounded
+// window (want*holdSeconds seconds, well past the 10ms test debounce) so an
+// absence-assertion — "no spurious second reconcile" — is made deterministically
+// rather than by a fixed soak sleep. It fails if the count ever exceeds want.
+func assertNoSpurious(t *testing.T, b *fakeBuilder, want, holdSeconds int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Duration(holdSeconds) * time.Second)
+	for time.Now().Before(deadline) {
+		if got := b.prepares(); got > want {
+			t.Fatalf("prepare count exceeded %d (spurious reconcile) while asserting absence, got %d", want, got)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 // Many quick Enqueue calls for the same function should fire exactly one
 // reconcile (the pump consumes the debounced name once). Distinct functions
 // queue independently.
@@ -36,8 +51,10 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	for b.prepares() < 1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	// Allow a little extra time to catch a spurious second reconcile.
-	time.Sleep(150 * time.Millisecond)
+	// Assert no spurious second reconcile: hold the count at 1 across a bounded
+	// window well past the debounce (10ms) instead of a fixed 150ms soak. If a
+	// second reconcile were to fire, it would do so within this window.
+	assertNoSpurious(t, b, 1, 2)
 
 	if got := b.prepares(); got != 1 {
 		t.Fatalf("expected exactly 1 reconcile from a burst, got %d prepares", got)
@@ -62,7 +79,9 @@ func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
 	for b.prepares() < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	time.Sleep(150 * time.Millisecond)
+	// Assert no spurious third reconcile: hold the count at 2 across a bounded
+	// window well past the debounce instead of a fixed 150ms soak.
+	assertNoSpurious(t, b, 2, 2)
 	// a: coalesced (2 events -> 1); b: 1. Total exactly 2.
 	if got := b.prepares(); got != 2 {
 		t.Fatalf("expected exactly 2 reconciles (a coalesced, b once), got %d", got)

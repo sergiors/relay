@@ -13,14 +13,15 @@ import (
 
 // TestIntegrationRetentionTrimsOldEntries verifies the retention trim against a
 // real Redis: entries older than the retention window are removed by
-// retentionTick, while a recent entry remains. It uses the same redisAddr()
-// helper and build tag as the other integration tests, so `go test ./...`
-// skips it by default.
+// retentionTick, while a recent entry remains.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
+// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
+// the affected tests rather than skipping them. Start the documented dev
+// dependencies with `docker compose -f compose.dev.yaml up -d`.
 func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
-	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
+	cli := requireRedis(t)
 	t.Cleanup(func() { _ = cli.Close() })
 
 	stream := fmt.Sprintf("relay:retention-test:%d", time.Now().UnixNano())

@@ -1,76 +1,78 @@
 //go:build integration
 
+// This file exercises the `relay health` command's real path against reachable
+// Redis and Docker.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES both a reachable
+// Docker daemon AND Redis at REDIS_TEST_ADDR (default localhost:6379, matching
+// compose.dev.yaml); a missing dependency fails the affected tests rather than
+// skipping them. Start the documented dev dependencies with
+// `docker compose -f compose.dev.yaml up -d`. The Docker daemon is located via
+// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
+// respected.
 package cli
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/config"
 )
 
-// healthRedisAddr is the Redis address used by the health integration test,
-// overridable via REDIS_TEST_ADDR (mirrors internal/stream).
-func healthRedisAddr() string {
-	if v := os.Getenv("REDIS_TEST_ADDR"); v != "" {
-		return v
-	}
-	return "localhost:6379"
-}
-
-// healthDockerAvailable reports whether the Docker daemon is reachable via the
-// Engine API (mirrors internal/stream).
-func healthDockerAvailable(t *testing.T) bool {
+// requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
+// localhost:6379) is not reachable, instead of skipping: the health command is
+// meaningless without it.
+func requireRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
-		return false
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Logf("docker client: %v", err)
-		return false
-	}
-	defer cli.Close()
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
-		t.Logf("docker unavailable: %v", err)
-		return false
-	}
-	return true
-}
-
-// healthRedisAvailable reports whether a real Redis is reachable (mirrors
-// internal/stream).
-func healthRedisAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_REDIS") != "" {
-		return false
-	}
-	cli := redis.NewClient(&redis.Options{Addr: healthRedisAddr()})
-	defer cli.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	opts, _ := config.RedisOptions(addr)
+	cli := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := cli.Ping(ctx).Err(); err != nil {
-		t.Logf("redis unavailable: %v", err)
-		return false
+		_ = cli.Close()
+		t.Fatalf(
+			"redis integration test requires a reachable Redis at %s (ping: %v); start one with `docker compose -f compose.dev.yaml up -d`",
+			addr,
+			err,
+		)
 	}
-	return true
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// requireDocker fails the test immediately when the Docker Engine API daemon
+// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
+// all respected). The health command checks Docker reachability; missing
+// infrastructure fails rather than skips.
+func requireDocker(t *testing.T) *client.Client {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
 }
 
 // TestIntegrationHealthRealPath verifies the real `relay health` path exits 0
 // when both Redis and Docker are reachable, and exits 1 when Redis is not.
 func TestIntegrationHealthRealPath(t *testing.T) {
-	if !healthRedisAvailable(t) {
-		t.Skip("redis not available")
-	}
-	if !healthDockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireRedis(t)
+	requireDocker(t)
 
 	// Point the command at the real test Redis.
-	t.Setenv("REDIS_ADDR", healthRedisAddr())
+	t.Setenv("REDIS_ADDR", config.Env("REDIS_TEST_ADDR", "localhost:6379"))
 	if code := runHealthCommand(); code != 0 {
 		t.Fatalf("health with reachable redis+docker = %d, want 0", code)
 	}

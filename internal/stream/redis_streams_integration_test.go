@@ -1,9 +1,23 @@
 //go:build integration
 
+// This file exercises the Redis Streams boundary end to end against a real
+// Redis server: consumer groups, the PEL, XAUTOCLAIM recovery, invocation
+// state, retention, and reconnect resilience.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
+// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
+// the affected tests rather than skipping them. Start the documented dev
+// dependencies with `docker compose -f compose.dev.yaml up -d`.
+//
+// One test, TestIntegrationReconnectAndResume, additionally boots its own
+// disposable Redis in a Docker container so it can simulate an outage; it
+// REQUIRES Docker (via a local requireDocker) because only that lets it start
+// its own Redis. It is kept here because it is a Redis-boundary test — the
+// container is merely how it starts its own Redis.
 package stream
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -11,6 +25,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,38 +35,89 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/config"
 	"relay/internal/metrics"
 )
 
-// redisAddr is the Redis address used by integration tests, overridable via
-// REDIS_TEST_ADDR. The default matches the compose.dev.yaml redis and any
-// disposable `docker run` redis exposed on the host.
-func redisAddr() string {
-	if v := os.Getenv("REDIS_TEST_ADDR"); v != "" {
-		return v
+// requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
+// localhost:6379) is not reachable, instead of skipping: the Redis-Streams
+// integration suite is meaningless without it.
+func requireRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	opts, _ := config.RedisOptions(addr)
+	cli := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cli.Ping(ctx).Err(); err != nil {
+		_ = cli.Close()
+		t.Fatalf(
+			"redis integration test requires a reachable Redis at %s (ping: %v); start one with `docker compose -f compose.dev.yaml up -d`",
+			addr,
+			err,
+		)
 	}
-	return "localhost:6379"
+	t.Cleanup(func() { cli.Close() })
+	return cli
 }
 
-// dockerAvailable reports whether the Docker daemon is reachable via the Engine
-// API, so docker-backed tests skip cleanly when it is not (mirrors the helper
-// in internal/runtime).
-func dockerAvailable(t *testing.T) bool {
+// requireDocker fails the test immediately when the Docker Engine API daemon
+// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
+// all respected). Only TestIntegrationReconnectAndResume needs it: it boots its
+// own disposable Redis in a Docker container. Missing infrastructure fails
+// rather than skips.
+func requireDocker(t *testing.T) *client.Client {
 	t.Helper()
-	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
-		return false
-	}
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
-		t.Logf("docker client: %v", err)
-		return false
+		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
 	}
-	defer cli.Close()
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
-		t.Logf("docker unavailable: %v", err)
-		return false
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
 	}
-	return true
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// WaitFor polls pred until it returns true or the deadline passes. It is a
+// bounded poll: a generous budget avoids spurious CI flakes while the loop
+// never spins forever. On timeout it fails the test with what as context.
+func WaitFor(t *testing.T, timeout time.Duration, what string, pred func() bool) {
+	t.Helper()
+	deadline := time.After(timeout)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if pred() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-tick.C:
+		}
+	}
+}
+
+// syncBuffer is a mutex-protected strings.Builder for log output written by
+// consumer goroutines while the test goroutine asserts on it concurrently.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // freePort returns an available TCP port on the loopback interface.
@@ -63,25 +129,6 @@ func freePort(t *testing.T) int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
-}
-
-// redisAvailable reports whether a real Redis is reachable, so the integration
-// suite skips cleanly when none is present (mirrors dockerAvailable in
-// internal/runtime).
-func redisAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_REDIS") != "" {
-		return false
-	}
-	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
-	defer cli.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := cli.Ping(ctx).Err(); err != nil {
-		t.Logf("redis unavailable: %v", err)
-		return false
-	}
-	return true
 }
 
 // Provisions a Consumer with a unique stream/group/consumer so tests are
@@ -100,7 +147,10 @@ type testEnv struct {
 
 func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	t.Helper()
-	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
+
+	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	redisOpts, _ := config.RedisOptions(addr)
+	cli := redis.NewClient(redisOpts)
 	ctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("itest-%d", time.Now().UnixNano())
 	if cfg.Stream == "" {
@@ -132,7 +182,16 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	}
 	t.Cleanup(func() {
 		cancel()
-		_ = cli.Del(ctx, c.stream, c.dlqStream).Err()
+		// Use a fresh context: cancel() above invalidates ctx, but Redis calls
+		// still need a live context to run the cleanup DELs and scans.
+		cleanupCtx := context.Background()
+		_ = cli.Del(cleanupCtx, c.stream, c.dlqStream).Err()
+		// Also clear any invocation-state keys this env's stream/group created,
+		// otherwise a message claimed on a failure path can leak a
+		// `relay:invocation:<stream>:<group>:*` hash in Redis. The scan pattern
+		// is bounded to the unique stream/group names this test owns — never a
+		// global FLUSHDB/FLUSHALL.
+		cleanupInvocationKeys(cleanupCtx, cli, prefix)
 		_ = cli.Close()
 	})
 	return &testEnv{
@@ -215,20 +274,51 @@ func (e *testEnv) dlq() map[string]redis.XMessage {
 	return out
 }
 
-// waitFor polls pred until it returns true or the deadline passes.
-func waitFor(t *testing.T, what string, pred func() bool) {
-	t.Helper()
-	deadline := time.After(8 * time.Second)
+// cleanupInvocationKeys scans for and deletes any `relay:invocation:*` hash
+// keys that belong to this test's ownership prefix (a unixnano-unique
+// stream/group prefix). The scan MATCH pattern is bounded to keys whose
+// percent-encoded prefix matches the unique names this env created, so it never
+// touches other tests' or the dev relay's state — never a global FLUSHDB.
+func cleanupInvocationKeys(ctx context.Context, cli *redis.Client, prefix string) {
+	match := "relay:invocation:*" + encodeComponent(prefix) + "*"
+	var cursor uint64
 	for {
-		if pred() {
-			return
+		keys, next, err := cli.Scan(ctx, cursor, match, 0).Result()
+		if err != nil {
+			break
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", what)
-		case <-time.After(50 * time.Millisecond):
+		if len(keys) > 0 {
+			_ = cli.Del(ctx, keys...).Err()
 		}
+		if next == 0 {
+			break
+		}
+		cursor = next
 	}
+}
+
+// waitSustained polls pred until it has held continuously for the given
+// duration. It is the deterministic replacement for a fixed "grace period"
+// sleep when we must assert that some state persists for a minimum window
+// (e.g. a message stays pending / a protected invocation is not re-run). It
+// fails the test if the state does not hold.
+func waitSustained(t *testing.T, what string, dur time.Duration, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	holdStart := time.Time{}
+	for time.Now().Before(deadline) {
+		if pred() {
+			if holdStart.IsZero() {
+				holdStart = time.Now()
+			} else if time.Since(holdStart) >= dur {
+				return
+			}
+		} else {
+			holdStart = time.Time{}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s to hold for %v", what, dur)
 }
 
 // waitDelivered waits until the message is present in the PEL (was read by a
@@ -236,7 +326,7 @@ func waitFor(t *testing.T, what string, pred func() bool) {
 // as "acked".
 func (e *testEnv) waitDelivered(t *testing.T, id string) {
 	t.Helper()
-	waitFor(t, "message "+id+" delivered into PEL", func() bool {
+	WaitFor(t, 8*time.Second, "message "+id+" delivered into PEL", func() bool {
 		_, ok := e.pending()[id]
 		return ok
 	})
@@ -245,16 +335,14 @@ func (e *testEnv) waitDelivered(t *testing.T, id string) {
 // waitGone waits until the message is absent from the PEL.
 func (e *testEnv) waitGone(t *testing.T, id string) {
 	t.Helper()
-	waitFor(t, "message "+id+" gone from PEL", func() bool {
+	WaitFor(t, 8*time.Second, "message "+id+" gone from PEL", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
 }
 
 func TestIntegrationNormalSuccessAck(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	acked := make(chan struct{})
@@ -265,7 +353,7 @@ func TestIntegrationNormalSuccessAck(t *testing.T) {
 		return nil
 	})
 	<-acked
-	waitFor(t, "message acked (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -273,9 +361,7 @@ func TestIntegrationNormalSuccessAck(t *testing.T) {
 }
 
 func TestIntegrationHandlerFailureStaysPending(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	delivered := make(chan struct{}, 1)
@@ -289,17 +375,18 @@ func TestIntegrationHandlerFailureStaysPending(t *testing.T) {
 		return fmt.Errorf("nope")
 	})
 	<-delivered
-	time.Sleep(500 * time.Millisecond)
-	if _, ok := e.pending()[id]; !ok {
-		t.Fatalf("message %s should still be pending after handler failure", id)
-	}
+	// After a handler failure the message must stay pending: poll that it
+	// remains in the PEL across the reclaim grace window, rather than a fixed
+	// sleep.
+	waitSustained(t, "message pending after handler failure", 500*time.Millisecond, func() bool {
+		_, ok := e.pending()[id]
+		return ok
+	})
 	e.stop(t)
 }
 
 func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
@@ -316,7 +403,7 @@ func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
 		return fmt.Errorf("fail first delivery")
 	})
 	<-acked
-	waitFor(t, "message acked", func() bool {
+	WaitFor(t, 8*time.Second, "message acked", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -332,9 +419,7 @@ func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
 // invocation, and on the final attempt marks it exhausted and returns
 // ErrInvocationExhausted.
 func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
@@ -358,11 +443,11 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	})
 	// The message is routed to the DLQ (and acked) on the first delivery, so it
 	// may never linger in the PEL; wait for the DLQ entry instead.
-	waitFor(t, "message routed to DLQ", func() bool {
+	WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	waitFor(t, "message acked (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -388,9 +473,7 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 }
 
 func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{not json`)
 	var handlerRan atomic.Bool
@@ -400,11 +483,11 @@ func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
 	})
 	// The malformed message is routed straight to the DLQ (and acked) so it may
 	// never appear in the PEL; wait for the DLQ entry instead.
-	waitFor(t, "malformed message routed to DLQ", func() bool {
+	WaitFor(t, 8*time.Second, "malformed message routed to DLQ", func() bool {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	waitFor(t, "malformed message acked", func() bool {
+	WaitFor(t, 8*time.Second, "malformed message acked", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -422,9 +505,7 @@ func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
 }
 
 func TestIntegrationDLQWriteFailureLeavesPending(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	// Make the DLQ stream name a wrong-type key so XADD fails. The handler
 	// returns ErrInvocationExhausted to force DLQ routing, but the DLQ write
@@ -444,17 +525,17 @@ func TestIntegrationDLQWriteFailureLeavesPending(t *testing.T) {
 		return ErrInvocationExhausted
 	})
 	<-delivered
-	time.Sleep(800 * time.Millisecond)
-	if _, ok := e.pending()[id]; !ok {
-		t.Fatalf("message %s must stay pending when DLQ write fails", id)
-	}
+	// The DLQ write failed, so the message must stay pending: poll it remains in
+	// the PEL across the reclaim grace window rather than a fixed sleep.
+	waitSustained(t, "message stays pending when DLQ write fails", 800*time.Millisecond, func() bool {
+		_, ok := e.pending()[id]
+		return ok
+	})
 	e.stop(t)
 }
 
 func TestIntegrationNoMatchAcked(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"x":1}`)
 	acked := make(chan struct{})
@@ -465,7 +546,7 @@ func TestIntegrationNoMatchAcked(t *testing.T) {
 		return nil // no-match success acks
 	})
 	<-acked
-	waitFor(t, "message acked", func() bool {
+	WaitFor(t, 8*time.Second, "message acked", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -473,9 +554,7 @@ func TestIntegrationNoMatchAcked(t *testing.T) {
 }
 
 func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -496,14 +575,14 @@ func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 		return nil
 	})
 	e.waitDelivered(t, id)
-	waitFor(t, "invocation state retained after failed delivery", func() bool {
+	WaitFor(t, 8*time.Second, "invocation state retained after failed delivery", func() bool {
 		v, err := e.client.HGet(context.Background(), key, "fn/h").Result()
 		return err == nil && v == "ok"
 	})
 
 	// The recovery loop reclaims the idle message; the handler sees the invocation
 	// already done and returns nil, so the message is acked and state cleared.
-	waitFor(t, "message acked and invocation state cleared", func() bool {
+	WaitFor(t, 8*time.Second, "message acked and invocation state cleared", func() bool {
 		_, ok := e.pending()[id]
 		if ok {
 			return false
@@ -515,9 +594,7 @@ func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 }
 
 func TestIntegrationStateClearedOnDLQ(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -533,11 +610,11 @@ func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 		return ErrInvocationExhausted
 	})
 	e.waitGone(t, id)
-	waitFor(t, "message in DLQ", func() bool {
+	WaitFor(t, 8*time.Second, "message in DLQ", func() bool {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	waitFor(t, "invocation state cleared after DLQ", func() bool {
+	WaitFor(t, 8*time.Second, "invocation state cleared after DLQ", func() bool {
 		n, err := e.client.Exists(context.Background(), key).Result()
 		return err == nil && n == 0
 	})
@@ -550,9 +627,7 @@ func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 // succeeding handler. The invocation-state key must be cleared only after the
 // ACK, and the message must be gone from the PEL.
 func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
@@ -599,9 +674,7 @@ func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
 // invocation-state key is retained; once the DLQ write succeeds, the message is
 // acked and the invocation-state key is cleared.
 func TestIntegrationRouteToDLQKeepsStateOnDLQWriteFailure(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
@@ -653,18 +726,14 @@ func TestIntegrationRouteToDLQKeepsStateOnDLQWriteFailure(t *testing.T) {
 }
 
 func TestIntegrationRecoveryLoopStopsOnCancel(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 	e.stop(t) // stop asserts the goroutine (including recovery loop) exits, run with -race
 }
 
 func TestIntegrationRestartResilience(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	const event = `{"restart":1}`
 
 	// Both consumers share one stream+group; only the consumer name differs, so
@@ -688,7 +757,7 @@ func TestIntegrationRestartResilience(t *testing.T) {
 		return fmt.Errorf("crashed before ack")
 	})
 	<-deliveredA
-	waitFor(t, "message pending under consumer A", func() bool {
+	WaitFor(t, 8*time.Second, "message pending under consumer A", func() bool {
 		_, ok := envA.pending()[id]
 		return ok
 	})
@@ -711,7 +780,7 @@ func TestIntegrationRestartResilience(t *testing.T) {
 		return nil
 	})
 	<-acked
-	waitFor(t, "message reclaimed and acked by consumer B", func() bool {
+	WaitFor(t, 8*time.Second, "message reclaimed and acked by consumer B", func() bool {
 		_, ok := envB.pending()[id]
 		return !ok
 	})
@@ -727,13 +796,13 @@ func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
 	cli := redis.NewClient(&redis.Options{Addr: addr})
 	defer cli.Close()
 
-	var buf strings.Builder
+	buf := &syncBuffer{}
 	c := NewConsumer(ConsumerConfig{
 		Client:        cli,
 		Stream:        "outage-stream",
 		Group:         "outage-group",
 		Consumer:      "outage-consumer",
-		Log:           log.New(&buf, "", 0),
+		Log:           log.New(buf, "", 0),
 		backoffTable:  []time.Duration{50 * time.Millisecond},
 		backoffJitter: func(f float64) float64 { return f },
 	})
@@ -776,14 +845,7 @@ func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
 // Redis again, XADD an event, and assert the handler runs and exactly one
 // recovery line is logged.
 func TestIntegrationReconnectAndResume(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("docker client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 
 	// Start a disposable redis on a free host port.
 	port := freePort(t)
@@ -812,7 +874,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	}
 
 	// Wait for redis to accept connections.
-	waitFor(t, "redis container accepting connections", func() bool {
+	WaitFor(t, 8*time.Second, "redis container accepting connections", func() bool {
 		probe := redis.NewClient(&redis.Options{Addr: addr})
 		defer probe.Close()
 		pctx, c := context.WithTimeout(context.Background(), time.Second)
@@ -822,7 +884,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 
 	prefix := fmt.Sprintf("outage-%d", time.Now().UnixNano())
 	stream, group := prefix+"-stream", prefix+"-group"
-	var buf strings.Builder
+	var buf syncBuffer
 	rc := redis.NewClient(&redis.Options{Addr: addr})
 	defer rc.Close()
 	consumer := NewConsumer(ConsumerConfig{
@@ -866,7 +928,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	if _, err := cli.ContainerStop(ctx, containerID, client.ContainerStopOptions{}); err != nil {
 		t.Fatalf("stop redis: %v", err)
 	}
-	waitFor(t, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
+	WaitFor(t, 8*time.Second, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
 	if !strings.Contains(buf.String(), "redis read failed") {
 		t.Fatalf("expected backoff log during outage, got: %q", buf.String())
 	}
@@ -875,14 +937,14 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	if _, err := cli.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
 		t.Fatalf("restart redis: %v", err)
 	}
-	waitFor(t, "redis accepting connections after restart", func() bool {
+	WaitFor(t, 8*time.Second, "redis accepting connections after restart", func() bool {
 		probe := redis.NewClient(&redis.Options{Addr: addr})
 		defer probe.Close()
 		pctx, c := context.WithTimeout(context.Background(), time.Second)
 		defer c()
 		return probe.Ping(pctx).Err() == nil
 	})
-	waitFor(t, "consumer healthy after recovery", func() bool { return consumer.Healthy() })
+	WaitFor(t, 8*time.Second, "consumer healthy after recovery", func() bool { return consumer.Healthy() })
 
 	secondID, err := rc.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: map[string]any{"event": `{"b":2}`}}).Result()
 	if err != nil {
@@ -890,7 +952,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	}
 	// The running Consume picks up the new message; assert it is processed (gone
 	// from the PEL) rather than re-registering a handler.
-	waitFor(t, "second message processed (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "second message processed (gone from PEL)", func() bool {
 		entries, err := rc.XPendingExt(context.Background(), &redis.XPendingExtArgs{
 			Stream: stream, Group: group, Start: "-", End: "+", Count: 100,
 		}).Result()
@@ -922,9 +984,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 // XPENDING depth gauge and the retries_total counter when a message stays
 // pending across redeliveries.
 func TestIntegrationPendingGauge(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	m := metrics.New()
 	e := newEnv(t, ConsumerConfig{
 		Metrics:         m,
@@ -936,7 +996,7 @@ func TestIntegrationPendingGauge(t *testing.T) {
 	})
 
 	// The sampler records pending_entries once the failed message is in the PEL.
-	waitFor(t, "pending_entries gauge set", func() bool {
+	WaitFor(t, 8*time.Second, "pending_entries gauge set", func() bool {
 		return strings.Contains(m.Snapshot(), "pending_entries value=1")
 	})
 
@@ -950,7 +1010,7 @@ func TestIntegrationPendingGauge(t *testing.T) {
 		t.Fatalf("pending_oldest_age_seconds not set; snapshot:\n%s", got)
 	}
 	// A reclaimed/redelivered pending message counts as a retry event.
-	waitFor(t, "retries_total increments", func() bool {
+	WaitFor(t, 8*time.Second, "retries_total increments", func() bool {
 		return strings.Contains(m.Snapshot(), "retries_total count=")
 	})
 	e.stop(t)
@@ -963,9 +1023,7 @@ func TestIntegrationPendingGauge(t *testing.T) {
 // deadline is skipped (the executor is not called). After the deadline expires,
 // a later delivery executes it.
 func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 
@@ -993,19 +1051,19 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 	})
 
 	// The first delivery claims and blocks; the invocation is protected.
-	waitFor(t, "invocation claimed and running", func() bool {
+	WaitFor(t, 8*time.Second, "invocation claimed and running", func() bool {
 		return calls.Load() >= 1
 	})
 	// A redelivery (reclaim) within the deadline must be skipped: TryStart
-	// returns false, so the executor is not called again.
-	time.Sleep(500 * time.Millisecond)
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("executor called %d times while invocation protected; want 1", got)
-	}
+	// returns false, so the executor is not called again. Poll that the call
+	// count stays at 1 across the reclaim grace window rather than a fixed sleep.
+	waitSustained(t, "executor not called again while invocation protected", 500*time.Millisecond, func() bool {
+		return calls.Load() == 1
+	})
 
 	// Release the handler; it acks and the message leaves the PEL.
 	close(release)
-	waitFor(t, "message acked (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -1020,9 +1078,7 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 // stream/group skips the invocation while within the deadline and runs it after
 // the deadline expires.
 func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	prefix := fmt.Sprintf("restart-inv-%d", time.Now().UnixNano())
 	stream, group := prefix+"-stream", prefix+"-group"
 
@@ -1041,7 +1097,7 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 		return fmt.Errorf("leave pending")
 	})
 	<-deliveredA
-	waitFor(t, "message pending under consumer A", func() bool {
+	WaitFor(t, 8*time.Second, "message pending under consumer A", func() bool {
 		_, ok := envA.pending()[id]
 		return ok
 	})
@@ -1077,14 +1133,14 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 		calls.Add(1)
 		return nil
 	})
-	// Give B's reclaim loop time to run while the deadline is still in the
-	// future; the invocation must be skipped.
-	time.Sleep(500 * time.Millisecond)
-	if got := calls.Load(); got != 0 {
-		t.Fatalf("executor called %d times while invocation protected after restart; want 0", got)
-	}
+	// B's reclaim loop must skip the invocation while the deadline is still in
+	// the future: poll that the executor is never called across the grace
+	// window rather than a fixed sleep.
+	waitSustained(t, "executor not called before deadline expiry on restart", 500*time.Millisecond, func() bool {
+		return calls.Load() == 0
+	})
 	// After the deadline expires, B executes it.
-	waitFor(t, "invocation executed after deadline expiry on restart", func() bool {
+	WaitFor(t, 8*time.Second, "invocation executed after deadline expiry on restart", func() bool {
 		return calls.Load() >= 1
 	})
 	envB.stop(t)
@@ -1094,9 +1150,7 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 // invocation marks "ok", the message is acked, and the invocation-state key is
 // cleared.
 func TestIntegrationSuccessThenCleanup(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -1109,11 +1163,11 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 		return nil
 	})
 	<-acked
-	waitFor(t, "message acked (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
-	waitFor(t, "invocation-state key cleared after ack", func() bool {
+	WaitFor(t, 8*time.Second, "invocation-state key cleared after ack", func() bool {
 		n, err := e.client.Exists(context.Background(), key).Result()
 		return err == nil && n == 0
 	})
@@ -1125,9 +1179,7 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 // invocation by its retry backoff, so a redelivery within the backoff is skipped
 // (not eligible) rather than re-run.
 func TestIntegrationFailureSchedulesRetryBackoff(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -1156,16 +1208,16 @@ func TestIntegrationFailureSchedulesRetryBackoff(t *testing.T) {
 	})
 	e.waitDelivered(t, id)
 	// The failure must have recorded a next_attempt_at marker.
-	waitFor(t, "next_attempt_at marker recorded after failure", func() bool {
+	WaitFor(t, 8*time.Second, "next_attempt_at marker recorded after failure", func() bool {
 		v, err := e.client.HGet(context.Background(), key, "fn/h").Result()
 		return err == nil && strings.HasPrefix(v, "next_attempt_at:")
 	})
 	// A redelivery within the backoff is skipped (not eligible), so the executor
-	// is not called again.
-	time.Sleep(500 * time.Millisecond)
-	if got := attempts.Load(); got != 1 {
-		t.Fatalf("executor called %d times while gated by retry backoff; want 1", got)
-	}
+	// is not called again: poll the attempt count stays at 1 across the grace
+	// window rather than a fixed sleep.
+	waitSustained(t, "executor not called again while gated by retry backoff", 500*time.Millisecond, func() bool {
+		return attempts.Load() == 1
+	})
 	e.stop(t)
 }
 
@@ -1175,9 +1227,7 @@ func TestIntegrationFailureSchedulesRetryBackoff(t *testing.T) {
 // reclaim redelivery must skip the invocation. Across both replicas, the
 // executor runs exactly once during the protected window.
 func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	prefix := fmt.Sprintf("conc-%d", time.Now().UnixNano())
 	stream, group := prefix+"-stream", prefix+"-group"
 
@@ -1233,16 +1283,15 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		return nil
 	})
 
-	// Let B's reclaim loop run against A's in-flight invocation; it must skip it
-	// while protected (A's running deadline is still in the future).
-	time.Sleep(800 * time.Millisecond)
-	if got := bCalls.Load(); got != 0 {
-		t.Fatalf("consumer B executed %d times while A's invocation was protected; want 0", got)
-	}
+	// B's reclaim loop must skip A's in-flight invocation (protected): poll that
+	// B never executes across the grace window rather than a fixed sleep.
+	waitSustained(t, "consumer B not executing while A's invocation is protected", 800*time.Millisecond, func() bool {
+		return bCalls.Load() == 0
+	})
 
 	// Release A's handler; it acks and the message leaves the PEL.
 	close(releaseA)
-	waitFor(t, "message acked by A (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked by A (gone from PEL)", func() bool {
 		_, ok := envA.pending()[id]
 		return !ok
 	})
@@ -1264,9 +1313,7 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 // a protected invocation). B must NOT acknowledge the message — it must stay in
 // the PEL so A's eventual completion or failure is not lost.
 func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	prefix := fmt.Sprintf("ackhazard-%d", time.Now().UnixNano())
 	stream, group := prefix+"-stream", prefix+"-group"
 
@@ -1316,16 +1363,17 @@ func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
 		return nil
 	})
 
-	// Let B's reclaim loop run against A's in-flight invocation. The message
-	// must STAY in the PEL (B must not ack it).
-	time.Sleep(800 * time.Millisecond)
-	if _, ok := envB.pending()[id]; !ok {
-		t.Fatalf("message %s must stay pending while A's invocation is in flight (B must not ack)", id)
-	}
+	// B's reclaim loop must leave the message pending (not ack it) while A's
+	// invocation is in flight: poll that it stays in the PEL across the grace
+	// window rather than a fixed sleep.
+	waitSustained(t, "message stays pending while A's invocation is in flight", 800*time.Millisecond, func() bool {
+		_, ok := envB.pending()[id]
+		return ok
+	})
 
 	// Release A; it acks and the message leaves the PEL.
 	close(releaseA)
-	waitFor(t, "message acked by A (gone from PEL)", func() bool {
+	WaitFor(t, 8*time.Second, "message acked by A (gone from PEL)", func() bool {
 		_, ok := envA.pending()[id]
 		return !ok
 	})
@@ -1338,9 +1386,7 @@ func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
 // (ErrInvocationNotEligible), and once it is in the past the invocation
 // executes.
 func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -1367,13 +1413,13 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 		calls.Add(1)
 		return nil
 	})
-	// While the marker is in the future, the invocation is skipped.
-	time.Sleep(500 * time.Millisecond)
-	if got := calls.Load(); got != 0 {
-		t.Fatalf("executor called %d times while gated by next_attempt_at; want 0", got)
-	}
+	// While the marker is in the future, the invocation is skipped: poll the
+	// executor is never called across the grace window rather than a fixed sleep.
+	waitSustained(t, "executor not called while gated by next_attempt_at", 500*time.Millisecond, func() bool {
+		return calls.Load() == 0
+	})
 	// After the marker expires, the invocation executes.
-	waitFor(t, "invocation executed after next_attempt_at expiry", func() bool {
+	WaitFor(t, 8*time.Second, "invocation executed after next_attempt_at expiry", func() bool {
 		return calls.Load() >= 1
 	})
 	e.stop(t)
@@ -1385,9 +1431,7 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 // return nil — but here the handler simulates the runner by returning nil for a
 // terminal skip, so the message is acked.
 func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
+	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
@@ -1398,10 +1442,16 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 	}
 
 	var calls atomic.Int64
+	// seen records that the handler was invoked for the message at all: the
+	// deterministic delivery signal. A PEL-presence poll cannot be used here —
+	// the delivery+ack completes within a few milliseconds, so the PEL may
+	// never contain the message between two polls.
+	seen := &atomic.Bool{}
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID != id {
 			return nil
 		}
+		seen.Store(true)
 		p, ok := InvocationStateFrom(ctx)
 		if !ok {
 			t.Fatalf("no invocation state in ctx")
@@ -1414,7 +1464,16 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 		// complete-or-exhausted).
 		return nil
 	})
-	waitFor(t, "message acked (gone from PEL)", func() bool {
+	// Wait for the handler to have run (the delivery signal), then for the
+	// ack. Without a delivery signal, the "gone from PEL" predicate is
+	// trivially true for a never-delivered message, and a delivery that lands
+	// after shutdown runs the handler with a cancelled context — TryStart
+	// fails open and counts as executed, failing the assertion below even
+	// though the terminal skip itself is correct.
+	WaitFor(t, 8*time.Second, "handler invoked for the message", func() bool {
+		return seen.Load()
+	})
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -1430,15 +1489,12 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 // retry the handler succeeds (non-panicking path) and the message is acked.
 // Consume must survive the panic and keep running.
 func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
-	if !redisAvailable(t) {
-		t.Skip("redis not available")
-	}
-	cli := redis.NewClient(&redis.Options{Addr: redisAddr()})
+	cli := requireRedis(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	prefix := fmt.Sprintf("panic-%d", time.Now().UnixNano())
 	stream, group, consumer := prefix+"-stream", prefix+"-group", prefix+"-consumer"
 
-	var buf bytes.Buffer
+	var buf syncBuffer
 	c := NewConsumer(ConsumerConfig{
 		Client:          cli,
 		Stream:          stream,
@@ -1486,7 +1542,7 @@ func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
 	}()
 
 	// Wait for the message to be delivered into the PEL (attempt 1 panicked).
-	waitFor(t, "message "+id+" delivered into PEL", func() bool {
+	WaitFor(t, 8*time.Second, "message "+id+" delivered into PEL", func() bool {
 		entries, err := cli.XPendingExt(context.Background(), &redis.XPendingExtArgs{
 			Stream: stream, Group: group, Start: "-", End: "+", Count: 100,
 		}).Result()
@@ -1503,7 +1559,7 @@ func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
 
 	// The panic must have been logged and the message must NOT have been acked
 	// (still pending right after the panic log line appears).
-	waitFor(t, "panic log line", func() bool {
+	WaitFor(t, 8*time.Second, "panic log line", func() bool {
 		return strings.Contains(buf.String(), "PANIC in handler")
 	})
 	if _, ok := pendingOf(cli, stream, group, id); !ok {
@@ -1518,7 +1574,7 @@ func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
 	}
 
 	// A later reclaim retries the message; the handler succeeds and it is acked.
-	waitFor(t, "message "+id+" gone from PEL", func() bool {
+	WaitFor(t, 8*time.Second, "message "+id+" gone from PEL", func() bool {
 		_, ok := pendingOf(cli, stream, group, id)
 		return !ok
 	})

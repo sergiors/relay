@@ -1,5 +1,16 @@
 //go:build integration
 
+// This file exercises the Docker boundary end to end against a real Docker
+// daemon: image build, rebuild, image lifecycle, container execution, orphan
+// cleanup, timeout/cancel, exit codes, and stdout/stderr capture.
+//
+// This file is excluded from the default suite by the integration build tag.
+// Running it (`go test -tags=integration ./...`) REQUIRES a reachable Docker
+// daemon; a missing dependency fails the affected tests rather than skipping
+// them. Start the documented dev dependencies with
+// `docker compose -f compose.dev.yaml up -d`. The daemon is located via
+// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
+// respected.
 package runtime
 
 import (
@@ -19,31 +30,30 @@ import (
 	"relay/internal/function"
 )
 
-// dockerAvailable reports whether the Docker daemon is reachable via the
-// Engine API.
-func dockerAvailable(t *testing.T) bool {
-	t.Helper()
-	if os.Getenv("RELAY_SKIP_DOCKER") != "" {
-		return false
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Logf("docker client: %v", err)
-		return false
-	}
-	defer cli.Close()
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
-		t.Logf("docker unavailable: %v", err)
-		return false
-	}
-	return true
-}
-
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
+}
+
+// requireDocker fails the test immediately when the Docker Engine API daemon
+// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
+// all respected). Integration tests fundamentally require Docker; missing
+// infrastructure fails rather than skips.
+func requireDocker(t *testing.T) *client.Client {
+	t.Helper()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
+		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
 }
 
 // newManager returns a Manager wired to a logger that writes into the returned
@@ -61,9 +71,7 @@ func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 }
 
 func TestPythonEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -97,9 +105,7 @@ def completed(event):
 }
 
 func TestPythonAsyncEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -135,9 +141,7 @@ async def completed(event):
 }
 
 func TestNodeEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -209,9 +213,7 @@ const devEventJSON = `{
 // live in the events/ namespace package
 // (events.created / events.updated / events.deleted).
 func TestRealUserEventsPythonEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir, tmpl := readRealTemplate(t, "user-events-python")
 	fn := function.Function{Name: "user-events-python", Dir: dir, Template: tmpl}
@@ -272,9 +274,7 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 // "handler" -> /app/handler.js. No package.json is present, exercising the
 // injected ESM package.json path.
 func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir, tmpl := readRealTemplate(t, "welcome-email-node")
 	fn := function.Function{Name: "welcome-email-node", Dir: dir, Template: tmpl}
@@ -303,9 +303,7 @@ func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 // imports a missing dependency surfaces the REAL import error through Execute,
 // not a "module not found" message.
 func TestNodeBrokenDependencyEndToEnd(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -361,14 +359,7 @@ func imageExistsInDaemon(cli *client.Client, ctx context.Context, ref string) bo
 // only v2 retires v1 -> an unrelated (non-relay-owned) image is untouched. It
 // also asserts the unrelated image is NOT removed by the sweep.
 func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -547,9 +538,7 @@ func waitForContainerGone(ctx context.Context, cli *client.Client, key, value st
 // into the execution container's environment, and that template.yaml is NOT
 // baked into the image (it is Relay configuration, not function source).
 func TestIntegrationFunctionEnvInjection(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -600,9 +589,7 @@ export function env(event) {
 // per invocation and that rotating the value between executions takes effect
 // without a rebuild (the image is prepared once; the fingerprint is unchanged).
 func TestIntegrationSecretInjectionAndRotation(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -656,9 +643,7 @@ export function secret(event) {
 // the same secret both resolve it (the provider is shared, resolution is
 // per-invocation).
 func TestIntegrationMultipleFunctionsSameSecret(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	// Both functions reference the same secret name; the runner resolves it per
 	// invocation. This test drives the runtime layer directly with the resolved
@@ -709,9 +694,7 @@ export function secret(event) {
 // (the previous blanket deferred remove logged a spurious 409 "removal already
 // in progress" on this path) and the container is gone.
 func TestIntegrationSuccessfulRunNoExplicitRemove(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	m, buf := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -762,9 +745,7 @@ export function ok(event) {
 // AutoRemove, and no removal log line may appear (the backstop must stay
 // disarmed on the normal path even under unwinding).
 func TestIntegrationPanicDuringOutputNoRemoval(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -825,14 +806,7 @@ export function paniclog(event) {
 // a created-but-never-started container — the exact state the start-failure path
 // leaves behind. The container must be gone afterward.
 func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -862,14 +836,7 @@ func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
 // returns no error, so a backstop remove that races AutoRemove never surfaces a
 // spurious failure.
 func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -904,9 +871,7 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 // stdout is still captured, and that a non-zero exit code surfaces as an error
 // while the container is still removed.
 func TestIntegrationContainerLabelsAndAutoRemove(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	m, buf := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -1004,9 +969,7 @@ export async function slow(event) {
 // surfaces as an Execute error AND is still auto-removed (attach + exit code
 // handling preserve the existing contract with AutoRemove enabled).
 func TestIntegrationNonZeroExitAutoRemove(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -1049,9 +1012,7 @@ export async function fail(event) {
 // still works with AutoRemove: an over-long handler is killed on cancellation,
 // the error surfaces, and the killed container is removed.
 func TestIntegrationTimeoutAutoRemove(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -1098,9 +1059,7 @@ export async function sleeper(event) {
 // host-config hardening are actually applied by the daemon. It also asserts
 // networking is not disabled (outbound access is a legitimate function need).
 func TestIntegrationContainerHardening(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
+	requireDocker(t)
 
 	// Python handler: asserts non-root uid, read-only rootfs (write to / must
 	// fail with EROFS), writable /tmp, and dropped capabilities (CapEff == 0).
@@ -1344,14 +1303,7 @@ func isClassicBuilderIntermediate(cmd []string) bool {
 // intermediate shape remains after the build. It exercises the real daemon path
 // (Manager.Prepare -> buildImage -> ImageBuild).
 func TestIntegrationRebuildLeavesNoIntermediateContainers(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1465,14 +1417,7 @@ events:
 // malformed package.json so the node engine's `npm install --omit=dev` step
 // fails deterministically.
 func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1574,18 +1519,11 @@ events:
 // stalled Relay container owned by the current hostname, leaves another worker's
 // container alone, and never touches an unrelated (non-Relay-labeled) container.
 func TestIntegrationSweepOrphanContainers(t *testing.T) {
-	if !dockerAvailable(t) {
-		t.Skip("docker not available")
-	}
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	defer cli.Close()
+	cli := requireDocker(t)
 
 	// Our orphan: relay labels + our hostname, left running (as a crashed prior
 	// process would leave a mid-invocation container).

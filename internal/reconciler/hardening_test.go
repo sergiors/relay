@@ -27,7 +27,9 @@ func TestShutdownNoSendOnClosedChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.Start(ctx)
 
-	time.Sleep(50 * time.Millisecond) // let the watcher install the root watch
+	// Wait (bounded) for the watcher to install the root watch rather than a
+	// fixed sleep, so the debounce timer below is armed against a live watcher.
+	waitAllWatched(t, r, []string{root})
 
 	// Enqueue so a debounce timer is armed, then cancel immediately (mid-debounce).
 	r.Enqueue("race-me")

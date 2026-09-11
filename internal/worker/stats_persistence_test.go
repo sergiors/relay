@@ -187,8 +187,12 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 		statsLoop(ctx, m, st, time.Hour)
 	}()
 
-	// Give the goroutine time to run the immediate first snapshot.
-	time.Sleep(100 * time.Millisecond)
+	// Wait (bounded) for the goroutine to run the immediate first snapshot: the
+	// stats row appears once it has, instead of a fixed sleep.
+	waitForStatsRow(t, "statsLoop first snapshot to persist", func() bool {
+		_, ok := st.Stats()
+		return ok
+	})
 	cancel()
 	select {
 	case <-done:
