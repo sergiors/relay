@@ -326,7 +326,7 @@ func TestFunctionHelpMisplaced(t *testing.T) {
 func TestHealthHelp(t *testing.T) {
 	var code int
 	out := capture(t, func() {
-		code = runCLI([]string{"health", "--help"})
+		code = Run([]string{"health", "--help"})
 	})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
@@ -340,7 +340,7 @@ func TestHealthHelp(t *testing.T) {
 func TestHealthArgError(t *testing.T) {
 	var code int
 	errOut := captureErr(t, func() {
-		code = runCLI([]string{"health", "extra"})
+		code = Run([]string{"health", "extra"})
 	})
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2", code)

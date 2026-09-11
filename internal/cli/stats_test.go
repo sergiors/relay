@@ -108,7 +108,7 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 	}
 
 	// The command path exits 0 on an empty DB, not an error.
-	if code := runCLI([]string{"stats"}); code != 0 {
+	if code := Run([]string{"stats"}); code != 0 {
 		t.Fatalf("stats on empty DB: exit = %d, want 0", code)
 	}
 }
@@ -117,17 +117,17 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 // usage error exiting 2; `relay stats --help` prints usage to stdout and exits 0.
 func TestStatsCommand(t *testing.T) {
 	seedStatsState(t)
-	if code := runCLI([]string{"stats"}); code != 0 {
+	if code := Run([]string{"stats"}); code != 0 {
 		t.Fatalf("stats: exit = %d, want 0", code)
 	}
 
-	if code := runCLI([]string{"stats", "extra"}); code != 2 {
+	if code := Run([]string{"stats", "extra"}); code != 2 {
 		t.Fatalf("stats extra: exit = %d, want 2", code)
 	}
 
 	var code int
 	out := capture(t, func() {
-		code = runCLI([]string{"stats", "--help"})
+		code = Run([]string{"stats", "--help"})
 	})
 	if code != 0 {
 		t.Fatalf("stats --help: exit = %d, want 0", code)

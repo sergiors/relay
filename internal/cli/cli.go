@@ -24,7 +24,7 @@ func helpWriter(rows [][2]string) string {
 }
 
 func rootHelp() string {
-	return "Usage:\n  relay COMMAND\n\nRun and manage Relay.\n\nCommands:\n" +
+	return "Usage:\n  relay COMMAND\n\nCommands:\n" +
 		helpWriter([][2]string{
 			{"start", "Start Relay"},
 			{"function", "Manage functions"},
@@ -36,7 +36,7 @@ func rootHelp() string {
 }
 
 func functionHelp() string {
-	return "Usage:\n  relay function COMMAND\n\nManage Relay functions.\n\nCommands:\n" +
+	return "Usage:\n  relay function COMMAND\n\nCommands:\n" +
 		helpWriter([][2]string{
 			{"ls", "List functions"},
 			{"inspect", "Show detailed information about a function"},
@@ -64,14 +64,7 @@ func printUsageError(msg, usage string) int {
 	return 2
 }
 
-// Run parses and dispatches the command line, returning the process exit code.
-// It is the package's public entry point; everything below it is unexported so
-// the command surface stays internal.
-func Run(args []string) int {
-	return runCLI(args)
-}
-
-// runCLI dispatches the CLI's subcommands. It is separated from main so tests
+// Run dispatches the CLI's subcommands. It is separated from main so tests
 // can exercise the exit codes directly. The CLI parses commands and owns exit
 // codes; `relay start` is the one command that starts the long-running Relay
 // runtime (delegating to internal/worker), while every other command is a
@@ -82,7 +75,7 @@ func Run(args []string) int {
 //	0  success
 //	1  runtime error (from a subcommand)
 //	2  usage error
-func runCLI(args []string) int {
+func Run(args []string) int {
 	if len(args) < 1 {
 		return printUsageError("missing command", rootHelp())
 	}

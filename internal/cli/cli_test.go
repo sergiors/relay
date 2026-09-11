@@ -15,7 +15,7 @@ func TestUsageOutputAndExitCode(t *testing.T) {
 	for _, cmd := range [][]string{nil, {"bogus"}} {
 		var code int
 		errOut := captureErr(t, func() {
-			code = runCLI(cmd)
+			code = Run(cmd)
 		})
 		if code != 2 {
 			t.Fatalf("args %v: exit = %d, want 2", cmd, code)
@@ -31,7 +31,7 @@ func TestRootHelp(t *testing.T) {
 	for _, flag := range []string{"--help", "-h"} {
 		var code int
 		out := capture(t, func() {
-			code = runCLI([]string{flag})
+			code = Run([]string{flag})
 		})
 		if code != 0 {
 			t.Fatalf("%s: exit = %d, want 0", flag, code)
@@ -55,7 +55,7 @@ func TestRootHelp(t *testing.T) {
 func TestRootHelpMisplaced(t *testing.T) {
 	var code int
 	errOut := captureErr(t, func() {
-		code = runCLI([]string{"--help", "function"})
+		code = Run([]string{"--help", "function"})
 	})
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2", code)
@@ -108,7 +108,7 @@ func captureErr(t *testing.T, fn func()) string {
 func TestRootHelpContainsStart(t *testing.T) {
 	var code int
 	out := capture(t, func() {
-		code = runCLI([]string{"--help"})
+		code = Run([]string{"--help"})
 	})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
@@ -141,7 +141,7 @@ func TestStartHelp(t *testing.T) {
 
 	var code int
 	out := capture(t, func() {
-		code = runCLI([]string{"start", "--help"})
+		code = Run([]string{"start", "--help"})
 	})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
@@ -160,7 +160,7 @@ func TestStartHelp(t *testing.T) {
 func TestStartTooManyArgs(t *testing.T) {
 	var code int
 	errOut := captureErr(t, func() {
-		code = runCLI([]string{"start", "extra"})
+		code = Run([]string{"start", "extra"})
 	})
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2", code)
@@ -178,7 +178,7 @@ func TestStartDelegatesToWorker(t *testing.T) {
 	startRun = func(l *log.Logger) int { called = true; return 0 }
 	defer func() { startRun = orig }()
 
-	if code := runCLI([]string{"start"}); code != 0 {
+	if code := Run([]string{"start"}); code != 0 {
 		t.Fatalf("start: exit = %d, want 0", code)
 	}
 	if !called {
@@ -195,8 +195,8 @@ func TestInformationalCommandsNeverStartWorker(t *testing.T) {
 	defer func() { startRun = orig }()
 
 	// --help and an unknown command must not reach the start hook.
-	_ = runCLI([]string{"--help"})
-	_ = runCLI([]string{"bogus"})
+	_ = Run([]string{"--help"})
+	_ = Run([]string{"bogus"})
 	if called {
 		t.Fatal("informational CLI commands must not start the worker")
 	}
