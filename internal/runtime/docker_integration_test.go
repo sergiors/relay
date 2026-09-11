@@ -355,13 +355,33 @@ func imageExistsInDaemon(cli *client.Client, ctx context.Context, ref string) bo
 
 // TestIntegrationFingerprintedImageLifecycle exercises the fingerprint-versioned
 // image lifecycle against a real Docker daemon: build v1 -> build v2 (changed
-// source) -> the two are distinct images and v1 still present -> cleanup keeping
-// only v2 retires v1 -> an unrelated (non-relay-owned) image is untouched. It
-// also asserts the unrelated image is NOT removed by the sweep.
+// source) -> the two are distinct images and v1 still present -> removing v1
+// (the superseded version) via the manager's per-image removal path retires it
+// -> an unrelated (non-relay-owned) image is untouched.
 func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
 	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// The test's own fn-ver images should be cleaned up even on failure so the
+	// test never leaks images into another package's cleanup on the shared
+	// daemon. Best-effort force-removal, like cleanupImage.
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{All: true})
+		if err != nil {
+			return
+		}
+		for _, img := range imgs.Items {
+			for _, tag := range img.RepoTags {
+				if strings.HasPrefix(tag, "relay-fn-fn-ver:") {
+					cleanupImage(cli, cleanupCtx, tag)
+					break
+				}
+			}
+		}
+	})
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -417,28 +437,37 @@ events:
 		t.Fatalf("v1 image %s still expected to exist alongside v2", ref1)
 	}
 
-	// An unrelated, non-relay image we create: it must never be touched by the
-	// sweep. Build a tiny tagged image ourselves (not relay-namespaced) via the
-	// Manager's ImageBuild against an inline one-line Dockerfile.
+	// An unrelated, non-relay image we create: it must never be touched by any
+	// of the test's removal operations. Build a tiny tagged image ourselves (not
+	// relay-namespaced) via the Manager's ImageBuild against an inline one-line
+	// Dockerfile.
 	unrelated := buildTestImage(ctx, t, "relay-unrelated-guard", `FROM scratch
 CMD []
 `)
 	defer cleanupImage(cli, ctx, unrelated)
 
-	// Conservative sweep keeping only ref2: ref1 (superseded) is removed, the
-	// unrelated image survives.
-	removed, err := mRemoveImagesExcept(ctx, t, map[string]bool{ref2: true})
+	// Retire v1 (the superseded version) through the manager's per-image
+	// removal path: it is non-forced and treats not-found as benign, matching
+	// production removal semantics without issuing a whole-daemon sweep.
+	//
+	// Note: we deliberately do NOT call (*Manager).RemoveImagesExcept here. That
+	// sweep is a worker-startup operation over ALL Relay-owned images on the
+	// daemon; a unit-scoped lifecycle test must not assert on whole-daemon state
+	// it does not own, since it races anything else creating relay-fn-* images on
+	// a shared daemon (e.g. another Go test package running concurrently).
+	m1, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
 	if err != nil {
-		t.Fatalf("remove images except: %v", err)
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m1.Close()
+	if err := m1.RemoveImage(ctx, ref1); err != nil {
+		t.Fatalf("remove image %s: %v", ref1, err)
 	}
 	if imageExistsInDaemon(cli, ctx, ref1) {
-		t.Errorf("v1 image %s should have been removed by the sweep", ref1)
-	}
-	if removed == 0 {
-		t.Errorf("expected at least one image removed (v1 %s)", ref1)
+		t.Errorf("v1 image %s should have been removed", ref1)
 	}
 	if !imageExistsInDaemon(cli, ctx, ref2) {
-		t.Errorf("kept v2 image %s must survive the sweep", ref2)
+		t.Errorf("kept v2 image %s must survive", ref2)
 	}
 	if !imageExistsInDaemon(cli, ctx, unrelated) {
 		t.Errorf("unrelated image %s must not be removed", unrelated)
@@ -454,17 +483,6 @@ func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepare
 	}
 	defer m.Close()
 	return m.Prepare(ctx, fn)
-}
-
-// mRemoveImagesExcept runs the conservative sweep via a fresh Manager.
-func mRemoveImagesExcept(ctx context.Context, t *testing.T, keep map[string]bool) (int, error) {
-	t.Helper()
-	m, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
-	defer m.Close()
-	return m.RemoveImagesExcept(ctx, keep)
 }
 
 // buildTestImage builds a tiny image with the given tag and an inline Dockerfile
