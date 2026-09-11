@@ -25,6 +25,12 @@ services:
       - DELETE=1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2375/_ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
 
   relay:
     build: .
@@ -33,7 +39,7 @@ services:
       redis:
         condition: service_healthy
       socket-proxy:
-        condition: service_started
+        condition: service_healthy
     ports:
       - 9090:9090
     environment:
