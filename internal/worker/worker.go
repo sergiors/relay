@@ -1,16 +1,18 @@
 // Package worker is the long-running Relay runtime, started via `relay start`.
 // It loads functions, builds their images, reconciles them live, and consumes
 // the Redis stream, blocking until signalled. Configuration comes entirely
-// from the environment. It also exposes a Prometheus /metrics endpoint (see
-// internal/metrics) and flushes the registry into the local state database on
-// a fixed 5-second cadence: stats accumulate in memory (the registry is the
-// single source of truth), Prometheus reflects them immediately, and SQLite
-// receives the current absolute snapshot every interval.
+// from the environment. It can also expose a Prometheus /metrics endpoint (see
+// internal/metrics), gated on the METRICS_ADDR environment variable, and
+// flushes the registry into the local state database on a fixed 5-second
+// cadence: stats accumulate in memory (the registry is the single source of
+// truth), Prometheus reflects them immediately, and SQLite receives the current
+// absolute snapshot every interval.
 package worker
 
 import (
 	"context"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -218,15 +220,18 @@ func Run(logger *log.Logger) {
 	// its own goroutine and exits when ctx is cancelled.
 	go m.LogLoop(ctx, 30*time.Second, logger.Printf)
 
-	// Expose the Prometheus /metrics endpoint. METRICS_ADDR is optional and
-	// defaults to the conventional 9090 port. ServeHTTP logs its own bind
-	// failures and retries, so a temporarily occupied port heals instead of
-	// crashing the worker; it returns nil on a clean shutdown (or ctx.Err on
-	// the retry-bind path). It starts before EnsureGroup/Consume so Prometheus
-	// can scrape during startup builds.
-	metricsAddr := config.Env("METRICS_ADDR", metrics.DefaultAddr)
-	logger.Printf("metrics http server listening on %s", metricsAddr)
-	go m.ServeHTTP(ctx, metricsAddr, logger.Printf)
+	// Expose the Prometheus /metrics endpoint. It is opt-in: METRICS_ADDR must
+	// be set to a non-empty listen address for the endpoint to start; unset or
+	// empty disables it entirely (no HTTP server, mirroring how an unset
+	// retention window disables trimming). ServeHTTP logs its own bind failures
+	// and retries, so a temporarily occupied port heals instead of crashing the
+	// worker; it returns nil on a clean shutdown (or ctx.Err on the retry-bind
+	// path). It starts before EnsureGroup/Consume so Prometheus can scrape
+	// during startup builds.
+	if metricsAddr := os.Getenv("METRICS_ADDR"); metricsAddr != "" {
+		logger.Printf("metrics http server listening on %s", metricsAddr)
+		go m.ServeHTTP(ctx, metricsAddr, logger.Printf)
+	}
 
 	// Flush the registry into the state database on the fixed 5-second cadence.
 	// It is nil-safe on both the registry and the state handle and stops when

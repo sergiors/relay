@@ -147,19 +147,20 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                  | Required | Description                                       |
-| ------------------------ | -------- | ------------------------------------------------- |
-| `REDIS_ADDR`             | yes      | Redis address or DSN (see below).                 |
-| `REDIS_STREAM`           | yes      | Redis stream to consume.                          |
-| `REDIS_GROUP`            | yes      | Consumer group name.                              |
-| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming. |
-| `METRICS_ADDR`           | no       | Metrics listen address (default `:9090`).         |
+| Env var                  | Required | Description                                          |
+| ------------------------ | -------- | ---------------------------------------------------- |
+| `REDIS_ADDR`             | yes      | Redis address or DSN (see below).                    |
+| `REDIS_STREAM`           | yes      | Redis stream to consume.                             |
+| `REDIS_GROUP`            | yes      | Consumer group name.                                 |
+| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.    |
+| `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
 optional and enables internal stream retention (see below). `METRICS_ADDR` is
-optional and must be a non-empty listen address when set (an empty value falls
-back to the default); an unbindable address is logged and retried, never fatal.
+optional and opt-in: when set to a non-empty listen address it starts the
+Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
+server is started. An unbindable address is logged and retried, never fatal.
 
 ### Stream retention
 
@@ -755,8 +756,9 @@ remains the health check.
   `message_id`, `event_id`, `event_name`, `attempt`, `duration`, and container
   `exit_code` where available. Handler stdout/stderr is still forwarded
   verbatim.
-- **Prometheus metrics**: the Relay runtime exposes `GET /metrics` on
-  `METRICS_ADDR` (default `:9090`) in Prometheus text format via the official
+- **Prometheus metrics**: when `METRICS_ADDR` is set to a non-empty listen
+  address, the Relay runtime exposes `GET /metrics` on that address in Prometheus
+  text format via the official
   Prometheus client. Counters: `events_received_total`, `events_processed_total`,
   `handler_success_total`, `handler_failure_total`, `retries_total`,
   `dlq_entries_total`, `handler_invocations_total{outcome,function,handler}`,

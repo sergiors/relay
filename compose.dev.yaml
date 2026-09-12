@@ -46,6 +46,7 @@ services:
       - REDIS_ADDR=redis:6379
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
+      - METRICS_ADDR=:9090
       - DOCKER_HOST=tcp://socket-proxy:2375
     healthcheck:
       test: ["CMD", "relay", "health"]

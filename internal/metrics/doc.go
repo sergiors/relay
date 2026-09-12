@@ -2,7 +2,8 @@
 // Prometheus registry (github.com/prometheus/client_golang/prometheus). It is
 // the single observability surface the runner, stream consumer, and runtime
 // manager record against; the worker exposes it as Prometheus text format on
-// /metrics (see METRICS_ADDR, default :9090).
+// /metrics, but only when METRICS_ADDR is set to a non-empty listen address.
+// Unset or empty disables the HTTP endpoint entirely.
 //
 // Metric kinds:
 //
