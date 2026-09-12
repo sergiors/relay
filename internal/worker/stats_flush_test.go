@@ -2,11 +2,14 @@ package worker
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"relay/internal/metrics"
+	"relay/internal/state"
 )
 
 // waitForStatsRow polls cond until it holds or a generous deadline passes. It
@@ -23,6 +26,169 @@ func waitForStatsRow(t *testing.T, what string, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestRecordSnapshotsSweepsStaleFunctionSeries pins the flush-path invariant:
+// recordSnapshots sweeps the registry against the live function set (from the
+// state DB), deleting series for a function whose functions row is gone even
+// though its series still linger in the registry, while live functions' series
+// and global counters survive in BOTH SQLite and the registry.
+func TestRecordSnapshotsSweepsStaleFunctionSeries(t *testing.T) {
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateFunction("ghost", t.TempDir()))
+	st.RecordFunctionStats(state.FunctionStats{Function: "alpha", EventsProcessedTotal: 10})
+	st.RecordFunctionStats(state.FunctionStats{Function: "ghost", EventsProcessedTotal: 5})
+
+	m := metrics.New()
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "ghost"}})
+	m.Add("events_processed_total", 42)
+	m.Add("handler_success_total", 30)
+
+	// Remove ghost's functions row (the reconciler's RecordRemoved) but KEEP its
+	// series in the registry, simulating an in-flight invocation that recreated
+	// them after removal. globals are untouched by removal.
+	st.RecordRemoved("ghost")
+
+	recordSnapshots(context.Background(), st, m)
+
+	// Ghost's SQLite function_stats is absent (pre-existing orphan-prune/upsert
+	// behavior).
+	if _, ok := st.FunctionStats("ghost"); ok {
+		t.Fatal("ghost function_stats must be absent after the sweep+flush")
+	}
+	// Ghost's registry series are swept away.
+	if fs := m.FunctionStatsSnapshot(); metricsStat(fs, "ghost") {
+		t.Fatalf("ghost must be absent from FunctionStatsSnapshot:\n%+v", fs)
+	}
+	if strings.Contains(m.Snapshot(), "function=ghost,") {
+		t.Fatalf("ghost series must be swept from the registry:\n%s", m.Snapshot())
+	}
+
+	// Alpha's series survive in both SQLite and the registry. The flush persists
+	// the registry's current absolute value (alpha was incremented twice), so
+	// its row is present with the live value — proving alpha was NOT swept.
+	a, ok := st.FunctionStats("alpha")
+	if !ok || a.EventsProcessedTotal != 2 {
+		t.Fatalf("alpha = %+v, ok=%v; want events 2 (registry value preserved)", a, ok)
+	}
+	if fs := m.FunctionStatsSnapshot(); !metricsStat(fs, "alpha") {
+		t.Fatalf("alpha must remain in FunctionStatsSnapshot:\n%+v", fs)
+	}
+
+	// Global counters unchanged (registry values persisted to SQLite).
+	gs, _ := st.Stats()
+	if gs.EventsProcessedTotal != 42 {
+		t.Fatalf("global events = %d, want 42", gs.EventsProcessedTotal)
+	}
+	if gs.HandlerSuccessTotal != 30 {
+		t.Fatalf("global success = %d, want 30", gs.HandlerSuccessTotal)
+	}
+	if m.Counter("events_processed_total") != 42 {
+		t.Fatalf("registry events = %d, want 42", m.Counter("events_processed_total"))
+	}
+}
+
+// TestReaddFunctionFreshSeries pins SQLite consistency on re-add: after a
+// function's series are removed, re-incrementing starts at 1 and the flush
+// persists that fresh small value (the row was recreated/upserted, not held at a
+// stale value).
+func TestReaddFunctionFreshSeries(t *testing.T) {
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	m := metrics.New()
+
+	// Seed and flush an initial value, then remove the series as the reconciler
+	// would on removal.
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	recordSnapshots(context.Background(), st, m)
+	m.RemoveFunction("alpha")
+
+	// Re-add: a fresh series at count 1.
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	if !strings.Contains(m.Snapshot(), "function_events_total{function=alpha} count=1") {
+		t.Fatalf("re-added alpha must count 1:\n%s", m.Snapshot())
+	}
+	recordSnapshots(context.Background(), st, m)
+	a, ok := st.FunctionStats("alpha")
+	if !ok || a.EventsProcessedTotal != 1 {
+		t.Fatalf("alpha persisted = %+v, ok=%v; want events 1", a, ok)
+	}
+}
+
+// TestSweepSkippedOnStateReadError pins the fail-open sweep: when the live set
+// cannot be read (FunctionNames errors, here by closing the DB so every read on
+// the single pooled connection fails), recordSnapshots must NOT sweep against an
+// empty live map — that would delete live functions' series. The sweep is
+// skipped entirely, so alpha and ghost series both survive in the registry (and
+// the flush itself is a no-op on the closed handle, logging internally without
+// panicking). Once the state DB is reopened on the same path (Open's schema init
+// is idempotent), a subsequent flush sweeps ghost and keeps alpha — the
+// ghost/live behavior resumes.
+func TestSweepSkippedOnStateReadError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateFunction("ghost", t.TempDir()))
+
+	m := metrics.New()
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "ghost"}})
+	m.Add("events_processed_total", 42)
+
+	// Close the DB so the pooled (single) connection is gone: FunctionNames and
+	// RecordStatsSnapshot both error, but the sweep must fail open.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close state: %v", err)
+	}
+
+	// Must not panic.
+	recordSnapshots(context.Background(), st, m)
+
+	// Fail-open: BOTH alpha and ghost series survive the failed flush.
+	if fs := m.FunctionStatsSnapshot(); !metricsStat(fs, "alpha") || !metricsStat(fs, "ghost") {
+		t.Fatalf("sweep must be skipped on state read error (fail-open), want alpha+ghost present:\n%+v", fs)
+	}
+	if !strings.Contains(m.Snapshot(), "{function=ghost}") {
+		t.Fatalf("ghost series must NOT be swept when the live set read fails:\n%s", m.Snapshot())
+	}
+	// Globals unchanged in the registry.
+	if m.Counter("events_processed_total") != 42 {
+		t.Fatalf("registry events = %d, want 42", m.Counter("events_processed_total"))
+	}
+
+	// Reopen on the same path (Open's schema init is idempotent) and flush; the
+	// ghost/live behavior resumes: ghost (now stale) is swept, alpha survives.
+	st2, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("reopen state: %v", err)
+	}
+	defer st2.Close()
+	recordSnapshots(context.Background(), st2, m)
+
+	if fs := m.FunctionStatsSnapshot(); !metricsStat(fs, "alpha") {
+		t.Fatalf("alpha must survive the resumed flush:\n%+v", fs)
+	}
+	if strings.Contains(m.Snapshot(), "function=ghost,") {
+		t.Fatalf("ghost series must be swept once the live set read succeeds:\n%s", m.Snapshot())
+	}
+}
+
+// metricsStat reports whether metrics.FunctionStats fs has a stat for name.
+func metricsStat(fs []metrics.FunctionStat, name string) bool {
+	for _, f := range fs {
+		if f.Function == name {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly pins the hot-path contract:

@@ -28,6 +28,14 @@
 // history. A hard crash loses at most the last unflushed interval of telemetry;
 // graceful shutdown performs a final bounded flush.
 //
+// Function lifecycle: function-scoped series (the CounterVecs and HistogramVecs
+// in functionMetrics) are created lazily on the first observation and deleted
+// when the function is removed. Removal happens at two points: RemoveFunction
+// is invoked from the reconciler's RemoveFunction hook at reconciliation time,
+// and SweepFunctionMetrics runs in the worker's stats flush to re-delete any
+// series an in-flight invocation may have recreated after removal. Global
+// metrics are never deleted — they are process-lifetime totals.
+//
 // Invariant: metrics are best-effort and must never interfere with event
 // processing. Every method on *Registry is safe to call on a nil receiver
 // (a no-op), so a missing or broken metrics pipeline never blocks or crashes the

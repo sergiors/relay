@@ -277,13 +277,21 @@ func Run(logger *log.Logger) {
 	// discover new ones, drop removed ones. The runner's registry is swapped
 	// atomically behind the snapshots the consumer already uses. The retire
 	// hooks hand superseded function images back to the runner so it can remove
-	// them once no in-flight execution uses them.
+	// them once no in-flight execution uses them. On removal, the RemoveFunction
+	// hook first deletes the function's Prometheus series (at the same retirement
+	// point, after the registry entry is swapped to nil) and then retires its
+	// images; the flush sweep in recordSnapshots below re-deletes any series an
+	// in-flight invocation may have recreated after this removal, so the
+	// "removed function => no exposed series" invariant holds even mid-invocation.
 	rec := reconciler.New(
 		reconciler.Config{
-			Root:           function.Dir,
-			State:          st,
-			Retire:         func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
-			RemoveFunction: runWorker.RemoveFunctionImages,
+			Root:   function.Dir,
+			State:  st,
+			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
+			RemoveFunction: func(name string) {
+				m.RemoveFunction(name)
+				runWorker.RemoveFunctionImages(name)
+			},
 		},
 		runWorker.Registry(),
 		manager,
@@ -427,16 +435,37 @@ func finalStatsFlush(m *metrics.Registry, st *state.State) {
 
 // recordSnapshots writes the whole stats snapshot — the global stats row and
 // one function_stats row per function with any attributed activity — in a
-// single short transaction (see state.RecordStatsSnapshot). The transaction
-// first prunes orphaned function_stats rows (a removed function's row is not
-// re-created even though its registry counters linger until process restart:
-// the registry is the in-memory store and we deliberately do not delete its
-// counters on removal — the flush simply stops persisting the removed function
-// because its functions row is gone). Per-function writes are bounded by the
-// function count, so the 5s cadence keeps them small. A failed flush is logged
-// and retried next tick with the current absolute values; no path resets
-// counters on failure.
+// single short transaction (see state.RecordStatsSnapshot). Before the write it
+// enforces the metrics/SQLite consistency invariant: it sweeps the registry with
+// SweepFunctionMetrics against state.FunctionNames, deleting any function-scoped
+// series whose function no longer has a functions row. This complements the
+// reconciler's RemoveFunction hook (which deletes series at removal time) by
+// re-deleting series an in-flight invocation may have recreated after removal —
+// a removed function exposes NO series on /metrics, and globals are untouched.
+// The transaction first prunes orphaned function_stats rows (a removed
+// function's row is not re-created even though its registry counters are swept
+// just above). Per-function writes are bounded by the function count, so the 5s
+// cadence keeps them small. A failed flush is logged and retried next tick with
+// the current absolute values; no path resets counters on failure.
 func recordSnapshots(ctx context.Context, st *state.State, m *metrics.Registry) {
+	// Sweep the registry against the live function set before snapshotting, so
+	// a function removed (or swept) this interval cannot persist a stale
+	// function_stats row that the orphan-prune would have to reject anyway, and
+	// cannot linger on /metrics.
+	//
+	// Fail-open: if the live set cannot be read (st.FunctionNames returns
+	// ok=false), the sweep is skipped entirely rather than run against an empty
+	// map — an empty live set would delete every function-scoped series,
+	// including live functions'. Sweeping is best-effort and re-applied on the
+	// next successful flush; RecordStatsSnapshot below already logs the DB
+	// issue, so no new logging is added here.
+	if names, ok := st.FunctionNames(); ok {
+		active := make(map[string]bool, len(names))
+		for _, name := range names {
+			active[name] = true
+		}
+		m.SweepFunctionMetrics(active)
+	}
 	// RecordStatsSnapshot logs internally on error (matching the state package's
 	// non-fatal style); the returned error is only for the caller to bound the
 	// write with a context.

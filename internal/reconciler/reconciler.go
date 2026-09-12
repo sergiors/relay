@@ -499,7 +499,10 @@ func (r *Reconciler) remove(name string) {
 		r.st.RecordRemoved(name)
 	}
 	// The directory is gone, so every version of this function's images is now
-	// garbage. Let the runner retire all of them (once idle) when wired.
+	// garbage. Let the runner retire all of them (once idle) when wired. The
+	// wired RemoveFunction hook also deletes the function's Prometheus series at
+	// this same retirement point (the reconciler itself stays metrics-free; the
+	// worker wires the metrics deletion by wrapping the hook).
 	if r.removeFunction != nil {
 		r.removeFunction(name)
 	}

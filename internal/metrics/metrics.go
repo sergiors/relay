@@ -371,6 +371,128 @@ func isFunctionMetric(name string) bool {
 	return false
 }
 
+// functionMetrics lists the labeled vecs that carry the function label, in
+// registration order. Function lifecycle cleanup iterates it so a removed
+// function's series are deleted across every function-scoped collector in one
+// pass. Global (unlabeled) metrics are deliberately absent: they are
+// process-lifetime and never deleted.
+var functionMetrics = []string{
+	"handler_invocations_total",
+	"build_failures_total",
+	"function_events_total",
+	"function_handler_success_total",
+	"function_handler_failure_total",
+	"function_retries_total",
+	"function_dlq_total",
+	"handler_duration_seconds",
+	"function_build_seconds",
+}
+
+// isFunctionCarryingMetric reports whether name is one of the labeled vecs that
+// carry the function label (see functionMetrics). It is the sweep's filter: a
+// family is only swept when its series are function-scoped, so global metrics
+// are never touched.
+func isFunctionCarryingMetric(name string) bool {
+	for _, n := range functionMetrics {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveFunction deletes every metric series labeled function=<name> across all
+// function-scoped vecs. Global metrics and other functions' series are
+// untouched. Nil-safe; unknown names are a no-op. It is the reconciliation-time
+// cleanup: when a function directory vanishes, the wired RemoveFunction hook
+// (see internal/worker) calls this so its stale Prometheus series do not linger
+// on /metrics after SQLite state is dropped.
+//
+// handler_invocations_total and handler_duration_seconds carry a second
+// variable label alongside function (outcome/handler respectively), and
+// prometheus DeleteLabelValues requires a value for EVERY variable label — so
+// those two are deleted by partial match on the function label. Every
+// single-function-label vec is deleted by label value. DeletePartialMatch and
+// DeleteLabelValues each lock the vec's metricMap internally, so no additional
+// lock is taken here. It is idempotent: calling it repeatedly (or for a name
+// with no series) is safe and a no-op.
+func (r *Registry) RemoveFunction(name string) {
+	if r == nil {
+		return
+	}
+	for _, n := range functionMetrics {
+		r.deleteFunction(n, name)
+	}
+}
+
+// SweepFunctionMetrics deletes stale function-scoped series for every function
+// name NOT in live. It is used by the worker's stats flush to enforce the
+// "removed function => no exposed series" invariant even when an in-flight
+// invocation recreates a series after RemoveFunction: the live set comes from
+// the state database (state.FunctionNames), and any series whose function is not
+// live is swept. Global metrics and live functions' series are untouched.
+// Nil-safe; a Gather error returns silently (metrics are best-effort).
+func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
+	if r == nil {
+		return
+	}
+	families, err := r.reg.Gather()
+	if err != nil {
+		return
+	}
+	for _, f := range families {
+		name := f.GetName()
+		if !isFunctionCarryingMetric(name) {
+			continue
+		}
+		// Collect the function label values present in this family, then delete
+		// each that is not live. Deleting inside the same pass is fine: gathered
+		// metrics are a snapshot, and the delete APIs lock the vec internally.
+		for _, m := range f.GetMetric() {
+			fn := labelValue(m, "function")
+			if fn == "" || live[fn] {
+				continue
+			}
+			r.deleteFunction(name, fn)
+		}
+	}
+}
+
+// deleteFunction removes every series labeled function=fn from the named vec,
+// using the delete strategy appropriate to its label set. It is shared by
+// RemoveFunction and SweepFunctionMetrics so both retirement paths behave
+// identically. Each vec that carries function plus another variable label — the
+// counter handler_invocations_total (outcome,function,handler) and the
+// histogram handler_duration_seconds (function,handler) — is deleted by
+// partial match: prometheus DeleteLabelValues requires a value for EVERY
+// variable label, so passing only the function name matches nothing on a
+// multi-label vec. Every single-function-label vec is deleted by label value
+// directly.
+//
+// WARNING: any NEW vec carrying the function label must be added to
+// functionMetrics AND, when it has more than the single function variable
+// label, classified for DeletePartialMatch by setting the `partial` flag below —
+// otherwise function lifecycle cleanup silently misses it.
+func (r *Registry) deleteFunction(name, fn string) {
+	partial := name == "handler_invocations_total" || name == "handler_duration_seconds"
+	if lc, ok := r.counterVecs[name]; ok {
+		if partial {
+			lc.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+		} else {
+			lc.vec.DeleteLabelValues(fn)
+		}
+		return
+	}
+	if lh, ok := r.histogramVecs[name]; ok {
+		if partial {
+			lh.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+		} else {
+			// function_build_seconds (sole label).
+			lh.vec.DeleteLabelValues(fn)
+		}
+	}
+}
+
 // labelValue returns the value of the named label on a gathered metric, or ""
 // when absent.
 func labelValue(m *dto.Metric, name string) string {

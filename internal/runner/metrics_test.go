@@ -106,6 +106,98 @@ func TestHandleRecordsFailureMetrics(t *testing.T) {
 	}
 }
 
+// TestRemoveFunctionDeletesRunnerSeries exercises the production retirement
+// path (the worker wraps RemoveFunctionImages with metrics.RemoveFunction at the
+// reconciler's RemoveFunction hook): after Handle runs success and failure for
+// one function, RemoveFunction must drop ALL of that function's series from the
+// registry while leaving the global totals intact.
+func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
+	m := metrics.New()
+	// A success runner (user-events + other) and a failure runner (user-events
+	// again) share the same registry, so one function accumulates both outcomes
+	// and another is isolated.
+	success := NewWithMetrics(
+		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{}), alwaysMatchFn(t, "other", &fixedExecutor{})},
+		silentLogger(), m)
+	failure := NewWithMetrics(
+		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{err: true})},
+		silentLogger(), m)
+	if err := success.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle success: %v", err)
+	}
+	if err := failure.Handle(context.Background(), "1757-1", map[string]any{"status": "err"}); err == nil {
+		t.Fatal("expected handle to fail")
+	}
+
+	// Both user-events and other have function series before removal.
+	before := m.Snapshot()
+	foundUE := false
+	for _, line := range strings.Split(before, "\n") {
+		if fnLabelIs(line, "user-events") {
+			foundUE = true
+			break
+		}
+	}
+	if !foundUE {
+		t.Fatalf("expected user-events series before removal; got:\n%s", before)
+	}
+	foundOther := false
+	for _, line := range strings.Split(before, "\n") {
+		if fnLabelIs(line, "other") {
+			foundOther = true
+			break
+		}
+	}
+	if !foundOther {
+		t.Fatalf("expected other series before removal; got:\n%s", before)
+	}
+	// Capture the global totals: removal must never touch them.
+	wantSuccess := m.Counter("handler_success_total")
+	wantFailure := m.Counter("handler_failure_total")
+
+	m.RemoveFunction("user-events")
+
+	got := m.Snapshot()
+	// All of user-events' function-scoped series are gone — no series at all
+	// carrying the function=user-events label on any of the functionMetrics vecs.
+	for _, mname := range []string{
+		"function_events_total",
+		"function_handler_success_total",
+		"function_handler_failure_total",
+		"handler_invocations_total",
+		"handler_duration_seconds",
+	} {
+		for _, line := range strings.Split(got, "\n") {
+			if strings.HasPrefix(line, mname+"{") && fnLabelIs(line, "user-events") {
+				t.Fatalf("user-events %s series must be removed; got:\n%s", mname, got)
+			}
+		}
+	}
+	// The other function's series survive.
+	if !strings.Contains(got, "function=other,") && !strings.Contains(got, "function=other}") {
+		t.Fatalf("other function's series must survive removal; got:\n%s", got)
+	}
+	// Global totals unchanged.
+	if got := m.Counter("handler_success_total"); got != wantSuccess {
+		t.Fatalf("handler_success_total = %d, want %d", got, wantSuccess)
+	}
+	if got := m.Counter("handler_failure_total"); got != wantFailure {
+		t.Fatalf("handler_failure_total = %d, want %d", got, wantFailure)
+	}
+}
+
+// fnLabelIs reports whether the rendered line carries the exact function label
+// value name (a full label value, not a prefix of another).
+func fnLabelIs(line, name string) bool {
+	token := "function=" + name
+	idx := strings.Index(line, token)
+	if idx < 0 {
+		return false
+	}
+	rest := line[idx+len(token):]
+	return strings.HasPrefix(rest, ",") || strings.HasPrefix(rest, "}") || rest == ""
+}
+
 // containsDuration asserts a duration metric line with a prefix and the given
 // count appears (without pinning the precise sum, which varies by timing).
 func containsDuration(snapshot, prefix string) bool {

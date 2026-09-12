@@ -4,9 +4,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"relay/internal/metrics"
 	"relay/internal/runner"
 	"relay/internal/state"
 )
@@ -145,6 +147,92 @@ func TestReconcileStateRemoved(t *testing.T) {
 	if _, ok := st.GetFunction("tobe-removed"); ok {
 		t.Fatal("state row should be removed")
 	}
+}
+
+// TestReconcileRemovalDeletesMetricsSeries wires a metrics.Registry through the
+// RemoveFunction hook the worker builds (RemoveFunction: m.RemoveFunction(...) +
+// image retirement), so a removed function's Prometheus series are dropped at
+// reconciliation time while an unrelated function's series and the globals stay
+// untouched. This is the reconciler-package view of the production hook wiring;
+// internal/worker owns the actual closure.
+func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
+	root := t.TempDir()
+	victimDir := writeFnDir(t, root, "victim")
+	bystanderDir := writeFnDir(t, root, "bystander")
+
+	victim := initialFn("victim", victimDir)
+	bystander := initialFn("bystander", bystanderDir)
+	b := &fakeBuilder{}
+
+	m := metrics.New()
+	// Seed per-function series for both functions, mirroring prior activity.
+	seedMetricsFunction(m, "victim")
+	seedMetricsFunction(m, "bystander")
+	// A global counter the removal must never touch.
+	m.Inc("events_received_total")
+	before := m.Snapshot()
+	if !strings.Contains(before, "function_events_total{function=victim}") {
+		t.Fatalf("expected victim series before removal:\n%s", before)
+	}
+	if !strings.Contains(before, "function_events_total{function=bystander}") {
+		t.Fatalf("expected bystander series before removal:\n%s", before)
+	}
+
+	// Build the reconciler with the production-style RemoveFunction hook: delete
+	// the function's metrics series, then retire its images (a no-op with the
+	// fake builder). The runner registry and state wiring mirror production.
+	reg := &runner.Registry{}
+	reg.Set([]*runner.PreparedFunction{victim, bystander})
+	r := New(Config{
+		Root:     root,
+		Debounce: 10 * time.Millisecond,
+		Interval: time.Hour,
+		RemoveFunction: func(name string) {
+			m.RemoveFunction(name)
+		},
+	}, reg, b, log.New(os.Stderr, "test: ", 0))
+	for _, pf := range []*runner.PreparedFunction{victim, bystander} {
+		r.Seed(pf.Function())
+	}
+
+	if err := os.RemoveAll(victimDir); err != nil {
+		t.Fatalf("remove victim: %v", err)
+	}
+	r.reconcileFunction("victim")
+
+	got := m.Snapshot()
+	// Victim's series are gone from every function-scoped vec.
+	if strings.Contains(got, "function_events_total{function=victim}") {
+		t.Fatalf("victim series must be deleted on removal:\n%s", got)
+	}
+	if strings.Contains(got, "handler_invocations_total{function=victim,") {
+		t.Fatalf("victim handler_invocations_total must be deleted:\n%s", got)
+	}
+	if strings.Contains(got, "function_build_seconds{function=victim}") {
+		t.Fatalf("victim function_build_seconds must be deleted:\n%s", got)
+	}
+	// Bystander's series and the global counter survive.
+	if !strings.Contains(got, "function_events_total{function=bystander}") {
+		t.Fatalf("bystander series must survive removal:\n%s", got)
+	}
+	if got := m.Counter("events_received_total"); got != 1 {
+		t.Fatalf("events_received_total = %d, want 1", got)
+	}
+}
+
+// seedMetricsFunction increments every function-carrying vec for name on the
+// given registry, so a function has a full set of series for the removal test.
+func seedMetricsFunction(m *metrics.Registry, name string) {
+	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
+	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "failure"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
+	m.IncLabels("build_failures_total", []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels("function_handler_failure_total", []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels("function_retries_total", []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels("function_dlq_total", []metrics.Label{{Name: "function", Value: name}})
+	m.ObserveDurationLabels("handler_duration_seconds", []metrics.Label{{Name: "function", Value: name}, {Name: "handler", Value: "x"}}, time.Millisecond)
+	m.ObserveDurationLabels("function_build_seconds", []metrics.Label{{Name: "function", Value: name}}, time.Millisecond)
 }
 
 // Invalid template -> NO state write (no success/failure/skipped recorded).
