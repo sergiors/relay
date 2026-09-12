@@ -378,18 +378,65 @@ events:
 A pattern is a tree of field conditions:
 
 - A plain YAML list is implicit equality: `status: [COMPLETED, FAILED]`.
-- A map with only operator keys (`equals`, `prefix`, `suffix`, `exists`) holds
-  operators.
+- A map with only operator keys (`equals`, `prefix`, `suffix`, `exists`,
+  `gt`/`gte`/`lt`/`lte`) holds operators.
 - A nested map without operator keys holds nested field conditions.
 
 ### Operators
 
-| Operator | Semantics                                                |
-| -------- | -------------------------------------------------------- |
-| `equals` | Value equals any of the listed values (type-preserving). |
-| `prefix` | String value starts with any of the listed prefixes.     |
-| `suffix` | String value ends with any of the listed suffixes.       |
-| `exists` | Key presence check. Takes a boolean, not a list.         |
+| Operator | Semantics                                                           |
+| -------- | ------------------------------------------------------------------- |
+| `equals` | Value equals any of the listed values (type-preserving).            |
+| `prefix` | String value starts with any of the listed prefixes.                |
+| `suffix` | String value ends with any of the listed suffixes.                  |
+| `exists` | Key presence check. Takes a boolean, not a list.                    |
+| `gt`     | Value is greater than a numeric threshold or `now`-relative cutoff.  |
+| `gte`    | Value is greater than or equal (numeric or `now` cutoff).           |
+| `lt`     | Value is less than a numeric threshold or `now`-relative cutoff.    |
+| `lte`    | Value is less than or equal (numeric or `now` cutoff).              |
+
+#### Comparison operators (gt/gte/lt/lte)
+
+`gt`, `gte`, `lt`, and `lte` take either a **number** (compared numerically) or
+a **`now`-relative expression** (compared as instants). Operands may be a list,
+in which case the value matches if any operand holds (ordinary OR).
+
+```yaml
+pattern:
+  new_image:
+    created_at:
+      gt: "now-5m"
+```
+
+- `now` expressions: `now`, `now-5m`, `now+10m`, `now-1h`, `now+24h`, and any
+  Go `time.ParseDuration` suffix (compound forms like `1h30m` are fine). They
+  are evaluated as a UTC instant **at match time** (never at template load), so
+  the cutoff moves as time passes. `now+0s` (zero offset) is valid.
+- Only the exact `now`/`now±duration` syntax triggers temporal comparison. The
+  event value must be an **RFC3339 string**; offsets are respected and values
+  are compared as instants, not lexicographically. A numeric operand stays
+  purely numeric.
+- The template pattern never accepts an arbitrary timestamp string (e.g.
+  `gt: "2026-09-12T10:00:00Z"`); only `now` expressions are valid string
+  operands, and anything else fails template validation rather than silently
+  never matching.
+- A missing, `null`, non-string, or invalid-RFC3339 event value never matches a
+  temporal comparison (and never panics).
+
+Examples:
+
+```yaml
+pattern:
+  price:
+    lte: 100.5           # numeric: value <= 100.5
+  age:
+    gt: 18               # numeric: value > 18
+  created_at:
+    gt: "now-5m"         # temporal: value after (now - 5m)
+  updated_at:
+    gte: "now-1h"
+    lt: "now"            # two operators on one field are OR, not a range
+```
 
 `exists` checks **key presence only** — the value is irrelevant. `null` still
 counts as "exists":
@@ -434,8 +481,8 @@ The value must be a strict boolean; `exists: "true"`, `exists: 1`, and
   **or** present with a value starting with `12`.
 
 For example, a rule with `status: [COMPLETED, FAILED]` matches while
-`id: { prefix: ["user_"] }` matches `user_123` but not `123`. Only
-`equals`/`prefix`/`suffix`/`exists` are implemented.
+`id: { prefix: ["user_"] }` matches `user_123` but not `123`. The implemented
+operators are `equals`, `prefix`, `suffix`, `exists`, and `gt`/`gte`/`lt`/`lte`.
 
 ## Supported runtimes
 
@@ -941,5 +988,4 @@ resource limits/networking, external secret-management providers (Vault/AWS/K8s
 — the local file provider is the current backend), HTTP API (beyond the
 Prometheus `/metrics` scrape endpoint), UI, full observability platforms
 (tracing, log shippers), and additional operators
-(numeric/exists/anything-but/regex/glob/scripts) are not implemented in this
-iteration.
+(anything-but/regex/glob/scripts) are not implemented in this iteration.

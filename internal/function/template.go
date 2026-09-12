@@ -34,6 +34,10 @@ var operatorKeys = map[string]bool{
 	"prefix": true,
 	"suffix": true,
 	"exists": true,
+	"gt":     true,
+	"gte":    true,
+	"lt":     true,
+	"lte":    true,
 }
 
 var supportedRuntimes = map[string]bool{
@@ -184,9 +188,123 @@ func (m existsMatcher) Match(value any) bool { return m.want }
 // present key matches exactly when want is true.
 func (m existsMatcher) MatchPresent(present bool) bool { return present == m.want }
 
+// comparisonKind selects how a comparisonMatcher treats its operand: either as a
+// fixed numeric threshold, or as a `now`-relative cutoff re-evaluated from the
+// clock at match time.
+type comparisonKind int
+
+const (
+	numericComparison comparisonKind = iota
+	nowComparison
+)
+
+// comparisonMatcher implements one of the ordering operators gt/gte/lt/lte. Its
+// operand list is OR: the value matches if ANY operand compares true. When the
+// operand is temporal (a `now`-relative string), the cutoff is recomputed from
+// the injected clock at match time — never at template load — so the rule stays
+// dynamic.
+//
+// Numeric operands compare numerically (via toFloat): a numeric event value
+// greater/equal/less than the threshold. A non-numeric event value never
+// matches. Temporal operands require the event value to be an RFC3339 string
+// and compare instants — not strings.
+type comparisonMatcher struct {
+	kind     comparisonKind
+	op       comparisonOp
+	numBound float64          // fixed numeric threshold (kind == numericComparison)
+	durNow   time.Duration    // relative clock offset, signed (kind == nowComparison)
+	now      func() time.Time // clock consulted at match time (kind == nowComparison)
+}
+
+// comparisonOp names the ordering operator; both numeric and temporal matching
+// branch on it so the "does equality pass" rule stays in one place.
+type comparisonOp int
+
+const (
+	opGt comparisonOp = iota
+	opGte
+	opLt
+	opLte
+)
+
+func (m comparisonMatcher) pred(a, b float64) bool {
+	switch m.op {
+	case opGt:
+		return a > b
+	case opGte:
+		return a >= b
+	case opLt:
+		return a < b
+	case opLte:
+		return a <= b
+	default:
+		return false
+	}
+}
+
+// predTime applies the same ordering predicate to two instants, comparing them
+// as instants (After/Before/Equal), never lexicographically.
+func (m comparisonMatcher) predTime(a, b time.Time) bool {
+	switch m.op {
+	case opGt:
+		return a.After(b)
+	case opGte:
+		return a.After(b) || a.Equal(b)
+	case opLt:
+		return a.Before(b)
+	case opLte:
+		return a.Before(b) || a.Equal(b)
+	default:
+		return false
+	}
+}
+
+func (m comparisonMatcher) Match(value any) bool {
+	if m.kind == nowComparison {
+		// The cutoff is computed from the injected clock at this instant, then
+		// compared. The clock is guaranteed non-nil for temporal matchers: it is
+		// always supplied by the parse entry point, which falls back to
+		// time.Now().UTC() when one is not provided. The fallback below is a
+		// defensive guard only and is unreachable through the parse path.
+		now := m.now
+		if now == nil {
+			now = time.Now().UTC
+		}
+		want := now().Add(m.durNow)
+		s, ok := value.(string)
+		if !ok {
+			// Missing, null, or non-string values never match (and never panic).
+			return false
+		}
+		inst, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			// A non-RFC3339 string is not a valid instant.
+			return false
+		}
+		return m.predTime(inst, want)
+	}
+	af, ok := toFloat(value)
+	if !ok {
+		// Non-numeric event value never matches a numeric threshold.
+		return false
+	}
+	return m.pred(af, m.numBound)
+}
+
 // ParseTemplate builds a Template from raw YAML, validating the runtime and
-// every rule's handler.
+// every rule's handler. It is the production entry point and uses the real wall
+// clock for temporal (`now`-relative) comparisons, computed per match at
+// run time. Tests that need a pinned clock call parseTemplateWithClock instead.
 func ParseTemplate(data []byte) (*Template, error) {
+	return parseTemplateWithClock(data, time.Now().UTC)
+}
+
+// parseTemplateWithClock is ParseTemplate with an explicit clock for `now`
+// -relative comparison operators. It is the single construction point for the
+// temporal clock seam: every comparisonMatcher derives its clock from the one
+// supplied here (or defaults to time.Now().UTC when nil), so temporal rules
+// re-evaluate dynamically per match and never capture the parse-time instant.
+func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error) {
 	var raw struct {
 		Runtime string            `yaml:"runtime"`
 		Env     map[string]string `yaml:"env"`
@@ -246,7 +364,7 @@ func ParseTemplate(data []byte) (*Template, error) {
 		}
 		pattern := make(Pattern, len(ev.Pattern))
 		for field, cond := range ev.Pattern {
-			parsed, err := parseFieldCondition(field, cond)
+			parsed, err := parseFieldCondition(field, cond, now)
 			if err != nil {
 				return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)
 			}
@@ -435,17 +553,20 @@ func validateHandler(handler string) error {
 // path is the dotted field path (e.g. "new_image.cnpj") used to give errors from
 // strict operator validation (exists) enough context to locate the offending
 // value. It must be non-empty for every field; nested fields append their name.
-func parseFieldCondition(path string, v any) (FieldCondition, error) {
+//
+// now is the temporal clock for `now`-relative comparison operators, passed
+// down unchanged so it is identical for the whole template.
+func parseFieldCondition(path string, v any, now func() time.Time) (FieldCondition, error) {
 	switch val := v.(type) {
 	case []any:
 		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: val}}}, nil
 	case map[string]any:
 		if isOperatorMap(val) {
-			return buildOperators(val, path)
+			return buildOperators(val, path, now)
 		}
 		children := make(map[string]FieldCondition, len(val))
 		for field, child := range val {
-			childCond, err := parseFieldCondition(path+"."+field, child)
+			childCond, err := parseFieldCondition(path+"."+field, child, now)
 			if err != nil {
 				return FieldCondition{}, err
 			}
@@ -466,7 +587,16 @@ func parseFieldCondition(path string, v any) (FieldCondition, error) {
 // rejected with a pointing error rather than silently ignored. This asymmetry is
 // deliberate: a missing operator key is a legitimate "this operator not used";
 // a non-boolean exists value is almost certainly a template authoring mistake.
-func buildOperators(m map[string]any, path string) (FieldCondition, error) {
+//
+// gt/gte/lt/lte are NEW operators with no legacy convention to preserve, so they
+// are validated strictly like exists. Each operand must be either a number (any
+// numeric kind — compared numerically) or a `now`-relative expression string
+// (validated with parseNowOperand). Anything else — null, a bool, a map, a
+// plain non-now string such as "hello" or a literal RFC3339 timestamp — is
+// rejected rather than silently ignored. A literal timestamp string is NOT
+// treated as a date; only the exact `now`/`now±duration` syntax triggers
+// temporal comparison, so rejecting anything-but is the honest, fail-fast choice.
+func buildOperators(m map[string]any, path string, now func() time.Time) (FieldCondition, error) {
 	var matchers []ValueMatcher
 	if vals, ok := m["equals"].([]any); ok {
 		matchers = append(matchers, equalityMatcher{values: vals})
@@ -486,7 +616,87 @@ func buildOperators(m map[string]any, path string) (FieldCondition, error) {
 		}
 		matchers = append(matchers, existsMatcher{want: want})
 	}
+	for _, op := range []struct {
+		key string
+		op  comparisonOp
+	}{{key: "gt", op: opGt}, {key: "gte", op: opGte}, {key: "lt", op: opLt}, {key: "lte", op: opLte}} {
+		if raw, ok := m[op.key]; ok {
+			built, err := buildComparison(op.key, op.op, raw, path, now)
+			if err != nil {
+				return FieldCondition{}, err
+			}
+			matchers = append(matchers, built...)
+		}
+	}
 	return FieldCondition{Operators: matchers}, nil
+}
+
+// buildComparison converts a gt/gte/lt/lte operand into one comparisonMatcher per
+// operand (a list means OR across operands — the same field-level OR that
+// match() already applies to multiple matchers, so emitting several is the
+// natural fit). Validation is strict and names the field path on error.
+func buildComparison(key string, op comparisonOp, raw any, path string, now func() time.Time) ([]ValueMatcher, error) {
+	// A scalar is treated as a single-element operand list.
+	norms := make([]any, 0, 1)
+	switch v := raw.(type) {
+	case []any:
+		if len(v) == 0 {
+			return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got an empty list",
+				path, key, "now ± duration")
+		}
+		norms = v
+	case nil:
+		return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got null",
+			path, key, "now ± duration")
+	default:
+		norms = append(norms, v)
+	}
+
+	for _, bound := range norms {
+		switch bound := bound.(type) {
+		case string:
+			// The ONLY strings allowed are valid `now`/`now±duration` expressions.
+			// Anything else — a literal timestamp, "hello", "abc" — is rejected
+			// rather than silently never-matching. Validation is pure syntax: it
+			// records only the relative offset and never consults a clock.
+			_, temporal, err := parseNowOperand(bound)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %s: %v", path, key, err)
+			}
+			if !temporal {
+				return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got %q",
+					path, key, "now ± duration", bound)
+			}
+		case nil:
+			return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got null",
+				path, key, "now ± duration")
+		default:
+			if !isNumeric(bound) {
+				return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got %v",
+					path, key, "now ± duration", bound)
+			}
+		}
+	}
+
+	matchers := make([]ValueMatcher, 0, len(norms))
+	for _, bound := range norms {
+		m := comparisonMatcher{op: op}
+		if s, ok := bound.(string); ok {
+			// Validated above; re-parsing cannot fail. The clock is stored so the
+			// cutoff is computed from it at match time; the relative duration's
+			// sign is already baked in, so now.Add(durNow) shifts the cutoff
+			// correctly (now-5m -> the cutoff is 5 minutes in the past).
+			d, _, _ := parseNowOperand(s)
+			m.kind = nowComparison
+			m.durNow = d
+			m.now = now
+		} else {
+			m.kind = numericComparison
+			m.numBound, _ = toFloat(bound)
+		}
+		matchers = append(matchers, m)
+	}
+	return matchers, nil
 }
 
 // isOperatorMap reports whether the map has only operator keys. If so, it is a
@@ -512,4 +722,54 @@ func toStrings(vals []any) []string {
 		}
 	}
 	return out
+}
+
+// parseNowOperand interprets a comparison operand string as either a plain
+// string (returns (0, false, nil)) or a `now`-relative expression. It is a pure
+// syntax function and never consults a clock: it validates the `now`-syntax and
+// records only the RELATIVE offset, with the sign baked in. Computing the actual
+// cutoff (clock().Add(offset)) is deferred to match time via comparisonMatcher.
+//
+// Accepted forms (no whitespace anywhere):
+//
+//	"now"        -> (0, true) — zero offset; cutoff = clock()
+//	"now±DUR"    -> (±DUR, true), where DUR is a non-empty time.ParseDuration
+//	                           and the sign is baked in (e.g. "now-5m" -> -5m)
+//
+// Everything else is "not a temporal operand":
+//
+//	"hello", "2026-09-12T10:00:00Z", etc. -> (0, false, nil)
+//
+// Malformed expressions that look like a `now` operand are an error rather than
+// silently non-temporal, so a typo is caught at parse time instead of becoming a
+// rule that never matches:
+//
+//	"now-"  -> error ("-" followed by nothing)
+//	"now+"  -> error
+//	"now-foo" -> error (duration "foo" fails ParseDuration)
+//	"now - 5m" -> error (the expression must have no interior whitespace)
+//	"now--5m" -> error (a sign directly after the leading sign is not a valid
+//	                    duration; now--5m would otherwise silently mean now+5m)
+func parseNowOperand(value string) (time.Duration, bool, error) {
+	if value == "now" {
+		return 0, true, nil
+	}
+	if !strings.HasPrefix(value, "now") {
+		return 0, false, nil
+	}
+	// Only "+" or "-" may follow "now"; anything else (a space, another letter)
+	// is malformed. value[3:] keeps the sign as part of the duration text so the
+	// minus of now-5m and plus of now+5m survive: ParseDuration("-5m") = -5m,
+	// ParseDuration("+5m") = 5m. A bare "-"/"+"/"", and the double-sign typo
+	// now--5m ("--5m"), all fail ParseDuration and are rejected rather than
+	// silently mis-arithmetic.
+	if len(value) < 4 || (value[3] != '+' && value[3] != '-') {
+		return 0, true, fmt.Errorf("invalid now expression %q: expected %q or %q followed by a duration",
+			value, "now", "now±duration")
+	}
+	d, err := time.ParseDuration(value[3:])
+	if err != nil {
+		return 0, true, fmt.Errorf("invalid now expression %q: %v", value, err)
+	}
+	return d, true, nil
 }
