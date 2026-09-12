@@ -390,36 +390,38 @@ A pattern is a tree of field conditions:
 | `prefix` | String value starts with any of the listed prefixes.                |
 | `suffix` | String value ends with any of the listed suffixes.                  |
 | `exists` | Key presence check. Takes a boolean, not a list.                    |
-| `gt`     | Value is greater than a numeric threshold or `now`-relative cutoff.  |
-| `gte`    | Value is greater than or equal (numeric or `now` cutoff).           |
-| `lt`     | Value is less than a numeric threshold or `now`-relative cutoff.    |
-| `lte`    | Value is less than or equal (numeric or `now` cutoff).              |
+| `gt`     | Value is greater than a numeric threshold or `now()`-relative cutoff.      |
+| `gte`    | Value is greater than or equal (numeric or `now()` cutoff).               |
+| `lt`     | Value is less than a numeric threshold or `now()`-relative cutoff.       |
+| `lte`    | Value is less than or equal (numeric or `now()` cutoff).                 |
 
 #### Comparison operators (gt/gte/lt/lte)
 
 `gt`, `gte`, `lt`, and `lte` take either a **number** (compared numerically) or
-a **`now`-relative expression** (compared as instants). Operands may be a list,
-in which case the value matches if any operand holds (ordinary OR).
+a **`now()`-relative expression** (compared as instants). Operands may be a
+list, in which case the value matches if any operand holds (ordinary OR).
 
 ```yaml
 pattern:
   new_image:
     created_at:
-      gt: "now-5m"
+      gt: "now()-5m"
 ```
 
-- `now` expressions: `now`, `now-5m`, `now+10m`, `now-1h`, `now+24h`, and any
-  Go `time.ParseDuration` suffix (compound forms like `1h30m` are fine). They
-  are evaluated as a UTC instant **at match time** (never at template load), so
-  the cutoff moves as time passes. `now+0s` (zero offset) is valid.
-- Only the exact `now`/`now±duration` syntax triggers temporal comparison. The
-  event value must be an **RFC3339 string**; offsets are respected and values
-  are compared as instants, not lexicographically. A numeric operand stays
-  purely numeric.
+- `now()` expressions: `now()`, `now()-5m`, `now()+10m`, `now()-1h`,
+  `now()+24h`, and any Go `time.ParseDuration` suffix (compound forms like
+  `now()-1h30m` are fine). They are evaluated as a UTC instant **at match time**
+  (never at template load), so the cutoff moves as time passes. `now()+0s` (zero
+  offset) is valid.
+- Only the exact `now()`/`now()±duration` syntax triggers temporal comparison.
+  The event value must be an **RFC3339 string**; offsets are respected and
+  values are compared as instants, not lexicographically. A numeric operand
+  stays purely numeric.
 - The template pattern never accepts an arbitrary timestamp string (e.g.
-  `gt: "2026-09-12T10:00:00Z"`); only `now` expressions are valid string
+  `gt: "2026-09-12T10:00:00Z"`); only `now()`-syntax is valid for string
   operands, and anything else fails template validation rather than silently
-  never matching.
+  never matching. The old bare `now` / `now-5m` syntax is **not** accepted and
+  is a validation error; rewrite it as `now()` / `now()-5m`.
 - A missing, `null`, non-string, or invalid-RFC3339 event value never matches a
   temporal comparison (and never panics).
 
@@ -432,10 +434,10 @@ pattern:
   age:
     gt: 18               # numeric: value > 18
   created_at:
-    gt: "now-5m"         # temporal: value after (now - 5m)
+    gt: "now()-5m"       # temporal: value after (now() - 5m)
   updated_at:
-    gte: "now-1h"
-    lt: "now"            # two operators on one field are OR, not a range
+    gte: "now()-1h"
+    lt: "now()"          # two operators on one field are OR, not a range
 ```
 
 `exists` checks **key presence only** — the value is irrelevant. `null` still

@@ -189,7 +189,7 @@ func (m existsMatcher) Match(value any) bool { return m.want }
 func (m existsMatcher) MatchPresent(present bool) bool { return present == m.want }
 
 // comparisonKind selects how a comparisonMatcher treats its operand: either as a
-// fixed numeric threshold, or as a `now`-relative cutoff re-evaluated from the
+// fixed numeric threshold, or as a `now()`-relative cutoff re-evaluated from the
 // clock at match time.
 type comparisonKind int
 
@@ -200,7 +200,7 @@ const (
 
 // comparisonMatcher implements one of the ordering operators gt/gte/lt/lte. Its
 // operand list is OR: the value matches if ANY operand compares true. When the
-// operand is temporal (a `now`-relative string), the cutoff is recomputed from
+// operand is temporal (a `now()`-relative string), the cutoff is recomputed from
 // the injected clock at match time — never at template load — so the rule stays
 // dynamic.
 //
@@ -293,13 +293,13 @@ func (m comparisonMatcher) Match(value any) bool {
 
 // ParseTemplate builds a Template from raw YAML, validating the runtime and
 // every rule's handler. It is the production entry point and uses the real wall
-// clock for temporal (`now`-relative) comparisons, computed per match at
+// clock for temporal (`now()`-relative) comparisons, computed per match at
 // run time. Tests that need a pinned clock call parseTemplateWithClock instead.
 func ParseTemplate(data []byte) (*Template, error) {
 	return parseTemplateWithClock(data, time.Now().UTC)
 }
 
-// parseTemplateWithClock is ParseTemplate with an explicit clock for `now`
+// parseTemplateWithClock is ParseTemplate with an explicit clock for `now()`
 // -relative comparison operators. It is the single construction point for the
 // temporal clock seam: every comparisonMatcher derives its clock from the one
 // supplied here (or defaults to time.Now().UTC when nil), so temporal rules
@@ -590,11 +590,11 @@ func parseFieldCondition(path string, v any, now func() time.Time) (FieldConditi
 //
 // gt/gte/lt/lte are NEW operators with no legacy convention to preserve, so they
 // are validated strictly like exists. Each operand must be either a number (any
-// numeric kind — compared numerically) or a `now`-relative expression string
+// numeric kind — compared numerically) or a `now()`-relative expression string
 // (validated with parseNowOperand). Anything else — null, a bool, a map, a
 // plain non-now string such as "hello" or a literal RFC3339 timestamp — is
 // rejected rather than silently ignored. A literal timestamp string is NOT
-// treated as a date; only the exact `now`/`now±duration` syntax triggers
+// treated as a date; only the exact `now()`/`now()±duration` syntax triggers
 // temporal comparison, so rejecting anything-but is the honest, fail-fast choice.
 func buildOperators(m map[string]any, path string, now func() time.Time) (FieldCondition, error) {
 	var matchers []ValueMatcher
@@ -641,13 +641,13 @@ func buildComparison(key string, op comparisonOp, raw any, path string, now func
 	switch v := raw.(type) {
 	case []any:
 		if len(v) == 0 {
-			return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got an empty list",
-				path, key, "now ± duration")
+			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got an empty list`,
+				path, key)
 		}
 		norms = v
 	case nil:
-		return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got null",
-			path, key, "now ± duration")
+		return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got null`,
+			path, key)
 	default:
 		norms = append(norms, v)
 	}
@@ -655,25 +655,26 @@ func buildComparison(key string, op comparisonOp, raw any, path string, now func
 	for _, bound := range norms {
 		switch bound := bound.(type) {
 		case string:
-			// The ONLY strings allowed are valid `now`/`now±duration` expressions.
-			// Anything else — a literal timestamp, "hello", "abc" — is rejected
-			// rather than silently never-matching. Validation is pure syntax: it
-			// records only the relative offset and never consults a clock.
+			// The ONLY strings allowed are valid `now()`/`now()±duration`
+			// expressions. Anything else — a literal timestamp, "hello", "abc",
+			// or the removed bare `now` syntax — is rejected rather than
+			// silently never-matching. Validation is pure syntax: it records
+			// only the relative offset and never consults a clock.
 			_, temporal, err := parseNowOperand(bound)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %s: %v", path, key, err)
 			}
 			if !temporal {
-				return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got %q",
-					path, key, "now ± duration", bound)
+				return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %q`,
+					path, key, bound)
 			}
 		case nil:
-			return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got null",
-				path, key, "now ± duration")
+			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got null`,
+				path, key)
 		default:
 			if !isNumeric(bound) {
-				return nil, fmt.Errorf("%s: %s operand must be a number or a %q expression, got %v",
-					path, key, "now ± duration", bound)
+				return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %v`,
+					path, key, bound)
 			}
 		}
 	}
@@ -685,7 +686,7 @@ func buildComparison(key string, op comparisonOp, raw any, path string, now func
 			// Validated above; re-parsing cannot fail. The clock is stored so the
 			// cutoff is computed from it at match time; the relative duration's
 			// sign is already baked in, so now.Add(durNow) shifts the cutoff
-			// correctly (now-5m -> the cutoff is 5 minutes in the past).
+			// correctly (now()-5m -> the cutoff is 5 minutes in the past).
 			d, _, _ := parseNowOperand(s)
 			m.kind = nowComparison
 			m.durNow = d
@@ -725,51 +726,61 @@ func toStrings(vals []any) []string {
 }
 
 // parseNowOperand interprets a comparison operand string as either a plain
-// string (returns (0, false, nil)) or a `now`-relative expression. It is a pure
-// syntax function and never consults a clock: it validates the `now`-syntax and
-// records only the RELATIVE offset, with the sign baked in. Computing the actual
-// cutoff (clock().Add(offset)) is deferred to match time via comparisonMatcher.
+// string (returns (0, false, nil)) or a `now()`-relative expression. It is a
+// pure syntax function and never consults a clock: it validates the `now()`
+// syntax and records only the RELATIVE offset, with the sign baked in.
+// Computing the actual cutoff (clock().Add(offset)) is deferred to match time
+// via comparisonMatcher.
 //
 // Accepted forms (no whitespace anywhere):
 //
-//	"now"        -> (0, true) — zero offset; cutoff = clock()
-//	"now±DUR"    -> (±DUR, true), where DUR is a non-empty time.ParseDuration
-//	                           and the sign is baked in (e.g. "now-5m" -> -5m)
+//	"now()"     -> (0, true) — zero offset; cutoff = clock()
+//	"now()±DUR" -> (±DUR, true), where DUR is a non-empty time.ParseDuration
+//	                            and the sign is baked in (e.g. "now()-5m" -> -5m)
 //
 // Everything else is "not a temporal operand":
 //
-//	"hello", "2026-09-12T10:00:00Z", etc. -> (0, false, nil)
+//	"hello", "now", "now-5m", "NOW()", "2026-09-12T10:00:00Z" -> (0, false, nil)
 //
-// Malformed expressions that look like a `now` operand are an error rather than
-// silently non-temporal, so a typo is caught at parse time instead of becoming a
-// rule that never matches:
+// Note: the removed bare `now`/`now±duration` syntax (without the parentheses)
+// no longer parses as temporal — it falls into the "not a temporal operand"
+// branch above. The caller (buildComparison) rejects it as a non-number,
+// non-`now()` string, so `gt: "now-5m"` is a parse-time validation error rather
+// than a rule that silently never matches or is interpreted as a date.
 //
-//	"now-"  -> error ("-" followed by nothing)
-//	"now+"  -> error
-//	"now-foo" -> error (duration "foo" fails ParseDuration)
-//	"now - 5m" -> error (the expression must have no interior whitespace)
-//	"now--5m" -> error (a sign directly after the leading sign is not a valid
-//	                    duration; now--5m would otherwise silently mean now+5m)
+// Malformed expressions that look like a `now()` operand are an error rather
+// than silently non-temporal, so a typo is caught at parse time instead of
+// becoming a rule that never matches:
+//
+//	"now()-"   -> error ("-" followed by nothing)
+//	"now()+"   -> error
+//	"now()-foo" -> error (duration "foo" fails ParseDuration)
+//	"now() - 5m" -> error (the expression must have no interior whitespace)
+//	"now()--5m" -> error (a sign directly after the leading sign is not a valid
+//	                      duration; now()--5m would otherwise silently mean
+//	                      now()+5m)
+//	"now()5m"  -> error (a duration must be preceded by '+' or '-')
+//	"now() "   -> error (trailing whitespace is not a valid duration)
 func parseNowOperand(value string) (time.Duration, bool, error) {
-	if value == "now" {
+	if value == "now()" {
 		return 0, true, nil
 	}
-	if !strings.HasPrefix(value, "now") {
+	if !strings.HasPrefix(value, "now()") {
 		return 0, false, nil
 	}
-	// Only "+" or "-" may follow "now"; anything else (a space, another letter)
-	// is malformed. value[3:] keeps the sign as part of the duration text so the
-	// minus of now-5m and plus of now+5m survive: ParseDuration("-5m") = -5m,
-	// ParseDuration("+5m") = 5m. A bare "-"/"+"/"", and the double-sign typo
-	// now--5m ("--5m"), all fail ParseDuration and are rejected rather than
+	// Only "+" or "-" may follow "now()"; anything else (a space, a letter) is
+	// malformed. value[5:] keeps the sign as part of the duration text so the
+	// minus of now()-5m and plus of now()+5m survive: ParseDuration("-5m") =
+	// -5m, ParseDuration("+5m") = 5m. A bare "-"/"+", and the double-sign typo
+	// now()--5m ("--5m"), all fail ParseDuration and are rejected rather than
 	// silently mis-arithmetic.
-	if len(value) < 4 || (value[3] != '+' && value[3] != '-') {
-		return 0, true, fmt.Errorf("invalid now expression %q: expected %q or %q followed by a duration",
-			value, "now", "now±duration")
+	if len(value) < 6 || (value[5] != '+' && value[5] != '-') {
+		return 0, true, fmt.Errorf("invalid now() expression %q: expected %q or %q followed by a duration",
+			value, "now()", "now()±duration")
 	}
-	d, err := time.ParseDuration(value[3:])
+	d, err := time.ParseDuration(value[5:])
 	if err != nil {
-		return 0, true, fmt.Errorf("invalid now expression %q: %v", value, err)
+		return 0, true, fmt.Errorf("invalid now() expression %q: %v", value, err)
 	}
 	return d, true, nil
 }
