@@ -103,7 +103,7 @@ func (s *Server) Start() error {
 		return errors.New("metrics: nil Server")
 	}
 	if !s.started.CompareAndSwap(false, true) {
-		return errors.New("metrics server already started")
+		return errors.New("Metrics server already started")
 	}
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {

@@ -259,7 +259,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	// so the test can assert it stops promptly on cancel.
 	metricsServer := metrics.NewServer(cfg.metricsAddr, metricsInstance.Handler(), logger)
 	if err := metricsServer.Start(); err != nil {
-		t.Fatalf("metrics server start: %v", err)
+		t.Fatalf("Metrics server start: %v", err)
 	}
 	metricsDone := make(chan error, 1)
 	go func() {
@@ -534,10 +534,10 @@ export async function slow(event) {
 	select {
 	case err := <-env.metricsDone:
 		if err != nil && err != context.Canceled {
-			t.Fatalf("metrics server error: %v", err)
+			t.Fatalf("Metrics server error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("metrics server did not stop on cancel")
+		t.Fatal("Metrics server did not stop on cancel")
 	}
 	select {
 	case <-env.statsDone:

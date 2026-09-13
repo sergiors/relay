@@ -70,7 +70,7 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 			resp.Body.Close()
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("metrics server never became scrapeable: %v", err)
+			t.Fatalf("Metrics server never became scrapeable: %v", err)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

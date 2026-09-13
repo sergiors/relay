@@ -52,7 +52,7 @@ func TestMetricsLoggerTicksAndStopsOnCancel(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(lines[0], "metrics events_received_total count=1") {
+	if !strings.Contains(lines[0], "Metrics events_received_total count=1") {
 		t.Fatalf("unexpected first log line: %q", lines[0])
 	}
 }

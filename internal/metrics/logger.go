@@ -61,7 +61,7 @@ func (ml *MetricsLogger) Start(ctx context.Context) {
 			}
 			for _, line := range strings.Split(s, "\n") {
 				if ml.logf != nil {
-					ml.logf("metrics %s", line)
+					ml.logf("Metrics %s", line)
 				}
 			}
 		}
