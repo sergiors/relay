@@ -44,7 +44,7 @@ func healthCommand(logger *log.Logger) *cli.Command {
 func runHealthCommand(ctx context.Context, w io.Writer, logger *log.Logger) error {
 	// The health command loads the full configuration via config.Load(logger),
 	// the same entry point the worker's `relay start` uses. A missing required
-	// variable (REDIS_ADDR/REDIS_STREAM/REDIS_GROUP) or an unresolvable
+	// variable (REDIS_URI/REDIS_STREAM/REDIS_GROUP) or an unresolvable
 	// hostname therefore exits via logger.Fatalf, matching the worker's
 	// fail-fast behavior: the healthcheck fails hard rather than probing with
 	// nothing (or half) configured. This IS a behavior change — `relay health`
@@ -54,7 +54,7 @@ func runHealthCommand(ctx context.Context, w io.Writer, logger *log.Logger) erro
 	// hand-picked subset. A malformed DSN is surfaced by RedisOptions below.
 	redisCheck := func() error {
 		cfg := config.Load(logger)
-		redisOpts, err := config.RedisOptions(cfg.RedisAddr)
+		redisOpts, err := config.RedisOptions(cfg.RedisURI)
 		if err != nil {
 			return fmt.Errorf("redis config: %w", err)
 		}

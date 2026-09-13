@@ -99,7 +99,7 @@ services:
       - socket-proxy
     environment:
       - DOCKER_HOST=tcp://socket-proxy:2375
-      - REDIS_ADDR=redis:6379
+      - REDIS_URI=redis:6379
 ```
 
 > **Security warning: the Docker socket is privileged.**
@@ -149,7 +149,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 | Env var                  | Required | Description                                          |
 | ------------------------ | -------- | ---------------------------------------------------- |
-| `REDIS_ADDR`             | yes      | Redis address or DSN (see below).                    |
+| `REDIS_URI`              | yes      | Redis address or DSN (see below).                    |
 | `REDIS_STREAM`           | yes      | Redis stream to consume.                             |
 | `REDIS_GROUP`            | yes      | Consumer group name.                                 |
 | `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.    |
@@ -193,7 +193,7 @@ Unset or empty `REDIS_STREAM_RETENTION` disables retention entirely (no
 goroutine, no trims). A malformed duration or a zero/negative value fails
 startup like any other configuration error.
 
-`REDIS_ADDR` accepts either a plain address or a Redis DSN:
+`REDIS_URI` accepts either a plain address or a Redis DSN:
 
 - `host:port` (e.g. `redis:6379`)
 - `redis://user:password@host:port`
@@ -207,7 +207,7 @@ startup like any other configuration error.
 
 `relay health` is an operational/container healthcheck command. It checks the
 two dependencies the runtime needs at startup — Redis connectivity (a PING to
-`REDIS_ADDR`) and Docker daemon connectivity (an Engine API Ping) — and exits
+`REDIS_URI`) and Docker daemon connectivity (an Engine API Ping) — and exits
 `0` when both are reachable, `1` otherwise (reporting the first failing check to
 stderr). It is **not** a public API and no HTTP server runs; it only creates
 clients and pings, so it never starts consumption, loads functions, builds

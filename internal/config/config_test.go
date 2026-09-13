@@ -16,7 +16,7 @@ import (
 // exercising (and clear it where a missing-required-var case is under test).
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("REDIS_URI", "redis:6379")
 	t.Setenv("REDIS_STREAM", "stream")
 	t.Setenv("REDIS_GROUP", "group")
 }
@@ -40,7 +40,7 @@ func TestLoadResolvesFields(t *testing.T) {
 	t.Setenv("METRICS_ADDR", ":9090")
 
 	cfg := Load(log.New(io.Discard, "", 0))
-	if cfg.RedisAddr != "redis:6379" || cfg.RedisStream != "stream" || cfg.RedisGroup != "group" {
+	if cfg.RedisURI != "redis:6379" || cfg.RedisStream != "stream" || cfg.RedisGroup != "group" {
 		t.Fatalf("redis fields = %+v, want address/stream/group sentinels", cfg)
 	}
 	if cfg.StreamRetention != 6*time.Hour {
@@ -144,7 +144,7 @@ func TestLoadFatalOnMissing(t *testing.T) {
 		missEnv string
 		wantVar string
 	}{
-		{"REDIS_ADDR", "REDIS_ADDR"},
+		{"REDIS_URI", "REDIS_URI"},
 		{"REDIS_STREAM", "REDIS_STREAM"},
 		{"REDIS_GROUP", "REDIS_GROUP"},
 	} {

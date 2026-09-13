@@ -46,8 +46,8 @@ func Run(logger *log.Logger) {
 	// or a redis(s):// URL — still fails fast here with a redacted message
 	// rather than silently connecting to the wrong host.
 	cfg := config.Load(logger)
-	// Resolve the Redis client options from cfg.RedisAddr.
-	redisOpts, err := config.RedisOptions(cfg.RedisAddr)
+	// Resolve the Redis client options from cfg.RedisURI.
+	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
 		logger.Fatalf("Redis config: %v", err)
 	}

@@ -142,7 +142,7 @@ func WaitFor(t *testing.T, timeout time.Duration, what string, pred func() bool)
 // uses, but with the FULL wiring including the real Consume loop and real Docker
 // execution).
 type workerConfig struct {
-	redisAddr    string
+	redisURI     string
 	stream       string
 	group        string
 	consumerName string
@@ -181,7 +181,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	buf := &syncBuffer{}
 	logger := log.New(buf, "", 0)
 
-	client := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
+	client := redis.NewClient(&redis.Options{Addr: cfg.redisURI})
 	t.Cleanup(func() { _ = client.Close() })
 
 	m := metrics.New()
@@ -424,7 +424,7 @@ func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 	requireRedis(t)
 	dcli := requireDocker(t)
 
-	redisAddr := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	redisURI := envOr("REDIS_TEST_ADDR", "localhost:6379")
 	prefix := fmt.Sprintf("shutdown-itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
@@ -467,7 +467,7 @@ export async function slow(event) {
 `)
 
 	env := startWorker(t, workerConfig{
-		redisAddr: redisAddr, stream: streamName, group: groupName,
+		redisURI: redisURI, stream: streamName, group: groupName,
 		consumerName: consumerName, fnRoot: fnRoot, statePath: statePath,
 		metricsAddr: metricsAddr,
 	})

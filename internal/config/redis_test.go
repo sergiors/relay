@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestRedisOptions covers the two accepted REDIS_ADDR forms: a plain
+// TestRedisOptions covers the two accepted REDIS_URI forms: a plain
 // host:port address (backward compatible) and a redis(s):// DSN. DSNs are
 // parsed with redis.ParseURL, so the resulting options carry the parsed
 // username, password, and (for rediss) TLS config.

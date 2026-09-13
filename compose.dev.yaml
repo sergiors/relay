@@ -43,7 +43,7 @@ services:
     ports:
       - 9090:9090
     environment:
-      - REDIS_ADDR=redis:6379
+      - REDIS_URI=redis:6379
       - REDIS_STREAM=events
       - REDIS_GROUP=relay
       - METRICS_ADDR=:9090

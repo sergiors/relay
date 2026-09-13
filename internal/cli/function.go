@@ -21,7 +21,7 @@ var statePath = state.DBPath
 
 // functionCommand builds the read-only `relay function ...` subcommand family.
 // It touches the local state database only — never Redis, Docker, or the
-// /functions loader — so it works with no REDIS_ADDR and no worker reachable.
+// /functions loader — so it works with no REDIS_URI and no worker reachable.
 func functionCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "function",

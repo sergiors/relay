@@ -15,7 +15,7 @@ import (
 // statsCommand builds the read-only `relay stats` subcommand. It reads the
 // operational snapshot from the local state database and renders it to stdout.
 // The command touches only the state database — never Redis, Docker, or the
-// worker — so it works with no REDIS_ADDR set. A missing or unreadable stats
+// worker — so it works with no REDIS_URI set. A missing or unreadable stats
 // row renders a zero snapshot rather than failing, so an empty state database
 // always produces sensible output with exit 0.
 func statsCommand() *cli.Command {

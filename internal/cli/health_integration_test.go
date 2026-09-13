@@ -89,10 +89,10 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 	// The health command loads full config via config.Load, which exits via
 	// logger.Fatalf when a required REDIS_* variable is missing, so provide a
 	// discard logger and set all three required variables (REDIS_STREAM and
-	// REDIS_GROUP need only be non-empty; only REDIS_ADDR is pinged).
+	// REDIS_GROUP need only be non-empty; only REDIS_URI is pinged).
 	logger := log.New(io.Discard, "", 0)
-	redisAddr := envOr("REDIS_TEST_ADDR", "localhost:6379")
-	t.Setenv("REDIS_ADDR", redisAddr)
+	redisURI := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	t.Setenv("REDIS_URI", redisURI)
 	t.Setenv("REDIS_STREAM", "health-itest-stream")
 	t.Setenv("REDIS_GROUP", "health-itest-group")
 
@@ -103,7 +103,7 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 	}
 
 	// A dead Redis address must fail the redis check.
-	t.Setenv("REDIS_ADDR", "127.0.0.1:1")
+	t.Setenv("REDIS_URI", "127.0.0.1:1")
 	if err := runHealthCommand(context.Background(), &writer, logger); err == nil {
 		t.Fatal("health with unreachable redis should have failed")
 	}

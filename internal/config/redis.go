@@ -13,7 +13,7 @@ func RedisOptions(addr string) (*redis.Options, error) {
 		opts, err := redis.ParseURL(addr)
 		if err != nil {
 			// Do not wrap the parse error because it may contain credentials.
-			return nil, errors.New("redis: invalid REDIS_ADDR DSN (credentials not shown)")
+			return nil, errors.New("redis: invalid REDIS_URI DSN (credentials not shown)")
 		}
 		return opts, nil
 	}

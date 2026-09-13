@@ -17,7 +17,7 @@ import (
 // and the two optional values (StreamRetention, MetricsAddr) are zero when
 // disabled, so gating on non-zero / non-empty keeps them opt-in.
 type Config struct {
-	RedisAddr       string
+	RedisURI        string
 	RedisStream     string
 	RedisGroup      string
 	ConsumerName    string
@@ -41,7 +41,7 @@ type Config struct {
 // semantics through the caller's non-zero / non-empty guards.
 func Load(logger *log.Logger) Config {
 	return Config{
-		RedisAddr:       requiredEnv(logger, "REDIS_ADDR"),
+		RedisURI:        requiredEnv(logger, "REDIS_URI"),
 		RedisStream:     requiredEnv(logger, "REDIS_STREAM"),
 		RedisGroup:      requiredEnv(logger, "REDIS_GROUP"),
 		ConsumerName:    consumerNameFromHost(logger),
