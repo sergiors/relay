@@ -569,8 +569,8 @@ export async function slow(event) {
 	}
 
 	// The stream layer must log the shutdown-cancel path.
-	if !strings.Contains(env.buf.String(), "handler canceled during shutdown; leaving pending") {
-		t.Error("expected 'handler canceled during shutdown; leaving pending' log line")
+	if !strings.Contains(env.buf.String(), "Handler canceled during shutdown; leaving pending") {
+		t.Error("expected 'Handler canceled during shutdown; leaving pending' log line")
 	}
 
 	// Recovery: a SECOND consumer (new name, same stream/group) with fast reclaim

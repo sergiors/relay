@@ -515,7 +515,7 @@ type invocationState struct {
 func (p *invocationState) IsComplete(invocation string) bool {
 	done, err := p.store.completed(p.ctx, p.stream, p.group, p.msgID, invocation)
 	if err != nil {
-		p.log.Printf("invocation state: read %q: %v; treating as not completed", invocation, err)
+		p.log.Printf("Invocation state: read %q: %v; treating as not completed", invocation, err)
 		return false
 	}
 	return done
@@ -530,7 +530,7 @@ func (p *invocationState) IsTerminal(invocation string) bool {
 		return false
 	}
 	if err != nil {
-		p.log.Printf("invocation state: read %q: %v; treating as not terminal", invocation, err)
+		p.log.Printf("Invocation state: read %q: %v; treating as not terminal", invocation, err)
 		return false
 	}
 	kind, _, _, ok := parseInvocationState(v)
@@ -545,7 +545,7 @@ func (p *invocationState) IsTerminal(invocation string) bool {
 // bookkeeping must never become a new failure source.
 func (p *invocationState) MarkComplete(invocation string) {
 	if err := p.store.markComplete(p.ctx, p.stream, p.group, p.msgID, invocation); err != nil {
-		p.log.Printf("invocation state: mark %q: %v; message will be re-run later", invocation, err)
+		p.log.Printf("Invocation state: mark %q: %v; message will be re-run later", invocation, err)
 	}
 }
 
@@ -570,7 +570,7 @@ func (p *invocationState) TryStart(invocation string, timeout time.Duration) (st
 	now := p.now()
 	started, attempt, wait, err := p.store.tryStart(p.ctx, p.stream, p.group, p.msgID, invocation, now, now.Add(timeout))
 	if err != nil {
-		p.log.Printf("invocation state: try-start %q: %v; failing open (running)", invocation, err)
+		p.log.Printf("Invocation state: try-start %q: %v; failing open (running)", invocation, err)
 		if attempt < 1 {
 			attempt = 1
 		}
@@ -587,10 +587,10 @@ func (p *invocationState) TryStart(invocation string, timeout time.Duration) (st
 func (p *invocationState) RecordFailure(invocation string, backoff time.Duration) {
 	next, err := p.store.finishFailure(p.ctx, p.stream, p.group, p.msgID, invocation, backoff, p.now())
 	if err != nil {
-		p.log.Printf("invocation state: record failure %q: %v; leaving field as-is (eligible immediately)", invocation, err)
+		p.log.Printf("Invocation state: record failure %q: %v; leaving field as-is (eligible immediately)", invocation, err)
 		return
 	}
-	p.log.Printf("invocation state: %q failed; next attempt eligible at %s", invocation, next)
+	p.log.Printf("Invocation state: %q failed; next attempt eligible at %s", invocation, next)
 }
 
 // MarkExhausted records that the invocation's attempts are exhausted, making
@@ -598,6 +598,6 @@ func (p *invocationState) RecordFailure(invocation string, backoff time.Duration
 // delivery may re-run the invocation once (at-least-once), which is safe.
 func (p *invocationState) MarkExhausted(invocation string, attempts int) {
 	if err := p.store.markExhausted(p.ctx, p.stream, p.group, p.msgID, invocation, attempts); err != nil {
-		p.log.Printf("invocation state: mark exhausted %q: %v", invocation, err)
+		p.log.Printf("Invocation state: mark exhausted %q: %v", invocation, err)
 	}
 }

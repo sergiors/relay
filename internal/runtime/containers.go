@@ -58,14 +58,14 @@ func (m *Manager) SweepOrphanContainers(ctx context.Context, hostname string) (i
 			if firstErr == nil {
 				firstErr = err
 			}
-			m.log.Printf("orphan sweep: remove container %s (%s %s): %v",
+			m.log.Printf("Orphan sweep: remove container %s (%s %s): %v",
 				c.ID, c.Labels[labelFunction], c.Labels[labelHandler], err)
 			continue
 		}
 		removed++
 	}
 	if skippedOther > 0 {
-		m.log.Printf("orphan sweep: skipped %d container(s) owned by other hostnames", skippedOther)
+		m.log.Printf("Orphan sweep: skipped %d container(s) owned by other hostnames", skippedOther)
 	}
 	if firstErr != nil {
 		return removed, firstErr

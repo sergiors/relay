@@ -126,7 +126,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
 	if m.imageExists(ctx, image) {
-		m.log.Printf("function %q: image %s exists; reusing", fn.Name, image)
+		m.log.Printf("Function %q: image %s exists; reusing", fn.Name, image)
 		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 	}
 
@@ -141,14 +141,14 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		})
 		// Function names are validated to [a-z0-9][a-z0-9._-]* (bounded by
 		// function count), so using them as labels is low-cardinality.
-		m.log.Printf("function %q: build failed%s", fn.Name,
+		m.log.Printf("Function %q: build failed%s", fn.Name,
 			logging.Fields("function", fn.Name, "duration", d, "result", "failed"))
 		return nil, err
 	}
 	d := time.Since(start)
 	m.metrics.ObserveDurationLabels("function_build_seconds",
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
-	m.log.Printf("function %q: built%s",
+	m.log.Printf("Function %q: built%s",
 		fn.Name, logging.Fields("function", fn.Name, "duration", d, "result", "success"))
 	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 }

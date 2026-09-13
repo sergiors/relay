@@ -60,7 +60,7 @@ func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
 		s.EventsProcessedTotal, s.HandlerSuccessTotal, s.HandlerFailureTotal,
 		s.RetryTotal, s.DLQTotal, s.PendingEntries, s.OldestPendingAgeSeconds, ts)
 	if err != nil {
-		c.log.Printf("state: record stats: %v", err)
+		c.log.Printf("State: record stats: %v", err)
 	}
 }
 
@@ -125,7 +125,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 		return nil
 	})
 	if err != nil {
-		c.log.Printf("state: flush stats snapshot: %v", err)
+		c.log.Printf("State: flush stats snapshot: %v", err)
 	}
 	return err
 }
@@ -146,7 +146,7 @@ func (c *State) Stats() (Stats, bool) {
 		return Stats{}, false
 	}
 	if err != nil {
-		c.log.Printf("state: read stats: %v", err)
+		c.log.Printf("State: read stats: %v", err)
 		return Stats{}, false
 	}
 	return s, true

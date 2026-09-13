@@ -836,7 +836,7 @@ func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
 	if c.Healthy() {
 		t.Fatalf("consumer should be unhealthy during outage")
 	}
-	if !strings.Contains(buf.String(), "redis read failed") {
+	if !strings.Contains(buf.String(), "Redis read failed") {
 		t.Fatalf("expected backoff failure log, got: %q", buf.String())
 	}
 
@@ -940,7 +940,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		t.Fatalf("stop redis: %v", err)
 	}
 	WaitFor(t, 8*time.Second, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
-	if !strings.Contains(buf.String(), "redis read failed") {
+	if !strings.Contains(buf.String(), "Redis read failed") {
 		t.Fatalf("expected backoff log during outage, got: %q", buf.String())
 	}
 
@@ -979,7 +979,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 	})
 
 	// Exactly one recovery line across the whole run.
-	if got := strings.Count(buf.String(), "redis connection recovered"); got != 1 {
+	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 1 {
 		t.Fatalf("expected exactly one recovery line, got %d: %q", got, buf.String())
 	}
 

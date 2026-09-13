@@ -141,7 +141,7 @@ func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) 
 				if firstErr == nil {
 					firstErr = err
 				}
-				m.log.Printf("image cleanup: skip %s: %v", tag, err)
+				m.log.Printf("Image cleanup: skip %s: %v", tag, err)
 				continue
 			}
 			removed++

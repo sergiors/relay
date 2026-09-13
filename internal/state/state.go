@@ -317,7 +317,7 @@ func (c *State) RebuildFromFS(dir string) error {
 	for _, fn := range fns {
 		fp, ferr := function.Fingerprint(fn.Dir)
 		if ferr != nil {
-			c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
+			c.log.Printf("State: fingerprint %q: %v", fn.Name, ferr)
 			fp = ""
 		}
 		prepared = append(prepared, fpFn{fn: fn, fp: fp})
@@ -350,7 +350,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 	// errors are logged and fall back to fp="" exactly as before.
 	fp, ferr := function.Fingerprint(fn.Dir)
 	if ferr != nil {
-		c.log.Printf("state: fingerprint %q: %v", fn.Name, ferr)
+		c.log.Printf("State: fingerprint %q: %v", fn.Name, ferr)
 		fp = ""
 	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -361,7 +361,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		return replaceHandlers(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
-		c.log.Printf("state: record discovered %q: %v", fn.Name, err)
+		c.log.Printf("State: record discovered %q: %v", fn.Name, err)
 	}
 }
 
@@ -380,7 +380,7 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 		return replaceHandlers(tx, name, fn.Template)
 	})
 	if err != nil {
-		c.log.Printf("state: record success %q: %v", name, err)
+		c.log.Printf("State: record success %q: %v", name, err)
 	}
 }
 
@@ -403,7 +403,7 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 		return err
 	})
 	if err != nil {
-		c.log.Printf("state: record failure %q: %v", name, err)
+		c.log.Printf("State: record failure %q: %v", name, err)
 	}
 }
 
@@ -419,7 +419,7 @@ func (c *State) RecordSkipped(name string) {
 		return err
 	})
 	if err != nil {
-		c.log.Printf("state: record skipped %q: %v", name, err)
+		c.log.Printf("State: record skipped %q: %v", name, err)
 	}
 }
 
@@ -432,7 +432,7 @@ func (c *State) RecordRemoved(name string) {
 		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
-		c.log.Printf("state: record removed %q: %v", name, err)
+		c.log.Printf("State: record removed %q: %v", name, err)
 	}
 }
 
@@ -455,14 +455,14 @@ func (c *State) PruneRemoved(dir string) {
 	// fully consuming the query first keeps the read and write paths independent.
 	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Printf("state: prune removed: list functions: %v", err)
+		c.log.Printf("State: prune removed: list functions: %v", err)
 		return
 	}
 	var names []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Printf("state: prune removed: scan name: %v", err)
+			c.log.Printf("State: prune removed: scan name: %v", err)
 			_ = rows.Close()
 			return
 		}
@@ -477,10 +477,10 @@ func (c *State) PruneRemoved(dir string) {
 			if rerr := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
-				c.log.Printf("state: prune removed %q: %v", name, rerr)
+				c.log.Printf("State: prune removed %q: %v", name, rerr)
 				continue
 			}
-			c.log.Printf("state: function %q removed (pruned at startup)", name)
+			c.log.Printf("State: function %q removed (pruned at startup)", name)
 		}
 		// Any other stat error (permissions/I/O) is skipped: only a genuine
 		// os.IsNotExist means the function was removed from the filesystem.
@@ -515,7 +515,7 @@ func (c *State) ListFunctions() []Row {
 		 GROUP BY f.name
 		 ORDER BY f.name`)
 	if err != nil {
-		c.log.Printf("state: list functions: %v", err)
+		c.log.Printf("State: list functions: %v", err)
 		return nil
 	}
 	defer rows.Close()
@@ -523,8 +523,16 @@ func (c *State) ListFunctions() []Row {
 	var out []Row
 	for rows.Next() {
 		var r Row
-		if err := rows.Scan(&r.Name, &r.Runtime, &r.Status, &r.PreparedAt, &r.LastReconcileStatus, &r.UpdatedAt, &r.HandlerCount); err != nil {
-			c.log.Printf("state: scan list: %v", err)
+		if err := rows.Scan(
+			&r.Name,
+			&r.Runtime,
+			&r.Status,
+			&r.PreparedAt,
+			&r.LastReconcileStatus,
+			&r.UpdatedAt,
+			&r.HandlerCount,
+		); err != nil {
+			c.log.Printf("State: scan list: %v", err)
 			return out
 		}
 		out = append(out, r)
@@ -545,7 +553,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		return Detail{}, false
 	}
 	if err != nil {
-		c.log.Printf("state: get %q: %v", name, err)
+		c.log.Printf("State: get %q: %v", name, err)
 		return Detail{}, false
 	}
 	// Decode the env/secret MAPPINGS (never values). A NULL or unparseable
@@ -560,14 +568,14 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	hrows, err := c.db.QueryContext(ctx,
 		`SELECT handler, timeout FROM handlers WHERE function_name = ? ORDER BY handler`, name)
 	if err != nil {
-		c.log.Printf("state: handlers %q: %v", name, err)
+		c.log.Printf("State: handlers %q: %v", name, err)
 		return d, true
 	}
 	defer hrows.Close()
 	for hrows.Next() {
 		var hn, ht string
 		if err := hrows.Scan(&hn, &ht); err != nil {
-			c.log.Printf("state: scan handler %q: %v", name, err)
+			c.log.Printf("State: scan handler %q: %v", name, err)
 			continue
 		}
 		dur, derr := time.ParseDuration(ht)

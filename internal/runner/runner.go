@@ -334,7 +334,7 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	defer cancel()
 	tags, err := cleaner.FunctionImageTags(ctx, name)
 	if err != nil {
-		r.log.Printf("image cleanup: list function %q versions: %v", name, err)
+		r.log.Printf("Image cleanup: list function %q versions: %v", name, err)
 		return
 	}
 	for _, tag := range tags {
@@ -361,7 +361,7 @@ func (r *Runner) removeImageAsync(image string) {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		if err := cleaner.RemoveImage(ctx, image); err != nil {
-			r.log.Printf("image cleanup: remove retired %s: %v", image, err)
+			r.log.Printf("Image cleanup: remove retired %s: %v", image, err)
 		}
 	}()
 }
@@ -535,7 +535,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// ACK.
 			invocation := pf.fn.Name + "/" + rule.Handler
 			if hasState && invState.IsComplete(invocation) {
-				r.log.Printf("function %q handler %q already succeeded for event %q; skipping%s",
+				r.log.Printf("Function %q handler %q already succeeded for event %q; skipping%s",
 					pf.fn.Name, rule.Handler, msgID,
 					logging.Fields(
 						"function", pf.fn.Name,
@@ -579,7 +579,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						// invocation may still complete or fail on its own), so
 						// this is a "not eligible" skip, not a completion.
 						skippedPending = true
-						r.log.Printf("function %q handler %q not eligible for event %q (running or waiting for retry; eligible in %s)%s",
+						r.log.Printf("Function %q handler %q not eligible for event %q (running or waiting for retry; eligible in %s)%s",
 							pf.fn.Name, rule.Handler, msgID, wait,
 							logging.Fields(
 								"function", pf.fn.Name,
@@ -593,7 +593,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					} else {
 						// Terminal (exhausted): skipped like complete, never
 						// eligible again.
-						r.log.Printf("function %q handler %q exhausted for event %q; skipping%s",
+						r.log.Printf("Function %q handler %q exhausted for event %q; skipping%s",
 							pf.fn.Name, rule.Handler, msgID,
 							logging.Fields(
 								"function", pf.fn.Name,
@@ -609,7 +609,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				attempt = n
 			}
 			executed = true
-			r.log.Printf("function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
+			r.log.Printf("Function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
 				logging.Fields(
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
@@ -692,7 +692,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// exhaustion accounting stay per-invocation. The stack is kept in
 				// the message body (multi-line) since logging.Fields values must
 				// stay single-line.
-				r.log.Printf("function %q handler %q PANICKED for event %q: %v\n%s%s",
+				r.log.Printf("Function %q handler %q PANICKED for event %q: %v\n%s%s",
 					pf.fn.Name, rule.Handler, msgID, panicValue, debug.Stack(),
 					logging.Fields(
 						"function", pf.fn.Name,
@@ -721,7 +721,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
 					}, d)
-				r.log.Printf("function %q handler %q execution failed for event %q: %v%s", pf.fn.Name, rule.Handler, msgID, err,
+				r.log.Printf("Function %q handler %q execution failed for event %q: %v%s", pf.fn.Name, rule.Handler, msgID, err,
 					logging.Fields(
 						"function", pf.fn.Name,
 						"handler", rule.Handler,
@@ -773,7 +773,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					{Name: "function", Value: pf.fn.Name},
 					{Name: "handler", Value: rule.Handler},
 				}, d)
-			r.log.Printf("function %q handler %q executed for event %q%s", pf.fn.Name, rule.Handler, msgID,
+			r.log.Printf("Function %q handler %q executed for event %q%s", pf.fn.Name, rule.Handler, msgID,
 				logging.Fields(
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
@@ -825,7 +825,7 @@ func (r *Runner) recordFailure(
 		invState.MarkExhausted(invocation, attempt)
 		r.metrics.IncLabels("function_dlq_total",
 			[]metrics.Label{{Name: "function", Value: fnName}})
-		r.log.Printf("function %q handler %q exhausted after %d/%d attempts for event %q%s",
+		r.log.Printf("Function %q handler %q exhausted after %d/%d attempts for event %q%s",
 			fnName, handler, attempt, maxAttempts, msgID,
 			logging.Fields(
 				"function", fnName,
@@ -849,7 +849,7 @@ func (r *Runner) recordFailure(
 	invState.RecordFailure(invocation, backoff)
 	r.metrics.IncLabels("function_retries_total",
 		[]metrics.Label{{Name: "function", Value: fnName}})
-	r.log.Printf("function %q handler %q failed attempt %d/%d for event %q; retrying in %s%s",
+	r.log.Printf("Function %q handler %q failed attempt %d/%d for event %q; retrying in %s%s",
 		fnName, handler, attempt, maxAttempts, msgID, backoff,
 		logging.Fields(
 			"function", fnName,

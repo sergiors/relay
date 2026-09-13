@@ -109,7 +109,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		s.started.Store(false)
 		if s.logger != nil {
-			s.logger.Printf("metrics: listen %s failed: %v", s.addr, err)
+			s.logger.Printf("Metrics: listen %s failed: %v", s.addr, err)
 		}
 		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
 	}

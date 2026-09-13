@@ -191,13 +191,13 @@ func (c *Consumer) Healthy() bool {
 func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 	if err != nil && !errors.Is(err, redis.Nil) {
 		if c.healthy.Swap(false) {
-			c.log.Printf("redis read failed: %v; retrying in %s", err, delay)
+			c.log.Printf("Redis read failed: %v; retrying in %s", err, delay)
 		}
 		return
 	}
 	// Success (or redis.Nil): mark healthy and reset backoff on the transition.
 	if !c.healthy.Swap(true) {
-		c.log.Printf("redis connection recovered")
+		c.log.Printf("Redis connection recovered")
 	}
 	c.backoff.reset()
 }
@@ -331,7 +331,7 @@ func (p *PendingGaugeSource) Refresh(ctx context.Context) {
 	// Count plus the oldest pending message ID in Lower.
 	pending, err := p.client.XPending(ctx, p.stream, p.group).Result()
 	if err != nil {
-		p.log.Printf("metrics: xpending %q/%q: %v", p.stream, p.group, err)
+		p.log.Printf("Metrics: xpending %q/%q: %v", p.stream, p.group, err)
 		return
 	}
 	p.metrics.SetGauge("pending_entries", float64(pending.Count))
@@ -435,9 +435,9 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			// A pending entry whose message was deleted returns nil values; ack it
 			// only to clear the PEL — there is nothing to process.
 			if msg.Values == nil {
-				c.log.Printf("message %q: deleted from stream; acking to clear PEL", msg.ID)
+				c.log.Printf("Message %q: deleted from stream; acking to clear PEL", msg.ID)
 				if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-					c.log.Printf("message %q: ack deleted entry: %v", msg.ID, err)
+					c.log.Printf("Message %q: ack deleted entry: %v", msg.ID, err)
 				}
 				continue
 			}
@@ -454,12 +454,12 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
 				}).Result()
 				if err != nil || len(entries) == 0 {
-					c.log.Printf("message %q: beyond reclaim window and pending lookup failed (%v); skipping this tick", msg.ID, err)
+					c.log.Printf("Message %q: beyond reclaim window and pending lookup failed (%v); skipping this tick", msg.ID, err)
 					continue
 				}
 				pe = entries[0]
 			}
-			c.log.Printf("reclaimed message %q for consumer %q (idle %s, attempts %d)",
+			c.log.Printf("Reclaimed message %q for consumer %q (idle %s, attempts %d)",
 				msg.ID, c.consumer, pe.Idle, pe.RetryCount)
 			c.deliverClaimed(ctx, msg, pe.RetryCount, handler)
 		}
@@ -523,14 +523,14 @@ func (c *Consumer) processMessage(
 	// a new failure class.
 	defer func() {
 		if pv := recover(); pv != nil {
-			c.log.Printf("message %q: PANIC in handler: %v\n%s", msg.ID, pv, debug.Stack())
+			c.log.Printf("Message %q: PANIC in handler: %v\n%s", msg.ID, pv, debug.Stack())
 		}
 	}()
 	event, err := classifyMessage(msg)
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on
 		// first encounter rather than consuming retry cycles.
-		c.log.Printf("message %q: non-retryable failure (%v); routing to DLQ%s",
+		c.log.Printf("Message %q: non-retryable failure (%v); routing to DLQ%s",
 			msg.ID, err, logging.Fields(
 				"message_id", msg.ID,
 				"attempt", deliveryNum,
@@ -565,7 +565,7 @@ func (c *Consumer) processMessage(
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
 		if ctx.Err() != nil {
-			c.log.Printf("message %q: handler canceled during shutdown; leaving pending", msg.ID)
+			c.log.Printf("Message %q: handler canceled during shutdown; leaving pending", msg.ID)
 			return
 		}
 		// A protected invocation (running on another replica, or waiting out its
@@ -574,7 +574,7 @@ func (c *Consumer) processMessage(
 		// still complete or fail on its own, so the message must not be
 		// acknowledged (this is the cross-replica ACK-hazard fix).
 		if errors.Is(err, ErrInvocationNotEligible) {
-			c.log.Printf("message %q: invocation(s) not eligible (running or waiting for retry); leaving pending%s",
+			c.log.Printf("Message %q: invocation(s) not eligible (running or waiting for retry); leaving pending%s",
 				msg.ID, logging.Fields("message_id", msg.ID, "attempt", deliveryNum))
 			return
 		}
@@ -582,12 +582,12 @@ func (c *Consumer) processMessage(
 		// so the whole message is routed to the DLQ. This is the per-invocation
 		// exhaustion path that replaces the old message-level max-attempts check.
 		if errors.Is(err, ErrInvocationExhausted) {
-			c.log.Printf("message %q: invocation(s) exhausted; routing to DLQ%s",
+			c.log.Printf("Message %q: invocation(s) exhausted; routing to DLQ%s",
 				msg.ID, logging.Fields("message_id", msg.ID, "attempt", deliveryNum, "reason", err))
 			c.routeToDLQ(ctx, msg, err, deliveryNum)
 			return
 		}
-		c.log.Printf("message %q: retry %d failed: %v%s",
+		c.log.Printf("Message %q: retry %d failed: %v%s",
 			msg.ID, deliveryNum, err,
 			logging.Fields(
 				"message_id", msg.ID,
@@ -599,7 +599,7 @@ func (c *Consumer) processMessage(
 	}
 
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-		c.log.Printf("message %q: ack: %v", msg.ID, err)
+		c.log.Printf("Message %q: ack: %v", msg.ID, err)
 		c.noteOutcome(err, 0)
 		return
 	}
@@ -611,7 +611,7 @@ func (c *Consumer) processMessage(
 	// fallback cleanup.
 	if c.invocationStore != nil {
 		if err := c.invocationStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-			c.log.Printf("message %q: clear invocation state: %v", msg.ID, err)
+			c.log.Printf("Message %q: clear invocation state: %v", msg.ID, err)
 		}
 	}
 }
@@ -634,17 +634,17 @@ func (c *Consumer) routeToDLQ(
 		Stream: c.dlqStream,
 		Values: entry,
 	}).Result(); err != nil {
-		c.log.Printf("message %q: DLQ write failed (leaving pending): %v%s",
+		c.log.Printf("Message %q: DLQ write failed (leaving pending): %v%s",
 			msg.ID, err, logging.Fields("message_id", msg.ID, "attempt", attempts))
 		c.noteOutcome(err, 0)
 		return
 	}
 	c.metrics.Inc("dlq_entries_total")
-	c.log.Printf("message %q: routed to DLQ stream %q after %d attempts: %v%s",
+	c.log.Printf("Message %q: routed to DLQ stream %q after %d attempts: %v%s",
 		msg.ID, c.dlqStream, attempts, reason,
 		logging.Fields("message_id", msg.ID, "attempt", attempts, "reason", reason))
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-		c.log.Printf("message %q: ack after DLQ: %v", msg.ID, err)
+		c.log.Printf("Message %q: ack after DLQ: %v", msg.ID, err)
 		c.noteOutcome(err, 0)
 		return
 	}
@@ -655,7 +655,7 @@ func (c *Consumer) routeToDLQ(
 	// failure is logged only; the TTL is the fallback cleanup.
 	if c.invocationStore != nil {
 		if err := c.invocationStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-			c.log.Printf("message %q: clear invocation state after DLQ: %v", msg.ID, err)
+			c.log.Printf("Message %q: clear invocation state after DLQ: %v", msg.ID, err)
 		}
 	}
 }

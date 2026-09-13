@@ -82,7 +82,7 @@ func TestNoteOutcomeFailureMarksUnhealthyAndLogsOnce(t *testing.T) {
 	if c.Healthy() {
 		t.Fatalf("consumer should be unhealthy after failure")
 	}
-	if got := buf.String(); !strings.Contains(got, "redis read failed: boom; retrying in 1s") {
+	if got := buf.String(); !strings.Contains(got, "Redis read failed: boom; retrying in 1s") {
 		t.Fatalf("expected one failure log, got: %q", got)
 	}
 }
@@ -99,7 +99,7 @@ func TestNoteOutcomeSuccessRecoversAndLogsOnce(t *testing.T) {
 	if !c.Healthy() {
 		t.Fatalf("consumer should be healthy after success")
 	}
-	if got := strings.Count(buf.String(), "redis connection recovered"); got != 1 {
+	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 1 {
 		t.Fatalf("expected exactly one recovery line, got %d: %q", got, buf.String())
 	}
 }
@@ -112,7 +112,7 @@ func TestNoteOutcomeNoRecoverySpamDuringOutage(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c.noteOutcome(errors.New("boom"), time.Second)
 	}
-	if got := strings.Count(buf.String(), "redis connection recovered"); got != 0 {
+	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 0 {
 		t.Fatalf("no recovery line expected during outage, got %d", got)
 	}
 }
@@ -125,7 +125,7 @@ func TestNoteOutcomeRedisNilCountsAsSuccess(t *testing.T) {
 	if !c.Healthy() {
 		t.Fatalf("redis.Nil should count as healthy")
 	}
-	if got := strings.Count(buf.String(), "redis connection recovered"); got != 1 {
+	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 1 {
 		t.Fatalf("expected one recovery line, got %d", got)
 	}
 }

@@ -66,11 +66,11 @@ func parseRetention(logger *log.Logger, value string) time.Duration {
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		logger.Printf("redis: invalid REDIS_STREAM_RETENTION %q: %v", value, err)
+		logger.Printf("Redis: invalid REDIS_STREAM_RETENTION %q: %v", value, err)
 		return 0
 	}
 	if d <= 0 {
-		logger.Printf("redis: REDIS_STREAM_RETENTION must be positive, got %q", value)
+		logger.Printf("Redis: REDIS_STREAM_RETENTION must be positive, got %q", value)
 		return 0
 	}
 	return d
@@ -86,11 +86,11 @@ func parseRetention(logger *log.Logger, value string) time.Duration {
 func consumerNameFromHost(logger *log.Logger) string {
 	host, err := os.Hostname()
 	if err != nil {
-		logger.Fatalf("resolve consumer name: hostname unavailable: %v", err)
+		logger.Fatalf("Resolve consumer name: hostname unavailable: %v", err)
 		return ""
 	}
 	if host == "" {
-		logger.Fatalf("resolve consumer name: hostname is empty")
+		logger.Fatalf("Resolve consumer name: hostname is empty")
 		return ""
 	}
 	return host
