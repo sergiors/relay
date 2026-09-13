@@ -568,9 +568,12 @@ export async function slow(event) {
 		t.Fatal("invocation state should NOT be 'ok' after mid-handler shutdown")
 	}
 
-	// The stream layer must log the shutdown-cancel path.
-	if !strings.Contains(env.buf.String(), "Handler canceled during shutdown; leaving pending") {
-		t.Error("expected 'Handler canceled during shutdown; leaving pending' log line")
+	// The stream layer must log the shutdown-cancel path. The full message is
+	// "Message %q: handler canceled during shutdown; leaving pending" — the
+	// sentence-case convention capitalizes only the first word (Message), so
+	// "handler" mid-sentence stays lowercase; assert the mid-sentence tail.
+	if !strings.Contains(env.buf.String(), "handler canceled during shutdown; leaving pending") {
+		t.Error("expected 'Message ...: handler canceled during shutdown; leaving pending' log line")
 	}
 
 	// Recovery: a SECOND consumer (new name, same stream/group) with fast reclaim
