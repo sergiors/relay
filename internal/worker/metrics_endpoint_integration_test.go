@@ -42,15 +42,15 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 
-	m := metrics.New()
-	m.Inc("events_processed_total")
-	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
-	m.ObserveDurationLabels("handler_duration_seconds",
+	metricsInstance := metrics.New()
+	metricsInstance.Inc("events_processed_total")
+	metricsInstance.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
+	metricsInstance.ObserveDurationLabels("handler_duration_seconds",
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
-	m.SetGauge("pending_entries", 3)
+	metricsInstance.SetGauge("pending_entries", 3)
 
-	srv := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), m.Handler(), log.New(os.Stderr, "", 0))
-	if err := srv.Start(); err != nil {
+	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), log.New(os.Stderr, "", 0))
+	if err := metricsServer.Start(); err != nil {
 		t.Fatalf("server start: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 	// scrape loop above. Stop performs the bounded graceful shutdown.
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopCancel()
-	if err := srv.Stop(stopCtx); err != nil {
+	if err := metricsServer.Stop(stopCtx); err != nil {
 		t.Fatalf("server stop: %v", err)
 	}
 }

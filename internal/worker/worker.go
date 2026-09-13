@@ -54,12 +54,26 @@ func Run(logger *log.Logger) {
 	client := redis.NewClient(redisOpts)
 	defer client.Close()
 
-	// The metrics registry is wired into the runner, the runtime manager, and
-	// the stream consumer. It is nil-safe throughout, so observability can never
-	// break processing. It is process-lifetime-scoped: its counters start at 0,
-	// so after the state DB opens below we seed it from the persisted cumulative
-	// snapshot (see restorePersistedStats) before the snapshot loop starts.
-	m := metrics.New()
+	// Metrics are opt-in, gated on METRICS_ADDR (cfg.MetricsAddr): when it is
+	// set, the registry instance, the /metrics HTTP server, and the periodic
+	// snapshot logger are created, started, and stopped explicitly; when unset,
+	// none of them exist and instrumentation continues through the registry's
+	// nil-safe no-op methods (a nil *metrics.Registry passed to the runner,
+	// runtime manager, stream consumer, and stats flush never breaks
+	// processing). One lifecycle rule makes this safe: every consumer of the
+	// registry is nil-safe, AND the stats flush is gated alongside it below —
+	// a nil registry must never feed snapshotStats, or the 5s flush loop would
+	// clobber the persisted cumulative totals with zeros.
+	var metricsInstance *metrics.Registry
+	var metricsServer *metrics.Server
+	if cfg.MetricsAddr != "" {
+		metricsInstance = metrics.New()
+		metricsServer = metrics.NewServer(
+			cfg.MetricsAddr,
+			metricsInstance.Handler(),
+			logger,
+		)
+	}
 
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
@@ -102,11 +116,11 @@ func Run(logger *log.Logger) {
 	// values instead of zeroing the persisted totals. Gauges are deliberately
 	// NOT restored — they are point-in-time backlog snapshots refreshed each
 	// snapshot.
-	restorePersistedStats(m, st)
+	restorePersistedStats(metricsInstance, st)
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
-	manager, err := runtime.NewManager(logger, m, cfg.ConsumerName)
+	manager, err := runtime.NewManager(logger, metricsInstance, cfg.ConsumerName)
 	if err != nil {
 		logger.Fatalf("runtime: %v", err)
 	}
@@ -195,39 +209,47 @@ func Run(logger *log.Logger) {
 		Group:    cfg.RedisGroup,
 		Consumer: cfg.ConsumerName,
 		Log:      logger,
-		Metrics:  m,
+		Metrics:  metricsInstance,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Expose the metrics snapshot on a fixed interval until shutdown. It runs in
-	// its own goroutine and exits when ctx is cancelled. It reads the same
-	// registry the /metrics server serves (see below).
-	go metrics.NewMetricsLogger(m, metrics.DefaultLogInterval, logger.Printf).Start(ctx)
+	// Start the metrics components created in the gated block above. The
+	// logger exposes the registry snapshot on a fixed interval until shutdown
+	// (its own goroutine, exits when ctx is cancelled) and reads the same
+	// registry the /metrics server serves. The server binds synchronously and
+	// returns nil once serving, so it is safe to call here in the startup path;
+	// a bind failure (a taken metrics port) returns an error and is FATAL — the
+	// worker does not retry a temporarily occupied port, because a
+	// metrics-address conflict is a config error that should surface at startup
+	// rather than heal invisibly. Both are nil when METRICS_ADDR is unset and
+	// are simply not started.
+	var metricsLogger *metrics.MetricsLogger
+	if metricsInstance != nil {
+		metricsLogger = metrics.NewMetricsLogger(
+			metricsInstance,
+			metrics.DefaultLogInterval,
+			logger.Printf,
+		)
+		go metricsLogger.Start(ctx)
 
-	// Expose the Prometheus /metrics endpoint. It is opt-in: cfg.MetricsAddr
-	// (METRICS_ADDR) must be a non-empty listen address for the endpoint to
-	// start; unset or empty disables it entirely (no HTTP server, mirroring how
-	// an unset retention window disables trimming). Server.Start binds
-	// synchronously and returns nil once serving, so it is safe to call here in
-	// the startup path; a bind failure (a taken metrics port) returns an error
-	// and is FATAL — the worker no longer retries a temporarily occupied port,
-	// because a metrics-address conflict is a config error that should surface
-	// at startup rather than heal invisibly. Stop is called after shutdown to
-	// perform the bounded graceful close.
-	var metricsSrv *metrics.Server
-	if cfg.MetricsAddr != "" {
-		metricsSrv = metrics.NewServer(cfg.MetricsAddr, m.Handler(), logger)
-		if err := metricsSrv.Start(); err != nil {
+		if err := metricsServer.Start(); err != nil {
 			logger.Fatalf("metrics server: %v", err)
 		}
+		logger.Printf("metrics http server listening on %s", cfg.MetricsAddr)
 	}
 
 	// Flush the registry into the state database on the fixed 5-second cadence.
-	// It is nil-safe on both the registry and the state handle and stops when
-	// ctx is cancelled.
-	go statsLoop(ctx, m, st, statsFlushInterval)
+	// It is gated on the metrics instance existing: with metrics disabled there
+	// is nothing to snapshot, and a nil-registry flush would clobber the
+	// persisted cumulative totals with zeros. The loop still parks on ctx so
+	// shutdown ordering stays uniform, and it is nil-safe on the state handle.
+	if metricsInstance != nil {
+		go statsLoop(ctx, metricsInstance, st, statsFlushInterval)
+	} else {
+		go parkUntilShutdown(ctx)
+	}
 
 	// Optional internal stream retention (cfg.StreamRetention from
 	// REDIS_STREAM_RETENTION). When set, a single goroutine periodically trims
@@ -245,7 +267,7 @@ func Run(logger *log.Logger) {
 		logger.Fatalf("ensure consumer group: %v", err)
 	}
 
-	runWorker := runner.NewWithMetrics(prepared, logger, m)
+	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
 	// Stamp the relay.hostname label (the worker/consumer identity) on every
 	// execution container. Must be set before Consume begins; it is wired right
 	// after construction so all invocations carry it.
@@ -283,7 +305,7 @@ func Run(logger *log.Logger) {
 			State:  st,
 			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
 			RemoveFunction: func(name string) {
-				m.RemoveFunction(name)
+				metricsInstance.RemoveFunction(name)
 				runWorker.RemoveFunctionImages(name)
 			},
 		},
@@ -310,23 +332,32 @@ func Run(logger *log.Logger) {
 
 	// Final flush of the registry into SQLite before the deferred st.Close()
 	// runs. Bounded by a short timeout so a wedged SQLite cannot hang shutdown;
-	// failure is logged and shutdown continues (telemetry, not state).
-	finalStatsFlush(m, st)
+	// failure is logged and shutdown continues (telemetry, not state). A no-op
+	// when metrics are disabled (nil registry).
+	finalStatsFlush(metricsInstance, st)
 
-	// Bounded graceful shutdown of the metrics server (if it was started), so
-	// in-flight scrapes drain rather than being cut off mid-request. This runs
-	// after Consume returned on shutdown; the bound comes from the caller-supplied
-	// context so a wedged handler cannot hang shutdown. It is a no-op when no
-	// server was started.
-	if metricsSrv != nil {
+	// Bounded graceful shutdown of the metrics server, so in-flight scrapes
+	// drain rather than being cut off mid-request. This runs after Consume
+	// returned on shutdown; the bound comes from a short timeout context so a
+	// wedged handler cannot hang shutdown. A no-op when metrics are disabled
+	// (the server was never created).
+	if metricsServer != nil {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := metricsSrv.Stop(stopCtx); err != nil {
+		if err := metricsServer.Stop(stopCtx); err != nil {
 			logger.Printf("metrics server: graceful shutdown: %v", err)
 		}
 	}
 
 	logger.Printf("shutdown complete")
+}
+
+// parkUntilShutdown blocks until ctx is cancelled, then returns. It stands in
+// for the stats flush goroutine when metrics are disabled (there is nothing to
+// snapshot), keeping shutdown ordering uniform: every background loop the
+// worker starts either exits on ctx.Done or is explicitly stopped.
+func parkUntilShutdown(ctx context.Context) {
+	<-ctx.Done()
 }
 
 // restorePersistedStats seeds the fresh process-lifetime metrics registry with
@@ -336,19 +367,19 @@ func Run(logger *log.Logger) {
 // is nil-safe on both the registry and the state handle (a nil st means the DB
 // failed to open, so there is nothing to restore). Gauges are deliberately NOT
 // restored: they are point-in-time backlog snapshots refreshed each snapshot.
-func restorePersistedStats(m *metrics.Registry, st *state.State) {
-	if m == nil || st == nil {
+func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
+	if metricsInstance == nil || st == nil {
 		return
 	}
 	if gs, ok := st.Stats(); ok {
-		m.SeedCounter("events_processed_total", gs.EventsProcessedTotal)
-		m.SeedCounter("handler_success_total", gs.HandlerSuccessTotal)
-		m.SeedCounter("handler_failure_total", gs.HandlerFailureTotal)
-		m.SeedCounter("retries_total", gs.RetryTotal)
-		m.SeedCounter("dlq_entries_total", gs.DLQTotal)
+		metricsInstance.SeedCounter("events_processed_total", gs.EventsProcessedTotal)
+		metricsInstance.SeedCounter("handler_success_total", gs.HandlerSuccessTotal)
+		metricsInstance.SeedCounter("handler_failure_total", gs.HandlerFailureTotal)
+		metricsInstance.SeedCounter("retries_total", gs.RetryTotal)
+		metricsInstance.SeedCounter("dlq_entries_total", gs.DLQTotal)
 	}
 	for _, fs := range st.AllFunctionStats() {
-		m.SeedFunctionStat(metrics.FunctionStat{
+		metricsInstance.SeedFunctionStat(metrics.FunctionStat{
 			Function:            fs.Function,
 			Events:              fs.EventsProcessedTotal,
 			HandlerSuccessTotal: fs.HandlerSuccessTotal,
@@ -364,29 +395,29 @@ func restorePersistedStats(m *metrics.Registry, st *state.State) {
 // (retries_total → RetryTotal) and the float gauges truncated to int64. It is
 // nil-safe: a nil registry yields a zero Stats so the snapshot path can never
 // panic or block processing.
-func snapshotStats(m *metrics.Registry) state.Stats {
-	if m == nil {
+func snapshotStats(metricsInstance *metrics.Registry) state.Stats {
+	if metricsInstance == nil {
 		return state.Stats{}
 	}
 	return state.Stats{
-		EventsProcessedTotal:    m.Counter("events_processed_total"),
-		HandlerSuccessTotal:     m.Counter("handler_success_total"),
-		HandlerFailureTotal:     m.Counter("handler_failure_total"),
-		RetryTotal:              m.Counter("retries_total"),
-		DLQTotal:                m.Counter("dlq_entries_total"),
-		PendingEntries:          int64(m.Gauge("pending_entries")),
-		OldestPendingAgeSeconds: int64(m.Gauge("pending_oldest_age_seconds")),
+		EventsProcessedTotal:    metricsInstance.Counter("events_processed_total"),
+		HandlerSuccessTotal:     metricsInstance.Counter("handler_success_total"),
+		HandlerFailureTotal:     metricsInstance.Counter("handler_failure_total"),
+		RetryTotal:              metricsInstance.Counter("retries_total"),
+		DLQTotal:                metricsInstance.Counter("dlq_entries_total"),
+		PendingEntries:          int64(metricsInstance.Gauge("pending_entries")),
+		OldestPendingAgeSeconds: int64(metricsInstance.Gauge("pending_oldest_age_seconds")),
 	}
 }
 
 // funcSnapshotStats maps the registry's per-function counters into the state
 // layer's FunctionStats rows. It is nil-safe: a nil registry yields an empty
 // slice so the snapshot path can never panic or block processing.
-func funcSnapshotStats(m *metrics.Registry) []state.FunctionStats {
-	if m == nil {
+func funcSnapshotStats(metricsInstance *metrics.Registry) []state.FunctionStats {
+	if metricsInstance == nil {
 		return nil
 	}
-	stats := m.FunctionStatsSnapshot()
+	stats := metricsInstance.FunctionStatsSnapshot()
 	out := make([]state.FunctionStats, 0, len(stats))
 	for _, fs := range stats {
 		out = append(out, state.FunctionStats{
@@ -408,12 +439,17 @@ func funcSnapshotStats(m *metrics.Registry) []state.FunctionStats {
 // the registry and the state handle, so observability can never break
 // processing. The loop's ctx is the shutdown ctx; periodic flushes use it
 // directly (a cancelled ctx simply stops the loop).
-func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interval time.Duration) {
+func statsLoop(
+	ctx context.Context,
+	metricsInstance *metrics.Registry,
+	st *state.State,
+	interval time.Duration,
+) {
 	if st == nil {
 		<-ctx.Done()
 		return
 	}
-	recordSnapshots(ctx, st, m)
+	recordSnapshots(ctx, st, metricsInstance)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -421,7 +457,7 @@ func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interv
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			recordSnapshots(ctx, st, m)
+			recordSnapshots(ctx, st, metricsInstance)
 		}
 	}
 }
@@ -431,13 +467,13 @@ func statsLoop(ctx context.Context, m *metrics.Registry, st *state.State, interv
 // bounded by a short timeout so a wedged SQLite cannot hang shutdown; on
 // timeout or error it logs and returns (telemetry, not state). It is nil-safe
 // on both the registry and the state handle.
-func finalStatsFlush(m *metrics.Registry, st *state.State) {
-	if m == nil || st == nil {
+func finalStatsFlush(metricsInstance *metrics.Registry, st *state.State) {
+	if metricsInstance == nil || st == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	recordSnapshots(ctx, st, m)
+	recordSnapshots(ctx, st, metricsInstance)
 }
 
 // recordSnapshots writes the whole stats snapshot — the global stats row and
@@ -454,7 +490,7 @@ func finalStatsFlush(m *metrics.Registry, st *state.State) {
 // just above). Per-function writes are bounded by the function count, so the 5s
 // cadence keeps them small. A failed flush is logged and retried next tick with
 // the current absolute values; no path resets counters on failure.
-func recordSnapshots(ctx context.Context, st *state.State, m *metrics.Registry) {
+func recordSnapshots(ctx context.Context, st *state.State, metricsInstance *metrics.Registry) {
 	// Sweep the registry against the live function set before snapshotting, so
 	// a function removed (or swept) this interval cannot persist a stale
 	// function_stats row that the orphan-prune would have to reject anyway, and
@@ -471,10 +507,14 @@ func recordSnapshots(ctx context.Context, st *state.State, m *metrics.Registry) 
 		for _, name := range names {
 			active[name] = true
 		}
-		m.SweepFunctionMetrics(active)
+		metricsInstance.SweepFunctionMetrics(active)
 	}
 	// RecordStatsSnapshot logs internally on error (matching the state package's
 	// non-fatal style); the returned error is only for the caller to bound the
 	// write with a context.
-	_ = st.RecordStatsSnapshot(ctx, snapshotStats(m), funcSnapshotStats(m))
+	_ = st.RecordStatsSnapshot(
+		ctx,
+		snapshotStats(metricsInstance),
+		funcSnapshotStats(metricsInstance),
+	)
 }

@@ -245,15 +245,20 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	// the normal (SIGTERM-equivalent) shutdown path.
 	t.Cleanup(cancel)
 
-	go metrics.NewMetricsLogger(m, 30*time.Second, logger.Printf).Start(ctx)
+	// Start the metrics components the same way the worker does: named
+	// variables, started separately, so the lifecycle reads the same as
+	// production (create → start → stop on shutdown).
+	metricsInstance := m
+	metricsLogger := metrics.NewMetricsLogger(metricsInstance, 30*time.Second, logger.Printf)
+	go metricsLogger.Start(ctx)
 
 	// The metrics server binds synchronously in Start (fail-fast on a taken
 	// port) and serves in the background. On shutdown (ctx cancel) Stop performs
 	// the bounded graceful close; the bounded context keeps a wedged handler
 	// from hanging the test. metricsDone mirrors the old "server exited" signal
 	// so the test can assert it stops promptly on cancel.
-	metricsSrv := metrics.NewServer(cfg.metricsAddr, m.Handler(), logger)
-	if err := metricsSrv.Start(); err != nil {
+	metricsServer := metrics.NewServer(cfg.metricsAddr, metricsInstance.Handler(), logger)
+	if err := metricsServer.Start(); err != nil {
 		t.Fatalf("metrics server start: %v", err)
 	}
 	metricsDone := make(chan error, 1)
@@ -261,7 +266,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		<-ctx.Done()
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
-		metricsDone <- metricsSrv.Stop(stopCtx)
+		metricsDone <- metricsServer.Stop(stopCtx)
 	}()
 
 	statsDone := make(chan struct{})
