@@ -5,6 +5,23 @@
 // /metrics, but only when METRICS_ADDR is set to a non-empty listen address.
 // Unset or empty disables the HTTP endpoint entirely.
 //
+// Structure:
+//
+//   - Registry (metrics.go) is the nil-safe in-memory store — the single source
+//     of truth for every recorded value, plus the Snapshot / FunctionStatsSnapshot
+//     gather routines and the Prometheus exposition Handler (a pure promhttp
+//     wrap, with no routing). It contains no lifecycle or network code.
+//   - Server (server.go) owns the net/http /metrics lifecycle and routing: a
+//     ServeMux that serves only `GET /metrics` with the exposition handler,
+//     Start binds synchronously (fail-fast on a taken port) and serves in the
+//     background; Stop performs a bounded graceful shutdown.
+//   - Refresher (refresh.go) runs a periodic ticker that drives GaugeSource
+//     implementations — external-lookup samplers that set point-in-time gauges
+//     (e.g. the stream consumer's XPENDING depth).
+//   - MetricsLogger (logger.go) runs a periodic ticker that logs the registry's
+//     snapshot as logfmt lines, reading the same registry the Server serves on
+//     /metrics.
+//
 // Metric kinds:
 //
 //   - Counters: events_received_total, events_processed_total, retries_total,

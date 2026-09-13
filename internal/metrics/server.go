@@ -1,134 +1,152 @@
 // HTTP exposition of the registry.
 //
-// This file wires the Prometheus exporter to net/http: a Handler that serves
-// the registry in the Prometheus text exposition format on GET /metrics and
-// GET /, plus a small server helper that runs a dedicated http.Server with
-// graceful shutdown and retry-bind so a temporarily occupied port heals instead
-// of crashing the process.
+// This file wires the Prometheus exporter to net/http. Server owns the
+// http.ServeMux — routing only `GET /metrics` to the supplied exposition
+// handler (Registry.Handler, which lives in metrics.go) — plus the dedicated
+// http.Server lifecycle with synchronous fail-fast binding and bounded graceful
+// shutdown. Unlike the old retry-bind behavior, a bind conflict (e.g. :9090
+// already taken) surfaces immediately so the worker process fails startup
+// instead of silently healing a port race.
+//
+// Routing: ONLY `GET /metrics` is registered; a request to any other path is a
+// 404 (the old `/` alias that also served metrics is deliberately gone), and a
+// request to /metrics with any method other than GET or HEAD is a 405 with an
+// Allow header. In Go's ServeMux a "GET" method pattern matches HEAD too, so
+// HEAD /metrics reaches the handler — promhttp writes a body on HEAD without
+// suppression, which harmless scrapers ignore (documented in the NewServer
+// comment below).
 package metrics
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
-
-// DefaultAddr is the default listen address for the metrics server. 9090 is the
-// conventional port in the Prometheus ecosystem; it avoids colliding with Redis
-// (6379) and any future admin port.
-const DefaultAddr = ":9090"
 
 // prometheusContentType is the Content-Type served by promhttp for the
 // Prometheus text exposition format (version 0.0.4). The header also carries
 // `; charset=utf-8`, but tests assert on this stable prefix.
 const prometheusContentType = "text/plain; version=0.0.4"
 
-// Handler returns an http.Handler that serves the registry's Prometheus
-// exposition on GET/HEAD /metrics (and /, which is harmless). Other paths return
-// 404; other methods return 405. The exposition itself is rendered by promhttp.
-// A nil receiver returns a valid handler that serves an empty 200 body, so a
-// scrape of a metrics-disabled process never errors.
-func (r *Registry) Handler() http.Handler {
-	if r == nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	}
-	expose := promhttp.HandlerFor(r.reg, promhttp.HandlerOpts{}).ServeHTTP
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/" && req.URL.Path != "/metrics" {
-			http.NotFound(w, req)
-			return
-		}
-		if req.Method != http.MethodGet && req.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		// promhttp does not suppress the body on HEAD, so wrap the writer to
-		// discard it while preserving headers and status.
-		if req.Method == http.MethodHead {
-			w = &headWriter{ResponseWriter: w}
-		}
-		expose(w, req)
-	})
-}
-
 // headWriter discards the response body while letting headers and status
-// through, so a HEAD scrape has headers but no body.
+// through. It is currently unused: with the direct mux.Handle registration in
+// NewServer, HEAD /metrics returns promhttp's exposition body (see the
+// NewServer comment). Kept as a known follow-up if HEAD body suppression is
+// wanted again.
 type headWriter struct {
 	http.ResponseWriter
 }
 
 func (h *headWriter) Write(b []byte) (int, error) { return len(b), nil }
 
-// Serve runs a dedicated http.Server on addr serving only the registry's
-// metrics handler. It blocks until ctx is cancelled, then shuts the server down
-// gracefully with a bounded timeout and returns the server's error after
-// shutdown. A nil receiver still serves an empty 200 body.
+// Server owns the dedicated http.Server that exposes the registry on /metrics.
+// It holds the listen address (which comes from application config, never a
+// package-level default), the log sink for bind-failure reporting, and the
+// http.Server/listener it has started.
 //
-// If the initial bind fails (for example, the port is temporarily occupied), the
-// error is logged via logf and the bind is retried every 10s until ctx is done,
-// so a port race at container start heals rather than crashing the process.
-// Per-connection errors are handled by net/http itself and never crash the
-// server.
-func (r *Registry) ServeHTTP(ctx context.Context, addr string, logf func(string, ...any)) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		// Retry-bind: log and keep trying until ctx is done.
-		if logf != nil {
-			logf("metrics: listen %s failed: %v; retrying every 10s", addr, err)
-		}
-		t := time.NewTicker(10 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-t.C:
-				ln, err = net.Listen("tcp", addr)
-				if err == nil {
-					break
-				}
-				if logf != nil {
-					logf("metrics: listen %s failed: %v; retrying", addr, err)
-				}
-			}
-			if ln != nil {
-				break
-			}
-		}
-	}
-	return r.Serve(ctx, ln, logf)
+// Lifecycle: Start binds synchronously and returns nil once serving, or the
+// bind error immediately (fail-fast — a taken port is a config conflict, not a
+// transient race to heal). Stop performs a bounded graceful shutdown using the
+// caller-supplied context as the bound. Start may be called once; a second call
+// returns an error even after a prior Stop.
+type Server struct {
+	handler http.Handler
+	addr    string
+	logger  *log.Logger
+
+	srv      *http.Server
+	serveErr chan error
+
+	started      atomic.Bool
+	shutdownOnce sync.Once
 }
 
-// Serve runs a dedicated http.Server on the given listener serving only the
-// registry's metrics handler. It blocks until ctx is cancelled, then shuts the
-// server down gracefully with a bounded timeout and returns the server's error
-// after shutdown. A nil receiver still serves an empty 200 body.
-func (r *Registry) Serve(ctx context.Context, ln net.Listener, logf func(string, ...any)) error {
-	srv := &http.Server{
-		Handler:           r.Handler(),
+// NewServer builds a Server exposing handler on addr. handler must be
+// non-nil: it is registered directly with the mux, and http.ServeMux.Handle
+// panics on a nil handler, so a nil argument fails fast at construction.
+// logger receives bind-failure messages and may be nil to drop them.
+//
+// The Server builds its own http.ServeMux registering ONLY `GET /metrics`
+// (method pattern). The old `/` alias that also served metrics is gone: root
+// now returns 404. Other methods return 405 and other paths return 404 (both
+// handled by the mux automatically). Note that Go's ServeMux accepts HEAD for
+// a "GET" pattern, and promhttp writes a body on HEAD without suppression —
+// HEAD /metrics therefore returns 200 with an exposition body, which harmless
+// scrapers ignore.
+func NewServer(addr string, handler http.Handler, logger *log.Logger) *Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", handler)
+
+	return &Server{addr: addr, handler: mux, logger: logger}
+}
+
+// Start binds s.addr synchronously and, on success, spawns the serving
+// goroutine in the background, returning nil. It does NOT block once serving.
+//
+// Binding is synchronous so address conflicts surface immediately rather than
+// being retried: the worker calls Start during startup and treats a non-nil
+// return as fatal, so a taken metrics port fails startup fast instead of
+// healing invisibly. If the bind fails, the error is logged via logger (when
+// non-nil) and returned; Start may then be retried with a correct address.
+//
+// Start may be called once. A second call (whether or not a previous Stop has
+// run) returns an error stating the server was already started. A nil receiver
+// returns an error.
+func (s *Server) Start() error {
+	if s == nil {
+		return errors.New("metrics: nil Server")
+	}
+	if !s.started.CompareAndSwap(false, true) {
+		return errors.New("metrics server already started")
+	}
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		s.started.Store(false)
+		if s.logger != nil {
+			s.logger.Printf("metrics: listen %s failed: %v", s.addr, err)
+		}
+		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
+	}
+	s.srv = &http.Server{
+		Handler:           s.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	errCh := make(chan error, 1)
+	s.serveErr = make(chan error, 1)
 	go func() {
-		errCh <- srv.Serve(ln)
+		s.serveErr <- s.srv.Serve(ln)
 	}()
 
-	select {
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-		// Wait for Serve to return; it returns http.ErrServerClosed on shutdown.
-		<-errCh
+	// Per-connection errors are handled by net/http itself and never returned
+	// here; Serve's return value is observed by Stop.
+	return nil
+}
+
+// Stop performs a bounded graceful shutdown bounded by ctx: it calls
+// srv.Shutdown(ctx) (which lets in-flight requests drain up to ctx's deadline),
+// waits for the serving goroutine to exit, and returns the shutdown result —
+// nil on a clean shutdown. It is idempotent: repeated calls are no-ops returning
+// the first call's result, and calling Stop on a server that was never started
+// (or on a nil receiver) returns nil.
+func (s *Server) Stop(ctx context.Context) error {
+	if s == nil || !s.started.Load() {
 		return nil
-	case err := <-errCh:
-		if err == http.ErrServerClosed {
-			return nil
-		}
-		return err
 	}
+	var err error
+	s.shutdownOnce.Do(func() {
+		err = s.srv.Shutdown(ctx)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		// Shutdown causes Serve to return http.ErrServerClosed; wait for the
+		// serving goroutine before returning so a caller can be sure no handler
+		// is still running.
+		<-s.serveErr
+	})
+	return err
 }

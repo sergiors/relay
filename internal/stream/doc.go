@@ -49,8 +49,8 @@
 //     left pending (no ACK) and a later reclaim retries it (at-least-once).
 //     This is defense in depth behind the runner's per-invocation boundary,
 //     which already converts executor panics into normal failed attempts so
-//     retry/exhaustion state machinery runs. Panics in Consume/reclaimLoop/
-//     metricsLoop are outside message processing and are deliberately NOT
+//     retry/exhaustion state machinery runs. Panics in Consume/reclaimLoop
+//     are outside message processing and are deliberately NOT
 //     recovered: they remain fatal
 //
 // Usage: NewConsumer, then EnsureGroup, then Consume with a Handler.

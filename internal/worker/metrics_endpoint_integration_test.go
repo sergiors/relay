@@ -49,10 +49,10 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
 	m.SetGauge("pending_entries", 3)
 
-	sctx, scancel := context.WithCancel(context.Background())
-	t.Cleanup(scancel)
-	done := make(chan error, 1)
-	go func() { done <- m.ServeHTTP(sctx, fmt.Sprintf("127.0.0.1:%d", port), log.New(os.Stderr, "", 0).Printf) }()
+	srv := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), m.Handler(), log.New(os.Stderr, "", 0))
+	if err := srv.Start(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
 
 	// Bounded scrape-retry: the server starts asynchronously, so poll until it
 	// responds rather than sleeping a fixed amount.
@@ -86,13 +86,11 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		}
 	}
 
-	scancel()
-	select {
-	case err := <-done:
-		if err != nil && err != context.Canceled {
-			t.Fatalf("server error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("server did not stop on cancel")
+	// Start bound synchronously, so the server was already serving during the
+	// scrape loop above. Stop performs the bounded graceful shutdown.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	if err := srv.Stop(stopCtx); err != nil {
+		t.Fatalf("server stop: %v", err)
 	}
 }

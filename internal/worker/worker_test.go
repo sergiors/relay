@@ -71,41 +71,20 @@ func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
 	}
 }
 
-// TestMetricsServerSurvivesBadAddr proves a metrics bind failure never takes
-// down the worker: ServeHTTP logs the failure, retries, and exits promptly when
-// ctx is cancelled. A deliberately unparseable address always fails to bind, so
-// the retry-bind path returns context.Canceled on shutdown rather than hanging.
-func TestMetricsServerSurvivesBadAddr(t *testing.T) {
+// TestServerStartBadAddrFailsFast proves a metrics bind failure surfaces
+// immediately: Server.Start binds synchronously and returns the error rather
+// than retrying, so the worker's startup gate (which logger.Fatalfs on a non-nil
+// return) treats a taken/unparseable metrics addr as a fatal config error. The
+// old retry-bind behavior (which healed a temporarily occupied port) is
+// deliberately removed.
+func TestServerStartBadAddrFailsFast(t *testing.T) {
 	m := metrics.New()
 	logger := log.New(io.Discard, "", 0)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- m.ServeHTTP(ctx, "crap", logger.Printf) }()
-
-	// ServeHTTP synchronously fails the invalid-address bind and enters its
-	// retry loop. There is no external observable for "the bind failed" (the
-	// logger is io.Discard), so bounded-yield the scheduler until the goroutine
-	// has started before cancelling, then assert the loop returned
-	// context.Canceled rather than hanging — the actual contract under test.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case err := <-done:
-			t.Fatalf("ServeHTTP returned %v before cancel, want it to keep retrying", err)
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != context.Canceled {
-			t.Fatalf("ServeHTTP returned %v, want context.Canceled on cancel", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("ServeHTTP did not return after cancel")
+	srv := metrics.NewServer("crap", m.Handler(), logger)
+	err := srv.Start()
+	if err == nil {
+		t.Fatal("Start on bad addr returned nil, want immediate error")
 	}
 }
 

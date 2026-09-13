@@ -1,13 +1,23 @@
+// Registry and its instrumentation.
+//
+// This file defines the nil-safe Registry facade over a dedicated Prometheus
+// registry, including the counters/histograms/gauges, the instrumented mutation
+// and readback methods, the Prometheus exposition Handler, and the Snapshot /
+// FunctionStatsSnapshot gather routines. It deliberately holds NO lifecycle
+// code and NO routing — the HTTP server (Server), the gauge refresher
+// (Refresher), and the periodic snapshot logger (MetricsLogger) each live in
+// their own file.
 package metrics
 
 import (
-	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -169,6 +179,23 @@ func New() *Registry {
 	}
 
 	return r
+}
+
+// Handler returns the Prometheus exposition handler for this registry —
+// nothing more. Routing of paths and methods is the Server's job (see
+// server.go), which wraps this handler behind its mux; this method only
+// exposes the registry through promhttp.HandlerFor, so a nil receiver returns
+// a valid handler serving an empty body and callers never get a nil
+// http.Handler (a scrape of a metrics-disabled process never errors).
+func (r *Registry) Handler() http.Handler {
+	if r == nil {
+		return http.HandlerFunc(
+			func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			},
+		)
+	}
+	return promhttp.HandlerFor(r.reg, promhttp.HandlerOpts{})
 }
 
 // Add increments the named counter by n. A nil receiver is a no-op.
@@ -597,32 +624,4 @@ func (r *Registry) values(order []string, labels []Label) []string {
 		}
 	}
 	return vals
-}
-
-// LogLoop exposes the registry on a fixed interval until ctx is cancelled. Each
-// tick, if Snapshot() is non-empty, every metric line is logged (prefixed with
-// "metrics"). It is intended to run from `go` in the worker; the stream package
-// also logs snapshots from its own sampler. A nil *Registry simply returns, so
-// this is safe to launch even when metrics are disabled.
-func (r *Registry) LogLoop(ctx context.Context, interval time.Duration, logf func(format string, args ...any)) {
-	if r == nil {
-		<-ctx.Done()
-		return
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s := r.Snapshot()
-			if s == "" {
-				continue
-			}
-			for _, line := range strings.Split(s, "\n") {
-				logf("metrics %s", line)
-			}
-		}
-	}
 }

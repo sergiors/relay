@@ -1,10 +1,9 @@
 package metrics
 
 import (
-	"context"
-	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -145,70 +144,6 @@ func TestNilReceiverNoop(t *testing.T) {
 	}
 }
 
-func TestLogLoopTicksAndStopsOnCancel(t *testing.T) {
-	r := New()
-	r.Inc("events_received_total")
-
-	var mu sync.Mutex
-	var lines []string
-	logf := func(format string, args ...any) {
-		mu.Lock()
-		defer mu.Unlock()
-		lines = append(lines, fmt.Sprintf(format, args...))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		r.LogLoop(ctx, 10*time.Millisecond, logf)
-	}()
-
-	// Wait for at least one tick to emit.
-	deadline := time.After(2 * time.Second)
-	for {
-		mu.Lock()
-		n := len(lines)
-		mu.Unlock()
-		if n > 0 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("LogLoop never logged")
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("LogLoop did not stop on cancel")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if !strings.Contains(lines[0], "metrics events_received_total count=1") {
-		t.Fatalf("unexpected first log line: %q", lines[0])
-	}
-}
-
-func TestLogLoopNilRegistryExitsOnCancel(t *testing.T) {
-	var r *Registry
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		r.LogLoop(ctx, time.Hour, func(string, ...any) { t.Error("must not log on nil registry") })
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("nil LogLoop did not stop on cancel")
-	}
-}
-
 func TestFunctionStatsSnapshot(t *testing.T) {
 	r := New()
 	// Two functions with distinct per-function counters.
@@ -256,5 +191,23 @@ func TestTestutilBacking(t *testing.T) {
 	}
 	if n := testutil.CollectAndCount(r.reg, "events_received_total"); n != 1 {
 		t.Fatalf("CollectAndCount = %d, want 1", n)
+	}
+}
+
+// TestHandlerNilRegistryServesEmpty verifies a nil-receiver Handler returns a
+// valid handler serving an empty 200 body (callers never get a nil http.Handler).
+func TestHandlerNilRegistryServesEmpty(t *testing.T) {
+	var r *Registry
+	h := r.Handler()
+	if h == nil {
+		t.Fatal("nil registry Handler() returned nil http.Handler")
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("nil registry body = %q, want empty", rec.Body.String())
 	}
 }

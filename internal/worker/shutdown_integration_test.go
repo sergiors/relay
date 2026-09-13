@@ -42,7 +42,7 @@ import (
 )
 
 // syncBuffer is a bytes.Buffer safe for concurrent writes and reads. The worker
-// wiring logs from several goroutines (LogLoop, ServeHTTP, statsLoop, the
+// wiring logs from several goroutines (MetricsLogger, metrics Server, statsLoop, the
 // reconciler, the consumer), so the test's log buffer must tolerate concurrent
 // access when asserted under -race.
 type syncBuffer struct {
@@ -166,9 +166,7 @@ type workerEnv struct {
 	consumerName string
 	metricsDone  chan error
 	statsDone    chan struct{}
-}
-
-// startWorker replicates the ordering of Run() (internal/worker/worker.go) with
+} // startWorker replicates the ordering of Run() (internal/worker/worker.go) with
 // test-controlled constants, but WITHOUT signal.NotifyContext: the test owns
 // ctx/cancel, and cancel() is the exact runtime effect of SIGTERM (NotifyContext
 // cancels its ctx when the signal arrives). Sending the real signal to the test
@@ -241,16 +239,30 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Tear the wiring down on EVERY exit path, including a t.Fatalf below
-	// (EnsureGroup/Prepare failures): cleanup cancels ctx so the LogLoop,
+	// (EnsureGroup/Prepare failures): cleanup cancels ctx so the MetricsLogger,
 	// metrics server, statsLoop, reconciler, and consumer goroutines stop and
 	// join instead of leaking past the test. The test's own cancel() later is
 	// the normal (SIGTERM-equivalent) shutdown path.
 	t.Cleanup(cancel)
 
-	go m.LogLoop(ctx, 30*time.Second, logger.Printf)
+	go metrics.NewMetricsLogger(m, 30*time.Second, logger.Printf).Start(ctx)
 
+	// The metrics server binds synchronously in Start (fail-fast on a taken
+	// port) and serves in the background. On shutdown (ctx cancel) Stop performs
+	// the bounded graceful close; the bounded context keeps a wedged handler
+	// from hanging the test. metricsDone mirrors the old "server exited" signal
+	// so the test can assert it stops promptly on cancel.
+	metricsSrv := metrics.NewServer(cfg.metricsAddr, m.Handler(), logger)
+	if err := metricsSrv.Start(); err != nil {
+		t.Fatalf("metrics server start: %v", err)
+	}
 	metricsDone := make(chan error, 1)
-	go func() { metricsDone <- m.ServeHTTP(ctx, cfg.metricsAddr, logger.Printf) }()
+	go func() {
+		<-ctx.Done()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		metricsDone <- metricsSrv.Stop(stopCtx)
+	}()
 
 	statsDone := make(chan struct{})
 	go func() {

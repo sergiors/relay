@@ -31,9 +31,9 @@ const (
 	// DefaultReclaimInterval is how often the recovery loop scans for idle
 	// pending messages.
 	DefaultReclaimInterval = time.Minute
-	// DefaultMetricsInterval is how often the pending-gauge sampler samples
-	// XPENDING depth and logs the metrics snapshot. It is overridable via
-	// ConsumerConfig.MetricsInterval (used by tests).
+	// DefaultMetricsInterval is how often the pending-gauge GaugeSource samples
+	// XPENDING depth. It is overridable via ConsumerConfig.MetricsInterval (used
+	// by tests).
 	DefaultMetricsInterval = 15 * time.Second
 )
 
@@ -74,8 +74,8 @@ type ConsumerConfig struct {
 	// Metrics is an optional metrics registry. A nil registry disables all
 	// observability: every metric call is a no-op.
 	Metrics *metrics.Registry
-	// MetricsInterval is how often the pending-gauge sampler runs and the
-	// metrics snapshot is logged. Defaults to DefaultMetricsInterval if zero.
+	// MetricsInterval is how often the pending-gauge GaugeSource runs.
+	// Defaults to DefaultMetricsInterval if zero.
 	MetricsInterval time.Duration
 	// DisableProgress disables per-handler invocation-state tracking. When
 	// true, redelivered messages re-run every matching handler exactly as before
@@ -225,14 +225,15 @@ func (c *Consumer) Consume(
 		}()
 	}
 
-	// The metrics sampler runs in its own goroutine and never affects health,
-	// backoff, or processing. It is stopped and joined before Consume returns.
+	// The metrics refresher drives the pending-gauge GaugeSource in its own
+	// goroutine and never affects health, backoff, or processing. It is stopped
+	// and joined before Consume returns.
 	if c.metrics != nil {
 		sctx, stop := context.WithCancel(ctx)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			c.metricsLoop(sctx)
+			metrics.NewRefresher(c.metricsInterval, c.pendingGaugeSource()).Start(sctx)
 		}()
 		defer func() {
 			stop()
@@ -293,39 +294,49 @@ func (c *Consumer) process(
 	c.processMessage(ctx, msg, deliveryNum, handler)
 }
 
-// metricsLoop samples the XPENDING pending-depth gauges once per interval until
-// ctx is cancelled. It is decoupled from health/backoff/processing: a Redis
-// failure just skips the pending gauges for that tick and is logged quietly. The
-// overall registry snapshot is exposed by the worker's LogLoop; this goroutine
-// only produces the pending gauges.
-func (c *Consumer) metricsLoop(ctx context.Context) {
-	t := time.NewTicker(c.metricsInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			c.samplePending(ctx)
-		}
+// pendingGaugeSource builds a metrics.GaugeSource that samples the XPENDING
+// pending-depth gauges. It needs the consumer's client, stream, and group, and
+// reuses the consumer's metrics registry and logger, so it is constructed from
+// the consumer rather than at the package level.
+func (c *Consumer) pendingGaugeSource() metrics.GaugeSource {
+	return &PendingGaugeSource{
+		client:  c.client,
+		stream:  c.stream,
+		group:   c.group,
+		metrics: c.metrics,
+		log:     c.log,
 	}
 }
 
-// samplePending reads the XPENDING summary (Count and the oldest pending ID) and
-// records the pending-depth gauges. It never blocks processing: it runs in its
-// own goroutine, holds no locks across the Redis call, and any error is logged
-// and skipped, never propagated.
-func (c *Consumer) samplePending(ctx context.Context) {
+// PendingGaugeSource is a metrics.GaugeSource that samples the Redis XPENDING
+// summary (Count and oldest pending ID) and records the pending_depth gauges on
+// each Refresh. It is decoupled from health/backoff/processing: a Redis failure
+// just skips the pending gauges for that tick and is logged quietly. The overall
+// registry snapshot is exposed by the worker's MetricsLogger; this source only
+// produces the pending gauges.
+type PendingGaugeSource struct {
+	client  *redis.Client
+	stream  string
+	group   string
+	metrics *metrics.Registry
+	log     *log.Logger
+}
+
+// Refresh reads the XPENDING summary and records the pending-depth gauges. It
+// satisfies metrics.GaugeSource. It never blocks processing: it runs in its own
+// goroutine (via the Refresher), holds no locks across the Redis call, and any
+// error is logged and skipped, never propagated.
+func (p *PendingGaugeSource) Refresh(ctx context.Context) {
 	// The summary form (no Start/End/Count) is O(1)-ish and returns the total
 	// Count plus the oldest pending message ID in Lower.
-	p, err := c.client.XPending(ctx, c.stream, c.group).Result()
+	pending, err := p.client.XPending(ctx, p.stream, p.group).Result()
 	if err != nil {
-		c.log.Printf("metrics: xpending %q/%q: %v", c.stream, c.group, err)
+		p.log.Printf("metrics: xpending %q/%q: %v", p.stream, p.group, err)
 		return
 	}
-	c.metrics.SetGauge("pending_entries", float64(p.Count))
-	if age, ok := pendingAge(p.Lower); ok {
-		c.metrics.SetGauge("pending_oldest_age_seconds", age.Seconds())
+	p.metrics.SetGauge("pending_entries", float64(pending.Count))
+	if age, ok := pendingAge(pending.Lower); ok {
+		p.metrics.SetGauge("pending_oldest_age_seconds", age.Seconds())
 	}
 }
 
@@ -492,7 +503,7 @@ func (c *Consumer) deliverClaimed(
 // boundary, which already converts executor panics into normal failed attempts
 // so retry/exhaustion state machinery runs. A panic here is a programming bug and
 // stays visible (logged every cycle) rather than killing the worker. Panics in
-// Consume/reclaimLoop/metricsLoop are outside message processing (startup or
+// Consume/reclaimLoop are outside message processing (startup or
 // programming) and are deliberately NOT recovered: they remain fatal.
 func (c *Consumer) processMessage(
 	ctx context.Context,

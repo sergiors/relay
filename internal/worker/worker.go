@@ -202,20 +202,26 @@ func Run(logger *log.Logger) {
 	defer stop()
 
 	// Expose the metrics snapshot on a fixed interval until shutdown. It runs in
-	// its own goroutine and exits when ctx is cancelled.
-	go m.LogLoop(ctx, 30*time.Second, logger.Printf)
+	// its own goroutine and exits when ctx is cancelled. It reads the same
+	// registry the /metrics server serves (see below).
+	go metrics.NewMetricsLogger(m, metrics.DefaultLogInterval, logger.Printf).Start(ctx)
 
 	// Expose the Prometheus /metrics endpoint. It is opt-in: cfg.MetricsAddr
 	// (METRICS_ADDR) must be a non-empty listen address for the endpoint to
 	// start; unset or empty disables it entirely (no HTTP server, mirroring how
-	// an unset retention window disables trimming). ServeHTTP logs its own bind
-	// failures and retries, so a temporarily occupied port heals instead of
-	// crashing the worker; it returns nil on a clean shutdown (or ctx.Err on the
-	// retry-bind path). It starts before EnsureGroup/Consume so Prometheus can
-	// scrape during startup builds.
+	// an unset retention window disables trimming). Server.Start binds
+	// synchronously and returns nil once serving, so it is safe to call here in
+	// the startup path; a bind failure (a taken metrics port) returns an error
+	// and is FATAL — the worker no longer retries a temporarily occupied port,
+	// because a metrics-address conflict is a config error that should surface
+	// at startup rather than heal invisibly. Stop is called after shutdown to
+	// perform the bounded graceful close.
+	var metricsSrv *metrics.Server
 	if cfg.MetricsAddr != "" {
-		logger.Printf("metrics http server listening on %s", cfg.MetricsAddr)
-		go m.ServeHTTP(ctx, cfg.MetricsAddr, logger.Printf)
+		metricsSrv = metrics.NewServer(cfg.MetricsAddr, m.Handler(), logger)
+		if err := metricsSrv.Start(); err != nil {
+			logger.Fatalf("metrics server: %v", err)
+		}
 	}
 
 	// Flush the registry into the state database on the fixed 5-second cadence.
@@ -306,6 +312,19 @@ func Run(logger *log.Logger) {
 	// runs. Bounded by a short timeout so a wedged SQLite cannot hang shutdown;
 	// failure is logged and shutdown continues (telemetry, not state).
 	finalStatsFlush(m, st)
+
+	// Bounded graceful shutdown of the metrics server (if it was started), so
+	// in-flight scrapes drain rather than being cut off mid-request. This runs
+	// after Consume returned on shutdown; the bound comes from the caller-supplied
+	// context so a wedged handler cannot hang shutdown. It is a no-op when no
+	// server was started.
+	if metricsSrv != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metricsSrv.Stop(stopCtx); err != nil {
+			logger.Printf("metrics server: graceful shutdown: %v", err)
+		}
+	}
 
 	logger.Printf("shutdown complete")
 }
