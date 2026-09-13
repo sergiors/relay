@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -22,7 +23,7 @@ const healthTimeout = 2 * time.Second
 // daemon connectivity — and exits 0 when both are reachable, 1 otherwise. It
 // never starts consumption, loads functions, builds images, or touches the
 // state database; it only creates clients and pings.
-func healthCommand() *cli.Command {
+func healthCommand(logger *log.Logger) *cli.Command {
 	return &cli.Command{
 		Name:  "health",
 		Usage: "Check Relay dependencies",
@@ -32,7 +33,7 @@ func healthCommand() *cli.Command {
 			if cmd.Args().Present() {
 				return cli.Exit("health: too many arguments", 2)
 			}
-			return runHealthCommand(ctx, cmd.Writer)
+			return runHealthCommand(ctx, cmd.Writer, logger)
 		},
 	}
 }
@@ -40,10 +41,20 @@ func healthCommand() *cli.Command {
 // runHealthCommand implements the `relay health` subcommand body. Dependency
 // probes derive their timeouts from the incoming ctx rather than a fresh
 // background context, so callers control how long a hung dependency may stall.
-func runHealthCommand(ctx context.Context, w io.Writer) error {
+func runHealthCommand(ctx context.Context, w io.Writer, logger *log.Logger) error {
+	// The health command loads the full configuration via config.Load(logger),
+	// the same entry point the worker's `relay start` uses. A missing required
+	// variable (REDIS_ADDR/REDIS_STREAM/REDIS_GROUP) or an unresolvable
+	// hostname therefore exits via logger.Fatalf, matching the worker's
+	// fail-fast behavior: the healthcheck fails hard rather than probing with
+	// nothing (or half) configured. This IS a behavior change — `relay health`
+	// now requires REDIS_STREAM and REDIS_GROUP to be set too, even though the
+	// health command only pings Redis — and it is intentional, since health's
+	// job is to verify the worker's actual startup configuration, not a
+	// hand-picked subset. A malformed DSN is surfaced by RedisOptions below.
 	redisCheck := func() error {
-		addr := config.MustEnv("REDIS_ADDR")
-		redisOpts, err := config.RedisOptions(addr)
+		cfg := config.Load(logger)
+		redisOpts, err := config.RedisOptions(cfg.RedisAddr)
 		if err != nil {
 			return fmt.Errorf("redis config: %w", err)
 		}

@@ -12,7 +12,6 @@ package worker
 import (
 	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -40,29 +39,15 @@ const statsFlushInterval = 5 * time.Second
 // Run wires the whole worker: startup state, then the reconciler and stream
 // consumer. It blocks in Consume until the process is signalled.
 func Run(logger *log.Logger) {
-	cfg := struct {
-		redisAddr   string
-		redisStream string
-		redisGroup  string
-		redisCons   string
-	}{
-		redisAddr:   config.MustEnv("REDIS_ADDR"),
-		redisStream: config.MustEnv("REDIS_STREAM"),
-		redisGroup:  config.MustEnv("REDIS_GROUP"),
-	}
-
-	// Resolve the consumer identity explicitly so startup fails fast with a
-	// clear message when the hostname is unavailable or empty.
-	consumerName, err := config.ConsumerName()
-	if err != nil {
-		logger.Fatalf("consumer identity: %v", err)
-	}
-	cfg.redisCons = consumerName
-
-	// Resolve the Redis client options from REDIS_ADDR (a plain address or a
-	// redis(s):// DSN). A malformed DSN fails fast with a clear, redacted
-	// message rather than silently connecting to the wrong host.
-	redisOpts, err := config.RedisOptions(cfg.redisAddr)
+	// Load the whole application configuration up front. Load resolves every
+	// required and optional variable and returns a Config value, so startup
+	// fails fast with a single clear message when anything is missing or
+	// malformed (see internal/config). A malformed Redis DSN — a plain address
+	// or a redis(s):// URL — still fails fast here with a redacted message
+	// rather than silently connecting to the wrong host.
+	cfg := config.Load(logger)
+	// Resolve the Redis client options from cfg.RedisAddr.
+	redisOpts, err := config.RedisOptions(cfg.RedisAddr)
 	if err != nil {
 		logger.Fatalf("redis config: %v", err)
 	}
@@ -121,7 +106,7 @@ func Run(logger *log.Logger) {
 
 	// Prepare (build) each function's image. A function whose image cannot be
 	// built is marked unavailable so the runner skips it; the rest continue.
-	manager, err := runtime.NewManager(logger, m, consumerName)
+	manager, err := runtime.NewManager(logger, m, cfg.ConsumerName)
 	if err != nil {
 		logger.Fatalf("runtime: %v", err)
 	}
@@ -135,7 +120,7 @@ func Run(logger *log.Logger) {
 	// context guarantees the sweep can never hang startup; on timeout or error
 	// we log and continue, leaving the orphans for a later restart.
 	sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, consumerName)
+	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
 		logger.Printf("startup: orphan container sweep: %v", sweepErr)
@@ -206,9 +191,9 @@ func Run(logger *log.Logger) {
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
 		Client:   client,
-		Stream:   cfg.redisStream,
-		Group:    cfg.redisGroup,
-		Consumer: cfg.redisCons,
+		Stream:   cfg.RedisStream,
+		Group:    cfg.RedisGroup,
+		Consumer: cfg.ConsumerName,
 		Log:      logger,
 		Metrics:  m,
 	})
@@ -220,17 +205,17 @@ func Run(logger *log.Logger) {
 	// its own goroutine and exits when ctx is cancelled.
 	go m.LogLoop(ctx, 30*time.Second, logger.Printf)
 
-	// Expose the Prometheus /metrics endpoint. It is opt-in: METRICS_ADDR must
-	// be set to a non-empty listen address for the endpoint to start; unset or
-	// empty disables it entirely (no HTTP server, mirroring how an unset
-	// retention window disables trimming). ServeHTTP logs its own bind failures
-	// and retries, so a temporarily occupied port heals instead of crashing the
-	// worker; it returns nil on a clean shutdown (or ctx.Err on the retry-bind
-	// path). It starts before EnsureGroup/Consume so Prometheus can scrape
-	// during startup builds.
-	if metricsAddr := os.Getenv("METRICS_ADDR"); metricsAddr != "" {
-		logger.Printf("metrics http server listening on %s", metricsAddr)
-		go m.ServeHTTP(ctx, metricsAddr, logger.Printf)
+	// Expose the Prometheus /metrics endpoint. It is opt-in: cfg.MetricsAddr
+	// (METRICS_ADDR) must be a non-empty listen address for the endpoint to
+	// start; unset or empty disables it entirely (no HTTP server, mirroring how
+	// an unset retention window disables trimming). ServeHTTP logs its own bind
+	// failures and retries, so a temporarily occupied port heals instead of
+	// crashing the worker; it returns nil on a clean shutdown (or ctx.Err on the
+	// retry-bind path). It starts before EnsureGroup/Consume so Prometheus can
+	// scrape during startup builds.
+	if cfg.MetricsAddr != "" {
+		logger.Printf("metrics http server listening on %s", cfg.MetricsAddr)
+		go m.ServeHTTP(ctx, cfg.MetricsAddr, logger.Printf)
 	}
 
 	// Flush the registry into the state database on the fixed 5-second cadence.
@@ -238,18 +223,16 @@ func Run(logger *log.Logger) {
 	// ctx is cancelled.
 	go statsLoop(ctx, m, st, statsFlushInterval)
 
-	// Optional internal stream retention. When REDIS_STREAM_RETENTION is set,
-	// a single goroutine periodically trims the configured stream with
-	// XTRIM MINID ~ so entries older than the window are removed. It is
-	// completely separate from ACK/retry/DLQ semantics and never touches
-	// message processing. A malformed or non-positive value fails startup like
-	// any other config error; unset/empty disables retention entirely.
-	retention, err := config.StreamRetention()
-	if err != nil {
-		logger.Fatalf("redis config: %v", err)
-	}
-	if retention > 0 {
-		go retentionLoop(ctx, client, cfg.redisStream, retention, logger)
+	// Optional internal stream retention (cfg.StreamRetention from
+	// REDIS_STREAM_RETENTION). When set, a single goroutine periodically trims
+	// the configured stream with XTRIM MINID ~ so entries older than the window
+	// are removed. It is completely separate from ACK/retry/DLQ semantics and
+	// never touches message processing. A malformed or non-positive value is
+	// logged by config.Load and retention is disabled (0) — a typo in this
+	// optional variable does not fail startup; unset/empty disables retention
+	// entirely.
+	if cfg.StreamRetention > 0 {
+		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
 	}
 
 	if err := consumer.EnsureGroup(ctx); err != nil {
@@ -260,7 +243,7 @@ func Run(logger *log.Logger) {
 	// Stamp the relay.hostname label (the worker/consumer identity) on every
 	// execution container. Must be set before Consume begins; it is wired right
 	// after construction so all invocations carry it.
-	runWorker.SetHostname(consumerName)
+	runWorker.SetHostname(cfg.ConsumerName)
 	// Wire the local secrets provider. It is infallible to construct (the
 	// directory is created lazily on Set, never on Resolve), and a missing
 	// secret surfaces as a per-invocation Resolve error rather than a startup
@@ -311,9 +294,9 @@ func Run(logger *log.Logger) {
 	go rec.Start(ctx)
 
 	logger.Printf("consuming stream %q as group %q consumer %q",
-		cfg.redisStream,
-		cfg.redisGroup,
-		cfg.redisCons,
+		cfg.RedisStream,
+		cfg.RedisGroup,
+		cfg.ConsumerName,
 	)
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
 		logger.Fatalf("consume: %v", err)

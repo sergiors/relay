@@ -39,12 +39,23 @@ import (
 	"relay/internal/metrics"
 )
 
+// envOr returns the value of the environment variable key, or fallback when it
+// is empty or unset. It replaces the deleted config.Env helper for integration
+// tests that want a configurable REDIS_TEST_ADDR override (config.getEnv is
+// unexported, so it cannot be used from this package).
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
 // localhost:6379) is not reachable, instead of skipping: the Redis-Streams
 // integration suite is meaningless without it.
 func requireRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
 	opts, _ := config.RedisOptions(addr)
 	cli := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -148,7 +159,7 @@ type testEnv struct {
 func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	t.Helper()
 
-	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
 	redisOpts, _ := config.RedisOptions(addr)
 	cli := redis.NewClient(redisOpts)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -37,7 +37,7 @@ func New(logger *log.Logger, writer io.Writer) *cli.Command {
 			functionCommand(),
 			secretCommand(),
 			statsCommand(),
-			healthCommand(),
+			healthCommand(logger),
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if !cmd.Args().Present() {

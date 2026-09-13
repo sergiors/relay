@@ -16,6 +16,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
+	"log"
+	"os"
 	"testing"
 	"time"
 
@@ -25,12 +28,23 @@ import (
 	"relay/internal/config"
 )
 
+// envOr returns the value of the environment variable key, or fallback when it
+// is unset or empty. It replaces the old config.Env helper (removed when the
+// config package dropped its generic env helpers) for reading TEST-controlled
+// variables; required application settings come from config.Load.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
 // localhost:6379) is not reachable, instead of skipping: the health command is
 // meaningless without it.
 func requireRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	addr := config.Env("REDIS_TEST_ADDR", "localhost:6379")
+	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
 	opts, _ := config.RedisOptions(addr)
 	cli := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -72,16 +86,25 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 	requireRedis(t)
 	requireDocker(t)
 
-	// Point the command at the real test Redis.
-	t.Setenv("REDIS_ADDR", config.Env("REDIS_TEST_ADDR", "localhost:6379"))
+	// The health command loads full config via config.Load, which exits via
+	// logger.Fatalf when a required REDIS_* variable is missing, so provide a
+	// discard logger and set all three required variables (REDIS_STREAM and
+	// REDIS_GROUP need only be non-empty; only REDIS_ADDR is pinged).
+	logger := log.New(io.Discard, "", 0)
+	redisAddr := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	t.Setenv("REDIS_ADDR", redisAddr)
+	t.Setenv("REDIS_STREAM", "health-itest-stream")
+	t.Setenv("REDIS_GROUP", "health-itest-group")
+
+	// Point the command at the test Redis.
 	var writer bytes.Buffer
-	if err := runHealthCommand(context.Background(), &writer); err != nil {
+	if err := runHealthCommand(context.Background(), &writer, logger); err != nil {
 		t.Fatalf("health with reachable redis+docker failed: %v", err)
 	}
 
 	// A dead Redis address must fail the redis check.
 	t.Setenv("REDIS_ADDR", "127.0.0.1:1")
-	if err := runHealthCommand(context.Background(), &writer); err == nil {
+	if err := runHealthCommand(context.Background(), &writer, logger); err == nil {
 		t.Fatal("health with unreachable redis should have failed")
 	}
 }

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/config"
 	"relay/internal/metrics"
 	"relay/internal/state"
 )
@@ -69,23 +68,6 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
 	if got := funcSnapshotStats(nil); got != nil {
 		t.Fatalf("funcSnapshotStats(nil) = %+v, want nil", got)
-	}
-}
-
-func TestEnvFallback(t *testing.T) {
-	t.Setenv("RELAY_TEST_ENV", "")
-	if got := config.Env("RELAY_TEST_ENV", "fallback"); got != "fallback" {
-		t.Fatalf("Env(empty) = %q, want fallback", got)
-	}
-
-	t.Setenv("RELAY_TEST_ENV", "set")
-	if got := config.Env("RELAY_TEST_ENV", "fallback"); got != "set" {
-		t.Fatalf("Env(set) = %q, want set", got)
-	}
-
-	t.Setenv("RELAY_TEST_ENV", "")
-	if got := config.Env("RELAY_TEST_ENV", ""); got != "" {
-		t.Fatalf("Env(empty, empty fallback) = %q, want empty", got)
 	}
 }
 
