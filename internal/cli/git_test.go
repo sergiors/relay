@@ -154,39 +154,174 @@ func TestGitStatusShowsConfigured(t *testing.T) {
 	}
 }
 
-// TestGitUnknownSubcommand verifies an unknown subcommand is a usage error (2).
-func TestGitUnknownSubcommand(t *testing.T) {
+// TestGitUnknownSubcommandFriendlyError verifies an unknown subcommand (single
+// and multi-token) returns a friendly Docker-style usage error naming the full
+// command path and pointing at the exact help command.
+func TestGitUnknownSubcommandFriendlyError(t *testing.T) {
 	_ = redirectGitDirs(t)
-	_, _, err := runCLI(t, "", "git", "bogus")
-	if err == nil || !strings.Contains(err.Error(), "unknown subcommand") {
-		t.Fatalf("git bogus err = %v, want unknown subcommand", err)
+	for _, c := range []struct {
+		args []string
+		full string
+	}{
+		{[]string{"git", "asdsa"}, "relay git asdsa"},
+		{[]string{"git", "foo", "bar"}, "relay git foo bar"},
+	} {
+		_, _, err := runCLI(t, "", c.args...)
+		if err == nil {
+			t.Fatalf("%v: err = nil, want usage error", c.args)
+		}
+		for _, want := range []string{
+			"relay: unknown command: " + c.full,
+			"Usage: relay git",
+			"Run 'relay git --help' for more information",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("%v err missing %q: %v", c.args, want, err)
+			}
+		}
 	}
 }
 
-// TestGitMissingSubcommand verifies `git` alone is a usage error (missing
-// subcommand).
-func TestGitMissingSubcommand(t *testing.T) {
+// TestGitBareShowsHelp verifies `git` alone shows the subcommand help on stdout
+// and exits 0 (nil error), listing every subcommand.
+func TestGitBareShowsHelp(t *testing.T) {
 	_ = redirectGitDirs(t)
-	_, _, err := runCLI(t, "", "git")
-	if err == nil || !strings.Contains(err.Error(), "missing subcommand") {
-		t.Fatalf("git alone err = %v, want missing subcommand", err)
+	out, _, err := runCLI(t, "", "git")
+	if err != nil {
+		t.Fatalf("git alone: err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "COMMANDS:") {
+		t.Fatalf("bare git help missing COMMANDS section:\n%s", out)
+	}
+	for _, want := range []string{"keygen", "set", "sync", "status", "remove"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("bare git help missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestGitRemoveConfirmed drives `git remove` with an affirmative `y\n` answer:
+// it removes the config and reports success.
+func TestGitRemoveConfirmed(t *testing.T) {
+	p := redirectGitDirs(t)
+	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	out, _, err := runCLI(t, "y\n", "git", "remove")
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if !strings.Contains(out, "Removed git source config") {
+		t.Fatalf("remove output missing confirmation:\n%s", out)
+	}
+	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+		t.Fatal("config not removed after confirming")
+	}
+}
+
+// TestGitRemoveConfirmedYes drives `git remove` with the long affirmative form
+// `yes\n`, verifying both accepted spellings.
+func TestGitRemoveConfirmedYes(t *testing.T) {
+	p := redirectGitDirs(t)
+	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	out, _, err := runCLI(t, "yes\n", "git", "remove")
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if !strings.Contains(out, "Removed git source config") {
+		t.Fatalf("remove output missing confirmation:\n%s", out)
+	}
+	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+		t.Fatal("config not removed after confirming")
+	}
+}
+
+// TestGitRemoveCancelled verifies non-affirmative answers (an explicit no and
+// a junk answer) cancel silently: nil error, NO output on the command writer,
+// the config STILL present, and the checkout untouched.
+func TestGitRemoveCancelled(t *testing.T) {
+	p := redirectGitDirs(t)
+	for _, answer := range []string{"n\n", "maybe\n"} {
+		if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		out, _, err := runCLI(t, answer, "git", "remove")
+		if err != nil {
+			t.Fatalf("remove with %q: err = %v, want nil", answer, err)
+		}
+		if out != "" {
+			t.Fatalf("remove with %q should stay silent on cancel, got:\n%s", answer, out)
+		}
+		if _, err := os.Stat(p.configPath); err != nil {
+			t.Fatalf("remove with %q: config should still exist, got %v", answer, err)
+		}
+		if _, err := os.Stat(p.checkoutDir); !os.IsNotExist(err) {
+			t.Fatalf("remove with %q: checkout should be untouched", answer)
+		}
+	}
+}
+
+// TestGitRemoveSkipsPromptWithYesFlag verifies `git remove -y` (short form) and
+// `git remove --yes` (long form) skip the prompt entirely: removal happens
+// with empty stdin and the -y flag is accepted.
+func TestGitRemoveSkipsPromptWithYesFlag(t *testing.T) {
+	for _, flag := range []string{"-y", "--yes"} {
+		p := redirectGitDirs(t)
+		if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+		// Empty stdin: with the flag the prompt is skipped, so removal proceeds.
+		out, _, err := runCLI(t, "", "git", "remove", flag)
+		if err != nil {
+			t.Fatalf("remove %s: err = %v, want nil", flag, err)
+		}
+		if !strings.Contains(out, "Removed git source config") {
+			t.Fatalf("remove %s output missing confirmation:\n%s", flag, out)
+		}
+		if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+			t.Fatalf("remove %s: config not removed", flag)
+		}
+	}
+}
+
+// TestGitRemoveCancelledEmptyStdin verifies the safe default of No for
+// non-interactive stdin: a bare `git remove` reading EOF (empty piped stdin)
+// cancels silently (nil error, no output) and leaves the config intact.
+func TestGitRemoveCancelledEmptyStdin(t *testing.T) {
+	p := redirectGitDirs(t)
+	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	out, _, err := runCLI(t, "", "git", "remove")
+	if err != nil {
+		t.Fatalf("remove: err = %v, want nil", err)
+	}
+	if out != "" {
+		t.Fatalf("cancelled remove should stay silent, got:\n%s", out)
+	}
+	if _, err := os.Stat(p.configPath); err != nil {
+		t.Fatal("config should still exist after cancelled remove")
 	}
 }
 
 // TestGitRemoveIdempotent drives `git remove` twice and verifies the config is
 // gone and that the second remove reports "not configured" rather than failing.
+// The first remove passes -y so it skips the confirmation gate; the second
+// passes -y too (there is nothing configured, so there is no risk either way).
 func TestGitRemoveIdempotent(t *testing.T) {
 	p := redirectGitDirs(t)
 	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if _, _, err := runCLI(t, "", "git", "remove"); err != nil {
+	if _, _, err := runCLI(t, "", "git", "remove", "-y"); err != nil {
 		t.Fatalf("first remove: %v", err)
 	}
 	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
 		t.Fatal("config not removed")
 	}
-	out, _, err := runCLI(t, "", "git", "remove")
+	out, _, err := runCLI(t, "", "git", "remove", "-y")
 	if err != nil {
 		t.Fatalf("second remove: %v", err)
 	}

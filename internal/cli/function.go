@@ -22,22 +22,16 @@ var statePath = state.DBPath
 // functionCommand builds the read-only `relay function ...` subcommand family.
 // It touches the local state database only — never Redis, Docker, or the
 // /functions loader — so it works with no REDIS_URI and no worker reachable.
+// It is a pure grouping command, so it uses the shared namespaceAction: a bare
+// `relay function` shows the subcommand help, and an unknown first token is a
+// friendly Docker-style usage error naming the full path.
 func functionCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "function",
 		Usage: "Manage functions",
 		Description: "List and inspect the functions Relay has discovered and " +
 			"reconciled, reading the local state database.",
-		// Unknown or missing subcommands are usage errors; a non-nil Action here
-		// keeps an unknown token from falling through to the built-in help.
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			switch {
-			case !cmd.Args().Present():
-				return cli.Exit("function: missing subcommand", 2)
-			default:
-				return cli.Exit(fmt.Sprintf("function: unknown subcommand %q", cmd.Args().First()), 2)
-			}
-		},
+		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:        "ls",

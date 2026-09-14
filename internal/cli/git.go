@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"strings"
 
 	"github.com/urfave/cli/v3"
 
@@ -26,27 +29,21 @@ var (
 // gitCommand builds the `relay git ...` manual sync subcommand family. It never
 // runs automatically and never touches Redis, Docker, or the worker; it only
 // writes the local git config/key/checkout and materializes /functions (on
-// sync). Mirroring secret.go/function.go, unknown or missing subcommands are
-// usage errors. It receives the process logger (like startCommand and
-// healthCommand) but threads it ONLY into the sync path: sync is the one
-// multi-step operation whose progress is worth a Debug-level trail. set, status,
-// keygen, and remove are single-step commands whose whole outcome already lands
-// on the command writer, so they take no logger at all.
+// sync). It is a pure grouping command, so it uses the shared namespaceAction:
+// a bare `relay git` shows the subcommand help (there is nothing else to do with
+// just the command name), and an unknown first token is a friendly Docker-style
+// usage error naming the full path. It receives the process logger (like
+// startCommand and healthCommand) but threads it ONLY into the sync path: sync
+// is the one multi-step operation whose progress is worth a Debug-level trail.
+// set, status, keygen, and remove are single-step commands whose whole outcome
+// already lands on the command writer, so they take no logger at all.
 func gitCommand(logger *slog.Logger) *cli.Command {
 	return &cli.Command{
 		Name:  "git",
 		Usage: "Manage manual Git synchronization",
 		Description: "Generate an SSH deploy key, configure a repository source, and " +
-			"manually sync it into /functions. Sync is always a manual, explicit " +
-			"operation: Relay never polls or syncs automatically.",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			switch {
-			case !cmd.Args().Present():
-				return cli.Exit("git: missing subcommand", 2)
-			default:
-				return cli.Exit(fmt.Sprintf("git: unknown subcommand %q", cmd.Args().First()), 2)
-			}
-		},
+			"manually sync it into /functions.",
+		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:      "keygen",
@@ -116,15 +113,20 @@ func gitCommand(logger *slog.Logger) *cli.Command {
 				},
 			},
 			{
-				Name:  "remove",
-				Usage: "Remove the git source config and checkout",
+				Name:      "remove",
+				Usage:     "Remove the git source config and checkout",
+				UsageText: "relay git remove [-y]",
 				Description: "Remove the persisted git source config and the managed checkout. Leaves /functions " +
-					"and the SSH key untouched (the key survives because the operator registers it as a Deploy Key).",
+					"and the SSH key untouched (the key survives because the operator registers it as a Deploy Key). " +
+					"Prompts for confirmation on the terminal with a default of No unless -y/--yes is given (for automation).",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip confirmation (for automation)"},
+				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
 						return cli.Exit("git remove: too many arguments", 2)
 					}
-					return gitRemove(cmd.Writer)
+					return gitRemoveAction(ctx, cmd)
 				},
 			},
 		},
@@ -196,6 +198,71 @@ func gitStatus(w io.Writer) error {
 	}
 	git.PrintStatus(w, s)
 	return nil
+}
+
+// gitRemoveAction runs the confirmation gate for `git remove` and, when
+// confirmed (or -y/--yes is set), performs the removal. It reads one answer
+// line from cmd.Reader (the injected stdin — tests drive it through runCLI's
+// Reader; never os.Stdin), prompts on os.Stderr (a prompt is UI, not a command
+// result, mirroring secret.go's readSecretValue), and routes the removal report
+// to cmd.Writer. The safe default is No: anything but an explicit y/yes on a
+// trimmed, lowercased line cancels silently with a nil error (exit 0, nothing
+// removed, no output on the command writer). That default makes the command
+// safe for automation: piped stdin with EOF reads "" and therefore cancels, so
+// a bare non-interactive `git remove` can never remove anything.
+func gitRemoveAction(ctx context.Context, cmd *cli.Command) error {
+	if cmd.Bool("yes") {
+		return gitRemove(cmd.Writer)
+	}
+	yes, err := confirmRemove(cmd.Reader, cmd.Writer, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if !yes {
+		// Safe default of No: nothing is removed and nothing is printed on the
+		// command writer — cancellation is silent (exit 0), so the absence of
+		// the removal report is the only record.
+		return nil
+	}
+	return gitRemove(cmd.Writer)
+}
+
+// confirmRemove asks the operator on stderr for a remove confirmation and
+// reports the verdict. It is the testable core of the confirmation gate: the
+// prompt goes to stderr, one line is read from in, and only an explicit
+// y/yes (case-insensitive, whitespace-trimmed) yields true. The safe default
+// is No: an empty or unknown answer returns (false, nil) so the caller cancels
+// silently rather than erroring. Reading the line uses a fresh bufio.Reader
+// per call, which is fine because remove reads exactly one line.
+func confirmRemove(in io.Reader, w io.Writer, stderr io.Writer) (bool, error) {
+	fmt.Fprint(stderr, "Remove git source config and checkout? [y/N] ")
+	answer, err := readLine(in)
+	if err != nil {
+		return false, fmt.Errorf("read confirmation: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// readLine reads one line from in, returning the text without its trailing
+// newline. The newline is stripped from whatever ReadString returns; a final
+// unterminated line (io.EOF without a newline) is still a valid answer, and
+// empty/EOF-only input yields "". This keeps the confirmation gate's default-No
+// behavior identical for a piped empty stdin and a typed empty line.
+func readLine(in io.Reader) (string, error) {
+	if in == nil {
+		return "", nil
+	}
+	r := bufio.NewReader(in)
+	line, err := r.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSuffix(line, "\n"), nil
 }
 
 // gitRemove removes the config and checkout, leaving /functions and the key.

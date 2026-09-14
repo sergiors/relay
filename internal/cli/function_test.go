@@ -233,12 +233,13 @@ events:
 }
 
 // Arg handling: usage errors and the unknown-function error are returned with
-// their messages (cmd/main.go prints them and exits 1).
+// their messages (cmd/main.go prints them and exits 1). `function` alone no
+// longer errors — it shows help (see TestFunctionBareShowsHelp). An unknown
+// token and missing/extra arguments still return errors with messages.
 func TestFunctionCommandErrors(t *testing.T) {
 	_ = seedTestState(t)
 
 	for _, args := range [][]string{
-		{"function"},
 		{"function", "bogus"},
 		{"function", "ls", "extra"},
 		{"function", "inspect"},
@@ -247,6 +248,37 @@ func TestFunctionCommandErrors(t *testing.T) {
 		_, _, err := runCLI(t, "", args...)
 		if err == nil || err.Error() == "" {
 			t.Fatalf("args %v: missing returned error message", args)
+		}
+	}
+}
+
+// A bare `relay function` shows the subcommand help on stdout and exits 0,
+// listing the function subcommands.
+func TestFunctionBareShowsHelp(t *testing.T) {
+	out, _, err := runCLI(t, "", "function")
+	if err != nil {
+		t.Fatalf("function alone: err = %v, want nil", err)
+	}
+	for _, want := range []string{"ls", "inspect"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("function help missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// An unknown function subcommand returns the friendly Docker-style usage error
+// naming the full command path.
+func TestFunctionUnknownCommandFriendly(t *testing.T) {
+	_, _, err := runCLI(t, "", "function", "bogus")
+	if err == nil {
+		t.Fatal("function bogus: err = nil, want usage error")
+	}
+	for _, want := range []string{
+		"relay: unknown command: relay function bogus",
+		"Run 'relay function --help' for more information",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("function bogus err missing %q: %v", want, err)
 		}
 	}
 }

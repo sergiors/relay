@@ -128,14 +128,14 @@ func TestSecretSetViaCommandPipe(t *testing.T) {
 	}
 }
 
-// TestSecretCommandErrors verifies arg handling: no subcommand, unknown
-// subcommand, missing name, and an extra value are all returned as errors —
-// the extra value case is the critical safety regression (a value passed as a
-// positional argument is never accepted).
+// TestSecretCommandErrors verifies arg handling: an unknown subcommand,
+// missing name, and an extra value are all returned as errors. `secret` alone
+// no longer errors — it shows help (see TestSecretBareShowsHelp). The extra
+// value case is the critical safety regression (a value passed as a positional
+// argument is never accepted).
 func TestSecretCommandErrors(t *testing.T) {
 	_ = seedSecretStore(t)
 	for _, args := range [][]string{
-		{"secret"},
 		{"secret", "bogus"},
 		{"secret", "set"},
 		{"secret", "rm"},
@@ -151,6 +151,40 @@ func TestSecretCommandErrors(t *testing.T) {
 	_, _, err := runCLI(t, "", "secret", "set", "a", "extra")
 	if err == nil || !strings.Contains(err.Error(), "secret set: too many arguments") {
 		t.Fatalf("set a extra: missing rejection error: %v", err)
+	}
+}
+
+// A bare `relay secret` shows the subcommand help on stdout and exits 0,
+// listing the secret subcommands.
+func TestSecretBareShowsHelp(t *testing.T) {
+	out, _, err := runCLI(t, "", "secret")
+	if err != nil {
+		t.Fatalf("secret alone: err = %v, want nil", err)
+	}
+	if !strings.Contains(out, "COMMANDS:") {
+		t.Fatalf("bare secret help missing COMMANDS section:\n%s", out)
+	}
+	for _, want := range []string{"ls", "set", "rm"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("secret help missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// An unknown secret subcommand returns the friendly Docker-style usage error
+// naming the full command path.
+func TestSecretUnknownCommandFriendly(t *testing.T) {
+	_, _, err := runCLI(t, "", "secret", "bogus")
+	if err == nil {
+		t.Fatal("secret bogus: err = nil, want usage error")
+	}
+	for _, want := range []string{
+		"relay: unknown command: relay secret bogus",
+		"Run 'relay secret --help' for more information",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("secret bogus err missing %q: %v", want, err)
+		}
 	}
 }
 

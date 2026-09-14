@@ -21,23 +21,17 @@ var secretsPath = secrets.SecretsDir
 
 // secretCommand builds the `relay secret ...` subcommand family. It manages
 // local secret files under the secrets directory only — it never touches
-// Redis, Docker, or the worker.
+// Redis, Docker, or the worker. It is a pure grouping command, so it uses the
+// shared namespaceAction: a bare `relay secret` shows the subcommand help, and
+// an unknown first token is a friendly Docker-style usage error naming the full
+// path.
 func secretCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "secret",
 		Usage: "Manage local secrets",
 		Description: "List, set, and remove local secrets. Secret values are stored locally " +
 			"and are never accepted as positional arguments or printed.",
-		// Unknown or missing subcommands are usage errors; a non-nil Action here
-		// keeps an unknown token from falling through to the built-in help.
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			switch {
-			case !cmd.Args().Present():
-				return cli.Exit("secret: missing subcommand", 2)
-			default:
-				return cli.Exit(fmt.Sprintf("secret: unknown subcommand %q", cmd.Args().First()), 2)
-			}
-		},
+		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
 				Name:        "ls",
