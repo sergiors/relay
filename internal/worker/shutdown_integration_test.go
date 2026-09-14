@@ -18,7 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -179,7 +179,10 @@ type workerEnv struct {
 func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Helper()
 	buf := &syncBuffer{}
-	logger := log.New(buf, "", 0)
+	// DEBUG level: the mid-handler shutdown path logs its cancellation line at
+	// Debug (expected shutdown coordination detail), and the assertions below
+	// match it.
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	client := redis.NewClient(&redis.Options{Addr: cfg.redisURI})
 	t.Cleanup(func() { _ = client.Close() })
@@ -249,7 +252,9 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	// variables, started separately, so the lifecycle reads the same as
 	// production (create → start → stop on shutdown).
 	metricsInstance := m
-	metricsLogger := metrics.NewMetricsLogger(metricsInstance, 30*time.Second, logger.Printf)
+	metricsLogger := metrics.NewMetricsLogger(metricsInstance, 30*time.Second, func(format string, args ...any) {
+		logger.Debug(fmt.Sprintf(format, args...))
+	})
 	go metricsLogger.Start(ctx)
 
 	// The metrics server binds synchronously in Start (fail-fast on a taken
@@ -599,7 +604,7 @@ export async function slow(event) {
 		Stream:          streamName,
 		Group:           groupName,
 		Consumer:        consumerName + "-b",
-		Log:             log.New(io.Discard, "", 0),
+		Log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 100 * time.Millisecond,
 	})

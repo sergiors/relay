@@ -3,7 +3,8 @@ package worker
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
+
 	"strings"
 	"testing"
 	"time"
@@ -79,7 +80,7 @@ func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
 // deliberately removed.
 func TestServerStartBadAddrFailsFast(t *testing.T) {
 	m := metrics.New()
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	srv := metrics.NewServer("crap", m.Handler(), logger)
 	err := srv.Start()

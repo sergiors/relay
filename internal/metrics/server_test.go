@@ -3,7 +3,7 @@ package metrics
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -159,7 +159,7 @@ func TestServerStartServesInBackground(t *testing.T) {
 // deliberate replacement for the old retry-bind: a metrics port conflict is a
 // fatal config error, not a transient race.
 func TestServerStartFailsFastOnBadAddr(t *testing.T) {
-	err := NewServer("crap", New().Handler(), log.New(io.Discard, "", 0)).Start()
+	err := NewServer("crap", New().Handler(), slog.New(slog.NewTextHandler(io.Discard, nil))).Start()
 	if err == nil {
 		t.Fatal("Start on bad addr returned nil, want error")
 	}
@@ -220,7 +220,7 @@ func TestServerStartTwiceFails(t *testing.T) {
 // TestServerStartBadAddrThenGoodAddr verifies a failed Start (bad addr) can be
 // followed by a successful Start on a corrected address.
 func TestServerStartBadAddrThenGoodAddr(t *testing.T) {
-	srv := NewServer("crap", New().Handler(), log.New(io.Discard, "", 0))
+	srv := NewServer("crap", New().Handler(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := srv.Start(); err == nil {
 		t.Fatal("Start on bad addr returned nil, want error")
 	}

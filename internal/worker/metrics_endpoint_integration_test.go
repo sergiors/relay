@@ -16,7 +16,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -49,7 +49,7 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
 	metricsInstance.SetGauge("pending_entries", 3)
 
-	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), log.New(os.Stderr, "", 0))
+	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err := metricsServer.Start(); err != nil {
 		t.Fatalf("server start: %v", err)
 	}

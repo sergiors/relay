@@ -17,7 +17,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -90,7 +90,7 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 	// logger.Fatalf when a required REDIS_* variable is missing, so provide a
 	// discard logger and set all three required variables (REDIS_STREAM and
 	// REDIS_GROUP need only be non-empty; only REDIS_URI is pinged).
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	redisURI := envOr("REDIS_TEST_ADDR", "localhost:6379")
 	t.Setenv("REDIS_URI", redisURI)
 	t.Setenv("REDIS_STREAM", "health-itest-stream")

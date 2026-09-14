@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+
 	"sync"
 	"testing"
 	"time"
@@ -61,7 +62,7 @@ func (s *stubTrimmer) lastCutoffID() string {
 	return s.cutoffID[len(s.cutoffID)-1]
 }
 
-func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // TestRetentionTickInterval pins the pure interval derivation: 6h → 15m, small
 // values clamp to the 1m floor, huge values clamp to the 1h ceiling.

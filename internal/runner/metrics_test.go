@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -15,10 +15,10 @@ import (
 	"relay/internal/stream"
 )
 
-// silentLogger returns a logger that discards output (nil *log.Logger writes to
-// a nil io.Writer, which would panic).
-func silentLogger() *log.Logger {
-	return log.New(io.Discard, "", 0)
+// silentLogger returns a leveled logger that discards output at the most
+// verbose (DEBUG) level, so nothing is filtered.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // alwaysMatch returns a prepared function whose single rule matches any event

@@ -21,7 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -58,7 +58,7 @@ func (h *headWriter) Write(b []byte) (int, error) { return len(b), nil }
 type Server struct {
 	handler http.Handler
 	addr    string
-	logger  *log.Logger
+	logger  *slog.Logger
 
 	srv      *http.Server
 	serveErr chan error
@@ -79,7 +79,7 @@ type Server struct {
 // a "GET" pattern, and promhttp writes a body on HEAD without suppression —
 // HEAD /metrics therefore returns 200 with an exposition body, which harmless
 // scrapers ignore.
-func NewServer(addr string, handler http.Handler, logger *log.Logger) *Server {
+func NewServer(addr string, handler http.Handler, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", handler)
 
@@ -109,7 +109,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		s.started.Store(false)
 		if s.logger != nil {
-			s.logger.Printf("Metrics: listen %s failed: %v", s.addr, err)
+			s.logger.Error(fmt.Sprintf("Metrics: listen %s failed: %v", s.addr, err))
 		}
 		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
 	}

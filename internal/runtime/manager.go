@@ -3,13 +3,13 @@ package runtime
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
-	"relay/internal/logging"
 	"relay/internal/metrics"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
@@ -34,7 +34,7 @@ func engineFor(spec plan.Spec) (interface {
 // Manager prepares function images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation.
 type Manager struct {
-	log *log.Logger
+	log *slog.Logger
 	cli *client.Client
 	// metrics is an optional observability registry. A nil registry disables
 	// all metric recording; every call is a no-op.
@@ -55,9 +55,9 @@ type Manager struct {
 // hostname-scoped container ownership identity (e.g. config.ConsumerName()); it
 // is stamped as the relay.hostname label on every execution container and gates
 // the startup orphan sweep.
-func NewManager(logger *log.Logger, m *metrics.Registry, hostname string) (*Manager, error) {
+func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string) (*Manager, error) {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
@@ -126,7 +126,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
 	if m.imageExists(ctx, image) {
-		m.log.Printf("Function %q: image %s exists; reusing", fn.Name, image)
+		m.log.Debug("Function %q: image %s exists; reusing", fn.Name, image)
 		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 	}
 
@@ -141,15 +141,21 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		})
 		// Function names are validated to [a-z0-9][a-z0-9._-]* (bounded by
 		// function count), so using them as labels is low-cardinality.
-		m.log.Printf("Function %q: build failed%s", fn.Name,
-			logging.Fields("function", fn.Name, "duration", d, "result", "failed"))
+		m.log.Error("Function: build failed",
+			"function", fn.Name,
+			"duration", d,
+			"result", "failed",
+		)
 		return nil, err
 	}
 	d := time.Since(start)
 	m.metrics.ObserveDurationLabels("function_build_seconds",
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
-	m.log.Printf("Function %q: built%s",
-		fn.Name, logging.Fields("function", fn.Name, "duration", d, "result", "success"))
+	m.log.Info("Function: built",
+		"function", fn.Name,
+		"duration", d,
+		"result", "success",
+	)
 	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 }
 
@@ -185,7 +191,7 @@ func (m *Manager) Execute(
 	return runContainer(
 		ctx,
 		m.cli,
-		m.log.Printf,
+		m.log,
 		prepared.Name,
 		prepared.Image,
 		prepared.Env,

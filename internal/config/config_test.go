@@ -3,7 +3,7 @@ package config
 import (
 	"bytes"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,9 +24,15 @@ func setRequiredEnv(t *testing.T) {
 // testLogger returns a logger writing into an in-memory buffer so tests can
 // assert on what Load/parseRetention logs without polluting stderr. The buffer
 // is returned for assertions on the logged text.
-func testLogger() (*log.Logger, *bytes.Buffer) {
+func testLogger() (*slog.Logger, *bytes.Buffer) {
 	var buf bytes.Buffer
-	return log.New(&buf, "", 0), &buf
+	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
+}
+
+// discardLogger returns a logger writing to io.Discard, for Load calls where
+// the specific log output is irrelevant.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // TestLoadResolvesFields proves Load() resolves every Config field from the
@@ -39,7 +45,7 @@ func TestLoadResolvesFields(t *testing.T) {
 	t.Setenv("REDIS_STREAM_RETENTION", "6h")
 	t.Setenv("METRICS_ADDR", ":9090")
 
-	cfg := Load(log.New(io.Discard, "", 0))
+	cfg := Load(discardLogger())
 	if cfg.RedisURI != "redis:6379" || cfg.RedisStream != "stream" || cfg.RedisGroup != "group" {
 		t.Fatalf("redis fields = %+v, want address/stream/group sentinels", cfg)
 	}
@@ -62,7 +68,7 @@ func TestLoadResolvesFields(t *testing.T) {
 // metrics HTTP server remains opt-in (a non-empty guard in the worker decides).
 func TestLoadMetricsAddrOptIn(t *testing.T) {
 	setRequiredEnv(t)
-	cfg := Load(log.New(io.Discard, "", 0))
+	cfg := Load(discardLogger())
 	if cfg.MetricsAddr != "" {
 		t.Fatalf("MetricsAddr = %q, want empty (opt-in)", cfg.MetricsAddr)
 	}
@@ -73,7 +79,7 @@ func TestLoadMetricsAddrOptIn(t *testing.T) {
 func TestMetricsAddrPassthrough(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("METRICS_ADDR", ":9091")
-	cfg := Load(log.New(io.Discard, "", 0))
+	cfg := Load(discardLogger())
 	if cfg.MetricsAddr != ":9091" {
 		t.Fatalf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9091")
 	}
@@ -152,7 +158,7 @@ func TestLoadFatalOnMissing(t *testing.T) {
 			cmd := exec.Command(os.Args[0], "-test.run=TestLoadFatalOnMissingSubprocess$")
 			cmd.Env = append(os.Environ(), "RELAY_TEST_MISSING="+tt.missEnv)
 			// The child writes its fatalf log (mentioning the var) to stderr via
-			// log.New(os.Stderr, "", 0), so capture and assert both the exit
+			// the slog handler, so capture and assert both the exit
 			// code and the message.
 			out, err := cmd.CombinedOutput()
 			if err == nil {
@@ -188,9 +194,9 @@ func TestLoadFatalOnMissingSubprocess(t *testing.T) {
 	setRequiredEnv(t)
 	// Clear the variable under test so requiredEnv sees it missing.
 	t.Setenv(missVar, "")
-	// Fatalf writes to stderr; log.New(os.Stderr, "", 0) routes the fatal line
-	// where the parent's CombinedOutput captures it.
-	Load(log.New(os.Stderr, "", 0))
+	// Fatalf writes to stderr; the slog handler writing to os.Stderr routes the
+	// fatal line where the parent's CombinedOutput captures it.
+	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	// Load should have exited via Fatalf; reaching here is a failure.
 	t.Fatal("Load returned instead of calling logger.Fatalf on missing variable")
 }
@@ -207,7 +213,7 @@ func TestConsumerNameResolvesToHostname(t *testing.T) {
 		t.Fatalf("os.Hostname unavailable on this host: %v", hostErr)
 	}
 	setRequiredEnv(t)
-	cfg := Load(log.New(io.Discard, "", 0))
+	cfg := Load(discardLogger())
 	if cfg.ConsumerName != host {
 		t.Fatalf("ConsumerName = %q, want hostname %q", cfg.ConsumerName, host)
 	}
@@ -222,3 +228,83 @@ func TestConsumerNameResolvesToHostname(t *testing.T) {
 // path is covered by the TestLoadFatalOnMissing subprocess test above; the
 // hostname-fatal paths are deliberately left untested because no environment or
 // argument can exercise them without stubbing os.Hostname.
+
+// TestLoadDefaultLogLevel pins that an unset LOG_LEVEL resolves to Info.
+func TestLoadDefaultLogLevel(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LOG_LEVEL", "")
+	logger, _ := testLogger()
+	cfg := Load(logger)
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Fatalf("LogLevel = %v, want INFO default", cfg.LogLevel)
+	}
+}
+
+// TestLoadLogLevelParses pins that each explicit (case-insensitive, whitespace-
+// trimmed) LOG_LEVEL resolves to the correct slog level. An empty value is the
+// default (INFO). "warning" is not an alias and is covered by the invalid-value
+// subprocess test.
+func TestLoadLogLevelParses(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  slog.Level
+	}{
+		{"", slog.LevelInfo},
+		{"debug", slog.LevelDebug},
+		{"DEBUG", slog.LevelDebug},
+		{" INFO ", slog.LevelInfo},
+		{"info", slog.LevelInfo},
+		{"WARN", slog.LevelWarn},
+		{"warn", slog.LevelWarn},
+		{"error", slog.LevelError},
+		{"ERROR", slog.LevelError},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("LOG_LEVEL", tc.value)
+			cfg := Load(discardLogger())
+			if cfg.LogLevel != tc.want {
+				t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadInvalidLogLevelFatal is the subprocess test for the invalid-LOG_LEVEL
+// path. config.Load calls logger.Fatalf (os.Exit) on an invalid LOG_LEVEL, so it
+// cannot be exercised in-process; the child re-exec pattern mirrors
+// TestLoadFatalOnMissing.
+func TestLoadInvalidLogLevelFatal(t *testing.T) {
+	for _, value := range []string{"bogus", "verbose", "warning"} {
+		t.Run(value, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidLogLevelFatalSubprocess$")
+			cmd.Env = append(os.Environ(), "RELAY_TEST_INVALID_LOGLEVEL="+value)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("subprocess exited 0; want non-zero exit for invalid LOG_LEVEL %q", value)
+			}
+			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+				t.Fatalf("subprocess error = %v, want non-zero exit", err)
+			}
+			for _, want := range []string{"LOG_LEVEL", "DEBUG", "INFO", "WARN", "ERROR"} {
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("subprocess output does not mention %s:\n%s", want, string(out))
+				}
+			}
+		})
+	}
+}
+
+// TestLoadInvalidLogLevelFatalSubprocess is the child side of
+// TestLoadInvalidLogLevelFatal. It sets an invalid LOG_LEVEL and calls Load,
+// which must exit via logger.Fatalf naming the variable and valid values.
+func TestLoadInvalidLogLevelFatalSubprocess(t *testing.T) {
+	value := os.Getenv("RELAY_TEST_INVALID_LOGLEVEL")
+	if value == "" {
+		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_INVALID_LOGLEVEL unset)")
+	}
+	setRequiredEnv(t)
+	t.Setenv("LOG_LEVEL", value)
+	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	t.Fatal("Load returned instead of calling logger.Fatalf on invalid LOG_LEVEL")
+}

@@ -3,7 +3,7 @@ package function
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -23,10 +23,10 @@ type Function struct {
 // function and must contain a template.yaml.
 type Loader struct {
 	dir string
-	log *log.Logger
+	log *slog.Logger
 }
 
-func NewLoader(dir string, logger *log.Logger) *Loader {
+func NewLoader(dir string, logger *slog.Logger) *Loader {
 	return &Loader{dir: dir, log: logger}
 }
 
@@ -77,7 +77,7 @@ func (l *Loader) Load() ([]Function, error) {
 		// better than crashing on it. A stray non-function directory then simply
 		// logs and is ignored.
 		if err := ValidName(name); err != nil {
-			l.log.Printf("Function %q: invalid name: %v; skipping", name, err)
+			l.log.Warn(fmt.Sprintf("Function %q: invalid name: %v; skipping", name, err))
 			continue
 		}
 
@@ -89,13 +89,13 @@ func (l *Loader) Load() ([]Function, error) {
 				// No template.yaml -> silently skip (unlike template errors, which log).
 				continue
 			}
-			l.log.Printf("Function %q: read template: %v", name, err)
+			l.log.Warn(fmt.Sprintf("Function %q: read template: %v", name, err))
 			continue
 		}
 
 		tmpl, err := ParseTemplate(data)
 		if err != nil {
-			l.log.Printf("Function %q: invalid template: %v", name, err)
+			l.log.Warn(fmt.Sprintf("Function %q: invalid template: %v", name, err))
 			continue
 		}
 

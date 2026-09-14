@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
 // FunctionStats is the per-function operational snapshot persisted in the
@@ -59,7 +60,7 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 		s.Function, s.EventsProcessedTotal, s.HandlerSuccessTotal,
 		s.HandlerFailureTotal, s.RetryTotal, s.DLQTotal, ts)
 	if err != nil {
-		c.log.Printf("State: record function stats %q: %v", s.Function, err)
+		c.log.Warn(fmt.Sprintf("State: record function stats %q: %v", s.Function, err))
 	}
 }
 
@@ -79,7 +80,7 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 		return FunctionStats{}, false
 	}
 	if err != nil {
-		c.log.Printf("State: read function stats %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: read function stats %q: %v", name, err))
 		return FunctionStats{}, false
 	}
 	return s, true
@@ -100,7 +101,7 @@ func (c *State) FunctionNames() ([]string, bool) {
 	ctx := context.Background()
 	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Printf("State: list function names: %v", err)
+		c.log.Warn(fmt.Sprintf("State: list function names: %v", err))
 		return nil, false
 	}
 	defer rows.Close()
@@ -109,7 +110,7 @@ func (c *State) FunctionNames() ([]string, bool) {
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Printf("State: scan function name: %v", err)
+			c.log.Warn(fmt.Sprintf("State: scan function name: %v", err))
 			return out, false
 		}
 		out = append(out, name)
@@ -129,7 +130,7 @@ func (c *State) AllFunctionStats() []FunctionStats {
 		        handler_failure_total, retry_total, dlq_total, updated_at
 		 FROM function_stats ORDER BY function_name`)
 	if err != nil {
-		c.log.Printf("State: list function stats: %v", err)
+		c.log.Warn(fmt.Sprintf("State: list function stats: %v", err))
 		return nil
 	}
 	defer rows.Close()
@@ -139,7 +140,7 @@ func (c *State) AllFunctionStats() []FunctionStats {
 		var s FunctionStats
 		if err := rows.Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
 			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal, &s.UpdatedAt); err != nil {
-			c.log.Printf("State: scan function stats: %v", err)
+			c.log.Warn(fmt.Sprintf("State: scan function stats: %v", err))
 			return out
 		}
 		out = append(out, s)

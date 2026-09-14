@@ -10,7 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 
 	"github.com/urfave/cli/v3"
@@ -24,7 +24,7 @@ import (
 // The silent ExitErrHandler MUST stay set: urfave's default HandleExitCoder
 // would print the error and call os.Exit itself, but printing belongs exactly
 // once to cmd/main.go.
-func New(logger *log.Logger, writer io.Writer) *cli.Command {
+func New(logger *slog.Logger, writer io.Writer) *cli.Command {
 	return &cli.Command{
 		Name:            "relay",
 		Usage:           "Relay event-driven function runner",
@@ -55,6 +55,6 @@ func New(logger *log.Logger, writer io.Writer) *cli.Command {
 // Run executes the root command tree against args. args includes the program
 // name; urfave's parser consumes it. Run neither prints the error nor exits:
 // it returns the tree's error to cmd/main.go, which prints and exits once.
-func Run(ctx context.Context, args []string, logger *log.Logger) error {
+func Run(ctx context.Context, args []string, logger *slog.Logger) error {
 	return New(logger, os.Stdout).Run(ctx, args)
 }

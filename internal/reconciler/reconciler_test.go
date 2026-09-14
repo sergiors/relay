@@ -2,7 +2,8 @@ package reconciler
 
 import (
 	"context"
-	"log"
+	"log/slog"
+
 	"os"
 	"path/filepath"
 	"sync"
@@ -86,7 +87,7 @@ func newTestReconciler(t *testing.T, root string, builder Builder, initial []*ru
 	t.Helper()
 	reg := &runner.Registry{}
 	reg.Set(initial)
-	r := New(Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}, reg, builder, log.New(os.Stderr, "test: ", 0))
+	r := New(Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range initial {
 		r.Seed(pf.Function())
 	}

@@ -16,7 +16,7 @@ package reconciler
 import (
 	"bytes"
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,7 +117,9 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	// DEBUG level: container stdout forwarding is a Debug-level diagnostic and
+	// the assertions below match handler output captured through the logger.
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m, err := runtime.NewManager(logger, nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)

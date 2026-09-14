@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -23,7 +23,7 @@ const healthTimeout = 2 * time.Second
 // daemon connectivity — and exits 0 when both are reachable, 1 otherwise. It
 // never starts consumption, loads functions, builds images, or touches the
 // state database; it only creates clients and pings.
-func healthCommand(logger *log.Logger) *cli.Command {
+func healthCommand(logger *slog.Logger) *cli.Command {
 	return &cli.Command{
 		Name:  "health",
 		Usage: "Check Relay dependencies",
@@ -41,12 +41,12 @@ func healthCommand(logger *log.Logger) *cli.Command {
 // runHealthCommand implements the `relay health` subcommand body. Dependency
 // probes derive their timeouts from the incoming ctx rather than a fresh
 // background context, so callers control how long a hung dependency may stall.
-func runHealthCommand(ctx context.Context, w io.Writer, logger *log.Logger) error {
+func runHealthCommand(ctx context.Context, w io.Writer, logger *slog.Logger) error {
 	// The health command loads the full configuration via config.Load(logger),
 	// the same entry point the worker's `relay start` uses. A missing required
 	// variable (REDIS_URI/REDIS_STREAM/REDIS_GROUP) or an unresolvable
-	// hostname therefore exits via logger.Fatalf, matching the worker's
-	// fail-fast behavior: the healthcheck fails hard rather than probing with
+	// hostname therefore exits via config's fail-fast logging, matching the
+	// worker's behavior: the healthcheck fails hard rather than probing with
 	// nothing (or half) configured. This IS a behavior change — `relay health`
 	// now requires REDIS_STREAM and REDIS_GROUP to be set too, even though the
 	// health command only pings Redis — and it is intentional, since health's

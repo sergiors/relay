@@ -2,7 +2,7 @@ package cli
 
 import (
 	"context"
-	"log"
+	"log/slog"
 
 	"github.com/urfave/cli/v3"
 
@@ -12,7 +12,7 @@ import (
 // startRun is the hook the "start" command delegates to. It is a package-level
 // variable so tests can observe dispatch without launching the runtime. The
 // worker's Run signature is fixed and must not change.
-var startRun = func(l *log.Logger) error {
+var startRun = func(l *slog.Logger) error {
 	worker.Run(l)
 	return nil
 }
@@ -21,7 +21,7 @@ var startRun = func(l *log.Logger) error {
 // that starts the long-running Relay runtime, delegating to internal/worker in
 // the foreground. The process never daemonizes or writes a PID file; Docker,
 // systemd, Kubernetes, or a terminal owns process supervision.
-func startCommand(logger *log.Logger) *cli.Command {
+func startCommand(logger *slog.Logger) *cli.Command {
 	return &cli.Command{
 		Name:  "start",
 		Usage: "Start Relay",

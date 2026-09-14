@@ -20,7 +20,7 @@ package stream
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -174,7 +174,7 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 		cfg.Consumer = prefix + "-consumer"
 	}
 	cfg.Client = cli
-	cfg.Log = log.New(os.Stderr, "itest: ", log.LstdFlags)
+	cfg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	// Fast recovery defaults for deterministic tests. A small Block keeps shutdown
 	// prompt: go-redis XReadGroup BLOCK is not interrupted by ctx cancellation and
 	// waits out the block duration before returning.
@@ -813,7 +813,7 @@ func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
 		Stream:        "outage-stream",
 		Group:         "outage-group",
 		Consumer:      "outage-consumer",
-		Log:           log.New(buf, "", 0),
+		Log:           slog.New(slog.NewTextHandler(buf, nil)),
 		backoffTable:  []time.Duration{50 * time.Millisecond},
 		backoffJitter: func(f float64) float64 { return f },
 	})
@@ -903,7 +903,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		Stream:        stream,
 		Group:         group,
 		Consumer:      prefix + "-consumer",
-		Log:           log.New(&buf, "", 0),
+		Log:           slog.New(slog.NewTextHandler(&buf, nil)),
 		Block:         200 * time.Millisecond,
 		backoffTable:  []time.Duration{100 * time.Millisecond},
 		backoffJitter: func(f float64) float64 { return f },
@@ -1514,7 +1514,7 @@ func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
 		Block:           300 * time.Millisecond,
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 200 * time.Millisecond,
-		Log:             log.New(&buf, "", 0),
+		Log:             slog.New(slog.NewTextHandler(&buf, nil)),
 	})
 	if err := c.EnsureGroup(ctx); err != nil {
 		t.Fatalf("ensure group: %v", err)

@@ -2,7 +2,8 @@ package reconciler
 
 import (
 	"context"
-	"log"
+	"log/slog"
+
 	"os"
 	"path/filepath"
 	"strconv"
@@ -47,7 +48,7 @@ func newTestReconcilerRetire(t *testing.T, root string, builder Builder, initial
 	if rec != nil {
 		cfg.Retire = rec.add
 	}
-	r := New(cfg, reg, builder, log.New(os.Stderr, "test: ", 0))
+	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range initial {
 		r.Seed(pf.Function())
 	}
@@ -192,7 +193,7 @@ func newTestReconcilerRemoval(t *testing.T, root string, builder Builder, initia
 	reg := &runner.Registry{}
 	reg.Set(initial)
 	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, RemoveFunction: removeFn}
-	r := New(cfg, reg, builder, log.New(os.Stderr, "test: ", 0))
+	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range initial {
 		r.Seed(pf.Function())
 	}

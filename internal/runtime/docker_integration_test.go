@@ -17,7 +17,8 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log"
+	"log/slog"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,11 +59,13 @@ func requireDocker(t *testing.T) *client.Client {
 
 // newManager returns a Manager wired to a logger that writes into the returned
 // buffer, so container output is captured for assertions. The manager owns
-// hostname "test-host" so container-ownership tests are deterministic.
+// hostname "test-host" so container-ownership tests are deterministic. The
+// handler runs at DEBUG because container stdout/stderr forwarding (the lines
+// these assertions match) is a DEBUG-level diagnostic.
 func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	l := log.New(&buf, "", 0)
+	l := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m, err := NewManager(l, nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -455,7 +458,7 @@ CMD []
 	// daemon; a unit-scoped lifecycle test must not assert on whole-daemon state
 	// it does not own, since it races anything else creating relay-fn-* images on
 	// a shared daemon (e.g. another Go test package running concurrently).
-	m1, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
+	m1, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -477,7 +480,7 @@ CMD []
 // mPrepare builds a function via a fresh Manager wired to a discard logger.
 func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepared, error) {
 	t.Helper()
-	m, err := NewManager(log.New(io.Discard, "", 0), nil, "test-host")
+	m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -756,6 +759,13 @@ export function ok(event) {
 	}
 }
 
+// panicWriter is an io.Writer whose Write always panics. It backs the log sink
+// in TestIntegrationPanicDuringOutputNoRemoval so any forwarded output blows up
+// exactly like the old panicking log func.
+type panicWriter struct{}
+
+func (panicWriter) Write(p []byte) (int, error) { panic("log sink exploded") }
+
 // TestIntegrationPanicDuringOutputNoRemovalNoise drives runContainer with a log
 // func that panics while forwarding handler output — a panic AFTER the container
 // exited on its own (wait.Result disarmed the backstop). The panic must
@@ -787,14 +797,17 @@ export function paniclog(event) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// Drive runContainer directly so the log func can panic on the first
-	// forwarded output line — simulating a Relay bug surfacing during output
-	// handling while the deferred cleanup is in scope.
+	// Drive runContainer directly so output forwarding panics on the first
+	// forwarded line — simulating a Relay bug surfacing during output handling
+	// while the deferred cleanup is in scope. The leveled Logger is wired to a
+	// sink whose Writer panics, so any emission (stdout/stderr forwarding) blows
+	// up exactly like the old panicking log func.
 	panicked := make(chan any, 1)
 	go func() {
 		defer func() { panicked <- recover() }()
+		panicCtx := slog.New(slog.NewTextHandler(&panicWriter{}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		_ = runContainer(ctx, m.cli,
-			func(format string, args ...any) { panic("log func exploded") },
+			panicCtx,
 			"paniclog-e2e", prepared.Image, nil, nil, "index.paniclog",
 			[]byte(`{"event_name":"INSERT"}`),
 			RunMeta{Hostname: "test-host", Function: "paniclog-e2e", Handler: "index.paniclog", Image: prepared.Image},

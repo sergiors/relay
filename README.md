@@ -154,6 +154,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_GROUP`            | yes      | Consumer group name.                                 |
 | `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.    |
 | `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus. |
+| `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -161,6 +162,36 @@ optional and enables internal stream retention (see below). `METRICS_ADDR` is
 optional and opt-in: when set to a non-empty listen address it starts the
 Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
 server is started. An unbindable address is logged and retried, never fatal.
+
+### Log levels
+
+`LOG_LEVEL` controls log verbosity. Valid values are `DEBUG`, `INFO`, `WARN`,
+and `ERROR`, parsed case-insensitively with surrounding whitespace trimmed. The
+default is `INFO`: only INFO, WARN and ERROR lines are shown unless DEBUG is
+explicitly requested. There is no `WARNING` alias (use `WARN`). Only messages at
+or above the configured level are emitted; each record is rendered in slog's
+native text format, e.g. `time=2026-09-13T22:47:41+02:00 level=INFO msg="Loaded 3
+function(s)"`. An invalid value is a configuration error: Relay fails startup
+with a message naming the accepted values.
+
+- `DEBUG` — detailed internal execution flow: Redis reads/claims and internal
+  retry decisions, function matching, container/image lifecycle details,
+  periodic metrics snapshots, cleanup and orphan-sweep details, and other
+  high-volume diagnostic lines that would be too noisy for production.
+- `INFO` — expected high-level lifecycle: Relay starting/stopping, worker and
+  metrics server started/stopped, functions discovered/updated/removed, function
+  executions completed, successful reconciliation, and other major state
+  changes an operator normally wants to see.
+- `WARN` — unexpected but recoverable situations: retryable failures, transient
+  Redis/Docker/network errors Relay continues through, failed cleanup that may
+  be retried, and degraded-but-operational behavior.
+- `ERROR` — a failed operation that materially affects the work: function
+  execution ultimately failed, DLQ write failed, handler panics, unrecoverable
+  processing failures, and failures returned upward that abort the workflow.
+
+Fatal startup failures (missing required variables, invalid `LOG_LEVEL`, an
+unbindable metrics address, an unreachable Redis or Docker daemon) always log
+and exit regardless of the configured level.
 
 ### Stream retention
 
@@ -752,10 +783,10 @@ snapshot. There is no HTTP health/readiness endpoint — `relay health` (above)
 remains the health check.
 
 - **Structured logs**: execution, retry, failure, DLQ,
-  reconciliation, and build lines carry logfmt fields — `function`, `handler`,
-  `message_id`, `event_id`, `event_name`, `attempt`, `duration`, and container
-  `exit_code` where available. Handler stdout/stderr is still forwarded
-  verbatim.
+  reconciliation, and build lines carry structured `slog` attributes —
+  `function`, `handler`, `message_id`, `event_id`, `event_name`, `attempt`,
+  `duration`, and container `exit_code` where available. Handler stdout/stderr
+  is still forwarded verbatim.
 - **Prometheus metrics**: when `METRICS_ADDR` is set to a non-empty listen
   address, the Relay runtime exposes `GET /metrics` on that address in Prometheus
   text format via the official

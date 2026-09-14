@@ -1,7 +1,7 @@
 package reconciler
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -189,7 +189,7 @@ func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
 
 	reg := &runner.Registry{}
 	reg.Set([]*runner.PreparedFunction{unavail})
-	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, log.New(os.Stderr, "test: ", 0))
+	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	r.Seed(unavail.Function())
 
 	// Even with an unchanged fingerprint, the unavailable function is rebuilt.

@@ -2,7 +2,8 @@ package state
 
 import (
 	"context"
-	"log"
+	"log/slog"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +34,7 @@ func openTestState(t *testing.T) *State {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	c.SetLogger(log.New(os.Stderr, "test: ", 0))
+	c.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	return c
 }
 

@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"relay/internal/function"
-	"relay/internal/logging"
 	"relay/internal/metrics"
 	"relay/internal/runtime"
 	"relay/internal/secrets"
@@ -118,7 +118,7 @@ func (r *Registry) Names() []string {
 // it can be reconciled (swapped) live without disrupting in-flight invocations.
 type Runner struct {
 	reg     *Registry
-	log     *log.Logger
+	log     *slog.Logger
 	metrics *metrics.Registry
 	// refs tracks which relay images are currently executing and which have been
 	// retired but cannot be removed yet. It is what lets the runner retire
@@ -209,15 +209,15 @@ func NewUnavailable(fn function.Function) *PreparedFunction {
 
 // New creates a Runner over the given prepared functions. Each invocation is
 // bounded by the matching rule's own timeout. Metrics are nil (disabled).
-func New(prepared []*PreparedFunction, logger *log.Logger) *Runner {
+func New(prepared []*PreparedFunction, logger *slog.Logger) *Runner {
 	return NewWithMetrics(prepared, logger, nil)
 }
 
 // NewWithMetrics is like New but wires an optional metrics registry. A nil
 // registry is safe: every metric call is a no-op.
-func NewWithMetrics(prepared []*PreparedFunction, logger *log.Logger, m *metrics.Registry) *Runner {
+func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, m *metrics.Registry) *Runner {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	r := &Runner{reg: &Registry{}, log: logger, metrics: m, refs: newImageRefCounter()}
 	// When a retired image's last in-flight execution releases it, run the async
@@ -334,7 +334,7 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	defer cancel()
 	tags, err := cleaner.FunctionImageTags(ctx, name)
 	if err != nil {
-		r.log.Printf("Image cleanup: list function %q versions: %v", name, err)
+		r.log.Warn(fmt.Sprintf("Image cleanup: list function %q versions: %v", name, err))
 		return
 	}
 	for _, tag := range tags {
@@ -361,7 +361,7 @@ func (r *Runner) removeImageAsync(image string) {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
 		if err := cleaner.RemoveImage(ctx, image); err != nil {
-			r.log.Printf("Image cleanup: remove retired %s: %v", image, err)
+			r.log.Warn(fmt.Sprintf("Image cleanup: remove retired %s: %v", image, err))
 		}
 	}()
 }
@@ -535,16 +535,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// ACK.
 			invocation := pf.fn.Name + "/" + rule.Handler
 			if hasState && invState.IsComplete(invocation) {
-				r.log.Printf("Function %q handler %q already succeeded for event %q; skipping%s",
-					pf.fn.Name, rule.Handler, msgID,
-					logging.Fields(
-						"function", pf.fn.Name,
-						"handler", rule.Handler,
-						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
-						"attempt", deliveryAttempt,
-					))
+				r.log.Debug("Function handler: already succeeded for event; skipping",
+					"function", pf.fn.Name,
+					"handler", rule.Handler,
+					"message_id", msgID,
+					"event_id", eventID,
+					"event_name", eventName,
+					"attempt", deliveryAttempt,
+				)
 				continue
 			}
 			// Cap the rule timeout at the configured maximum (defense in depth;
@@ -579,45 +577,40 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						// invocation may still complete or fail on its own), so
 						// this is a "not eligible" skip, not a completion.
 						skippedPending = true
-						r.log.Printf("Function %q handler %q not eligible for event %q (running or waiting for retry; eligible in %s)%s",
-							pf.fn.Name, rule.Handler, msgID, wait,
-							logging.Fields(
-								"function", pf.fn.Name,
-								"handler", rule.Handler,
-								"message_id", msgID,
-								"event_id", eventID,
-								"event_name", eventName,
-								"attempt", n,
-								"next_attempt_in", wait,
-							))
+						r.log.Debug("Function handler: not eligible for event (running or waiting for retry); leaving pending",
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"event_id", eventID,
+							"event_name", eventName,
+							"attempt", n,
+							"next_attempt_in", wait,
+						)
 					} else {
 						// Terminal (exhausted): skipped like complete, never
 						// eligible again.
-						r.log.Printf("Function %q handler %q exhausted for event %q; skipping%s",
-							pf.fn.Name, rule.Handler, msgID,
-							logging.Fields(
-								"function", pf.fn.Name,
-								"handler", rule.Handler,
-								"message_id", msgID,
-								"event_id", eventID,
-								"event_name", eventName,
-								"attempt", n,
-							))
+						r.log.Debug("Function handler: exhausted for event; skipping",
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"event_id", eventID,
+							"event_name", eventName,
+							"attempt", n,
+						)
 					}
 					continue
 				}
 				attempt = n
 			}
 			executed = true
-			r.log.Printf("Function %q rule %q matched event %q%s", pf.fn.Name, rule.Handler, msgID,
-				logging.Fields(
-					"function", pf.fn.Name,
-					"handler", rule.Handler,
-					"message_id", msgID,
-					"event_id", eventID,
-					"event_name", eventName,
-					"attempt", attempt,
-				))
+			r.log.Debug("Function rule: matched event",
+				"function", pf.fn.Name,
+				"handler", rule.Handler,
+				"message_id", msgID,
+				"event_id", eventID,
+				"event_name", eventName,
+				"attempt", attempt,
+			)
 			eventJSON, err := json.Marshal(event)
 			if err != nil {
 				// The invocation was already claimed (TryStart above) but will not
@@ -689,19 +682,19 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// failure: log the panic value and the full stack so the bug is
 				// visible and attributable, then funnel it through the SAME
 				// failure branch below (metrics + recordFailure) so retry and
-				// exhaustion accounting stay per-invocation. The stack is kept in
-				// the message body (multi-line) since logging.Fields values must
-				// stay single-line.
-				r.log.Printf("Function %q handler %q PANICKED for event %q: %v\n%s%s",
-					pf.fn.Name, rule.Handler, msgID, panicValue, debug.Stack(),
-					logging.Fields(
-						"function", pf.fn.Name,
-						"handler", rule.Handler,
-						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
-						"attempt", attempt,
-					))
+				// exhaustion accounting stay per-invocation. The panic value and
+				// stack are structured attributes; slog renders them single-line
+				// in the text handler, which keeps every record one line.
+				r.log.Error("Function handler: PANICKED for event",
+					"function", pf.fn.Name,
+					"handler", rule.Handler,
+					"message_id", msgID,
+					"event_id", eventID,
+					"event_name", eventName,
+					"attempt", attempt,
+					"panic_value", fmt.Sprintf("%v", panicValue),
+					"stack", string(debug.Stack()),
+				)
 			}
 			if err != nil {
 				r.metrics.IncLabels("handler_invocations_total",
@@ -721,16 +714,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
 					}, d)
-				r.log.Printf("Function %q handler %q execution failed for event %q: %v%s", pf.fn.Name, rule.Handler, msgID, err,
-					logging.Fields(
-						"function", pf.fn.Name,
-						"handler", rule.Handler,
-						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
-						"attempt", attempt,
-						"duration", d,
-					))
+				r.log.Warn("Function handler: execution failed for event",
+					"function", pf.fn.Name,
+					"handler", rule.Handler,
+					"message_id", msgID,
+					"event_id", eventID,
+					"event_name", eventName,
+					"attempt", attempt,
+					"duration", d,
+					"reason", err,
+				)
 				// Record the failure and decide retry vs exhaustion. This is the
 				// per-invocation retry driver: a retryable failure schedules a
 				// backoff and counts function_retries_total; an exhausted attempt
@@ -773,16 +766,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					{Name: "function", Value: pf.fn.Name},
 					{Name: "handler", Value: rule.Handler},
 				}, d)
-			r.log.Printf("Function %q handler %q executed for event %q%s", pf.fn.Name, rule.Handler, msgID,
-				logging.Fields(
-					"function", pf.fn.Name,
-					"handler", rule.Handler,
-					"message_id", msgID,
-					"event_id", eventID,
-					"event_name", eventName,
-					"attempt", attempt,
-					"duration", d,
-				),
+			r.log.Info("Function handler: executed for event",
+				"function", pf.fn.Name,
+				"handler", rule.Handler,
+				"message_id", msgID,
+				"event_id", eventID,
+				"event_name", eventName,
+				"attempt", attempt,
+				"duration", d,
 			)
 		}
 	}
@@ -825,17 +816,15 @@ func (r *Runner) recordFailure(
 		invState.MarkExhausted(invocation, attempt)
 		r.metrics.IncLabels("function_dlq_total",
 			[]metrics.Label{{Name: "function", Value: fnName}})
-		r.log.Printf("Function %q handler %q exhausted after %d/%d attempts for event %q%s",
-			fnName, handler, attempt, maxAttempts, msgID,
-			logging.Fields(
-				"function", fnName,
-				"handler", handler,
-				"message_id", msgID,
-				"event_id", eventID,
-				"event_name", eventName,
-				"attempt", attempt,
-				"attempts_total", maxAttempts,
-			))
+		r.log.Error("Function handler: exhausted; invocation terminal",
+			"function", fnName,
+			"handler", handler,
+			"message_id", msgID,
+			"event_id", eventID,
+			"event_name", eventName,
+			"attempt", attempt,
+			"attempts_total", maxAttempts,
+		)
 		// If every matched invocation is now terminal, the message is terminal
 		// and must be routed to the DLQ. Otherwise leave it pending so the other
 		// invocations continue.
@@ -849,18 +838,17 @@ func (r *Runner) recordFailure(
 	invState.RecordFailure(invocation, backoff)
 	r.metrics.IncLabels("function_retries_total",
 		[]metrics.Label{{Name: "function", Value: fnName}})
-	r.log.Printf("Function %q handler %q failed attempt %d/%d for event %q; retrying in %s%s",
-		fnName, handler, attempt, maxAttempts, msgID, backoff,
-		logging.Fields(
-			"function", fnName,
-			"handler", handler,
-			"message_id", msgID,
-			"event_id", eventID,
-			"event_name", eventName,
-			"attempt", attempt,
-			"attempts_total", maxAttempts,
-			"retry_delay", backoff,
-		))
+	r.log.Warn("Function handler: failed attempt; retrying later",
+		"function", fnName,
+		"handler", handler,
+		"message_id", msgID,
+		"event_id", eventID,
+		"event_name", eventName,
+		"attempt", attempt,
+		"attempts_total", maxAttempts,
+		"retry_backoff", backoff,
+		"reason", origErr,
+	)
 	return fmt.Errorf("function %q handler %q: attempt %d failed: %w", fnName, handler, attempt, origErr)
 }
 

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -18,7 +18,7 @@ import (
 func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	cmd := New(log.New(io.Discard, "", 0), &out)
+	cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &out)
 	if stdin != "" {
 		cmd.Reader = strings.NewReader(stdin)
 	}
@@ -35,7 +35,7 @@ func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, 
 func TestRootHelp(t *testing.T) {
 	for _, flag := range []string{"--help", "-h"} {
 		var output bytes.Buffer
-		cmd := New(log.New(io.Discard, "", 0), &output)
+		cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &output)
 		err := cmd.Run(context.Background(), []string{"relay", flag})
 		if err != nil {
 			t.Fatalf("%s: err = %v, want nil", flag, err)
@@ -78,7 +78,7 @@ func TestRootHelpContainsStart(t *testing.T) {
 func TestStartHelp(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) error { called = true; return nil }
+	startRun = func(l *slog.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
 	out, _, err := runCLI(t, "", "start", "--help")
@@ -109,7 +109,7 @@ func TestStartTooManyArgs(t *testing.T) {
 func TestStartDelegatesToWorker(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) error { called = true; return nil }
+	startRun = func(l *slog.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
 	if _, _, err := runCLI(t, "", "start"); err != nil {
@@ -125,7 +125,7 @@ func TestStartDelegatesToWorker(t *testing.T) {
 func TestInformationalCommandsNeverStartWorker(t *testing.T) {
 	called := false
 	orig := startRun
-	startRun = func(l *log.Logger) error { called = true; return nil }
+	startRun = func(l *slog.Logger) error { called = true; return nil }
 	defer func() { startRun = orig }()
 
 	// --help and an unknown command must not reach the start hook.

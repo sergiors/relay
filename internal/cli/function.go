@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sort"
 	"text/tabwriter"
@@ -78,7 +78,7 @@ func openState() (*state.State, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open state: %w", err)
 	}
-	st.SetLogger(log.New(os.Stderr, "", 0))
+	st.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	return st, func() { _ = st.Close() }, nil
 }
 

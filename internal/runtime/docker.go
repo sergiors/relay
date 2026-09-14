@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,9 +281,9 @@ func removeContainer(cli *client.Client, id string) error {
 // no explicit remove is issued there. removeContainer is idempotent w.r.t. the
 // benign races (not-found, removal-in-progress), so this is safe to call even
 // when the daemon is already removing the container.
-func removeBackstop(cli *client.Client, log func(format string, args ...any), id string) {
+func removeBackstop(cli *client.Client, log *slog.Logger, id string) {
 	if err := removeContainer(cli, id); err != nil {
-		log("docker run: remove container %s: %v", id, err)
+		log.Warn(fmt.Sprintf("docker run: remove container %s: %v", id, err))
 	}
 }
 
@@ -325,7 +326,7 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 func runContainer(
 	ctx context.Context,
 	cli *client.Client,
-	log func(format string, args ...any),
+	log *slog.Logger,
 	name, image string,
 	env []string,
 	extraEnv []string,
@@ -497,10 +498,10 @@ func runContainer(
 
 	// Forward container output to Relay logs with a function/handler prefix.
 	if stdout.Len() > 0 {
-		log("function %q handler %q: %s", name, handler, strings.TrimRight(stdout.String(), "\n"))
+		log.Debug(fmt.Sprintf("function %q handler %q: %s", name, handler, strings.TrimRight(stdout.String(), "\n")))
 	}
 	if stderr.Len() > 0 {
-		log("function %q handler %q: stderr: %s", name, handler, strings.TrimRight(stderr.String(), "\n"))
+		log.Debug(fmt.Sprintf("function %q handler %q: stderr: %s", name, handler, strings.TrimRight(stderr.String(), "\n")))
 	}
 
 	if waitErr != nil {

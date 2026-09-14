@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -74,8 +74,14 @@ type Handler struct {
 // no state is shared.
 type State struct {
 	db  *sql.DB
-	log *log.Logger
+	log *slog.Logger
 }
+
+// fallbackLogger is the package-level default logger used when a State is
+// opened without SetLogger (e.g. the CLI admin commands and the worker's
+// early-open path before wiring). It runs at DEBUG so nothing is hidden; the
+// worker replaces it with the process's leveled logger via SetLogger.
+var fallbackLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 // Open creates (MkdirAll) the parent directory, opens (creating if absent) the
 // database, applies concurrency-friendly PRAGMAs, and initializes the schema
@@ -95,7 +101,7 @@ func Open(path string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state %s: %w", path, err)
 	}
-	c := &State{db: db, log: log.Default()}
+	c := &State{db: db, log: fallbackLogger}
 
 	// Serialize all access through a single pooled connection. Relay's local
 	// state is a tiny, low-frequency, single-file workload (reconciler writes, a
@@ -136,9 +142,10 @@ func Open(path string) (*State, error) {
 	return c, nil
 }
 
-// SetLogger redirects log output; used by tests and CLI wiring.
-func (c *State) SetLogger(l *log.Logger) {
-	if l != nil {
+// SetLogger redirects log output; used by tests and CLI wiring. A nil l (or a
+// nil receiver) is a no-op, leaving the current logger in place.
+func (c *State) SetLogger(l *slog.Logger) {
+	if c != nil && l != nil {
 		c.log = l
 	}
 }
@@ -317,7 +324,7 @@ func (c *State) RebuildFromFS(dir string) error {
 	for _, fn := range fns {
 		fp, ferr := function.Fingerprint(fn.Dir)
 		if ferr != nil {
-			c.log.Printf("State: fingerprint %q: %v", fn.Name, ferr)
+			c.log.Warn(fmt.Sprintf("State: fingerprint %q: %v", fn.Name, ferr))
 			fp = ""
 		}
 		prepared = append(prepared, fpFn{fn: fn, fp: fp})
@@ -350,7 +357,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 	// errors are logged and fall back to fp="" exactly as before.
 	fp, ferr := function.Fingerprint(fn.Dir)
 	if ferr != nil {
-		c.log.Printf("State: fingerprint %q: %v", fn.Name, ferr)
+		c.log.Warn(fmt.Sprintf("State: fingerprint %q: %v", fn.Name, ferr))
 		fp = ""
 	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -361,7 +368,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		return replaceHandlers(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
-		c.log.Printf("State: record discovered %q: %v", fn.Name, err)
+		c.log.Warn(fmt.Sprintf("State: record discovered %q: %v", fn.Name, err))
 	}
 }
 
@@ -380,7 +387,7 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 		return replaceHandlers(tx, name, fn.Template)
 	})
 	if err != nil {
-		c.log.Printf("State: record success %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: record success %q: %v", name, err))
 	}
 }
 
@@ -403,7 +410,7 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 		return err
 	})
 	if err != nil {
-		c.log.Printf("State: record failure %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: record failure %q: %v", name, err))
 	}
 }
 
@@ -419,7 +426,7 @@ func (c *State) RecordSkipped(name string) {
 		return err
 	})
 	if err != nil {
-		c.log.Printf("State: record skipped %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: record skipped %q: %v", name, err))
 	}
 }
 
@@ -432,7 +439,7 @@ func (c *State) RecordRemoved(name string) {
 		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
-		c.log.Printf("State: record removed %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: record removed %q: %v", name, err))
 	}
 }
 
@@ -455,14 +462,14 @@ func (c *State) PruneRemoved(dir string) {
 	// fully consuming the query first keeps the read and write paths independent.
 	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Printf("State: prune removed: list functions: %v", err)
+		c.log.Warn(fmt.Sprintf("State: prune removed: list functions: %v", err))
 		return
 	}
 	var names []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Printf("State: prune removed: scan name: %v", err)
+			c.log.Warn(fmt.Sprintf("State: prune removed: scan name: %v", err))
 			_ = rows.Close()
 			return
 		}
@@ -477,10 +484,10 @@ func (c *State) PruneRemoved(dir string) {
 			if rerr := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
-				c.log.Printf("State: prune removed %q: %v", name, rerr)
+				c.log.Warn(fmt.Sprintf("State: prune removed %q: %v", name, rerr))
 				continue
 			}
-			c.log.Printf("State: function %q removed (pruned at startup)", name)
+			c.log.Info(fmt.Sprintf("State: function %q removed (pruned at startup)", name))
 		}
 		// Any other stat error (permissions/I/O) is skipped: only a genuine
 		// os.IsNotExist means the function was removed from the filesystem.
@@ -515,7 +522,7 @@ func (c *State) ListFunctions() []Row {
 		 GROUP BY f.name
 		 ORDER BY f.name`)
 	if err != nil {
-		c.log.Printf("State: list functions: %v", err)
+		c.log.Warn(fmt.Sprintf("State: list functions: %v", err))
 		return nil
 	}
 	defer rows.Close()
@@ -532,7 +539,7 @@ func (c *State) ListFunctions() []Row {
 			&r.UpdatedAt,
 			&r.HandlerCount,
 		); err != nil {
-			c.log.Printf("State: scan list: %v", err)
+			c.log.Warn(fmt.Sprintf("State: scan list: %v", err))
 			return out
 		}
 		out = append(out, r)
@@ -553,7 +560,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		return Detail{}, false
 	}
 	if err != nil {
-		c.log.Printf("State: get %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: get %q: %v", name, err))
 		return Detail{}, false
 	}
 	// Decode the env/secret MAPPINGS (never values). A NULL or unparseable
@@ -568,14 +575,14 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	hrows, err := c.db.QueryContext(ctx,
 		`SELECT handler, timeout FROM handlers WHERE function_name = ? ORDER BY handler`, name)
 	if err != nil {
-		c.log.Printf("State: handlers %q: %v", name, err)
+		c.log.Warn(fmt.Sprintf("State: handlers %q: %v", name, err))
 		return d, true
 	}
 	defer hrows.Close()
 	for hrows.Next() {
 		var hn, ht string
 		if err := hrows.Scan(&hn, &ht); err != nil {
-			c.log.Printf("State: scan handler %q: %v", name, err)
+			c.log.Warn(fmt.Sprintf("State: scan handler %q: %v", name, err))
 			continue
 		}
 		dur, derr := time.ParseDuration(ht)

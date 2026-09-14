@@ -11,7 +11,9 @@ package worker
 
 import (
 	"context"
-	"log"
+	"fmt"
+	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -38,18 +40,16 @@ const statsFlushInterval = 5 * time.Second
 
 // Run wires the whole worker: startup state, then the reconciler and stream
 // consumer. It blocks in Consume until the process is signalled.
-func Run(logger *log.Logger) {
-	// Load the whole application configuration up front. Load resolves every
-	// required and optional variable and returns a Config value, so startup
-	// fails fast with a single clear message when anything is missing or
-	// malformed (see internal/config). A malformed Redis DSN — a plain address
-	// or a redis(s):// URL — still fails fast here with a redacted message
-	// rather than silently connecting to the wrong host.
+func Run(logger *slog.Logger) {
+	// Load the whole application configuration up front.
 	cfg := config.Load(logger)
 	// Resolve the Redis client options from cfg.RedisURI.
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
-		logger.Fatalf("Redis config: %v", err)
+		// Fatal: Redis config is a hard startup requirement (this worker cannot
+		// consume without a valid DSN), so exit the process rather than return.
+		logger.Error(fmt.Sprintf("Redis config: %v", err))
+		os.Exit(1)
 	}
 	client := redis.NewClient(redisOpts)
 	defer client.Close()
@@ -78,9 +78,12 @@ func Run(logger *log.Logger) {
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
 	if err != nil {
-		logger.Fatalf("Load functions: %v", err)
+		// Fatal: the worker cannot run without its function set, so exit the
+		// process rather than continue with nothing to serve.
+		logger.Error(fmt.Sprintf("Load functions: %v", err))
+		os.Exit(1)
 	}
-	logger.Printf("Loaded %d function(s) from %s", len(functions), function.Dir)
+	logger.Info(fmt.Sprintf("Loaded %d function(s) from %s", len(functions), function.Dir))
 
 	// The state database is a read-only local state view (see internal/state).
 	// It is NOT the source of truth and never drives matching or building. Open
@@ -90,13 +93,13 @@ func Run(logger *log.Logger) {
 	// if it is broken.
 	st, err := state.Open(state.DBPath)
 	if err != nil {
-		logger.Printf("State: open (continuing without): %v", err)
+		logger.Warn(fmt.Sprintf("State: open (continuing without): %v", err))
 		st = nil
 	}
 	if st != nil {
 		defer st.Close()
 		if err := st.RebuildFromFS(function.Dir); err != nil {
-			logger.Printf("State: rebuild from fs (continuing): %v", err)
+			logger.Warn(fmt.Sprintf("State: rebuild from fs (continuing): %v", err))
 		}
 		// Prune state rows for functions that no longer exist on disk. This
 		// must run BEFORE restorePersistedStats so a pruned function's
@@ -122,7 +125,10 @@ func Run(logger *log.Logger) {
 	// built is marked unavailable so the runner skips it; the rest continue.
 	manager, err := runtime.NewManager(logger, metricsInstance, cfg.ConsumerName)
 	if err != nil {
-		logger.Fatalf("Runtime: %v", err)
+		// Fatal: the runtime manager owns container execution, which the worker
+		// cannot serve without, so exit the process on construction failure.
+		logger.Error(fmt.Sprintf("Runtime: %v", err))
+		os.Exit(1)
 	}
 	defer manager.Close()
 
@@ -137,16 +143,16 @@ func Run(logger *log.Logger) {
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
-		logger.Printf("Startup: orphan container sweep: %v", sweepErr)
+		logger.Warn(fmt.Sprintf("Startup: orphan container sweep: %v", sweepErr))
 	} else if n > 0 {
-		logger.Printf("Startup: removed %d orphan container(s) from a previous relay process", n)
+		logger.Info(fmt.Sprintf("Startup: removed %d orphan container(s) from a previous relay process", n))
 	}
 	preparedCount := 0
 	var prepared []*runner.PreparedFunction
 	for _, fn := range functions {
 		p, err := manager.Prepare(context.Background(), fn)
 		if err != nil {
-			logger.Printf("Function %q: prepare: %v", fn.Name, err)
+			logger.Warn(fmt.Sprintf("Function %q: prepare: %v", fn.Name, err))
 			if st != nil {
 				st.RecordReconcileFailure(fn.Name, err)
 			}
@@ -158,7 +164,7 @@ func Run(logger *log.Logger) {
 			// changed between load and build; the state DB records the final state.
 			fp, fperr := function.Fingerprint(fn.Dir)
 			if fperr != nil {
-				logger.Printf("Function %q: fingerprint: %v", fn.Name, fperr)
+				logger.Warn(fmt.Sprintf("Function %q: fingerprint: %v", fn.Name, fperr))
 				fp = ""
 			}
 			st.RecordReconcileSuccess(fn.Name, p.Image, fp, time.Now(), fn)
@@ -166,7 +172,7 @@ func Run(logger *log.Logger) {
 		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
 		preparedCount++
 	}
-	logger.Printf("Prepared %d function(s)", preparedCount)
+	logger.Info(fmt.Sprintf("Prepared %d function(s)", preparedCount))
 
 	// Conservative startup image sweep. After every current function's image is
 	// built (reused if unchanged), remove Relay-owned images that no longer
@@ -199,7 +205,7 @@ func Run(logger *log.Logger) {
 			}
 		}
 		if _, err := manager.RemoveImagesExcept(context.Background(), keep); err != nil {
-			logger.Printf("Image cleanup: startup sweep: %v", err)
+			logger.Warn(fmt.Sprintf("Image cleanup: startup sweep: %v", err))
 		}
 	}
 
@@ -230,14 +236,17 @@ func Run(logger *log.Logger) {
 		metricsLogger = metrics.NewMetricsLogger(
 			metricsInstance,
 			metrics.DefaultLogInterval,
-			logger.Printf,
+			func(format string, args ...any) { logger.Debug(fmt.Sprintf(format, args...)) },
 		)
 		go metricsLogger.Start(ctx)
 
 		if err := metricsServer.Start(); err != nil {
-			logger.Fatalf("Metrics server: %v", err)
+			// Fatal: a bind failure (taken metrics port) is a config error that
+			// should surface at startup, not retry invisibly, so exit.
+			logger.Error(fmt.Sprintf("Metrics server: %v", err))
+			os.Exit(1)
 		}
-		logger.Printf("Metrics http server listening on %s", cfg.MetricsAddr)
+		logger.Info(fmt.Sprintf("Metrics http server listening on %s", cfg.MetricsAddr))
 	}
 
 	// Flush the registry into the state database on the fixed 5-second cadence.
@@ -264,7 +273,10 @@ func Run(logger *log.Logger) {
 	}
 
 	if err := consumer.EnsureGroup(ctx); err != nil {
-		logger.Fatalf("Ensure consumer group: %v", err)
+		// Fatal: the consumer group is a hard prerequisite for consumption, so
+		// exit the process rather than retry a misconfiguration silently.
+		logger.Error(fmt.Sprintf("Ensure consumer group: %v", err))
+		os.Exit(1)
 	}
 
 	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
@@ -278,7 +290,9 @@ func Run(logger *log.Logger) {
 	// failure — startup does not validate that referenced secrets exist.
 	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
 	if err != nil {
-		logger.Fatalf("Secrets: %v", err)
+		// Fatal: the secrets provider is core to invocation, so exit startup.
+		logger.Error(fmt.Sprintf("Secrets: %v", err))
+		os.Exit(1)
 	}
 	runWorker.SetSecretProvider(secretProvider)
 	// Cap every rule's handler timeout at the same value template validation
@@ -316,18 +330,23 @@ func Run(logger *log.Logger) {
 	for _, fn := range functions {
 		rec.Seed(fn)
 	}
-	logger.Printf("Watching %s for changes", function.Dir)
+	logger.Info(fmt.Sprintf("Watching %s for changes", function.Dir))
 
 	// Runs in its own goroutine and stops when ctx is cancelled.
 	go rec.Start(ctx)
 
-	logger.Printf("Consuming stream %q as group %q consumer %q",
+	logger.Info(fmt.Sprintf("Consuming stream %q as group %q consumer %q",
 		cfg.RedisStream,
 		cfg.RedisGroup,
 		cfg.ConsumerName,
-	)
+	))
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
-		logger.Fatalf("Consume: %v", err)
+		logger.Error(fmt.Sprintf("Consume: %v", err))
+		// The consumer is the worker's raison d'être; a Consume error means the
+		// consumption loop has stopped, so exit the process rather than return
+		// with nothing running. (Shutdown via a cancelled ctx returns nil, so a
+		// non-nil error here is a genuine failure.)
+		os.Exit(1)
 	}
 
 	// Final flush of the registry into SQLite before the deferred st.Close()
@@ -345,11 +364,11 @@ func Run(logger *log.Logger) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := metricsServer.Stop(stopCtx); err != nil {
-			logger.Printf("Metrics server: graceful shutdown: %v", err)
+			logger.Warn(fmt.Sprintf("Metrics server: graceful shutdown: %v", err))
 		}
 	}
 
-	logger.Printf("Shutdown complete")
+	logger.Info("Shutdown complete")
 }
 
 // parkUntilShutdown blocks until ctx is cancelled, then returns. It stands in

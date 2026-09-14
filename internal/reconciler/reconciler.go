@@ -3,7 +3,8 @@ package reconciler
 import (
 	"context"
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"relay/internal/function"
-	"relay/internal/logging"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -81,7 +81,7 @@ type Reconciler struct {
 
 	reg     *runner.Registry
 	builder Builder
-	log     *log.Logger
+	log     *slog.Logger
 	st      *state.State
 	// retire/removeFunction are optional image-lifecycle hooks (see Config).
 	retire         func(name, oldImage string)
@@ -102,9 +102,9 @@ type Reconciler struct {
 // New builds a Reconciler. The registry must already be populated with the
 // startup-loaded functions (available or not) so reconciliation can compare
 // against and swap them.
-func New(cfg Config, reg *runner.Registry, builder Builder, logger *log.Logger) *Reconciler {
+func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger) *Reconciler {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	if cfg.Debounce == 0 {
 		cfg.Debounce = DefaultDebounce
@@ -148,7 +148,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		r.log.Printf("Reconciler: fsnotify: %v", err)
+		r.log.Error(fmt.Sprintf("Reconciler: fsnotify: %v", err))
 		return
 	}
 	r.w = w
@@ -280,7 +280,7 @@ func (r *Reconciler) eventLoop() {
 			if !ok {
 				return
 			}
-			r.log.Printf("Reconciler: watch error: %v", err)
+			r.log.Warn(fmt.Sprintf("Reconciler: watch error: %v", err))
 		}
 	}
 }
@@ -355,7 +355,7 @@ func (r *Reconciler) reconcileAll() {
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(r.root)
 	if err != nil {
-		r.log.Printf("Reconciler: read root %q: %v", r.root, err)
+		r.log.Warn(fmt.Sprintf("Reconciler: read root %q: %v", r.root, err))
 		return
 	}
 	for _, e := range entries {
@@ -387,7 +387,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 	} else if err != nil {
 		// Unexpected stat error (permissions, I/O): don't drop the function on a
 		// flaky read, but surface it so staleness isn't silently ignored.
-		r.log.Printf("Function %q stat error: %v; retaining previous version", name, err)
+		r.log.Warn(fmt.Sprintf("Function %q stat error: %v; retaining previous version", name, err))
 		return
 	}
 
@@ -398,13 +398,13 @@ func (r *Reconciler) reconcileFunction(name string) {
 			// more events rather than dropping a previously-active function.
 			return
 		}
-		r.log.Printf("Function %q template invalid; retaining previous version: %v", name, err)
+		r.log.Warn(fmt.Sprintf("Function %q template invalid; retaining previous version: %v", name, err))
 		return
 	}
 
 	fp, err := function.Fingerprint(dir)
 	if err != nil {
-		r.log.Printf("Function %q fingerprint error; retaining previous version: %v", name, err)
+		r.log.Warn(fmt.Sprintf("Function %q fingerprint error; retaining previous version: %v", name, err))
 		return
 	}
 
@@ -425,17 +425,17 @@ func (r *Reconciler) reconcileFunction(name string) {
 		return
 	}
 
-	r.log.Printf("Function %q changed; rebuilding", name)
+	r.log.Debug(fmt.Sprintf("Function %q changed; rebuilding", name))
 
 	start := time.Now()
 	built, err := r.builder.Prepare(r.rctx(), fn)
 	if err != nil {
-		r.log.Printf("Function %q reload failed (retaining previous version): %v%s",
-			name, err, logging.Fields(
-				"function", name,
-				"duration", time.Since(start),
-				"outcome", "failed",
-			))
+		r.log.Error("Function %q reload failed (retaining previous version): %v",
+			name, err,
+			"function", name,
+			"duration", time.Since(start),
+			"outcome", "failed",
+		)
 		// Keep the old active version AND the old fingerprint so a later change
 		// (which alters the fingerprint) triggers a fresh attempt.
 		if r.st != nil {
@@ -473,19 +473,17 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	if cur == nil {
-		r.log.Printf("Function %q discovered%s",
-			name, logging.Fields(
-				"function", name,
-				"duration", time.Since(start),
-				"outcome", "discovered",
-			))
+		r.log.Info("Function: discovered",
+			"function", name,
+			"duration", time.Since(start),
+			"outcome", "discovered",
+		)
 	} else {
-		r.log.Printf("Function %q updated%s",
-			name, logging.Fields(
-				"function", name,
-				"duration", time.Since(start),
-				"outcome", "updated",
-			))
+		r.log.Info("Function: updated",
+			"function", name,
+			"duration", time.Since(start),
+			"outcome", "updated",
+		)
 	}
 }
 
@@ -506,7 +504,7 @@ func (r *Reconciler) remove(name string) {
 	if r.removeFunction != nil {
 		r.removeFunction(name)
 	}
-	r.log.Printf("Function %q removed", name)
+	r.log.Info(fmt.Sprintf("Function %q removed", name))
 }
 
 // isAvailable reports whether a prepared function has a usable image.

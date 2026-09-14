@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -66,7 +66,7 @@ func newTestConsumer(t *testing.T) (*Consumer, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	c := NewConsumer(ConsumerConfig{
-		Log:           log.New(&buf, "", 0),
+		Log:           slog.New(slog.NewTextHandler(&buf, nil)),
 		backoffTable:  []time.Duration{time.Second},
 		backoffJitter: func(f float64) float64 { return f },
 	})

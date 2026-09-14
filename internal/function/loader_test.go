@@ -1,7 +1,7 @@
 package function
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,7 +28,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -67,7 +67,7 @@ events:
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -91,7 +91,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -121,7 +121,7 @@ events:
       event_name: [DELETE]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -156,7 +156,7 @@ events:
       event_name: [INSERT]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -183,7 +183,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -215,7 +215,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -244,7 +244,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -288,7 +288,7 @@ events:
       event_name: [MODIFY]
 `)
 
-	loader := NewLoader(dir, log.New(os.Stderr, "", 0))
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)

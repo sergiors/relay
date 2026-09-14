@@ -3,7 +3,8 @@ package runner
 import (
 	"context"
 	"errors"
-	"log"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,7 @@ import (
 // Set and Replace keep the function set sorted by name, so Names() and iteration
 // order never depend on the order functions were discovered or swapped in.
 func TestRegistryNamesDeterministic(t *testing.T) {
-	r := New(nil, log.New(nil, "", 0))
+	r := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg := r.Registry()
 
 	// Inserting "zeta" before "alpha": the slice must come out sorted anyway.
@@ -67,7 +68,7 @@ func newFn(t *testing.T, name string) *PreparedFunction {
 // Runs Handle concurrently with registry swaps under -race and asserts the
 // runner neither panics nor errors while the set is being replaced mid-iteration.
 func TestHandleVsSwapSnapshotConsistency(t *testing.T) {
-	r := New(nil, log.New(nil, "", 0))
+	r := New(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	names := []string{"a", "b", "c"}
 	var fns []*PreparedFunction
@@ -623,11 +624,12 @@ func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 	}
 }
 
-// bufferLogger returns a logger that captures output into a buffer, so tests can
-// assert on the structured log lines the runner emits (e.g. the panic log).
-func bufferLogger() (*log.Logger, *strings.Builder) {
+// bufferLogger returns a leveled logger that captures output into a buffer, so
+// tests can assert on the structured log lines the runner emits (e.g. the panic
+// log). It runs at DEBUG so nothing is filtered.
+func bufferLogger() (*slog.Logger, *strings.Builder) {
 	var b strings.Builder
-	return log.New(&b, "", 0), &b
+	return slog.New(slog.NewTextHandler(&b, nil)), &b
 }
 
 // TestHandleExecutorPanicTreatedAsFailedAttempt verifies that an executor panic

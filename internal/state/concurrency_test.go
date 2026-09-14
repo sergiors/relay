@@ -3,7 +3,7 @@ package state
 import (
 	"bytes"
 	"context"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,7 +25,7 @@ func captureLogger(t *testing.T) (*State, *bytes.Buffer) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	var buf bytes.Buffer
-	c.SetLogger(log.New(&buf, "", 0))
+	c.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
 	return c, &buf
 }
 
@@ -243,7 +243,7 @@ func TestReopenUnderConcurrency(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	var buf bytes.Buffer
-	c1.SetLogger(log.New(&buf, "", 0))
+	c1.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
 
 	const n = 40
 	var wg sync.WaitGroup
@@ -284,7 +284,7 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	var buf bytes.Buffer
-	c1.SetLogger(log.New(&buf, "", 0))
+	c1.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
 
 	const k = 20
 	var wg sync.WaitGroup

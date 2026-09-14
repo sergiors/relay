@@ -1,8 +1,10 @@
 package config
 
 import (
-	"log"
+	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -23,6 +25,9 @@ type Config struct {
 	ConsumerName    string
 	StreamRetention time.Duration
 	MetricsAddr     string
+	// LogLevel is the slog level selected by LOG_LEVEL (default Info). It is
+	// used by cmd/main.go to build the process logger after config.Load.
+	LogLevel slog.Level
 }
 
 // Load reads Relay's configuration from the environment and returns a Config. It
@@ -30,16 +35,16 @@ type Config struct {
 // value instead of reading environment variables directly. It only reaches the
 // executable boundary (the CLI commands and the worker call Load at startup),
 // so the failure paths are fatal rather than returned errors: a missing required
-// REDIS_* variable or an unresolvable hostname exits via logger.Fatalf, both
-// naming what went wrong.
+// REDIS_* variable, an unresolvable hostname, or an invalid LOG_LEVEL exits via
+// os.Exit, each naming what went wrong.
 //
-// The required REDIS_* variables must be non-empty or the process exits via
-// logger.Fatalf (see requiredEnv); the consumer name is hostname-resolved via
-// consumerNameFromHost. The two optional variables are read with os.Getenv and
-// stay zero/empty when unset: retention maps to 0 (disabled, see parseRetention)
-// and the metrics address to "" (no HTTP server), preserving their opt-in
-// semantics through the caller's non-zero / non-empty guards.
-func Load(logger *log.Logger) Config {
+// The required REDIS_* variables must be non-empty or the process exits (see
+// requiredEnv); the consumer name is hostname-resolved via consumerNameFromHost.
+// The two optional variables are read with os.Getenv and stay zero/empty when
+// unset: retention maps to 0 (disabled, see parseRetention) and the metrics
+// address to "" (no HTTP server), preserving their opt-in semantics through the
+// caller's non-zero / non-empty guards.
+func Load(logger *slog.Logger) Config {
 	return Config{
 		RedisURI:        requiredEnv(logger, "REDIS_URI"),
 		RedisStream:     requiredEnv(logger, "REDIS_STREAM"),
@@ -47,8 +52,57 @@ func Load(logger *log.Logger) Config {
 		ConsumerName:    consumerNameFromHost(logger),
 		StreamRetention: parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
 		MetricsAddr:     getEnv("METRICS_ADDR", ""),
+		LogLevel:        loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
 	}
 
+}
+
+// logLevelNames are the documented LOG_LEVEL values, in order of increasing
+// verbosity, used to render a helpful error message on an invalid value.
+var logLevelNames = []string{"DEBUG", "INFO", "WARN", "ERROR"}
+
+// ParseLogLevel parses a LOG_LEVEL value into a slog.Level. It trims leading
+// and trailing whitespace and is case-insensitive ("info"/"Info"/"INFO" all
+// work), though the documented form is uppercase. The accepted values map
+// 1:1 onto slog's built-in levels: DEBUG, INFO, WARN and ERROR. "WARNING" is
+// NOT accepted — it is treated as an invalid value, not an alias for WARN. An
+// empty value returns slog.LevelInfo (the default). Any other value returns an
+// error listing the valid values so callers can render a clear configuration
+// error rather than silently falling back.
+func ParseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "":
+		return slog.LevelInfo, nil
+	case "DEBUG":
+		return slog.LevelDebug, nil
+	case "INFO":
+		return slog.LevelInfo, nil
+	case "WARN":
+		return slog.LevelWarn, nil
+	case "ERROR":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf(
+			"invalid LOG_LEVEL %q: valid values are %s",
+			value, strings.Join(logLevelNames, ", "),
+		)
+	}
+}
+
+// loadLogLevel parses LOG_LEVEL and, on an invalid value, reports a clear
+// configuration error and aborts startup. Unlike optional tuning knobs
+// (loadDuration falls back), an invalid log level is a configuration error:
+// silently running at an unintended level would obscure precisely the
+// operational feedback the operator asked for. The valid value set is small and
+// enumerated, so there is no ambiguity worth falling back on. The injected
+// logger is non-nil at this entry point (the CLI owns logger creation).
+func loadLogLevel(logger *slog.Logger, value string) slog.Level {
+	level, err := ParseLogLevel(value)
+	if err != nil {
+		logger.Error("Configuration error", "error", err)
+		os.Exit(1)
+	}
+	return level
 }
 
 // parseRetention parses a stream-retention window from REDIS_STREAM_RETENTION
@@ -60,56 +114,60 @@ func Load(logger *log.Logger) Config {
 // variable must not take down the worker; the operator sees the log line and
 // the retained (disabled) behavior. The value carries no credentials, so
 // echoing it in the log line is safe.
-func parseRetention(logger *log.Logger, value string) time.Duration {
+func parseRetention(logger *slog.Logger, value string) time.Duration {
 	if value == "" {
 		return 0
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		logger.Printf("Redis: invalid REDIS_STREAM_RETENTION %q: %v", value, err)
+		logger.Warn(fmt.Sprintf("Redis: invalid REDIS_STREAM_RETENTION %q: %v", value, err))
 		return 0
 	}
 	if d <= 0 {
-		logger.Printf("Redis: REDIS_STREAM_RETENTION must be positive, got %q", value)
+		logger.Warn(fmt.Sprintf("Redis: REDIS_STREAM_RETENTION must be positive, got %q", value))
 		return 0
 	}
 	return d
 }
 
 // consumerNameFromHost resolves the hostname into a consumer name. Failures are
-// fatal: it calls logger.Fatalf (process exit) on both a hostname resolution
-// error and an empty hostname, keeping the two failure paths distinct in their
-// messages. It is only reached from the executable boundary's Load (see the
-// requiredEnv NOTE), so the fatal exit is intentional; it is wrapped here so
-// the two failure paths stay distinguishable in the log. os.Hostname is not
-// injectable, so these fatals are not unit-testable in-process.
-func consumerNameFromHost(logger *log.Logger) string {
+// fatal: it logs and exits the process (os.Exit(1)) on both a hostname
+// resolution error and an empty hostname, keeping the two failure paths
+// distinct in their messages. It is only reached from the executable boundary's
+// Load, so the fatal exit is intentional; it is wrapped here so the two failure
+// paths stay distinguishable in the log. os.Hostname is not injectable, so
+// these fatals are not unit-testable in-process.
+func consumerNameFromHost(logger *slog.Logger) string {
 	host, err := os.Hostname()
 	if err != nil {
-		logger.Fatalf("Resolve consumer name: hostname unavailable: %v", err)
+		logger.Error(fmt.Sprintf("Resolve consumer name: hostname unavailable: %v", err))
+		os.Exit(1)
 		return ""
 	}
 	if host == "" {
-		logger.Fatalf("Resolve consumer name: hostname is empty")
+		logger.Error("Resolve consumer name: hostname is empty")
+		os.Exit(1)
 		return ""
 	}
 	return host
 }
 
-// requiredEnv returns the value of the environment variable key, or exits the
-// process if it is empty.
+// requiredEnv returns the value of the environment variable key, or logs a
+// clear configuration error and exits the process (os.Exit(1)) if it is empty.
 //
-// NOTE: this is PRE-EXISTING behavior preserved as-is. requiredEnv calls
-// logger.Fatalf (process exit) on a missing required environment variable. It
-// is only ever reached from the executable boundary (the Relay CLI commands
-// call Load), so the fatal exit is intentional and must not be converted to a
-// returned error. The injected logger is non-nil at this entry point (the CLI
-// owns logger creation).
-func requiredEnv(logger *log.Logger, key string) string {
+// NOTE: this is PRE-EXISTING behavior (missing required variable = fatal)
+// preserved through the slog migration: requiredEnv logs at Error and calls
+// os.Exit(1) on a missing required environment variable. It is only ever
+// reached from the executable boundary (the Relay CLI commands call Load), so
+// the fatal exit is intentional and must not be converted to a returned error.
+// The injected logger is non-nil at this entry point (the CLI owns logger
+// creation).
+func requiredEnv(logger *slog.Logger, key string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
-	logger.Fatalf("Required environment variable %s is not set", key)
+	logger.Error(fmt.Sprintf("Required environment variable %s is not set", key))
+	os.Exit(1)
 	return ""
 }
 

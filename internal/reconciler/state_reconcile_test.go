@@ -1,7 +1,7 @@
 package reconciler
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +29,7 @@ func newStateReconciler(t *testing.T, root string, builder Builder, initial []*r
 		Debounce: 10 * time.Millisecond,
 		Interval: time.Hour,
 		State:    st,
-	}, reg, builder, log.New(os.Stderr, "test: ", 0))
+	}, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range initial {
 		r.Seed(pf.Function())
 		// Mirror production wiring: startup records each loaded function before
@@ -190,7 +190,7 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 		RemoveFunction: func(name string) {
 			m.RemoveFunction(name)
 		},
-	}, reg, b, log.New(os.Stderr, "test: ", 0))
+	}, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range []*runner.PreparedFunction{victim, bystander} {
 		r.Seed(pf.Function())
 	}

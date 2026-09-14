@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -59,7 +59,7 @@ func TestHealthRedisConfigErrorRedactsCredentials(t *testing.T) {
 	t.Setenv("REDIS_URI", "redis://default:s3cr3t-pw@:63799x")
 	t.Setenv("REDIS_STREAM", "stream")
 	t.Setenv("REDIS_GROUP", "group")
-	logger := log.New(io.Discard, "", 0)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	var w bytes.Buffer
 	err := runHealthCommand(context.Background(), &w, logger)
