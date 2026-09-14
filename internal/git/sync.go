@@ -31,8 +31,9 @@ type gitOps interface {
 type gitRepo interface {
 	// fetch pulls remote "origin" from url with force+prune and all tags.
 	fetch(ctx context.Context, url string, auth gitssh.AuthMethod) error
-	// resolveRef resolves ref to a commit hash, trying the bare ref name first
-	// and then the origin remote-tracking form (see resolveCommit).
+	// resolveRef resolves ref to a commit hash, making the freshly fetched
+	// refs/remotes/origin/<ref> authoritative for bare branch names so a stale
+	// local refs/heads/<ref> never wins after a fetch (see resolveRef).
 	resolveRef(ref string) (plumbing.Hash, error)
 	// checkoutForce performs a hard-reset (Force) checkout to the given hash
 	// (detached HEAD); the remote is the source of truth, so a Force hard reset
@@ -213,9 +214,10 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return fmt.Errorf("git: fetch: %w", err)
 	}
 
-	// Resolve the configured ref to a commit. Bare branch names do not resolve
-	// via go-git's default expansion (it uses refs/remotes/<ref>, never
-	// refs/remotes/origin/<ref>), so try the origin-tracking form explicitly.
+	// Resolve the configured ref to a commit. A bare branch name resolves
+	// against the freshly fetched refs/remotes/origin/<ref> FIRST — never the
+	// possibly-stale local refs/heads/<ref>, which a clone always creates for
+	// the default branch — so a post-fetch sync reflects the remote tip.
 	hash, err := repo.resolveRef(ref)
 	if err != nil {
 		return fmt.Errorf("git: ref %q not found as branch, tag, or commit: %w", ref, err)

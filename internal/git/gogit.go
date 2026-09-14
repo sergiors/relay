@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"strings"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -58,18 +59,108 @@ func (g *goGitRepo) fetch(ctx context.Context, url string, auth gitssh.AuthMetho
 	})
 }
 
-// resolveRef resolves ref to a commit hash. go-git's ResolveRevision expands
-// bare branch names against refs/remotes/<ref> — which becomes refs/remotes/main,
-// never refs/remotes/origin/main — so a configured bare branch name like "main"
-// would fail after a clone even though origin/main exists. We therefore try the
-// bare revision first (covers tags, hashes, and names that happen to fit go-git's
-// rules) and fall back to the explicit origin-tracking form refs/remotes/origin/<ref>,
-// which reliably resolves short branch names.
+// resolveRef resolves ref to a commit hash, making the freshly-fetched remote
+// authoritative for branch names. This matters because go-git's RefRevParseRules
+// (plumbing/reference.go) expand a bare `main` in this order:
+//
+//	%s, refs/%s, refs/tags/%s, refs/heads/%s, refs/remotes/%s, refs/remotes/%s/HEAD
+//
+// A clone ALWAYS creates a local refs/heads/main when main is the remote's default
+// branch (the normal GitHub/GitLab case). After a fetch that advanced origin/main
+// to a new commit, refs/heads/main still points at the OLD commit — so resolving
+// the bare `main` first would silently materialize stale content. The remote
+// tracking ref refs/remotes/origin/main is the fresh one, so it must win.
+//
+// Resolution order:
+//
+//  1. Exact/abbreviated hash: if ref looks like a commit SHA (4-64 hex chars),
+//     resolve it directly via go-git's hash-prefix resolution and return
+//     regardless of remote state. A 40-hex ref is a full SHA and must resolve to
+//     itself even if a branch happens to share its spelling; an abbreviated
+//     prefix resolves through the same hash-prefix lookup.
+//  2. Fully-qualified ref: a refs/... prefixed value (branch, tag, remote
+//     tracking) resolves directly, never against origin/.
+//  3. Bare branch name (the default case, e.g. main): resolve
+//     refs/remotes/origin/<ref> FIRST — the freshly fetched remote-tracking ref.
+//     If that fails, fall back to refs/tags/<ref> (a bare string like `v1.2.0`
+//     is a tag name; go-git would find it via refs/tags/%s, but we must NOT
+//     resolve the bare name before the origin-tracking ref for branches). As a
+//     last resort resolve the bare name itself — the ONLY case where local state
+//     wins, and it only happens when no remote-tracking ref exists at all (e.g.
+//     odd checkouts where a local branch exists but origin tracking does not).
 func (g *goGitRepo) resolveRef(ref string) (plumbing.Hash, error) {
-	if h, err := g.r.ResolveRevision(plumbing.Revision(ref)); err == nil {
-		return *h, nil
+	if isHashLike(ref) {
+		if h, err := g.resolveHash(ref); err == nil {
+			return h, nil
+		}
 	}
-	h, err := g.r.ResolveRevision(plumbing.Revision("refs/remotes/origin/" + ref))
+
+	// Fully-qualified refs are exact: resolve them directly.
+	if strings.HasPrefix(ref, "refs/") {
+		if h, err := g.resolveRevision(plumbing.Revision(ref)); err == nil {
+			return h, nil
+		}
+		return plumbing.ZeroHash, plumbing.ErrReferenceNotFound
+	}
+
+	// Bare branch name: the freshly fetched remote-tracking ref is authoritative.
+	// Only after it fails do we fall back to a tag, then (last resort) the bare
+	// name itself. See the function doc comment for the stale-local-trap WHY.
+	if h, err := g.resolveRevision(plumbing.Revision("refs/remotes/origin/" + ref)); err == nil {
+		return h, nil
+	}
+	if h, err := g.resolveRevision(plumbing.Revision("refs/tags/" + ref)); err == nil {
+		return h, nil
+	}
+	if h, err := g.resolveRevision(plumbing.Revision(ref)); err == nil {
+		return h, nil
+	}
+
+	return plumbing.ZeroHash, plumbing.ErrReferenceNotFound
+}
+
+// resolveRevision resolves a single, fully-expanded revision to a commit hash.
+// ResolveRevision peels annotated tags to their commit (it calls TagObject.Commit
+// when the hash is a tag object), so both lightweight and annotated tags land on
+// the commit.
+func (g *goGitRepo) resolveRevision(rev plumbing.Revision) (plumbing.Hash, error) {
+	h, err := g.r.ResolveRevision(rev)
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	return *h, nil
+}
+
+// isHashLike reports whether ref could be a commit SHA (full or abbreviated).
+// go-git resolves hash prefixes via resolveHashPrefix, which requires hex and a
+// prefix of at least two hex chars; we accept 4-64 hex chars so a bare branch or
+// tag name (which may be all-hex but is far more commonly a word) is not
+// misclassified. A value that is all-hex and within SHA length is treated as a
+// hash; it resolves to the SHA if that object exists, and otherwise falls through
+// to the branch/tag/bare chain below.
+func isHashLike(ref string) bool {
+	n := len(ref)
+	if n < 4 || n > 64 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		switch {
+		case ref[i] >= '0' && ref[i] <= '9':
+		case ref[i] >= 'a' && ref[i] <= 'f':
+		case ref[i] >= 'A' && ref[i] <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// resolveHash resolves a full or abbreviated hex SHA. For a full 40-hex SHA this
+// resolves to itself; for an abbreviated prefix go-git's ResolveRevision runs
+// resolveHashPrefix over the object store. It returns ErrReferenceNotFound when
+// the hash does not exist so resolveRef can fall through to the bare-chain.
+func (g *goGitRepo) resolveHash(ref string) (plumbing.Hash, error) {
+	h, err := g.r.ResolveRevision(plumbing.Revision(ref))
 	if err != nil {
 		return plumbing.ZeroHash, err
 	}
