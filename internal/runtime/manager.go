@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -14,6 +15,15 @@ import (
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
+)
+
+// arch and platform are the build-host architecture keys for the dependency
+// fingerprint. They default to the running process's GOARCH/GOOS (the daemon
+// this process builds on is the daemon it executes on, so the build host is the
+// correct key). Making them variables lets tests inject synthetic architectures.
+var (
+	arch     = runtime.GOARCH
+	platform = runtime.GOOS
 )
 
 // engineFor returns the engine that prepares a spec. A single engine serves
@@ -130,6 +140,26 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
 	}
 
+	// When the function declares a dependency layer, ensure the dependency image
+	// exists first and build the function image FROM it. The dependency image is
+	// content-addressed (no function name): it is shared across every function
+	// and every version with identical (runtime + arch + manifest + install), so
+	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
+	// existing layer with no rebuild (even when the function's source changed).
+	depRef := ""
+	if !p.Deps.IsZero() {
+		depRef, err = m.ensureDependencyImage(ctx, fn, spec, p.Deps)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+		}
+		// The function image inherits every layer of the dependency image, so
+		// its Dockerfile's FROM is the dependency reference rather than the raw
+		// base image. The engine moved the install into Deps, so the function
+		// image carries no install RUN of its own — only UserSetup/User/Env/
+		// Entrypoint on top of the dependency layer.
+		p.BaseImage = depRef
+	}
+
 	start := time.Now()
 	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image); err != nil {
 		d := time.Since(start)
@@ -157,6 +187,55 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		"result", "success",
 	)
 	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
+}
+
+// ensureDependencyImage computes the dependency fingerprint for the function's
+// dependency manifest set and returns the dependency image reference, building
+// the image on first use. It is a no-op (returns the existing reference) when
+// the dependency image is already present locally — the content address makes
+// existence the correctness test, since the tag embeds the fingerprint over
+// every relevant input. If the dependency build fails, Prepare fails: there is
+// no fallback to the old single-stage build, because the function image's
+// Dockerfile inherits its dependency layers via FROM and cannot be built without
+// them.
+func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Function, spec plan.Spec, deps plan.Deps) (string, error) {
+	fp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, deps)
+	if err != nil {
+		return "", fmt.Errorf("dependency fingerprint: %w", err)
+	}
+	ref := depImageRef(fp)
+	if m.imageExists(ctx, ref) {
+		m.log.Debug("Dependency image exists; reusing", "dep_image", ref)
+		return ref, nil
+	}
+
+	start := time.Now()
+	if err := buildDependencyImage(ctx, m.cli, spec, fn.Dir, deps, ref); err != nil {
+		d := time.Since(start)
+		// Dependency-image build failures count as function build failures so the
+		// existing failure metric/label surface stays the single observability
+		// contract for "this function could not be prepared".
+		m.metrics.IncLabels("build_failures_total", []metrics.Label{
+			{Name: "function", Value: fn.Name},
+		})
+		m.log.Error("Function: dependency build failed",
+			"function", fn.Name,
+			"duration", d,
+			"dep_image", ref,
+			"result", "failed",
+		)
+		return "", err
+	}
+	d := time.Since(start)
+	m.metrics.ObserveDurationLabels("function_build_seconds",
+		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
+	m.log.Info("Function: dependency layer built",
+		"function", fn.Name,
+		"duration", d,
+		"dep_image", ref,
+		"result", "success",
+	)
+	return ref, nil
 }
 
 // Execute runs the container for one invocation of the given handler with the

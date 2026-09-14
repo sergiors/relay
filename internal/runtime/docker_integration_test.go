@@ -29,6 +29,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
+	"relay/internal/runtime/plan"
 )
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -1685,4 +1686,294 @@ func TestIntegrationSweepOrphanContainers(t *testing.T) {
 			t.Errorf("container %s should NOT have been swept", cid)
 		}
 	}
+}
+
+// cleanupImagePrefixes force-removes every local image whose repo tag starts with
+// any of the given prefixes. It is t.Cleanup glue so dependency-layer tests never
+// leak relay-dep-* / relay-fn-* images onto a shared daemon.
+func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		imgs, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
+		if err != nil {
+			return
+		}
+		for _, img := range imgs.Items {
+			for _, tag := range img.RepoTags {
+				for _, p := range prefixes {
+					if strings.HasPrefix(tag, p) {
+						cleanupImage(cli, ctx, tag)
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+// depTags lists every local relay-dep-* image tag, used to assert how many
+// distinct dependency layers exist after a build.
+func depTags(ctx context.Context, cli *client.Client) []string {
+	list, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, img := range list.Items {
+		for _, tag := range img.RepoTags {
+			if strings.HasPrefix(tag, depRepoPrefix) {
+				out = append(out, tag)
+			}
+		}
+	}
+	return out
+}
+
+// TestIntegrationDependencyLayerReuse verifies the shared dependency layer is
+// reused across source changes: build v1 (with requirements.txt), then change
+// ONLY the handler source and build v2. The dependency image must exist
+// unchanged BEFORE and AFTER (same tag, no new dep image), while the function
+// image gets a NEW tag for the changed source.
+func TestIntegrationDependencyLayerReuse(t *testing.T) {
+	cli := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.run
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
+
+	fn := function.Function{Name: "dep-reuse", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+
+	// v1 source.
+	writeFile(t, dir, "handler.py", "def run(event):\n    print('v1')\n")
+	fp1, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint v1: %v", err)
+	}
+	ref1 := ImageRef(fn.Name, fp1)
+
+	p1, err := mPrepare(ctx, t, fn)
+	if err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+	if p1.Image != ref1 {
+		t.Fatalf("prepare v1 image = %q, want %q", p1.Image, ref1)
+	}
+	depsAfterV1 := depTags(ctx, cli)
+	if len(depsAfterV1) != 1 {
+		t.Fatalf("expected exactly one dependency image after v1 build, got %v", depsAfterV1)
+	}
+	depRef := depsAfterV1[0]
+	depIDBefore, err := cli.ImageInspect(ctx, depRef)
+	if err != nil {
+		t.Fatalf("inspect dep image: %v", err)
+	}
+
+	// v2 source: ONLY the handler changes.
+	writeFile(t, dir, "handler.py", "def run(event):\n    print('v2')\n")
+	fp2, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint v2: %v", err)
+	}
+	ref2 := ImageRef(fn.Name, fp2)
+	if ref1 == ref2 {
+		t.Fatalf("v1 and v2 refs must differ, both %s", ref1)
+	}
+
+	p2, err := mPrepare(ctx, t, fn)
+	if err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	if p2.Image != ref2 {
+		t.Fatalf("prepare v2 image = %q, want %q", p2.Image, ref2)
+	}
+
+	// The same dependency tag exists after v2, and it inspects to the SAME image
+	// ID (identical content — not rebuilt).
+	depsAfterV2 := depTags(ctx, cli)
+	if len(depsAfterV2) != 1 {
+		t.Fatalf("expected still exactly one dependency image after v2 built from source change, got %v", depsAfterV2)
+	}
+	if depsAfterV2[0] != depRef {
+		t.Fatalf("dep image tag changed across pure source change: %s -> %s", depRef, depsAfterV2[0])
+	}
+	depIDAfter, err := cli.ImageInspect(ctx, depRef)
+	if err != nil {
+		t.Fatalf("inspect dep image after v2: %v", err)
+	}
+	if depIDAfter.ID != depIDBefore.ID {
+		t.Errorf("dependency layer was rebuilt across a pure source change (before %s after %s) — it should be reused", depIDBefore.ID, depIDAfter.ID)
+	}
+
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-reuse:"))
+}
+
+// TestIntegrationDependencyChangeProducesNewDepLayer verifies that changing the
+// dependency manifest (adding a package to requirements.txt) yields a NEW
+// dependency fingerprint and a NEW relay-dep-* image, with both the old and new
+// dependency layers coexisting (old layers are never mutated).
+func TestIntegrationDependencyChangeProducesNewDepLayer(t *testing.T) {
+	cli := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.run
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	fn := function.Function{Name: "dep-change", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+
+	// v1 manifest.
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
+	if _, err := mPrepare(ctx, t, fn); err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+	deps1 := depTags(ctx, cli)
+	if len(deps1) != 1 {
+		t.Fatalf("expected one dep image after v1, got %v", deps1)
+	}
+
+	// v2 manifest: add a package. The function source and template are unchanged,
+	// so only the dependencies differ.
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\nrequests==2.32.3\n")
+	if _, err := mPrepare(ctx, t, fn); err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	deps2 := depTags(ctx, cli)
+	if len(deps2) != 2 {
+		t.Fatalf("expected TWO dependency images to coexist after manifest change, got %v", deps2)
+	}
+	// The original layer is still present (never mutated or pruned).
+	stillPresent := false
+	for _, d := range deps2 {
+		if d == deps1[0] {
+			stillPresent = true
+		}
+	}
+	if !stillPresent {
+		t.Errorf("original dependency image %s must coexist with the new layer", deps1[0])
+	}
+
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-change:"))
+}
+
+// TestIntegrationDepFingerprintRuntimeVersionDifferent verifies that the
+// dependency fingerprint differs across runtime versions even with identical
+// manifest content (via the fingerprint function directly, no second Python
+// runtime needed): different spec.Name / BaseImage must not share a layer.
+func TestIntegrationDepFingerprintRuntimeVersionDifferent(t *testing.T) {
+	requireDocker(t) // this test needs no daemon image ops, but stays tagged integration for consistency
+
+	dir := t.TempDir()
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
+	deps := plan.Deps{Files: []string{"requirements.txt"}, Install: "pip install --no-cache-dir -r requirements.txt", Dir: "/app"}
+
+	specA := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
+	specB := plan.Spec{Name: "python3.15", Engine: plan.EnginePython, BaseImage: "python:3.15-slim"}
+
+	fpA, err := DependencyFingerprint(arch, platform, specA, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint A: %v", err)
+	}
+	fpB, err := DependencyFingerprint(arch, platform, specB, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint B: %v", err)
+	}
+	if fpA == fpB {
+		t.Error("different runtime versions must not share a dependency layer fingerprint")
+	}
+	if depImageRef(fpA) == depImageRef(fpB) {
+		t.Error("different runtime versions must map to different dependency images")
+	}
+}
+
+// TestIntegrationConcurrentDepBuilds verifies two concurrent Prepare calls for
+// the same function version (two Manager instances, as two worker replicas
+// would) both succeed and leave exactly ONE dependency image tag — the shared,
+// content-addressed layer is built once even under a build race.
+func TestIntegrationConcurrentDepBuilds(t *testing.T) {
+	cli := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: handler.run
+    pattern:
+      status: [COMPLETED]
+`)
+	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
+	fn := function.Function{Name: "dep-race", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+
+	// Snapshot the pre-existing dep images so the assertion counts only what
+	// THIS test's concurrent builds add.
+	preexisting := depTags(ctx, cli)
+	preexistingSet := make(map[string]bool, len(preexisting))
+	for _, d := range preexisting {
+		preexistingSet[d] = true
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	results := make(chan *Prepared, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer m.Close()
+			p, err := m.Prepare(ctx, fn)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- p
+		}()
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			t.Fatalf("concurrent prepare failed: %v", err)
+		case p := <-results:
+			if !imageExistsInDaemon(cli, ctx, p.Image) {
+				t.Fatalf("concurrently prepared image %s must exist", p.Image)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for concurrent prepares")
+		}
+	}
+
+	// Exactly one NEW relay-dep-* image may exist after the race (both goroutines
+	// built the same fingerprint; Docker racing same-content builds => one tag).
+	var newDeps []string
+	for _, d := range depTags(ctx, cli) {
+		if !preexistingSet[d] {
+			newDeps = append(newDeps, d)
+		}
+	}
+	if len(newDeps) != 1 {
+		t.Errorf("expected exactly one new dependency image after concurrent builds, got %v", newDeps)
+	}
+
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-race:"))
 }

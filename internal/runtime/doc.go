@@ -4,7 +4,10 @@
 // container lifecycle, turning function specs into runnable images:
 //   - Dispatch: a runtime spec maps to an engine, which produces a build plan
 //     (never a Dockerfile)
-//   - Build: one image per function via a single generic Dockerfile renderer
+//   - Build: one image per function via a single generic Dockerfile renderer;
+//     a declared dependency layer (plan.Deps) is built once as a content-
+//     addressed, shared `relay-dep-*` base image that the function image builds
+//     FROM, so unchanged dependency manifests are reused across source changes
 //   - Execute: one disposable container per handler invocation, event JSON on
 //     stdin, stdout/stderr forwarded verbatim to the process output sink as a
 //     raw transport (not slog)
@@ -22,7 +25,11 @@
 //   - A single reused Docker Engine client for every build and invocation
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;
 //     this package answers "how do I build it?" and knows nothing about Python
-//     imports or Node module resolution
+//     imports or Node module resolution. Engines declare a function's reusable
+//     dependency layer (manifest files + install command) via plan.Deps; the
+//     dependency images and their content-addressed `relay-dep-*` references
+//     live entirely here. The dependency fingerprint keys on the base image
+//     TAG, not its digest (a documented limitation).
 //   - The package knows nothing about matching or Redis
 //
 // Security baseline: every execution container is hardened. It runs as a

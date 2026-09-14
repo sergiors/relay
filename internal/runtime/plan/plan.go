@@ -32,14 +32,59 @@ type File struct {
 // BuildPlan is how a function directory becomes an image. Engines answer "what
 // does this runtime need?" by producing a plan; the Docker builder answers "how
 // do I build the image?" by rendering it into a single generic Dockerfile.
+// Deps describes the function's dependencies as a reusable layer: the manifest
+// files the engine reads (paths relative to the function dir), the install
+// command, and the directory the dependencies land in. Zero value = no deps.
+type Deps struct {
+	// Files are the dependency manifest files, RELATIVE to the function dir
+	// (e.g. "requirements.txt"; node: "package.json", "package-lock.json").
+	Files []string
+	// Install is the shell command that installs the dependencies from the
+	// manifest files into InstallDir, run inside the dependency-image build.
+	Install string
+	// Dir is the absolute path the dependencies are installed into (the layer's
+	// payload; e.g. /app). It must equal the function image's WorkDir so a
+	// FROM of the dependency image inherits everything in place.
+	Dir string
+}
+
+// IsZero reports whether no dependency layer is declared. Files is the driving
+// field (an install into an empty manifest set is meaningless); it also lets
+// callers compare a Deps value without relying on slice comparability.
+func (d Deps) IsZero() bool {
+	return len(d.Files) == 0
+}
+
+// Equal reports whether two Deps describe the same dependency layer. It exists
+// because Deps contains slices, which Go cannot compare with ==; tests and
+// callers use it instead.
+func (d Deps) Equal(o Deps) bool {
+	if d.Install != o.Install || d.Dir != o.Dir || len(d.Files) != len(o.Files) {
+		return false
+	}
+	for i := range d.Files {
+		if d.Files[i] != o.Files[i] {
+			return false
+		}
+	}
+	return true
+}
+
 type BuildPlan struct {
 	BaseImage string
 	WorkDir   string
 	// Files are additional files for the builder to write (the bootstrap, an
 	// injected package.json, etc.).
 	Files []File
-	// Install are shell commands run inside the image at build time (e.g. "pip
-	// install ..."). Empty when there is nothing to install.
+	// Deps is the function's reusable dependency layer (manifest files +
+	// install command + install directory). When non-zero, the builder renders
+	// a separate dependency image whose contents are installed into Deps.Dir,
+	// and the function image's Dockerfile builds FROM that dependency image
+	// instead of BaseImage. Zero value = no dependency layer.
+	Deps Deps
+	// Install are shell commands run inside the image at build time. With the
+	// dependency install moved into Deps, engines that have no dependency stage
+	// leave this empty; it remains for any future non-dependency build step.
 	Install []string
 	// UserSetup is a single RUN command that creates the runtime user and
 	// prepares the writable paths it needs (e.g. "groupadd ... && useradd ...

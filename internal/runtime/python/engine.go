@@ -60,9 +60,18 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		Mode:    fs.FileMode(0o644),
 	}}
 
-	var install []string
+	// A requirements.txt declares the function's dependency layer: a reusable
+	// image that installs the requirements into /app (the same directory the
+	// function image uses as its WORKDIR, so a FROM of the dependency image
+	// inherits the installed packages in place). Without requirements.txt there
+	// are no dependencies, so no Deps and no dependency image.
+	var deps plan.Deps
 	if _, err := os.Stat(filepath.Join(fnDir, dependenciesFile)); err == nil {
-		install = append(install, installCommand)
+		deps = plan.Deps{
+			Files:   []string{dependenciesFile},
+			Install: installCommand,
+			Dir:     workDir,
+		}
 	} else if !os.IsNotExist(err) {
 		return plan.BuildPlan{}, fmt.Errorf("stat %s: %w", dependenciesFile, err)
 	}
@@ -71,7 +80,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		BaseImage:  spec.BaseImage,
 		WorkDir:    workDir,
 		Files:      files,
-		Install:    install,
+		Deps:       deps,
 		UserSetup:  userSetup,
 		User:       userID,
 		Env:        []string{noBytecodeEnv},

@@ -339,6 +339,19 @@ stays authoritative in the local state database and on the prepared function.
 - Relay manages **only its own `relay-fn-*` images** — it never prunes globally
   or touches other apps' images or layers.
 
+Dependency layers (`requirements.txt` / `package-lock.json` / `package.json`)
+are installed once into reusable `relay-dep-*` images, fingerprinted by runtime
++ architecture + manifest contents. Function images build `FROM` them, so only
+dependency or source changes rebuild the top layers; a changed manifest yields a
+new `relay-dep-*` tag, an unchanged one is reused across every version of a
+function (and across functions with identical dependency sets). Dependency
+images are content-addressed and, being shared bases, are **not** auto-pruned by
+the startup sweep — a removed function image never removes a layer another
+function may still need. The fingerprint keys on the base image **tag** (e.g.
+`python:3.14-slim`), not its digest, so a newer pull of the same tag reuses the
+cached `relay-dep-*` image — operators wanting a refresh must remove those images
+(a future digest-pinning feature is the proper fix).
+
 ### Execution container lifecycle
 
 Every function execution container is created with Docker **AutoRemove**, so the

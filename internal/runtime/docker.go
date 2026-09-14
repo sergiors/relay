@@ -88,7 +88,23 @@ func buildImage(
 		return fmt.Errorf("function %q: copy sources: %w", name, err)
 	}
 
-	for _, f := range p.Files {
+	if err := writePlanFiles(ctxDir, name, p.Files); err != nil {
+		return err
+	}
+
+	dockerfile := renderDockerfile(p)
+	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		return fmt.Errorf("function %q: write dockerfile: %w", name, err)
+	}
+
+	return runImageBuild(ctx, cli, name, ctxDir, image)
+}
+
+// writePlanFiles writes the generated plan files (bootstrap, injected
+// package.json) into the staged build context. The caller's function directory
+// is never modified: generated files live only in the transient context.
+func writePlanFiles(ctxDir, name string, files []plan.File) error {
+	for _, f := range files {
 		rel := strings.TrimPrefix(filepath.Clean(f.Path), "/")
 		target := filepath.Join(ctxDir, rel)
 		if dir := filepath.Dir(target); dir != ctxDir {
@@ -104,12 +120,12 @@ func buildImage(
 			return fmt.Errorf("function %q: write %s: %w", name, f.Path, err)
 		}
 	}
+	return nil
+}
 
-	dockerfile := renderDockerfile(p)
-	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
-		return fmt.Errorf("function %q: write dockerfile: %w", name, err)
-	}
-
+// runImageBuild is the shared ImageBuild tail: write the Dockerfile is already
+// done by the caller; this tars the context, builds, and drains the response.
+func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string) error {
 	// The daemon expects the build context as a tar stream; build it in memory
 	// from the staged directory rather than shelling out to tar.
 	contextTar, err := tarContext(ctxDir)
@@ -131,6 +147,67 @@ func buildImage(
 		return fmt.Errorf("function %q: docker build: %w\n%s", name, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// buildDependencyImage builds the reusable dependency layer for a function. The
+// image installs the dependencies into Deps.Dir (e.g. /app) as ROOT and carries
+// NO user setup, entrypoint, or env — it is a BASE for the function image, not a
+// runnable image, so run-time concerns (the runtime user, the entrypoint) stay in
+// the function image's own layer.
+//
+// Concurrency: two processes may build the same dependency image concurrently
+// (two Relay workers, or two Manager instances sharing a daemon). Both stage
+// isolated temp contexts (per-call), run the exact same manifest + base + install
+// command, and tag the same reference; Docker lets the tag land on the identical
+// content either way (last tag wins, content-equal), so no lockfile is needed.
+func buildDependencyImage(ctx context.Context, cli *client.Client, spec plan.Spec, fnDir string, deps plan.Deps, depRef string) error {
+	ctxDir, err := os.MkdirTemp("", "relay-dep-build-*")
+	if err != nil {
+		return fmt.Errorf("dependency %s: create build context: %w", depRef, err)
+	}
+	defer os.RemoveAll(ctxDir)
+
+	// Stage ONLY the manifest files, not the function's source tree. The
+	// dependency image exists to cache the install; baking the whole source
+	// would couple the layer to every source change and defeat the reuse.
+	for _, name := range deps.Files {
+		src := filepath.Join(fnDir, filepath.FromSlash(name))
+		content, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("dependency %s: read manifest %q: %w", depRef, name, err)
+		}
+		target := filepath.Join(ctxDir, filepath.FromSlash(name))
+		if dir := filepath.Dir(target); dir != ctxDir {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("dependency %s: mkdir for %s: %w", depRef, name, err)
+			}
+		}
+		if err := os.WriteFile(target, content, 0o644); err != nil {
+			return fmt.Errorf("dependency %s: write manifest %s: %w", depRef, name, err)
+		}
+	}
+
+	// Render via the single generic renderer with a synthetic plan: the runtime
+	// base, WORKDIR = the install dir, the manifests already staged at their
+	// relative context paths (so the generic `COPY . <workdir>` copies exactly
+	// them), and the install command. No User/UserSetup/Env/Entrypoint — it is a
+	// base image.
+	depPlan := plan.BuildPlan{
+		BaseImage: spec.BaseImage,
+		WorkDir:   deps.Dir,
+		// Note: plan.Deps is intentionally left zero here so the renderer emits
+		// the plain `COPY . <workdir>` path, not a nested dependency base.
+		Install: []string{deps.Install},
+	}
+	if depPlan.Install[0] == "" {
+		return fmt.Errorf("dependency %s: empty install command", depRef)
+	}
+	dockerfile := renderDockerfile(depPlan)
+	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		return fmt.Errorf("dependency %s: write dockerfile: %w", depRef, err)
+	}
+
+	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef)
 }
 
 // buildImageOptions returns the ImageBuildOptions Relay uses for every function

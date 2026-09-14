@@ -43,8 +43,11 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if p.WorkDir != "/app" {
 				t.Errorf("work dir = %q, want /app", p.WorkDir)
 			}
+			if !p.Deps.IsZero() {
+				t.Errorf("expected zero Deps without package files, got %+v", p.Deps)
+			}
 			if len(p.Install) != 0 {
-				t.Errorf("expected no install without package files, got %v", p.Install)
+				t.Errorf("expected no build-step install without package files, got %v", p.Install)
 			}
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" {
 				t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs]", p.Entrypoint)
@@ -101,8 +104,12 @@ func TestPlanWithPackageJSONOnly(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 1 || p.Install[0] != "npm install --omit=dev" {
-				t.Errorf("install = %v, want [npm install --omit=dev]", p.Install)
+			if len(p.Install) != 0 {
+				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			}
+			want := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+			if !p.Deps.Equal(want) {
+				t.Errorf("deps = %+v, want %+v", p.Deps, want)
 			}
 			for _, f := range p.Files {
 				if f.Path == filepath.Join("/app", "package.json") {
@@ -117,6 +124,9 @@ func TestPlanWithLock(t *testing.T) {
 	for _, spec := range testSpecs {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+				t.Fatalf("write package.json: %v", err)
+			}
 			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
 				t.Fatalf("write package-lock.json: %v", err)
 			}
@@ -125,12 +135,69 @@ func TestPlanWithLock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 1 || p.Install[0] != "npm ci --omit=dev" {
-				t.Errorf("install = %v, want [npm ci --omit=dev]", p.Install)
+			if len(p.Install) != 0 {
+				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			}
+			// Both the lock and the manifest are listed so a lock change (a
+			// different pinned tree) re-fingerprints the layer even when the
+			// manifest is unchanged.
+			want := plan.Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+			if !p.Deps.Equal(want) {
+				t.Errorf("deps = %+v, want %+v", p.Deps, want)
 			}
 			for _, f := range p.Files {
 				if f.Path == filepath.Join("/app", "package.json") {
 					t.Error("did not expect injected package.json when a lock exists")
+				}
+			}
+		})
+	}
+}
+
+func TestPlanWithLockOnly(t *testing.T) {
+	for _, spec := range testSpecs {
+		t.Run(spec.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
+				t.Fatalf("write package-lock.json: %v", err)
+			}
+
+			p, err := Engine{}.Plan(spec, dir)
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			// A lock without a manifest is unusual; only the present file is
+			// listed so fingerprinting/the dep build never read a missing file.
+			want := plan.Deps{Files: []string{"package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+			if !p.Deps.Equal(want) {
+				t.Errorf("deps = %+v, want %+v", p.Deps, want)
+			}
+		})
+	}
+}
+
+func TestPlanWithLockOnlyNoInject(t *testing.T) {
+	for _, spec := range testSpecs {
+		t.Run(spec.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
+				t.Fatalf("write package-lock.json: %v", err)
+			}
+
+			p, err := Engine{}.Plan(spec, dir)
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			// Lock-only still routes through the Deps install path: npm ci must
+			// fail loudly during the build (no package.json), never silently be
+			// covered up by injecting an ESM package.json here.
+			want := plan.Deps{Files: []string{"package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+			if !p.Deps.Equal(want) {
+				t.Errorf("deps = %+v, want %+v", p.Deps, want)
+			}
+			for _, f := range p.Files {
+				if f.Path == filepath.Join("/app", "package.json") {
+					t.Error("did not expect injected package.json for a lock-only function")
 				}
 			}
 		})

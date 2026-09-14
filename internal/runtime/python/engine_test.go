@@ -34,8 +34,11 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if p.WorkDir != "/app" {
 				t.Errorf("work dir = %q, want /app", p.WorkDir)
 			}
+			if !p.Deps.IsZero() {
+				t.Errorf("expected zero Deps without requirements.txt, got %+v", p.Deps)
+			}
 			if len(p.Install) != 0 {
-				t.Errorf("expected no install without requirements.txt, got %v", p.Install)
+				t.Errorf("expected no build-step install without requirements.txt, got %v", p.Install)
 			}
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "python" || p.Entrypoint[1] != "/relay/bootstrap.py" {
 				t.Errorf("entrypoint = %v, want [python /relay/bootstrap.py]", p.Entrypoint)
@@ -78,8 +81,16 @@ func TestPlanWithRequirements(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 1 || p.Install[0] != "pip install --no-cache-dir -r requirements.txt" {
-				t.Errorf("install = %v, want [pip install --no-cache-dir -r requirements.txt]", p.Install)
+			if len(p.Install) != 0 {
+				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			}
+			want := plan.Deps{
+				Files:   []string{"requirements.txt"},
+				Install: "pip install --no-cache-dir -r requirements.txt",
+				Dir:     "/app",
+			}
+			if !p.Deps.Equal(want) {
+				t.Errorf("deps = %+v, want %+v", p.Deps, want)
 			}
 		})
 	}

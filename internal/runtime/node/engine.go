@@ -66,19 +66,39 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		Mode:    fs.FileMode(0o644),
 	}}
 
-	var install []string
+	// A package.json / package-lock.json declares the function's dependencies:
+	// a reusable layer that installs them into /app (the function WORKDIR).
+	var deps plan.Deps
 
 	lockErr := stat(fnDir, lockFile)
 	pkgErr := stat(fnDir, pkgFile)
 
 	switch {
-	case lockErr == nil:
-		install = append(install, "npm ci --omit=dev")
+	case lockErr == nil && pkgErr == nil:
+		// A lockfile pins the exact tree, so npm ci reproduces it: deterministic,
+		// correct, and the fastest install. Both files are listed so a lock change
+		// (a different pinned tree) re-fingerprints the layer even when the
+		// manifest is unchanged.
+		deps = plan.Deps{Files: []string{pkgFile, lockFile}, Install: "npm ci --omit=dev", Dir: workDir}
 	case pkgErr == nil:
-		install = append(install, "npm install --omit=dev")
+		// No lock: npm install resolves from the manifest.
+		deps = plan.Deps{Files: []string{pkgFile}, Install: "npm install --omit=dev", Dir: workDir}
+	case lockErr == nil:
+		// A lock without a manifest is unusual (npm ci needs both) but preserve
+		// the previous engine's intent to ci-install from the lock. Only the
+		// present file is listed so fingerprinting and the dep build never read a
+		// missing manifest.
+		//
+		// Intentional surface: npm ci fails without a package.json, so this
+		// branch's build fails loudly — the same failure mode as the previous
+		// single-stage behavior. Operators get an explicit error rather than
+		// silent misbehavior. No ESM package.json is injected here because the
+		// Deps path replaces the inject.
+		deps = plan.Deps{Files: []string{lockFile}, Install: "npm ci --omit=dev", Dir: workDir}
 	default:
 		// No package.json or lock: inject a minimal ESM package.json so .js files
-		// are treated as ESM.
+		// are treated as ESM. There are no dependencies, so no Deps and no
+		// dependency image.
 		files = append(files, plan.File{
 			Path:    filepath.Join(workDir, pkgFile),
 			Content: esmPackageJSON,
@@ -90,7 +110,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		BaseImage:  spec.BaseImage,
 		WorkDir:    workDir,
 		Files:      files,
-		Install:    install,
+		Deps:       deps,
 		UserSetup:  userSetup,
 		User:       userID,
 		Entrypoint: entrypoint,

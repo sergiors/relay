@@ -145,6 +145,74 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 	}
 }
 
+// TestRenderDockerfileDependencyBase verifies the synthetic plan the builder
+// renders for a dependency image: FROM the runtime base -> WORKDIR the install
+// dir -> COPY the staged manifests -> RUN install. It must carry NO user setup,
+// USER, Env, or ENTRYPOINT — a dependency image is a base for the function
+// image, not a runnable function.
+func TestRenderDockerfileDependencyBase(t *testing.T) {
+	// buildDependencyImage builds this plan (note Deps is intentionally zero so
+	// the renderer emits the plain COPY . path, not a nested dep base).
+	p := plan.BuildPlan{
+		BaseImage: "python:3.14-slim",
+		WorkDir:   "/app",
+		Install:   []string{"pip install --no-cache-dir -r requirements.txt"},
+	}
+	df := renderDockerfile(p)
+
+	if !strings.Contains(df, "FROM python:3.14-slim") {
+		t.Errorf("expected FROM base line, got:\n%s", df)
+	}
+	if !strings.Contains(df, "WORKDIR /app") {
+		t.Errorf("expected WORKDIR install-dir line, got:\n%s", df)
+	}
+	// The dep build context contains ONLY the manifest files, so COPY . /app
+	// stages exactly them into the install dir.
+	if !strings.Contains(df, "COPY . /app") {
+		t.Errorf("expected COPY manifests line, got:\n%s", df)
+	}
+	if !strings.Contains(df, "RUN pip install --no-cache-dir -r requirements.txt") {
+		t.Errorf("expected RUN install line, got:\n%s", df)
+	}
+	// A base image must not get runtime concerns baked in.
+	for _, banned := range []string{"USER ", "ENTRYPOINT", "groupadd", "addgroup", "PYTHONDONTWRITEBYTECODE"} {
+		if strings.Contains(df, banned) {
+			t.Errorf("dependency image must not contain %q, got:\n%s", banned, df)
+		}
+	}
+}
+
+// TestRenderDockerfileFunctionFromDependency verified the MANAGER rewrites the
+// function image's FROM to the dependency reference when Deps are present; this
+// test asserts the plan the manager hands to renderDockerfile produces the right
+// FROM and no install RUN (engine moved install into Deps).
+func TestRenderDockerfileFunctionFromDependency(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage:  "relay-dep-abcdef1234567890",
+		WorkDir:    "/app",
+		Files:      []plan.File{{Path: "/relay/bootstrap.py", Content: []byte("x"), Mode: fs.FileMode(0o644)}},
+		UserSetup:  "groupadd -g 10001 app && useradd -u 10001 -g 10001 app && chown -R 10001:10001 /app /relay",
+		User:       "10001:10001",
+		Entrypoint: []string{"python", "/relay/bootstrap.py"},
+	}
+	df := renderDockerfile(p)
+
+	if !strings.Contains(df, "FROM relay-dep-abcdef1234567890") {
+		t.Errorf("function image must build FROM the dependency image, got:\n%s", df)
+	}
+	// The install is in the dependency layer; the function image has no install
+	// RUN of its own.
+	if strings.Contains(df, "RUN pip install") {
+		t.Errorf("function image built FROM the dep layer must not re-run install, got:\n%s", df)
+	}
+	// The user setup is still needed (the dep layer's /app contents are owned by
+	// root; chown hands them to the runtime user), and the user switch + entry
+	// point stay in the function layer.
+	if !strings.Contains(df, "RUN groupadd") {
+		t.Errorf("expected user-setup RUN kept in the function image, got:\n%s", df)
+	}
+}
+
 func TestRenderDockerfileEntrypointQuoting(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage:  "example:1",
