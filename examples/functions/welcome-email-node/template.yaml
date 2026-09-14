@@ -1,4 +1,5 @@
 runtime: node24
+concurrency: 2
 
 events:
   - handler: handler.handler

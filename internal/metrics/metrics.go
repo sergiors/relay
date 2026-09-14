@@ -85,6 +85,10 @@ func New() *Registry {
 		"dlq_entries_total",
 		"handler_success_total",
 		"handler_failure_total",
+		// concurrency_waits_total counts each time an invocation's acquisition
+		// of a concurrency slot had to block (regardless of eventual success) —
+		// a cheap proxy for slot contention in the runner.
+		"concurrency_waits_total",
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name})
 		reg.MustRegister(c)
@@ -172,6 +176,19 @@ func New() *Registry {
 	for _, name := range []string{
 		"pending_entries",
 		"pending_oldest_age_seconds",
+	} {
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
+		reg.MustRegister(g)
+		r.gauges[name] = g
+	}
+
+	// Buffer/backpressure gauges. buffered_events is the stream consumer's
+	// current in-flight local buffer occupancy (events read from Redis but not
+	// yet finished); in_flight_invocations is the runner's current globally
+	// executing invocation count. Both are set on acquire/release.
+	for _, name := range []string{
+		"buffered_events",
+		"in_flight_invocations",
 	} {
 		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
 		reg.MustRegister(g)

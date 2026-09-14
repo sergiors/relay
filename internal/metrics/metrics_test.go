@@ -17,10 +17,20 @@ func TestCounterAccumulation(t *testing.T) {
 	r.Add("events_processed_total", 3)
 	r.Inc("retries_total")
 	got := r.Snapshot()
-	// Pre-registered gauges render their current (zero) value too.
-	want := "events_processed_total count=5\npending_entries value=0\npending_oldest_age_seconds value=0\nretries_total count=1"
-	if got != want {
-		t.Fatalf("snapshot = %q, want %q", got, want)
+	// Pre-registered counters and gauges render their current (zero) value too;
+	// assert the accumulated counters and that the required zero gauges are
+	// present rather than an exact full-string match (the gauge set grows).
+	for _, want := range []string{
+		"events_processed_total count=5",
+		"retries_total count=1",
+		"pending_entries value=0",
+		"pending_oldest_age_seconds value=0",
+		"buffered_events value=0",
+		"in_flight_invocations value=0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("snapshot missing %q; got %q", want, got)
+		}
 	}
 }
 
@@ -51,8 +61,8 @@ func TestDurationCountSum(t *testing.T) {
 	obs(3 * time.Second)
 	obs(2 * time.Second)
 	got := r.Snapshot()
-	if !strings.HasPrefix(got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000") {
-		t.Fatalf("snapshot = %q, want prefix %q", got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000")
+	if !strings.Contains(got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000") {
+		t.Fatalf("snapshot = %q, want it to contain %q", got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000")
 	}
 }
 

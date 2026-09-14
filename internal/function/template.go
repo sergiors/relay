@@ -20,6 +20,14 @@ const DefaultTimeout = 6 * time.Second
 // exhausted and the message is routed to the DLQ.
 const DefaultRetries = 4
 
+// DefaultConcurrency is the per-function concurrency applied to a template that
+// omits the top-level `concurrency` key. It bounds how many invocations of THIS
+// function's handlers may execute concurrently within a single Relay worker
+// (the worker-global cap in MAX_CONCURRENCY is a separate, broader limit). A
+// template that specifies `concurrency` must be a positive integer; zero,
+// negative, or non-integer values fail validation.
+const DefaultConcurrency = 2
+
 // MaxTimeout is the upper bound on any rule's handler timeout. It is the same
 // value as stream.MaxRuleTimeout (kept in sync; function is a leaf package and
 // stream may import it, not the reverse). The stream layer derives its
@@ -74,6 +82,12 @@ type SecretBinding struct {
 type Template struct {
 	Runtime string
 	Rules   []Rule
+	// Concurrency bounds how many of this function's handler invocations may
+	// execute concurrently within a single Relay worker (per-function, per
+	// worker). It is always >= 1 after ParseTemplate; a Template constructed
+	// without parsing (tests) may be 0, and the runner treats <=0 as
+	// DefaultConcurrency.
+	Concurrency int
 	// Env maps an env-var name to a literal string value, injected into every
 	// execution container at runtime. It is never baked into the image.
 	Env map[string]string
@@ -309,7 +323,12 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		Runtime string            `yaml:"runtime"`
 		Env     map[string]string `yaml:"env"`
 		Secrets map[string]string `yaml:"secrets"`
-		Events  []struct {
+		// Concurrency is decoded as `any` (not `*int`) so a non-integer value
+		// (e.g. "abc", "1.5", true) is distinguishable from an omitted one and
+		// rejected with a clear message instead of being silently truncated or
+		// coerced by yaml.v3.
+		Concurrency any `yaml:"concurrency"`
+		Events      []struct {
 			Handler string         `yaml:"handler"`
 			Pattern map[string]any `yaml:"pattern"`
 			Timeout string         `yaml:"timeout"`
@@ -325,6 +344,14 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	}
 
 	t := &Template{Runtime: raw.Runtime}
+
+	// Parse and validate concurrency. It is optional; when non-nil it must be a
+	// positive integer (see resolveConcurrency).
+	concurrency, err := resolveConcurrency(raw.Concurrency)
+	if err != nil {
+		return nil, err
+	}
+	t.Concurrency = concurrency
 
 	// Parse and validate env/secrets. Both are optional; when present, every
 	// key must be a valid env-var name, every secret reference a valid secret
@@ -502,6 +529,24 @@ func resolveTimeout(raw string) (time.Duration, error) {
 		return 0, fmt.Errorf("timeout %q exceeds max %s", raw, MaxTimeout)
 	}
 	return d, nil
+}
+
+// resolveConcurrency parses the optional per-function `concurrency` key. A nil
+// value (omitted) yields the default; any non-integer value (a string, a float,
+// a bool, ...), zero, or a negative integer is rejected. Concurrency must be a
+// positive integer (a value of 0 does not mean "unbounded").
+func resolveConcurrency(raw any) (int, error) {
+	if raw == nil {
+		return DefaultConcurrency, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, fmt.Errorf("concurrency must be a positive integer, got %v", raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("concurrency must be a positive integer, got %v", raw)
+	}
+	return n, nil
 }
 
 // resolveRetries parses an optional rule retry count. A nil value (omitted)

@@ -19,6 +19,22 @@ import (
 	"relay/internal/stream"
 )
 
+// DefaultMaxConcurrency is the runner's default global cap on concurrently
+// executing invocations in a single worker (MAX_CONCURRENCY). A zero or
+// negative value passed to SetMaxConcurrency falls back to this. The runner
+// deliberately owns this constant (it cannot import config; worker wires the
+// cfg value).
+const DefaultMaxConcurrency = 8
+
+// slotWaitTimeout bounds how long Handle waits for a free concurrency slot
+// (global or per-function) before giving up. It is deliberately well below the
+// stream layer's default MinPendingIdle reclaim threshold (1m): if slots never
+// free within the wait, Handle returns ErrInvocationNotEligible and the message
+// stays pending, so reclaim replays it later — and locally buffered events never
+// sit long enough to defeat the reclaim pacing (see the README's
+// "Concurrency and backpressure" note).
+const slotWaitTimeout = 30 * time.Second
+
 // Executor is the subset of the runtime Manager that invocations need. It is a
 // small interface so Handle and PreparedFunction construction can be exercised
 // in tests without a Docker daemon; the concrete *runtime.Manager satisfies it.
@@ -149,6 +165,33 @@ type Runner struct {
 	// references secrets then fails the invocation with a clear error). It is
 	// set via SetSecretProvider; the worker wires the production local provider.
 	secrets secrets.Provider
+	// maxConcurrency is the worker-global cap on concurrently executing
+	// invocations (0 = uncapped, which SetMaxConcurrency normalizes to
+	// DefaultMaxConcurrency). It is stored as an atomic so a SetMaxConcurrency
+	// call (worker wires it right after construction) and concurrent Handle
+	// calls read a consistent value.
+	maxConcurrency atomic.Int64
+	// globalSem is the global concurrency semaphore, sized to the (normalized)
+	// max concurrency. It is stored as an atomic pointer so a SetMaxConcurrency
+	// call (worker wires it right after construction) is race-free against
+	// concurrent Handle calls reading it: readers get either the old or the new
+	// semaphore, both of which are internally consistent.
+	globalSem atomic.Pointer[semaphore]
+	// fnSems is a mutex-protected map of per-function semaphores, keyed by
+	// function name and created on demand (first-wins capacity), so a hot-swapped
+	// template's concurrency change only takes effect for NEW function names; a
+	// running function's slots are resized only on restart (see the README).
+	fnSemsMu sync.Mutex
+	fnSems   map[string]*semaphore
+	// inFlight is the current number of invocations executing concurrently in
+	// this worker. It is kept in sync with the global semaphore slots and feeds
+	// the in_flight_invocations gauge (set on acquire/release).
+	inFlight atomic.Int64
+	// slotWait is how long an invocation waits for a free concurrency slot
+	// before giving up (leaving the message pending and reclaiming it later). It
+	// defaults to slotWaitTimeout and is overridable by tests (package-internal
+	// tests set r.slotWait directly to keep the slot-timeout tests fast).
+	slotWait time.Duration
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
@@ -219,7 +262,19 @@ func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, m *metric
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	r := &Runner{reg: &Registry{}, log: logger, metrics: m, refs: newImageRefCounter()}
+	r := &Runner{
+		reg:      &Registry{},
+		log:      logger,
+		metrics:  m,
+		refs:     newImageRefCounter(),
+		fnSems:   map[string]*semaphore{},
+		slotWait: slotWaitTimeout,
+	}
+	// maxConcurrency defaults to DefaultMaxConcurrency so an uncalled
+	// SetMaxConcurrency (a runner constructed directly, as in tests) still has a
+	// bounded global concurrency. SetMaxConcurrency overwrites it.
+	r.maxConcurrency.Store(DefaultMaxConcurrency)
+	r.globalSem.Store(newSemaphore(DefaultMaxConcurrency))
 	// When a retired image's last in-flight execution releases it, run the async
 	// removal automatically. r is fully built before any goroutine can run, and
 	// imageRemovedIdle is nil-safe on a nil cleaner.
@@ -275,6 +330,24 @@ func (r *Runner) SetSecretProvider(p secrets.Provider) {
 		return
 	}
 	r.secrets = p
+}
+
+// SetMaxConcurrency sets the worker-global cap on concurrently executing
+// invocations. A value of 0 or negative (the zero value) falls back to
+// DefaultMaxConcurrency (8); a value of 0 must not mean "unbounded". It is
+// nil-safe (a nil Runner is a no-op) and takes effect on the next Handle. It
+// is wired by the worker right next to SetHostname/SetSecretProvider/
+// SetMaxHandlerTimeout. The global semaphore is (re)built on the next acquisition,
+// so a call after construction resizes it.
+func (r *Runner) SetMaxConcurrency(n int) {
+	if r == nil {
+		return
+	}
+	if n < 1 {
+		n = DefaultMaxConcurrency
+	}
+	r.maxConcurrency.Store(int64(n))
+	r.globalSem.Store(newSemaphore(n))
 }
 
 // resolver returns the runner's resolved image cleaner, or nil when the executor
@@ -388,6 +461,130 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 	r.refs.acquire(image)
 	defer r.refs.release(image)
 	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON, extraEnv)
+}
+
+// semaphore is a channel-based counting semaphore that bounds how many
+// invocations may execute concurrently (globally or per function). acquireReserve
+// blocks up to slotWaitTimeout for a free slot, returning false on timeout (the
+// invocation is left pending and reclaimed later). It is created sized to the
+// concurrency limit and never resized mid-flight: per-function semaphores are
+// created first-wins by name, and the global semaphore is rebuilt by
+// SetMaxConcurrency.
+type semaphore struct {
+	slots chan struct{}
+}
+
+func newSemaphore(n int) *semaphore {
+	return &semaphore{slots: make(chan struct{}, n)}
+}
+
+// acquire acquires one slot, blocking up to wait until a slot frees, ctx is
+// done, or wait elapses. On success it returns (true, waited false/true) and the
+// caller MUST release (via release) exactly once. On timeout/cancel it returns
+// (false, ...) and no slot is held. waited reports whether the call had to
+// block at all (a slot was not immediately available): it feeds the
+// concurrency_waits_total counter.
+func (s *semaphore) acquire(ctx context.Context, wait time.Duration) (got bool, waited bool) {
+	select {
+	case s.slots <- struct{}{}:
+		return true, false
+	default:
+		// Not immediately free: fall through to the blocking wait.
+	}
+	waited = true
+	select {
+	case s.slots <- struct{}{}:
+		return true, true
+	case <-time.After(wait):
+		return false, true
+	case <-ctx.Done():
+		return false, true
+	}
+}
+
+func (s *semaphore) release() {
+	<-s.slots
+}
+
+// concurrencySems returns the global and per-function semaphores for the given
+// function, creating the function's semaphore on demand (first-wins capacity:
+// only sizes it to the function's template concurrency when none exists). The
+// global semaphore is non-nil on the runner (normalized on construction).
+func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *semaphore, fn *semaphore) {
+	// Global semaphore: normalized on construction / SetMaxConcurrency; it is
+	// always non-nil in practice. Guard nil defensively (a zero-valued Runner
+	// in tests would read nil).
+	global = r.globalSem.Load()
+	if global == nil {
+		global = newSemaphore(DefaultMaxConcurrency)
+	}
+	// Per-function semaphore: created on demand, first-wins capacity.
+	if fnConcurrency < 1 {
+		fnConcurrency = function.DefaultConcurrency
+	}
+	r.fnSemsMu.Lock()
+	defer r.fnSemsMu.Unlock()
+	if s, ok := r.fnSems[fnName]; ok {
+		return global, s
+	}
+	s := newSemaphore(fnConcurrency)
+	r.fnSems[fnName] = s
+	return global, s
+}
+
+// reserveSlots acquires both the global and per-function slots for one
+// invocation, counting a concurrency_waits_total whenever either slot was not
+// immediately free (the acquisition had to block). It returns a release func on
+// success (call it after the invocation, releasing both slots and the in-flight
+// gauge) and whether the acquisition had to block at all (for a debug log); on
+// timeout it returns (nil, ...) and does NOT hold any slot. It must be called
+// BEFORE TryStart so a blocked invocation is never counted as an attempt and does
+// not persist state.
+func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency int) (release func(), waited bool) {
+	global, fn := r.concurrencySems(fnName, fnConcurrency)
+
+	// Acquire the global slot first (the broader bound). A blocked acquire
+	// counts a wait, whether it eventually succeeds or not.
+	got, w := global.acquire(ctx, r.slotWait)
+	if w {
+		r.metrics.Inc("concurrency_waits_total")
+	}
+	waited = waited || w
+	if !got {
+		return nil, waited
+	}
+
+	// Then the per-function slot. A blocked acquire also counts a wait. If the
+	// per-function slot never frees, release the global slot so it does not
+	// leak to another function's wait.
+	got, w = fn.acquire(ctx, r.slotWait)
+	if w {
+		r.metrics.Inc("concurrency_waits_total")
+	}
+	waited = waited || w
+	if !got {
+		global.release()
+		return nil, waited
+	}
+
+	// Both slots held and the invocation is about to execute: publish the
+	// in-flight gauge for it.
+	r.inFlight.Add(1)
+	r.metrics.SetGauge("in_flight_invocations", float64(r.inFlight.Load()))
+
+	released := false
+	release = func() {
+		if released {
+			return
+		}
+		released = true
+		fn.release()
+		global.release()
+		// Publish the in-flight gauge AFTER dropping below the cap.
+		r.inFlight.Add(-1)
+		r.metrics.SetGauge("in_flight_invocations", float64(r.inFlight.Load()))
+	}
+	return release, waited
 }
 
 // runInvocation runs one rule's handler while holding a reference to the
@@ -555,166 +752,266 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
 				timeout = cap
 			}
-			// The per-invocation attempt number. With invocation state it comes
-			// from TryStart (Redis-backed, incremented per actual execution);
-			// without it, each direct call is simply attempt 1.
-			attempt := int(deliveryAttempt)
-			// Claim the invocation for this execution before running it. TryStart
-			// persists an absolute running deadline (now + timeout) and returns
-			// started=false when the invocation is already complete (handled
-			// above), exhausted, or protected by an active attempt deadline or a
-			// retry backoff — this or another replica may be executing it, or it
-			// is waiting out its backoff, so we must not run it concurrently. The
-			// IsComplete check above is the fast path that avoids an HSET on
-			// completed invocations; TryStart's own HGET also reads "ok" and
-			// covers the same case, so the two are consistent.
-			if hasState {
-				started, n, wait := invState.TryStart(invocation, timeout)
-				if !started {
-					if wait > 0 {
-						// Protected by an active running deadline or a retry
-						// backoff. The message must stay pending (the protected
-						// invocation may still complete or fail on its own), so
-						// this is a "not eligible" skip, not a completion.
-						skippedPending = true
-						r.log.Debug("Function handler: not eligible for event (running or waiting for retry); leaving pending",
-							"function", pf.fn.Name,
-							"handler", rule.Handler,
-							"message_id", msgID,
-							"event_id", eventID,
-							"event_name", eventName,
-							"attempt", n,
-							"next_attempt_in", wait,
-						)
-					} else {
-						// Terminal (exhausted): skipped like complete, never
-						// eligible again.
-						r.log.Debug("Function handler: exhausted for event; skipping",
-							"function", pf.fn.Name,
-							"handler", rule.Handler,
-							"message_id", msgID,
-							"event_id", eventID,
-							"event_name", eventName,
-							"attempt", n,
-						)
+			// executeRule runs this single rule's invocation while holding the
+			// worker-global and per-function concurrency slots (whose defer scope
+			// is THIS call, so a multi-rule message never accumulates slots across
+			// rules). It returns an error to propagate on a failure that must
+			// leave the message pending (the recordFailure/err paths below), or
+			// nil on a skip / success so the caller continues to the next rule.
+			// skippedPending and executed are updated by reference so the outer
+			// return contract still sees them.
+			executeRule := func() error {
+				// The per-invocation attempt number. With invocation state it
+				// comes from TryStart (Redis-backed, incremented per actual
+				// execution); without it, each direct call is simply attempt 1.
+				attempt := int(deliveryAttempt)
+				// Reserve the worker-global and per-function concurrency slots
+				// BEFORE TryStart, so a blocked invocation is never counted as an
+				// attempt and does not persist state. If no slot frees within
+				// slotWait (well below MinPendingIdle, so a locally buffered event
+				// never defeats reclaim), the invocation is treated as not
+				// eligible: it stays pending and is replayed by a later reclaim,
+				// with no retry accounting and no DLQ. The slots are released via
+				// defer as soon as THIS invocation finishes.
+				releaseSlots, waited := r.reserveSlots(ctx, pf.fn.Name, pf.fn.Template.Concurrency)
+				if releaseSlots == nil {
+					// No slot freed in time: skip this invocation without marking
+					// it failed, leave the message pending (reclaim replays it
+					// later).
+					skippedPending = true
+					r.log.Debug("Function handler: concurrency slot wait timed out; leaving pending",
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+					)
+					return nil
+				}
+				if waited {
+					r.log.Debug("Function handler: waiting for concurrency slot",
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+					)
+				}
+				defer releaseSlots()
+				// Claim the invocation for this execution before running it.
+				// TryStart persists an absolute running deadline (now + timeout)
+				// and returns started=false when the invocation is already
+				// complete (handled above), exhausted, or protected by an active
+				// attempt deadline or a retry backoff — this or another replica
+				// may be executing it, or it is waiting out its backoff, so we
+				// must not run it concurrently. The IsComplete check above is the
+				// fast path that avoids an HSET on completed invocations;
+				// TryStart's own HGET also reads "ok" and covers the same case,
+				// so the two are consistent.
+				if hasState {
+					started, n, wait := invState.TryStart(invocation, timeout)
+					if !started {
+						// The slot is released by the deferred releaseSlots before
+						// the next rule acquires.
+						if wait > 0 {
+							// Protected by an active running deadline or a retry
+							// backoff. The message must stay pending (the protected
+							// invocation may still complete or fail on its own), so
+							// this is a "not eligible" skip, not a completion.
+							skippedPending = true
+							r.log.Debug("Function handler: not eligible for event (running or waiting for retry); leaving pending",
+								"function", pf.fn.Name,
+								"handler", rule.Handler,
+								"message_id", msgID,
+								"event_id", eventID,
+								"event_name", eventName,
+								"attempt", n,
+								"next_attempt_in", wait,
+							)
+						} else {
+							// Terminal (exhausted): skipped like complete, never
+							// eligible again.
+							r.log.Debug("Function handler: exhausted for event; skipping",
+								"function", pf.fn.Name,
+								"handler", rule.Handler,
+								"message_id", msgID,
+								"event_id", eventID,
+								"event_name", eventName,
+								"attempt", n,
+							)
+						}
+						return nil
 					}
-					continue
+					attempt = n
 				}
-				attempt = n
-			}
-			executed = true
-			r.log.Debug("Function rule: matched event",
-				"function", pf.fn.Name,
-				"handler", rule.Handler,
-				"message_id", msgID,
-				"event_id", eventID,
-				"event_name", eventName,
-				"attempt", attempt,
-			)
-			eventJSON, err := json.Marshal(event)
-			if err != nil {
-				// The invocation was already claimed (TryStart above) but will not
-				// execute: this is a failed attempt, so schedule a retry with the
-				// same backoff rules as an execution failure (it IS a failed
-				// attempt). If the attempt is exhausted, mark it terminal.
-				if hasState {
-					return r.recordFailure(
-						invState,
-						invocation,
-						attempt,
-						rule.Retries,
-						matched,
-						pf.fn.Name,
-						rule.Handler,
-						msgID,
-						eventID,
-						eventName,
-						err,
-					)
-				}
-				return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
-			}
-			// Resolve the template's env values and secret references into the
-			// per-invocation extra env, immediately before container creation.
-			// Secret values are resolved per execution (never cached on Prepared,
-			// never in the fingerprint), so rotating a secret value never requires
-			// a rebuild. A resolution failure is a failed attempt (the invocation
-			// was already claimed by TryStart), so it flows through the same
-			// retry/exhaustion machinery as an execution failure. The error names
-			// the secret REFERENCE only — never any value.
-			extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
-			if err != nil {
-				if hasState {
-					return r.recordFailure(
-						invState,
-						invocation,
-						attempt,
-						rule.Retries,
-						matched,
-						pf.fn.Name,
-						rule.Handler,
-						msgID,
-						eventID,
-						eventName,
-						err,
-					)
-				}
-				return fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
-			}
-			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
-			// Stamp the invocation's diagnostic metadata into the context so the
-			// executor can attach it as container labels. This keeps the
-			// Executor interface (and every test fake) unchanged.
-			invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
-				Function:  pf.fn.Name,
-				Handler:   rule.Handler,
-				MessageID: msgID,
-				EventID:   eventID,
-				EventName: eventName,
-				Hostname:  r.hostname,
-				Image:     toImage(pf),
-			})
-			start := time.Now()
-			err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
-			d := time.Since(start)
-			if panicked {
-				// A panicking execution is a misbehaving handler, not a healthy
-				// failure: log the panic value and the full stack so the bug is
-				// visible and attributable, then funnel it through the SAME
-				// failure branch below (metrics + recordFailure) so retry and
-				// exhaustion accounting stay per-invocation. The panic value and
-				// stack are structured attributes; slog renders them single-line
-				// in the text handler, which keeps every record one line.
-				r.log.Error("Function handler: PANICKED for event",
+				executed = true
+				r.log.Debug("Function rule: matched event",
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
 					"event_id", eventID,
 					"event_name", eventName,
 					"attempt", attempt,
-					"panic_value", fmt.Sprintf("%v", panicValue),
-					"stack", string(debug.Stack()),
 				)
-			}
-			if err != nil {
+				eventJSON, err := json.Marshal(event)
+				if err != nil {
+					// The invocation was already claimed (deferred-released) but
+					// will not execute: this is a failed attempt, so schedule a
+					// retry with the same backoff rules as an execution failure (it
+					// IS a failed attempt). If the attempt is exhausted, mark it
+					// terminal.
+					if hasState {
+						return r.recordFailure(
+							invState,
+							invocation,
+							attempt,
+							rule.Retries,
+							matched,
+							pf.fn.Name,
+							rule.Handler,
+							msgID,
+							eventID,
+							eventName,
+							err,
+						)
+					}
+					return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
+				}
+				// Resolve the template's env values and secret references into the
+				// per-invocation extra env, immediately before container creation.
+				// Secret values are resolved per execution (never cached on
+				// Prepared, never in the fingerprint), so rotating a secret value
+				// never requires a rebuild. A resolution failure is a failed
+				// attempt (the invocation was already claimed by TryStart), so it
+				// flows through the same retry/exhaustion machinery as an
+				// execution failure. The error names the secret REFERENCE only —
+				// never any value.
+				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
+				if err != nil {
+					if hasState {
+						return r.recordFailure(
+							invState,
+							invocation,
+							attempt,
+							rule.Retries,
+							matched,
+							pf.fn.Name,
+							rule.Handler,
+							msgID,
+							eventID,
+							eventName,
+							err,
+						)
+					}
+					return fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
+				}
+				invokeCtx, cancel := context.WithTimeout(ctx, timeout)
+				// Stamp the invocation's diagnostic metadata into the context so
+				// the executor can attach it as container labels. This keeps the
+				// Executor interface (and every test fake) unchanged.
+				invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+					Function:  pf.fn.Name,
+					Handler:   rule.Handler,
+					MessageID: msgID,
+					EventID:   eventID,
+					EventName: eventName,
+					Hostname:  r.hostname,
+					Image:     toImage(pf),
+				})
+				start := time.Now()
+				err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
+				d := time.Since(start)
+				if panicked {
+					// A panicking execution is a misbehaving handler, not a
+					// healthy failure: log the panic value and the full stack so
+					// the bug is visible and attributable, then funnel it through
+					// the SAME failure branch below (metrics + recordFailure) so
+					// retry and exhaustion accounting stay per-invocation.
+					r.log.Error("Function handler: PANICKED for event",
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+						"panic_value", fmt.Sprintf("%v", panicValue),
+						"stack", string(debug.Stack()),
+					)
+				}
+				if err != nil {
+					r.metrics.IncLabels("handler_invocations_total",
+						[]metrics.Label{
+							{Name: "outcome", Value: "failure"},
+							{Name: "function", Value: pf.fn.Name},
+							{Name: "handler", Value: rule.Handler},
+						})
+					// Unlabeled total for the SQLite snapshot; the labeled counter
+					// above stays for Prometheus.
+					r.metrics.Inc("handler_failure_total")
+					// Per-function failure attribution (per rule execution).
+					r.metrics.IncLabels("function_handler_failure_total",
+						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+					r.metrics.ObserveDurationLabels("handler_duration_seconds",
+						[]metrics.Label{
+							{Name: "function", Value: pf.fn.Name},
+							{Name: "handler", Value: rule.Handler},
+						}, d)
+					r.log.Warn("Function handler: execution failed for event",
+						"function", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"event_id", eventID,
+						"event_name", eventName,
+						"attempt", attempt,
+						"duration", d,
+						"reason", err,
+					)
+					// Record the failure and decide retry vs exhaustion. This is
+					// the per-invocation retry driver: a retryable failure
+					// schedules a backoff and counts function_retries_total; an
+					// exhausted attempt marks the invocation terminal and, when
+					// the whole message is terminal, routes it to the DLQ.
+					if hasState {
+						return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+					}
+					// No invocation state (direct callers/tests): every failure
+					// counts as a retry driver, but there is no Redis-backed
+					// attempt count to decide exhaustion — so no DLQ attribution
+					// here either. The DLQ metric is only meaningful with
+					// invocation state, where exhaustion is actually persisted
+					// and observable.
+					r.metrics.IncLabels("function_retries_total",
+						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+					return err
+				}
+				// Record the invocation as completed so a redelivery skips it.
+				// This happens BEFORE the success metrics so a crash between the
+				// side effect and MarkComplete re-runs the handler (at-least-once;
+				// the handler must remain idempotent). A mark failure is logged by
+				// the handle and does not fail the invocation.
+				if hasState {
+					invState.MarkComplete(invocation)
+				}
 				r.metrics.IncLabels("handler_invocations_total",
 					[]metrics.Label{
-						{Name: "outcome", Value: "failure"},
+						{Name: "outcome", Value: "success"},
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
 					})
 				// Unlabeled total for the SQLite snapshot; the labeled counter
 				// above stays for Prometheus.
-				r.metrics.Inc("handler_failure_total")
-				// Per-function failure attribution (per rule execution).
-				r.metrics.IncLabels("function_handler_failure_total",
+				r.metrics.Inc("handler_success_total")
+				// Per-function success attribution (per rule execution).
+				r.metrics.IncLabels("function_handler_success_total",
 					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 				r.metrics.ObserveDurationLabels("handler_duration_seconds",
 					[]metrics.Label{
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
 					}, d)
-				r.log.Warn("Function handler: execution failed for event",
+				r.log.Info("Function handler: executed for event",
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
@@ -722,59 +1019,12 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"event_name", eventName,
 					"attempt", attempt,
 					"duration", d,
-					"reason", err,
 				)
-				// Record the failure and decide retry vs exhaustion. This is the
-				// per-invocation retry driver: a retryable failure schedules a
-				// backoff and counts function_retries_total; an exhausted attempt
-				// marks the invocation terminal and, when the whole message is
-				// terminal, routes it to the DLQ.
-				if hasState {
-					return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
-				}
-				// No invocation state (direct callers/tests): every failure counts
-				// as a retry driver, but there is no Redis-backed attempt count to
-				// decide exhaustion — so no DLQ attribution here either. The DLQ
-				// metric is only meaningful with invocation state, where
-				// exhaustion is actually persisted and observable.
-				r.metrics.IncLabels("function_retries_total",
-					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+				return nil
+			}
+			if err := executeRule(); err != nil {
 				return err
 			}
-			// Record the invocation as completed so a redelivery skips it. This
-			// happens BEFORE the success metrics so a crash between the side
-			// effect and MarkComplete re-runs the handler (at-least-once; the
-			// handler must remain idempotent). A mark failure is logged by the
-			// handle and does not fail the invocation.
-			if hasState {
-				invState.MarkComplete(invocation)
-			}
-			r.metrics.IncLabels("handler_invocations_total",
-				[]metrics.Label{
-					{Name: "outcome", Value: "success"},
-					{Name: "function", Value: pf.fn.Name},
-					{Name: "handler", Value: rule.Handler},
-				})
-			// Unlabeled total for the SQLite snapshot; the labeled counter above
-			// stays for Prometheus.
-			r.metrics.Inc("handler_success_total")
-			// Per-function success attribution (per rule execution).
-			r.metrics.IncLabels("function_handler_success_total",
-				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-			r.metrics.ObserveDurationLabels("handler_duration_seconds",
-				[]metrics.Label{
-					{Name: "function", Value: pf.fn.Name},
-					{Name: "handler", Value: rule.Handler},
-				}, d)
-			r.log.Info("Function handler: executed for event",
-				"function", pf.fn.Name,
-				"handler", rule.Handler,
-				"message_id", msgID,
-				"event_id", eventID,
-				"event_name", eventName,
-				"attempt", attempt,
-				"duration", d,
-			)
 		}
 	}
 	// Return contract: nil when something executed successfully (or nothing

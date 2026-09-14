@@ -557,6 +557,84 @@ events:
 
 // TestTemplateEnvPairsSorted verifies EnvList and SecretList return
 // name-ordered slices regardless of YAML map ordering.
+// TestParseConcurrencyOmittedDefaults pins that a template omitting the
+// top-level `concurrency` key resolves to DefaultConcurrency (2).
+func TestParseConcurrencyOmittedDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Concurrency != DefaultConcurrency {
+		t.Errorf("omitted concurrency = %d, want default %d", tmpl.Concurrency, DefaultConcurrency)
+	}
+}
+
+// TestParseConcurrencyExplicit verifies an explicit top-level `concurrency` is
+// honored.
+func TestParseConcurrencyExplicit(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+concurrency: 2
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Concurrency != 2 {
+		t.Errorf("concurrency: 2 = %d, want 2", tmpl.Concurrency)
+	}
+
+	five := mustParse(t, `
+runtime: python3.14
+concurrency: 5
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if five.Concurrency != 5 {
+		t.Errorf("concurrency: 5 = %d, want 5", five.Concurrency)
+	}
+}
+
+// TestParseConcurrencyRejected verifies that a zero, negative, or non-integer
+// top-level `concurrency` fails validation with a clear message mentioning
+// "concurrency". yaml.v3 decodes "1.5" as a float and "true" as a bool, so they
+// must be rejected rather than silently coerced.
+func TestParseConcurrencyRejected(t *testing.T) {
+	cases := []struct {
+		name        string
+		concurrency string
+	}{
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"string", "abc"},
+		{"float", "1.5"},
+		{"bool", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+concurrency: ` + tc.concurrency + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for concurrency %q", tc.concurrency)
+			}
+			if !strings.Contains(err.Error(), "concurrency") {
+				t.Errorf("expected error to mention concurrency, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestTemplateEnvPairsSorted(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,6 +29,16 @@ type Config struct {
 	// LogLevel is the slog level selected by LOG_LEVEL (default Info). It is
 	// used by cmd/main.go to build the process logger after config.Load.
 	LogLevel slog.Level
+	// MaxConcurrency is the MAX_CONCURRENCY value (default 8): the total number
+	// of function invocations executing concurrently in this single Relay
+	// worker. Values below the default fall back in the runner (see
+	// runner.SetMaxConcurrency); it is always positive after Load.
+	MaxConcurrency int
+	// MaxBufferedEvents is the MAX_BUFFERED_EVENTS value (default 16): the
+	// number of events already read from Redis and still held locally by this
+	// worker before they complete/ACK. It bounds the local buffer so the
+	// backlog stays in Redis when full. It is always positive after Load.
+	MaxBufferedEvents int
 }
 
 // Load reads Relay's configuration from the environment and returns a Config. It
@@ -43,18 +54,65 @@ type Config struct {
 // The two optional variables are read with os.Getenv and stay zero/empty when
 // unset: retention maps to 0 (disabled, see parseRetention) and the metrics
 // address to "" (no HTTP server), preserving their opt-in semantics through the
-// caller's non-zero / non-empty guards.
+// caller's non-zero / non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
+// default to 8 and 16 respectively (see ParsePositiveInt); an invalid (zero,
+// negative, or non-integer) value is a configuration error and aborts startup,
+// matching the loadLogLevel style.
 func Load(logger *slog.Logger) Config {
 	return Config{
-		RedisURI:        requiredEnv(logger, "REDIS_URI"),
-		RedisStream:     requiredEnv(logger, "REDIS_STREAM"),
-		RedisGroup:      requiredEnv(logger, "REDIS_GROUP"),
-		ConsumerName:    consumerNameFromHost(logger),
-		StreamRetention: parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
-		MetricsAddr:     getEnv("METRICS_ADDR", ""),
-		LogLevel:        loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
+		RedisURI:          requiredEnv(logger, "REDIS_URI"),
+		RedisStream:       requiredEnv(logger, "REDIS_STREAM"),
+		RedisGroup:        requiredEnv(logger, "REDIS_GROUP"),
+		ConsumerName:      consumerNameFromHost(logger),
+		StreamRetention:   parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
+		MetricsAddr:       getEnv("METRICS_ADDR", ""),
+		LogLevel:          loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
+		MaxConcurrency:    loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
+		MaxBufferedEvents: loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
 	}
 
+}
+
+// Default max-concurrency and max-buffered-events values. The runner and stream
+// layers keep their own copies of these constants (a leaf package cannot import
+// config); this package owns the env-facing defaults.
+const (
+	DefaultMaxConcurrency    = 8
+	DefaultMaxBufferedEvents = 16
+)
+
+// loadPositiveInt parses an optional positive-integer environment value,
+// falling back to def when unset/empty. An unparseable, zero, or negative value
+// is a configuration error: it logs and aborts startup, matching loadLogLevel.
+// The injected logger is non-nil at this entry point (the CLI owns logger
+// creation).
+func loadPositiveInt(logger *slog.Logger, name, value string, def int) int {
+	n, err := ParsePositiveInt(name, value, def)
+	if err != nil {
+		logger.Error("Configuration error", "error", err)
+		os.Exit(1)
+	}
+	return n
+}
+
+// ParsePositiveInt parses a positive-integer environment value, returning def
+// when value is unset/empty. It accepts any parseable positive integer
+// (surrounding whitespace is trimmed) and rejects non-numeric, float, negative,
+// zero, and overflow values. The error names the variable and the required
+// form so callers (Load and tests) render a clear configuration error.
+func ParsePositiveInt(name, value string, def int) (int, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", name, value)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", name, value)
+	}
+	return n, nil
 }
 
 // logLevelNames are the documented LOG_LEVEL values, in order of increasing

@@ -52,9 +52,16 @@ func TestMetricsLoggerTicksAndStopsOnCancel(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !strings.Contains(lines[0], "Metrics events_received_total count=1") {
-		t.Fatalf("unexpected first log line: %q", lines[0])
+	// The snapshot is emitted as one line per metric, sorted; zero-valued
+	// required gauges (buffered_events, in_flight_invocations) sort before the
+	// counters, so search for the accumulated counter line rather than asserting
+	// a specific first line.
+	for _, l := range lines {
+		if strings.Contains(l, "Metrics events_received_total count=1") {
+			return
+		}
 	}
+	t.Fatalf("no snapshot line contains the events_received_total counter; got: %q", lines)
 }
 
 func TestMetricsLoggerNilRegistryExitsOnCancel(t *testing.T) {

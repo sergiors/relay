@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,11 @@ const (
 	// XPENDING depth. It is overridable via ConsumerConfig.MetricsInterval (used
 	// by tests).
 	DefaultMetricsInterval = 15 * time.Second
+	// DefaultMaxBufferedEvents is the default number of messages read from Redis
+	// and held locally before completion/ACK. It bounds the consumer's local
+	// buffer so the backlog stays in the Redis stream when the buffer is full
+	// (backpressure).
+	DefaultMaxBufferedEvents = 16
 )
 
 // MaxRuleTimeout is the upper bound on any rule's handler timeout. It is the
@@ -82,6 +88,12 @@ type ConsumerConfig struct {
 	// (at-least-once, no skip). Test/ops hook: invocation-state tracking is
 	// enabled by default (zero value); set true only in tests.
 	DisableProgress bool
+	// MaxBufferedEvents bounds the number of messages read from Redis (via
+	// XREADGROUP or reclaimed) that have been handed to processing but not yet
+	// finished (ACKed / DLQ'd / left-pending). When the buffer is at capacity,
+	// Consume stops reading (backpressure) so the backlog stays in Redis.
+	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
+	MaxBufferedEvents int
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -106,6 +118,12 @@ type Consumer struct {
 	backoff         *backoff
 	invocationStore *invocationStore
 	healthy         atomic.Bool
+	// buffer is the bounded local-event semaphore: it caps the number of
+	// messages read from Redis and held locally before completion, so the
+	// consumption loop applies backpressure instead of unboundedly buffering.
+	// capacity is the configured MaxBufferedEvents limit.
+	buffer   *bufferSemaphore
+	capacity int
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -136,6 +154,13 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 	if cfg.MetricsInterval == 0 {
 		cfg.MetricsInterval = DefaultMetricsInterval
 	}
+	// The bounded local-event buffer defaults to DefaultMaxBufferedEvents (16)
+	// and falls back to it on a zero or negative value (a value of 0 must not
+	// mean "unbounded").
+	capacity := DefaultMaxBufferedEvents
+	if cfg.MaxBufferedEvents >= 1 {
+		capacity = cfg.MaxBufferedEvents
+	}
 	c := &Consumer{
 		client:          cfg.Client,
 		stream:          cfg.Stream,
@@ -150,6 +175,8 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		metrics:         cfg.Metrics,
 		metricsInterval: cfg.MetricsInterval,
 		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
+		capacity:        capacity,
+		buffer:          newBufferSemaphore(capacity),
 	}
 	// Invocation-state tracking is always constructed when a client is present
 	// (the consumer always has one). DisableProgress turns it off for tests.
@@ -202,10 +229,97 @@ func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 	c.backoff.reset()
 }
 
+// bufferSemaphore is a channel-based counting semaphore that bounds the number
+// of locally buffered events (messages read from Redis but not yet finished).
+// It also tracks the current occupancy (a mutex-protected counter) so the
+// consumer can set the buffered_events gauge on acquire/release and compute the
+// current in-flight count without draining the channel.
+type bufferSemaphore struct {
+	slots chan struct{}
+	mu    sync.Mutex
+	count int // current in-flight occupancy
+}
+
+// newBufferSemaphore builds a semaphore of the given capacity. capacity must be
+// >= 1 (callers pass a validated MaxBufferedEvents).
+func newBufferSemaphore(capacity int) *bufferSemaphore {
+	return &bufferSemaphore{slots: make(chan struct{}, capacity)}
+}
+
+// inflight returns the current occupancy (number of slots held).
+func (s *bufferSemaphore) inflight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
+// acquire acquires one slot, blocking until either a slot is free or ctx is
+// cancelled. It returns false when ctx is done first (no slot acquired).
+func (s *bufferSemaphore) acquire(ctx context.Context) bool {
+	select {
+	case s.slots <- struct{}{}:
+		s.mu.Lock()
+		s.count++
+		s.mu.Unlock()
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// tryAcquire acquires a slot without blocking. It returns false when no slot is
+// immediately free. Used by the reclaim path, which must never block (it skips
+// a message for capacity and retries it next tick instead).
+func (s *bufferSemaphore) tryAcquire() bool {
+	select {
+	case s.slots <- struct{}{}:
+		s.mu.Lock()
+		s.count++
+		s.mu.Unlock()
+		return true
+	default:
+		return false
+	}
+}
+
+// release frees a slot, waking an acquire that is waiting. It must be called
+// exactly once for every successful acquire/tryAcquire.
+func (s *bufferSemaphore) release() {
+	<-s.slots
+	s.mu.Lock()
+	s.count--
+	s.mu.Unlock()
+}
+
+// setGauge publishes the current occupancy to the buffered_events gauge (nil-safe
+// in the registry).
+func (c *Consumer) setBufferGauge() {
+	c.metrics.SetGauge("buffered_events", float64(c.buffer.inflight()))
+}
+
+// freeSlots returns the number of slots currently available (capacity - inFlight).
+func (c *Consumer) freeSlots() int {
+	free := c.capacity - c.buffer.inflight()
+	if free < 0 {
+		free = 0
+	}
+	return free
+}
+
 // Consume reads messages from the stream and calls handler for each decoded
 // event. A message is acknowledged (XACK) only after the handler returns nil or
 // it is routed to the DLQ. Consume blocks until ctx is cancelled, and stops the
 // recovery goroutine before returning so nothing leaks.
+//
+// Backpressure: the number of messages read from Redis but not yet finished is
+// bounded by the buffer capacity. Before each XREADGROUP the loop computes how
+// many slots are free and reads at most that many; when the buffer is full it
+// waits (context-aware) for a slot to release instead of reading more, so the
+// backlog stays in Redis rather than in local memory. Each read message is
+// handed to the handler in its own goroutine (bounded by the buffer capacity),
+// so handler latency never blocks further reads, only the release of slots.
+// In-flight messages are drained via a WaitGroup before Consume returns, so
+// shutdown joins them exactly as it joins reclaim and metrics goroutines.
 func (c *Consumer) Consume(
 	ctx context.Context,
 	handler Handler,
@@ -241,17 +355,73 @@ func (c *Consumer) Consume(
 		}()
 	}
 
+	// Track in-flight message goroutines so Consume can join them on shutdown.
+	// The count is bounded by the buffer capacity (each goroutine holds a slot),
+	// so the WaitGroup can never grow unbounded.
+	var inflight sync.WaitGroup
+
+	// bufferFull is a transition flag so the "read loop paused" log fires only
+	// once on the healthy→blocked transition (and once on the recovery), not on
+	// every iteration, mirroring noteOutcome's transition-only logging.
+	bufferFull := false
+
+Drain:
 	for {
+		// Apply backpressure BEFORE issuing a read: compute how many slots are
+		// free and wait (context-aware, not a busy spin) until capacity exists if
+		// the buffer is full. Since XREADGROUP BLOCK is not interrupted by ctx
+		// cancellation in go-redis, the loop re-checks capacity at least every
+		// block interval; the wait below is a blocking channel receive, so it
+		// does not spin.
+		free := c.freeSlots()
+		if free == 0 {
+			if !bufferFull {
+				c.log.Debug("Read loop paused: local event buffer full")
+				bufferFull = true
+			}
+			// Wait for a slot release or shutdown. This is context-aware: on
+			// cancellation it returns promptly rather than spinning until a
+			// handler frees a slot.
+			if !c.buffer.acquire(ctx) {
+				// ctx done; nothing was handed out. Drain in-flight goroutines
+				// before returning (see below).
+				break
+			}
+			// We acquired a slot, so the buffer has room now; release it back so
+			// the read below is not double-counted — we only re-check free slots
+			// below and issue a read sized to them. (Keeping a slot held here
+			// and immediately releasing avoids needing a read to know how many
+			// it will produce.)
+			c.buffer.release()
+		} else if bufferFull {
+			// Buffer has room again: leave the paused state.
+			bufferFull = false
+		}
+
+		// Read at most as many messages as there are free slots, so every
+		// message we get can be handed out to a slot without blocking the loop
+		// on a full buffer mid-batch.
+		batch := c.count
+		if n := c.freeSlots(); n < int(batch) {
+			batch = int64(n)
+		}
+		if batch < 1 {
+			// A race released a slot between the check above and here; loop and
+			// recompute rather than issuing a zero-count read. This cannot
+			// busy-spin: the acquire/release path above paces it.
+			continue
+		}
+
 		streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.group,
 			Consumer: c.consumer,
 			Streams:  []string{c.stream, ">"},
-			Count:    c.count,
+			Count:    batch,
 			Block:    c.block,
 		}).Result()
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
+				break
 			}
 			if errors.Is(err, redis.Nil) {
 				// Block timed out with no messages; connectivity is fine.
@@ -266,7 +436,7 @@ func (c *Consumer) Consume(
 			c.noteOutcome(err, delay)
 			select {
 			case <-ctx.Done():
-				return nil
+				break
 			case <-time.After(delay):
 			}
 			continue
@@ -275,23 +445,47 @@ func (c *Consumer) Consume(
 		c.noteOutcome(nil, 0)
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
-				// A message read fresh from XREADGROUP is on its first delivery.
-				c.process(ctx, msg, 1, handler)
+				// Acquire a slot synchronously. The batch was sized to the free
+				// slots just now (see above), so acquisition must not block in
+				// practice; on ctx cancellation it returns false and the message
+				// is skipped (it stays in the PEL, redelivered on a later read).
+				// Release the slot when the message finishes.
+				if !c.buffer.acquire(ctx) {
+					// Shutting down: stop handing out fresh work. The message is
+					// left pending in the PEL for a live consumer (this matches
+					// processMessage's ctx-cancelled behavior for in-flight
+					// messages). Break out of the whole loop and drain.
+					break Drain
+				}
+				inflight.Add(1)
+				go func(m redis.XMessage) {
+					defer inflight.Done()
+					// A defensive recover in the goroutine wrapper is the last
+					// line of defense so a panic escaping processMessage (which
+					// recovers internally) can never crash the worker. It is
+					// effectively unreachable in normal operation.
+					defer func() {
+						if pv := recover(); pv != nil {
+							c.log.Error(fmt.Sprintf("Message %q: PANIC outside processMessage: %v\n%s", m.ID, pv, debug.Stack()))
+						}
+					}()
+					defer c.buffer.release()
+					c.setBufferGauge()
+					// A message read fresh from XREADGROUP is on its first delivery.
+					c.processMessage(ctx, m, 1, handler)
+					c.setBufferGauge()
+				}(msg)
 			}
 		}
 	}
-}
-
-// process routes a freshly-read message to the shared processMessage path. Since
-// XPendingExt is the source of truth for retry counts (see reclaimTick), fresh
-// XREADGROUP reads are always treated as delivery attempt 1.
-func (c *Consumer) process(
-	ctx context.Context,
-	msg redis.XMessage,
-	deliveryNum int64,
-	handler Handler,
-) {
-	c.processMessage(ctx, msg, deliveryNum, handler)
+	// Drain all in-flight message goroutines before returning. On ctx
+	// cancellation the handler path already leaves messages pending
+	// (processMessage checks ctx.Err()); joining here bounds shutdown to at most
+	// the longest in-flight handler. The deferred stops for the reclaim and
+	// metrics goroutines run when Consume returns (after this join), preserving
+	// the existing stop-and-join-before-return shutdown contract.
+	inflight.Wait()
+	return nil
 }
 
 // pendingGaugeSource builds a metrics.GaugeSource that samples the XPENDING
@@ -480,6 +674,13 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 // skipped as protected, because a redelivery DID occur. This is distinct from
 // the per-function function_retries_total (runner), which counts failed
 // executions only.
+//
+// Backpressure: the reclaimed message also counts against the bounded local
+// buffer. Slot acquisition is non-blocking (tryAcquire): if the buffer is full
+// the message is skipped THIS tick and left pending in the PEL for the next
+// reclaim tick. With the default MinPendingIdle the skip simply defers the
+// retry by one tick — no starvation beyond pacing — and the reclaim goroutine
+// never blocks on the semaphore.
 func (c *Consumer) deliverClaimed(
 	ctx context.Context,
 	msg redis.XMessage,
@@ -487,7 +688,20 @@ func (c *Consumer) deliverClaimed(
 	handler Handler,
 ) {
 	c.metrics.Inc("retries_total")
+	if !c.buffer.tryAcquire() {
+		// Buffer full: leave the message pending; a later reclaim tick retries
+		// it. Never block the reclaim goroutine on the semaphore.
+		c.log.Debug(fmt.Sprintf("Message %q: buffer full; deferring reclaimed delivery", msg.ID))
+		return
+	}
+	// Release the slot when the message finishes (ACK/DLQ/pending).
+	// processMessage runs synchronously here on the reclaim goroutine (bounded
+	// by the reclaim cadence), exactly as before; the slot is held for its
+	// duration so the buffer occupancy reflects a reclaimed message too.
+	c.setBufferGauge()
 	c.processMessage(ctx, msg, retryCount+1, handler)
+	c.setBufferGauge()
+	c.buffer.release()
 }
 
 // processMessage is the single shared path used by both the XREADGROUP loop and

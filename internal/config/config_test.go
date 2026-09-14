@@ -308,3 +308,123 @@ func TestLoadInvalidLogLevelFatalSubprocess(t *testing.T) {
 	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	t.Fatal("Load returned instead of calling logger.Fatalf on invalid LOG_LEVEL")
 }
+
+// TestLoadConcurrencyDefaults pins that unset MAX_CONCURRENCY and
+// MAX_BUFFERED_EVENTS resolve to their documented defaults (8 and 16). Load
+// needs the required REDIS_* vars set (setRequiredEnv).
+func TestLoadConcurrencyDefaults(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_CONCURRENCY", "")
+	t.Setenv("MAX_BUFFERED_EVENTS", "")
+	cfg := Load(discardLogger())
+	if cfg.MaxConcurrency != DefaultMaxConcurrency {
+		t.Fatalf("MaxConcurrency = %d, want default %d", cfg.MaxConcurrency, DefaultMaxConcurrency)
+	}
+	if cfg.MaxBufferedEvents != DefaultMaxBufferedEvents {
+		t.Fatalf("MaxBufferedEvents = %d, want default %d", cfg.MaxBufferedEvents, DefaultMaxBufferedEvents)
+	}
+}
+
+// TestLoadConcurrencyExplicitValues pins that explicit positive values are
+// honored.
+func TestLoadConcurrencyExplicitValues(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_CONCURRENCY", "4")
+	t.Setenv("MAX_BUFFERED_EVENTS", "32")
+	cfg := Load(discardLogger())
+	if cfg.MaxConcurrency != 4 {
+		t.Fatalf("MaxConcurrency = %d, want 4", cfg.MaxConcurrency)
+	}
+	if cfg.MaxBufferedEvents != 32 {
+		t.Fatalf("MaxBufferedEvents = %d, want 32", cfg.MaxBufferedEvents)
+	}
+}
+
+// TestParsePositiveInt exercises the shared positive-integer parser directly:
+// unset → default; whitespace-trimmed positive ints parse; and zero, negative,
+// non-numeric, float, and overflow values error. The os.Exit path in Load is
+// not exercised here (it cannot run in-process); ParsePositiveInt is where the
+// actual validation logic lives.
+func TestParsePositiveInt(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		def       int
+		want      int
+		wantError bool
+	}{
+		{"unset returns default", "", 8, 8, false},
+		{"empty string returns default", "  ", 16, 16, false},
+		{"positive", "8", 0, 8, false},
+		{"trimmed positive", " 8 ", 0, 8, false},
+		{"explicit buffers", "32", 0, 32, false},
+		{"zero rejected", "0", 0, 0, true},
+		{"negative rejected", "-1", 0, 0, true},
+		{"non-numeric rejected", "abc", 0, 0, true},
+		{"float rejected", "1.5", 0, 0, true},
+		{"overflow rejected", "999999999999999999999", 0, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParsePositiveInt("MAX_CONCURRENCY", tt.value, tt.def)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("ParsePositiveInt(%q) = %d, nil; want error", tt.value, got)
+				}
+				if !strings.Contains(err.Error(), "MAX_CONCURRENCY") {
+					t.Fatalf("error should name the variable: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParsePositiveInt(%q) error: %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParsePositiveInt(%q) = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadInvalidConcurrencyFatal exercises the fatal path for an invalid
+// MAX_CONCURRENCY via the subprocess pattern, matching TestLoadInvalidLogLevelFatal.
+func TestLoadInvalidConcurrencyFatal(t *testing.T) {
+	for _, tt := range []struct {
+		env, value, wantVar string
+	}{
+		{"MAX_CONCURRENCY", "0", "MAX_CONCURRENCY"},
+		{"MAX_CONCURRENCY", "abc", "MAX_CONCURRENCY"},
+		{"MAX_BUFFERED_EVENTS", "-1", "MAX_BUFFERED_EVENTS"},
+	} {
+		t.Run(tt.env+"="+tt.value, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidConcurrencyFatalSubprocess$")
+			cmd.Env = append(os.Environ(), "RELAY_TEST_ENV="+tt.env, "RELAY_TEST_VALUE="+tt.value)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("subprocess exited 0; want non-zero exit for invalid %s=%s", tt.env, tt.value)
+			}
+			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+				t.Fatalf("subprocess error = %v, want non-zero exit", err)
+			}
+			for _, want := range []string{tt.wantVar, "Configuration error", "positive integer"} {
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("subprocess output does not mention %q:\n%s", want, string(out))
+				}
+			}
+		})
+	}
+}
+
+// TestLoadInvalidConcurrencyFatalSubprocess is the child side of the fatal
+// concurrency test (see TestLoadInvalidConcurrencyFatal).
+func TestLoadInvalidConcurrencyFatalSubprocess(t *testing.T) {
+	env := os.Getenv("RELAY_TEST_ENV")
+	value := os.Getenv("RELAY_TEST_VALUE")
+	if env == "" || value == "" {
+		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_* unset)")
+	}
+	setRequiredEnv(t)
+	t.Setenv(env, value)
+	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	t.Fatal("Load returned instead of calling logger.Fatalf on invalid positive-integer value")
+}

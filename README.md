@@ -155,6 +155,8 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.    |
 | `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus. |
 | `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
+| `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`. |
+| `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -162,6 +164,41 @@ optional and enables internal stream retention (see below). `METRICS_ADDR` is
 optional and opt-in: when set to a non-empty listen address it starts the
 Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
 server is started. An unbindable address is logged and retried, never fatal.
+
+### Concurrency and backpressure
+
+`MAX_CONCURRENCY` and `MAX_BUFFERED_EVENTS` bound how much work a single Relay
+worker keeps in flight or in its local buffer. Both default to a positive value
+(`8` and `16` respectively); a value of `0` is invalid (it does not mean
+"unbounded") and a non-integer/negative/zero value is a configuration error
+that fails startup. These limits are **per worker**: with `N` replica workers
+in a cluster, the effective totals multiply (`N * MAX_CONCURRENCY` global
+capacity, `N * MAX_BUFFERED_EVENTS * ...` local buffering), and the per-function
+`concurrency` (see _Template format_) applies per function **per worker**.
+
+```
+Redis stream → bounded local buffer → matcher/dispatcher → global worker
+concurrency → per-function concurrency → runner/container → completion/ACK
+```
+
+- `MAX_BUFFERED_EVENTS` bounds the number of messages read from Redis and held
+  locally (handed to a handler but not yet ACKed / DLQ'd / left-pending). When
+  the buffer is full, the consumer **stops reading** until capacity is released,
+  so the backlog stays in Redis (not in local memory) and backpressure flows
+  naturally. The reclaimed-message path is also buffer-aware: a message skipped
+  for capacity is simply retried next reclaim tick.
+- `MAX_CONCURRENCY` bounds the total number of function invocations executing
+  concurrently in one worker, and the per-function `concurrency` bounds how many
+  concurrent invocations a single function's handlers may run in that worker.
+  The effective limit is the intersection of both. If a slot cannot be acquired
+  within a bounded wait (well below the reclaim `MinPendingIdle`), the message is
+  left pending and replayed by a later reclaim — so a locally buffered event
+  never sits long enough to defeat the reclaim pacing, and no retry/exhaustion
+  accounting is charged for a merely-blocked invocation.
+- A hot-swapped template's `concurrency` change requires a **worker restart** to
+  resize: per-function slots are created first-wins by name and never resized
+  mid-flight (a running invocation is never interrupted). Changes take effect for
+  new function names immediately.
 
 ### Log levels
 
@@ -331,6 +368,7 @@ sandbox for untrusted code).
 
 ```yaml
 runtime: python3.14
+concurrency: 2
 
 events:
   - handler: events.created.handler
@@ -354,6 +392,13 @@ events:
   `node24` are supported; any other value fails validation.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
+- `concurrency` (optional, top-level) bounds how many of this function's handler
+  invocations may execute concurrently within a single Relay worker (per
+  function, per worker). It must be a positive integer; a zero, negative, or
+  non-integer value (e.g. `0`, `-1`, `1.5`, `true`) fails the function's
+  template validation (the function is logged and skipped). Omitted templates use
+  a `2` default. A hot-swapped change requires a worker restart to resize (see
+  _Concurrency and backpressure_).
 - `timeout` (optional, per rule) is a Go duration string bounding a single
   invocation of that rule's handler (e.g. `20s`, `1m30s`). It must be positive.
   Zero, negative, unparseable, or values above `5m` (`MaxTimeout`) fail the
@@ -798,7 +843,11 @@ remains the health check.
   `handler_duration_seconds{function,handler}`,
   `function_build_seconds{function}`. Gauges: `pending_entries`,
   `pending_oldest_age_seconds` — sampled from the Redis consumer group
-  (`XPENDING`) every 15s, not per event. Labels are bounded to
+  (`XPENDING`) every 15s, not per event — plus `buffered_events` (the current
+  local buffer occupancy, set on each acquire/release) and
+  `in_flight_invocations` (the current number of executing invocations in this
+  worker), and the `concurrency_waits_total` counter (each time an invocation's
+  concurrency-slot acquisition had to block). Labels are bounded to
   `function`/`handler`/`outcome`; IDs (message, event, container, fingerprint)
   are never labels. The metrics server is operationally isolated: bind failures
   are logged and retried, scrape errors never stop event consumption, and

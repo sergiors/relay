@@ -38,6 +38,26 @@ import (
 // (a hard crash loses at most one interval of telemetry).
 const statsFlushInterval = 5 * time.Second
 
+// effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
+// (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
+// the value actually enforced regardless of the configured raw value.
+func effectiveMaxConcurrency(n int) int {
+	if n < 1 {
+		return runner.DefaultMaxConcurrency
+	}
+	return n
+}
+
+// effectiveMaxBuffered mirrors the stream consumer's MaxBufferedEvents
+// normalization (<1 → stream.DefaultMaxBufferedEvents) so the "Concurrency
+// limits" log reflects the value actually enforced.
+func effectiveMaxBuffered(n int) int {
+	if n < 1 {
+		return stream.DefaultMaxBufferedEvents
+	}
+	return n
+}
+
 // Run wires the whole worker: startup state, then the reconciler and stream
 // consumer. It blocks in Consume until the process is signalled.
 func Run(logger *slog.Logger) {
@@ -145,7 +165,9 @@ func Run(logger *slog.Logger) {
 	if sweepErr != nil {
 		logger.Warn(fmt.Sprintf("Startup: orphan container sweep: %v", sweepErr))
 	} else if n > 0 {
-		logger.Info(fmt.Sprintf("Startup: removed %d orphan container(s) from a previous relay process", n))
+		logger.Info(
+			fmt.Sprintf("Startup: removed %d orphan container(s) from a previous relay process", n),
+		)
 	}
 	preparedCount := 0
 	var prepared []*runner.PreparedFunction
@@ -210,12 +232,13 @@ func Run(logger *slog.Logger) {
 	}
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
-		Client:   client,
-		Stream:   cfg.RedisStream,
-		Group:    cfg.RedisGroup,
-		Consumer: cfg.ConsumerName,
-		Log:      logger,
-		Metrics:  metricsInstance,
+		Client:            client,
+		Stream:            cfg.RedisStream,
+		Group:             cfg.RedisGroup,
+		Consumer:          cfg.ConsumerName,
+		Log:               logger,
+		Metrics:           metricsInstance,
+		MaxBufferedEvents: cfg.MaxBufferedEvents,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -302,6 +325,16 @@ func Run(logger *slog.Logger) {
 	// (see runner.SetMaxHandlerTimeout / stream.InvocationState.TryStart);
 	// template validation enforces it at load.
 	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
+	// Bounds the number of function invocations executing concurrently in this
+	// worker (MAX_CONCURRENCY). A value < 1 falls back to the runner's default.
+	runWorker.SetMaxConcurrency(cfg.MaxConcurrency)
+	logger.Info(
+		fmt.Sprintf(
+			"Concurrency limits: MAX_CONCURRENCY=%d MAX_BUFFERED_EVENTS=%d",
+			effectiveMaxConcurrency(cfg.MaxConcurrency),
+			effectiveMaxBuffered(cfg.MaxBufferedEvents),
+		),
+	)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped

@@ -1,4 +1,5 @@
 runtime: python3.14
+concurrency: 2
 
 secrets:
   POSTGRES_DSN: postgres-dsn
