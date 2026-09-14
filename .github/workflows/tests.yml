@@ -33,6 +33,8 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
     services:
       redis:
         image: redis:8-alpine
