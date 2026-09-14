@@ -303,8 +303,11 @@ func drainWait(wait client.ContainerWaitResult, timeout time.Duration) {
 }
 
 // runContainer runs the image once for a single handler invocation, writing the
-// event JSON to stdin. Container stdout/stderr are forwarded to Relay logs. The
-// container exit status is the result: 0 is success, non-zero is failure. A
+// event JSON to stdin. Container stdout/stderr are forwarded to the Relay
+// process output (see output.go) line by line, live while the container runs —
+// a raw transport, unaffected by Relay's LOG_LEVEL and not inferred into log
+// severity levels. The container exit status is the result: 0 is success,
+// non-zero is failure. A
 // cancelled context is reported as cancellation, not as a docker error. meta is
 // the diagnostic metadata stamped as container labels (purely for triage; see
 // RunMeta). env are the function's runtime environment variables (from the
@@ -413,14 +416,24 @@ func runContainer(
 	// confirmed exit via wait.Result hands cleanup back to AutoRemove.
 	armedRemove = true
 
-	// Demultiplex the non-TTY attach stream (stdout/stderr are multiplexed) into
-	// separate buffers. Reading runs concurrently so a chatty container cannot
-	// deadlock on a full socket while we write stdin.
-	var stdout, stderr bytes.Buffer
+	// Demultiplex the non-TTY attach stream (stdout/stderr are multiplexed)
+	// into two line forwarders, which emit each completed line to the
+	// function-output sink live while the container runs. Reading runs
+	// concurrently so a chatty container cannot deadlock on a full socket
+	// while we write stdin. The forwarders are written from this single reader
+	// goroutine (no concurrent writes per forwarder); the sink itself is
+	// mutex-guarded against other in-flight invocations.
+	stdoutFwd := newStreamForwarder("stdout", name, handler, meta)
+	stderrFwd := newStreamForwarder("stderr", name, handler, meta)
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		_, _ = stdcopy.StdCopy(&stdout, &stderr, attach.Reader)
+		_, _ = stdcopy.StdCopy(stdoutFwd, stderrFwd, attach.Reader)
+		// Flush any trailing partial lines so every byte the container wrote
+		// is delivered before runContainer returns (the same guarantee the old
+		// buffered dump gave, minus the buffering).
+		stdoutFwd.flush()
+		stderrFwd.flush()
 	}()
 
 	// Start the container first: the not-running wait below is only meaningful
@@ -495,14 +508,6 @@ func runContainer(
 		armedRemove = false
 	}
 	<-readerDone
-
-	// Forward container output to Relay logs with a function/handler prefix.
-	if stdout.Len() > 0 {
-		log.Debug(fmt.Sprintf("function %q handler %q: %s", name, handler, strings.TrimRight(stdout.String(), "\n")))
-	}
-	if stderr.Len() > 0 {
-		log.Debug(fmt.Sprintf("function %q handler %q: stderr: %s", name, handler, strings.TrimRight(stderr.String(), "\n")))
-	}
 
 	if waitErr != nil {
 		if ctx.Err() != nil {

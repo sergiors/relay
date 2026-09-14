@@ -58,10 +58,14 @@ func requireDocker(t *testing.T) *client.Client {
 }
 
 // newManager returns a Manager wired to a logger that writes into the returned
-// buffer, so container output is captured for assertions. The manager owns
-// hostname "test-host" so container-ownership tests are deterministic. The
-// handler runs at DEBUG because container stdout/stderr forwarding (the lines
-// these assertions match) is a DEBUG-level diagnostic.
+// buffer, capturing Relay operational logs for assertions. The manager owns
+// hostname "test-host" so container-ownership tests are deterministic.
+//
+// Handler stdout/stderr is NO LONGER routed through the logger (it is forwarded
+// as a raw transport to the function-output sink; see output.go and
+// newFunctionOutputSink), so handler-output assertions must read from that sink,
+// not from this operational log buffer. The logger level is nevertheless kept at
+// DEBUG here so the operational-line assertions these tests make are unaffected.
 func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
@@ -71,6 +75,18 @@ func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 		t.Fatalf("new manager: %v", err)
 	}
 	return m, &buf
+}
+
+// newFunctionOutputSink installs a bytes.Buffer as the function-output sink and
+// returns it, registering restoration of the previous sink. Container
+// stdout/stderr is transport-forwarded here (not to the logger), so every
+// handler-output assertion reads from this buffer.
+func newFunctionOutputSink(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := SetFunctionOutput(buf)
+	t.Cleanup(func() { SetFunctionOutput(prev) })
+	return buf
 }
 
 func TestPythonEndToEnd(t *testing.T) {
@@ -220,7 +236,8 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 
 	dir, tmpl := readRealTemplate(t, "user-events-python")
 	fn := function.Function{Name: "user-events-python", Dir: dir, Template: tmpl}
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -258,7 +275,7 @@ func TestRealUserEventsPythonEndToEnd(t *testing.T) {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	logs := buf.String()
+	logs := out.String()
 	for _, want := range []string{
 		"User created: user_123",
 		"User updated: user_123",
@@ -281,7 +298,8 @@ func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 
 	dir, tmpl := readRealTemplate(t, "welcome-email-node")
 	fn := function.Function{Name: "welcome-email-node", Dir: dir, Template: tmpl}
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -295,7 +313,7 @@ func TestRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 		t.Fatalf("execute handler.handler: %v", err)
 	}
 
-	logs := buf.String()
+	logs := out.String()
 	if want := "Sending welcome email to john@example.com"; !strings.Contains(logs, want) {
 		t.Errorf("expected stdout to contain %q, got: %s", want, logs)
 	}
@@ -324,7 +342,8 @@ export function run(event) {
 `)
 
 	fn := function.Function{Name: "node-broken-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -342,7 +361,7 @@ export function run(event) {
 	if strings.Contains(err.Error(), "not found") {
 		t.Errorf("broken dependency must NOT be reported as module not found, got: %v", err)
 	}
-	logs := buf.String()
+	logs := out.String()
 	if !strings.Contains(logs, "missing-package") {
 		t.Errorf("expected the real import error mentioning 'missing-package' in logs, got: %s", logs)
 	}
@@ -581,7 +600,8 @@ export function env(event) {
 }
 `)
 	fn := function.Function{Name: "env-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -596,7 +616,7 @@ export function env(event) {
 	if err := m.Execute(ctx, prepared, "index.env", []byte(`{"event_name":"INSERT"}`), []string{"GREETING=hello"}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	logs := buf.String()
+	logs := out.String()
 	if !strings.Contains(logs, "GREETING=hello") {
 		t.Errorf("expected container env to contain GREETING=hello, got: %s", logs)
 	}
@@ -628,7 +648,8 @@ export function secret(event) {
 }
 `)
 	fn := function.Function{Name: "secret-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -643,8 +664,8 @@ export function secret(event) {
 	if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=v1"}); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
-	if !strings.Contains(buf.String(), "TOKEN=v1") {
-		t.Errorf("expected TOKEN=v1, got: %s", buf.String())
+	if !strings.Contains(out.String(), "TOKEN=v1") {
+		t.Errorf("expected TOKEN=v1, got: %s", out.String())
 	}
 
 	// Rotate the value; the second execution sees v2 with NO rebuild (the
@@ -652,8 +673,8 @@ export function secret(event) {
 	if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=v2"}); err != nil {
 		t.Fatalf("execute v2: %v", err)
 	}
-	if !strings.Contains(buf.String(), "TOKEN=v2") {
-		t.Errorf("expected TOKEN=v2 after rotation, got: %s", buf.String())
+	if !strings.Contains(out.String(), "TOKEN=v2") {
+		t.Errorf("expected TOKEN=v2 after rotation, got: %s", out.String())
 	}
 	if prepared.Fingerprint != fp1 {
 		t.Errorf("fingerprint changed across secret rotation: %s -> %s", fp1, prepared.Fingerprint)
@@ -692,7 +713,8 @@ export function secret(event) {
 }
 `)
 			fn := function.Function{Name: tc.name, Dir: dir, Template: &function.Template{Runtime: "node24"}}
-			m, buf := newManager(t)
+			m, _ := newManager(t)
+			out := newFunctionOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			prepared, err := m.Prepare(ctx, fn)
@@ -702,8 +724,8 @@ export function secret(event) {
 			if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"TOKEN=shared-value"}); err != nil {
 				t.Fatalf("execute: %v", err)
 			}
-			if !strings.Contains(buf.String(), "TOKEN=shared-value") {
-				t.Errorf("expected TOKEN=shared-value, got: %s", buf.String())
+			if !strings.Contains(out.String(), "TOKEN=shared-value") {
+				t.Errorf("expected TOKEN=shared-value, got: %s", out.String())
 			}
 		})
 	}
@@ -717,6 +739,7 @@ export function secret(event) {
 func TestIntegrationSuccessfulRunNoExplicitRemove(t *testing.T) {
 	requireDocker(t)
 	m, buf := newManager(t)
+	out := newFunctionOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -745,13 +768,12 @@ export function ok(event) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	logs := buf.String()
-	if !strings.Contains(logs, "ok evt_1") {
-		t.Errorf("expected handler output, got: %s", logs)
+	if !strings.Contains(out.String(), "ok evt_1") {
+		t.Errorf("expected handler output, got: %s", out.String())
 	}
 	// The normal path must NOT emit an explicit removal log line.
-	if strings.Contains(logs, "remove container") {
-		t.Errorf("normal completion path must not log an explicit container removal, got: %s", logs)
+	if strings.Contains(buf.String(), "remove container") {
+		t.Errorf("normal completion path must not log an explicit container removal, got: %s", buf.String())
 	}
 	// AutoRemove: the container must vanish after exit.
 	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.ok") {
@@ -759,22 +781,26 @@ export function ok(event) {
 	}
 }
 
-// panicWriter is an io.Writer whose Write always panics. It backs the log sink
-// in TestIntegrationPanicDuringOutputNoRemoval so any forwarded output blows up
-// exactly like the old panicking log func.
+// panicWriter is an io.Writer whose Write always panics. It backs the
+// function-output sink in TestIntegrationPanickingSinkDoesNotBreakInvocation so
+// a forwarding emission of container output blows up. With transport forwarding
+// the panic is swallowed, so this must never break the invocation.
 type panicWriter struct{}
 
-func (panicWriter) Write(p []byte) (int, error) { panic("log sink exploded") }
+func (panicWriter) Write(p []byte) (int, error) { panic("function output sink exploded") }
 
-// TestIntegrationPanicDuringOutputNoRemovalNoise drives runContainer with a log
-// func that panics while forwarding handler output — a panic AFTER the container
-// exited on its own (wait.Result disarmed the backstop). The panic must
-// propagate (recovered by the test), the container must still be gone via
-// AutoRemove, and no removal log line may appear (the backstop must stay
-// disarmed on the normal path even under unwinding).
-func TestIntegrationPanicDuringOutputNoRemoval(t *testing.T) {
+// TestIntegrationPanickingSinkDoesNotBreakInvocation drives runContainer with a
+// function-output sink whose Writer panics while forwarding handler output. Since
+// forwarding is a best-effort transport, the panic must be swallowed: runContainer
+// must return nil (invocation succeeds), the panic must not leak out of the
+// process, and the container must still be auto-removed. This preserves the old
+// test's cleanup/no-removal-noise intent while asserting the new transport-based
+// behavior (a broken sink can never fail an invocation).
+func TestIntegrationPanickingSinkDoesNotBreakInvocation(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
+	prev := SetFunctionOutput(panicWriter{})
+	defer SetFunctionOutput(prev)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -797,17 +823,15 @@ export function paniclog(event) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// Drive runContainer directly so output forwarding panics on the first
-	// forwarded line — simulating a Relay bug surfacing during output handling
-	// while the deferred cleanup is in scope. The leveled Logger is wired to a
-	// sink whose Writer panics, so any emission (stdout/stderr forwarding) blows
-	// up exactly like the old panicking log func.
+	// Drive runContainer directly so output forwarding hits the panicking sink
+	// on the first forwarded line. The panic must be swallowed by the transport;
+	// runContainer must return nil and MUST NOT propagate the panic.
 	panicked := make(chan any, 1)
+	done := make(chan error, 1)
 	go func() {
 		defer func() { panicked <- recover() }()
-		panicCtx := slog.New(slog.NewTextHandler(&panicWriter{}, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		_ = runContainer(ctx, m.cli,
-			panicCtx,
+		done <- runContainer(ctx, m.cli,
+			slog.New(slog.NewTextHandler(io.Discard, nil)),
 			"paniclog-e2e", prepared.Image, nil, nil, "index.paniclog",
 			[]byte(`{"event_name":"INSERT"}`),
 			RunMeta{Hostname: "test-host", Function: "paniclog-e2e", Handler: "index.paniclog", Image: prepared.Image},
@@ -815,16 +839,19 @@ export function paniclog(event) {
 	}()
 	select {
 	case pv := <-panicked:
-		if pv == nil {
-			t.Fatal("expected log-func panic to propagate out of runContainer")
+		if pv != nil {
+			t.Fatalf("sink panic leaked out of runContainer: %v", pv)
 		}
 	case <-time.After(2 * time.Minute):
-		t.Fatal("runContainer did not return after panic")
+		t.Fatal("runContainer did not return")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("runContainer returned error despite swallowed sink panic: %v", err)
 	}
 
 	// The container exited on its own; AutoRemove (not the backstop) removed it.
 	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.paniclog") {
-		t.Error("container should have been auto-removed after exit despite the log panic")
+		t.Error("container should have been auto-removed after exit despite the sink panic")
 	}
 }
 
@@ -903,7 +930,8 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 // while the container is still removed.
 func TestIntegrationContainerLabelsAndAutoRemove(t *testing.T) {
 	requireDocker(t)
-	m, buf := newManager(t)
+	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -986,8 +1014,8 @@ export async function slow(event) {
 	if err := <-done; err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if !strings.Contains(buf.String(), "completed evt_777") {
-		t.Errorf("expected stdout to contain %q, got: %s", "completed evt_777", buf.String())
+	if !strings.Contains(out.String(), "completed evt_777") {
+		t.Errorf("expected stdout to contain %q, got: %s", "completed evt_777", out.String())
 	}
 	// AutoRemove: the container must vanish after exit (asynchronously on the
 	// daemon side, so poll).
@@ -1002,6 +1030,7 @@ export async function slow(event) {
 func TestIntegrationNonZeroExitAutoRemove(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
+	out := newFunctionOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1034,8 +1063,72 @@ export async function fail(event) {
 	if !strings.Contains(err.Error(), "exited with status 1") {
 		t.Errorf("expected exit-status error, got: %v", err)
 	}
+	// stderr (console.error) is forwarded to the function-output sink and must
+	// carry the function/handler prefix.
+	if !strings.Contains(out.String(), "[fail-e2e/index.fail] stderr: boom") {
+		t.Errorf("expected stderr 'boom' forwarded with prefix, got: %q", out.String())
+	}
 	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.fail") {
 		t.Error("container should have been auto-removed after non-zero exit")
+	}
+}
+
+// TestIntegrationFunctionOutputIgnoresLogLevel drives a Node handler that prints
+// to both stdout and stderr (multi-line) while Relay's own logger is wired to
+// DISCARD at ERROR level. Since function output is forwarded as a raw transport
+// — NOT routed through slog — the stdout lines, the stderr line, and the
+// function/handler prefix must all still appear in the function-output sink even
+// though every Relay log line is discarded at ERROR.
+func TestIntegrationFunctionOutputIgnoresLogLevel(t *testing.T) {
+	requireDocker(t)
+
+	// Relay-operational logger discards everything below ERROR, so no handler
+	// output can possibly flow through it (forwarding must be independent).
+	opLogger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	m, err := NewManager(opLogger, nil, "test-host")
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m.Close()
+	out := newFunctionOutputSink(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.emit
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export function emit(event) {
+  console.log("out-first");
+  console.log("out-second");
+  console.error("err-line");
+}
+`)
+	fn := function.Function{Name: "loglevel-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := m.Execute(ctx, prepared, "index.emit", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	logs := out.String()
+	for _, want := range []string{
+		"[loglevel-e2e/index.emit] stdout: out-first",
+		"[loglevel-e2e/index.emit] stdout: out-second",
+		"[loglevel-e2e/index.emit] stderr: err-line",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("expected %q in function output despite ERROR-level Relay logs, got:\n%s", want, logs)
+		}
 	}
 }
 
@@ -1210,7 +1303,8 @@ export function check(event) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fn := function.Function{Name: "harden-" + tc.name, Dir: tc.dir, Template: &function.Template{Runtime: tc.runtime}}
-			m, buf := newManager(t)
+			m, _ := newManager(t)
+			out := newFunctionOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
@@ -1274,8 +1368,8 @@ export function check(event) {
 			if err := <-done; err != nil {
 				t.Fatalf("execute: %v", err)
 			}
-			if !strings.Contains(buf.String(), tc.name+" hardening ok") {
-				t.Errorf("expected in-handler hardening assertions to pass, got logs:\n%s", buf.String())
+			if !strings.Contains(out.String(), tc.name+" hardening ok") {
+				t.Errorf("expected in-handler hardening assertions to pass, got logs:\n%s", out.String())
 			}
 		})
 	}

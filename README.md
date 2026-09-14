@@ -230,6 +230,11 @@ Fatal startup failures (missing required variables, invalid `LOG_LEVEL`, an
 unbindable metrics address, an unreachable Redis or Docker daemon) always log
 and exit regardless of the configured level.
 
+`LOG_LEVEL` governs only Relay's own operational logs. Function container
+stdout/stderr forwarding is NOT routed through the logger, so it is unaffected
+by `LOG_LEVEL` and streams at every level (see _Handler contract_); the level
+filters only Relay's diagnostic and lifecycle lines.
+
 ### Stream retention
 
 `REDIS_STREAM_RETENTION` is an optional duration (e.g. `6h`) that enables
@@ -593,7 +598,10 @@ the event JSON written to the container's stdin. An embedded bootstrap resolves
 the module and function from `RELAY_HANDLER`, reads the event from stdin, and
 invokes the function. The container's exit code decides the result: `0` is
 success, non-zero is failure. The container's stdout and stderr are forwarded
-to Relay's logs.
+verbatim to Relay's process output as a raw transport while the handler runs —
+one line per process line, each prefixed with the function/handler (and
+message/event id when available), independent of `LOG_LEVEL`, with no severity
+inferred from the stream.
 
 ## Execution
 
@@ -831,7 +839,9 @@ remains the health check.
   reconciliation, and build lines carry structured `slog` attributes —
   `function`, `handler`, `message_id`, `event_id`, `event_name`, `attempt`,
   `duration`, and container `exit_code` where available. Handler stdout/stderr
-  is still forwarded verbatim.
+  is forwarded unconditionally as a raw transport: it is not routed through
+  slog, so it is unaffected by `LOG_LEVEL`, and only Relay's own operational
+  logs are governed by the level.
 - **Prometheus metrics**: when `METRICS_ADDR` is set to a non-empty listen
   address, the Relay runtime exposes `GET /metrics` on that address in Prometheus
   text format via the official

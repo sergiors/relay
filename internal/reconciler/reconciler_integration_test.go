@@ -90,7 +90,7 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 func runHandlerWith(
 	t *testing.T,
 	m *runtime.Manager,
-	buf *bytes.Buffer,
+	out *bytes.Buffer,
 	fn function.Function,
 	hndlr,
 	eventJSON string,
@@ -117,14 +117,23 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	// DEBUG level: container stdout forwarding is a Debug-level diagnostic and
-	// the assertions below match handler output captured through the logger.
+	// Relay-operational logger. Container stdout/stderr is NO LONGER routed
+	// through the logger (it is forwarded as a raw transport to the
+	// function-output sink; see runtime/output.go), so the assertions below that
+	// match handler output read from the sink buffer installed via
+	// SetFunctionOutput, not from this operational log buffer.
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m, err := runtime.NewManager(logger, nil, "test-host")
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m.Close()
+
+	// Function-output sink: handler stdout is transport-forwarded here (not to
+	// the logger), so handler-output assertions read from this buffer.
+	outBuf := &bytes.Buffer{}
+	outPrev := runtime.SetFunctionOutput(outBuf)
+	defer runtime.SetFunctionOutput(outPrev)
 
 	// Track the relay-fn-example:* images this test builds (v1/v2/v3 via
 	// fingerprint-tagged refs) so t.Cleanup removes them; the reconciler's
@@ -178,25 +187,25 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	}
 	// Execute the freshly built image for v1.
 	fn := function.Function{Name: "example", Dir: filepath.Join(root, "example"), Template: mustParse(templateWithInsert())}
-	runHandlerWith(t, m, &buf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(buf.Bytes(), []byte("hello-v1")) {
-		t.Fatalf("expected v1 output, got: %s", buf.String())
+	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
+	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v1")) {
+		t.Fatalf("expected v1 output, got: %s", outBuf.String())
 	}
 
 	// b) Change source; unchanged template. Fingerprint changes -> rebuild.
-	buf.Reset()
+	outBuf.Reset()
 	writeNodeFn(t, root, "example", "hello-v2")
 	r.reconcileFunction("example")
-	runHandlerWith(t, m, &buf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(buf.Bytes(), []byte("hello-v2")) {
-		t.Fatalf("expected v2 output after reload, got: %s", buf.String())
+	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
+	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
+		t.Fatalf("expected v2 output after reload, got: %s", outBuf.String())
 	}
 	if pf := reg.GetByName("example"); pf == nil || pf.Prepared() == nil {
 		t.Fatal("example must stay prepared after reload")
 	}
 
 	// c) Break template -> old version retained, not removed.
-	buf.Reset()
+	outBuf.Reset()
 	tmplPath := filepath.Join(root, "example", "template.yaml")
 	if err := os.WriteFile(tmplPath, []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
@@ -206,18 +215,18 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		t.Fatal("broken template must not drop the active version")
 	}
 	// Old image still runs (v2) because the running snapshot is unchanged.
-	runHandlerWith(t, m, &buf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(buf.Bytes(), []byte("hello-v2")) {
-		t.Fatalf("old version must keep running after broken template, got: %s", buf.String())
+	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
+	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
+		t.Fatalf("old version must keep running after broken template, got: %s", outBuf.String())
 	}
 
 	// d) Fix template -> rebuild succeeds.
-	buf.Reset()
+	outBuf.Reset()
 	writeNodeFn(t, root, "example", "hello-v3")
 	r.reconcileFunction("example")
-	runHandlerWith(t, m, &buf, fn, "index.hi", `{"event_name":"INSERT"}`)
-	if !bytes.Contains(buf.Bytes(), []byte("hello-v3")) {
-		t.Fatalf("expected v3 output after fix, got: %s", buf.String())
+	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
+	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v3")) {
+		t.Fatalf("expected v3 output after fix, got: %s", outBuf.String())
 	}
 
 	// e) Remove dir -> function dropped.

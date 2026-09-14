@@ -6,7 +6,8 @@
 //     (never a Dockerfile)
 //   - Build: one image per function via a single generic Dockerfile renderer
 //   - Execute: one disposable container per handler invocation, event JSON on
-//     stdin
+//     stdin, stdout/stderr forwarded verbatim to the process output sink as a
+//     raw transport (not slog)
 //
 // Env and secrets injection: each execution container's environment is the base
 // RELAY_HANDLER var, then the function's plan env (runtime needs), then the
