@@ -36,6 +36,7 @@ func New(logger *slog.Logger, writer io.Writer) *cli.Command {
 			startCommand(logger),
 			functionCommand(),
 			secretCommand(),
+			gitCommand(logger),
 			statsCommand(),
 			healthCommand(logger),
 		},

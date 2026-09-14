@@ -46,6 +46,7 @@ func TestRootHelp(t *testing.T) {
 			"health",
 			"stats",
 			"secret",
+			"git",
 		} {
 			if !strings.Contains(output.String(), want) {
 				t.Fatalf("%s: stdout missing %q:\n%s", flag, want, output.String())
