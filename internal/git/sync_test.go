@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
 	"relay/internal/function"
 )
@@ -349,32 +350,38 @@ func TestSyncMissingKey(t *testing.T) {
 	}
 }
 
-// TestSyncKnownHostsRequired verifies that even with a key present, a sync to an
-// SSH host fails when no known_hosts file can be found — host-key verification
-// is NEVER skipped. This exercises the guard: the auth builder must reject,
-// never fall back to InsecureIgnoreHostKey.
-func TestSyncKnownHostsRequired(t *testing.T) {
+// TestSyncBuildsTOFUAuthWithoutSystemKnownHosts verifies the new TOFU model's
+// premise: with a key present but NO system known_hosts and NO Relay known_hosts
+// yet, an SSH sync builds transport auth WITHOUT error (the old hard
+// "known_hosts required" failure is obsolete). The TOFU callback is set and its
+// host-key verification is present (never InsecureIgnoreHostKey). The actual
+// dial cannot be tested without an sshd, so verification is exercised at the
+// callback level here and in hostkey_test.go.
+func TestSyncBuildsTOFUAuthWithoutSystemKnownHosts(t *testing.T) {
 	e := fixture(t, false)
 	if _, err := GenerateKey(e.sshDir); err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	// Deterministically hide any host system known_hosts by pointing
-	// SSH_KNOWN_HOSTS at a path that does not exist, so go-git's callback errors
-	// the same way regardless of this machine's ~/.ssh contents.
+	// Point SSH_KNOWN_HOSTS at a nonexistent path to prove we no longer depend
+	// on the system known_hosts at all — Relay's own TOFU file is what matters.
 	t.Setenv("SSH_KNOWN_HOSTS", filepath.Join(t.TempDir(), "does-not-exist"))
-	o := syncOpts(t, e, io.Discard)
-	o.CloneURL = ""
-	o.RepositoryURL = "git@github.com:acme/r.git"
-	o.SSHDir = e.sshDir
-	err := SyncFromConfig(context.Background(), o, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
-	if err == nil {
-		t.Fatal("sync with no known_hosts: nil error, want host-key verification error")
+
+	// Route the real transport auth (nil opts.Auth + RepositoryURL ssh) through
+	// the builder: authFor must succeed and return a TOFU-wired auth method.
+	repoURL := "git@github.com:acme/r.git"
+	auth, err := newGoGitAuthFn(SyncOptions{SSHDir: e.sshDir}).authFor(repoURL)
+	if err != nil {
+		t.Fatalf("authFor: %v, want non-nil TOFU auth (host-key verification must not fail on first use)", err)
 	}
-	// The error must carry the known_hosts guidance and must NOT say the key is
-	// missing (the key exists here).
-	if strings.Contains(err.Error(), "keygen") || !strings.Contains(err.Error(), "known_hosts") {
-		t.Fatalf("sync err = %v, want known_hosts guidance (not keygen)", err)
+	if auth == nil {
+		t.Fatal("authFor returned nil auth, want TOFU-wired ssh auth")
 	}
+	// HostKeyCallback must be set — verification is never disabled.
+	if cb := auth.(*gitssh.PublicKeys).HostKeyCallback; cb == nil {
+		t.Fatal("TOFU auth has nil HostKeyCallback; host-key verification must never be disabled")
+	}
+	// Relay known_hosts does not exist yet; first-trust is a callback concern
+	// (covered in hostkey_test.go), not an auth-build error.
 }
 
 // TestSyncLogsThroughInjectedLogger pins the DI wiring AND the two-channel

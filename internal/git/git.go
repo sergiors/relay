@@ -33,6 +33,11 @@ const (
 	CheckoutDir = GitDir + "/checkout"
 	// PrivateKeyFile is the deploy key filename written under SSHDir.
 	PrivateKeyFile = "id_ed25519"
+	// KnownHostsFile is Relay's own OpenSSH known_hosts file under SSHDir,
+	// maintained by the TOFU host-key callback (see hostkey.go). It is
+	// deliberately NOT the operator's ~/.ssh/known_hosts: Relay trusts on first
+	// use and records the fingerprint itself, so no ssh-keyscan step is needed.
+	KnownHostsFile = "known_hosts"
 	// DefaultRef is the ref used by `relay git set` when --ref is omitted.
 	DefaultRef = "main"
 )
@@ -207,8 +212,8 @@ type SyncOptions struct {
 	// Path overrides the configured monorepo path in the same way as Ref.
 	Path *string
 	// Auth is the transport auth. nil is fine for local filesystem sources
-	// (tests); production leaves it nil so the SSHDir key is loaded with
-	// known_hosts verification.
+	// (tests); production leaves it nil so the SSHDir key is loaded with TOFU
+	// host-key verification over Relay's own known_hosts.
 	Auth gitssh.AuthMethod
 	// SSHDir is where the SSH deploy key lives. Defaulted by the CLI.
 	SSHDir string

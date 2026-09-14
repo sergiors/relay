@@ -46,7 +46,8 @@ type gitRepo interface {
 // the /functions target. It:
 //
 //  1. Loads the persisted config; errors clearly if none is configured.
-//  2. Builds (or receives) the SSH auth and enforces host-key verification. When
+//  2. Builds (or receives) the SSH auth and enforces host-key verification via
+//     Trust On First Use over Relay's own known_hosts (see sshAuthFor). When
 //     opts.Auth is already set (the test/local seam), it is used as-is; in
 //     production SyncFromConfig builds it from the SSHDir key.
 //  3. Ensures the checkout: clones fresh (default branch, single-branch=false)
@@ -80,15 +81,16 @@ func Sync(ctx context.Context, opts SyncOptions) error {
 // SyncFromConfig runs a sync using a fully-provided Config (used by the CLI after
 // `git set` has persisted it identically, and by tests that construct a Config
 // directly without touching a config file). It is the test-friendly entry that
-// still honors the seam: when opts.Auth is non-nil it bypasses the SSH/known
-// hosts path entirely (local filesystem sources in tests).
+// still honors the seam: when opts.Auth is non-nil it bypasses the SSH/TOFU
+// known_hosts path entirely (local filesystem sources in tests).
 func SyncFromConfig(ctx context.Context, opts SyncOptions, cfg Config) error {
 	return syncWithGit(ctx, opts, cfg, newGoGitOps(), newGoGitAuthFn(opts))
 }
 
 // newGoGitAuthFn returns the auth-builder for the transport. Production resolves
-// auth from the SSHDir key (with host-key verification) when the source is SSH;
-// tests supply opts.Auth and/or point at a local source (nil auth).
+// auth from the SSHDir key (with TOFU host-key verification over Relay's own
+// known_hosts) when the source is SSH; tests supply opts.Auth and/or point at a
+// local source (nil auth).
 func newGoGitAuthFn(opts SyncOptions) gitOpsAuth {
 	return gitOpsAuth{opts: opts}
 }
@@ -101,11 +103,11 @@ type gitOpsAuth struct {
 
 // authFor returns the transport auth method for the given source URL. An
 // explicitly supplied opts.Auth wins (the local test seam). Otherwise, when the
-// source is an SSH URL (the production case) the SSHDir key is loaded with
-// known_hosts verification — and any failure (missing key, no known_hosts) is a
-// hard error so host-key verification is never skipped. Non-ssh sources (file://
-// or a plain local path, as tests and monorepo fixtures use) need no auth and get
-// nil.
+// source is an SSH URL (the production case) the SSHDir key is loaded and wired
+// for TOFU host-key verification over Relay's own known_hosts file — any failure
+// that would skip verification (missing key, unreadable known_hosts) is a hard
+// error. Non-ssh sources (file:// or a plain local path, as tests and monorepo
+// fixtures use) need no auth and get nil.
 func (a gitOpsAuth) authFor(sourceURL string) (gitssh.AuthMethod, error) {
 	if a.opts.Auth != nil {
 		return a.opts.Auth, nil
@@ -122,7 +124,9 @@ func (a gitOpsAuth) authFor(sourceURL string) (gitssh.AuthMethod, error) {
 	if a.opts.SSHDir == "" {
 		return nil, fmt.Errorf("git: ssh source requires the SSHDir option (production sets /var/lib/relay/ssh)")
 	}
-	return sshAuthFor(a.opts.SSHDir)
+	// Thread the parsed endpoint and the two-channel reporting seams (out/log)
+	// down to the TOFU callback so a first-trust surfaces on both.
+	return sshAuthFor(a.opts.SSHDir, ep, a.opts.Out, a.opts.Log)
 }
 
 // syncWithGit is the shared implementation behind Sync and SyncFromConfig. It

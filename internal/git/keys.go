@@ -5,11 +5,17 @@ import (
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
+	"github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -103,31 +109,182 @@ func keyExists(dir string) bool {
 }
 
 // sshAuthFor builds the go-git SSH auth method from the persisted key under
-// ssdDir. It enforces host-key verification through the system known_hosts
-// files via go-git's NewKnownHostsCallback (which reads ~/.ssh/known_hosts,
-// /etc/ssh/ssh_known_hosts, and the SSH_KNOWN_HOSTS env var). Verification is
-// NEVER disabled: when no known_hosts file can be found, sshAuthFor returns a
-// descriptive error telling the operator to add the host, never an
-// insecure-verification fallback.
-func sshAuthFor(ssdDir string) (gitssh.AuthMethod, error) {
-	data, err := os.ReadFile(filepath.Join(ssdDir, PrivateKeyFile))
+// sshDir, wired for TOFU (Trust On First Use) host-key verification using
+// Relay's OWN known_hosts file (<sshDir>/known_hosts). It no longer consults
+// the system files (~/.ssh/known_hosts, /etc/ssh/ssh_known_hosts,
+// SSH_KNOWN_HOSTS) and never needs ssh-keyscan: Relay is provider-neutral and
+// works with GitHub, GitLab, or any SSH git server by trusting each host on its
+// first contact and recording the fingerprint itself.
+//
+// The returned callback never returns a nil HostKeyCallback and never uses
+// InsecureIgnoreHostKey. Verification semantics, per host:
+//   - unknown host  -> persist its key (TOFU) and accept; the first-trust is
+//     surfaced via out (a user-facing line) and log (Debug attrs).
+//   - known, matching -> accept (normal verification).
+//   - known, changed  -> fail loudly with an operator-actionable MITM warning
+//     and never modify known_hosts.
+//
+// ep is the already-parsed SSH endpoint (so hostWithPort is consistent with the
+// address go-git dials); out/log are the two-channel reporting seams (see
+// writeLine in sync.go) and are both optional (nil is silent).
+func sshAuthFor(sshDir string, ep *transport.Endpoint, out io.Writer, log *slog.Logger) (gitssh.AuthMethod, error) {
+	data, err := os.ReadFile(filepath.Join(sshDir, PrivateKeyFile))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no SSH key found under %s; run relay git keygen first", ssdDir)
+			return nil, fmt.Errorf("no SSH key found under %s; run relay git keygen first", sshDir)
 		}
 		return nil, fmt.Errorf("git: read key %s: %w", PrivateKeyFile, err)
 	}
-	// This is the hard known_hosts requirement: the callback errors when it
-	// cannot locate any known_hosts source, and we propagate that error with
-	// operator guidance instead of skipping host verification.
-	cb, err := gitssh.NewKnownHostsCallback()
-	if err != nil {
-		return nil, fmt.Errorf("git: cannot verify host key, no known_hosts file: %v; add the host first, e.g. 'ssh-keyscan <host> >> ~/.ssh/known_hosts'", err)
+
+	// NewDB only ever sees a file that exists: ensureKnownHostsFile creates an
+	// empty 0600 file (0700 dir) when absent, so "no hosts trusted yet" is a valid
+	// state, not an error. Empty known_hosts yields a callback with an empty
+	// trust set whose first contact takes the TOFU path below.
+	if err := ensureKnownHostsFile(knownHostsPath(sshDir)); err != nil {
+		return nil, err
 	}
+	db, err := knownhosts.NewDB(knownHostsPath(sshDir))
+	if err != nil {
+		return nil, fmt.Errorf("git: load known_hosts %s: %w", KnownHostsFile, err)
+	}
+
 	auth, err := gitssh.NewPublicKeys("git", data, "")
 	if err != nil {
 		return nil, fmt.Errorf("git: parse SSH key: %w", err)
 	}
-	auth.HostKeyCallback = cb
+	auth.HostKeyCallback = tofuHostKeyCallback(sshDir, db, ep, out, log)
+	// When the host is already trusted, restrict the algorithms the client will
+	// offer to exactly those in known_hosts for that host. This mirrors what
+	// go-git's own connect() does in its known_hosts branch (ssh/common.go:134),
+	// and here it matters: go-git leaves HostKeyAlgorithms to the user when a
+	// custom HostKeyCallback is set (ssh/common.go:135-140), so without this the
+	// client would offer its default preference list. On FIRST contact
+	// (hostWithPort not yet known) HostKeyAlgorithms(hostWithPort) is empty and
+	// the field stays nil, letting golang ssh dial with default preferences and
+	// the callback persist whatever key the server presents. On SUBSEQUENT
+	// contacts the restricted list guarantees the callback only ever sees a key
+	// type the pinned known_hosts entry records (a server offering only something
+	// else is a mismatch). Setting nil when empty is required: an empty non-nil
+	// slice would instruct ssh to offer NO host key algorithms.
+	hostWithPort := net.JoinHostPort(ep.Host, strconv.Itoa(endpointPort(ep)))
+	auth.HostKeyAlgorithms = db.HostKeyAlgorithms(hostWithPort)
 	return auth, nil
+}
+
+// endpointPort returns the endpoint's port, defaulting to 22 (go-git's
+// DefaultPort) when unset, matching getHostWithPort in go-git's ssh transport.
+func endpointPort(ep *transport.Endpoint) int {
+	if ep.Port <= 0 {
+		return 22
+	}
+	return ep.Port
+}
+
+// knownHostsPath returns the Relay-owned known_hosts path under sshDir.
+func knownHostsPath(sshDir string) string {
+	return filepath.Join(sshDir, KnownHostsFile)
+}
+
+// ensureKnownHostsFile creates Relay's known_hosts file (and its 0700 parent)
+// at path when missing, as an empty 0600 file. "File absent" is the "no hosts
+// trusted yet" TOFU state, not an error; a present-but-unreadable file is a real
+// error. Creating an empty file up front keeps knownhosts.NewDB (which errors on
+// a nonexistent path) simple and always successful.
+func ensureKnownHostsFile(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("git: create ssh dir: %w", err)
+	}
+	// O_CREATE|O_EXCL guards against racing a concurrent first-trust; a
+	// successful open means some other goroutine already created it.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return fmt.Errorf("git: create known_hosts: %w", err)
+	}
+	return f.Close()
+}
+
+// tofuHostKeyCallback wraps the strict inner known_hosts callback with the TOFU
+// policy. err == nil (host known and matching) is normal verification. A
+// HostKeyChanged error is a loud, operator-actionable MITM warning that never
+// touches known_hosts. A HostUnknown error triggers TOFU: the presented key is
+// appended to Relay's known_hosts file and the connection proceeds, with the
+// first-trust event surfaced on out (user line) and log (Debug attrs).
+func tofuHostKeyCallback(sshDir string, db *knownhosts.HostKeyDB, ep *transport.Endpoint, out io.Writer, log *slog.Logger) ssh.HostKeyCallback {
+	inner := db.HostKeyCallback()
+	return ssh.HostKeyCallback(func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := inner(hostname, remote, key)
+		switch {
+		case err == nil:
+			// Known and matching: normal OpenSSH-style verification.
+			return nil
+		case knownhosts.IsHostKeyChanged(err):
+			// The host's key changed under us — the classic MITM signal. Fail
+			// loudly and NEVER auto-update known_hosts: silently replacing the
+			// key would let an attacker pin their own key. The operator resolves
+			// a genuinely expected rotation by editing the file manually.
+			return fmt.Errorf("git: host key for %s has changed! This may indicate a man-in-the-middle attack. If the change is expected, remove the host's line(s) from %s and sync again", hostname, knownHostsPath(sshDir))
+		case knownhosts.IsHostUnknown(err):
+			// First use of this host: TOFU — persist the key and continue. The
+			// append is done with the file left O_APPEND (see the comment below),
+			// deliberately NOT the temp+rename pattern used for config/key,
+			// because known_hosts is append-only by design.
+			if werr := appendKnownHost(knownHostsPath(sshDir), hostname, remote, key); werr != nil {
+				return werr
+			}
+			// Surfacing the first-trust: a sentence-style user line on out plus
+			// a Debug log with attrs (never the raw key bytes). Same
+			// two-channel rule as writeLine in sync.go — Out is user-facing,
+			// slog is Debug (mirroring the no-double-print rationale there).
+			fp := ssh.FingerprintSHA256(key)
+			host := knownhosts.Normalize(hostname)
+			if out != nil {
+				fmt.Fprintf(out, "Trusted new host %s (fingerprint %s)\n", host, fp)
+			}
+			if log != nil {
+				log.Debug("trusted new host", "host", host, "fingerprint", fp)
+			}
+			return nil
+		default:
+			// Any other error (corrupt line, unreadable entry): propagate.
+			return err
+		}
+	})
+}
+
+// appendKnownHost appends a host-key line to Relay's known_hosts file, creating
+// it (0700 dir, 0600 file) if absent, and returns a descriptive error on any
+// failure so a first-trust that cannot be persisted fails the connection rather
+// than silently proceeding on an unverified host.
+func appendKnownHost(path, hostname string, remote net.Addr, key ssh.PublicKey) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("git: create ssh dir: %w", err)
+	}
+	// O_APPEND|O_CREATE: a fresh (possibly zero) file or an existing one, always
+	// opened append-only with the 0600 mode applied to a newly created file. This
+	// is a deliberate divergence from the config/key rename pattern (see
+	// writeConfig/GenerateKey): known_hosts is a pure append log of distinct
+	// host:port=>key pins, and re-opening with O_APPEND on every new host is
+	// simplest and correct. Concurrent first-trusts of different hosts each get
+	// an O_APPEND write that lands atomically at the end without overwriting a
+	// sibling line. A changed/key mismatch path never reaches here (only the
+	// TOFU HostUnknown branch does), so an existing pin is never replaced.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("git: open known_hosts: %w", err)
+	}
+	if err := knownhosts.WriteKnownHost(f, hostname, remote, key); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("git: write known_hosts: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("git: sync known_hosts: %w", err)
+	}
+	return f.Close()
 }

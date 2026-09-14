@@ -22,16 +22,21 @@
 // Sync's documentation and README.md "Git" for the precise contract.
 //
 // Transport model: production sync authenticates over SSH only, using a local
-// ed25519 deploy key whose host verification is enforced through the system
-// known_hosts files (host-key verification is NEVER disabled). The sync core is
-// still transport-neutral: it accepts a RepositoryURL and an AuthMethod, both
-// injected by the caller. The CLI entry wires the SSH URL and the key; tests
-// drive the same core against a local filesystem path with a nil auth, which
-// requires no key and no network.
+// ed25519 deploy key whose host verification uses Trust On First Use (TOFU)
+// over Relay's OWN known_hosts file (host-key verification is NEVER disabled).
+// The first time a host is reached it is trusted and its fingerprint persists;
+// every later sync verifies against that pinned key, and a changed key fails
+// loudly and is never auto-replaced. Relay is provider-neutral — it works with
+// GitHub, GitLab, or any SSH git server — and never needs ssh-keyscan or the
+// operator's ~/.ssh/known_hosts. The sync core is still transport-neutral: it
+// accepts a RepositoryURL and an AuthMethod, both injected by the caller. The
+// CLI entry wires the SSH URL and the key; tests drive the same core against a
+// local filesystem path with a nil auth, which requires no key and no network.
 //
 // Storage layout (fixed application conventions, mirroring state and secrets):
 //
 //	/var/lib/relay/ssh/id_ed25519            the private deploy key (0700/0600)
+//	/var/lib/relay/ssh/known_hosts           Relay's TOFU host-key pins (0600)
 //	/var/lib/relay/git/source.json           the persisted sync config (0600)
 //	/var/lib/relay/git/checkout              the managed git checkout/worktree
 //
