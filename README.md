@@ -147,16 +147,16 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                  | Required | Description                                          |
-| ------------------------ | -------- | ---------------------------------------------------- |
-| `REDIS_URI`              | yes      | Redis address or DSN (see below).                    |
-| `REDIS_STREAM`           | yes      | Redis stream to consume.                             |
-| `REDIS_GROUP`            | yes      | Consumer group name.                                 |
-| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.    |
-| `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus. |
+| Env var                  | Required | Description                                                                            |
+| ------------------------ | -------- | -------------------------------------------------------------------------------------- |
+| `REDIS_URI`              | yes      | Redis address or DSN (see below).                                                      |
+| `REDIS_STREAM`           | yes      | Redis stream to consume.                                                               |
+| `REDIS_GROUP`            | yes      | Consumer group name.                                                                   |
+| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.                                      |
+| `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus.                                |
 | `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
-| `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`. |
-| `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`. |
+| `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
+| `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -359,7 +359,7 @@ containers owned by other hostnames (another replica's property, live or crashed
 or any non-Relay container, and does no global pruning.
 
 Every execution container is hardened: it runs as a non-root user (uid 10001,
-baked into the generated image), is limited to 512 MiB memory / 1 CPU / 128 PIDs,
+baked into the generated image), is limited to 128 MiB memory / 1 CPU / 128 PIDs,
 drops all Linux capabilities, has a read-only root filesystem with a bounded
 `/tmp` tmpfs, and keeps outbound networking enabled (a documented residual, not a
 sandbox for untrusted code).
@@ -461,16 +461,16 @@ A pattern is a tree of field conditions:
 
 ### Operators
 
-| Operator | Semantics                                                           |
-| -------- | ------------------------------------------------------------------- |
-| `equals` | Value equals any of the listed values (type-preserving).            |
-| `prefix` | String value starts with any of the listed prefixes.                |
-| `suffix` | String value ends with any of the listed suffixes.                  |
-| `exists` | Key presence check. Takes a boolean, not a list.                    |
-| `gt`     | Value is greater than a numeric threshold or `now()`-relative cutoff.      |
-| `gte`    | Value is greater than or equal (numeric or `now()` cutoff).               |
-| `lt`     | Value is less than a numeric threshold or `now()`-relative cutoff.       |
-| `lte`    | Value is less than or equal (numeric or `now()` cutoff).                 |
+| Operator | Semantics                                                             |
+| -------- | --------------------------------------------------------------------- |
+| `equals` | Value equals any of the listed values (type-preserving).              |
+| `prefix` | String value starts with any of the listed prefixes.                  |
+| `suffix` | String value ends with any of the listed suffixes.                    |
+| `exists` | Key presence check. Takes a boolean, not a list.                      |
+| `gt`     | Value is greater than a numeric threshold or `now()`-relative cutoff. |
+| `gte`    | Value is greater than or equal (numeric or `now()` cutoff).           |
+| `lt`     | Value is less than a numeric threshold or `now()`-relative cutoff.    |
+| `lte`    | Value is less than or equal (numeric or `now()` cutoff).              |
 
 #### Comparison operators (gt/gte/lt/lte)
 
@@ -507,14 +507,14 @@ Examples:
 ```yaml
 pattern:
   price:
-    lte: 100.5           # numeric: value <= 100.5
+    lte: 100.5 # numeric: value <= 100.5
   age:
-    gt: 18               # numeric: value > 18
+    gt: 18 # numeric: value > 18
   created_at:
-    gt: "now()-5m"       # temporal: value after (now() - 5m)
+    gt: "now()-5m" # temporal: value after (now() - 5m)
   updated_at:
     gte: "now()-1h"
-    lt: "now()"          # two operators on one field are OR, not a range
+    lt: "now()" # two operators on one field are OR, not a range
 ```
 
 `exists` checks **key presence only** — the value is irrelevant. `null` still

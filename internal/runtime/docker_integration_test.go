@@ -1249,8 +1249,8 @@ export function check(event) {
 			if hc == nil {
 				t.Fatal("inspect returned nil HostConfig")
 			}
-			if hc.Memory != 512<<20 {
-				t.Errorf("memory limit = %d, want %d", hc.Memory, 512<<20)
+			if hc.Memory != 128<<20 {
+				t.Errorf("memory limit = %d, want %d", hc.Memory, 128<<20)
 			}
 			if hc.NanoCPUs != 1_000_000_000 {
 				t.Errorf("nano cpus = %d, want %d", hc.NanoCPUs, 1_000_000_000)

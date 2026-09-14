@@ -369,7 +369,7 @@ func runContainer(
 		HostConfig: &container.HostConfig{
 			AutoRemove: true,
 			Resources: container.Resources{
-				Memory:    512 << 20,     // 512 MiB
+				Memory:    128 << 20,     // 128 MiB
 				NanoCPUs:  1_000_000_000, // 1 CPU
 				PidsLimit: ptr(int64(128)),
 			},
