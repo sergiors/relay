@@ -110,8 +110,10 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 	}
 }
 
-// Unchanged healthy function -> state DB records skipped.
-func TestReconcileStateUnchangedSkipped(t *testing.T) {
+// Unchanged healthy function -> skipped periodic check persists NO reconcile
+// outcome (RecordDiscovered seeds empty reconcile fields); the last meaningful
+// reconcile (none yet) is untouched.
+func TestReconcileStateUnchangedDoesNotRecordOutcome(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "stable")
 
@@ -125,8 +127,11 @@ func TestReconcileStateUnchangedSkipped(t *testing.T) {
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if d.LastReconcileStatus != state.ReconcileSkipped {
-		t.Fatalf("last_reconcile_status = %s, want skipped", d.LastReconcileStatus)
+	if d.LastReconcileStatus != "" {
+		t.Fatalf("last_reconcile_status = %s, want empty (unchanged check must not record an outcome)", d.LastReconcileStatus)
+	}
+	if d.LastReconcileAt != "" {
+		t.Fatalf("last_reconcile_at = %s, want empty (unchanged check must not record a timestamp)", d.LastReconcileAt)
 	}
 }
 

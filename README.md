@@ -797,7 +797,8 @@ how the last reconcile of each function went without touching Redis or Docker.
   time-series source).
 - **State model**: `status` is `ready` (an active version is built and serving)
   or `pending` (loaded but not yet built). `last_reconcile_status` is
-  `success` / `failed` / `skipped`. A **failed rebuild never marks a whole
+  `success` / `failed` (the last MEANINGFUL reconcile outcome; unchanged periodic
+  checks are not recorded). A **failed rebuild never marks a whole
   function unavailable**: the previously active image and fingerprint are
   retained, so the last good version keeps serving while `last reconcile` shows
   the failure. All timestamps are RFC3339.

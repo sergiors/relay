@@ -152,24 +152,89 @@ type boomErr struct{}
 
 func (*boomErr) Error() string { return "boom" }
 
-// skipped only touches an existing row (never creates a phantom).
-func TestRecordSkippedOnlyIfRowExists(t *testing.T) {
+// TestRecordReconcileSuccessAdvancesLastReconcileAt is the regression for the
+// upsert that omitted last_reconcile_at: a success on an EXISTING row (one
+// already seeded by RecordDiscovered) must persist its reconcile timestamp and
+// status. A second, later success must advance the timestamp.
+func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+	c.RecordDiscovered(fn) // existing row, empty reconcile fields
 
-	c.RecordSkipped("ghost") // no row -> no-op
-	if _, ok := c.GetFunction("ghost"); ok {
-		t.Fatal("skipped must not create a row")
+	img1, fp1 := "img-v1", "fp-v1"
+	t1 := time.Now()
+	c.RecordReconcileSuccess("fn", img1, fp1, t1, fn)
+
+	d1, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after success")
+	}
+	if d1.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s, want %s", d1.LastReconcileStatus, ReconcileSuccess)
+	}
+	at1, err := time.Parse(time.RFC3339, d1.LastReconcileAt)
+	if err != nil {
+		t.Fatalf("first last_reconcile_at not a valid RFC3339 timestamp %q: %v", d1.LastReconcileAt, err)
 	}
 
+	// A second success shortly later (RFC3339 has 1s resolution, so sleep just
+	// over 1s for a deterministic strict increase) must advance the timestamp.
+	time.Sleep(1100 * time.Millisecond)
+	t2 := time.Now()
+	c.RecordReconcileSuccess("fn", img1, fp1, t2, fn)
+
+	d2, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after second success")
+	}
+	if d2.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s, want %s", d2.LastReconcileStatus, ReconcileSuccess)
+	}
+	at2, err := time.Parse(time.RFC3339, d2.LastReconcileAt)
+	if err != nil {
+		t.Fatalf("second last_reconcile_at not a valid RFC3339 timestamp %q: %v", d2.LastReconcileAt, err)
+	}
+	if !at2.After(at1) {
+		t.Fatalf("last_reconcile_at did not advance: first=%s second=%s", at1, at2)
+	}
+}
+
+// TestLastReconcileSurvivesDiscoveredUpsert pins the full upsert contract: (i) a
+// success on an existing row persists its status and timestamp (the core fix),
+// and (ii) a subsequent re-discovery upsert resets the outcome view (the
+// excluded reconcile columns are empty), because a discovery is NOT a
+// meaningful reconcile.
+func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
+	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordDiscovered(fnFor(t, "fn", tmpl))
-	c.RecordSkipped("fn")
+	fn := fnFor(t, "fn", tmpl)
+	c.RecordDiscovered(fn)
+
+	// (i) success on the existing row persists status + timestamp.
+	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn)
 	d, ok := c.GetFunction("fn")
 	if !ok {
-		t.Fatal("expected row")
+		t.Fatal("expected row after success")
 	}
-	if d.LastReconcileStatus != ReconcileSkipped {
-		t.Fatalf("last_reconcile_status = %s, want skipped", d.LastReconcileStatus)
+	if d.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s, want %s", d.LastReconcileStatus, ReconcileSuccess)
+	}
+	if d.LastReconcileAt == "" {
+		t.Fatal("last_reconcile_at must be persisted by a success on an existing row")
+	}
+
+	// (ii) re-discovery resets the outcome view (it is not a meaningful reconcile).
+	c.RecordDiscovered(fnFor(t, "fn", tmpl))
+	d, ok = c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after re-discovery")
+	}
+	if d.LastReconcileStatus != "" {
+		t.Fatalf("last_reconcile_status = %s after re-discovery, want empty", d.LastReconcileStatus)
+	}
+	if d.LastReconcileAt != "" {
+		t.Fatalf("last_reconcile_at = %s after re-discovery, want empty", d.LastReconcileAt)
 	}
 }
 

@@ -31,7 +31,6 @@ const (
 const (
 	ReconcileSuccess = "success"
 	ReconcileFailed  = "failed"
-	ReconcileSkipped = "skipped"
 )
 
 // Row is the per-function summary returned by ListFunctions.
@@ -402,8 +401,11 @@ func (c *State) RecordDiscovered(fn function.Function) {
 }
 
 // RecordReconcileSuccess records that a function built and serves an active
-// version: status=ready, the new image/fingerprint/prepared_at, last reconcile
-// success, cleared last_error, and the handlers replaced.
+// version: status=ready, the new image/fingerprint/prepared_at,
+// last_reconcile_status=success AND last_reconcile_at=now (the last meaningful
+// reconcile), cleared last_error, and the handlers replaced. On conflict
+// (existing row) the upsert persists these outcome columns too, so a success on
+// a previously-discovered row records its own outcome and timestamp.
 func (c *State) RecordReconcileSuccess(name, image, fingerprint string, preparedAt time.Time, fn function.Function) {
 	ctx := context.Background()
 	ts := now()
@@ -443,22 +445,6 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 	})
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: record failure %q: %v", name, err))
-	}
-}
-
-// RecordSkipped records that a reconcile skipped an unchanged function, but
-// only if the row already exists (never introduces a phantom row).
-func (c *State) RecordSkipped(name string) {
-	ctx := context.Background()
-	ts := now()
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE functions SET last_reconcile_status = ?, updated_at = ? WHERE name = ?`,
-			ReconcileSkipped, ts, name)
-		return err
-	})
-	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record skipped %q: %v", name, err))
 	}
 }
 
@@ -652,8 +638,13 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 // insertStmt returns a function that INSERTs a function row, upserting
 // (replacing) on conflict keyed by name. On conflict only the non-active fields
 // are overwritten; a rebuild/discovery never clobbers a ready image until a
-// later success records it. env and secrets are the serialized env/secret
-// MAPPINGS (JSON objects), never secret values.
+// later success records it. The reconcile outcome columns
+// (last_reconcile_at/last_reconcile_status/last_error) are also overwritten by
+// the record in the VALUES row, so a success on an existing row persists its
+// own outcome and timestamp; only the active-version fields
+// (image/fingerprint/prepared_at — and status on the failure path) are guarded.
+// env and secrets are the serialized env/secret MAPPINGS (JSON objects), never
+// secret values.
 type insertFn func(name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets string) error
 
 func insertStmt(tx *sql.Tx) insertFn {
@@ -667,6 +658,7 @@ func insertStmt(tx *sql.Tx) insertFn {
 			   image = excluded.image,
 			   fingerprint = excluded.fingerprint,
 			   prepared_at = excluded.prepared_at,
+			   last_reconcile_at = excluded.last_reconcile_at,
 			   last_reconcile_status = excluded.last_reconcile_status,
 			   last_error = excluded.last_error,
 			   updated_at = excluded.updated_at,

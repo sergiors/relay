@@ -128,7 +128,8 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Reconcile-style writer: alternate success/skipped over the functions.
+	// Reconcile-style writer: alternate success writers (different image values)
+	// and failures to exercise concurrent writes with the stats snapshot.
 	go func() {
 		defer wg.Done()
 		for {
@@ -142,7 +143,7 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 				if i%2 == 0 {
 					c.RecordReconcileSuccess(name, "img", "fp", time.Now(), fns[i])
 				} else {
-					c.RecordSkipped(name)
+					c.RecordReconcileSuccess(name, "img-else", "fp", time.Now(), fns[i])
 				}
 			}
 		}

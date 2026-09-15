@@ -427,11 +427,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// unchanged. A previously-failed build (unavailable) is retried even if the
 	// fingerprint is stable, so a broken function recovers without edits.
 	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp {
-		// The state's RecordSkipped only touches an existing row; a function
-		// never seeded (no row) is left alone. This writes the outcome view.
-		if r.st != nil {
-			r.st.RecordSkipped(name)
-		}
+		// Skipped checks are deliberately NOT persisted as the last reconcile:
+		// RecordReconcileSuccess/Failure record the last MEANINGFUL operation and
+		// its timestamp; a periodic no-op must not hide a recent success or
+		// failure. It is surfaced in debug logging only.
+		r.log.Debug(fmt.Sprintf("Function %q: unchanged; reconcile skipped", name))
 		return
 	}
 

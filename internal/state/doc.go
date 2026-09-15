@@ -11,7 +11,10 @@
 // State Model:
 //   - status: "ready" (an active version is built and serving) or "pending"
 //     (loaded but not yet built/verified)
-//   - last_reconcile_status: "success" | "failed" | "skipped"
+//   - last_reconcile_status: "success" | "failed"
+//     (skipped periodic checks are not recorded; the columns reflect the last
+//     MEANINGFUL reconcile — a success or a failure — so an unchanged-function
+//     periodic pass never overwrites them)
 //
 // A failed reconcile never marks a whole function unavailable: the previously
 // active image/fingerprint/prepared_at are retained so the last good version
