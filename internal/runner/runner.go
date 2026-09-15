@@ -720,9 +720,9 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// matching rules. This is the message-level counter.
 	r.metrics.Inc("events_received_total")
 	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
-	// it (e.g. when the runner is driven directly in tests). It is used for
-	// logging and as the per-invocation attempt number when no invocation state
-	// is present (each direct call is then treated as attempt 1).
+	// it (e.g. when the runner is driven directly in tests). It is the delivery
+	// attempt used for logging; without invocation state the handler attempt is
+	// unknown, so the delivery attempt is logged instead.
 	deliveryAttempt := stream.DeliveryAttemptFrom(ctx)
 	// Best-effort invocation state, absent when the stream did not inject it
 	// (direct Handle callers/tests, or invocation tracking disabled).
@@ -797,7 +797,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"message_id", msgID,
 					"event_id", eventID,
 					"event_name", eventName,
-					"attempt", deliveryAttempt,
+					"delivery_attempt", deliveryAttempt,
 				)
 				continue
 			}
@@ -819,10 +819,11 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// loop can aggregate AFTER iterating every matching rule — a failure in
 			// one handler never prevents later handlers from running.
 			executeRule := func() (invocationOutcome, error) {
-				// The per-invocation attempt number. With invocation state it
-				// comes from TryStart (Redis-backed, incremented per actual
-				// execution); without it, each direct call is simply attempt 1.
-				attempt := int(deliveryAttempt)
+				// The per-invocation handler attempt number. With invocation state
+				// it comes from TryStart (Redis-backed, incremented per actual
+				// execution); without it there is no persisted handler attempt, so
+				// the delivery count is used as the handler_attempt fallback.
+				handlerAttempt := int(deliveryAttempt)
 				// Reserve the worker-global and per-function concurrency slots
 				// BEFORE TryStart, so a blocked invocation is never counted as an
 				// attempt and does not persist state. If no slot frees within
@@ -843,7 +844,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"message_id", msgID,
 						"event_id", eventID,
 						"event_name", eventName,
-						"attempt", attempt,
+						"delivery_attempt", int(deliveryAttempt),
 					)
 					return outcomePendingSkip, nil
 				}
@@ -854,7 +855,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"message_id", msgID,
 						"event_id", eventID,
 						"event_name", eventName,
-						"attempt", attempt,
+						"delivery_attempt", int(deliveryAttempt),
 					)
 				}
 				defer releaseSlots()
@@ -885,7 +886,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 								"message_id", msgID,
 								"event_id", eventID,
 								"event_name", eventName,
-								"attempt", n,
+								"handler_attempt", n,
 								"next_attempt_in", wait,
 							)
 							return outcomePendingSkip, nil
@@ -901,11 +902,11 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							"message_id", msgID,
 							"event_id", eventID,
 							"event_name", eventName,
-							"attempt", n,
+							"handler_attempt", n,
 						)
 						return outcomeTerminalSkip, nil
 					}
-					attempt = n
+					handlerAttempt = n
 				}
 				r.log.Debug("Function rule: matched event",
 					"function", pf.fn.Name,
@@ -913,7 +914,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"message_id", msgID,
 					"event_id", eventID,
 					"event_name", eventName,
-					"attempt", attempt,
+					"handler_attempt", handlerAttempt,
 				)
 				eventJSON, err := json.Marshal(event)
 				if err != nil {
@@ -923,7 +924,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// next matching rule so each independent invocation gets its own
 					// failed attempt.
 					if hasState {
-						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -940,7 +941,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
 					if hasState {
-						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -972,7 +973,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"message_id", msgID,
 						"event_id", eventID,
 						"event_name", eventName,
-						"attempt", attempt,
+						"handler_attempt", handlerAttempt,
 						"panic_value", fmt.Sprintf("%v", panicValue),
 						"stack", string(debug.Stack()),
 					)
@@ -1001,7 +1002,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"message_id", msgID,
 						"event_id", eventID,
 						"event_name", eventName,
-						"attempt", attempt,
+						"handler_attempt", handlerAttempt,
 						"duration", d,
 						"reason", err,
 					)
@@ -1014,7 +1015,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// end-of-loop aggregate, so an invocation may exhaust while
 					// others still run.
 					if hasState {
-						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -1057,7 +1058,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"message_id", msgID,
 					"event_id", eventID,
 					"event_name", eventName,
-					"attempt", attempt,
+					"handler_attempt", handlerAttempt,
 					"duration", d,
 				)
 				return outcomeExecuted, nil
@@ -1229,7 +1230,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 		// returns started=false when the invocation is already exhausted or
 		// protected by an active attempt deadline or a retry backoff (this or
 		// another replica may be executing it, or it is waiting out its backoff).
-		started, attempt, wait := invState.TryStart(invocation, timeout)
+		started, handlerAttempt, wait := invState.TryStart(invocation, timeout)
 		if !started {
 			if wait > 0 {
 				// Protected by an active running deadline or a retry backoff. The
@@ -1239,7 +1240,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 				r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
 					"function", fnName,
 					"handler", handler,
-					"attempt", attempt,
+					"handler_attempt", handlerAttempt,
 					"next_attempt_in", wait,
 				)
 				return stream.ErrInvocationNotEligible
@@ -1250,7 +1251,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 			r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
 				"function", fnName,
 				"handler", handler,
-				"attempt", attempt,
+				"handler_attempt", handlerAttempt,
 			)
 			return fmt.Errorf("%w: schedule function %q handler %q is exhausted", stream.ErrInvocationExhausted, fnName, handler)
 		}
@@ -1264,7 +1265,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 			// attempt marks the invocation terminal and, because a schedule has
 			// exactly ONE invocation (this one), the message is terminal — wrap
 			// stream.ErrInvocationExhausted so the stream routes it to the DLQ.
-			outcome, retErr := r.recordFailure(invState, invocation, attempt, retries, fnName, handler, "relay.schedule", "", "", err)
+			outcome, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, "relay.schedule", "", "", err)
 			if outcome == outcomeExhausted {
 				return fmt.Errorf("%w: %w", stream.ErrInvocationExhausted, retErr)
 			}
@@ -1404,19 +1405,19 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 }
 
 // recordFailure handles a failed invocation attempt: it decides whether the
-// attempt is retryable or exhausted, updates the invocation state and metrics
-// accordingly, and returns the outcome plus the plain error Handle should
-// aggregate. It is used for execution, marshal, secret-resolution, and timeout
-// failures (all are failed attempts).
+// handler attempt is retryable or exhausted, updates the invocation state and
+// metrics accordingly, and returns the outcome plus the plain error Handle
+// should aggregate. It is used for execution, marshal, secret-resolution, and
+// timeout failures (all are failed attempts).
 //
-// A retryable attempt (attempt < 1+retries) schedules a retry backoff via
-// RecordFailure, counts function_retries_total, and returns (outcomeRetryable,
-// err). An exhausted attempt (attempt >= 1+retries) marks the invocation
-// terminal via MarkExhausted, counts function_dlq_total, and returns
-// (outcomeExhausted, err). The message-level DLQ decision (whether EVERY matched
-// invocation is terminal) is NOT made here; it is deferred to Handle's
-// end-of-loop aggregation, so an invocation can exhaust while others still run
-// without short-circuiting them.
+// A retryable handler attempt (handlerAttempt < 1+retries) schedules a retry
+// backoff via RecordFailure, counts function_retries_total, and returns
+// (outcomeRetryable, err). An exhausted handler attempt (handlerAttempt >=
+// 1+retries) marks the invocation terminal via MarkExhausted, counts
+// function_dlq_total, and returns (outcomeExhausted, err). The message-level
+// DLQ decision (whether EVERY matched invocation is terminal) is NOT made
+// here; it is deferred to Handle's end-of-loop aggregation, so an invocation
+// can exhaust while others still run without short-circuiting them.
 //
 // The returned error is always the plain, unwrapped failure so Handle only has
 // to wrap stream.ErrInvocationExhausted once, at the aggregate, if the message
@@ -1424,15 +1425,15 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 func (r *Runner) recordFailure(
 	invState stream.InvocationState,
 	invocation string,
-	attempt int,
+	handlerAttempt int,
 	retries int,
 	fnName, handler, msgID, eventID, eventName string,
 	origErr error,
 ) (invocationOutcome, error) {
 	maxAttempts := 1 + retries
-	if attempt >= maxAttempts {
+	if handlerAttempt >= maxAttempts {
 		// Exhausted: mark the invocation terminal.
-		invState.MarkExhausted(invocation, attempt)
+		invState.MarkExhausted(invocation, handlerAttempt)
 		r.metrics.IncLabels("function_dlq_total",
 			[]metrics.Label{{Name: "function", Value: fnName}})
 		r.log.Error("Function handler: exhausted; invocation terminal",
@@ -1441,13 +1442,13 @@ func (r *Runner) recordFailure(
 			"message_id", msgID,
 			"event_id", eventID,
 			"event_name", eventName,
-			"attempt", attempt,
-			"attempts_total", maxAttempts,
+			"handler_attempt", handlerAttempt,
+			"handler_attempts_total", maxAttempts,
 		)
-		return outcomeExhausted, fmt.Errorf("function %q handler %q exhausted after %d attempts: %w", fnName, handler, attempt, origErr)
+		return outcomeExhausted, fmt.Errorf("function %q handler %q exhausted after %d handler attempts: %w", fnName, handler, handlerAttempt, origErr)
 	}
 	// Retryable: schedule a retry backoff and count the retry.
-	backoff := retryBackoff(attempt)
+	backoff := retryBackoff(handlerAttempt)
 	invState.RecordFailure(invocation, backoff)
 	r.metrics.IncLabels("function_retries_total",
 		[]metrics.Label{{Name: "function", Value: fnName}})
@@ -1457,12 +1458,12 @@ func (r *Runner) recordFailure(
 		"message_id", msgID,
 		"event_id", eventID,
 		"event_name", eventName,
-		"attempt", attempt,
-		"attempts_total", maxAttempts,
+		"handler_attempt", handlerAttempt,
+		"handler_attempts_total", maxAttempts,
 		"retry_backoff", backoff,
 		"reason", origErr,
 	)
-	return outcomeRetryable, fmt.Errorf("function %q handler %q: attempt %d failed: %w", fnName, handler, attempt, origErr)
+	return outcomeRetryable, fmt.Errorf("function %q handler %q: handler attempt %d failed: %w", fnName, handler, handlerAttempt, origErr)
 }
 
 // allMatchedTerminal reports whether every matched invocation is terminal

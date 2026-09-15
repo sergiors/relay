@@ -662,7 +662,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 				}
 				pe = entries[0]
 			}
-			c.log.Debug(fmt.Sprintf("Reclaimed message %q for consumer %q (idle %s, attempts %d)",
+			c.log.Debug(fmt.Sprintf("Reclaimed message %q for consumer %q (idle %s, delivery_attempt %d)",
 				msg.ID, c.consumer, pe.Idle, pe.RetryCount))
 			c.deliverClaimed(ctx, msg, pe.RetryCount, handler)
 		}
@@ -756,7 +756,7 @@ func (c *Consumer) processMessage(
 		c.log.Error("Message %q: non-retryable failure (%v); routing to DLQ",
 			msg.ID, err,
 			"message_id", msg.ID,
-			"attempt", deliveryNum,
+			"delivery_attempt", deliveryNum,
 			"reason", err,
 		)
 		c.routeToDLQ(ctx, msg, err, deliveryNum)
@@ -804,7 +804,7 @@ func (c *Consumer) processMessage(
 		if errors.Is(err, ErrInvocationNotEligible) {
 			c.log.Debug("Message: invocation(s) not eligible (running or waiting for retry); leaving pending",
 				"message_id", msg.ID,
-				"attempt", deliveryNum,
+				"delivery_attempt", deliveryNum,
 			)
 			return
 		}
@@ -814,7 +814,7 @@ func (c *Consumer) processMessage(
 		if errors.Is(err, ErrInvocationExhausted) {
 			c.log.Error("Message: invocation(s) exhausted; routing to DLQ",
 				"message_id", msg.ID,
-				"attempt", deliveryNum,
+				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
 			c.routeToDLQ(ctx, msg, err, deliveryNum)
@@ -822,7 +822,7 @@ func (c *Consumer) processMessage(
 		}
 		c.log.Warn("Message: retryable failure; leaving pending for a later reclaim",
 			"message_id", msg.ID,
-			"attempt", deliveryNum,
+			"delivery_attempt", deliveryNum,
 			"reason", err,
 		)
 		// A retryable failure: this delivery will be retried, so it counts as a
@@ -866,7 +866,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		"occurrence_id", occ.ID(),
 		"scheduled_at", occ.ScheduledAt.UTC().Format(time.RFC3339),
 		"message_id", msgID,
-		"attempt", deliveryNum,
+		"delivery_attempt", deliveryNum,
 	)
 
 	// Inject the same per-message context as processMessage: the delivery-attempt
@@ -893,7 +893,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		if errors.Is(err, ErrInvocationNotEligible) {
 			c.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
 				"message_id", msgID,
-				"attempt", deliveryNum,
+				"delivery_attempt", deliveryNum,
 			)
 			return
 		}
@@ -902,7 +902,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		if errors.Is(err, ErrInvocationExhausted) {
 			c.log.Error("Schedule: invocation exhausted; routing to DLQ",
 				"message_id", msgID,
-				"attempt", deliveryNum,
+				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
 			// Rebuild the message with its envelope so the DLQ entry carries the
@@ -917,7 +917,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// A retryable failure: leave pending for a later reclaim.
 		c.log.Warn("Schedule: retryable failure; leaving pending for a later reclaim",
 			"message_id", msgID,
-			"attempt", deliveryNum,
+			"delivery_attempt", deliveryNum,
 			"reason", err,
 		)
 		return
@@ -942,11 +942,11 @@ func (c *Consumer) routeToDLQ(
 	ctx context.Context,
 	msg redis.XMessage,
 	reason error,
-	attempts int64,
+	deliveryAttempts int64,
 ) {
 	entry := dlqPayload(
 		c.stream, msg.ID, c.group, c.consumer,
-		eventString(msg), reason.Error(), attempts,
+		eventString(msg), reason.Error(), deliveryAttempts,
 	)
 	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: c.dlqStream,
@@ -954,7 +954,7 @@ func (c *Consumer) routeToDLQ(
 	}).Result(); err != nil {
 		c.log.Error("Message: DLQ write failed (leaving pending)",
 			"message_id", msg.ID,
-			"attempt", attempts,
+			"delivery_attempt", deliveryAttempts,
 			"reason", err,
 		)
 		c.noteOutcome(err, 0)
@@ -964,7 +964,7 @@ func (c *Consumer) routeToDLQ(
 	c.log.Error("Message: routed to DLQ",
 		"message_id", msg.ID,
 		"dlq_stream", c.dlqStream,
-		"attempt", attempts,
+		"delivery_attempt", deliveryAttempts,
 		"reason", reason,
 	)
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
