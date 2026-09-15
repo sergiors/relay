@@ -39,12 +39,6 @@ import (
 	"relay/internal/stream"
 )
 
-// Compile-time assertion that the schedule publisher satisfies the cron
-// scheduler's publication boundary. The runner is now the stream's ScheduleRunner
-// seam (a func type, not an interface, so it cannot be compile-time asserted; the
-// worker just passes runWorker.InvokeHandler as the ScheduleRunner config).
-var _ cron.Publisher = (*schedule.SchedulePublisher)(nil)
-
 // statsFlushInterval is the fixed SQLite snapshot cadence. Telemetry, not
 // event-processing state: Prometheus stays live in-process, while SQLite
 // receives the current absolute snapshot every interval. Deliberately NOT
