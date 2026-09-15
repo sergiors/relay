@@ -194,10 +194,10 @@ export async function created(event) {
 
 	fn := function.Function{
 		Name: "node-e2e",
-		Dir: dir,
+		Dir:  dir,
 		Template: &function.Template{
 			Runtime: "node24",
-		}
+		},
 	}
 	m, _ := newManager(t)
 
