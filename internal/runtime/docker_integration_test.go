@@ -91,7 +91,17 @@ func newFunctionOutputSink(t *testing.T) *bytes.Buffer {
 }
 
 func TestPythonEndToEnd(t *testing.T) {
-	requireDocker(t)
+	cli := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// This python build creates a relay-dep-* layer from its requirements.txt.
+	// Clean only the dep images this test adds (delta vs snapshot, so layers
+	// built concurrently by other tests/workers are untouched), and register it
+	// BEFORE Prepare so it also runs on failure and never leaks into the sibling
+	// dep-layer tests that follow on the shared daemon.
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -110,9 +120,6 @@ def completed(event):
 	fn := function.Function{Name: "py-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -125,7 +132,17 @@ def completed(event):
 }
 
 func TestPythonAsyncEndToEnd(t *testing.T) {
-	requireDocker(t)
+	cli := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// This python build creates a relay-dep-* layer from its requirements.txt.
+	// Clean only the dep images this test adds (delta vs snapshot, so layers
+	// built concurrently by other tests/workers are untouched), and register it
+	// BEFORE Prepare so it also runs on failure and never leaks into the sibling
+	// dep-layer tests that follow on the shared daemon.
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -145,9 +162,6 @@ async def completed(event):
 
 	fn := function.Function{Name: "py-async-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -178,7 +192,13 @@ export async function created(event) {
 `)
 	// No package.json: the image must inject an ESM package.json.
 
-	fn := function.Function{Name: "node-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := function.Function{
+		Name: "node-e2e",
+		Dir: dir,
+		Template: &function.Template{
+			Runtime: "node24",
+		}
+	}
 	m, _ := newManager(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -1309,6 +1329,16 @@ export function check(event) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
+			// The python subtest's Prepare builds a relay-dep-* layer from its
+			// requirements.txt; the node subtest has no package.json so it builds
+			// no dep layer (cleanup is a harmless no-op for it). Clean only dep
+			// images this subtest adds (delta vs snapshot, leaving other
+			// tests'/workers' layers untouched) and register it BEFORE Prepare so
+			// it also runs on failure and never leaks into the sibling dep-layer
+			// tests on the shared daemon.
+			depBefore := depTagSet(ctx, m.cli)
+			t.Cleanup(cleanupNewDepImagesSince(m.cli, depBefore))
+
 			prepared, err := m.Prepare(ctx, fn)
 			if err != nil {
 				t.Fatalf("prepare: %v", err)
@@ -1712,8 +1742,8 @@ func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
 	}
 }
 
-// depTags lists every local relay-dep-* image tag, used to assert how many
-// distinct dependency layers exist after a build.
+// depTags lists every local relay-dep-* image tag currently present on the
+// daemon.
 func depTags(ctx context.Context, cli *client.Client) []string {
 	list, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
 	if err != nil {
@@ -1730,15 +1760,73 @@ func depTags(ctx context.Context, cli *client.Client) []string {
 	return out
 }
 
+// depTagSet snapshots the CURRENT set of relay-dep-* tags on the daemon into a
+// map so tests can diff their OWN additions against a baseline. The relay-dep-*
+// namespace is content-addressed and shared across every test and worker
+// process on a daemon (any Python build with a requirements manifest creates a
+// relay-dep-* image), so asserting on whole-daemon relay-dep-* counts is
+// inherently racy. Tests must snapshot at test start and assert only on the
+// tags that appear SINCE that snapshot.
+func depTagSet(ctx context.Context, cli *client.Client) map[string]bool {
+	before := make(map[string]bool)
+	for _, d := range depTags(ctx, cli) {
+		before[d] = true
+	}
+	return before
+}
+
+// newDepTagsSince returns the relay-dep-* tags present NOW but NOT present in
+// the given baseline snapshot. On a shared daemon this scopes a dep-layer
+// assertion to exactly the images this test's builds created, ignoring relay-dep-*
+// layers other tests or workers legitimately created.
+func newDepTagsSince(ctx context.Context, cli *client.Client, before map[string]bool) []string {
+	var out []string
+	for _, d := range depTags(ctx, cli) {
+		if !before[d] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// cleanupNewDepImagesSince force-removes only the relay-dep-* images that
+// appeared since the given baseline snapshot, leaving dep layers built
+// concurrently by other tests/workers on the shared daemon untouched. It is
+// t.Cleanup glue so dep-image-creating tests clean up after themselves and never
+// leak relay-dep-* images into later sibling tests.
+func cleanupNewDepImagesSince(cli *client.Client, before map[string]bool) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, d := range newDepTagsSince(ctx, cli, before) {
+			cleanupImage(cli, ctx, d)
+		}
+	}
+}
+
 // TestIntegrationDependencyLayerReuse verifies the shared dependency layer is
 // reused across source changes: build v1 (with requirements.txt), then change
 // ONLY the handler source and build v2. The dependency image must exist
 // unchanged BEFORE and AFTER (same tag, no new dep image), while the function
 // image gets a NEW tag for the changed source.
+//
+// NOTE: the relay-dep-* namespace is content-addressed and shared daemon-wide,
+// so the assertions count only the dep layers THIS test creates (the delta vs a
+// snapshot taken at test start), never the whole-daemon relay-dep-* population —
+// other tests or workers on a shared daemon legitimately create their own.
 func TestIntegrationDependencyLayerReuse(t *testing.T) {
 	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
+	// leak the dep-layer and function images this test creates into the sibling
+	// tests that follow on the shared daemon. We remove only the dep images this
+	// test built (delta vs the snapshot below), not every relay-dep-* layer on
+	// the daemon, and force-remove this test's own function image.
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-reuse:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -1767,9 +1855,9 @@ events:
 	if p1.Image != ref1 {
 		t.Fatalf("prepare v1 image = %q, want %q", p1.Image, ref1)
 	}
-	depsAfterV1 := depTags(ctx, cli)
+	depsAfterV1 := newDepTagsSince(ctx, cli, depBefore)
 	if len(depsAfterV1) != 1 {
-		t.Fatalf("expected exactly one dependency image after v1 build, got %v", depsAfterV1)
+		t.Fatalf("expected exactly one NEW dependency image after v1 build, got %v", depsAfterV1)
 	}
 	depRef := depsAfterV1[0]
 	depIDBefore, err := cli.ImageInspect(ctx, depRef)
@@ -1797,10 +1885,12 @@ events:
 	}
 
 	// The same dependency tag exists after v2, and it inspects to the SAME image
-	// ID (identical content — not rebuilt).
-	depsAfterV2 := depTags(ctx, cli)
+	// ID (identical content — not rebuilt). Count only THIS test's delta vs the
+	// snapshot: still exactly one NEW layer and it is the same tag we captured
+	// after v1.
+	depsAfterV2 := newDepTagsSince(ctx, cli, depBefore)
 	if len(depsAfterV2) != 1 {
-		t.Fatalf("expected still exactly one dependency image after v2 built from source change, got %v", depsAfterV2)
+		t.Fatalf("expected still exactly one NEW dependency image after v2 built from source change, got %v", depsAfterV2)
 	}
 	if depsAfterV2[0] != depRef {
 		t.Fatalf("dep image tag changed across pure source change: %s -> %s", depRef, depsAfterV2[0])
@@ -1812,18 +1902,27 @@ events:
 	if depIDAfter.ID != depIDBefore.ID {
 		t.Errorf("dependency layer was rebuilt across a pure source change (before %s after %s) — it should be reused", depIDBefore.ID, depIDAfter.ID)
 	}
-
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-reuse:"))
 }
 
 // TestIntegrationDependencyChangeProducesNewDepLayer verifies that changing the
 // dependency manifest (adding a package to requirements.txt) yields a NEW
 // dependency fingerprint and a NEW relay-dep-* image, with both the old and new
 // dependency layers coexisting (old layers are never mutated).
+//
+// NOTE: the relay-dep-* namespace is content-addressed and shared daemon-wide,
+// so the assertions count only the dep layers THIS test creates (the delta vs a
+// snapshot taken at test start), never the whole-daemon relay-dep-* population.
 func TestIntegrationDependencyChangeProducesNewDepLayer(t *testing.T) {
 	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
+	// leak the dep-layer and function images this test creates into the sibling
+	// tests that follow on the shared daemon.
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-change:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -1841,9 +1940,9 @@ events:
 	if _, err := mPrepare(ctx, t, fn); err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
-	deps1 := depTags(ctx, cli)
+	deps1 := newDepTagsSince(ctx, cli, depBefore)
 	if len(deps1) != 1 {
-		t.Fatalf("expected one dep image after v1, got %v", deps1)
+		t.Fatalf("expected one NEW dep image after v1, got %v", deps1)
 	}
 
 	// v2 manifest: add a package. The function source and template are unchanged,
@@ -1852,11 +1951,12 @@ events:
 	if _, err := mPrepare(ctx, t, fn); err != nil {
 		t.Fatalf("prepare v2: %v", err)
 	}
-	deps2 := depTags(ctx, cli)
+	deps2 := newDepTagsSince(ctx, cli, depBefore)
 	if len(deps2) != 2 {
-		t.Fatalf("expected TWO dependency images to coexist after manifest change, got %v", deps2)
+		t.Fatalf("expected TWO NEW dependency images to coexist after manifest change, got %v", deps2)
 	}
-	// The original layer is still present (never mutated or pruned).
+	// The original layer (v1's new tag) is still present (never mutated or
+	// pruned), found among the tags this test created vs its snapshot.
 	stillPresent := false
 	for _, d := range deps2 {
 		if d == deps1[0] {
@@ -1866,8 +1966,6 @@ events:
 	if !stillPresent {
 		t.Errorf("original dependency image %s must coexist with the new layer", deps1[0])
 	}
-
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-change:"))
 }
 
 // TestIntegrationDepFingerprintRuntimeVersionDifferent verifies that the
@@ -1902,12 +2000,22 @@ func TestIntegrationDepFingerprintRuntimeVersionDifferent(t *testing.T) {
 
 // TestIntegrationConcurrentDepBuilds verifies two concurrent Prepare calls for
 // the same function version (two Manager instances, as two worker replicas
-// would) both succeed and leave exactly ONE dependency image tag — the shared,
-// content-addressed layer is built once even under a build race.
+// would) both succeed and leave exactly ONE NEW dependency image tag — the
+// shared, content-addressed layer is built once even under a build race. Only
+// the delta vs a snapshot taken at test start is counted, so unrelated
+// relay-dep-* layers from other tests/workers on the shared daemon are ignored.
 func TestIntegrationConcurrentDepBuilds(t *testing.T) {
 	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	// Snapshot the pre-existing dep images so the assertions AND the cleanup
+	// count only what THIS test's concurrent builds add. Register cleanup FIRST
+	// (before any Fatalf) so a mid-test failure never leaks the dep-layer nor
+	// function images into the sibling tests that follow on the shared daemon.
+	depBefore := depTagSet(ctx, cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-race:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -1920,14 +2028,6 @@ events:
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 	fn := function.Function{Name: "dep-race", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
-
-	// Snapshot the pre-existing dep images so the assertion counts only what
-	// THIS test's concurrent builds add.
-	preexisting := depTags(ctx, cli)
-	preexistingSet := make(map[string]bool, len(preexisting))
-	for _, d := range preexisting {
-		preexistingSet[d] = true
-	}
 
 	start := make(chan struct{})
 	errs := make(chan error, 2)
@@ -1955,7 +2055,20 @@ events:
 		case err := <-errs:
 			t.Fatalf("concurrent prepare failed: %v", err)
 		case p := <-results:
-			if !imageExistsInDaemon(cli, ctx, p.Image) {
+			// Two concurrent Prepare calls build the SAME function image
+			// ref. The second build can briefly un-tag/rebuild the ref while
+			// the daemon finishes, so poll for the ref to exist rather than
+			// asserting at the instant this goroutine finished.
+			exists := false
+			deadline := time.Now().Add(20 * time.Second)
+			for time.Now().Before(deadline) {
+				if imageExistsInDaemon(cli, ctx, p.Image) {
+					exists = true
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !exists {
 				t.Fatalf("concurrently prepared image %s must exist", p.Image)
 			}
 		case <-ctx.Done():
@@ -1965,15 +2078,10 @@ events:
 
 	// Exactly one NEW relay-dep-* image may exist after the race (both goroutines
 	// built the same fingerprint; Docker racing same-content builds => one tag).
-	var newDeps []string
-	for _, d := range depTags(ctx, cli) {
-		if !preexistingSet[d] {
-			newDeps = append(newDeps, d)
-		}
-	}
+	// Count only the delta vs the snapshot so unrelated relay-dep-* layers from
+	// other tests/workers on the shared daemon are ignored.
+	newDeps := newDepTagsSince(ctx, cli, depBefore)
 	if len(newDeps) != 1 {
 		t.Errorf("expected exactly one new dependency image after concurrent builds, got %v", newDeps)
 	}
-
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-dep-", "relay-fn-dep-race:"))
 }
