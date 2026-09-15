@@ -41,7 +41,7 @@ relay function ls          # list functions
 relay function inspect <name>
 relay secret ls|set|rm     # manage local secrets
 relay git keygen           # generate an SSH deploy key
-relay git set <repository> # set the git source to sync from
+relay git set <repository> # set the git source to sync from (optionally --webhook-secret)
 relay git sync             # manually sync the source into /functions
 relay git status           # show git sync state
 relay git remove           # forget the source and drop the checkout
@@ -159,6 +159,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_GROUP`            | yes      | Consumer group name.                                                                   |
 | `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.                                      |
 | `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus.                                |
+| `GIT_WEBHOOK_ADDR`       | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).          |
 | `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
 | `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
 | `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
@@ -169,6 +170,10 @@ optional and enables internal stream retention (see below). `METRICS_ADDR` is
 optional and opt-in: when set to a non-empty listen address it starts the
 Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
 server is started. An unbindable address is logged and retried, never fatal.
+`GIT_WEBHOOK_ADDR` is likewise opt-in: when set it starts the GitHub webhook
+endpoint on that address (see _Git_), and when unset or empty the webhook
+server is not started. Unlike the metrics server, a webhook bind failure (a
+taken port) is fatal at startup.
 
 ### Concurrency and backpressure
 
@@ -341,16 +346,17 @@ stays authoritative in the local state database and on the prepared function.
 
 Dependency layers (`requirements.txt` / `package-lock.json` / `package.json`)
 are installed once into reusable `relay-dep-*` images, fingerprinted by runtime
-+ architecture + manifest contents. Function images build `FROM` them, so only
-dependency or source changes rebuild the top layers; a changed manifest yields a
-new `relay-dep-*` tag, an unchanged one is reused across every version of a
-function (and across functions with identical dependency sets). Dependency
-images are content-addressed and, being shared bases, are **not** auto-pruned by
-the startup sweep — a removed function image never removes a layer another
-function may still need. The fingerprint keys on the base image **tag** (e.g.
-`python:3.14-slim`), not its digest, so a newer pull of the same tag reuses the
-cached `relay-dep-*` image — operators wanting a refresh must remove those images
-(a future digest-pinning feature is the proper fix).
+
+- architecture + manifest contents. Function images build `FROM` them, so only
+  dependency or source changes rebuild the top layers; a changed manifest yields a
+  new `relay-dep-*` tag, an unchanged one is reused across every version of a
+  function (and across functions with identical dependency sets). Dependency
+  images are content-addressed and, being shared bases, are **not** auto-pruned by
+  the startup sweep — a removed function image never removes a layer another
+  function may still need. The fingerprint keys on the base image **tag** (e.g.
+  `python:3.14-slim`), not its digest, so a newer pull of the same tag reuses the
+  cached `relay-dep-*` image — operators wanting a refresh must remove those images
+  (a future digest-pinning feature is the proper fix).
 
 ### Execution container lifecycle
 
@@ -850,12 +856,11 @@ relay secret rm database-url
 ## Git
 
 Relay can source its functions from an SSH git repository. Git synchronization
-is **manual only**: `relay start` never polls, never watches a repository, and
-never calls a git remote. The runtime only watches `/functions` for filesystem
-changes (see `relay function`/the reconciler). The only thing that updates
-`/functions` from git is an explicit `relay git sync`. There are no watchers, no
-webhooks, and no automatic sync — synchronization runs when the operator runs the
-command.
+is **manual by default**: `relay start` never polls, never watches a repository,
+and never calls a git remote on its own. The runtime only watches `/functions`
+for filesystem changes (see `relay function`/the reconciler). Without an
+explicit trigger the only thing that updates `/functions` from git is an
+explicit `relay git sync`.
 
 ### Workflow
 
@@ -871,8 +876,48 @@ relay git remove                             # forget the source + drop the chec
 `relay git set` accepts an SSH URL only — either scp-like (`git@host:org/repo.git`)
 or `ssh://git@host/org/repo.git` — this iteration does not support HTTPS. It
 stores the repository, an optional `--ref` (default `main`, a branch/tag/commit),
-and an optional `--path` monorepo subdirectory. Calling it again overwrites the
-source.
+an optional `--path` monorepo subdirectory, and an optional `--webhook-secret`
+name (see _GitHub webhook_ below). Calling it again overwrites the source.
+
+### GitHub webhook (opt-in)
+
+Relay can additionally expose a GitHub webhook endpoint that triggers the same
+sync an operator would run manually. It is **opt-in twice over**: it only starts
+when both `GIT_WEBHOOK_ADDR` is set to a non-empty listen address and a git
+source is configured. When the webhook server starts it logs
+`Webhook http server listening on <addr>`; when disabled it logs the reason
+(missing address, no git source, or a configured webhook secret with no secret
+resolver) and binds nothing.
+
+- **Endpoint**: `POST /github` on `GIT_WEBHOOK_ADDR`. Only `push` events for
+  the configured repository and ref schedule a sync; anything else (pings,
+  other events, other repos/refs, deleted refs) is acknowledged with 200 and
+  ignored.
+- **No sync in the request path**: a valid delivery only schedules the sync
+  through a coalescing scheduler — at most one sync runs at a time and pushes
+  arriving mid-sync collapse into a single follow-up run, so a burst of pushes
+  converges to the latest commit with exactly one extra sync. The HTTP handler
+  returns `202 Accepted` immediately.
+- **Secret is optional**: without `relay git set --webhook-secret`, deliveries
+  are accepted **unauthenticated** (a GitHub webhook created without a secret
+  sends no signature header) — anyone who can reach the endpoint can trigger a
+  sync. With a webhook secret configured, every delivery must carry a valid
+  `X-Hub-Signature-256` HMAC; bad or missing signatures are rejected with 401.
+- **Secret resolution**: the secret is read from Relay's local secret store by
+  reference name on every delivery (so `relay secret set` rotations apply
+  without a restart). The value is never logged, never persisted in the git
+  config, and never included in any error.
+
+```
+relay secret set github-webhook          # store the webhook secret value
+relay git set --webhook-secret github-webhook git@github.com:acme/repo.git
+# then set GIT_WEBHOOK_ADDR (e.g. :8081) and restart `relay start`
+```
+
+Bind failures (a taken webhook port) are fatal at startup, exactly like the
+metrics server, so a port conflict surfaces instead of healing invisibly. Like
+`relay git set` itself, a webhook secret configured later requires a worker
+restart to take effect.
 
 ### Storage layout
 
@@ -910,7 +955,7 @@ produced), then locates the functions source at the repo root or the monitored
 `--path`. Each direct subdirectory containing a `template.yaml` is one function.
 
 **Deterministic replace**: while a git source is configured and synced, `/functions`
-is owned by git. A sync rewrites `/functions` to reflect *exactly* the repository
+is owned by git. A sync rewrites `/functions` to reflect _exactly_ the repository
 and path: every function directory is refreshed from the checkout, and any
 directory present in `/functions` but absent from the source is removed. Operator
 placed directly in `/functions` are subject to the same rule once a git source is
@@ -1188,7 +1233,10 @@ Prometheus `/metrics` scrape endpoint), UI, full observability platforms
 (tracing, log shippers), and additional operators
 (anything-but/regex/glob/scripts) are not implemented in this iteration.
 
-Git is now supported via the manual `relay git sync` workflow (see "Git"); what
-remains out of scope is automatic synchronization — polling, filesystem watchers
-on the repository, or provider webhooks. Relay never syncs on its own; only an
-explicit `relay git sync` updates /functions.
+Git is supported via the manual `relay git sync` workflow plus the opt-in
+GitHub webhook endpoint (see "Git"); what remains out of scope is polling-based
+automatic synchronization — periodic polling, filesystem watchers on the
+repository, providers other than GitHub, and webhook providers requiring
+payload-level filtering beyond ref/repo matching. Relay never syncs on its own;
+only an explicit `relay git sync` or an accepted webhook delivery updates
+/functions.

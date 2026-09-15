@@ -295,6 +295,26 @@ func subsystemConfig(t *testing.T) Config {
 	}
 }
 
+// subsystemConfigNoSecret builds a Config like subsystemConfig but with an EMPTY
+// webhook secret reference in the persisted git source (unsigned deliveries). No
+// secret is stored/needed since signature verification is disabled; a resolver
+// is still supplied so NewServer's enabled path is exercised.
+func subsystemConfigNoSecret(t *testing.T) Config {
+	t.Helper()
+	gitDir := t.TempDir()
+	cfgPath := filepath.Join(gitDir, "source.json")
+	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", ""); err != nil {
+		t.Fatalf("set source: %v", err)
+	}
+	return Config{
+		Secrets:      mustProvider(t),
+		ConfigPath:   cfgPath,
+		CheckoutDir:  filepath.Join(gitDir, "checkout"),
+		FunctionsDir: filepath.Join(t.TempDir(), "functions"),
+		SSHDir:       filepath.Join(gitDir, "ssh"),
+	}
+}
+
 // TestNewDisabledWithoutGitSource verifies NewServer returns nil (Warn logged)
 // when the git source config does not exist at the configured ConfigPath
 // override.
@@ -324,20 +344,62 @@ func mustProvider(t *testing.T) secrets.Provider {
 	return p
 }
 
-// TestNewDisabledWithoutWebhookSecret verifies NewServer returns nil when the
-// git source is configured but has an empty webhook secret ref.
+// TestNewDisabledWithoutWebhookSecret verifies NewServer with a configured git
+// source but EMPTY webhook secret is now ENABLED (non-nil): unsigned deliveries
+// are accepted, so an empty ref never disables the server. The log must NOT
+// contain the old "no webhook secret configured" disable Warn.
 func TestNewDisabledWithoutWebhookSecret(t *testing.T) {
-	logger, buf := 	testLogger()
+	logger, buf := testLogger()
 	cfgPath := filepath.Join(t.TempDir(), "source.json")
 	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", ""); err != nil {
 		t.Fatalf("set source: %v", err)
 	}
 	cfg := Config{Secrets: mustProvider(t), ConfigPath: cfgPath}
-	if s := NewServer("127.0.0.1:0", logger, cfg); s != nil {
-		t.Fatal("NewServer returned non-nil without a webhook secret; want nil (disabled)")
+	if s := NewServer("127.0.0.1:0", logger, cfg); s == nil {
+		t.Fatal("NewServer returned nil with an empty webhook secret; want non-nil (enabled, unsigned deliveries)")
 	}
-	if !strings.Contains(buf.String(), "no webhook secret configured") {
-		t.Fatalf("missing disable Warn:\n%s", buf.String())
+	if strings.Contains(buf.String(), "no webhook secret configured") {
+		t.Fatalf("log contained the stale disable Warn:\n%s", buf.String())
+	}
+}
+
+// TestServerAssemblesAndServesUnsignedGitHub exercises the full assembled server
+// over real HTTP with an EMPTY webhook secret: NewServer on a free port, Start,
+// an UNSIGNED push for acme/backend refs/heads/main (no X-Hub-Signature-256
+// header), 202, then Stop. It mirrors TestServerAssemblesAndServesGitHub but
+// without signature verification.
+func TestServerAssemblesAndServesUnsignedGitHub(t *testing.T) {
+	logger, _ := testLogger()
+	s := NewServer(freeAddr(t), logger, subsystemConfigNoSecret(t))
+	if s == nil {
+		t.Fatal("NewServer returned nil for an enabled server")
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+	// Unsigned POST over HTTP: no X-Hub-Signature-256 header.
+	req, err := http.NewRequest(http.MethodPost, "http://"+s.addr+"/github", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		t.Fatalf("unsigned POST: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, respBody)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 

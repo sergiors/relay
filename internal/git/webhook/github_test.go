@@ -381,20 +381,23 @@ func TestRepositoryMismatchIgnored(t *testing.T) {
 	}
 }
 
-// setupNilSecretProvider builds a provider with no secrets provider and an empty
-// secret ref, so every request 500s as "webhook secret not configured". It
-// returns the provider, a fake trigger, and a capturing log buffer.
+// setupNilSecretProvider builds a provider with NO secrets provider but a
+// NON-EMPTY secret ref ("gh_secret"), so every request 500s: a configured ref
+// cannot be resolved without a resolver. (The empty-ref + nil-secrets
+// combination — unsigned-accepting, guarded by a 500 only as defense-in-depth —
+// is the setupUnsignedProvider helper below.) It returns the provider, a fake
+// trigger, and a capturing log buffer.
 func setupNilSecretProvider(t *testing.T) (*GitHubProvider, *fakeTrigger, *bytes.Buffer) {
 	t.Helper()
 	logBuf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	gitDir := t.TempDir()
 	cfgPath := filepath.Join(gitDir, "source.json")
-	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", ""); err != nil {
+	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", "gh_secret"); err != nil {
 		t.Fatalf("set source: %v", err)
 	}
 	tr := newFakeTrigger()
-	h := NewGitHubProvider(logger, "", nil, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
+	h := NewGitHubProvider(logger, "gh_secret", nil, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
 	return h, tr, logBuf
 }
 
@@ -407,6 +410,59 @@ func TestSecretNotConfigured500(t *testing.T) {
 	}
 	if tr.count() != 0 {
 		t.Fatalf("trigger calls = %d, want 0", tr.count())
+	}
+}
+
+// setupUnsignedProvider builds a provider with an EMPTY secret ref (and nil
+// secrets), the unsigned-delivery case: no signature verification runs, so
+// deliveries are accepted unauthenticated. It persists a git source for
+// git@github.com:acme/backend.git at the given ref. It returns the provider, a
+// fake trigger, and a capturing log buffer.
+func setupUnsignedProvider(t *testing.T, cfgRef string) (*GitHubProvider, *fakeTrigger, *bytes.Buffer) {
+	t.Helper()
+	logBuf := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	gitDir := t.TempDir()
+	cfgPath := filepath.Join(gitDir, "source.json")
+	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", cfgRef, "", ""); err != nil {
+		t.Fatalf("set source: %v", err)
+	}
+	tr := newFakeTrigger()
+	h := NewGitHubProvider(logger, "", nil, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
+	return h, tr, logBuf
+}
+
+// TestUnsignedPushAcceptedWithEmptySecret proves an empty secret ref accepts an
+// unsigned matching push: no X-Hub-Signature-256 header, no secret provider —
+// the delivery is treated as authentic and a matching push triggers a sync (202).
+func TestUnsignedPushAcceptedWithEmptySecret(t *testing.T) {
+	h, tr, _ := setupUnsignedProvider(t, "main")
+	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+	rec := serve(h, pushReq(body, "", "push"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	if tr.count() != 1 {
+		t.Fatalf("trigger calls = %d, want 1", tr.count())
+	}
+}
+
+// TestUnsignedNonPushEventIgnoredWithEmptySecret proves an empty secret ref
+// still runs the event filter: a non-push (e.g. ping) delivery is acknowledged
+// (200) and ignored, with no sync triggered.
+func TestUnsignedNonPushEventIgnoredWithEmptySecret(t *testing.T) {
+	h, tr, logBuf := setupUnsignedProvider(t, "main")
+	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+	rec := serve(h, pushReq(body, "", "ping"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if tr.count() != 0 {
+		t.Fatalf("trigger calls = %d, want 0", tr.count())
+	}
+	// The unsigned-acceptance path logs at Debug, never a per-request Warn.
+	if strings.Contains(logBuf.String(), "level=WARN") {
+		t.Fatalf("unsigned delivery produced a Warn:\n%s", logBuf.String())
 	}
 }
 

@@ -114,7 +114,8 @@ func Run(logger *slog.Logger) {
 	// package's single NewServer owns all assembly — git source config, secret
 	// reference checks, the coalescing sync scheduler, and the provider
 	// handlers — and returns nil when the webhook is disabled (no git source,
-	// no webhook secret, or no secret resolver), logging why. The worker only
+	// or no secret resolver when a webhook secret is configured), logging why.
+	// The worker only
 	// orchestrates: construct, start (bind failure is fatal, matching
 	// metrics), and stop on shutdown. It never syncs, never polls, and never
 	// knows how a provider handler is built.
@@ -304,8 +305,9 @@ func Run(logger *slog.Logger) {
 	// the metrics server. It binds synchronously and fails fast on a taken or
 	// unparseable GIT_WEBHOOK_ADDR, exactly like metrics: a webhook port
 	// conflict is a config error that must surface at startup, not heal
-	// invisibly. A nil server here means the webhook was disabled (no source, no
-	// secret reference, or no secret resolver), so there is nothing to start.
+	// invisibly. A nil server here means the webhook was disabled (no source,
+	// or a configured webhook secret with no secret resolver), so there is
+	// nothing to start.
 	if gitWebhookServer != nil {
 		if err := gitWebhookServer.Start(); err != nil {
 			logger.Error(fmt.Sprintf("Git webhook server: %v", err))

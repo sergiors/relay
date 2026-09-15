@@ -100,13 +100,16 @@ type Server struct {
 // only orchestrates (construct/start/stop) like it does metrics.
 //
 // It returns nil (disabled) — the documented disabled contract — when there is
-// no git source configured, the config is unreadable, no webhook secret
-// reference is configured, or no secret resolver is configured — logging a Warn
-// for each disable reason so the operator knows why nothing is bound. A nil
-// *Server means the subsystem is disabled; callers must nil-check before Start,
-// mirroring how the worker nil-checks. addr is the listen address ("" never
-// reaches the worker path: the worker gates on cfg.GitWebhookAddr before
-// calling).
+// no git source configured, the config is unreadable, or a webhook secret
+// reference is configured but no secret resolver is — logging a Warn for each
+// disable reason so the operator knows why nothing is bound. An empty webhook
+// secret reference (the common case) does NOT disable the server: it is
+// enabled-by-default with signature verification disabled, so unsigned GitHub
+// deliveries (a webhook configured without a secret sends no signature header)
+// are accepted. A nil *Server means the subsystem is disabled; callers must
+// nil-check before Start, mirroring how the worker nil-checks. addr is the
+// listen address ("" never reaches the worker path: the worker gates on
+// cfg.GitWebhookAddr before calling).
 //
 // logger receives disable-Warns, bind-failure, and lifecycle messages; it is
 // injected (DI) — this package never constructs its own logger. Adding a
@@ -128,17 +131,11 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 		logger.Warn(fmt.Sprintf("Git webhook: read git config: %v (continuing without webhook)", err))
 		return nil
 	}
-	if gitCfg.WebhookSecretRef == "" {
-		// The source is configured but has no webhook secret reference; the
-		// operator must run `relay git set --webhook-secret NAME` to enable
-		// delivery. Without it the handler would 500 every request, so we
-		// disable the server and say so.
-		logger.Warn("Git webhook: no webhook secret configured; run relay git set --webhook-secret; webhook disabled")
-		return nil
-	}
-	if cfg.Secrets == nil {
-		// Defensive, mirroring the disable style: without a resolver nothing can
-		// authenticate a delivery, so the server is bound and would 500.
+	if gitCfg.WebhookSecretRef != "" && cfg.Secrets == nil {
+		// A configured webhook secret reference cannot be resolved without a
+		// resolver, so the handler would 500 every delivery. Disable the server
+		// (defensive) and say so. An EMPTY secret reference needs no resolver
+		// (unsigned deliveries are accepted), so it does not reach this branch.
 		logger.Warn("Git webhook: no secret resolver configured; webhook disabled")
 		return nil
 	}
@@ -334,7 +331,10 @@ func (s *Server) Stop(ctx context.Context) error {
 // conventions (git.ConfigPath, git.CheckoutDir, function.Dir, git.SSHDir) when
 // zero-valued so callers pass only what differs (tests).
 type Config struct {
-	// Secrets resolves the webhook secret reference(s). Required. It is a
+	// Secrets resolves the webhook secret reference(s). It is required only
+	// when a webhook secret reference is configured in the git source (so HMAC
+	// verification can resolve it); with an empty secret reference deliveries
+	// are accepted unsigned and no resolver is needed. It is a
 	// secrets.Provider, which never exposes a secret's value in an error.
 	Secrets secrets.Provider
 	// Optional directory overrides (zero value = production default):
