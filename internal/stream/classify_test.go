@@ -71,7 +71,7 @@ func TestEventStringFallback(t *testing.T) {
 func TestNewConsumerDefaults(t *testing.T) {
 	c := NewConsumer(ConsumerConfig{Client: redis.NewClient(&redis.Options{}), Stream: "events"})
 	if c.dlqStream != "relay:events:dlq" {
-		t.Errorf("dlqStream default = %q, want relay:events:dlq", c.dlqStream)
+		t.Errorf("dlqStream = %q, want relay:events:dlq", c.dlqStream)
 	}
 	if c.minPendingIdle != DefaultReclaimInterval {
 		t.Errorf("minPendingIdle default = %s, want DefaultReclaimInterval = %s", c.minPendingIdle, DefaultReclaimInterval)

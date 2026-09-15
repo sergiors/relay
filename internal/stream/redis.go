@@ -74,10 +74,7 @@ type ConsumerConfig struct {
 	// InvocationState.TryStart), so MinPendingIdle no longer needs to be the
 	// oversized 3*MaxRuleTimeout guard against in-flight reclamation.
 	MinPendingIdle time.Duration
-	// DLQStream is the stream that exhausted/poison messages are written to.
-	// Defaults to "relay:<Stream>:dlq" if empty.
-	DLQStream string
-	Log       *slog.Logger
+	Log            *slog.Logger
 	// Metrics is an optional metrics registry. A nil registry disables all
 	// observability: every metric call is a no-op.
 	Metrics *metrics.Registry
@@ -155,9 +152,6 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.MinPendingIdle == 0 {
 		cfg.MinPendingIdle = DefaultReclaimInterval
 	}
-	if cfg.DLQStream == "" {
-		cfg.DLQStream = "relay:" + cfg.Stream + ":dlq"
-	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
@@ -180,7 +174,7 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 		count:           cfg.Count,
 		reclaimInterval: cfg.ReclaimInterval,
 		minPendingIdle:  cfg.MinPendingIdle,
-		dlqStream:       cfg.DLQStream,
+		dlqStream:       DLQStreamFor(cfg.Stream),
 		log:             cfg.Log,
 		metrics:         cfg.Metrics,
 		metricsInterval: cfg.MetricsInterval,
@@ -195,6 +189,11 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	c.invStateStore = store
 	c.healthy.Store(true)
 	return c
+}
+
+// DLQStreamFor returns the Relay-owned DLQ stream derived from source.
+func DLQStreamFor(stream string) string {
+	return "relay:" + stream + ":dlq"
 }
 
 // EnsureGroup creates the consumer group if it does not exist, tolerating a

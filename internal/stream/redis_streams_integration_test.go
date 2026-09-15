@@ -434,8 +434,9 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	e := newEnv(t, ConsumerConfig{})
 	// The default DLQ stream is a Relay-owned, `relay:`-prefixed key, never the
 	// user-owned source stream name.
-	if got := e.consumer.dlqStream; got != "relay:"+e.stream+":dlq" {
-		t.Fatalf("dlqStream = %q, want relay:%s:dlq", got, e.stream)
+	want := DLQStreamFor(e.stream)
+	if got := e.consumer.dlqStream; got != want {
+		t.Fatalf("dlqStream = %q, want %q", got, want)
 	}
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
