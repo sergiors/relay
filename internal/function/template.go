@@ -482,17 +482,20 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	return t, nil
 }
 
-// validateCron reports whether cronExpr is a valid standard 5-field cron
-// expression evaluated in loc, delegating parsing/validation to gocron/v2
-// (no Relay-specific cron regexes). A throwaway scheduler is created per
-// validation because gocron exposes validation through NewJob.
+// validateCron reports whether cronExpr is a valid cron expression evaluated in
+// loc, delegating parsing/validation to gocron/v2 (no Relay-specific cron
+// regexes). Accepted forms are the 5-field `minute hour day-of-month month
+// day-of-week` and the 6-field `second minute hour day-of-month month
+// day-of-week`; gocron/robfig's seconds-optional parser handles both. A
+// throwaway scheduler is created per validation because gocron exposes
+// validation through NewJob.
 func validateCron(cronExpr string, loc *time.Location) error {
 	sch, err := gocron.NewScheduler(gocron.WithLocation(loc))
 	if err != nil {
 		return err
 	}
 	defer func() { _ = sch.Shutdown() }()
-	if _, err := sch.NewJob(gocron.CronJob(cronExpr, false), gocron.NewTask(func() {})); err != nil {
+	if _, err := sch.NewJob(gocron.CronJob(cronExpr, true), gocron.NewTask(func() {})); err != nil {
 		return err
 	}
 	return nil

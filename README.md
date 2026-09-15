@@ -438,9 +438,11 @@ schedules:
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
 - `schedules` (optional) is a list of cron-triggered handlers; each entry
   requires `handler` (module.function) and `cron`.
-- `cron` is a standard 5-field cron expression (minute hour day-of-month month
-  day-of-week). Seconds are not supported. The exact expression is shown by
-  `relay function inspect`.
+- `cron` is a cron expression in either the standard 5-field form `minute hour
+  day-of-month month day-of-week` or the 6-field (seconds) form `second minute
+  hour day-of-month month day-of-week`. The exact expression is shown by
+  `relay function inspect`, alongside a human-readable description in 24-hour
+  time.
 - `timezone` (optional) is an IANA timezone (e.g. `Europe/Rome`,
   `America/Sao_Paulo`) resolved with Go's `time.LoadLocation`; omitted means
   UTC. Scheduling respects DST and offset changes of the configured zone. An
@@ -857,9 +859,14 @@ Events:
   events.deleted.handler   timeout=6s
 
 Schedules:
-  jobs.cleanup.handler                  cron="0 3 * * *" timezone=UTC
-  jobs.report.handler                   cron="0 8 * * 1-5" timezone=Europe/Rome timeout=20s
+  jobs.cleanup.handler                  cron="0 3 * * *" (At 03:00) timezone=UTC
+  jobs.report.handler                   cron="0 8 * * 1-5" (At 08:00, Monday through Friday) timezone=Europe/Rome timeout=20s
 ```
+
+The human-readable description in parentheses is display-only: it renders the
+same cron in 24-hour time and never affects scheduling. If a description cannot
+be generated, `inspect` falls back to printing just the raw `cron="..."`
+expression (no parentheses) and never fails.
 
 The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function is
 `pending` (never built); the `Last error` line is omitted when there is none. A

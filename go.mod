@@ -8,6 +8,7 @@ require (
 	github.com/go-co-op/gocron/v2 v2.16.6
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/lmittmann/tint v1.2.0
+	github.com/lnquy/cron v1.1.1
 	github.com/moby/moby/api v1.56.0
 	github.com/moby/moby/client v0.6.0
 	github.com/prometheus/client_golang v1.24.1

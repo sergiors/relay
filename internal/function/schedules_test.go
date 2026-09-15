@@ -147,10 +147,11 @@ schedules:
 	}
 }
 
-// Seconds (6-field) cron is rejected: only the standard 5-field form is
-// supported.
-func TestParseScheduleRejectsSeconds(t *testing.T) {
-	_, err := ParseTemplate([]byte(`
+// Seconds (6-field) cron is accepted alongside the standard 5-field form, with
+// defaults intact (UTC location, default timeout/retries).
+func TestParseScheduleAcceptsSeconds(t *testing.T) {
+	for _, cron := range []string{"30 0 0 * * *", "*/10 * * * * *"} {
+		tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
@@ -158,10 +159,24 @@ events:
       status: [COMPLETED]
 schedules:
   - handler: jobs.cleanup.handler
-    cron: "30 2 * * * *"
-`))
-	if err == nil || !strings.Contains(err.Error(), "invalid cron expression") {
-		t.Fatalf("err = %v, want invalid-cron error for seconds field", err)
+    cron: "`+cron+`"
+`)
+		if len(tmpl.Schedules) != 1 {
+			t.Fatalf("cron %q: expected 1 schedule, got %d", cron, len(tmpl.Schedules))
+		}
+		s := tmpl.Schedules[0]
+		if s.Cron != cron {
+			t.Fatalf("cron = %q, want %q", s.Cron, cron)
+		}
+		if s.Location != time.UTC {
+			t.Fatalf("cron %q: location = %v, want UTC", cron, s.Location)
+		}
+		if s.Timeout != DefaultTimeout {
+			t.Fatalf("cron %q: timeout = %s, want %s", cron, s.Timeout, DefaultTimeout)
+		}
+		if s.Retries != DefaultRetries {
+			t.Fatalf("cron %q: retries = %d, want %d", cron, s.Retries, DefaultRetries)
+		}
 	}
 }
 

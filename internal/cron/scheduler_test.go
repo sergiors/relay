@@ -149,6 +149,32 @@ func TestReplaceFunctionRegistersJobs(t *testing.T) {
 	}
 }
 
+// A 6-field (seconds) schedule registers alongside a 5-field one, matching the
+// seconds-optional validation in template. Both forms are accepted by the
+// runtime scheduler.
+func TestReplaceFunctionRegistersSixFieldSecondsSchedule(t *testing.T) {
+	fp := newFakePublisher(2)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Handler: "jobs.five", Cron: "0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Handler: "jobs.six", Cron: "30 0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+	if n := s.JobCount(); n != 2 {
+		t.Fatalf("jobs = %d, want 2 (5-field and 6-field)", n)
+	}
+
+	// Both names must be present.
+	names := map[string]bool{}
+	for _, j := range s.g.Jobs() {
+		names[j.Name()] = true
+	}
+	if !names["fn/jobs.five#0"] || !names["fn/jobs.six#1"] {
+		t.Fatalf("registered jobs = %v, want both five-field and six-field", names)
+	}
+}
+
 // Firing a registered job publishes a schedule occurrence for the function and
 // handler with a scheduled instant within a minute-truncation window.
 func TestFireSendsPayload(t *testing.T) {

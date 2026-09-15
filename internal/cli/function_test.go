@@ -272,12 +272,113 @@ schedules:
 		t.Fatalf("Schedules should follow Events:\n%s", out)
 	}
 	for _, want := range []string{
-		`jobs.cleanup.handler   cron="0 3 * * *" timezone=UTC timeout=6s`,
-		`jobs.report.handler    cron="0 8 * * 1-5" timezone=Europe/Rome timeout=20s`,
+		`jobs.cleanup.handler   cron="0 3 * * *" (At 03:00) timezone=UTC timeout=6s`,
+		`jobs.report.handler    cron="0 8 * * 1-5" (At 08:00, Monday through Friday) timezone=Europe/Rome timeout=20s`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
+	}
+}
+
+// inspectSchedules is a helper that seeds a temp state DB with a function whose
+// template schedules match scheds (yaml fragments), then returns the rendered
+// inspect Schedules output.
+func inspectSchedules(t *testing.T, scheds string) string {
+	t.Helper()
+	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tmpl, err := function.ParseTemplate([]byte(`runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+schedules:
+` + scheds))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	return w.String()
+}
+
+// A 6-field (seconds) cron renders a human-readable description in the same
+// format as 5-field ones.
+func TestFunctionInspectSchedulesSixFieldDescription(t *testing.T) {
+	out := inspectSchedules(t, `  - handler: jobs.cleanup.handler
+    cron: "30 0 0 * * *"
+`)
+	if !strings.Contains(out, `cron="30 0 0 * * *" (At 00:00:30) timezone=UTC`) {
+		t.Errorf("inspect output missing 6-field description:\n%s", out)
+	}
+}
+
+// Descriptions always use 24-hour time: the 08:30 schedule must not contain
+// AM/PM.
+func TestFunctionInspectSchedulesNoAMPM(t *testing.T) {
+	out := inspectSchedules(t, `  - handler: jobs.report.handler
+    cron: "30 8 * * 1-5"
+`)
+	if !strings.Contains(out, `cron="30 8 * * 1-5" (At 08:30, Monday through Friday) timezone=UTC`) {
+		t.Errorf("inspect output missing 24h description:\n%s", out)
+	}
+	if strings.Contains(out, "AM") || strings.Contains(out, "PM") {
+		t.Errorf("inspect output must not contain AM/PM:\n%s", out)
+	}
+}
+
+// The description is independent of the schedule's timezone: two rows that
+// differ only in timezone render the identical description text.
+func TestFunctionInspectSchedulesTimezoneIndependence(t *testing.T) {
+	out := inspectSchedules(t, `  - handler: jobs.a.handler
+    cron: "0 0 * * *"
+    timezone: America/Sao_Paulo
+  - handler: jobs.b.handler
+    cron: "0 0 * * *"
+    timezone: Europe/Rome
+`)
+	// Extract both description substrings and assert equality. The description
+	// is purely a function of the cron; the timezone column must not alter it.
+	if !strings.Contains(out, `cron="0 0 * * *" (At 00:00) timezone=America/Sao_Paulo`) {
+		t.Errorf("inspect output missing first row description:\n%s", out)
+	}
+	if !strings.Contains(out, `cron="0 0 * * *" (At 00:00) timezone=Europe/Rome`) {
+		t.Errorf("inspect output missing second row description:\n%s", out)
+	}
+}
+
+// When description generation fails, inspect falls back to the raw cron output
+// (no parentheses) and never fails. The error path is exercised by injecting a
+// descriptor that always fails via the describeCronFunc seam.
+func TestFunctionInspectSchedulesDescriptionFallback(t *testing.T) {
+	orig := describeCronFunc
+	describeCronFunc = func(string) (string, bool) { return "", false }
+	defer func() { describeCronFunc = orig }()
+
+	out := inspectSchedules(t, `  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+`)
+	if !strings.Contains(out, `jobs.cleanup.handler   cron="0 3 * * *" timezone=UTC timeout=6s`) {
+		t.Errorf("inspect fallback output missing raw cron row:\n%s", out)
+	}
+	// The schedule row must not carry a parenthesized description. (Note: the
+	// whole output may contain parens elsewhere, e.g. "Last reconcile (0s ago)",
+	// so scope the check to the schedule row only.)
+	if strings.Contains(out, `cron="0 3 * * *" (`) {
+		t.Errorf("inspect fallback output must not contain a parenthesized description:\n%s", out)
 	}
 }
 

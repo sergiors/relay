@@ -171,6 +171,14 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 		fmt.Fprintln(w, "Schedules:")
 		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, s := range d.Schedules {
+			// A human-readable description (in 24-hour time) is appended in
+			// parentheses when it is available; the raw cron remains the source
+			// of truth. The command must never fail because of description
+			// generation, so on any error the row renders exactly as before.
+			if desc, ok := describeCronFunc(s.Cron); ok {
+				fmt.Fprintf(sw, "  %s\tcron=%q (%s) timezone=%s timeout=%s\n", s.Handler, s.Cron, desc, s.Timezone, s.Timeout)
+				continue
+			}
 			fmt.Fprintf(sw, "  %s\tcron=%q timezone=%s timeout=%s\n", s.Handler, s.Cron, s.Timezone, s.Timeout)
 		}
 		sw.Flush()

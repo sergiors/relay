@@ -84,8 +84,11 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// UTC; NextRun returns a UTC instant regardless.
 		spec := "CRON_TZ=" + sch.Location.String() + " " + sch.Cron
 		jobName := name + "/" + sch.Handler + "#" + strconv.Itoa(i)
+		// withSeconds=true so runtime execution accepts the same 5-field and
+		// 6-field (seconds) expressions that template validation permits,
+		// keeping the two sides exactly consistent.
 		_, err := s.g.NewJob(
-			gocron.CronJob(spec, false),
+			gocron.CronJob(spec, true),
 			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Handler) }),
 			gocron.WithTags(functionTag(name), jobTag(name, sch.Handler, i)),
 			gocron.WithName(jobName),
