@@ -3,6 +3,10 @@
 // This package manages the consumer-group lifecycle and message delivery:
 //   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP
 //   - Consumption: an XREADGROUP loop that hands each decoded event to a Handler
+//   - Schedule occurrences: messages whose decode is recognized as a schedule
+//     envelope (see internal/schedule) ride this same consumer-group / PEL /
+//     XAUTOCLAIM / retry / DLQ machinery but bypass event matching: when a
+//     ScheduleRunner is wired they invoke the named function/handler directly.
 //   - Recovery: XAUTOCLAIM reclaims idle pending messages, with retry counts
 //     sourced from XPENDING so delivery counts survive restarts. Reclaim is
 //     message-ownership recovery only; whether a reclaimed message's invocation
@@ -56,5 +60,8 @@
 // Usage: NewConsumer, then EnsureGroup, then Consume with a Handler.
 //
 // The package knows nothing about matching or execution; it delegates each
-// decoded event to the caller's Handler.
+// decoded event to the caller's Handler. Schedule-occurrence messages are a
+// notable exception: they are routed to the ScheduleRunner seam (when wired),
+// which is the runner's InvokeHandler executing the named function/handler
+// directly without event matching.
 package stream

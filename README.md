@@ -25,6 +25,12 @@ on the stream with a consumer group, decodes each message, and for every event:
 3. acknowledges the message (XACK) only after **all** matching invocations
    succeed.
 
+Cron schedules (`schedules` in `template.yaml`) ride the same stream: every
+worker evaluates the cron locally, but the due occurrence is published to the
+stream exactly once cluster-wide (atomic publish-if-new), and the consumer
+group delivers that single entry to one worker for execution — see
+_Schedules_ below.
+
 Relay is distributed as **one** binary. `relay start` runs the long-running
 process — it consumes events, loads functions, builds images, and reconciles
 `/functions` live, blocking in the foreground until signalled. The remaining
@@ -415,12 +421,37 @@ events:
     pattern:
       event_name: [REMOVE]
       table_name: [users]
+
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+
+  - handler: jobs.report.handler
+    cron: "0 8 * * 1-5"
+    timezone: "Europe/Rome"
+    timeout: 20s
 ```
 
 - `runtime` (required) selects the execution runtime. Only `python3.14` and
   `node24` are supported; any other value fails validation.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
+- `schedules` (optional) is a list of cron-triggered handlers; each entry
+  requires `handler` (module.function) and `cron`.
+- `cron` is a standard 5-field cron expression (minute hour day-of-month month
+  day-of-week). Seconds are not supported. The exact expression is shown by
+  `relay function inspect`.
+- `timezone` (optional) is an IANA timezone (e.g. `Europe/Rome`,
+  `America/Sao_Paulo`) resolved with Go's `time.LoadLocation`; omitted means
+  UTC. Scheduling respects DST and offset changes of the configured zone. An
+  invalid timezone or cron expression fails template validation (the function
+  is logged and skipped).
+- `timeout` (optional, per schedule) follows exactly the same rules as event
+  rules (default 6s, max 5m).
+- Scheduled handlers receive a deterministic payload
+  `{"source":"relay.schedule","scheduled_at":"<RFC3339 UTC instant>"}` on stdin
+  (same handler contract as events: RELAY_HANDLER + JSON on stdin, exit code
+  decides).
 - `concurrency` (optional, top-level) bounds how many of this function's handler
   invocations may execute concurrently within a single Relay worker (per
   function, per worker). It must be a positive integer; a zero, negative, or
@@ -442,6 +473,63 @@ events:
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
+
+### Schedules
+
+Cron schedules reuse the exact event execution path: a scheduled invocation
+runs through the same runtime image lifecycle, secrets, timeout cap,
+per-function and global concurrency slots, and handler metrics as any
+event-driven invocation.
+
+```
+gocron (every worker) → atomic publish-if-new → Redis Stream
+→ existing consumer group → one worker → runner → function container
+```
+
+**Distributed coordination.** Every Relay worker evaluates the function's
+configured cron schedules locally, but a worker does not execute the handler
+itself. Instead, when gocron determines an occurrence is due, the worker
+attempts an atomic **publish-if-new** into the same Relay event stream — a
+single Lua script checks a dedup key (with a 7-day TTL) and writes the stream
+entry in one atomic step, so there is never a window where the dedup key exists
+without its stream entry. Exactly one worker wins and publishes one stream
+entry per logical occurrence; every other worker's simultaneous evaluation of
+the same tick is a clean no-op.
+
+An occurrence's identity is deterministic — `schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>` —
+derived from the absolute instant (normalized to UTC), never from a timezone
+representation. The configured `timezone` affects **when** the schedule fires,
+never the identity, so DST and offset changes cannot split or merge
+occurrences. Dedup keys live under `relay:schedule:<occurrence_id>`, are
+history only, and expire solely by TTL — they are never deleted when the
+handler completes, so a worker whose cron callback runs slightly later cannot
+re-publish an occurrence the fleet already completed.
+
+Once the stream entry exists, it is an ordinary Relay stream message and
+follows the full consumer-group model: one worker receives it, the PEL and
+`XAUTOCLAIM` recovery hand it to another worker if that one crashes, and
+retries/exhaustion route failures to the DLQ like any other message.
+
+The guarantee is therefore:
+
+> **One schedule occurrence is published once cluster-wide, while handler
+> execution remains at-least-once** — exactly-once handler execution is not
+> claimed (a crash between a handler's side effect and its completion re-runs
+> the handler, so handlers must stay idempotent).
+
+Publication is best-effort across the fleet: every worker evaluates the cron
+independently, so a publish failure on one worker only loses that worker's
+tick — other workers still publish the same occurrence. Scheduled handlers do
+not advance the event counters (`events_received_total`,
+`events_processed_total`, `function_events_total`); schedule coordination has
+its own counters (see _Observability_).
+
+Adding, changing, or removing a function's schedules (or handler/cron/
+timezone/timeout) converges live through the reconciler: the worker's cron
+jobs are replaced in place, so **future** occurrences use the current
+definition. Already-published occurrences are not purged from Redis — those
+entries were valid when published and expire via the dedup-key TTL / stream
+retention.
 
 ### Environment variables and secrets
 
@@ -759,10 +847,14 @@ Prepared:          2026-09-08T12:00:00Z (12s ago)
 Last reconcile:    success (12s ago)
 Last error:        <error>
 
-Handlers:
+Events:
   events.created.handler   timeout=6s
   events.updated.handler   timeout=20s
   events.deleted.handler   timeout=6s
+
+Schedules:
+  jobs.cleanup.handler                  cron="0 3 * * *" timezone=UTC
+  jobs.report.handler                   cron="0 8 * * 1-5" timezone=Europe/Rome timeout=20s
 ```
 
 The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function is
@@ -1006,7 +1098,13 @@ remains the health check.
   local buffer occupancy, set on each acquire/release) and
   `in_flight_invocations` (the current number of executing invocations in this
   worker), and the `concurrency_waits_total` counter (each time an invocation's
-  concurrency-slot acquisition had to block). Labels are bounded to
+  concurrency-slot acquisition had to block). Schedule coordination counters
+  (`schedule_occurrences_published_total`,
+  `schedule_occurrences_duplicate_total`, `schedule_publish_failures_total`)
+  track the distributed publish-if-new path per worker: published/duplicate
+  counts converge across workers toward one published entry per logical
+  occurrence, while failures flag workers that cannot reach Redis. These are
+  Prometheus-only and not part of the SQLite snapshot. Labels are bounded to
   `function`/`handler`/`outcome`; IDs (message, event, container, fingerprint)
   are never labels. The metrics server is operationally isolated: bind failures
   are logged and retried, scrape errors never stop event consumption, and

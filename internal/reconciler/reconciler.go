@@ -70,6 +70,13 @@ type Config struct {
 	// (and its registry entry and state are dropped) so the runner can retire
 	// every version of that function's images. Nil-safe.
 	RemoveFunction func(name string)
+	// UpdateSchedules, when set, is called after a function's new version is
+	// prepared and swapped into the registry (both discovery and update paths;
+	// never on the skip path), so the scheduler can converge its cron jobs to
+	// the template's schedules. Nil-safe. It does NOT purge previously-published
+	// schedule dedup keys or stream entries: those represent occurrences valid
+	// when published and expire via the key TTL / stream retention.
+	UpdateSchedules func(name string, tmpl *function.Template)
 }
 
 // Watches Root, debounces per-function events, and swaps the registry when a
@@ -83,9 +90,11 @@ type Reconciler struct {
 	builder Builder
 	log     *slog.Logger
 	st      *state.State
-	// retire/removeFunction are optional image-lifecycle hooks (see Config).
-	retire         func(name, oldImage string)
-	removeFunction func(name string)
+	// retire/removeFunction/updateSchedules are optional image-lifecycle and
+	// schedule-convergence hooks (see Config).
+	retire          func(name, oldImage string)
+	removeFunction  func(name string)
+	updateSchedules func(name string, tmpl *function.Template)
 
 	mu          sync.Mutex
 	fingerprnts map[string]string // name -> last-reconciled fingerprint
@@ -113,19 +122,20 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		cfg.Interval = DefaultInterval
 	}
 	return &Reconciler{
-		root:           cfg.Root,
-		debounce:       cfg.Debounce,
-		interval:       cfg.Interval,
-		reg:            reg,
-		builder:        builder,
-		log:            logger,
-		st:             cfg.State,
-		retire:         cfg.Retire,
-		removeFunction: cfg.RemoveFunction,
-		fingerprnts:    map[string]string{},
-		timers:         map[string]*time.Timer{},
-		incoming:       make(chan string, DefaultQueueSize),
-		done:           make(chan struct{}),
+		root:            cfg.Root,
+		debounce:        cfg.Debounce,
+		interval:        cfg.Interval,
+		reg:             reg,
+		builder:         builder,
+		log:             logger,
+		st:              cfg.State,
+		retire:          cfg.Retire,
+		removeFunction:  cfg.RemoveFunction,
+		updateSchedules: cfg.UpdateSchedules,
+		fingerprnts:     map[string]string{},
+		timers:          map[string]*time.Timer{},
+		incoming:        make(chan string, DefaultQueueSize),
+		done:            make(chan struct{}),
 	}
 }
 
@@ -470,6 +480,14 @@ func (r *Reconciler) reconcileFunction(name string) {
 
 	if r.st != nil {
 		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
+	}
+
+	// After a successful swap, converge the scheduler's cron jobs to this
+	// template's schedules. This runs on both discovery and update, never on
+	// the skip path above nor on a build failure (the previous version — and
+	// its schedules — are retained).
+	if r.updateSchedules != nil {
+		r.updateSchedules(name, fn.Template)
 	}
 
 	if cur == nil {

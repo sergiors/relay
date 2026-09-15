@@ -54,6 +54,7 @@ type Detail struct {
 	LastReconcileAt string
 	LastError       string
 	Handlers        []Handler
+	Schedules       []Schedule
 	// Env and Secrets are the function's env/secret MAPPINGS from its template:
 	// env-var name → literal value, and env-var name → secret reference. They
 	// are configuration metadata (like the handler timeouts), never secret
@@ -67,6 +68,16 @@ type Detail struct {
 type Handler struct {
 	Name    string
 	Timeout time.Duration
+}
+
+// Schedule is one cron schedule's handler, its verbatim 5-field cron
+// expression, the effective timezone name (e.g. "UTC", "Europe/Rome"), and its
+// resolved per-invocation timeout.
+type Schedule struct {
+	Handler  string
+	Cron     string
+	Timezone string
+	Timeout  time.Duration
 }
 
 // State is a concrete SQLite-backed local state view. It is safe for use from
@@ -186,6 +197,18 @@ func (c *State) initSchema(ctx context.Context) error {
 			handler TEXT,
 			timeout TEXT,
 			PRIMARY KEY (function_name, handler)
+		)`,
+		// schedules is keyed by function_name but carries no foreign key, like
+		// handlers: cleanup is explicit (removeTx), not relational, for the same
+		// reasoning documented above (function stats rows can exist without a
+		// functions row, and no PRAGMA foreign_keys is forced).
+		`CREATE TABLE IF NOT EXISTS schedules (
+			function_name TEXT,
+			handler TEXT,
+			cron TEXT,
+			timezone TEXT,
+			timeout TEXT,
+			PRIMARY KEY (function_name, handler, cron, timezone)
 		)`,
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
@@ -340,6 +363,9 @@ func (c *State) RebuildFromFS(dir string) error {
 			if err := replaceHandlers(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
+			if err := replaceSchedules(tx, p.fn.Name, p.fn.Template); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -365,7 +391,10 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		if err := insertStmt(tx)(fn.Name, fn.Template.Runtime, StatusPending, "", fp, "", "", "", "", ts, env, secrets); err != nil {
 			return err
 		}
-		return replaceHandlers(tx, fn.Name, fn.Template)
+		if err := replaceHandlers(tx, fn.Name, fn.Template); err != nil {
+			return err
+		}
+		return replaceSchedules(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: record discovered %q: %v", fn.Name, err))
@@ -384,7 +413,10 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 		if err := insertStmt(tx)(name, fn.Template.Runtime, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "", ts, env, secrets); err != nil {
 			return err
 		}
-		return replaceHandlers(tx, name, fn.Template)
+		if err := replaceHandlers(tx, name, fn.Template); err != nil {
+			return err
+		}
+		return replaceSchedules(tx, name, fn.Template)
 	})
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: record success %q: %v", name, err))
@@ -494,13 +526,16 @@ func (c *State) PruneRemoved(dir string) {
 	}
 }
 
-// removeTx deletes a function and all of its state rows — handlers,
+// removeTx deletes a function and all of its state rows — handlers, schedules,
 // function_stats, and the functions row itself — inside tx. It is shared by the
 // live reconciler removal (RecordRemoved) and the startup sweep (PruneRemoved)
 // so both are behaviorally identical: a removed function never leaves a stale
-// handlers or function_stats row behind.
+// handlers, schedules, or function_stats row behind.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM schedules WHERE function_name = ?`, name); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
@@ -591,6 +626,26 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		}
 		d.Handlers = append(d.Handlers, Handler{Name: hn, Timeout: dur})
 	}
+
+	srows, err := c.db.QueryContext(ctx,
+		`SELECT handler, cron, timezone, timeout FROM schedules WHERE function_name = ? ORDER BY handler, cron`, name)
+	if err != nil {
+		c.log.Warn(fmt.Sprintf("State: schedules %q: %v", name, err))
+		return d, true
+	}
+	defer srows.Close()
+	for srows.Next() {
+		var sh, sc, stz, sto string
+		if err := srows.Scan(&sh, &sc, &stz, &sto); err != nil {
+			c.log.Warn(fmt.Sprintf("State: scan schedule %q: %v", name, err))
+			continue
+		}
+		dur, derr := time.ParseDuration(sto)
+		if derr != nil {
+			dur = 0
+		}
+		d.Schedules = append(d.Schedules, Schedule{Handler: sh, Cron: sc, Timezone: stz, Timeout: dur})
+	}
 	return d, true
 }
 
@@ -632,6 +687,24 @@ func replaceHandlers(tx *sql.Tx, name string, tmpl *function.Template) error {
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO handlers (function_name, handler, timeout) VALUES (?,?,?)`,
 			name, rule.Handler, rule.Timeout.String()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replaceSchedules deletes a function's schedules and re-inserts them from the
+// template, so the schedule list always mirrors the latest parsed template. The
+// timezone is stored as its effective location name (e.g. "UTC",
+// "Europe/Rome"); the timeout as its string form.
+func replaceSchedules(tx *sql.Tx, name string, tmpl *function.Template) error {
+	if _, err := tx.Exec(`DELETE FROM schedules WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	for _, s := range tmpl.Schedules {
+		if _, err := tx.Exec(
+			`INSERT OR REPLACE INTO schedules (function_name, handler, cron, timezone, timeout) VALUES (?,?,?,?,?)`,
+			name, s.Handler, s.Cron, s.Location.String(), s.Timeout.String()); err != nil {
 			return err
 		}
 	}

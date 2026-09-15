@@ -21,6 +21,11 @@
 // prior active version), unchanged-skip, and removal. State writes never drive
 // decisions and never fail the reconcile loop; errors are only logged.
 //
+// When Config.UpdateSchedules is set, it is called after a function's new
+// version is swapped into the registry (discovery and update paths only, never
+// the skip path or a failed build) so the scheduler can converge its cron jobs
+// to the template's schedules. Removal converges via RemoveFunction instead.
+//
 // The package does NOT build images; it delegates image preparation and
 // invocation to a Builder.
 package reconciler

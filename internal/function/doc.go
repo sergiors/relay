@@ -33,6 +33,14 @@
 //     be valid secret names (see ValidSecretName). All validation errors are
 //     value-free.
 //
+// Schedules:
+//   - `schedules` (optional) is a list of cron-triggered handlers. Each entry
+//     requires `handler` (module.function) and `cron`; `timezone` is optional
+//     and defaults to UTC (resolved with time.LoadLocation), and `timeout` is
+//     identical to event rules. Cron validation is delegated to gocron/v2 (no
+//     Relay cron regexes); an invalid cron expression, timezone, or timeout
+//     fails template validation. An embedded TZ=/CRON_TZ= prefix is rejected.
+//
 // The package has no side effects beyond reading the filesystem; building,
 // execution, and Redis are owned elsewhere.
 package function

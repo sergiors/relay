@@ -6,7 +6,12 @@
 // flushes the registry into the local state database on a fixed 5-second
 // cadence: stats accumulate in memory (the registry is the single source of
 // truth), Prometheus reflects them immediately, and SQLite receives the current
-// absolute snapshot every interval.
+// absolute snapshot every interval. The cron scheduler (internal/cron)
+// joins the same lifecycle: constructed, seeded from the loaded schedules,
+// started, and stopped on shutdown. Schedules are coordinated through Redis:
+// every worker evaluates the cron locally but publishes one stream entry per
+// occurrence cluster-wide (atomic publish-if-new), and the consumer group
+// delivers that single entry to exactly one worker for execution (at-least-once).
 package worker
 
 import (
@@ -21,16 +26,24 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/config"
+	"relay/internal/cron"
 	"relay/internal/function"
 	gitwh "relay/internal/git/webhook"
 	"relay/internal/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/schedule"
 	"relay/internal/secrets"
 	"relay/internal/state"
 	"relay/internal/stream"
 )
+
+// Compile-time assertion that the schedule publisher satisfies the cron
+// scheduler's publication boundary. The runner is now the stream's ScheduleRunner
+// seam (a func type, not an interface, so it cannot be compile-time asserted; the
+// worker just passes runWorker.InvokeHandler as the ScheduleRunner config).
+var _ cron.Publisher = (*schedule.SchedulePublisher)(nil)
 
 // statsFlushInterval is the fixed SQLite snapshot cadence. Telemetry, not
 // event-processing state: Prometheus stays live in-process, while SQLite
@@ -260,6 +273,31 @@ func Run(logger *slog.Logger) {
 		}
 	}
 
+	// The runner executes invocations. It is constructed before the stream
+	// consumer so its InvokeHandler can be wired as the consumer's ScheduleRunner
+	// seam (schedule-occurrence messages route directly to it, bypassing matching).
+	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
+	// Stamp the relay.hostname label (the worker/consumer identity) on every
+	// execution container. Must be set before Consume begins; it is wired right
+	// after construction so all invocations carry it.
+	runWorker.SetHostname(cfg.ConsumerName)
+	// Wire the shared secrets provider (created above for both the webhook
+	// subsystem and the runner). It is infallible to construct (the directory is
+	// created lazily on Set, never on Resolve), and a missing secret surfaces as
+	// a per-invocation Resolve error rather than a startup failure — startup does
+	// not validate that referenced secrets exist.
+	runWorker.SetSecretProvider(secretProvider)
+	// Cap every rule's handler timeout at the same value template validation
+	// enforces (function.MaxTimeout). Defense in depth: a misconfigured or
+	// hot-swapped template can never run a handler past the cap. The capped
+	// value is the maximum persisted running deadline an invocation can carry
+	// (see runner.SetMaxHandlerTimeout / stream.InvocationState.TryStart);
+	// template validation enforces it at load.
+	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
+	// Bounds the number of function invocations executing concurrently in this
+	// worker (MAX_CONCURRENCY). A value < 1 falls back to the runner's default.
+	runWorker.SetMaxConcurrency(cfg.MaxConcurrency)
+
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
 		Client:            client,
 		Stream:            cfg.RedisStream,
@@ -268,6 +306,10 @@ func Run(logger *slog.Logger) {
 		Log:               logger,
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
+		// Schedule occurrences route directly to the runner, bypassing event
+		// matching; the runner resolves the handler timeout from the function's
+		// current template.
+		ScheduleRunner: runWorker.InvokeHandler,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -346,27 +388,23 @@ func Run(logger *slog.Logger) {
 		os.Exit(1)
 	}
 
-	runWorker := runner.NewWithMetrics(prepared, logger, metricsInstance)
-	// Stamp the relay.hostname label (the worker/consumer identity) on every
-	// execution container. Must be set before Consume begins; it is wired right
-	// after construction so all invocations carry it.
-	runWorker.SetHostname(cfg.ConsumerName)
-	// Wire the shared secrets provider (created above for both the webhook
-	// subsystem and the runner). It is infallible to construct (the directory is
-	// created lazily on Set, never on Resolve), and a missing secret surfaces as
-	// a per-invocation Resolve error rather than a startup failure — startup does
-	// not validate that referenced secrets exist.
-	runWorker.SetSecretProvider(secretProvider)
-	// Cap every rule's handler timeout at the same value template validation
-	// enforces (function.MaxTimeout). Defense in depth: a misconfigured or
-	// hot-swapped template can never run a handler past the cap. The capped
-	// value is the maximum persisted running deadline an invocation can carry
-	// (see runner.SetMaxHandlerTimeout / stream.InvocationState.TryStart);
-	// template validation enforces it at load.
-	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
-	// Bounds the number of function invocations executing concurrently in this
-	// worker (MAX_CONCURRENCY). A value < 1 falls back to the runner's default.
-	runWorker.SetMaxConcurrency(cfg.MaxConcurrency)
+	// The schedule publisher atomically publishes one stream entry per logical
+	// occurrence cluster-wide (publish-if-new Lua script) into the same Relay
+	// stream the consumer reads. It is built after the consumer (it shares the
+	// client and Redis stream) and wired into the scheduler below.
+	publisher := schedule.NewPublisher(client, cfg.RedisStream, logger, metricsInstance)
+
+	// The cron scheduler wraps gocron and maps each function template's
+	// schedules into jobs that publish schedule occurrences through the
+	// schedule publisher (atomic publish-if-new into the same stream the
+	// consumer reads). It is constructed here (after runWorker and the consumer
+	// exist) and seeded from the loaded function set before Start, then
+	// converges live via the reconciler's UpdateSchedules/RemoveFunction hooks.
+	sched := cron.New(publisher, logger)
+	for _, fn := range functions {
+		sched.ReplaceFunction(fn.Name, fn.Template)
+	}
+	logger.Info(fmt.Sprintf("Scheduler: %d schedule job(s) registered", sched.JobCount()))
 	logger.Info(
 		fmt.Sprintf(
 			"Concurrency limits: MAX_CONCURRENCY=%d MAX_BUFFERED_EVENTS=%d",
@@ -393,6 +431,12 @@ func Run(logger *slog.Logger) {
 			RemoveFunction: func(name string) {
 				metricsInstance.RemoveFunction(name)
 				runWorker.RemoveFunctionImages(name)
+				// Stop the function's cron schedules so a removed function never
+				// keeps firing.
+				sched.RemoveFunction(name)
+			},
+			UpdateSchedules: func(name string, tmpl *function.Template) {
+				sched.ReplaceFunction(name, tmpl)
 			},
 		},
 		runWorker.Registry(),
@@ -407,6 +451,11 @@ func Run(logger *slog.Logger) {
 	// Runs in its own goroutine and stops when ctx is cancelled.
 	go rec.Start(ctx)
 
+	// Start the cron scheduler right after the reconciler, so jobs added here
+	// (seeded from the loaded function set before Start) fire from their first
+	// cron tick and jobs the reconciler later converges schedule immediately.
+	sched.Start()
+
 	logger.Info(fmt.Sprintf("Consuming stream %q as group %q consumer %q",
 		cfg.RedisStream,
 		cfg.RedisGroup,
@@ -419,6 +468,21 @@ func Run(logger *slog.Logger) {
 		// with nothing running. (Shutdown via a cancelled ctx returns nil, so a
 		// non-nil error here is a genuine failure.)
 		os.Exit(1)
+	}
+
+	// Bounded graceful shutdown of the cron scheduler, so an in-flight
+	// publication observes cancellation and drains within the bound (gocron's
+	// Shutdown cancels every job's context). Safe even with zero schedules.
+	//
+	// NOTE: the scheduler runs AFTER Consume returns here, so a tick racing
+	// shutdown could publish an entry during the drain window — that is safe: the
+	// entry is consumed after this worker exits Consume only if another consumer
+	// is running, and if the whole cluster is down the entry waits in the stream
+	// for the next boot (PEL/group state persists). Harmless under at-least-once.
+	stopSD, cancelSD := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSD()
+	if err := sched.Stop(stopSD); err != nil {
+		logger.Warn(fmt.Sprintf("Scheduler: graceful shutdown: %v", err))
 	}
 
 	// Final flush of the registry into SQLite before the deferred st.Close()

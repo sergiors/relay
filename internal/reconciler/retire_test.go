@@ -199,3 +199,112 @@ func newTestReconcilerRemoval(t *testing.T, root string, builder Builder, initia
 	}
 	return r, reg
 }
+
+// scheduleRecorder records the (name, template-handler-count) pairs a hook is
+// called with, so a test can assert convergence timing and frequency.
+type scheduleRecorder struct {
+	mu   sync.Mutex
+	args []string // "name=scheduleCount"
+}
+
+func (s *scheduleRecorder) add(name string, tmpl *function.Template) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.args = append(s.args, name+"="+strconv.Itoa(len(tmpl.Schedules)))
+}
+
+func (s *scheduleRecorder) all() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.args...)
+}
+
+// newTestReconcilerSched is like newTestReconciler but wires the
+// UpdateSchedules hook.
+func newTestReconcilerSched(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction, rec *scheduleRecorder) (*Reconciler, *runner.Registry) {
+	t.Helper()
+	reg := &runner.Registry{}
+	reg.Set(initial)
+	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}
+	if rec != nil {
+		cfg.UpdateSchedules = rec.add
+	}
+	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	for _, pf := range initial {
+		r.Seed(pf.Function())
+	}
+	return r, reg
+}
+
+// On discovery and on update after a swap, the UpdateSchedules hook fires with
+// the function name and its template. It does not fire on the skip path.
+func TestReconcileUpdateSchedulesHookFires(t *testing.T) {
+	root := t.TempDir()
+	rec := &scheduleRecorder{}
+
+	// Discovery of a brand-new function (not yet in the registry) fires the hook.
+	writeFnDir(t, root, "brand-new")
+	r, _ := newTestReconcilerSched(t, root, &fakeBuilder{}, nil, rec)
+	r.reconcileFunction("brand-new")
+	if got := rec.all(); len(got) != 1 || got[0] != "brand-new=0" {
+		t.Fatalf("UpdateSchedules after discovery = %v, want [brand-new=0]", got)
+	}
+
+	// Update path: a registered function whose content changes fires the hook
+	// again with the fresh template.
+	updateDir := filepath.Join(root, "changing")
+	if err := os.MkdirAll(updateDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(updateDir, "template.yaml"), []byte(template), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e){ console.log('v1'); }\n"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	b := &versionedBuilder{version: 1}
+	chgFn := runner.NewPrepared(
+		function.Function{Name: "changing", Dir: updateDir, Template: mustParse(template)},
+		&runtime.Prepared{Name: "changing", Image: "img-changing-v1"},
+		b,
+	)
+	r2, _ := newTestReconcilerSched(t, root, b, []*runner.PreparedFunction{chgFn}, rec)
+	// Change source so an update warrants a rebuild.
+	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	r2.reconcileFunction("changing")
+	if got := rec.all(); len(got) != 2 || got[1] != "changing=0" {
+		t.Fatalf("UpdateSchedules after update = %v, want two calls ending [changing=0]", got)
+	}
+
+	// Skip path: an unchanged function does not fire the hook.
+	before := len(rec.all())
+	r2.reconcileFunction("changing")
+	if got := len(rec.all()); got != before {
+		t.Fatalf("UpdateSchedules fired on the skip path: %v", rec.all())
+	}
+}
+
+// On removal, the UpdateSchedules hook does NOT fire (removal converges via
+// RemoveFunction).
+func TestReconcileUpdateSchedulesHookNotFiredOnRemoval(t *testing.T) {
+	root := t.TempDir()
+	dir := writeFnDir(t, root, "gone")
+
+	fn := runner.NewPrepared(
+		function.Function{Name: "gone", Dir: dir, Template: mustParse(template)},
+		&runtime.Prepared{Name: "gone", Image: "img-gone-v1"},
+		&fakeBuilder{},
+	)
+	rec := &scheduleRecorder{}
+	r, _ := newTestReconcilerSched(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, rec)
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove dir: %v", err)
+	}
+	r.reconcileFunction("gone")
+	if got := rec.all(); len(got) != 0 {
+		t.Fatalf("UpdateSchedules must not fire on removal, got %v", got)
+	}
+}

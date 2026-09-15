@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/metrics"
+	"relay/internal/schedule"
 )
 
 // Handler is the contract between the stream layer and the runner. It receives
@@ -94,6 +95,13 @@ type ConsumerConfig struct {
 	// Consume stops reading (backpressure) so the backlog stays in Redis.
 	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
 	MaxBufferedEvents int
+	// ScheduleRunner, when set, executes messages identified as schedule
+	// occurrences directly against the named function/handler, bypassing event
+	// matching. The stream layer stays the same consumer-group/PEL/recovery
+	// machinery for both message kinds. It is wired by the worker to
+	// runner.InvokeHandler. A nil value means schedule messages are treated as
+	// normal events (the safe fallback for tests that do not wire it).
+	ScheduleRunner func(ctx context.Context, fnName, handler string, payload []byte) error
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -124,6 +132,9 @@ type Consumer struct {
 	// capacity is the configured MaxBufferedEvents limit.
 	buffer   *bufferSemaphore
 	capacity int
+	// scheduleRunner is the ScheduleRunner seam (see ConsumerConfig). When nil,
+	// schedule-occurrence messages are treated as normal events.
+	scheduleRunner func(ctx context.Context, fnName, handler string, payload []byte) error
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -177,6 +188,7 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
 		capacity:        capacity,
 		buffer:          newBufferSemaphore(capacity),
+		scheduleRunner:  cfg.ScheduleRunner,
 	}
 	// Invocation-state tracking is always constructed when a client is present
 	// (the consumer always has one). DisableProgress turns it off for tests.
@@ -775,6 +787,15 @@ func (c *Consumer) processMessage(
 			NewInvocationState(ctx, c.invocationStore, c.stream, c.group, msg.ID, c.log))
 	}
 
+	// A schedule-occurrence message is recognized by its relay.schedule envelope
+	// and, when a ScheduleRunner is wired, routed directly to it, bypassing event
+	// matching entirely. A nil ScheduleRunner falls back to treating schedule
+	// messages as normal events (the safe fallback for tests/unwired consumers).
+	if occ, ok := schedule.IsScheduleEvent(event); ok && c.scheduleRunner != nil {
+		c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
+		return
+	}
+
 	if err := handler(handlerCtx, msg.ID, event); err != nil {
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
@@ -834,8 +855,99 @@ func (c *Consumer) processMessage(
 	}
 }
 
-// routeToDLQ writes the message to the DLQ and only then acks the original. The
-// XADD-before-XACK ordering matters: if the DLQ write fails the original stays
+// processScheduleMessage routes a schedule-occurrence message directly to the
+// ScheduleRunner (which resolves the function's current timeout from the
+// registry), bypassing event matching entirely. It shares the exact delivery
+// contract of processMessage: events_processed_total counts the delivery
+// attempt, invocation state protects redeliveries (complete/running/backoff/
+// exhausted), and the message is ACKed on success, left pending on a retryable
+// failure or protected skip, and routed to the DLQ on exhaustion.
+func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) {
+	// Schedules ARE stream deliveries now, so this is the same delivery-attempt
+	// counter as processMessage: it keeps the global events_processed_total
+	// semantics uniform across message kinds (a redelivered schedule increments
+	// it again, like any other delivery attempt).
+	c.metrics.Inc("events_processed_total")
+
+	c.log.Debug("Schedule: executing occurrence",
+		"function", occ.Function,
+		"handler", occ.Handler,
+		"occurrence_id", occ.ID(),
+		"scheduled_at", occ.ScheduledAt.UTC().Format(time.RFC3339),
+		"message_id", msgID,
+		"attempt", deliveryNum,
+	)
+
+	// Inject the same per-message context as processMessage: the delivery-attempt
+	// number and the invocation-state handle bound to this (stream, group, msgID),
+	// so a redelivery skips a completed schedule invocation. The ScheduleRunner
+	// (runner.InvokeHandler) itself carries no invocation state (it has no
+	// matching pre-pass), but the invocation Store still protects this message's
+	// redelivery via the same hash keying.
+	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
+	if c.invocationStore != nil {
+		handlerCtx = WithInvocationState(handlerCtx,
+			NewInvocationState(ctx, c.invocationStore, c.stream, c.group, msgID, c.log))
+	}
+
+	err := c.scheduleRunner(handlerCtx, occ.Function, occ.Handler, occ.Payload())
+	if err != nil {
+		// Shutting down: not a real attempt; leave pending for a live consumer.
+		if ctx.Err() != nil {
+			c.log.Debug(fmt.Sprintf("Schedule: message %q canceled during shutdown; leaving pending", msgID))
+			return
+		}
+		// A protected invocation (running on another replica, or waiting out its
+		// retry backoff) means the message stays pending, not a failed attempt:
+		// no retry accounting, no DLQ.
+		if errors.Is(err, ErrInvocationNotEligible) {
+			c.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
+				"message_id", msgID,
+				"attempt", deliveryNum,
+			)
+			return
+		}
+		// A terminal message: the schedule invocation is exhausted, so the message
+		// routes to the DLQ.
+		if errors.Is(err, ErrInvocationExhausted) {
+			c.log.Error("Schedule: invocation exhausted; routing to DLQ",
+				"message_id", msgID,
+				"attempt", deliveryNum,
+				"reason", err,
+			)
+			// Rebuild the message with its envelope so the DLQ entry carries the
+			// schedule body (mirroring a normal event's `event` field).
+			if envelope, eerr := occ.Envelope(); eerr == nil {
+				c.routeToDLQ(ctx, redis.XMessage{ID: msgID, Values: map[string]any{"event": string(envelope)}}, err, deliveryNum)
+			} else {
+				c.routeToDLQ(ctx, redis.XMessage{ID: msgID}, err, deliveryNum)
+			}
+			return
+		}
+		// A retryable failure: leave pending for a later reclaim.
+		c.log.Warn("Schedule: retryable failure; leaving pending for a later reclaim",
+			"message_id", msgID,
+			"attempt", deliveryNum,
+			"reason", err,
+		)
+		return
+	}
+
+	if err := c.client.XAck(ctx, c.stream, c.group, msgID).Err(); err != nil {
+		c.log.Warn(fmt.Sprintf("Schedule: message %q: ack: %v", msgID, err))
+		c.noteOutcome(err, 0)
+		return
+	}
+	// Eagerly clear the invocation-state hash after a successful ACK, exactly
+	// like processMessage. A clear failure is logged only; the TTL is the fallback.
+	if c.invocationStore != nil {
+		if err := c.invocationStore.clear(ctx, c.stream, c.group, msgID); err != nil {
+			c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, err))
+		}
+	}
+}
+
+// routeToDLQ writes the message to the DLQ and only then acks the original. The// XADD-before-XACK ordering matters: if the DLQ write fails the original stays
 // pending so the next recovery cycle retries the DLQ write rather than losing
 // the message.
 func (c *Consumer) routeToDLQ(

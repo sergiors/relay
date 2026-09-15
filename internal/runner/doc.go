@@ -42,4 +42,16 @@
 //
 // The package owns no Redis, Docker, or matching internals; execution is
 // delegated to a runtime executor.
+//
+// Schedules: cron-triggered handlers reach the runner through InvokeHandler
+// (see internal/schedule for coordination and internal/cron for timing). Every worker evaluates a cron
+// schedule locally but publishes one stream entry per occurrence cluster-wide
+// (atomic publish-if-new), and the consumer routes that single schedule
+// message directly to InvokeHandler, bypassing event matching. Schedules ride
+// the normal stream machinery: retry, backoff, exhaustion, DLQ, and
+// invocation-state semantics apply exactly like any other stream message. The
+// handler timeout is resolved from the function's CURRENT template (single
+// source of truth), so a hot-swapped template's new timeout applies to future
+// occurrences; the scheduled container is attributable via the relay.schedule
+// MessageID stamp. Handler execution remains at-least-once.
 package runner

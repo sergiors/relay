@@ -1039,6 +1039,163 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	return nil
 }
 
+// InvokeHandler executes a single schedule-occurrence invocation routed through
+// the stream. The handler's timeout is read from the function's current
+// template (single source of truth), capped at the configured maximum exactly
+// like Handle caps rule timeouts. It reuses the exact event execution path:
+// registry snapshot lookup, the global + per-function concurrency slots,
+// per-invocation secret resolution, the panic boundary, and the same handler
+// metrics. The stream layer (via ConsumerConfig.ScheduleRunner) drives retry,
+// backoff, invocation state, and DLQ around this single invocation; here there
+// is no per-invocation state of its own — a failure surfaces to the stream so a
+// redelivery reclaim can retry it.
+func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payload []byte) error {
+	// Take one consistent registry snapshot and find the function. A schedule
+	// whose function is missing or unavailable is dropped: the reconciler
+	// removes the schedule's jobs when the function directory vanishes, so a
+	// miss here is a race between the swap and a tick.
+	var pf *PreparedFunction
+	for _, f := range r.reg.snapshot() {
+		if f.fn.Name == fnName {
+			pf = f
+			break
+		}
+	}
+	if pf == nil || pf.Prepared() == nil {
+		r.log.Warn(fmt.Sprintf("Schedule: function %q is not available", fnName))
+		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+	}
+
+	// Resolve the handler's timeout from the function's CURRENT template — the
+	// single source of truth, so a hot-swapped template's new timeout applies to
+	// future occurrences automatically. The template's FIRST matching schedule
+	// entry provides the timeout; multiple entries sharing a handler time out the
+	// same (occurrence identity distinguishes them by scheduled_at, not timeout).
+	// Fall back to the default when the handler has no schedule entry, exactly as
+	// Handle falls back to the rule default.
+	timeout := function.DefaultTimeout
+	for _, sch := range pf.fn.Template.Schedules {
+		if sch.Handler == handler {
+			timeout = sch.Timeout
+			break
+		}
+	}
+
+	// Cap the schedule timeout at the configured maximum, exactly like Handle
+	// caps each rule's timeout (defense in depth; template validation enforces
+	// it at load).
+	if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
+		timeout = cap
+	}
+
+	// Reserve the worker-global and per-function concurrency slots. A timeout
+	// surfaces as an error so the stream layer leaves the message pending and a
+	// later reclaim retries it.
+	releaseSlots, _ := r.reserveSlots(ctx, fnName, pf.fn.Template.Concurrency)
+	if releaseSlots == nil {
+		r.log.Warn(fmt.Sprintf("Schedule: concurrency slot wait timed out for %q/%q", fnName, handler))
+		return fmt.Errorf("schedule invocation: concurrency slot wait timed out")
+	}
+	defer releaseSlots()
+
+	// Resolve the template's env values and secret references immediately before
+	// container creation, mirroring Handle's rule path.
+	extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
+	if err != nil {
+		// Counted as a handler failure with a zero duration (no execution
+		// happened), mirroring how Handle attributes a resolution failure.
+		r.recordHandlerFailure(pf.fn.Name, handler, 0)
+		return fmt.Errorf("schedule invocation: function %q handler %q: %w", fnName, handler, err)
+	}
+
+	r.log.Debug("Schedule: invoking handler",
+		"function", pf.fn.Name,
+		"handler", handler,
+	)
+
+	invokeCtx, cancel := context.WithTimeout(ctx, timeout)
+	// Stamp the invocation's diagnostic metadata. MessageID identifies the
+	// scheduled dispatch; EventID/EventName are empty (diagnostic-only labels),
+	// and "relay.schedule" makes scheduled containers attributable.
+	invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+		Function:  pf.fn.Name,
+		Handler:   handler,
+		MessageID: "relay.schedule",
+		Hostname:  r.hostname,
+		Image:     toImage(pf),
+	})
+	start := time.Now()
+	err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv)
+	d := time.Since(start)
+	if panicked {
+		r.log.Error("Function handler: PANICKED for schedule",
+			"function", pf.fn.Name,
+			"handler", handler,
+			"panic_value", fmt.Sprintf("%v", panicValue),
+			"stack", string(debug.Stack()),
+		)
+		r.recordHandlerFailure(pf.fn.Name, handler, d)
+		return err
+	}
+	if err != nil {
+		r.recordHandlerFailure(pf.fn.Name, handler, d)
+		r.log.Warn("Function handler: execution failed for schedule",
+			"function", pf.fn.Name,
+			"handler", handler,
+			"duration", d,
+			"reason", err,
+		)
+		return err
+	}
+	r.metrics.IncLabels("handler_invocations_total",
+		[]metrics.Label{
+			{Name: "outcome", Value: "success"},
+			{Name: "function", Value: pf.fn.Name},
+			{Name: "handler", Value: handler},
+		})
+	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
+	// for Prometheus.
+	r.metrics.Inc("handler_success_total")
+	// Per-function success attribution.
+	r.metrics.IncLabels("function_handler_success_total",
+		[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+	r.metrics.ObserveDurationLabels("handler_duration_seconds",
+		[]metrics.Label{
+			{Name: "function", Value: pf.fn.Name},
+			{Name: "handler", Value: handler},
+		}, d)
+	r.log.Info("Function handler: executed for schedule",
+		"function", pf.fn.Name,
+		"handler", handler,
+		"duration", d,
+	)
+	return nil
+}
+
+// recordHandlerFailure increments the failure metrics shared by Handle's
+// failure branch and InvokeHandler: the labeled invocation outcome counter, the
+// unlabeled total, per-function failure attribution, and the duration
+// histogram. It deliberately does NOT touch events_received/processed or
+// function_events_total — the stream layer counts events_processed_total for a
+// schedule delivery (see stream.processScheduleMessage), so those are not
+// double-counted here.
+func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
+	r.metrics.IncLabels("handler_invocations_total",
+		[]metrics.Label{
+			{Name: "outcome", Value: "failure"},
+			{Name: "function", Value: fnName},
+			{Name: "handler", Value: handler},
+		})
+	r.metrics.Inc("handler_failure_total")
+	r.metrics.IncLabels("function_handler_failure_total",
+		[]metrics.Label{{Name: "function", Value: fnName}})
+	r.metrics.ObserveDurationLabels("handler_duration_seconds",
+		[]metrics.Label{
+			{Name: "function", Value: fnName},
+			{Name: "handler", Value: handler},
+		}, d)
+}
+
 // recordFailure handles a failed invocation attempt: it decides whether the
 // attempt is retryable or exhausted, updates the invocation state and metrics
 // accordingly, and returns the error Handle should propagate. It is used for

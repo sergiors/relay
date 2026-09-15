@@ -89,6 +89,12 @@ func New() *Registry {
 		// of a concurrency slot had to block (regardless of eventual success) —
 		// a cheap proxy for slot contention in the runner.
 		"concurrency_waits_total",
+		// schedule_occurrences_* are the cluster-wide schedule coordination
+		// counters (see internal/schedule). They are Prometheus-only: they are
+		// deliberately NOT wired into the SQLite stats snapshot.
+		"schedule_occurrences_published_total",
+		"schedule_occurrences_duplicate_total",
+		"schedule_publish_failures_total",
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name})
 		reg.MustRegister(c)

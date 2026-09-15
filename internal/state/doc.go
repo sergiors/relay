@@ -25,6 +25,12 @@
 // idempotently to pre-existing databases by a small PRAGMA table_info migration
 // in initSchema.
 //
+// Schedules: a `schedules` table (function_name, handler, cron, timezone,
+// timeout) mirrors the template's cron schedules — the handler, its verbatim
+// 5-field cron expression, the effective IANA timezone name, and the resolved
+// timeout — so `relay function inspect` can render them. Like handlers, it is
+// keyed by function_name with no foreign key; cleanup is explicit via removeTx.
+//
 // Design Constraint:
 //   - State errors are never fatal. Callers (main, reconciler) log them and
 //     continue; the state database degrades to "no state available" on failure.

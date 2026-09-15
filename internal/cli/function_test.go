@@ -152,11 +152,11 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
 	}
-	// The Stats section sits between the metadata and Handlers, so Handlers
-	// still renders after it.
-	si, hi := strings.Index(out, "Stats:"), strings.Index(out, "Handlers:")
+	// The Stats section sits between the metadata and Events, so Events still
+	// renders after it.
+	si, hi := strings.Index(out, "Stats:"), strings.Index(out, "Events:")
 	if si == -1 || hi == -1 || si > hi {
-		t.Fatalf("Stats section should precede Handlers:\n%s", out)
+		t.Fatalf("Stats section should precede Events:\n%s", out)
 	}
 }
 
@@ -229,6 +229,69 @@ events:
 	// The secret VALUE must never appear — only the reference.
 	if strings.Contains(out, "postgres://") {
 		t.Errorf("inspect leaked a secret value:\n%s", out)
+	}
+}
+
+// A function with schedules renders a Schedules section after Events, showing
+// the verbatim cron expression, effective timezone, and resolved timeout.
+func TestFunctionInspectSchedulesSection(t *testing.T) {
+	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+  - handler: jobs.report.handler
+    cron: "0 8 * * 1-5"
+    timezone: Europe/Rome
+    timeout: 20s
+`))
+	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
+
+	// The Schedules section follows Events.
+	ei, si := strings.Index(out, "Events:"), strings.Index(out, "Schedules:")
+	if ei == -1 || si == -1 || ei > si {
+		t.Fatalf("Schedules should follow Events:\n%s", out)
+	}
+	for _, want := range []string{
+		`jobs.cleanup.handler   cron="0 3 * * *" timezone=UTC timeout=6s`,
+		`jobs.report.handler    cron="0 8 * * 1-5" timezone=Europe/Rome timeout=20s`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+}
+
+// A template without schedules renders no Schedules: header.
+func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
+	st := seedTestState(t)
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	if strings.Contains(w.String(), "Schedules:") {
+		t.Fatalf("inspect must omit Schedules: for a template without schedules:\n%s", w.String())
 	}
 }
 

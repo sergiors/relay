@@ -49,7 +49,7 @@ func functionCommand() *cli.Command {
 				Usage:     "Show detailed information about a function",
 				UsageText: "relay function inspect NAME",
 				Description: "Show the full detail record for a single function, including " +
-					"its runtime, status, handlers, and env/secret mappings.",
+					"its runtime, status, events and schedules, and env/secret mappings.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
 				},
@@ -120,8 +120,8 @@ func printList(w io.Writer, st *state.State) error {
 
 // printInspect renders the full detail record to w. Labels are tab-aligned
 // through a tabwriter so padding matches the longest label without hand-
-// maintained spaces. The Handlers section is rendered with the same alignment,
-// using a wider padding for visual grouping.
+// maintained spaces. The Events and Schedules sections are rendered with the
+// same alignment, using a wider padding for visual grouping.
 func printInspect(w io.Writer, st *state.State, d state.Detail) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
@@ -156,12 +156,25 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 	sw.Flush()
 
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Handlers:")
+	fmt.Fprintln(w, "Events:")
 	hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 	for _, h := range d.Handlers {
 		fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
 	}
 	hw.Flush()
+
+	// The Schedules section renders the template's cron schedules (handler,
+	// verbatim cron expression, effective timezone, resolved timeout). It is
+	// omitted entirely when the template defines none, like Environment.
+	if len(d.Schedules) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Schedules:")
+		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+		for _, s := range d.Schedules {
+			fmt.Fprintf(sw, "  %s\tcron=%q timezone=%s timeout=%s\n", s.Handler, s.Cron, s.Timezone, s.Timeout)
+		}
+		sw.Flush()
+	}
 
 	// Env and secrets sections render the template's MAPPINGS only: literal env
 	// values (not secret) and secret references (never values). Both are

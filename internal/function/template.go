@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-co-op/gocron/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -78,7 +79,8 @@ type SecretBinding struct {
 }
 
 // Template is a parsed template.yaml file: the runtime plus a list of rules,
-// each pairing a handler with a pattern invoked when the pattern matches.
+// each pairing a handler with a pattern invoked when the pattern matches, and
+// an optional list of cron schedules.
 type Template struct {
 	Runtime string
 	Rules   []Rule
@@ -96,6 +98,22 @@ type Template struct {
 	// at runtime. The reference name (never the resolved value) is part of the
 	// function's configuration; the value lives outside template.yaml.
 	Secrets map[string]SecretRef
+	// Schedules lists the function's cron-triggered handlers. It is nil when
+	// the template defines no `schedules` key. Each Schedule carries its
+	// resolved timezone and timeout (never zero after ParseTemplate).
+	Schedules []Schedule
+}
+
+// Schedule is one cron schedule from the template's `schedules` list: the
+// handler it invokes, the standard 5-field cron expression (verbatim), the
+// effective IANA timezone (always non-nil after ParseTemplate; omitted
+// timezones resolve to UTC), and the resolved per-invocation timeout (same
+// rules as event rules).
+type Schedule struct {
+	Handler  string
+	Cron     string
+	Location *time.Location
+	Timeout  time.Duration
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -338,6 +356,12 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			// truncated or coerced by yaml.v3.
 			Retries any `yaml:"retries"`
 		} `yaml:"events"`
+		Schedules []struct {
+			Handler  string `yaml:"handler"`
+			Cron     string `yaml:"cron"`
+			Timezone string `yaml:"timezone"`
+			Timeout  string `yaml:"timeout"`
+		} `yaml:"schedules"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse template yaml: %w", err)
@@ -399,7 +423,64 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		}
 		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
 	}
+
+	// Parse and validate the optional cron schedules. Each entry requires a
+	// handler (module.function) and a 5-field cron expression. The timezone is
+	// optional (defaults to UTC); the timeout follows the same rules as event
+	// rules. Schedules are optional — a template with events and no schedules
+	// key parses exactly as before.
+	for _, s := range raw.Schedules {
+		if s.Handler == "" {
+			return nil, fmt.Errorf("schedule is missing a handler")
+		}
+		if err := validateHandler(s.Handler); err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+		}
+		if s.Cron == "" {
+			return nil, fmt.Errorf("schedule %q: cron is required", s.Handler)
+		}
+		// Timezone is a separate template field: an embedded TZ=/CRON_TZ=
+		// prefix would silently override it, so reject the ambiguity outright.
+		if strings.Contains(s.Cron, "TZ=") {
+			return nil, fmt.Errorf("schedule %q: cron expression must not embed TZ=/CRON_TZ=; use the timezone field", s.Handler)
+		}
+		loc := time.UTC
+		if s.Timezone != "" {
+			if s.Timezone == "Local" {
+				return nil, fmt.Errorf("schedule %q: timezone %q must be an IANA location", s.Handler, s.Timezone)
+			}
+			l, err := time.LoadLocation(s.Timezone)
+			if err != nil {
+				return nil, fmt.Errorf("schedule %q: invalid timezone %q: %v", s.Handler, s.Timezone, err)
+			}
+			loc = l
+		}
+		timeout, err := resolveTimeout(s.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+		}
+		if err := validateCron(s.Cron, loc); err != nil {
+			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Handler, s.Cron, err)
+		}
+		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout})
+	}
 	return t, nil
+}
+
+// validateCron reports whether cronExpr is a valid standard 5-field cron
+// expression evaluated in loc, delegating parsing/validation to gocron/v2
+// (no Relay-specific cron regexes). A throwaway scheduler is created per
+// validation because gocron exposes validation through NewJob.
+func validateCron(cronExpr string, loc *time.Location) error {
+	sch, err := gocron.NewScheduler(gocron.WithLocation(loc))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sch.Shutdown() }()
+	if _, err := sch.NewJob(gocron.CronJob(cronExpr, false), gocron.NewTask(func() {})); err != nil {
+		return err
+	}
+	return nil
 }
 
 // envVarNamePattern restricts the characters an env-var name may contain. It is
