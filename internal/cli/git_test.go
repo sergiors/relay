@@ -94,6 +94,59 @@ func TestGitSetExplicitRefAndPath(t *testing.T) {
 	}
 }
 
+// TestGitSetWebhookSecretPersistsRef verifies --webhook-secret persists the
+// secret REFERENCE name into source.json and reflects it in the confirmation
+// line (the name, never the value).
+func TestGitSetWebhookSecretPersistsRef(t *testing.T) {
+	p := redirectGitDirs(t)
+	out, _, err := runCLI(t, "", "git", "set", "--webhook-secret", "gh_secret", "git@github.com:acme/repo.git")
+	if err != nil {
+		t.Fatalf("git set --webhook-secret: %v", err)
+	}
+	if !strings.Contains(out, "webhook-secret=gh_secret") {
+		t.Fatalf("set output missing webhook-secret confirmation:\n%s", out)
+	}
+	cfg, err := gitpkg.LoadConfig(p.configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.WebhookSecretRef != "gh_secret" {
+		t.Fatalf("WebhookSecretRef = %q, want %q", cfg.WebhookSecretRef, "gh_secret")
+	}
+}
+
+// TestGitSetWebhookSecretDefaultsEmpty verifies omitting --webhook-secret leaves
+// it empty (webhook triggering disabled) and the confirmation omits the field.
+func TestGitSetWebhookSecretDefaultsEmpty(t *testing.T) {
+	p := redirectGitDirs(t)
+	out, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git")
+	if err != nil {
+		t.Fatalf("git set: %v", err)
+	}
+	if strings.Contains(out, "webhook-secret=") {
+		t.Fatalf("set output should not mention webhook-secret when unset:\n%s", out)
+	}
+	cfg, _ := gitpkg.LoadConfig(p.configPath)
+	if cfg.WebhookSecretRef != "" {
+		t.Fatalf("WebhookSecretRef = %q, want empty", cfg.WebhookSecretRef)
+	}
+}
+
+// TestGitSetRejectsInvalidWebhookSecret verifies an invalid --webhook-secret
+// name (uppercase, slash) is rejected and nothing is persisted.
+func TestGitSetRejectsInvalidWebhookSecret(t *testing.T) {
+	p := redirectGitDirs(t)
+	for _, ref := range []string{"GH_secret", "a/b"} {
+		_, _, err := runCLI(t, "", "git", "set", "--webhook-secret", ref, "git@github.com:acme/repo.git")
+		if err == nil {
+			t.Fatalf("git set --webhook-secret %q: nil, want error", ref)
+		}
+		if _, statErr := os.Stat(p.configPath); !os.IsNotExist(statErr) {
+			t.Fatal("config persisted despite invalid webhook-secret name")
+		}
+	}
+}
+
 // TestGitSetRejectsInvalidURL ensures an http/https/non-SSH URL is rejected.
 func TestGitSetRejectsInvalidURL(t *testing.T) {
 	p := redirectGitDirs(t)

@@ -418,7 +418,7 @@ func TestSyncLogsThroughInjectedLogger(t *testing.T) {
 // config keeps the last-synced metadata (so changing ref/path retains status).
 func TestSetSourceUpsertPreservesBookkeeping(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "source.json")
-	if err := SetSource(p, "git@github.com:acme/r.git", "main", ""); err != nil {
+	if err := SetSource(p, "git@github.com:acme/r.git", "main", "", ""); err != nil {
 		t.Fatalf("SetSource initial: %v", err)
 	}
 	// Simulate a completed sync by writing the metadata into the config.
@@ -430,7 +430,7 @@ func TestSetSourceUpsertPreservesBookkeeping(t *testing.T) {
 		t.Fatalf("writeConfig: %v", err)
 	}
 	// Re-set with a different ref/path: must keep the bookkeeping.
-	if err := SetSource(p, "git@github.com:acme/r.git", "dev", "pkg/fn"); err != nil {
+	if err := SetSource(p, "git@github.com:acme/r.git", "dev", "pkg/fn", ""); err != nil {
 		t.Fatalf("SetSource update: %v", err)
 	}
 	got, err := LoadConfig(p)
@@ -439,5 +439,48 @@ func TestSetSourceUpsertPreservesBookkeeping(t *testing.T) {
 	}
 	if got.Ref != "dev" || got.Path != "pkg/fn" || !got.Synced || got.LastSyncedCommit != "abc" {
 		t.Fatalf("updated = %+v, want ref dev path pkg/fn synced with preserved commit", got)
+	}
+}
+
+// TestSetSourceWebhookSecretRef verifies SetSource persists a webhook secret
+// reference (the name, never the value) and keeps an empty ref empty (webhook
+// triggering disabled).
+func TestSetSourceWebhookSecretRef(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "source.json")
+
+	// Empty ref stays empty (no webhook triggering).
+	if err := SetSource(p, "git@github.com:acme/r.git", "main", "", ""); err != nil {
+		t.Fatalf("SetSource (empty secret ref): %v", err)
+	}
+	cfg, err := LoadConfig(p)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.WebhookSecretRef != "" {
+		t.Fatalf("WebhookSecretRef = %q, want empty", cfg.WebhookSecretRef)
+	}
+
+	// A valid secret name is persisted exactly.
+	if err := SetSource(p, "git@github.com:acme/r.git", "main", "", "gh_secret"); err != nil {
+		t.Fatalf("SetSource (valid secret ref): %v", err)
+	}
+	cfg, err = LoadConfig(p)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.WebhookSecretRef != "gh_secret" {
+		t.Fatalf("WebhookSecretRef = %q, want %q", cfg.WebhookSecretRef, "gh_secret")
+	}
+}
+
+// TestSetSourceRejectsInvalidWebhookSecretRef verifies an invalid webhook secret
+// reference name (uppercase, slash, whitespace) is rejected, so it can never be
+// persisted as the store reference.
+func TestSetSourceRejectsInvalidWebhookSecretRef(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "source.json")
+	for _, ref := range []string{"GH_secret", "a/b", "a b"} {
+		if err := SetSource(p, "git@github.com:acme/r.git", "main", "", ref); err == nil {
+			t.Fatalf("SetSource(secret ref %q) = nil, want error", ref)
+		}
 	}
 }

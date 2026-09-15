@@ -22,6 +22,7 @@ import (
 
 	"relay/internal/config"
 	"relay/internal/function"
+	gitwh "relay/internal/git/webhook"
 	"relay/internal/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
@@ -93,6 +94,33 @@ func Run(logger *slog.Logger) {
 			metricsInstance.Handler(),
 			logger,
 		)
+	}
+
+	// A single shared secrets provider, created once up front so both the webhook
+	// subsystem (below) and the runner (later) resolve secrets from the same
+	// resolver. It is infallible to construct (the directory is created lazily on
+	// Set, never on Resolve), and a missing secret surfaces as a per-invocation
+	// Resolve error rather than a startup failure. A construction failure here is
+	// fatal: the secrets provider is core to invocation (and to the webhook),
+	// so exit startup rather than continue unready.
+	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Secrets: %v", err))
+		os.Exit(1)
+	}
+
+	// The Git webhook server (internal/git/webhook) is opt-in, gated on
+	// GIT_WEBHOOK_ADDR, mirroring metrics' gated construction. The webhook
+	// package's single NewServer owns all assembly — git source config, secret
+	// reference checks, the coalescing sync scheduler, and the provider
+	// handlers — and returns nil when the webhook is disabled (no git source,
+	// no webhook secret, or no secret resolver), logging why. The worker only
+	// orchestrates: construct, start (bind failure is fatal, matching
+	// metrics), and stop on shutdown. It never syncs, never polls, and never
+	// knows how a provider handler is built.
+	var gitWebhookServer *gitwh.Server
+	if cfg.GitWebhookAddr != "" {
+		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
 
 	loader := function.NewLoader(function.Dir, logger)
@@ -272,6 +300,20 @@ func Run(logger *slog.Logger) {
 		logger.Info(fmt.Sprintf("Metrics http server listening on %s", cfg.MetricsAddr))
 	}
 
+	// Start the webhook server (created in the gated block above), right after
+	// the metrics server. It binds synchronously and fails fast on a taken or
+	// unparseable GIT_WEBHOOK_ADDR, exactly like metrics: a webhook port
+	// conflict is a config error that must surface at startup, not heal
+	// invisibly. A nil server here means the webhook was disabled (no source, no
+	// secret reference, or no secret resolver), so there is nothing to start.
+	if gitWebhookServer != nil {
+		if err := gitWebhookServer.Start(); err != nil {
+			logger.Error(fmt.Sprintf("Git webhook server: %v", err))
+			os.Exit(1)
+		}
+		logger.Info(fmt.Sprintf("Webhook http server listening on %s", cfg.GitWebhookAddr))
+	}
+
 	// Flush the registry into the state database on the fixed 5-second cadence.
 	// It is gated on the metrics instance existing: with metrics disabled there
 	// is nothing to snapshot, and a nil-registry flush would clobber the
@@ -307,16 +349,11 @@ func Run(logger *slog.Logger) {
 	// execution container. Must be set before Consume begins; it is wired right
 	// after construction so all invocations carry it.
 	runWorker.SetHostname(cfg.ConsumerName)
-	// Wire the local secrets provider. It is infallible to construct (the
-	// directory is created lazily on Set, never on Resolve), and a missing
-	// secret surfaces as a per-invocation Resolve error rather than a startup
-	// failure — startup does not validate that referenced secrets exist.
-	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
-	if err != nil {
-		// Fatal: the secrets provider is core to invocation, so exit startup.
-		logger.Error(fmt.Sprintf("Secrets: %v", err))
-		os.Exit(1)
-	}
+	// Wire the shared secrets provider (created above for both the webhook
+	// subsystem and the runner). It is infallible to construct (the directory is
+	// created lazily on Set, never on Resolve), and a missing secret surfaces as
+	// a per-invocation Resolve error rather than a startup failure — startup does
+	// not validate that referenced secrets exist.
 	runWorker.SetSecretProvider(secretProvider)
 	// Cap every rule's handler timeout at the same value template validation
 	// enforces (function.MaxTimeout). Defense in depth: a misconfigured or
@@ -398,6 +435,21 @@ func Run(logger *slog.Logger) {
 		defer cancel()
 		if err := metricsServer.Stop(stopCtx); err != nil {
 			logger.Warn(fmt.Sprintf("Metrics server: graceful shutdown: %v", err))
+		}
+	}
+
+	// Bounded graceful shutdown of the webhook server. Order matters and is
+	// owned by the server's Stop: the HTTP server shuts down FIRST so no new
+	// deliveries can arrive, then the scheduler it assembled waits, bounded by
+	// the same short ctx, for the in-flight sync — if any — to observe
+	// cancellation and drain. The worker warns on a server-level error while
+	// Stop itself logs the scheduler-level error, mirroring metrics. A no-op
+	// when the webhook is disabled (nil server).
+	if gitWebhookServer != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := gitWebhookServer.Stop(stopCtx); err != nil {
+			logger.Warn(fmt.Sprintf("Git webhook server: graceful shutdown: %v", err))
 		}
 	}
 

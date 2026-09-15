@@ -85,6 +85,29 @@ func TestMetricsAddrPassthrough(t *testing.T) {
 	}
 }
 
+// TestLoadGitWebhookAddrOptIn pins that GIT_WEBHOOK_ADDR stays empty when
+// unset, so the GitHub webhook server remains opt-in (a non-empty guard in the
+// worker decides whether to bind it).
+func TestLoadGitWebhookAddrOptIn(t *testing.T) {
+	setRequiredEnv(t)
+	cfg := Load(discardLogger())
+	if cfg.GitWebhookAddr != "" {
+		t.Fatalf("GitWebhookAddr = %q, want empty (opt-in)", cfg.GitWebhookAddr)
+	}
+}
+
+// TestLoadGitWebhookAddrPassthrough pins that GIT_WEBHOOK_ADDR is passed
+// through as-is when set, so a configured webhook address reaches the Config
+// exactly.
+func TestLoadGitWebhookAddrPassthrough(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GIT_WEBHOOK_ADDR", ":8080")
+	cfg := Load(discardLogger())
+	if cfg.GitWebhookAddr != ":8080" {
+		t.Fatalf("GitWebhookAddr = %q, want %q", cfg.GitWebhookAddr, ":8080")
+	}
+}
+
 // TestStreamRetention covers the REDIS_STREAM_RETENTION parsing contract via the
 // pure parseRetention helper now that retention is log-and-disable: unset/empty
 // disables retention (0, no log); a valid duration parses; an invalid duration

@@ -5,7 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-) // readSource returns the source file at relPath relative to the module root
+)
+
+// readSource returns the source file at relPath relative to the module root
 // (../../ from this package). These are ARCHITECTURAL GUARDRAIL tests (not style
 // checks): they pin that the automatic runtime never references git sync and
 // that the git package keeps no background timers. They read source text, not
@@ -20,18 +22,28 @@ func readSource(t *testing.T, relPath string) string {
 	return string(data)
 }
 
-// TestWorkerNeverReferencesGit pins that the long-running runtime has NO git
-// hooks: the worker/reconciler only watch /functions and must not know about
-// git sync, which is a separate, manual operator command. A change that wires
-// automatic git into `relay start` would show up here as a reference to
-// "internal/git" or "git sync" in worker.go. This is intentionally a source-scan
-// (cheap, deterministic, no runtime) — it guards the architectural boundary that
-// git sync must never run on its own.
-func TestWorkerNeverReferencesGit(t *testing.T) {
+// TestWorkerNeverSyncsGitDirectly pins the automatic-sync architectural
+// contract: the long-running runtime may host the GitHub webhook (which triggers
+// sync through the coalescing scheduler in internal/git/webhook) but must NEVER
+// run a git sync itself and must NEVER poll. The worker may import the git
+// package for read-only configuration helpers (NewSyncOptions, LoadConfig, the
+// /var/lib/relay path constants) but a change that calls git.Sync or
+// git.SyncFromConfig directly in worker.go, or that introduces periodic
+// polling, would break the boundary that automatic materialization flows only
+// through the webhook package. This is intentionally a source-scan (cheap,
+// deterministic, no runtime).
+//
+// NOTE: TestGitPackageHasNoTimers / TestGitPackageNeverConstructsLoggers scan
+// only non-test .go files DIRECTLY in internal/git/ (they use os.ReadDir(".")
+// and skip subdirectories), so the files under internal/git/webhook/ are not
+// scanned by them. webhook/ is a distinct package with its own (intentional)
+// background scheduling; the timer/logger guardrails continue to pin the git
+// transport core.
+func TestWorkerNeverSyncsGitDirectly(t *testing.T) {
 	worker := readSource(t, "internal/worker/worker.go")
-	for _, forbid := range []string{"internal/git", "git sync", "git\\.Sync", "internal/git.GitDir"} {
+	for _, forbid := range []string{"git.Sync(", "git.SyncFromConfig(", "git sync", "git\\.Sync", "internal/git.GitDir"} {
 		if strings.Contains(worker, forbid) {
-			t.Fatalf("worker.go references git sync (%q); Relay's runtime must never sync on its own", forbid)
+			t.Fatalf("worker.go calls git sync directly (%q); Relay's runtime must sync only through the webhook package", forbid)
 		}
 	}
 }

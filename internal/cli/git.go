@@ -63,13 +63,16 @@ func gitCommand(logger *slog.Logger) *cli.Command {
 			{
 				Name:      "set",
 				Usage:     "Set the git source repository",
-				UsageText: "relay git set <repository> [--ref REF] [--path PATH]",
+				UsageText: "relay git set <repository> [--ref REF] [--path PATH] [--webhook-secret NAME]",
 				Description: "Remember an SSH git repository to sync from. The value must be an SSH " +
 					"URL (scp-like or ssh://). --ref selects the branch/tag/commit (default " + git.DefaultRef + "); " +
-					"--path selects an optional monorepo subdirectory. Calling set again overwrites the source.",
+					"--path selects an optional monorepo subdirectory. --webhook-secret names the secret " +
+					"(in Relay's secret store) holding the GitHub webhook secret used to verify deliveries; " +
+					"calling set again overwrites the source.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit to sync (default " + git.DefaultRef + ")"},
 					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repo"},
+					&cli.StringFlag{Name: "webhook-secret", Usage: "name of the secret holding the GitHub webhook secret (optional; enables webhook triggering)"},
 				},
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "repository", Min: 1, Max: 1},
@@ -84,6 +87,7 @@ func gitCommand(logger *slog.Logger) *cli.Command {
 						cmd.StringArgs("repository")[0],
 						cmd.String("ref"),
 						cmd.String("path"),
+						cmd.String("webhook-secret"),
 					)
 				},
 			},
@@ -148,10 +152,11 @@ func gitKeygen(w io.Writer) error {
 }
 
 // gitSet validates and persists the source config (upsert semantics; calling
-// again overwrites). It enforces the SSH-URL and monorepo-path rules. It takes
-// no logger: the confirmation line on w IS the complete record of this
-// single-step command.
-func gitSet(ctx context.Context, w io.Writer, repository, ref, path string) error {
+// again overwrites). It enforces the SSH-URL, monorepo-path, and (when
+// provided) webhook-secret-name rules. It takes no logger: the confirmation
+// line on w IS the complete record of this single-step command. The confirmation
+// line may mention the webhook-secret REFERENCE name (never its value).
+func gitSet(ctx context.Context, w io.Writer, repository, ref, path, webhookSecretRef string) error {
 	// Default the ref to DefaultRef when the flag was omitted.
 	if ref == "" {
 		ref = git.DefaultRef
@@ -159,12 +164,15 @@ func gitSet(ctx context.Context, w io.Writer, repository, ref, path string) erro
 	if err := git.ValidateRepositoryURL(repository); err != nil {
 		return err
 	}
-	if err := git.SetSource(gitConfigPath, repository, ref, path); err != nil {
+	if err := git.SetSource(gitConfigPath, repository, ref, path, webhookSecretRef); err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "Set git source repository=%s ref=%s", repository, ref)
 	if path != "" {
 		fmt.Fprintf(w, " path=%s", path)
+	}
+	if webhookSecretRef != "" {
+		fmt.Fprintf(w, " webhook-secret=%s", webhookSecretRef)
 	}
 	fmt.Fprintln(w)
 	return nil

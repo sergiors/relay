@@ -73,11 +73,15 @@ func (g *goGitRepo) fetch(ctx context.Context, url string, auth gitssh.AuthMetho
 //
 // Resolution order:
 //
-//  1. Exact/abbreviated hash: if ref looks like a commit SHA (4-64 hex chars),
-//     resolve it directly via go-git's hash-prefix resolution and return
-//     regardless of remote state. A 40-hex ref is a full SHA and must resolve to
-//     itself even if a branch happens to share its spelling; an abbreviated
-//     prefix resolves through the same hash-prefix lookup.
+	//  1. Exact/abbreviated hash: if ref looks like a commit SHA (4-64 hex chars),
+	//     resolve it directly via go-git's hash-prefix resolution and return
+	//     regardless of remote state. A 40-hex ref is a full SHA and must resolve to
+	//     itself even if a branch happens to share its spelling; an abbreviated
+	//     prefix resolves through the same hash-prefix lookup. The classification is
+	//     the exported IsHashLike; it is a heuristic gate, so a full 40-hex SHA
+	//     resolves to itself, an abbreviated prefix resolves through hash-prefix
+	//     resolution, and a value that only LOOKS hex but matches no object falls
+	//     through to the ref resolution chain below.
 //  2. Fully-qualified ref: a refs/... prefixed value (branch, tag, remote
 //     tracking) resolves directly, never against origin/.
 //  3. Bare branch name (the default case, e.g. main): resolve
@@ -89,8 +93,8 @@ func (g *goGitRepo) fetch(ctx context.Context, url string, auth gitssh.AuthMetho
 //     wins, and it only happens when no remote-tracking ref exists at all (e.g.
 //     odd checkouts where a local branch exists but origin tracking does not).
 func (g *goGitRepo) resolveRef(ref string) (plumbing.Hash, error) {
-	if isHashLike(ref) {
-		if h, err := g.resolveHash(ref); err == nil {
+	if IsHashLike(ref) {
+		if h, err := g.resolveRevision(plumbing.Revision(ref)); err == nil {
 			return h, nil
 		}
 	}
@@ -122,45 +126,13 @@ func (g *goGitRepo) resolveRef(ref string) (plumbing.Hash, error) {
 // resolveRevision resolves a single, fully-expanded revision to a commit hash.
 // ResolveRevision peels annotated tags to their commit (it calls TagObject.Commit
 // when the hash is a tag object), so both lightweight and annotated tags land on
-// the commit.
+// the commit. It is also the path for exact/abbreviated SHA resolution: passed a
+// full 40-hex value it resolves to itself, and passed an abbreviated hex prefix
+// it runs go-git's resolveHashPrefix over the object store. It returns
+// ErrReferenceNotFound when the hash/ref does not exist so resolveRef can fall
+// through to the next resolution attempt.
 func (g *goGitRepo) resolveRevision(rev plumbing.Revision) (plumbing.Hash, error) {
 	h, err := g.r.ResolveRevision(rev)
-	if err != nil {
-		return plumbing.ZeroHash, err
-	}
-	return *h, nil
-}
-
-// isHashLike reports whether ref could be a commit SHA (full or abbreviated).
-// go-git resolves hash prefixes via resolveHashPrefix, which requires hex and a
-// prefix of at least two hex chars; we accept 4-64 hex chars so a bare branch or
-// tag name (which may be all-hex but is far more commonly a word) is not
-// misclassified. A value that is all-hex and within SHA length is treated as a
-// hash; it resolves to the SHA if that object exists, and otherwise falls through
-// to the branch/tag/bare chain below.
-func isHashLike(ref string) bool {
-	n := len(ref)
-	if n < 4 || n > 64 {
-		return false
-	}
-	for i := 0; i < n; i++ {
-		switch {
-		case ref[i] >= '0' && ref[i] <= '9':
-		case ref[i] >= 'a' && ref[i] <= 'f':
-		case ref[i] >= 'A' && ref[i] <= 'F':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// resolveHash resolves a full or abbreviated hex SHA. For a full 40-hex SHA this
-// resolves to itself; for an abbreviated prefix go-git's ResolveRevision runs
-// resolveHashPrefix over the object store. It returns ErrReferenceNotFound when
-// the hash does not exist so resolveRef can fall through to the bare-chain.
-func (g *goGitRepo) resolveHash(ref string) (plumbing.Hash, error) {
-	h, err := g.r.ResolveRevision(plumbing.Revision(ref))
 	if err != nil {
 		return plumbing.ZeroHash, err
 	}

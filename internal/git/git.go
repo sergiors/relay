@@ -14,6 +14,8 @@ import (
 	"time"
 
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
+
+	"relay/internal/secrets"
 )
 
 // Fixed application-convention paths, mirroring state.DBPath and
@@ -76,6 +78,9 @@ type Config struct {
 	LastSyncedCommit string `json:"lastSyncedCommit,omitempty"`
 	LastSyncedAt     string `json:"lastSyncedAt,omitempty"`
 	Synced           bool   `json:"synced"`
+	// WebhookSecretRef names the secret used to authenticate webhook requests for
+	// this Git source. The value itself is resolved only when validating a request.
+	WebhookSecretRef string `json:"webhookSecretRef,omitempty"`
 }
 
 // LoadConfig reads and decodes the persisted config at path. A missing file
@@ -153,13 +158,15 @@ func writeConfig(c Config, path string) error {
 }
 
 // SetSource validates and persists a sync source config: repository (an SSH URL),
-// ref, and an optional monorepo path. Calling it again overwrites (upsert). It
-// enforces the SSH-URL rule and the monorepo-path safety rule so a bad value can
-// never be persisted. The ref and path are stored exactly as given (the CLI
-// defaults an omitted ref to DefaultRef; an empty path means repo root). Any
-// prior last-synced bookkeeping is retained on update so an operator changing
-// the ref/path keeps the last-success metadata until the next sync.
-func SetSource(path, repository, ref, monorepoPath string) error {
+// ref, an optional monorepo path, and an optional name of the secret holding the
+// GitHub webhook secret (see Config.WebhookSecretRef). Calling it again
+// overwrites (upsert). It enforces the SSH-URL rule and the monorepo-path safety
+// rule so a bad value can never be persisted. The ref and path are stored exactly
+// as given (the CLI defaults an omitted ref to DefaultRef; an empty path means
+// repo root). Any prior last-synced bookkeeping is retained on update so an
+// operator changing the ref/path keeps the last-success metadata until the next
+// sync.
+func SetSource(path, repository, ref, monorepoPath, webhookSecretRef string) error {
 	// Preserve prior bookkeeping on an update (upsert) so status survives a
 	// config change until the next sync records fresh values.
 	var (
@@ -181,6 +188,14 @@ func SetSource(path, repository, ref, monorepoPath string) error {
 	if err := validatePath(monorepoPath); err != nil {
 		return err
 	}
+	// An empty webhookSecretRef disables webhook triggering; a non-empty one
+	// must be a legal secret name so the webhook server can resolve it later.
+	// The value is never validated as the secret's VALUE — only its store name.
+	if webhookSecretRef != "" {
+		if err := secrets.ValidateName(webhookSecretRef); err != nil {
+			return err
+		}
+	}
 	if ref == "" {
 		ref = DefaultRef
 	}
@@ -191,6 +206,7 @@ func SetSource(path, repository, ref, monorepoPath string) error {
 		Synced:           priorSynced,
 		LastSyncedCommit: priorCommit,
 		LastSyncedAt:     priorAt,
+		WebhookSecretRef: webhookSecretRef,
 	}, path)
 }
 

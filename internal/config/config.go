@@ -26,6 +26,15 @@ type Config struct {
 	ConsumerName    string
 	StreamRetention time.Duration
 	MetricsAddr     string
+	// GitWebhookAddr is the address for the GitHub webhook server
+	// (POST /github) that triggers an automatic git sync on matching pushes.
+	// Like MetricsAddr it is opt-in via the GIT_WEBHOOK_ADDR environment
+	// variable: empty (unset) disables the webhook server entirely, and a
+	// non-empty value makes the worker bind it at startup (a bad address is a
+	// fatal startup error, matching metrics). Sync itself remains a separate
+	// manual command; the webhook server only schedules syncs through the
+	// coalescing trigger in internal/git/webhook, never directly.
+	GitWebhookAddr string
 	// LogLevel is the slog level selected by LOG_LEVEL (default Info). It is
 	// used by cmd/main.go to build the process logger after config.Load.
 	LogLevel slog.Level
@@ -51,10 +60,11 @@ type Config struct {
 //
 // The required REDIS_* variables must be non-empty or the process exits (see
 // requiredEnv); the consumer name is hostname-resolved via consumerNameFromHost.
-// The two optional variables are read with os.Getenv and stay zero/empty when
+// The optional variables are read with os.Getenv and stay zero/empty when
 // unset: retention maps to 0 (disabled, see parseRetention) and the metrics
-// address to "" (no HTTP server), preserving their opt-in semantics through the
-// caller's non-zero / non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
+// and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR) to "" (no HTTP
+// server), preserving their opt-in semantics through the caller's non-zero /
+// non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
 // default to 8 and 16 respectively (see ParsePositiveInt); an invalid (zero,
 // negative, or non-integer) value is a configuration error and aborts startup,
 // matching the loadLogLevel style.
@@ -66,6 +76,7 @@ func Load(logger *slog.Logger) Config {
 		ConsumerName:      consumerNameFromHost(logger),
 		StreamRetention:   parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
 		MetricsAddr:       getEnv("METRICS_ADDR", ""),
+		GitWebhookAddr:    getEnv("GIT_WEBHOOK_ADDR", ""),
 		LogLevel:          loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
 		MaxConcurrency:    loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
 		MaxBufferedEvents: loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
