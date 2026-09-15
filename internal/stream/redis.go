@@ -870,11 +870,12 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	)
 
 	// Inject the same per-message context as processMessage: the delivery-attempt
-	// number and the invocation-state handle bound to this (stream, group, msgID),
-	// so a redelivery skips a completed schedule invocation. The ScheduleRunner
-	// (runner.InvokeHandler) itself carries no invocation state (it has no
-	// matching pre-pass), but the invocation store still protects this message's
-	// redelivery via the same hash keying.
+	// number and the invocation-state handle bound to this (stream, group, msgID).
+	// The ScheduleRunner (runner.InvokeHandler) participates in the SAME
+	// TryStart / complete / failure / exhaustion lifecycle as event handlers via
+	// this handle: a completed schedule invocation is skipped and ACKed, a
+	// protected (running or backoff) one stays pending, and an exhausted one
+	// routes to the DLQ.
 	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))

@@ -327,3 +327,91 @@ schedules:
 		t.Fatalf("err = %v, want handler-form error naming the handler", err)
 	}
 }
+
+// TestParseScheduleMissingRetriesDefaults pins the default retry count for a
+// schedule entry that omits `retries`, matching the event-rule default.
+func TestParseScheduleMissingRetriesDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+`)
+	if got := tmpl.Schedules[0].Retries; got != DefaultRetries {
+		t.Fatalf("missing retries schedule = %d, want default %d", got, DefaultRetries)
+	}
+}
+
+// TestParseScheduleExplicitRetries verifies an explicit non-negative `retries`
+// is honored, including zero (only the initial attempt).
+func TestParseScheduleExplicitRetries(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+    retries: 2
+`)
+	if got := tmpl.Schedules[0].Retries; got != 2 {
+		t.Fatalf("explicit retries = %d, want 2", got)
+	}
+
+	zero := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+    retries: 0
+`)
+	if got := zero.Schedules[0].Retries; got != 0 {
+		t.Fatalf("retries: 0 = %d, want 0", got)
+	}
+}
+
+// TestParseScheduleRetriesRejected verifies that a negative or non-integer
+// `retries` fails template validation with a clear message naming the field,
+// mirroring the event-rule retries tests.
+func TestParseScheduleRetriesRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		retries string
+	}{
+		{"negative", "-1"},
+		{"string", "abc"},
+		{"float", "1.5"},
+		{"bool", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+    retries: ` + tc.retries + `
+`))
+			if err == nil {
+				t.Fatalf("expected error for retries %q", tc.retries)
+			}
+			if !strings.Contains(err.Error(), "retries") {
+				t.Errorf("expected error to mention retries, got: %v", err)
+			}
+		})
+	}
+}

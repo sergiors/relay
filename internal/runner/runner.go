@@ -1135,13 +1135,23 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 // InvokeHandler executes a single schedule-occurrence invocation routed through
 // the stream. The handler's timeout is read from the function's current
 // template (single source of truth), capped at the configured maximum exactly
-// like Handle caps rule timeouts. It reuses the exact event execution path:
-// registry snapshot lookup, the global + per-function concurrency slots,
-// per-invocation secret resolution, the panic boundary, and the same handler
-// metrics. The stream layer (via ConsumerConfig.ScheduleRunner) drives retry,
-// backoff, invocation state, and DLQ around this single invocation; here there
-// is no per-invocation state of its own — a failure surfaces to the stream so a
-// redelivery reclaim can retry it.
+// like Handle caps rule timeouts, and passed BOTH to TryStart and to
+// context.WithTimeout so the persisted running deadline matches the local kill
+// timer. It reuses the exact event execution path: registry snapshot lookup,
+// the global + per-function concurrency slots, per-invocation secret
+// resolution, the panic boundary, and the same handler metrics.
+//
+// InvokeHandler participates in the SAME per-invocation invocation-state
+// lifecycle as Handle: when the stream injects an InvocationState into ctx
+// (via stream.WithInvocationState), it reserves concurrency slots before
+// TryStart (a slot timeout is never an attempt and persists no state), claims
+// the "<function>/<handler>" invocation with TryStart using the capped timeout,
+// skips already-complete redeliveries (stream ACKs), leaves pending under a
+// protected running/backoff marker, marks the invocation complete on success
+// (before the success metrics), and on failure drives recordFailure for the
+// retry-backoff/exhaustion decision from the template's schedule Retries. The
+// stream layer (via ConsumerConfig.ScheduleRunner) drives retry, backoff,
+// invocation state, and DLQ around this single invocation.
 func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payload []byte) error {
 	// Take one consistent registry snapshot and find the function. A schedule
 	// whose function is missing or unavailable is dropped: the reconciler
@@ -1159,17 +1169,19 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 
-	// Resolve the handler's timeout from the function's CURRENT template — the
-	// single source of truth, so a hot-swapped template's new timeout applies to
-	// future occurrences automatically. The template's FIRST matching schedule
-	// entry provides the timeout; multiple entries sharing a handler time out the
-	// same (occurrence identity distinguishes them by scheduled_at, not timeout).
-	// Fall back to the default when the handler has no schedule entry, exactly as
-	// Handle falls back to the rule default.
+	// Resolve the handler's timeout AND retry count from the function's CURRENT
+	// template — the single source of truth, so a hot-swapped template's new
+	// values apply to future occurrences automatically. The template's FIRST
+	// matching schedule entry provides both; multiple entries sharing a handler
+	// behave identically (occurrence identity distinguishes them by scheduled_at).
+	// Fall back to the event defaults when the handler has no schedule entry,
+	// exactly as Handle falls back to the rule defaults.
 	timeout := function.DefaultTimeout
+	retries := function.DefaultRetries
 	for _, sch := range pf.fn.Template.Schedules {
 		if sch.Handler == handler {
 			timeout = sch.Timeout
+			retries = sch.Retries
 			break
 		}
 	}
@@ -1181,16 +1193,111 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 		timeout = cap
 	}
 
-	// Reserve the worker-global and per-function concurrency slots. A timeout
-	// surfaces as an error so the stream layer leaves the message pending and a
-	// later reclaim retries it.
+	invState, hasState := stream.InvocationStateFrom(ctx)
+	invocation := fnName + "/" + handler
+
+	// Reserve the worker-global and per-function concurrency slots BEFORE
+	// TryStart so a blocked invocation is never counted as an attempt and does
+	// not persist state (same ordering as Handle's event path). A slot timeout
+	// means the invocation is unresolved: with invocation state it returns a
+	// "not eligible" skip (the stream leaves the message pending with no retry
+	// accounting); without state it preserves the legacy plain error.
 	releaseSlots, _ := r.reserveSlots(ctx, fnName, pf.fn.Template.Concurrency)
 	if releaseSlots == nil {
 		r.log.Warn(fmt.Sprintf("Schedule: concurrency slot wait timed out for %q/%q", fnName, handler))
+		if hasState {
+			return stream.ErrInvocationNotEligible
+		}
 		return fmt.Errorf("schedule invocation: concurrency slot wait timed out")
 	}
 	defer releaseSlots()
 
+	if hasState {
+		// Fast path: an already-completed ("ok") invocation on redelivery means a
+		// previous delivery succeeded but the ACK failed (or is racing). The
+		// message should be ACKed, not re-run and not DLQ'd — return nil so the
+		// stream ACKs and then clears state.
+		if invState.IsComplete(invocation) {
+			r.log.Debug("Schedule: invocation already succeeded; skipping (stream ACKs)",
+				"function", fnName,
+				"handler", handler,
+			)
+			return nil
+		}
+		// Claim the invocation for this execution before running it. TryStart
+		// persists an absolute running deadline (now + the capped timeout) and
+		// returns started=false when the invocation is already exhausted or
+		// protected by an active attempt deadline or a retry backoff (this or
+		// another replica may be executing it, or it is waiting out its backoff).
+		started, attempt, wait := invState.TryStart(invocation, timeout)
+		if !started {
+			if wait > 0 {
+				// Protected by an active running deadline or a retry backoff. The
+				// message must stay pending: the protected invocation may still
+				// complete or fail on its own, so this is a "not eligible" skip,
+				// never an ACK.
+				r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
+					"function", fnName,
+					"handler", handler,
+					"attempt", attempt,
+					"next_attempt_in", wait,
+				)
+				return stream.ErrInvocationNotEligible
+			}
+			// Terminal skip: the invocation is already exhausted. A schedule has
+			// exactly ONE invocation, so a terminal skip means the message is
+			// terminal and must route to the DLQ.
+			r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
+				"function", fnName,
+				"handler", handler,
+				"attempt", attempt,
+			)
+			return fmt.Errorf("%w: schedule function %q handler %q is exhausted", stream.ErrInvocationExhausted, fnName, handler)
+		}
+		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation)
+		if err != nil {
+			// A failed attempt — resolve extra env, marshal, execution, or
+			// timeout failures all land here. recordFailure decides retry vs
+			// exhaustion using the template's schedule Retries: a retryable
+			// failure schedules a backoff and returns a plain error (the stream
+			// leaves the message pending, gated by next_attempt_at); an exhausted
+			// attempt marks the invocation terminal and, because a schedule has
+			// exactly ONE invocation (this one), the message is terminal — wrap
+			// stream.ErrInvocationExhausted so the stream routes it to the DLQ.
+			outcome, retErr := r.recordFailure(invState, invocation, attempt, retries, fnName, handler, "relay.schedule", "", "", err)
+			if outcome == outcomeExhausted {
+				return fmt.Errorf("%w: %w", stream.ErrInvocationExhausted, retErr)
+			}
+			return retErr
+		}
+		return nil
+	}
+
+	// No invocation state (direct callers/tests): preserve the legacy behavior
+	// exactly — execute the single handler and return the plain error (or nil on
+	// success). MarkComplete/success metrics still emit inside invokeOnce.
+	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "")
+}
+
+// invokeOnce is the smallest reusable single-handler execution core shared by
+// InvokeHandler (with or without invocation state): it resolves the per-invocation
+// template env/secrets, runs the handler inside the panic boundary and the
+// caller-provided capped timeout, and emits the handler success/failure metrics.
+// It assumes the caller has already reserved the concurrency slots; on success,
+// when invState is non-nil it marks the invocation complete BEFORE the success
+// metrics so a crash between the side effect and MarkComplete re-runs the
+// handler (at-least-once; the handler must remain idempotent), mirroring
+// Handle's per-rule ordering. It returns the plain execution error (nil on
+// success) that the caller routes through the invocation-state lifecycle.
+func (r *Runner) invokeOnce(
+	ctx context.Context,
+	pf *PreparedFunction,
+	handler string,
+	payload []byte,
+	timeout time.Duration,
+	invState stream.InvocationState,
+	invocation string,
+) error {
 	// Resolve the template's env values and secret references immediately before
 	// container creation, mirroring Handle's rule path.
 	extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
@@ -1198,7 +1305,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 		// Counted as a handler failure with a zero duration (no execution
 		// happened), mirroring how Handle attributes a resolution failure.
 		r.recordHandlerFailure(pf.fn.Name, handler, 0)
-		return fmt.Errorf("schedule invocation: function %q handler %q: %w", fnName, handler, err)
+		return fmt.Errorf("schedule invocation: function %q handler %q: %w", pf.fn.Name, handler, err)
 	}
 
 	r.log.Debug("Schedule: invoking handler",
@@ -1208,8 +1315,8 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 
 	invokeCtx, cancel := context.WithTimeout(ctx, timeout)
 	// Stamp the invocation's diagnostic metadata. MessageID identifies the
-	// scheduled dispatch; EventID/EventName are empty (diagnostic-only labels),
-	// and "relay.schedule" makes scheduled containers attributable.
+	// scheduled dispatch (a constant, diagnostic-only label); EventID/EventName
+	// are empty, and "relay.schedule" makes scheduled containers attributable.
 	invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 		Function:  pf.fn.Name,
 		Handler:   handler,
@@ -1239,6 +1346,13 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 			"reason", err,
 		)
 		return err
+	}
+	// Mark the invocation complete on success BEFORE the success metrics so a
+	// crash between the side effect and MarkComplete re-runs the handler
+	// (at-least-once; the handler must remain idempotent). A mark failure is
+	// logged by the handle and does not fail the invocation.
+	if invState != nil {
+		invState.MarkComplete(invocation)
 	}
 	r.metrics.IncLabels("handler_invocations_total",
 		[]metrics.Label{

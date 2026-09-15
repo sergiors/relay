@@ -107,13 +107,19 @@ type Template struct {
 // Schedule is one cron schedule from the template's `schedules` list: the
 // handler it invokes, the standard 5-field cron expression (verbatim), the
 // effective IANA timezone (always non-nil after ParseTemplate; omitted
-// timezones resolve to UTC), and the resolved per-invocation timeout (same
-// rules as event rules).
+// timezones resolve to UTC), and the resolved per-invocation timeout and retry
+// count (same rules as event rules).
 type Schedule struct {
 	Handler  string
 	Cron     string
 	Location *time.Location
 	Timeout  time.Duration
+	// Retries is the number of additional executions attempted after the
+	// initial one (0 = only the initial attempt). Schedule entries carry the
+	// same semantics as Rule.Retries: it is always non-negative after
+	// ParseTemplate; omitted schedules default to DefaultRetries. The total
+	// number of attempts for a failing invocation is 1 + Retries.
+	Retries int
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -361,6 +367,11 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Cron     string `yaml:"cron"`
 			Timezone string `yaml:"timezone"`
 			Timeout  string `yaml:"timeout"`
+			// Retries is decoded as `any` (not `*int`) so a non-integer value
+			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
+			// and rejected with a clear message instead of being silently
+			// truncated or coerced by yaml.v3.
+			Retries any `yaml:"retries"`
 		} `yaml:"schedules"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
@@ -459,10 +470,14 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err != nil {
 			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
 		}
+		retries, err := resolveRetries(s.Retries)
+		if err != nil {
+			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+		}
 		if err := validateCron(s.Cron, loc); err != nil {
 			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Handler, s.Cron, err)
 		}
-		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout})
+		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout, Retries: retries})
 	}
 	return t, nil
 }
