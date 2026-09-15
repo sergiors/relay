@@ -11,13 +11,18 @@
 //     counted)
 //   - Retry: a failing invocation records a per-invocation retry backoff
 //     (1m/2m/5m/10m, capped at 10m) and counts function_retries_total; once its
-//     attempts (1 + rule.Retries) are exhausted it is marked terminal and, when
-//     every matched invocation is terminal, the message is routed to the DLQ
-//   - Outcome: an error is returned when any invocation fails, so the stream
-//     layer does not acknowledge the message. A protected-only skip returns
-//     stream.ErrInvocationNotEligible so the message stays pending (never acked
-//     while another replica may still be processing it); a fully-exhausted
-//     message returns stream.ErrInvocationExhausted so it is routed to the DLQ
+//     attempts (1 + rule.Retries) are exhausted it is marked terminal. Outcomes
+//     are per-invocation and aggregated after the full rule loop (the loop is
+//     sequential, never parallel)
+//   - Outcome: each matching invocation gets its own independent attempt on
+//     every delivery — a failure in one handler never prevents the others from
+//     running. Handle then aggregates the per-invocation outcomes into a single
+//     message-level error: a retryable failure keeps the message pending; when
+//     every matched invocation is terminal (complete or exhausted) and at least
+//     one exhausted, the message is terminal and routed to the DLQ; a protected
+//     or slot-timeout skip returns stream.ErrInvocationNotEligible so the
+//     message stays pending (never acked while another replica may still be
+//     processing it, even if other invocations succeeded this delivery)
 //   - Panic boundary: each invocation's execution runs inside runInvocation,
 //     which recovers an executor/runtime panic and converts it into a normal
 //     failed attempt (metrics + recordFailure), so a panicking execution is

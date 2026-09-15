@@ -35,6 +35,35 @@ const DefaultMaxConcurrency = 8
 // "Concurrency and backpressure" note).
 const slotWaitTimeout = 30 * time.Second
 
+// invocationOutcome classifies what one delivery round did for a single matched
+// invocation. Handle's rule loop returns one of these per invocation so it can
+// aggregate the per-invocation outcomes AFTER the whole loop (see Handle's doc
+// comment), rather than fail-fast on the first failure. outcomeRetryable and
+// outcomeExhausted are produced by recordFailure; the skip outcomes are produced
+// by the TryStart/slot paths.
+type invocationOutcome int
+
+const (
+	// outcomeExecuted means the handler ran and returned success (the invocation
+	// was marked complete).
+	outcomeExecuted invocationOutcome = iota
+	// outcomeTerminalSkip means the invocation was skipped because it is already
+	// terminal: complete or exhausted (never eligible again). Exhausted skips are
+	// distinguishable from complete skips by the TryStart attempt number (>0).
+	outcomeTerminalSkip
+	// outcomePendingSkip means the invocation was skipped because it is protected
+	// (running or waiting out a retry backoff) or its concurrency slot timed out:
+	// it is unresolved, so the message must stay pending (never ACKed).
+	outcomePendingSkip
+	// outcomeRetryable means the invocation failed a retryable attempt: a retry
+	// backoff was scheduled and the message must stay pending for a later retry.
+	outcomeRetryable
+	// outcomeExhausted means the invocation failed its last attempt: it was
+	// marked exhausted (terminal) and, if every other matched invocation is also
+	// terminal, the message routes to the DLQ.
+	outcomeExhausted
+)
+
 // Executor is the subset of the runtime Manager that invocations need. It is a
 // small interface so Handle and PreparedFunction construction can be exercised
 // in tests without a Docker daemon; the concrete *runtime.Manager satisfies it.
@@ -630,7 +659,18 @@ func (r *Runner) runInvocation(
 // a retried message re-runs the handlers that already succeeded. events_received
 // and events_processed count each delivery attempt that reaches the handler
 // handoff, so retries increment them too — they are delivery-attempt counters,
-// not unique-event counters.
+// not unique-event counters. Handle does NOT claim exactly-once: redeliveries
+// re-run whatever is not yet recorded as complete, and the handlers must stay
+// idempotent.
+//
+// Aggregate, per-invocation semantics: a single Redis message can match multiple
+// "<function>/<handler>" invocations, and each is tracked independently in the
+// per-message invocation-state hash. Every eligible matching invocation gets its
+// own attempt on each delivery regardless of the others' outcomes: a failure in one
+// handler does NOT prevent later matching handlers from running. The rule loop is
+// strictly sequential (never parallel), and after iterating every matching rule
+// Handle aggregates the per-invocation outcomes into the message-level return
+// contract below.
 //
 // Invocation state: when the stream layer injects an InvocationState into ctx
 // (see stream.WithInvocationState), Handle skips any matching invocation whose
@@ -643,23 +683,29 @@ func (r *Runner) runInvocation(
 // function_events_total still counts the function as engaged (it matched), which
 // is attribution, not execution counting. When no invocation state is present
 // (direct Handle callers/tests, or invocation tracking disabled) Handle behaves
-// exactly as before.
+// exactly as before: it runs every matching handler and returns the first
+// failure's plain error immediately, with no invocation wrapping or DLQ
+// attribution.
 //
-// Return contract (with invocation state):
-//   - nil when every matched invocation is complete (or nothing matched).
-//   - a wrapped stream.ErrInvocationNotEligible when at least one matched
+// Return contract (with invocation state, aggregated after the full rule loop):
+//   - a plain (retryable) error when any matched invocation had a retryable
+//     failure this delivery — regardless of other invocations' outcomes — so
+//     the message stays pending and is retried. The first such error is returned.
+//   - a wrapped stream.ErrInvocationExhausted when every invocation in the
+//     matched set is terminal (complete or exhausted), at least one of them is
+//     exhausted, and no retryable failure occurred this delivery. The whole
+//     message is terminal, so the stream layer routes it to the DLQ.
+//   - a wrapped stream.ErrInvocationNotEligible when no retryable failure
+//     occurred and the message is not all-terminal, but at least one matched
 //     invocation was skipped because it is protected (running or waiting out a
-//     retry backoff) and nothing executed. The stream layer leaves the message
-//     pending without counting a retry or routing to the DLQ — this is what
-//     fixes the cross-replica ACK hazard: a replica that reclaims a message
-//     whose invocation is still in flight on another replica must not ACK it.
-//   - a wrapped stream.ErrInvocationExhausted when a failing invocation's
-//     attempts are exhausted AND every other matched invocation is complete or
-//     also exhausted, so the message is terminal and the stream layer routes it
-//     to the DLQ.
-//   - the plain execution error otherwise (a retryable failure, or an exhausted
-//     invocation while other matched invocations may still run), so the message
-//     stays pending.
+//     retry backoff) or its concurrency slot timed out. This fires even when
+//     other invocations executed successfully in this same call: a protected
+//     or slot-timeout invocation is unresolved, so the message must stay pending
+//     and NOT be ACKed (this is what fixes the cross-replica ACK hazard — a
+//     replica that reclaims a message whose invocation is still in flight on
+//     another replica must not ACK it).
+//   - nil when every matched invocation is complete (or nothing matched), so the
+//     stream layer ACKs the message.
 //
 // Panic boundary: each invocation's execution runs inside runInvocation, which
 // recovers an executor/runtime panic and converts it into a normal failed
@@ -682,11 +728,24 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// (direct Handle callers/tests, or invocation tracking disabled).
 	invState, hasState := stream.InvocationStateFrom(ctx)
 
-	// Track whether any invocation actually executed and whether any matched
-	// invocation was skipped because it is protected (running or waiting out a
-	// retry backoff). These drive the return contract above.
-	executed := false
+	// Trackers for the message-level return contract, aggregated only after the
+	// whole rule loop has run (see the Handle doc comment). skippedPending records
+	// whether any matched invocation was skipped because it is protected (running
+	// or waiting out a retry backoff) or its concurrency slot timed out — an
+	// unresolved invocation that must keep the message pending even when other
+	// invocations succeeded this call. firstErr holds the first plain retryable
+	// failure; exhaustedErr holds the plain error of an exhaustion this delivery so
+	// the aggregate can wrap ErrInvocationExhausted; anyExhausted records whether
+	// any matched invocation exhausted this delivery. These are only meaningful
+	// when hasState is true.
 	skippedPending := false
+	var firstErr, exhaustedErr error
+	anyExhausted := false
+	// executed tracks whether any invocation actually executed, for the
+	// no-state (direct caller/test) path, which preserves the old fail-fast
+	// tail exactly. With invocation state it is unused (the aggregate uses the
+	// per-invocation outcomes instead).
+	executed := false
 
 	// Take one consistent snapshot for the whole call so a concurrent registry
 	// swap mid-execution cannot reorder or drop functions under us.
@@ -755,12 +814,11 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// executeRule runs this single rule's invocation while holding the
 			// worker-global and per-function concurrency slots (whose defer scope
 			// is THIS call, so a multi-rule message never accumulates slots across
-			// rules). It returns an error to propagate on a failure that must
-			// leave the message pending (the recordFailure/err paths below), or
-			// nil on a skip / success so the caller continues to the next rule.
-			// skippedPending and executed are updated by reference so the outer
-			// return contract still sees them.
-			executeRule := func() error {
+			// rules). It classifies this invocation's outcome for this delivery and
+			// returns it plus the plain error (for a failed attempt) so the outer
+			// loop can aggregate AFTER iterating every matching rule — a failure in
+			// one handler never prevents later handlers from running.
+			executeRule := func() (invocationOutcome, error) {
 				// The per-invocation attempt number. With invocation state it
 				// comes from TryStart (Redis-backed, incremented per actual
 				// execution); without it, each direct call is simply attempt 1.
@@ -787,7 +845,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"event_name", eventName,
 						"attempt", attempt,
 					)
-					return nil
+					return outcomePendingSkip, nil
 				}
 				if waited {
 					r.log.Debug("Function handler: waiting for concurrency slot",
@@ -830,23 +888,25 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 								"attempt", n,
 								"next_attempt_in", wait,
 							)
-						} else {
-							// Terminal (exhausted): skipped like complete, never
-							// eligible again.
-							r.log.Debug("Function handler: exhausted for event; skipping",
-								"function", pf.fn.Name,
-								"handler", rule.Handler,
-								"message_id", msgID,
-								"event_id", eventID,
-								"event_name", eventName,
-								"attempt", n,
-							)
+							return outcomePendingSkip, nil
 						}
-						return nil
+						// Terminal (complete or exhausted): skipped like complete,
+						// never eligible again. An exhausted skip (n > 0) is
+						// indistinguishable here from the already-complete case,
+						// which is fine: exhaustion accounting is per-invocation and
+						// the message-level DLQ decision happens in the aggregate.
+						r.log.Debug("Function handler: terminal for event; skipping",
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"event_id", eventID,
+							"event_name", eventName,
+							"attempt", n,
+						)
+						return outcomeTerminalSkip, nil
 					}
 					attempt = n
 				}
-				executed = true
 				r.log.Debug("Function rule: matched event",
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
@@ -858,26 +918,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				eventJSON, err := json.Marshal(event)
 				if err != nil {
 					// The invocation was already claimed (deferred-released) but
-					// will not execute: this is a failed attempt, so schedule a
-					// retry with the same backoff rules as an execution failure (it
-					// IS a failed attempt). If the attempt is exhausted, mark it
-					// terminal.
+					// will not execute: this is a failed attempt, so treat it as
+					// such — schedule a retry (or exhaust), then CONTINUE to the
+					// next matching rule so each independent invocation gets its own
+					// failed attempt.
 					if hasState {
-						return r.recordFailure(
-							invState,
-							invocation,
-							attempt,
-							rule.Retries,
-							matched,
-							pf.fn.Name,
-							rule.Handler,
-							msgID,
-							eventID,
-							eventName,
-							err,
-						)
+						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
-					return fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
+					return outcomeRetryable, fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
 				// Resolve the template's env values and secret references into the
 				// per-invocation extra env, immediately before container creation.
@@ -886,26 +934,15 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// never requires a rebuild. A resolution failure is a failed
 				// attempt (the invocation was already claimed by TryStart), so it
 				// flows through the same retry/exhaustion machinery as an
-				// execution failure. The error names the secret REFERENCE only —
-				// never any value.
+				// execution failure and, like marshal failures, does not
+				// short-circuit the remaining rules. The error names the secret
+				// REFERENCE only — never any value.
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
 					if hasState {
-						return r.recordFailure(
-							invState,
-							invocation,
-							attempt,
-							rule.Retries,
-							matched,
-							pf.fn.Name,
-							rule.Handler,
-							msgID,
-							eventID,
-							eventName,
-							err,
-						)
+						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
-					return fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
+					return outcomeRetryable, fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
 				invokeCtx, cancel := context.WithTimeout(ctx, timeout)
 				// Stamp the invocation's diagnostic metadata into the context so
@@ -971,10 +1008,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// Record the failure and decide retry vs exhaustion. This is
 					// the per-invocation retry driver: a retryable failure
 					// schedules a backoff and counts function_retries_total; an
-					// exhausted attempt marks the invocation terminal and, when
-					// the whole message is terminal, routes it to the DLQ.
+					// exhausted attempt marks the invocation terminal and counts
+					// function_dlq_total. The message-level DLQ decision (whether
+					// EVERY matched invocation is terminal) is left to Handle's
+					// end-of-loop aggregate, so an invocation may exhaust while
+					// others still run.
 					if hasState {
-						return r.recordFailure(invState, invocation, attempt, rule.Retries, matched, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, attempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -984,7 +1024,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// and observable.
 					r.metrics.IncLabels("function_retries_total",
 						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-					return err
+					return outcomeRetryable, err
 				}
 				// Record the invocation as completed so a redelivery skips it.
 				// This happens BEFORE the success metrics so a crash between the
@@ -1020,16 +1060,69 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"attempt", attempt,
 					"duration", d,
 				)
-				return nil
+				return outcomeExecuted, nil
 			}
-			if err := executeRule(); err != nil {
-				return err
+			outcome, err := executeRule()
+			if !hasState {
+				// No invocation state (direct callers/tests): preserve the old
+				// fail-fast behavior exactly — run every matching handler and
+				// return the first failure's plain error immediately; the tail
+				// handles the nothing-executed/not-eligible case. No invocation
+				// wrapping or DLQ attribution when matched.
+				if outcome == outcomeRetryable {
+					return err
+				}
+				if outcome == outcomeExecuted {
+					executed = true
+				}
+				continue
+			}
+			// Aggregate the per-invocation outcome for the message-level contract,
+			// decided only after the whole loop (see Handle's doc comment). Keep
+			// iterating regardless: each matching invocation gets its own attempt.
+			switch outcome {
+			case outcomeRetryable:
+				if firstErr == nil {
+					firstErr = err
+				}
+			case outcomeExhausted:
+				anyExhausted = true
+				if exhaustedErr == nil {
+					exhaustedErr = err
+				}
 			}
 		}
 	}
-	// Return contract: nil when something executed successfully (or nothing
-	// matched); ErrInvocationNotEligible when nothing executed and at least one
-	// matched invocation is protected (running or waiting out a retry backoff).
+	// Aggregate: decide the single message-level error from the per-invocation
+	// outcomes collected across the whole rule loop.
+	if hasState {
+		// 1. Any retryable failure this delivery → the message stays pending
+		//    (retryable): return the first such failure, even if other
+		//    invocations succeeded or are otherwise still running.
+		if firstErr != nil {
+			return firstErr
+		}
+		// 2. Every matched invocation is terminal (complete or exhausted) AND at
+		//    least one exhausted → the message is terminal; route it to the DLQ.
+		//    allMatchedTerminal fails open to false on a read error, keeping the
+		//    message pending rather than DLQ'ing it.
+		if anyExhausted && allMatchedTerminal(invState, matched) {
+			return fmt.Errorf("%w: %w", stream.ErrInvocationExhausted, exhaustedErr)
+		}
+		// 3. Any matched invocation was protected- or slot-timeout-skipped
+		//    (unresolved) → the message stays pending with NO retry accounting.
+		//    This fires even when other invocations executed successfully this
+		//    call: an unresolved invocation must not be ACKed away.
+		if skippedPending {
+			return stream.ErrInvocationNotEligible
+		}
+		// 4. Every matched invocation is complete (or nothing matched) → ACK.
+		return nil
+	}
+	// No invocation state: preserve the old fail-fast tail — nil when something
+	// executed successfully (or nothing matched); ErrInvocationNotEligible when
+	// nothing executed and at least one invocation was protected- or
+	// slot-timeout-skipped (so the stream leaves the message pending).
 	if executed {
 		return nil
 	}
@@ -1198,25 +1291,30 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 
 // recordFailure handles a failed invocation attempt: it decides whether the
 // attempt is retryable or exhausted, updates the invocation state and metrics
-// accordingly, and returns the error Handle should propagate. It is used for
-// both execution failures and marshal failures (both are failed attempts).
+// accordingly, and returns the outcome plus the plain error Handle should
+// aggregate. It is used for execution, marshal, secret-resolution, and timeout
+// failures (all are failed attempts).
 //
 // A retryable attempt (attempt < 1+retries) schedules a retry backoff via
-// RecordFailure and counts function_retries_total. An exhausted attempt
-// (attempt >= 1+retries) marks the invocation terminal via MarkExhausted; if
-// every other matched invocation is also terminal, the whole message is
-// terminal and the returned error wraps stream.ErrInvocationExhausted so the
-// stream layer routes it to the DLQ. Otherwise the plain error is returned so
-// the message stays pending and the other invocations continue.
+// RecordFailure, counts function_retries_total, and returns (outcomeRetryable,
+// err). An exhausted attempt (attempt >= 1+retries) marks the invocation
+// terminal via MarkExhausted, counts function_dlq_total, and returns
+// (outcomeExhausted, err). The message-level DLQ decision (whether EVERY matched
+// invocation is terminal) is NOT made here; it is deferred to Handle's
+// end-of-loop aggregation, so an invocation can exhaust while others still run
+// without short-circuiting them.
+//
+// The returned error is always the plain, unwrapped failure so Handle only has
+// to wrap stream.ErrInvocationExhausted once, at the aggregate, if the message
+// is terminal.
 func (r *Runner) recordFailure(
 	invState stream.InvocationState,
 	invocation string,
 	attempt int,
 	retries int,
-	matched []string,
 	fnName, handler, msgID, eventID, eventName string,
 	origErr error,
-) error {
+) (invocationOutcome, error) {
 	maxAttempts := 1 + retries
 	if attempt >= maxAttempts {
 		// Exhausted: mark the invocation terminal.
@@ -1232,13 +1330,7 @@ func (r *Runner) recordFailure(
 			"attempt", attempt,
 			"attempts_total", maxAttempts,
 		)
-		// If every matched invocation is now terminal, the message is terminal
-		// and must be routed to the DLQ. Otherwise leave it pending so the other
-		// invocations continue.
-		if allMatchedTerminal(invState, matched) {
-			return fmt.Errorf("%w: function %q handler %q exhausted after %d attempts: %w", stream.ErrInvocationExhausted, fnName, handler, attempt, origErr)
-		}
-		return fmt.Errorf("function %q handler %q exhausted after %d attempts: %w", fnName, handler, attempt, origErr)
+		return outcomeExhausted, fmt.Errorf("function %q handler %q exhausted after %d attempts: %w", fnName, handler, attempt, origErr)
 	}
 	// Retryable: schedule a retry backoff and count the retry.
 	backoff := retryBackoff(attempt)
@@ -1256,7 +1348,7 @@ func (r *Runner) recordFailure(
 		"retry_backoff", backoff,
 		"reason", origErr,
 	)
-	return fmt.Errorf("function %q handler %q: attempt %d failed: %w", fnName, handler, attempt, origErr)
+	return outcomeRetryable, fmt.Errorf("function %q handler %q: attempt %d failed: %w", fnName, handler, attempt, origErr)
 }
 
 // allMatchedTerminal reports whether every matched invocation is terminal

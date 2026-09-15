@@ -104,6 +104,70 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 	}
 }
 
+// TestHandleMultiHandlerFirstFailsSecondSucceeds is the primary aggregate
+// regression test: a message matching two handlers where the FIRST (by sorted
+// name) fails and the SECOND succeeds in the SAME delivery. The failure of A
+// must not prevent B from running; Handle returns a plain (retryable) error so
+// the message stays pending; B is marked complete and A is not. On a later
+// delivery A is retried (B skipped, not re-run) and, once A succeeds, a further
+// delivery skips both and returns nil (the stream would ACK).
+func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
+	a := &scriptedExecutor{fail: true} // sorts first, fails delivery 1
+	b := &scriptedExecutor{}           // sorts second, succeeds always
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "alpha", a), // sorts before "beta"
+		alwaysMatchFn(t, "beta", b),
+	}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Delivery 1: handler A fails yet handler B still executes and succeeds.
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if err == nil {
+		t.Fatal("expected delivery 1 to return an error (A failed)")
+	}
+	if errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("delivery 1 error = %v, want a plain (not not-eligible) error", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("delivery 1 error = %v, want a plain (not exhausted) error", err)
+	}
+	if a.count() != 1 || b.count() != 1 {
+		t.Fatalf("delivery1 calls: alpha=%d beta=%d, want 1/1 (B must still run)", a.count(), b.count())
+	}
+	if prog.IsComplete("alpha/index.run") {
+		t.Errorf("alpha should NOT be marked after failure")
+	}
+	if !prog.IsComplete("beta/index.run") {
+		t.Errorf("beta should be marked after success")
+	}
+
+	// Delivery 2 (advance past A's 1m backoff): A is retried and now succeeds;
+	// B is skipped (executor not called again). Handle returns nil (stream ACKs).
+	prog.advance(2 * time.Minute)
+	a.setFail(false)
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("delivery 2: %v", err)
+	}
+	if a.count() != 2 {
+		t.Errorf("alpha calls = %d, want 2 (retried)", a.count())
+	}
+	if b.count() != 1 {
+		t.Errorf("beta calls = %d, want 1 (skipped on redelivery)", b.count())
+	}
+	if !prog.IsComplete("alpha/index.run") {
+		t.Errorf("alpha should be marked after delivery-2 success")
+	}
+
+	// Delivery 3: both skipped, nil, no extra executor calls.
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("delivery 3: %v", err)
+	}
+	if a.count() != 2 || b.count() != 1 {
+		t.Fatalf("delivery3 calls: alpha=%d beta=%d, want 2/1 (both skipped)", a.count(), b.count())
+	}
+}
+
 // TestHandleSkippedInvocationsDoNotCountMetrics verifies that a skipped
 // invocation (already completed on a previous delivery) is not counted as an
 // execution: handler_success_total and function_handler_success_total only
@@ -211,10 +275,11 @@ func TestHandleWithoutStateUnchanged(t *testing.T) {
 }
 
 // TestHandleMultipleFunctionsIndependentState verifies that each function's
-// invocation state is tracked independently across redeliveries. Names are
-// chosen so the always-failing function (Z) sorts last: the runner iterates in
-// sorted order and returns on the first failure, so Z must come after C for C
-// to be retried on delivery 2.
+// invocation state is tracked independently across redeliveries. Now that
+// Handle aggregates outcomes instead of failing fast, ALL matching functions
+// are attempted on every eligible delivery regardless of the others' outcomes:
+// a failure in one handler no longer prevents the later, sorted ones from
+// running.
 func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	a := &scriptedExecutor{}           // A: always succeeds
 	c := &scriptedExecutor{fail: true} // C: fails delivery 1, succeeds delivery 2
@@ -227,7 +292,9 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// Delivery 1: A succeeds (marked), C fails (unmarked), Z never runs (unmarked).
+	// Delivery 1: each independent invocation gets its own attempt — A succeeds
+	// (marked), C and Z each fail (separately). Handle returns the first plain
+	// error (Z sorts last but its failure is aggregated, not fail-fast).
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected delivery 1 to fail")
 	}
@@ -240,8 +307,8 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	if prog.IsComplete("Z/index.run") {
 		t.Errorf("Z should not be marked")
 	}
-	if a.count() != 1 || c.count() != 1 || z.count() != 0 {
-		t.Fatalf("delivery1 calls: A=%d C=%d Z=%d, want 1/1/0", a.count(), c.count(), z.count())
+	if a.count() != 1 || c.count() != 1 || z.count() != 1 {
+		t.Fatalf("delivery1 calls: A=%d C=%d Z=%d, want 1/1/1 (all independently attempted)", a.count(), c.count(), z.count())
 	}
 
 	// Delivery 2: A skipped, C retried (succeeds, marked), Z retried (fails). The
@@ -257,8 +324,8 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	if c.count() != 2 {
 		t.Errorf("C calls = %d, want 2 (retried)", c.count())
 	}
-	if z.count() != 1 {
-		t.Errorf("Z calls = %d, want 1 (retried)", z.count())
+	if z.count() != 2 {
+		t.Errorf("Z calls = %d, want 2 (retried)", z.count())
 	}
 	if !prog.IsComplete("C/index.run") {
 		t.Errorf("C should be marked after success")
@@ -279,8 +346,8 @@ func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
 	if c.count() != 2 {
 		t.Errorf("C calls = %d, want 2 (skipped)", c.count())
 	}
-	if z.count() != 2 {
-		t.Errorf("Z calls = %d, want 2 (retried)", z.count())
+	if z.count() != 3 {
+		t.Errorf("Z calls = %d, want 3 (retried)", z.count())
 	}
 }
 
@@ -391,11 +458,13 @@ func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
 	}
 }
 
-// TestHandleExhaustedWithOtherRunnableKeepsPending verifies that when a failing
-// invocation exhausts but another matched invocation is still runnable (not
-// terminal), Handle returns the plain error (not ErrInvocationExhausted) so the
-// message stays pending and the other invocation continues.
-func TestHandleExhaustedWithOtherRunnableKeepsPending(t *testing.T) {
+// TestHandleExhaustedAndOtherCompletesRoutesToDLQ verifies the aggregate
+// exhaustion decision: when a failing invocation exhausts (retries:0) and the
+// other matched invocation executes and completes in the SAME delivery, every
+// matched invocation is terminal (one exhausted, one complete), so Handle
+// returns ErrInvocationExhausted and the stream layer routes the message to the
+// DLQ. Note both run in one delivery (no fail-fast).
+func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
 	alpha := &scriptedExecutor{fail: true} // exhausts
 	beta := &scriptedExecutor{}            // succeeds
 	r := NewWithMetrics([]*PreparedFunction{
@@ -405,17 +474,97 @@ func TestHandleExhaustedWithOtherRunnableKeepsPending(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// alpha exhausts (retries:0) but beta is still runnable, so the message is
-	// NOT terminal: Handle returns a plain error, not ErrInvocationExhausted.
 	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
-	if err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
-		t.Fatalf("handle error = %v, want a plain (non-exhausted) error", err)
+	// alpha exhausts and beta completes this delivery → all matched terminal →
+	// the message routes to the DLQ.
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, want ErrInvocationExhausted", err)
 	}
 	if !prog.IsTerminal("alpha/index.run") {
 		t.Fatalf("alpha should be terminal (exhausted)")
 	}
+	if !prog.IsComplete("beta/index.run") {
+		t.Fatalf("beta should be complete (it succeeded this delivery)")
+	}
+}
+
+// TestHandleExhaustedOtherProtectedKeepsPending verifies the cross-replica
+// hazard: when a failing invocation exhausts (retries:0) but another matched
+// invocation is protected (waiting out a retry backoff or running on another
+// replica), NOT all matched invocations are terminal — the protected one is
+// unresolved — so Handle returns ErrInvocationNotEligible (nothing else
+// executed, protected skip) and the message stays pending rather than being
+// routed to the DLQ or ACKed.
+func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
+	alpha := &scriptedExecutor{fail: true} // exhausts
+	beta := &scriptedExecutor{}             // protected (never executed)
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "alpha", 0, alpha),
+		fnWithRetries(t, "beta", 0, beta),
+	}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	// Mark beta protected by a future retry backoff so it is skipped (not
+	// eligible) this delivery.
+	prog.nextAt["beta/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	// alpha exhausts but beta remains unresolved (protected) → the message must
+	// NOT be DLQ'd and must NOT be ACKed: ErrInvocationNotEligible (protected
+	// skip, nothing else executed) keeps it pending.
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle error = %v, want ErrInvocationNotEligible (beta unresolved)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (beta unresolved)", err)
+	}
+	if !prog.IsTerminal("alpha/index.run") {
+		t.Fatalf("alpha should be terminal (exhausted)")
+	}
+	// beta is protected, not complete/exhausted → not terminal.
 	if prog.IsTerminal("beta/index.run") {
-		t.Fatalf("beta should NOT be terminal (it succeeded and is complete)")
+		t.Fatalf("beta should NOT be terminal (it is only protected)")
+	}
+}
+
+// TestHandleSuccessWithProtectedSkipNotEligible pins the cross-replica ACK
+// hazard: a succeeded invocation does not let the message ACK while a sibling
+// invocation is unresolved — the stream keeps it pending and reclaim replays it.
+func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
+	alpha := &scriptedExecutor{} // executes and succeeds this delivery
+	beta := &scriptedExecutor{}   // protected, never executes
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "alpha", alpha),
+		alwaysMatchFn(t, "beta", beta),
+	}, silentLogger(), nil)
+
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	// Mark beta protected by a future retry backoff so it is skipped (not
+	// eligible) this delivery.
+	prog.nextAt["beta/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	// alpha succeeded but beta remains unresolved (protected) → the message must
+	// NOT be ACKed: ErrInvocationNotEligible (protected skip) keeps it pending.
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle error = %v, want ErrInvocationNotEligible (beta unresolved)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (beta unresolved)", err)
+	}
+	if alpha.count() != 1 {
+		t.Fatalf("alpha calls = %d, want 1 (executed and succeeded)", alpha.count())
+	}
+	if !prog.IsComplete("alpha/index.run") {
+		t.Errorf("alpha should be marked complete despite the message not being ACKed")
+	}
+	if beta.count() != 0 {
+		t.Fatalf("beta calls = %d, want 0 (protected invocation skipped)", beta.count())
 	}
 }
 

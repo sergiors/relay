@@ -75,7 +75,7 @@ type ConsumerConfig struct {
 	// oversized 3*MaxRuleTimeout guard against in-flight reclamation.
 	MinPendingIdle time.Duration
 	// DLQStream is the stream that exhausted/poison messages are written to.
-	// Defaults to "<Stream>:dlq" if empty.
+	// Defaults to "relay:<Stream>:dlq" if empty.
 	DLQStream string
 	Log       *slog.Logger
 	// Metrics is an optional metrics registry. A nil registry disables all
@@ -84,11 +84,6 @@ type ConsumerConfig struct {
 	// MetricsInterval is how often the pending-gauge GaugeSource runs.
 	// Defaults to DefaultMetricsInterval if zero.
 	MetricsInterval time.Duration
-	// DisableProgress disables per-handler invocation-state tracking. When
-	// true, redelivered messages re-run every matching handler exactly as before
-	// (at-least-once, no skip). Test/ops hook: invocation-state tracking is
-	// enabled by default (zero value); set true only in tests.
-	DisableProgress bool
 	// MaxBufferedEvents bounds the number of messages read from Redis (via
 	// XREADGROUP or reclaimed) that have been handed to processing but not yet
 	// finished (ACKed / DLQ'd / left-pending). When the buffer is at capacity,
@@ -124,7 +119,7 @@ type Consumer struct {
 	metrics         *metrics.Registry
 	metricsInterval time.Duration
 	backoff         *backoff
-	invocationStore *invocationStore
+	invStateStore   invocationStateStore
 	healthy         atomic.Bool
 	// buffer is the bounded local-event semaphore: it caps the number of
 	// messages read from Redis and held locally before completion, so the
@@ -138,6 +133,10 @@ type Consumer struct {
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
+	return newConsumer(cfg, &invocationStore{client: cfg.Client})
+}
+
+func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.Block == 0 {
 		cfg.Block = DefaultBlock
 	}
@@ -157,7 +156,7 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		cfg.MinPendingIdle = DefaultReclaimInterval
 	}
 	if cfg.DLQStream == "" {
-		cfg.DLQStream = cfg.Stream + ":dlq"
+		cfg.DLQStream = "relay:" + cfg.Stream + ":dlq"
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -190,11 +189,10 @@ func NewConsumer(cfg ConsumerConfig) *Consumer {
 		buffer:          newBufferSemaphore(capacity),
 		scheduleRunner:  cfg.ScheduleRunner,
 	}
-	// Invocation-state tracking is always constructed when a client is present
-	// (the consumer always has one). DisableProgress turns it off for tests.
-	if !cfg.DisableProgress {
-		c.invocationStore = &invocationStore{client: cfg.Client}
-	}
+	// The consumer is always constructed with a functional invocation-state
+	// store. processMessage/processScheduleMessage/routeToDLQ rely on it being
+	// present (no nil guard), so the seam must be injected here.
+	c.invStateStore = store
 	c.healthy.Store(true)
 	return c
 }
@@ -778,14 +776,10 @@ func (c *Consumer) processMessage(
 	// Inject a per-message invocation-state handle so the runner can skip
 	// invocations that already completed on a previous delivery or are protected
 	// by an active attempt deadline. The handle is bound to this (stream, group,
-	// msgID) and reads/writes the invocation-state hash in Redis. When
-	// invocation-state tracking is disabled (tests) the context carries none and
-	// the runner behaves exactly as before.
+	// msgID) and reads/writes the invocation-state hash in Redis.
 	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
-	if c.invocationStore != nil {
-		handlerCtx = WithInvocationState(handlerCtx,
-			NewInvocationState(ctx, c.invocationStore, c.stream, c.group, msg.ID, c.log))
-	}
+	handlerCtx = WithInvocationState(handlerCtx,
+		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msg.ID, c.log))
 
 	// A schedule-occurrence message is recognized by its relay.schedule envelope
 	// and, when a ScheduleRunner is wired, routed directly to it, bypassing event
@@ -848,10 +842,8 @@ func (c *Consumer) processMessage(
 	// may be redelivered, so its state must remain for the redelivery to skip
 	// completed handlers. A clear failure is logged only; the TTL is the
 	// fallback cleanup.
-	if c.invocationStore != nil {
-		if err := c.invocationStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-			c.log.Warn(fmt.Sprintf("Message %q: clear invocation state: %v", msg.ID, err))
-		}
+	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn(fmt.Sprintf("Message %q: clear invocation state: %v", msg.ID, err))
 	}
 }
 
@@ -882,13 +874,11 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	// number and the invocation-state handle bound to this (stream, group, msgID),
 	// so a redelivery skips a completed schedule invocation. The ScheduleRunner
 	// (runner.InvokeHandler) itself carries no invocation state (it has no
-	// matching pre-pass), but the invocation Store still protects this message's
+	// matching pre-pass), but the invocation store still protects this message's
 	// redelivery via the same hash keying.
 	handlerCtx := WithDeliveryAttempt(ctx, deliveryNum)
-	if c.invocationStore != nil {
-		handlerCtx = WithInvocationState(handlerCtx,
-			NewInvocationState(ctx, c.invocationStore, c.stream, c.group, msgID, c.log))
-	}
+	handlerCtx = WithInvocationState(handlerCtx,
+		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))
 
 	err := c.scheduleRunner(handlerCtx, occ.Function, occ.Handler, occ.Payload())
 	if err != nil {
@@ -940,10 +930,8 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	}
 	// Eagerly clear the invocation-state hash after a successful ACK, exactly
 	// like processMessage. A clear failure is logged only; the TTL is the fallback.
-	if c.invocationStore != nil {
-		if err := c.invocationStore.clear(ctx, c.stream, c.group, msgID); err != nil {
-			c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, err))
-		}
+	if err := c.invStateStore.clear(ctx, c.stream, c.group, msgID); err != nil {
+		c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, err))
 	}
 }
 
@@ -989,10 +977,8 @@ func (c *Consumer) routeToDLQ(
 	// write and the ACK succeed. If the ACK failed (handled above) the message
 	// stays in the PEL and may be redelivered, so its state must remain. A clear
 	// failure is logged only; the TTL is the fallback cleanup.
-	if c.invocationStore != nil {
-		if err := c.invocationStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-			c.log.Warn(fmt.Sprintf("Message %q: clear invocation state after DLQ: %v", msg.ID, err))
-		}
+	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn(fmt.Sprintf("Message %q: clear invocation state after DLQ: %v", msg.ID, err))
 	}
 }
 

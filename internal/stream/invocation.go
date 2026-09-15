@@ -80,6 +80,19 @@ const (
 	kindExhausted
 )
 
+// invocationStateStore is the per-message invocation-state persistence seam:
+// the concrete *invocationStore implements it against Redis; tests may
+// substitute a fake.
+type invocationStateStore interface {
+	completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
+	markComplete(ctx context.Context, stream, group, msgID, invocation string) error
+	tryStart(ctx context.Context, stream, group, msgID, invocation string, now, deadline time.Time) (started bool, attempt int, wait time.Duration, err error)
+	finishFailure(ctx context.Context, stream, group, msgID, invocation string, backoff time.Duration, now time.Time) (time.Time, error)
+	markExhausted(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
+	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
+	clear(ctx context.Context, stream, group, msgID string) error
+}
+
 // invocationStore is a thin Redis-backed store for per-message invocation
 // state. Each key is a HASH mapping an invocation ID ("<function>/<handler>")
 // to a short value describing that invocation's lifecycle for this message.
@@ -123,6 +136,29 @@ func (p *invocationStore) completed(
 		return false, err
 	}
 	return v == "ok", nil
+}
+
+// terminal reports whether the invocation is terminal (complete or exhausted);
+// redis.Nil (field absent) means not terminal.
+func (p *invocationStore) terminal(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) (bool, error) {
+	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	kind, _, _, ok := parseInvocationState(v)
+	if !ok {
+		return false, nil
+	}
+	return kind == kindComplete || kind == kindExhausted, nil
 }
 
 // markComplete records that the invocation completed for this message. HSET and
@@ -452,8 +488,7 @@ func WithInvocationState(ctx context.Context, p InvocationState) context.Context
 // InvocationStateFrom returns the InvocationState carried in ctx, or (nil,
 // false) if absent. Callers must treat the value as best-effort context: it
 // never panics and returns false when no invocation state was injected (e.g.
-// when the runner is driven directly in tests or invocation tracking is
-// disabled).
+// when the runner is driven directly in tests).
 func InvocationStateFrom(ctx context.Context) (InvocationState, bool) {
 	p, ok := ctx.Value(invocationStateContextKey{}).(InvocationState)
 	return p, ok
@@ -471,14 +506,14 @@ func WithClock(next func() time.Time) Option {
 }
 
 // NewInvocationState builds the concrete per-message InvocationState handle the
-// stream layer injects. It binds an invocationStore to one (stream, group,
+// stream layer injects. It binds an invocationStateStore to one (stream, group,
 // msgID) and captures the delivery context so the runner's calls hit the right
 // key. Reads are lazy per-invocation (one HGET per call), which is acceptable
 // for v1; the batch completedSet is available for callers that know the full set
 // up front.
 func NewInvocationState(
 	ctx context.Context,
-	store *invocationStore,
+	store invocationStateStore,
 	stream,
 	group,
 	msgID string,
@@ -503,7 +538,7 @@ func NewInvocationState(
 // invocationState is the concrete per-message handle the stream layer injects.
 type invocationState struct {
 	ctx    context.Context
-	store  *invocationStore
+	store  invocationStateStore
 	stream string
 	group  string
 	msgID  string
@@ -526,19 +561,12 @@ func (p *invocationState) IsComplete(invocation string) bool {
 // A Redis read error fails open to false (not terminal), so the message is
 // conservatively left pending rather than DLQ'd.
 func (p *invocationState) IsTerminal(invocation string) bool {
-	v, err := p.store.client.HGet(p.ctx, invocationStateKey(p.stream, p.group, p.msgID), invocation).Result()
-	if err == redis.Nil {
-		return false
-	}
+	terminal, err := p.store.terminal(p.ctx, p.stream, p.group, p.msgID, invocation)
 	if err != nil {
 		p.log.Debug(fmt.Sprintf("Invocation state: read %q: %v; treating as not terminal", invocation, err))
 		return false
 	}
-	kind, _, _, ok := parseInvocationState(v)
-	if !ok {
-		return false
-	}
-	return kind == kindComplete || kind == kindExhausted
+	return terminal
 }
 
 // MarkComplete logs but does not fail the handler on a write error: the message

@@ -432,6 +432,11 @@ func TestIntegrationReclaimAfterIdleRetrySuccess(t *testing.T) {
 func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	requireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
+	// The default DLQ stream is a Relay-owned, `relay:`-prefixed key, never the
+	// user-owned source stream name.
+	if got := e.consumer.dlqStream; got != "relay:"+e.stream+":dlq" {
+		t.Fatalf("dlqStream = %q, want relay:%s:dlq", got, e.stream)
+	}
 	id := e.xadd(t, `{"a":1}`)
 	var attempts atomic.Int64
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
@@ -1618,4 +1623,70 @@ func pendingOf(cli *redis.Client, stream, group, id string) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+// TestIntegrationMultiHandlerIndependence proves the aggregate multi-handler
+// semantics end to end at the stream layer: a handler backed by two independent
+// invocations ("fnA/h" fails its first delivery then succeeds; "fnB/h" always
+// succeeds) mimics the runner's outcome aggregation. The two invocation-state
+// hash fields are tracked independently — fnB is skipped on redelivery (its
+// field is "ok") — and the message is ACKed only after both invocations resolve.
+func TestIntegrationMultiHandlerIndependence(t *testing.T) {
+	requireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	var fnAExec, fnBExec atomic.Int64
+	acked := make(chan struct{})
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := InvocationStateFrom(ctx)
+		if !ok {
+			t.Fatalf("no invocation state in ctx")
+		}
+		// fnB: always succeeds, claimed once and completed (skipped on redelivery
+		// via its "ok" field).
+		if started, _, _ := p.TryStart("fnB/h", time.Hour); started {
+			fnBExec.Add(1)
+			p.MarkComplete("fnB/h")
+		}
+		// fnA: fails the first delivery (records a retry backoff), succeeds later.
+		// If a redelivery arrives before the backoff elapses, TryStart is gated:
+		// mirror the runner by leaving the message pending rather than ACKing an
+		// unresolved invocation.
+		startedA, _, _ := p.TryStart("fnA/h", time.Hour)
+		if startedA {
+			if fnAExec.Add(1) == 1 {
+				p.RecordFailure("fnA/h", time.Millisecond) // simulate the runner's retry backoff
+				return fmt.Errorf("fnA first delivery failed")
+			}
+		} else if !p.IsTerminal("fnA/h") {
+			// fnA is protected (waiting out its retry backoff) and not yet resolved:
+			// keep the message pending, never ack it.
+			return ErrInvocationNotEligible
+		}
+		// All resolutions complete: the aggregate is nil so the stream ACKs.
+		close(acked)
+		return nil
+	})
+	<-acked
+	WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.stop(t)
+
+	if fnAExec.Load() != 2 {
+		t.Fatalf("fnA executions = %d, want 2 (first fails, second succeeds)", fnAExec.Load())
+	}
+	if fnBExec.Load() != 1 {
+		t.Fatalf("fnB executions = %d, want 1 (completed and skipped on redelivery)", fnBExec.Load())
+	}
+	// After ACK the invocation-state key is cleared.
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
+		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
+	}
 }

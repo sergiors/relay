@@ -70,14 +70,19 @@ func TestEventStringFallback(t *testing.T) {
 
 func TestNewConsumerDefaults(t *testing.T) {
 	c := NewConsumer(ConsumerConfig{Client: redis.NewClient(&redis.Options{}), Stream: "events"})
-	if c.dlqStream != "events:dlq" {
-		t.Errorf("dlqStream default = %q, want events:dlq", c.dlqStream)
+	if c.dlqStream != "relay:events:dlq" {
+		t.Errorf("dlqStream default = %q, want relay:events:dlq", c.dlqStream)
 	}
 	if c.minPendingIdle != DefaultReclaimInterval {
 		t.Errorf("minPendingIdle default = %s, want DefaultReclaimInterval = %s", c.minPendingIdle, DefaultReclaimInterval)
 	}
 	if c.reclaimInterval != time.Minute {
 		t.Errorf("reclaimInterval default = %s, want 1m", c.reclaimInterval)
+	}
+	// Invariant: the consumer is always constructed with a functional
+	// invocation-state store (the production path supplies a Redis-backed one).
+	if c.invStateStore == nil {
+		t.Error("invStateStore is nil, want non-nil (consumer must always carry an invocation-state store)")
 	}
 }
 

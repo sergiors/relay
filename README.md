@@ -1189,7 +1189,8 @@ handler failure — stays in the PEL.
   `next_attempt_at` marker in the invocation state. Once `1 + retries` attempts
   are exhausted, the invocation is marked `exhausted` (terminal).
 - **Exhaustion → DLQ**: when every non-complete matched invocation is exhausted,
-  the whole message is written to the dead-letter stream `<stream>:dlq` and the
+  the whole message is written to the dead-letter stream `relay:<stream>:dlq` (a
+  Relay-owned `relay:`-prefixed key) and the
   original is then acknowledged, removing it from the PEL. Per-invocation DLQ is
   not claimed; exhaustion of the last runnable invocation routes the message.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
