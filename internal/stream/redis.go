@@ -897,6 +897,34 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			)
 			return
 		}
+		// An obsolete invocation: the function or its schedule entry/handler was
+		// removed from the current configuration while the message was pending.
+		// That removal is an intentional configuration change, so the message is
+		// terminal but MUST NOT be retried or routed to the DLQ — acknowledge it
+		// (and then clear its invocation state), exactly like the success tail.
+		// Note the ordering: this must run BEFORE the exhaustion check, because
+		// an obsolete occurrence is never exhausted (exhaustion implies retries
+		// were attempted, which an obsolete occurrence never is).
+		if errors.Is(err, ErrInvocationObsolete) {
+			c.log.Debug("Schedule: occurrence obsolete (function or schedule removed); acknowledging",
+				"message_id", msgID,
+				"delivery_attempt", deliveryNum,
+				"reason", err,
+			)
+			ackErr := c.client.XAck(ctx, c.stream, c.group, msgID).Err()
+			if ackErr != nil {
+				c.log.Warn(fmt.Sprintf("Schedule: message %q: ack: %v", msgID, ackErr))
+				c.noteOutcome(ackErr, 0)
+				return
+			}
+			// Clear the invocation-state hash after a successful ACK, exactly
+			// like the success tail. A clear failure is logged only; the TTL is
+			// the fallback cleanup.
+			if cerr := c.invStateStore.clear(ctx, c.stream, c.group, msgID); cerr != nil {
+				c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, cerr))
+			}
+			return
+		}
 		// A terminal message: the schedule invocation is exhausted, so the message
 		// routes to the DLQ.
 		if errors.Is(err, ErrInvocationExhausted) {

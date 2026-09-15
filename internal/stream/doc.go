@@ -63,5 +63,8 @@
 // decoded event to the caller's Handler. Schedule-occurrence messages are a
 // notable exception: they are routed to the ScheduleRunner seam (when wired),
 // which is the runner's InvokeHandler executing the named function/handler
-// directly without event matching.
+// directly without event matching. A ScheduleRunner that reports
+// ErrInvocationObsolete (the function or schedule handler was removed while the
+// occurrence was pending) causes the message to be acknowledged — an obsolete
+// occurrence is terminal and is never retried or dead-lettered.
 package stream

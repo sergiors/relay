@@ -497,7 +497,7 @@ func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
 // routed to the DLQ or ACKed.
 func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
 	alpha := &scriptedExecutor{fail: true} // exhausts
-	beta := &scriptedExecutor{}             // protected (never executed)
+	beta := &scriptedExecutor{}            // protected (never executed)
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
@@ -534,7 +534,7 @@ func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
 // invocation is unresolved — the stream keeps it pending and reclaim replays it.
 func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
 	alpha := &scriptedExecutor{} // executes and succeeds this delivery
-	beta := &scriptedExecutor{}   // protected, never executes
+	beta := &scriptedExecutor{}  // protected, never executes
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
@@ -620,5 +620,170 @@ func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	}
 	if fs[0].DLQTotal != 1 {
 		t.Fatalf("dlq after exhaustion = %d, want 1", fs[0].DLQTotal)
+	}
+}
+
+// --- Lifecycle regressions #4-#8: removed functions/rules on the event path ---
+//
+// These pin the invariant that Handle re-matches against the CURRENT registry
+// snapshot every delivery, so a removed function or removed rule drops out of
+// `matched` on the next delivery: it stops gating the ACK, its stale
+// invocation-state field is never consulted, and it is never DLQ'd.
+
+// regression #4: a function whose rule matches H is registered; its invocation
+// is pre-marked as waiting out a retry backoff (which WOULD block a redelivery
+// if it still gated). The function is then REMOVED from the registry. A
+// redelivery matches nothing, so Handle returns nil (the stream would ACK) and
+// the removed invocation's backoff no longer blocks.
+func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	// Pre-mark alpha waiting out a future retry backoff.
+	prog.nextAt["alpha/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Remove the function from the registry before redelivery.
+	r.Registry().Replace("alpha", nil)
+
+	// Nothing matches → nil (ACK). The removed invocation must not block.
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle = %v, want nil (removed function must not block the ack)", err)
+	}
+	// The removed invocation is never exhausted (not marked in the fake).
+	if len(prog.exhausted) != 0 {
+		t.Fatalf("exhausted = %v, want none (removed invocation must not be marked exhausted)", prog.exhausted)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (function removed, nothing to run)", exec.count())
+	}
+}
+
+// regression #5: the function stays registered but its handler is removed from
+// the template rules, so MatchingRules no longer matches H. Redelivery matches
+// nothing → nil (ACK); the stale invocation-state field is not consulted.
+func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	prog.nextAt["alpha/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Swap to a template with NO matching rules (empty rule set).
+	swapped := NewPrepared(
+		function.Function{
+			Name: "alpha",
+			Template: &function.Template{
+				Runtime: "node24",
+				Rules:   []function.Rule{},
+			},
+		},
+		&runtime.Prepared{Name: "alpha", Image: "x"},
+		exec,
+	)
+	r.Registry().Replace("alpha", swapped)
+
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle = %v, want nil (removed rule must not block the ack)", err)
+	}
+	if len(prog.exhausted) != 0 {
+		t.Fatalf("exhausted = %v, want none (removed rule invocation must not be marked exhausted)", prog.exhausted)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (no matching rules)", exec.count())
+	}
+}
+
+// regression #6: two functions A (removed) and B (valid, its invocation
+// pre-marked complete). A redelivery matches only B, which is complete → Handle
+// returns nil (ACK). A's removal does not re-gate anything.
+func TestHandleRemovedAndCompleteMatchesAck(t *testing.T) {
+	a := &countingExecutor{}
+	b := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "alpha", a),
+		alwaysMatchFn(t, "beta", b),
+	}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	// B already completed on a previous delivery.
+	prog.done["beta/index.run"] = true
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Remove function alpha before redelivery.
+	r.Registry().Replace("alpha", nil)
+
+	// Only B matches, and B is complete → nil (ACK).
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle = %v, want nil (only the complete B matches)", err)
+	}
+	if a.count() != 0 || b.count() != 0 {
+		t.Fatalf("executor calls: alpha=%d beta=%d, want 0/0 (A removed, B complete)", a.count(), b.count())
+	}
+}
+
+// regression #7: A removed; B valid but its invocation is protected by an
+// active retry backoff (TryStart returns started=false, wait>0), so it is NOT
+// eligible. Handle must return stream.ErrInvocationNotEligible (message stays
+// pending) — NOT an ACK. This pins that a removed (obsolete) A does not
+// force-ACK a message whose B is still unresolved.
+func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
+	a := &countingExecutor{}
+	b := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "alpha", a),
+		alwaysMatchFn(t, "beta", b),
+	}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	// B waits out a future retry backoff → not eligible this delivery.
+	prog.nextAt["beta/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Remove function alpha before redelivery.
+	r.Registry().Replace("alpha", nil)
+
+	// Only B matches and B is protected → not eligible, message stays pending.
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle = %v, want ErrInvocationNotEligible (B unresolved; removed A must not force an ack)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle = %v, must NOT be ErrInvocationExhausted (B resolved-late would be pending, not DLQ)", err)
+	}
+	if len(prog.exhausted) != 0 {
+		t.Fatalf("exhausted = %v, want none (removed A must not be marked exhausted)", prog.exhausted)
+	}
+}
+
+// regression #8: no DLQ accounting for a removed invocation. On a removed
+// function/rule redelivery, MarkExhausted is never called for the removed
+// invocation and function_dlq_total is not bumped. Combined with #4/#5/#6's
+// assertions on prog.exhausted, this pins there is no DLQ path for removals.
+func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
+	m := metrics.New()
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), m)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	prog.nextAt["alpha/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	r.Registry().Replace("alpha", nil)
+
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle = %v, want nil", err)
+	}
+	if len(prog.exhausted) != 0 {
+		t.Fatalf("exhausted = %v, want none (removed invocation must not be MarkExhausted → no DLQ)", prog.exhausted)
+	}
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 0 {
+		t.Fatalf("function stats = %+v, want none (no DLQ/metrics for a removed function)", fs)
 	}
 }

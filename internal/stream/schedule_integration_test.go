@@ -256,7 +256,7 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	}
 }
 
-// A schedule message whose runner returns ErrInvocationNotEligible (a protected
+// A schedule message whose ScheduleRunner reports ErrInvocationNotEligible (a protected
 // invocation, e.g. running on another replica or waiting out a retry backoff) is
 // left pending, never acked and never DLQ'd.
 func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
@@ -280,6 +280,40 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 	waitSustained(t, "not-eligible schedule message stays pending", 500*time.Millisecond, func() bool {
 		_, ok := env.pending()[id]
 		return ok
+	})
+	env.stop(t)
+}
+
+// A schedule message whose ScheduleRunner reports ErrInvocationObsolete (the
+// function or its schedule entry/handler was removed while the message was
+// pending) is terminal but must be ACKed — never left pending, never routed to
+// the DLQ. This is the intentional-removal case: retrying or dead-lettering an
+// obsolete occurrence would be wrong, so the stream acknowledges it instead.
+func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
+	requireRedis(t)
+	env := newEnv(t, ConsumerConfig{
+		ScheduleRunner: func(ctx context.Context, fn, handler string, payload []byte) error {
+			return fmt.Errorf("%w: removed", ErrInvocationObsolete)
+		},
+		MinPendingIdle:  300 * time.Millisecond,
+		ReclaimInterval: 200 * time.Millisecond,
+	})
+	id := env.xadd(t, schEnvelope(t, schOcc()))
+	env.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
+
+	// The obsolete occurrence is acknowledged: it disappears from the PEL.
+	WaitFor(t, 8*time.Second, "obsolete schedule message acked (gone from PEL)", func() bool {
+		_, ok := env.pending()[id]
+		return !ok
+	})
+	// It must NOT be dead-lettered, and it must stay acked — no reclaim brings it
+	// back into the PEL.
+	waitSustained(t, "obsolete schedule message stays acked and un-DLQed", 500*time.Millisecond, func() bool {
+		if _, ok := env.pending()[id]; ok {
+			return false
+		}
+		_, dlqed := env.dlq()[id]
+		return !dlqed
 	})
 	env.stop(t)
 }

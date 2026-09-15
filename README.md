@@ -529,7 +529,10 @@ timezone/timeout) converges live through the reconciler: the worker's cron
 jobs are replaced in place, so **future** occurrences use the current
 definition. Already-published occurrences are not purged from Redis — those
 entries were valid when published and expire via the dedup-key TTL / stream
-retention.
+retention. An occurrence that is still pending when its function or schedule
+handler is removed is treated as obsolete: it is acknowledged (terminal) rather
+than retried forever or dead-lettered, because its removal was an intentional
+configuration change.
 
 ### Environment variables and secrets
 

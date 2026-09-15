@@ -564,3 +564,125 @@ func TestIntegrationScheduleRetryFailureLeavesPending(t *testing.T) {
 		t.Fatalf("invocation field = %q, want a next_attempt_at marker", v)
 	}
 }
+
+// TestIntegrationScheduleObsoleteFunctionRemoved publishes an occurrence for a
+// function, then REMOVES that function from the runner's registry before the
+// consumer starts. The occurrence must be treated as obsolete: ACKed (gone from
+// the PEL), never DLQ'd, and the invocation-state key cleared — never retried
+// forever.
+func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{fail: 1000} // would never succeed if it ran
+	r := registerScheduleFn(t, exec, 100)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+
+	// Remove the function from the runner's registry BEFORE the consumer starts,
+	// so the reclaim delivery sees it absent.
+	r.Registry().Replace(scheduleFnName, nil)
+
+	e.start()
+	e.eventually("obsolete (function removed) schedule message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("obsolete schedule message not routed to DLQ", func() bool {
+		// Once acked, nothing must reappear, and no DLQ entry may exist.
+		if _, ok := e.pending(id); ok {
+			return false
+		}
+		return !e.inDlq(id)
+	})
+	// The invocation-state key is cleared after the ACK.
+	e.eventually("obsolete schedule invocation-state key cleared", func() bool {
+		return !e.hasStateKey(id)
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (removed function must not execute)", got)
+	}
+}
+
+// TestIntegrationScheduleObsoleteScheduleHandlerRemoved publishes an occurrence,
+// then SWAPS the function's template to one whose Schedules no longer include
+// the handler. The occurrence must be treated as obsolete: ACKed, not DLQ'd,
+// never retried forever, and the executor never runs.
+func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 100)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 8, 3, 13, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+
+	// Swap the function to a template whose Schedules no longer include the
+	// occurrence's handler, BEFORE the consumer starts.
+	r.Registry().Replace(scheduleFnName, NewPrepared(
+		function.Function{
+			Name: scheduleFnName,
+			Template: &function.Template{
+				Runtime: "node24",
+				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}}},
+				// No Schedules: the handler is removed.
+			},
+		},
+		&runtime.Prepared{Name: scheduleFnName, Image: "x"},
+		exec,
+	))
+
+	e.start()
+	e.eventually("obsolete (handler removed) schedule message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("obsolete handler-removed schedule message not routed to DLQ", func() bool {
+		if _, ok := e.pending(id); ok {
+			return false
+		}
+		return !e.inDlq(id)
+	})
+	e.eventually("obsolete handler-removed invocation-state key cleared", func() bool {
+		return !e.hasStateKey(id)
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (removed handler must not execute)", got)
+	}
+}
+
+// TestIntegrationScheduleUnavailableStaysPending is regression #3: a function
+// still REGISTERED but temporarily unavailable (NewUnavailable) must leave the
+// occurrence PENDING across reclaim cycles — never ACKed, never DLQ'd. It is a
+// temporary condition, not an obsolete removal.
+func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
+	_ = redisAvailable(t)
+	r := NewWithMetrics(
+		[]*PreparedFunction{NewUnavailable(function.Function{Name: scheduleFnName, Template: &function.Template{Runtime: "node24"}})},
+		silentLogger(), nil)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 8, 3, 14, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	e.start()
+
+	// The message is delivered into the PEL and stays pending (unavailable =
+	// retryable) across the reclaim grace window, never ACKed and never DLQ'd.
+	e.eventually("unavailable schedule message delivered into PEL", func() bool {
+		_, ok := e.pending(id)
+		return ok
+	})
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	wasPending := true
+	for time.Now().Before(deadline) {
+		_, ok := e.pending(id)
+		if !ok {
+			wasPending = false
+			break
+		}
+		if e.inDlq(id) {
+			t.Fatalf("unavailable schedule message must not be DLQ'd")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !wasPending {
+		t.Fatalf("message must stay pending (never acked) while the function is temporarily unavailable")
+	}
+}

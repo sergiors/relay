@@ -1154,19 +1154,38 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 // stream layer (via ConsumerConfig.ScheduleRunner) drives retry, backoff,
 // invocation state, and DLQ around this single invocation.
 func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payload []byte) error {
-	// Take one consistent registry snapshot and find the function. A schedule
-	// whose function is missing or unavailable is dropped: the reconciler
-	// removes the schedule's jobs when the function directory vanishes, so a
-	// miss here is a race between the swap and a tick.
-	var pf *PreparedFunction
-	for _, f := range r.reg.snapshot() {
-		if f.fn.Name == fnName {
-			pf = f
-			break
+	// Invocation state (when present) distinguishes the production stream path
+	// from direct callers/tests: obsolete-removal is only treated as terminal
+	// on the production path. See the availability checks below.
+	invState, hasState := stream.InvocationStateFrom(ctx)
+
+	// Find the function in the current registry. GetByName returns nil only when
+	// the function is ABSENT (removed) — a present but unavailable function
+	// returns a non-nil entry whose Prepared() is nil. These two cases must be
+	// handled differently:
+	//   - absent (removed): an intentional configuration change, so an occurrence
+	//     for it is OBSOLETE and terminal (ACKed, never retried/DLQ'd) — but only
+	//     on the production state-carrying path; direct callers/tests keep the
+	//     legacy plain error.
+	//   - present but unavailable: temporary (build failed at startup/reconcile),
+	//     retryable exactly as today.
+	pf := r.reg.GetByName(fnName)
+	if pf == nil {
+		if hasState {
+			r.log.Warn(fmt.Sprintf("Schedule: occurrence obsolete; function %q removed; acknowledging", fnName),
+				"function", fnName,
+				"handler", handler,
+			)
+			return fmt.Errorf("%w: schedule function %q handler %q no longer in configuration", stream.ErrInvocationObsolete, fnName, handler)
 		}
-	}
-	if pf == nil || pf.Prepared() == nil {
 		r.log.Warn(fmt.Sprintf("Schedule: function %q is not available", fnName))
+		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+	}
+	if pf.Prepared() == nil {
+		// The function exists but its image could not be built yet: temporarily
+		// unavailable, so the occurrence is retryable (not obsolete — the function
+		// is still configured).
+		r.log.Warn(fmt.Sprintf("Schedule: function %q is temporarily unavailable", fnName))
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 
@@ -1176,15 +1195,26 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 	// matching schedule entry provides both; multiple entries sharing a handler
 	// behave identically (occurrence identity distinguishes them by scheduled_at).
 	// Fall back to the event defaults when the handler has no schedule entry,
-	// exactly as Handle falls back to the rule defaults.
+	// exactly as Handle falls back to the rule defaults. On the production
+	// (state-carrying) path, a missing schedule entry means the handler was
+	// removed from the template while the occurrence was pending → obsolete.
 	timeout := function.DefaultTimeout
 	retries := function.DefaultRetries
+	found := false
 	for _, sch := range pf.fn.Template.Schedules {
 		if sch.Handler == handler {
 			timeout = sch.Timeout
 			retries = sch.Retries
+			found = true
 			break
 		}
+	}
+	if hasState && !found {
+		r.log.Warn(fmt.Sprintf("Schedule: occurrence obsolete; schedule handler %q no longer in template; acknowledging", handler),
+			"function", fnName,
+			"handler", handler,
+		)
+		return fmt.Errorf("%w: schedule function %q handler %q no longer in configuration", stream.ErrInvocationObsolete, fnName, handler)
 	}
 
 	// Cap the schedule timeout at the configured maximum, exactly like Handle
@@ -1194,7 +1224,6 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 		timeout = cap
 	}
 
-	invState, hasState := stream.InvocationStateFrom(ctx)
 	invocation := fnName + "/" + handler
 
 	// Reserve the worker-global and per-function concurrency slots BEFORE

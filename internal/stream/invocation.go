@@ -477,6 +477,14 @@ var ErrInvocationNotEligible = errors.New("invocation not eligible")
 // message).
 var ErrInvocationExhausted = errors.New("invocation exhausted")
 
+// ErrInvocationObsolete is returned (wrapped) by the runner when an invocation
+// no longer exists in the current function/template configuration — the
+// function or its schedule entry/handler was removed while the message was
+// pending. Obsolete invocations are terminal and MUST NOT be retried or
+// routed to the DLQ: their removal was an intentional configuration change,
+// so the stream layer acknowledges the message instead.
+var ErrInvocationObsolete = errors.New("invocation obsolete")
+
 // WithInvocationState returns a child of ctx carrying the per-message
 // InvocationState. The stream layer sets this before invoking the Handler so
 // the runner can skip already-completed or in-flight invocations without

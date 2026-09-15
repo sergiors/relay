@@ -256,6 +256,91 @@ func TestInvokeHandlerSlotTimeoutLeavesPending(t *testing.T) {
 	<-firstDone
 }
 
+// TestInvokeHandlerObsoleteFunctionRemoved verifies that on the production
+// (state-carrying) path, an occurrence for a function NO LONGER in the registry
+// returns a wrapped stream.ErrInvocationObsolete — the stream ACKs the message
+// instead of retrying it forever or dead-lettering it. No invocation-state
+// method may be called (the occurrence is obsolete before TryStart).
+func TestInvokeHandlerObsoleteFunctionRemoved(t *testing.T) {
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+	// Registry WITHOUT the function: NewWithMetrics with an empty set.
+	r := NewWithMetrics(nil, silentLogger(), nil)
+
+	err := r.InvokeHandler(ctx, "ghost", "index.run", []byte(`{}`))
+	if !errors.Is(err, stream.ErrInvocationObsolete) {
+		t.Fatalf("err = %v, want wrapped ErrInvocationObsolete", err)
+	}
+	if len(prog.attempts) != 0 || len(prog.marks) != 0 || len(prog.failures) != 0 || len(prog.exhausted) != 0 {
+		t.Fatalf("invocation state was touched: attempts=%v marks=%v failures=%v exhausted=%v",
+			prog.attempts, prog.marks, prog.failures, prog.exhausted)
+	}
+}
+
+// TestInvokeHandlerObsoleteScheduleHandlerRemoved verifies that on the
+// production path, an occurrence whose function is present and available but
+// whose schedule HANDLER is no longer in the current template's Schedules is
+// obsolete: returns wrapped stream.ErrInvocationObsolete, no TryStart, and the
+// executor is never called.
+func TestInvokeHandlerObsoleteScheduleHandlerRemoved(t *testing.T) {
+	exec := &countingExecutor{}
+	// Build a prepared function whose template has NO schedule entries at all.
+	pf := NewPrepared(
+		function.Function{
+			Name: "fn",
+			Template: &function.Template{
+				Runtime: "node24",
+				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}}},
+			},
+		},
+		&runtime.Prepared{Name: "fn", Image: "x"},
+		exec,
+	)
+	r := NewWithMetrics([]*PreparedFunction{pf}, silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "fn", "index.run", []byte(`{}`))
+	if !errors.Is(err, stream.ErrInvocationObsolete) {
+		t.Fatalf("err = %v, want wrapped ErrInvocationObsolete", err)
+	}
+	if len(prog.attempts) != 0 {
+		t.Fatalf("TryStart was called (attempts=%v); obsolete occurrence must not claim", prog.attempts)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (obsolete handler must not execute)", exec.count())
+	}
+}
+
+// TestInvokeHandlerUnavailableFunctionStillRetryable is the regression for the
+// conflation bug: a function that IS still in the registry but is temporarily
+// unavailable (image build failed at startup/reconcile) must NOT be treated as
+// obsolete — it returns a plain retryable error, NOT ErrInvocationObsolete (and
+// not NotEligible/Exhausted), so the stream leaves the message pending. No
+// TryStart (the unavailable branch returns before claiming).
+func TestInvokeHandlerUnavailableFunctionStillRetryable(t *testing.T) {
+	r := NewWithMetrics(
+		[]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})},
+		silentLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "broken", "index.run", []byte(`{}`))
+	if err == nil {
+		t.Fatal("expected InvokeHandler to fail for an unavailable function")
+	}
+	if errors.Is(err, stream.ErrInvocationObsolete) {
+		t.Fatalf("err = %v, must NOT be ErrInvocationObsolete (function still configured, just unavailable)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationNotEligible) || errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("err = %v, must NOT be NotEligible/Exhausted (unavailable is a plain retryable error)", err)
+	}
+	if len(prog.attempts) != 0 || len(prog.marks) != 0 || len(prog.failures) != 0 {
+		t.Fatalf("invocation state was touched for an unavailable function: attempts=%v marks=%v failures=%v",
+			prog.attempts, prog.marks, prog.failures)
+	}
+}
+
 // TestInvokeHandlerNoStateUnchanged verifies that with no invocation state in
 // ctx, the legacy behavior is preserved: the executor runs, a success returns
 // nil, and no state methods are touched.
