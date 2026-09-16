@@ -9,6 +9,8 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
+
+	"relay/internal/runtime/python"
 )
 
 // Service container labels beyond the shared registry in labels.go. relay.type
@@ -336,11 +338,20 @@ func validateServiceEntrypoint(entrypoint string) error {
 // entrypoint file on the given runtime, or an error for an unsupported runtime
 // or an invalid entrypoint. One image serves both invocations and services
 // (the function image's bootstrap entrypoint is overridden per-container), so
-// this is the only service-specific knowledge the runtime needs — no separate
-// plan or image per service. node24 and python3.14 are the runtimes Relay
-// supports as of this iteration. The file is launched as a relative path under
-// /app (the image's WORKDIR where the function dir is COPYied), so a nested
-// entrypoint like "app/service.js" resolves to /app/app/service.js.
+// this is the only service-specific knowledge the generic layers need — no
+// separate plan or image per service — and the runtime switch here is the
+// sanctioned dispatch point.
+//
+// entrypoint is a RELATIVE source FILE path (e.g. "app/main.py"); each runtime
+// decides how that file is executed:
+//
+//   - node24 runs the file directly: `node /app/<entrypoint>`. The `/app/`
+//     prefix is the image WORKDIR where the function directory is COPYied, so a
+//     nested entrypoint like "app/service.js" resolves to /app/app/service.js.
+//   - python3.14 executes the file as a MODULE under the function directory
+//     (`python -m <module>`, e.g. "app/main.py" → `python -m app.main`), so
+//     package-relative imports (`from .deps import ...`) work. The conversion
+//     and its Python-specific validation live in python.ServiceCommand.
 func ServiceEntry(runtimeName, entrypoint string) ([]string, error) {
 	if err := validateServiceEntrypoint(entrypoint); err != nil {
 		return nil, err
@@ -349,7 +360,7 @@ func ServiceEntry(runtimeName, entrypoint string) ([]string, error) {
 	case "node24":
 		return []string{"node", "/app/" + entrypoint}, nil
 	case "python3.14":
-		return []string{"python", "/app/" + entrypoint}, nil
+		return python.ServiceCommand(entrypoint)
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q for services", runtimeName)
 	}

@@ -353,6 +353,29 @@ func TestExampleUsersAPITemplateParses(t *testing.T) {
 	}
 }
 
+// The fastapi-service example is a python3.14 service whose entrypoint is a
+// nested package module (app/main.py), demonstrating module execution.
+func TestExampleFastAPITemplateParses(t *testing.T) {
+	data, err := os.ReadFile("../../examples/functions/fastapi-service/template.yaml")
+	if err != nil {
+		t.Skipf("example not present: %v", err)
+	}
+	tmpl, err := ParseTemplate(data)
+	if err != nil {
+		t.Fatalf("parse example template: %v", err)
+	}
+	if tmpl.Runtime != "python3.14" {
+		t.Fatalf("runtime = %q, want python3.14", tmpl.Runtime)
+	}
+	if len(tmpl.Services) != 1 {
+		t.Fatalf("services = %d, want 1", len(tmpl.Services))
+	}
+	s := tmpl.Services[0]
+	if s.Entrypoint != "app/main.py" || s.Port != 8000 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want {app/main.py 8000 1}", s)
+	}
+}
+
 // Nested entrypoints (a relative path inside the application directory) parse
 // and round-trip into the Service entrypoint.
 func TestParseServiceNestedEntrypoint(t *testing.T) {

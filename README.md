@@ -718,8 +718,11 @@ services:
   per-request: HTTP requests are handled directly by the user's application
   inside the container. It must be a relative path inside the application
   directory (e.g. `service.js`, `app/main.py`) — no whitespace, no absolute
-  paths, and no `..` path elements. The runtime starts it as `node <entrypoint>`
-  / `python <entrypoint>` within the application directory.
+  paths, and no `..` path elements. Each runtime decides how the file is
+  executed: Node runs it directly (`node <entrypoint>` within the application
+  directory), while Python executes it **as a module** (`python -m <module>` —
+  e.g. `app/main.py` runs as `python -m app.main`) so package-relative imports
+  work.
 - `port` (optional) is the internal TCP port the service application listens
   on. It defaults to `80` and must be between `1` and `65535`. Relay injects it
   as the `PORT` environment variable (it cannot be overridden by template env
@@ -735,7 +738,8 @@ services:
 The service lifecycle reuses the function image machinery with no separate
 build system: the function image is prepared exactly as for invocations, and a
 service container runs the **same image** with its entrypoint overridden to
-the service entrypoint (e.g. `node /app/service.js`). This keeps every version of a
+the service entrypoint (e.g. `node /app/service.js`; Python overrides to
+`python -m app.main`). This keeps every version of a
 function in one image repository, so the existing image-retirement machinery
 covers services too.
 
@@ -1396,6 +1400,13 @@ above.
   `GET /users`, listening on the template-configured port (`3000`, injected as
   `PORT`). No `events`-style invocation: Relay keeps the container running and
   reconciled.
+
+- `examples/functions/fastapi-service/` (python3.14): a persistent **service**
+  demonstrating that `entrypoint: app/main.py` runs as `python -m app.main`,
+  so package-relative imports work: `main.py` imports `from .deps import
+  get_settings` and serves `GET /health` (started via `uvicorn.run` in user
+  code, reading `PORT`). FastAPI/Uvicorn live in the user's code — Relay only
+  decides how the entrypoint file is executed.
 
 A single generic, cross-engine event matches both functions:
 

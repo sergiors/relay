@@ -7,9 +7,12 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +53,123 @@ setInterval(() => {}, 1 << 30);
 		t.Fatalf("prepare %s: %v", fnName, err)
 	}
 	return fn, prepared.Image
+}
+
+// TestIntegrationPythonServiceModuleExecution builds a tiny python3.14 function
+// whose service entrypoint is app/main.py (a nested package module with a
+// package-relative import from app/deps.py), starts one replica via the module
+// execution entrypoint (python -m app.main), and asserts the container actually
+// ran the module: its Config.Entrypoint is ["python","-m","app.main"] and the
+// logs contain the value the module imported with a relative import — the whole
+// point of module (not script) execution. No requirements.txt keeps the build to
+// just the base image.
+func TestIntegrationPythonServiceModuleExecution(t *testing.T) {
+	cli := requireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		if c, err := m.ServiceContainerList(cc); err == nil {
+			_ = m.StopServiceContainers(cc, c)
+		}
+		cleanupImagePrefixes(cli, "relay-fn-svc-py-svc:")()
+	})
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: python3.14
+events:
+  - handler: index.hi
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.py", "def hi(e): return 'hi'\n")
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	// app/__init__.py marks app as a package so the relative import resolves.
+	writeFile(t, dir, "app/__init__.py", "")
+	writeFile(t, dir, "app/deps.py", "NAME = 'from-relative-import-ok'\n")
+	// main.py imports a value with a PACKAGE-RELATIVE import and prints it before
+	// keeping the process alive forever. Printing proves python executed the file
+	// as an importable module, not as a bare script (a bare script run of
+	// app/main.py cannot resolve `.deps`).
+	writeFile(t, dir, "app/main.py", `from .deps import NAME
+# stdout is block-buffered when not attached to a TTY, so flush explicitly
+# before the keep-alive blocks forever -- otherwise the proof never reaches us.
+print("module-entrypoint-started " + NAME, flush=True)
+
+def keep_alive():
+    import time
+    while True:
+        time.sleep(86400)
+
+keep_alive()
+`)
+	fn := function.Function{Name: "svc-py-svc", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	prepared, err := mPrepare(ctx, t, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Resolve the entry through the same translation the reconciler uses.
+	entry, err := ServiceEntry("python3.14", "app/main.py")
+	if err != nil {
+		t.Fatalf("service entry: %v", err)
+	}
+	if len(entry) != 3 || entry[0] != "python" || entry[1] != "-m" || entry[2] != "app.main" {
+		t.Fatalf("service entry = %v, want [python -m app.main]", entry)
+	}
+
+	id, err := m.StartService(ctx, ServiceSpec{
+		Function:   "svc-py-svc",
+		Entrypoint: "app/main.py",
+		Port:       8000,
+		Image:      prepared.Image,
+		Entry:      entry,
+		Env:        []string{"PORT=8000"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+
+	// Wait for the container to be running, then assert its entrypoint.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if insp.Container.Config == nil || len(insp.Container.Config.Entrypoint) != 3 ||
+		insp.Container.Config.Entrypoint[0] != "python" ||
+		insp.Container.Config.Entrypoint[1] != "-m" ||
+		insp.Container.Config.Entrypoint[2] != "app.main" {
+		t.Fatalf("entrypoint = %v, want [python -m app.main]", insp.Container.Config.Entrypoint)
+	}
+
+	// Fetch the logs and assert the module (with its relative import) actually ran.
+	rc, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+	if err != nil {
+		t.Fatalf("logs: %v", err)
+	}
+	defer rc.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rc); err != nil {
+		t.Fatalf("copy logs: %v", err)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "module-entrypoint-started from-relative-import-ok") {
+		t.Fatalf("container logs do not show the module-entrypoint + relative-import proof, got:\n%s", logs)
+	}
 }
 
 func TestServiceStartListStop(t *testing.T) {

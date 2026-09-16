@@ -121,21 +121,35 @@ func TestServiceEntry(t *testing.T) {
 		runtime    string
 		entrypoint string
 		want       []string
-		wantErr    bool
+		wantErr    string // substring; empty means success
 	}{
-		{"node24", "service.js", []string{"node", "/app/service.js"}, false},
-		{"python3.14", "server.py", []string{"python", "/app/server.py"}, false},
-		{"node24", "app/service.js", []string{"node", "/app/app/service.js"}, false},
-		{"python3.14", "app/main.py", []string{"python", "/app/app/main.py"}, false},
-		{"node24", "a/b/c.js", []string{"node", "/app/a/b/c.js"}, false},
-		{"unknown", "service.js", nil, true},
-		{"node24", "../../etc/passwd", nil, true},
+		{"node24", "service.js", []string{"node", "/app/service.js"}, ""},
+		{"python3.14", "service.py", []string{"python", "-m", "service"}, ""},
+		{"node24", "app/service.js", []string{"node", "/app/app/service.js"}, ""},
+		{"python3.14", "app/main.py", []string{"python", "-m", "app.main"}, ""},
+		{"python3.14", "app/http/server.py", []string{"python", "-m", "app.http.server"}, ""},
+		{"node24", "a/b/c.js", []string{"node", "/app/a/b/c.js"}, ""},
+		// Python entrypoints that are valid files but not importable modules fail
+		// with a python-specific error (the conversion runs after validation).
+		{"python3.14", "app/main.js", nil, "require a .py module file"},
+		{"python3.14", "app/my-file.py", nil, "not a valid Python module name"},
+		{"unknown", "service.js", nil, "unsupported runtime"},
+		// The generic path rules reject these for BOTH runtimes, before any
+		// runtime-specific translation.
+		{"node24", "../../etc/passwd", nil, "must not contain"},
+		{"python3.14", "../main.py", nil, "must not contain"},
+		{"python3.14", "/app/main.py", nil, "relative"},
+		{"python3.14", "a//b.py", nil, "empty path elements"},
+		{"python3.14", ".hidden.py", nil, "path elements must not"},
 	} {
 		t.Run(tc.runtime+"/"+tc.entrypoint, func(t *testing.T) {
 			got, err := ServiceEntry(tc.runtime, tc.entrypoint)
-			if tc.wantErr {
+			if tc.wantErr != "" {
 				if err == nil {
-					t.Fatalf("expected error, got %v", got)
+					t.Fatalf("expected error containing %q, got %v", tc.wantErr, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error %q does not mention %q", err.Error(), tc.wantErr)
 				}
 				return
 			}

@@ -630,3 +630,50 @@ func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 		t.Fatalf("entry = %v, want [node /app/app/service.js]", started)
 	}
 }
+
+// A python3.14 service entrypoint resolves to module execution (python -m), and
+// replicas start with that launch path.
+func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.py", Port: 8000, Replicas: 1})
+	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := f.runningCount("fn", "app/main.py"); got != 1 {
+		t.Fatalf("running = %d, want 1", got)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var started []string
+	for _, c := range f.ctrs {
+		if c.function == "fn" && c.entrypoint == "app/main.py" {
+			started = c.entry
+		}
+	}
+	if len(started) != 3 || started[0] != "python" || started[1] != "-m" || started[2] != "app.main" {
+		t.Fatalf("entry = %v, want [python -m app.main]", started)
+	}
+}
+
+// A python service whose entrypoint is not a .py importable module cannot
+// resolve its entrypoint (python.ServiceCommand errors): reconcile still stops
+// stale containers but never starts replicas for that service.
+func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["stale-1"] = &fakeContainer{id: "stale-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
+
+	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
+	err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
+	if err == nil {
+		t.Fatal("expected an error for the unresolvable python entrypoint")
+	}
+	if !strings.Contains(err.Error(), "python services require a .py") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := f.countForFunction("fn"); got != 0 {
+		t.Fatalf("stale containers must still be removed, got %d", got)
+	}
+	if got := f.runningCount("fn", "app/main.js"); got != 0 {
+		t.Fatalf("python non-importable service must never start, got %d running", got)
+	}
+}
