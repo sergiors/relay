@@ -100,6 +100,13 @@ func BuildEnv(ctx context.Context, tmpl *function.Template, port int, preparedEn
 // error is returned (at least one error surfaces when anything failed), so a
 // transient daemon error on one container does not abort convergence of the rest.
 //
+// The returned bool reports whether the pass performed any convergence action
+// (stopped at least one removed-service or stale container, or attempted to
+// start at least one replica). A fully-converged desired state — everything
+// already running with the correct image, port, and replica count — returns
+// (false, nil). Callers can use this to distinguish a no-op verification pass
+// from a pass that actually changed state (e.g. for log-level selection).
+//
 // Container ownership is always label-derived. A container belongs to fnName
 // when its Function == fnName; containers of other functions are never touched.
 // The ownership predicate is NOT hostname-scoped — services must be
@@ -113,13 +120,17 @@ func Reconcile(
 	preparedEnv []string,
 	secrets SecretResolver,
 	log *slog.Logger,
-) error {
+) (bool, error) {
 	containers, err := d.ServiceContainerList(ctx)
 	if err != nil {
 		// Without a listing we cannot know the running set; surface the error
 		// rather than guessing whether to start/stop anything.
-		return fmt.Errorf("service: list containers: %w", err)
+		return false, fmt.Errorf("service: list containers: %w", err)
 	}
+	// changed reports whether any convergence action (a stop or a start
+	// attempt) was issued during this pass. It starts false and is only set by
+	// the classify/start work below.
+	changed := false
 
 	desired := make(map[string]function.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
@@ -142,6 +153,7 @@ func Reconcile(
 			continue
 		}
 		if _, ok := desired[c.Entrypoint]; !ok {
+			changed = true
 			if err := d.StopServiceContainers(ctx, []runtime.ServiceContainer{c}); err != nil {
 				fail(fmt.Errorf("service %q removed: %w", c.Entrypoint, err))
 			}
@@ -190,6 +202,7 @@ func Reconcile(
 
 		// Stop every stale/excess container for this service.
 		if len(stale) > 0 {
+			changed = true
 			if err := d.StopServiceContainers(ctx, stale); err != nil {
 				fail(fmt.Errorf("service %q stale: %w", svc.Entrypoint, err))
 			}
@@ -222,6 +235,7 @@ func Reconcile(
 			if occupied[slot] {
 				continue
 			}
+			changed = true
 			spec := runtime.ServiceSpec{
 				Function:   fnName,
 				Entrypoint: svc.Entrypoint,
@@ -236,7 +250,7 @@ func Reconcile(
 		}
 	}
 
-	return firstErr
+	return changed, firstErr
 }
 
 // RemoveAll stops and removes every service container belonging to fnName,
@@ -274,9 +288,11 @@ func NewServiceReconciler(d Docker, secrets SecretResolver, log *slog.Logger) *S
 }
 
 // Apply converges fnName's services to tmpl+image: it runs Reconcile and logs
-// the outcome (Info when converged, Warn on the first error). It is
-// intentionally non-fatal — a service-convergence failure must not fail the
-// function's reconcile.
+// the outcome — Info when the pass changed state, Debug when it was a no-op
+// verification pass, Warn when it errored. It is intentionally non-fatal: a
+// service-convergence failure must not fail the function's reconcile. The
+// Info/Debug distinction means an unchanged function (periodic self-healing
+// tick) does not log at Info; only converges that actually changed or failed do.
 func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -286,7 +302,8 @@ func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *func
 		replicas += svc.Replicas
 	}
 
-	if err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.log); err != nil {
+	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.log)
+	if err != nil {
 		if c.log != nil {
 			c.log.Warn(fmt.Sprintf("Service: reconciled with errors: %v", err),
 				"function", fnName,
@@ -295,13 +312,22 @@ func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *func
 		}
 		return
 	}
-	if c.log != nil {
+	if c.log == nil {
+		return
+	}
+	if changed {
 		c.log.Info("Service: reconciled",
 			"function", fnName,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 		)
+		return
 	}
+	c.log.Debug("Service: unchanged",
+		"function", fnName,
+		"services", len(tmpl.Services),
+		"replicas", replicas,
+	)
 }
 
 // Remove stops and removes every service container belonging to fnName. Called

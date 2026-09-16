@@ -466,7 +466,9 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// cheap and gives crash replacement within the default cadence without
 		// a separate services-only loop. updateServices is only reachable when
 		// the current build is available (this skip branch already guarantees
-		// cur.Prepared() != nil via isAvailable).
+		// cur.Prepared() != nil via isAvailable). When that converge pass is a
+		// no-op (nothing to stop or start), the caller logs it at Debug rather
+		// than Info — the summary line only surfaces real state changes.
 		if r.updateServices != nil && len(fn.Template.Services) > 0 {
 			r.updateServices(name, fn.Template, cur.Prepared().Image)
 		}

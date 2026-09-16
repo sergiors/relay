@@ -192,7 +192,7 @@ func TestReconcileInitialCreation(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
 
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -203,7 +203,7 @@ func TestReconcileInitialCreation(t *testing.T) {
 		t.Fatalf("slots = %v, want [0 1]", slots)
 	}
 	// Idempotent second pass is a no-op (replicas unchanged).
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -214,12 +214,12 @@ func TestReconcileInitialCreation(t *testing.T) {
 func TestReconcileScaleUp(t *testing.T) {
 	f := newFakeDocker()
 	svc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
-	if err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 
 	svc.Replicas = 3
-	if err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile 3: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 3 {
@@ -240,7 +240,7 @@ func TestReconcileScaleUp(t *testing.T) {
 func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 	f := newFakeDocker()
 	svc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 3}
-	if err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile 3: %v", err)
 	}
 	slots3 := f.replicas("fn", "service.js")
@@ -249,7 +249,7 @@ func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 	}
 
 	svc.Replicas = 1
-	if err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
@@ -267,7 +267,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 		function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2},
 		function.Service{Entrypoint: "old.js", Port: 80, Replicas: 1},
 	)
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "old.js"); got != 1 {
@@ -276,7 +276,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 
 	// Remove old.js from the template; only service.js remains.
 	reduced := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if err := Reconcile(context.Background(), f, "fn", reduced, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", reduced, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile reduced: %v", err)
 	}
 	if got := f.runningCount("fn", "old.js"); got != 0 {
@@ -290,7 +290,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 func TestReconcilePortChange(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	old := f.replicas("fn", "service.js")
@@ -300,7 +300,7 @@ func TestReconcilePortChange(t *testing.T) {
 
 	// Change the port: the now-stale-config container must be replaced.
 	changed := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", changed, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", changed, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile changed: %v", err)
 	}
 	// The single container should still run (replaced), on the new port.
@@ -326,7 +326,7 @@ func TestReconcilePortChange(t *testing.T) {
 func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile img-1: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -334,7 +334,7 @@ func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	}
 
 	// New image -> all stale -> replaced with the new image.
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-2", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-2", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile img-2: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -365,7 +365,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 	}
 
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -400,7 +400,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	slots0 := f.replicas("fn", "service.js")
@@ -420,7 +420,7 @@ func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f.mu.Unlock()
 	f.setState(toCrash, container.StateExited)
 
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile after crash: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -437,7 +437,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	// A Replica == -1 container (legacy/unlabeled) is always stale and replaced.
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	slots0 := f.replicas("fn", "service.js")
@@ -454,7 +454,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile unlabeled: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
@@ -481,7 +481,7 @@ func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
 	}
 
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile fn: %v", err)
 	}
 	// "other"'s container is untouched.
@@ -505,7 +505,7 @@ func TestReconcileStopFailureDoesNotAbort(t *testing.T) {
 	f.mu.Unlock()
 	f.failStopFor = "id-1"
 
-	err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog())
 	if err == nil {
 		t.Fatal("expected an error surfaced from the failing stop")
 	}
@@ -526,7 +526,7 @@ func containsErr(err error, substr string) bool {
 func TestRemoveAll(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -542,7 +542,7 @@ func TestRemoveAll(t *testing.T) {
 func TestSweepOrphans(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "live", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "live", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile live: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
@@ -623,7 +623,7 @@ func TestReconcileEmptyDesiredRemovesLeftovers(t *testing.T) {
 	f.ctrs["leftover-2"] = &fakeContainer{id: "leftover-2", function: "fn", entrypoint: "other.js", image: "img-old", port: 3000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("node24") // no services
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.countForFunction("fn"); got != 0 {
@@ -640,7 +640,7 @@ func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
 
 	// An unsupported runtime makes ServiceEntry fail for any entrypoint.
 	tmpl := serviceTemplate("rust", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable entrypoint (unsupported runtime)")
 	}
@@ -657,7 +657,7 @@ func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
 func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "app/service.js"); got != 1 {
@@ -682,7 +682,7 @@ func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.py", Port: 8000, Replicas: 1})
-	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "app/main.py"); got != 1 {
@@ -709,7 +709,7 @@ func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
 	f.ctrs["stale-1"] = &fakeContainer{id: "stale-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
-	err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable python entrypoint")
 	}
@@ -722,4 +722,159 @@ func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
 	if got := f.runningCount("fn", "app/main.js"); got != 0 {
 		t.Fatalf("python non-importable service must never start, got %d running", got)
 	}
+}
+
+// TestReconcileUnchangedIsNoOp: a fully-converged state (one running container
+// with the correct image, port, and replica label) is a pass that performs NO
+// convergence action — it returns (false, nil) and stops/starts nothing.
+func TestReconcileUnchangedIsNoOp(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["id-1"] = &fakeContainer{
+		id: "id-1", function: "fn", entrypoint: "service.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+	}
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	changed, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog())
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if changed {
+		t.Fatalf("changed = true, want false (already converged)")
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("stops = %v, want none for a no-op", f.stops)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1 (untouched)", got)
+	}
+}
+
+// captureLogger is a minimal in-memory slog writer used to assert the level and
+// text of ServiceReconciler.Apply's summary lines. Apply (and Reconcile) run
+// synchronously in this test, so a plain strings.Builder is safe.
+type captureLogger struct{ buf strings.Builder }
+
+func (c *captureLogger) Write(p []byte) (int, error) { return c.buf.Write(p) }
+
+func (c *captureLogger) String() string { return c.buf.String() }
+
+// TestApplyNoOpLogsDebugNotInfo: applying a converged state logs "Service:
+// unchanged" at Debug and never the Info "Service: reconciled" — neither the
+// first nor a repeated (idempotent) pass.
+func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["id-1"] = &fakeContainer{
+		id: "id-1", function: "fn", entrypoint: "service.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+	}
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	logger, capture := newCaptureLogger(slog.LevelDebug)
+	c := NewServiceReconciler(f, nil, logger)
+
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil) // idempotent second pass
+
+	out := capture.String()
+	if !strings.Contains(out, "Service: unchanged") {
+		t.Fatalf("expected no-op Apply to log \"Service: unchanged\", got:\n%s", out)
+	}
+	if !strings.Contains(out, "level=DEBUG") {
+		t.Fatalf("expected the no-op pass at DEBUG level, got:\n%s", out)
+	}
+	if strings.Contains(out, "Service: reconciled") {
+		t.Fatalf("no-op Apply must not log the Info \"Service: reconciled\" line, got:\n%s", out)
+	}
+}
+
+// TestApplyChangedLogsInfo: a missing replica triggers a start, so Apply logs
+// the Info "Service: reconciled" line (and performs the change).
+func TestApplyChangedLogsInfo(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	logger, capture := newCaptureLogger(slog.LevelInfo)
+	c := NewServiceReconciler(f, nil, logger)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+
+	out := capture.String()
+	if !strings.Contains(out, "Service: reconciled") {
+		t.Fatalf("expected the changed Apply to log Info \"Service: reconciled\", got:\n%s", out)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1 (the start happened)", got)
+	}
+}
+
+// TestApplyChangedStaleReplacement: a stale container (wrong image) is replaced
+// on Apply, which logs Info and stops the old / starts the new with the desired
+// image.
+func TestApplyChangedStaleReplacement(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["old-1"] = &fakeContainer{
+		id: "old-1", function: "fn", entrypoint: "service.js",
+		image: "img-old", port: 80, replica: 0, state: container.StateRunning,
+	}
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	logger, capture := newCaptureLogger(slog.LevelInfo)
+	c := NewServiceReconciler(f, nil, logger)
+	c.Apply(context.Background(), "fn", tmpl, "img-new", nil)
+
+	out := capture.String()
+	if !strings.Contains(out, "Service: reconciled") {
+		t.Fatalf("expected the stale-replacement Apply to log Info, got:\n%s", out)
+	}
+	if len(f.stops) != 1 || f.stops[0] != "old-1" {
+		t.Fatalf("stops = %v, want [old-1]", f.stops)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var running *fakeContainer
+	for _, c := range f.ctrs {
+		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+			running = c
+		}
+	}
+	if running == nil {
+		t.Fatal("no running container after stale replacement")
+	}
+	if running.image != "img-new" {
+		t.Fatalf("started image = %q, want img-new (the desired image)", running.image)
+	}
+}
+
+// TestApplyErrorLogsWarn: a stop failure makes Apply log the Warn
+// "Service: reconciled with errors" line.
+func TestApplyErrorLogsWarn(t *testing.T) {
+	f := newFakeDocker()
+	f.mu.Lock()
+	f.ctrs["id-1"] = &fakeContainer{
+		id: "id-1", function: "fn", entrypoint: "old.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+	}
+	f.mu.Unlock()
+	f.failStopFor = "id-1"
+	tmpl := serviceTemplate("node24")
+
+	logger, capture := newCaptureLogger(slog.LevelWarn)
+	c := NewServiceReconciler(f, nil, logger)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+
+	out := capture.String()
+	if !strings.Contains(out, "Service: reconciled with errors") {
+		t.Fatalf("expected the failing Apply to log Warn, got:\n%s", out)
+	}
+	if !strings.Contains(out, "level=WARN") {
+		t.Fatalf("expected the failing pass at WARN level, got:\n%s", out)
+	}
+}
+
+// newCaptureLogger builds a slog.Logger (at the given level) writing into a
+// captureLogger, and returns both.
+func newCaptureLogger(level slog.Level) (*slog.Logger, *captureLogger) {
+	c := &captureLogger{}
+	h := slog.NewTextHandler(c, &slog.HandlerOptions{Level: level})
+	return slog.New(h), c
 }
