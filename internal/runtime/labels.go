@@ -23,6 +23,16 @@ package runtime
 // untouchable. (Backward compatibility with labels from Relay processes older
 // than this model is deliberately NOT required: a restart simply treats such
 // containers as non-Relay and sweeps/reconciles only typed ones.)
+//
+// The same strict relay.type model classifies Relay's IMAGES. A single
+// relay.type label names either a function image or a dependency image; the
+// label set is the source of truth for which images Relay owns and how they
+// are wired. relay.fingerprint pins the content version the image was built
+// from, relay.function names the owning function, relay.dependency names the
+// exact dependency image this function image was built FROM (a full
+// "relay-dep-*" repo tag), and relay.runtime names the runtime a dependency
+// image was built for. The dependency GC reads exactly these labels and never
+// infers ownership from repository names alone.
 
 const (
 	labelType      = "relay.type"
@@ -37,6 +47,19 @@ const (
 	labelEntrypoint = "relay.entrypoint"
 	labelPort       = "relay.port"
 	labelReplica    = "relay.replica"
+
+	// Managed-image labels. These pin the identity and wiring of a managed
+	// image (function or dependency) so the dependency GC can classify images
+	// and resolve function→dependency ownership without inferring anything
+	// from repository names. relay.fingerprint holds the content fingerprint
+	// prefix the image was built from; relay.dependency is the full
+	// "relay-dep-*" reference the function image was built FROM (present on
+	// function images only, and only when the function declares deps);
+	// relay.runtime names the runtime spec.Name a dependency image was built
+	// for (dependency images only).
+	labelRuntime     = "relay.runtime"
+	labelFingerprint = "relay.fingerprint"
+	labelDependency  = "relay.dependency"
 )
 
 // The relay.type values. Every Relay-owned container carries exactly one; the
@@ -48,6 +71,59 @@ const (
 	ContainerTypeSchedule = "schedule"
 	ContainerTypeService  = "service"
 )
+
+// The relay.type values for managed IMAGES. Every managed image carries exactly
+// one; the absence of a type (or an unknown type) means an image is NOT managed
+// — an unlabeled "relay-fn-*" or "relay-dep-*" image from a pre-labels build is
+// unmanaged for classification purposes, and the dependency GC deliberately
+// never touches it (function-image cleanup handles legacy function images by
+// name; an inert, unlabeled legacy dependency image is left alone and documented
+// as out of scope for GC). These are exported so the builder stamps them without
+// a stringly-typed duplicate.
+const (
+	ImageTypeFunction   = "function"
+	ImageTypeDependency = "dependency"
+)
+
+// imageLabels builds the managed-image label set for a single image. imageType
+// is one of ImageTypeFunction / ImageTypeDependency; the remaining fields
+// narrow that identity (see labelRuntime / labelFingerprint / labelDependency).
+// Empty fields are simply omitted, so the caller can build a function label set
+// (type+function+fingerprint+optional dependency) or a dependency label set
+// (type+runtime+fingerprint) with one helper. These labels are the strict
+// classification the dependency GC reads: an image is a managed function image
+// iff its relay.type == ImageTypeFunction and a managed dependency image iff its
+// relay.type == ImageTypeDependency.
+func imageLabels(imageType string, fnName, runtimeName, fingerprint, dependency string) map[string]string {
+	l := map[string]string{labelType: imageType}
+	if fnName != "" {
+		l[labelFunction] = fnName
+	}
+	if runtimeName != "" {
+		l[labelRuntime] = runtimeName
+	}
+	if fingerprint != "" {
+		l[labelFingerprint] = fingerprint
+	}
+	if dependency != "" {
+		l[labelDependency] = dependency
+	}
+	return l
+}
+
+// functionImageLabels returns the managed function-image label set for a
+// function version built from the given dependency reference ("" when the
+// function declares no deps).
+func functionImageLabels(fnName, fingerprint, dependency string) map[string]string {
+	return imageLabels(ImageTypeFunction, fnName, "", fingerprint, dependency)
+}
+
+// dependencyImageLabels returns the managed dependency-image label set for a
+// dependency layer built for the named runtime from the given dependency
+// fingerprint.
+func dependencyImageLabels(runtimeName, fingerprint string) map[string]string {
+	return imageLabels(ImageTypeDependency, "", runtimeName, fingerprint, "")
+}
 
 // isServiceContainer reports whether labels classify a container as a
 // persistent Relay service container. It is a strict equality on relay.type

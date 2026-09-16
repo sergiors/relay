@@ -95,6 +95,13 @@ type Prepared struct {
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
 	// execution container for this function, after the base RELAY_HANDLER var.
 	Env []string
+	// Dependency is the full "relay-dep-*" reference this function image was
+	// built FROM, or "" when the function declares no dependency layer. It is
+	// the function image's parent, so a caller (the runner) knows which
+	// dependency image this function version pulls its payload from — the input
+	// to dependency garbage collection. It is populated on BOTH the build and
+	// reuse paths.
+	Dependency string
 }
 
 // Prepare builds exactly ONE image for the function's current content (never per
@@ -131,13 +138,30 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 
 	image := ImageRef(fn.Name, fp)
 
+	// Prepare the dependency label reference for the return value on both paths.
+	// On the build path it is the dependency image built FROM; on the reuse path
+	// it is computed WITHOUT building (the dependency image obviously exists, or
+	// the existing function image — which inherits its layers — would never have
+	// built). Computing the dependency fingerprint needs the same fnDir reads the
+	// function fingerprint above already performed, so it stays cheap.
+	funcPrepared := &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}
+	if !p.Deps.IsZero() {
+		// Split out the pure fingerprint computation so the reuse path below can
+		// name the function image's dependency without touching the daemon.
+		depFp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, p.Deps)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
+		}
+		funcPrepared.Dependency = depImageRef(depFp)
+	}
+
 	// Reuse an existing local image when present. The fingerprinted reference is
 	// the identity: an image carrying this exact tag was necessarily built from
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
 	if m.imageExists(ctx, image) {
 		m.log.Debug("Function %q: image %s exists; reusing", fn.Name, image)
-		return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
+		return funcPrepared, nil
 	}
 
 	// When the function declares a dependency layer, ensure the dependency image
@@ -146,9 +170,9 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// and every version with identical (runtime + arch + manifest + install), so
 	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
 	// existing layer with no rebuild (even when the function's source changed).
-	depRef := ""
+	depRef := funcPrepared.Dependency
 	if !p.Deps.IsZero() {
-		depRef, err = m.ensureDependencyImage(ctx, fn, spec, p.Deps)
+		depRef, err = m.ensureDependencyImage(ctx, fn, spec, p.Deps, depRef)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 		}
@@ -161,7 +185,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	}
 
 	start := time.Now()
-	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image); err != nil {
+	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef)); err != nil {
 		d := time.Since(start)
 		m.metrics.ObserveDurationLabels("function_build_seconds", []metrics.Label{
 			{Name: "function", Value: fn.Name},
@@ -186,31 +210,42 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		"duration", d,
 		"result", "success",
 	)
-	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}, nil
+	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env, Dependency: funcPrepared.Dependency}, nil
 }
 
-// ensureDependencyImage computes the dependency fingerprint for the function's
-// dependency manifest set and returns the dependency image reference, building
-// the image on first use. It is a no-op (returns the existing reference) when
-// the dependency image is already present locally — the content address makes
-// existence the correctness test, since the tag embeds the fingerprint over
-// every relevant input. If the dependency build fails, Prepare fails: there is
-// no fallback to the old single-stage build, because the function image's
-// Dockerfile inherits its dependency layers via FROM and cannot be built without
-// them.
-func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Function, spec plan.Spec, deps plan.Deps) (string, error) {
+// ensureDependencyImage builds the dependency image for the function's
+// dependency manifest set, returning the dependency image reference. It is a
+// no-op (returns the existing reference) when the dependency image is already
+// present locally — the content address makes existence the correctness test,
+// since the tag embeds the fingerprint over every relevant input. If the
+// dependency build fails, Prepare fails: there is no fallback to the old
+// single-stage build, because the function image's Dockerfile inherits its
+// dependency layers via FROM and cannot be built without them.
+//
+// depRef is the reference the caller already derived for the dependency
+// fingerprint (so a build failure is attributable, and the caller has it in hand
+// even for the reuse case). It must be the reference for depFingerprint; the
+// two travel together to keep "which dependency was this built for" exact.
+func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Function, spec plan.Spec, deps plan.Deps, depRef string) (string, error) {
+	// Derive the dependency fingerprint so the built image is stamped with the
+	// exact content address it encodes (see dependencyImageLabels). The
+	// fingerprint has already been computed by Prepare's split above, but
+	// recomputing here keeps this method self-contained and cheap (the same
+	// manifest reads); the reference passed in is what identifies the image.
 	fp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, deps)
 	if err != nil {
 		return "", fmt.Errorf("dependency fingerprint: %w", err)
 	}
-	ref := depImageRef(fp)
-	if m.imageExists(ctx, ref) {
-		m.log.Debug("Dependency image exists; reusing", "dep_image", ref)
-		return ref, nil
+	if depRef == "" {
+		depRef = depImageRef(fp)
+	}
+	if m.imageExists(ctx, depRef) {
+		m.log.Debug("Dependency image exists; reusing", "dep_image", depRef)
+		return depRef, nil
 	}
 
 	start := time.Now()
-	if err := buildDependencyImage(ctx, m.cli, spec, fn.Dir, deps, ref); err != nil {
+	if err := buildDependencyImage(ctx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
 		d := time.Since(start)
 		// Dependency-image build failures count as function build failures so the
 		// existing failure metric/label surface stays the single observability
@@ -221,7 +256,7 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 		m.log.Error("Function: dependency build failed",
 			"function", fn.Name,
 			"duration", d,
-			"dep_image", ref,
+			"dep_image", depRef,
 			"result", "failed",
 		)
 		return "", err
@@ -232,10 +267,10 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 	m.log.Info("Function: dependency layer built",
 		"function", fn.Name,
 		"duration", d,
-		"dep_image", ref,
+		"dep_image", depRef,
 		"result", "success",
 	)
-	return ref, nil
+	return depRef, nil
 }
 
 // Execute runs the container for one invocation of the given handler with the

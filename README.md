@@ -357,12 +357,23 @@ are installed once into reusable `relay-dep-*` images, fingerprinted by runtime
   dependency or source changes rebuild the top layers; a changed manifest yields a
   new `relay-dep-*` tag, an unchanged one is reused across every version of a
   function (and across functions with identical dependency sets). Dependency
-  images are content-addressed and, being shared bases, are **not** auto-pruned by
-  the startup sweep — a removed function image never removes a layer another
+  images are content-addressed and, being shared bases, are **not** auto-pruned
+  by the startup sweep — a removed function image never removes a layer another
   function may still need. The fingerprint keys on the base image **tag** (e.g.
   `python:3.14-slim`), not its digest, so a newer pull of the same tag reuses the
   cached `relay-dep-*` image — operators wanting a refresh must remove those images
   (a future digest-pinning feature is the proper fix).
+
+Managed images carry Relay-ownership labels: `relay.type=function|dependency`
+(classifies a function vs a dependency image), `relay.function`,
+`relay.runtime`, `relay.fingerprint`, and `relay.dependency` (a function image's
+`relay.dependency` names the exact `relay-dep-*` image it was built `FROM`).
+Labels — not repository names — are the source of truth for ownership:
+dependency images are garbage-collected **lifecycle-driven**, once at worker
+startup (after the boot sweep removed superseded function images) and once after
+each successful function-image removal — never periodically, never forced, and
+only when no managed function image references them. An image with no
+`relay.type` label (e.g. a pre-label dependency image) is never touched.
 
 ### Execution container lifecycle
 

@@ -355,6 +355,20 @@ func Run(logger *slog.Logger) {
 		}
 	}
 
+	// Lifecycle-driven dependency GC at startup. The boot sweep above removed
+	// every superseded function image (each such removal frees the dependency
+	// image only its removed version referenced), so prune now any managed
+	// dependency layer no managed function image references anymore. This runs
+	// OUTSIDE the st != nil gate on purpose: unlike RemoveImagesExcept, it needs
+	// no state keep-set — ownership is derived from the managed-image labels,
+	// which the builds above just stamped onto every new function/dependency
+	// image. It is best-effort and single-shot: an error is logged and left for
+	// the next natural lifecycle point (the next successful function-image
+	// removal, or the next startup); it never retries in a loop.
+	if _, err := manager.CleanupUnusedDependencies(context.Background()); err != nil {
+		logger.Warn(fmt.Sprintf("Dependency image cleanup: %v", err))
+	}
+
 	// The runner executes invocations. It is constructed before the stream
 	// consumer so its InvokeHandler can be wired as the consumer's ScheduleRunner
 	// seam (schedule-occurrence messages route directly to it, bypassing matching).

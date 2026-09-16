@@ -241,6 +241,13 @@ type ImageCleaner interface {
 	// to a function's repository, so the runner can retire each version with
 	// in-flight safety.
 	FunctionImageTags(ctx context.Context, name string) ([]string, error)
+	// CleanupUnusedDependencies removes managed dependency images no managed
+	// function image references anymore. Lifecycle-driven: call it after a
+	// managed function image was successfully removed, so a dependency layer
+	// whose last referencing function version just disappeared is pruned. It is
+	// best-effort and must not affect the outcome of the removal that preceded
+	// it.
+	CleanupUnusedDependencies(ctx context.Context) (int, error)
 }
 
 // Pairs a loaded function with its prepared image and the executor used to run
@@ -526,6 +533,22 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 				return
 			}
 			r.log.Warn(fmt.Sprintf("Image cleanup: remove retired %s: %v", image, err))
+			return
+		}
+
+		// The function image was successfully removed. This is the lifecycle
+		// moment a dependency layer may become orphaned: the removed function
+		// image was the only reference to its dependency, so run dependency GC
+		// now to prune any layer no managed function image references anymore.
+		// It is best-effort: a failure here (a genuine daemon error) is worth a
+		// Warn — it retries on the next natural pass after the next function-image
+		// removal or at the next startup — and must NOT affect the outcome of the
+		// removal that already succeeded. The function image's own removal (and
+		// this GC) both proceed off the event path in this same goroutine, and the
+		// reconciler pump is serial with this retire hook, so this cannot race a
+		// build that FROM the dependency.
+		if _, err := cleaner.CleanupUnusedDependencies(ctx); err != nil {
+			r.log.Warn(fmt.Sprintf("Dependency image cleanup: %v", err))
 		}
 	}()
 }

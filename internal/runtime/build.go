@@ -94,6 +94,7 @@ func buildImage(
 	fn function.Function,
 	p plan.BuildPlan,
 	image string,
+	labels map[string]string,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
@@ -121,7 +122,7 @@ func buildImage(
 		return fmt.Errorf("function %q: write dockerfile: %w", name, err)
 	}
 
-	return runImageBuild(ctx, cli, name, ctxDir, image)
+	return runImageBuild(ctx, cli, name, ctxDir, image, labels)
 }
 
 // writePlanFiles writes the generated plan files (bootstrap, injected
@@ -149,7 +150,9 @@ func writePlanFiles(ctxDir, name string, files []plan.File) error {
 
 // runImageBuild is the shared ImageBuild tail: write the Dockerfile is already
 // done by the caller; this tars the context, builds, and drains the response.
-func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string) error {
+// labels are the managed-image labels stamped onto the resulting image (see
+// buildImageOptions / managed image labeling in labels.go); nil means no labels.
+func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string, labels map[string]string) error {
 	// The daemon expects the build context as a tar stream; build it in memory
 	// from the staged directory rather than shelling out to tar.
 	contextTar, err := tarContext(ctxDir)
@@ -157,7 +160,7 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 		return fmt.Errorf("function %q: tar build context: %w", name, err)
 	}
 
-	resp, err := cli.ImageBuild(ctx, contextTar, buildImageOptions(image))
+	resp, err := cli.ImageBuild(ctx, contextTar, buildImageOptions(image, labels))
 	if err != nil {
 		return fmt.Errorf("function %q: docker build: %w", name, err)
 	}
@@ -184,7 +187,7 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 // isolated temp contexts (per-call), run the exact same manifest + base + install
 // command, and tag the same reference; Docker lets the tag land on the identical
 // content either way (last tag wins, content-equal), so no lockfile is needed.
-func buildDependencyImage(ctx context.Context, cli *client.Client, spec plan.Spec, fnDir string, deps plan.Deps, depRef string) error {
+func buildDependencyImage(ctx context.Context, cli *client.Client, spec plan.Spec, fnDir string, deps plan.Deps, depRef, depFingerprint string) error {
 	ctxDir, err := os.MkdirTemp("", "relay-dep-build-*")
 	if err != nil {
 		return fmt.Errorf("dependency %s: create build context: %w", depRef, err)
@@ -231,27 +234,36 @@ func buildDependencyImage(ctx context.Context, cli *client.Client, spec plan.Spe
 		return fmt.Errorf("dependency %s: write dockerfile: %w", depRef, err)
 	}
 
-	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef)
+	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, dependencyImageLabels(spec.Name, depFingerprint))
 }
 
 // buildImageOptions returns the ImageBuildOptions Relay uses for every function
-// build. Remove is set to true deliberately: the moby client v0.6.0 emits
+// and dependency build. Remove is set to true deliberately: the moby client
+// v0.6.0 emits
 // rm=0 when Remove is false (it only sends the value when opting out of the
 // daemon's default), which suppresses the daemon's default cleanup of
 // intermediate containers after a successful classic-builder build. Remove:true
 // restores rm=1, so the daemon prunes the intermediate RUN and metadata-step
 // containers (and the dangling parent-chain head image) once a build succeeds.
 //
+// labels are the managed-image labels stamped onto the resulting image config.
+// The build backend (buildkit, and the classic builder) applies them as LABEL
+// instructions equivalent — the same mechanism as a Dockerfile LABEL line — so
+// the labels land on the image and are visible via ImageList's per-image
+// Labels. Labels are nil when a build should stamp nothing (no managed-image
+// identity to record).
+//
 // Failed builds intentionally keep their intermediates: the daemon only removes
 // intermediates when the build completed successfully (Remove && retErr == nil),
 // so a failed build leaves its intermediate state in place for debugging.
 // ForceRemove is deliberately not used: it would also remove intermediates on
 // failure, which we do not want.
-func buildImageOptions(image string) client.ImageBuildOptions {
+func buildImageOptions(image string, labels map[string]string) client.ImageBuildOptions {
 	return client.ImageBuildOptions{
 		Tags:       []string{image},
 		Dockerfile: "Dockerfile",
 		Remove:     true,
+		Labels:     labels,
 	}
 }
 

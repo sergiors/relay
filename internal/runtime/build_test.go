@@ -17,7 +17,7 @@ import (
 // rm=1. It also asserts ForceRemove is NOT set: failed builds must keep their
 // intermediates for debugging.
 func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
-	opts := buildImageOptions("relay-fn-test:abc123")
+	opts := buildImageOptions("relay-fn-test:abc123", nil)
 
 	if !opts.Remove {
 		t.Error("expected Remove=true so the daemon removes intermediate containers after a successful build (moby client v0.6.0 emits rm=0 when Remove is false)")
@@ -30,6 +30,28 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 	}
 	if opts.Dockerfile != "Dockerfile" {
 		t.Errorf("Dockerfile = %q, want %q", opts.Dockerfile, "Dockerfile")
+	}
+	if opts.Labels != nil {
+		t.Errorf("Labels = %v, want nil for a plain build", opts.Labels)
+	}
+}
+
+// TestBuildImageOptionsCarriesManagedLabels verifies that a managed build passes
+// its ownership labels through to the daemon's ImageBuild options, so the
+// resulting image config carries them (the build backend applies them as LABEL
+// equivalents, the same mechanism Relay relies on for its label model).
+func TestBuildImageOptionsCarriesManagedLabels(t *testing.T) {
+	labels := map[string]string{labelType: ImageTypeFunction, labelFunction: "a", labelDependency: "relay-dep-abc"}
+	opts := buildImageOptions("relay-fn-a:abc123", labels)
+
+	if got := opts.Labels[labelType]; got != ImageTypeFunction {
+		t.Errorf("opts.Labels[relay.type] = %q, want %q", got, ImageTypeFunction)
+	}
+	if got := opts.Labels[labelFunction]; got != "a" {
+		t.Errorf("opts.Labels[relay.function] = %q, want a", got)
+	}
+	if got := opts.Labels[labelDependency]; got != "relay-dep-abc" {
+		t.Errorf("opts.Labels[relay.dependency] = %q, want relay-dep-abc", got)
 	}
 }
 

@@ -28,6 +28,13 @@ type blockExecutor struct {
 	// referenced reports, per image, whether a relay-owned container currently
 	// references it (ImageReferencedByManagedContainer).
 	referenced map[string]bool
+	// gcCalls counts how many times CleanupUnusedDependencies was invoked, for
+	// the dependency-GC-after-removal assertions.
+	gcCalls int
+	// gcErr, when true, makes CleanupUnusedDependencies return a genuine error
+	// so a test can assert the failure is logged but ignores the removal
+	// outcome.
+	gcErr bool
 	// entered is closed (once, under mu) when a blocking Execute begins, so the
 	// test can synchronize on it. release is closed to unblock Execute.
 	entered     chan struct{}
@@ -93,6 +100,23 @@ func (f *blockExecutor) FunctionImageTags(ctx context.Context, name string) ([]s
 		return nil, nil
 	}
 	return append([]string(nil), f.tags[name]...), nil
+}
+
+func (f *blockExecutor) CleanupUnusedDependencies(_ context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gcCalls++
+	if f.gcErr {
+		return 0, errRemoveBoom
+	}
+	return 0, nil
+}
+
+// gcCallCount returns how many times CleanupUnusedDependencies has run.
+func (f *blockExecutor) gcCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gcCalls
 }
 
 func (f *blockExecutor) removedImages() []string {
@@ -438,4 +462,78 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("condition not reached before timeout")
+}
+
+// A successful function-image removal fires dependency GC exactly once, off the
+// event path, after the removal succeeded: the function image that referenced
+// its dependency is gone, so the now-possibly-orphaned dependency layer can be
+// pruned.
+func TestSuccessfulRemovalRunsDependencyGC(t *testing.T) {
+	exec := &blockExecutor{startBlocks: false, tags: map[string][]string{}}
+	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, silentLogger(), nil)
+
+	r.RetireImage("relay-fn-a:old")
+	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
+
+	// GC must have fired exactly once, after the successful removal.
+	waitFor(t, func() bool { return exec.gcCallCount() == 1 })
+	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {
+		t.Fatalf("removed = %v, want [relay-fn-a:old]", got)
+	}
+}
+
+// A removal that is skipped (a relay-owned container references the image
+// forever) never fires dependency GC: the function image was NOT removed, so its
+// dependency is still referenced and pruning would be pointless. This pins "no
+// GC before/during a removal that did not succeed".
+func TestSkippedRemovalRunsNoDependencyGC(t *testing.T) {
+	exec := &blockExecutor{
+		startBlocks: false,
+		tags:        map[string][]string{},
+		referenced:  map[string]bool{"relay-fn-a:old": true},
+	}
+	orig := imageCleanupRetryDelays
+	imageCleanupRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { imageCleanupRetryDelays = orig })
+
+	logger, buf := debugBufferLogger()
+	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+
+	r.RetireImage("relay-fn-a:old")
+
+	// Wait for the retry loop to give up (exactly one deferral Info); the image
+	// was never removed, so GC must never have run.
+	waitFor(t, func() bool {
+		return strings.Count(buf.String(), "deferring to a later cleanup pass") == 1
+	})
+	if got := exec.removedImages(); len(got) != 0 {
+		t.Fatalf("removed a referenced image: %v, want none", got)
+	}
+	if n := exec.gcCallCount(); n != 0 {
+		t.Fatalf("dependency GC ran %d times on an unremoved image, want 0 (no GC before removal succeeds)", n)
+	}
+}
+
+// A dependency-GC failure is logged at Warn but must NOT change the outcome of
+// the function-image removal that preceded it: the removal already succeeded, so
+// a genuine GC failure only means the dependency layer is pruned on the next
+// natural lifecycle point.
+func TestDependencyGCFailureDoesNotAffectRemoval(t *testing.T) {
+	exec := &blockExecutor{startBlocks: false, tags: map[string][]string{}, gcErr: true}
+	logger, buf := debugBufferLogger()
+	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+
+	r.RetireImage("relay-fn-a:old")
+	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
+
+	// GC was attempted and failed: the failure is logged as a Warn ("Dependency
+	// image cleanup: ..."), and the removal outcome is unchanged (the image was
+	// removed).
+	waitFor(t, func() bool { return exec.gcCallCount() == 1 })
+	if !strings.Contains(buf.String(), "Dependency image cleanup:") {
+		t.Fatalf("expected a Warn logging the dependency-GC failure, got:\n%s", buf.String())
+	}
+	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {
+		t.Fatalf("removed = %v, want [relay-fn-a:old] despite the GC failure", got)
+	}
 }
