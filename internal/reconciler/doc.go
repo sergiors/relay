@@ -26,6 +26,11 @@
 // the skip path or a failed build) so the scheduler can converge its cron jobs
 // to the template's schedules. Removal converges via RemoveFunction instead.
 //
+// The service reconciler (services.go) is part of this package. Service
+// convergence is driven by the Config hooks UpdateServices/RemoveServices (both
+// nil-safe), which the worker wires to a *ServiceReconciler constructed from the
+// runtime Manager's Docker seam.
+//
 // The package does NOT build images; it delegates image preparation and
 // invocation to a Builder.
 package reconciler

@@ -978,6 +978,7 @@ export async function slow(event) {
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
 		RunMeta{
+			Type:      ContainerTypeEvent,
 			Function:  "labels-e2e",
 			Handler:   "index.slow",
 			MessageID: "1791234567890-0",
@@ -1019,6 +1020,7 @@ export async function slow(event) {
 		t.Fatalf("container %s not in listing", id)
 	}
 	for k, want := range map[string]string{
+		labelType:      ContainerTypeEvent,
 		labelFunction:  "labels-e2e",
 		labelHandler:   "index.slow",
 		labelMessageID: "1791234567890-0",
@@ -1684,11 +1686,11 @@ func TestIntegrationSweepOrphanContainers(t *testing.T) {
 	// Our orphan: relay labels + our hostname, left running (as a crashed prior
 	// process would leave a mid-invocation container).
 	ours := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelFunction: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelFunction: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
 	})
 	// Another worker's orphan: different hostname, must survive.
 	theirs := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelFunction: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelFunction: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
 	})
 	// Unrelated container: no relay labels, must survive.
 	unrelated := createOrphanContainer(t, cli, ctx, map[string]string{"app": "whatever"})

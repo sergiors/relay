@@ -3,9 +3,14 @@ package runtime
 import "context"
 
 // RunMeta carries the diagnostic metadata attached as Docker labels to every
-// function execution container. It is diagnostic-only: Relay's correctness
-// never depends on these labels, and the sweep's ownership predicate relies only
-// on the relay.function and relay.hostname labels.
+// function execution container. It is diagnostic-only: Relay's correctness never
+// depends on these labels beyond the relay.type + relay.hostname ownership
+// predicate used by the sweep.
+//
+// Type classifies the execution population (containerTypeEvent or
+// containerTypeSchedule); it is stamped as the relay.type label and is the
+// strict marker that distinguishes event containers from schedule containers and
+// both from persistent service containers (see labels.go).
 //
 // The values are all low-cardinality or bounded identifiers that Relay already
 // uses as log fields or identities elsewhere — never raw payload content:
@@ -21,6 +26,7 @@ import "context"
 // the label set is total and greppable across every container Relay owns; no
 // key is ever omitted.
 type RunMeta struct {
+	Type      string
 	Function  string
 	Handler   string
 	MessageID string
@@ -30,22 +36,13 @@ type RunMeta struct {
 	Image     string
 }
 
-// Label keys Relay stamps on every execution container.
-const (
-	labelFunction  = "relay.function"
-	labelHandler   = "relay.handler"
-	labelMessageID = "relay.message_id"
-	labelEventID   = "relay.event_id"
-	labelEventName = "relay.event_name"
-	labelHostname  = "relay.hostname"
-	labelImage     = "relay.image"
-)
-
 // runLabels maps a RunMeta to the Docker label set for an execution container.
 // Every key is always present (empty values become empty labels) so the set is
-// total and stable. Nothing depends on the labels for correctness.
+// total and stable. Nothing depends on the labels for correctness beyond the
+// relay.type + relay.hostname ownership predicate.
 func runLabels(meta RunMeta) map[string]string {
 	return map[string]string{
+		labelType:      meta.Type,
 		labelFunction:  meta.Function,
 		labelHandler:   meta.Handler,
 		labelMessageID: meta.MessageID,

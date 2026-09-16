@@ -430,6 +430,11 @@ schedules:
     cron: "0 8 * * 1-5"
     timezone: "Europe/Rome"
     timeout: 20s
+
+services:
+  - handler: service.js
+    port: 3000
+    replicas: 2
 ```
 
 - `runtime` (required) selects the execution runtime. Only `python3.14` and
@@ -475,6 +480,11 @@ schedules:
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
+- `services` (optional) is a list of persistent long-running HTTP services (see
+  _Services_ below). Each entry has a required `handler` (an application
+  entrypoint **file**, not the `module.function` form) plus optional `port`
+  (default `80`, `1`–`65535`) and `replicas` (default `1`, positive integer).
+  The template example above shows a service alongside events and schedules.
 
 ### Schedules
 
@@ -684,6 +694,91 @@ The value must be a strict boolean; `exists: "true"`, `exists: 1`, and
 For example, a rule with `status: [COMPLETED, FAILED]` matches while
 `id: { prefix: ["user_"] }` matches `user_123` but not `123`. The implemented
 operators are `equals`, `prefix`, `suffix`, `exists`, and `gt`/`gte`/`lt`/`lte`.
+
+## Services
+
+A template's optional `services` list declares **persistent long-running
+containers**: unlike `events` and `schedules`, a service is not an invocation
+container that exits after one request. It is a long-lived process — an HTTP
+server, for example — that Relay keeps running and reconciling continuously.
+
+```yaml
+runtime: node24
+
+services:
+  - handler: service.js
+    port: 3000
+    replicas: 2
+```
+
+- `handler` (required) is the application entrypoint **file** the runtime
+  starts as the long-lived process (`service.js` on the Node runtime). It is
+  not the `module.function` event-handler form, and it is not invoked
+  per-request: HTTP requests are handled directly by the user's application
+  inside the container. It must be a plain filename (no path separators, no
+  whitespace).
+- `port` (optional) is the internal TCP port the service application listens
+  on. It defaults to `80` and must be between `1` and `65535`. Relay injects it
+  as the `PORT` environment variable (it cannot be overridden by template env
+  or secrets), and exposes the port as container metadata only — **no host
+  port is published, and no proxy/routing layer is attached yet**: how requests
+  reach the service (Traefik, host routing, TLS) is a later concern.
+- `replicas` (optional) is the desired replica count Relay maintains. It
+  defaults to `1` and must be a positive integer. No autoscaling — the count
+  is always exactly what the template declares.
+
+### Lifecycle
+
+The service lifecycle reuses the function image machinery with no separate
+build system: the function image is prepared exactly as for invocations, and a
+service container runs the **same image** with its entrypoint overridden to
+the service file (e.g. `node /app/service.js`). This keeps every version of a
+function in one image repository, so the existing image-retirement machinery
+covers services too.
+
+At startup and on every reconcile of the owning function, Relay lists its
+service containers and converges them to the template:
+
+```
+desired replicas (template)  vs  actual Relay-owned service containers
+```
+
+- Containers whose image or port no longer match the current version are
+  **replaced** (stop + remove, then start fresh replicas). Containers whose
+  image and port are unchanged are **preserved** — no unnecessary restarts.
+- Scaling up starts the missing replica slots; scaling down stops and removes
+  exactly the excess containers (the lowest-numbered replicas are kept).
+- A replica whose process **exits** (a crash) is detected by the same
+  reconciliation — Relay recreates the missing slot on the next reconcile of
+  the owning function, which includes the periodic pass (default every 30s) —
+  so a crashed service self-heals without a tight restart loop and without any
+  event-style retry/DLQ semantics.
+- A service removed from the template, or its whole function removed, stops
+  and removes all of its containers. Relay then retires obsolete
+  `relay-fn-<name>` images — but only after no active container still
+  references them, and never for images outside Relay's own namespace.
+
+Containers are identified by deterministic Relay-owned labels
+(`relay.type=service`, `relay.function`, `relay.service`, plus the image,
+port, and replica slot), never by name alone. Stale containers left behind by a
+crashed Relay process are swept at the next startup.
+
+The environment each replica gets: the runtime's plan environment (e.g.
+`PYTHONDONTWRITEBYTECODE=1` for Python), then the template's `env` values,
+then resolved `secrets` values, then `PORT`. Containers run under the same
+hardening as invocation containers: non-root user, dropped capabilities,
+memory/CPU/pids limits, read-only rootfs, and a bounded `/tmp`.
+
+`relay function inspect` shows the effective values (defaults included):
+
+```
+Services:
+  service.js   port=3000 replicas=2
+```
+
+Out of scope for this first version: host port publishing, Traefik/routing
+integration, host/domain configuration, autoscaling, and request-level handler
+invocation.
 
 ## Supported runtimes
 
@@ -1290,6 +1385,12 @@ above.
   reads `event.new_image` and logs a welcome email. No `package.json` is
   provided, so Relay injects the ESM `package.json`. It omits `timeout`, so it
   exercises the `6s` default.
+
+- `examples/functions/users-api-node/` (node24): a persistent **service** — a
+  small Fastify HTTP server (`service.js`) exposing `GET /health` and
+  `GET /users`, listening on the template-configured port (`3000`, injected as
+  `PORT`). No `events`-style invocation: Relay keeps the container running and
+  reconciled.
 
 A single generic, cross-engine event matches both functions:
 

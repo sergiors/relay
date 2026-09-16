@@ -120,8 +120,8 @@ func printList(w io.Writer, st *state.State) error {
 
 // printInspect renders the full detail record to w. Labels are tab-aligned
 // through a tabwriter so padding matches the longest label without hand-
-// maintained spaces. The Events and Schedules sections are rendered with the
-// same alignment, using a wider padding for visual grouping.
+// maintained spaces. The Events, Schedules, and Services sections are rendered
+// with the same alignment, using a wider padding for visual grouping.
 func printInspect(w io.Writer, st *state.State, d state.Detail) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
@@ -182,6 +182,19 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 			fmt.Fprintf(sw, "  %s\tcron=%q timezone=%s timeout=%s\n", s.Handler, s.Cron, s.Timezone, s.Timeout)
 		}
 		sw.Flush()
+	}
+
+	// The Services section renders the template's persistent services (entrypoint
+	// file, effective internal port, desired replica count). It is omitted
+	// entirely when the template defines none, like Schedules.
+	if len(d.Services) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Services:")
+		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+		for _, svc := range d.Services {
+			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", svc.Handler, svc.Port, svc.Replicas)
+		}
+		srw.Flush()
 	}
 
 	// Env and secrets sections render the template's MAPPINGS only: literal env

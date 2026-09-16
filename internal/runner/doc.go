@@ -57,6 +57,7 @@
 // invocation-state semantics apply exactly like any other stream message. The
 // handler timeout is resolved from the function's CURRENT template (single
 // source of truth), so a hot-swapped template's new timeout applies to future
-// occurrences; the scheduled container is attributable via the relay.schedule
-// MessageID stamp. Handler execution remains at-least-once.
+// occurrences; the scheduled container is attributable via the relay.type=
+// schedule label (message id stamped on relay.message_id). Handler execution
+// remains at-least-once.
 package runner

@@ -186,6 +186,7 @@ func TestHandleInjectsRunMeta(t *testing.T) {
 	}
 
 	want := runtime.RunMeta{
+		Type:      runtime.ContainerTypeEvent,
 		Function:  "user-events",
 		Handler:   "index.run",
 		MessageID: "1757-0",

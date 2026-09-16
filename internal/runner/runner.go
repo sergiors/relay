@@ -950,6 +950,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// the executor can attach it as container labels. This keeps the
 				// Executor interface (and every test fake) unchanged.
 				invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+					Type:      runtime.ContainerTypeEvent,
 					Function:  pf.fn.Name,
 					Handler:   rule.Handler,
 					MessageID: msgID,
@@ -1153,7 +1154,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 // retry-backoff/exhaustion decision from the template's schedule Retries. The
 // stream layer (via ConsumerConfig.ScheduleRunner) drives retry, backoff,
 // invocation state, and DLQ around this single invocation.
-func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payload []byte) error {
+func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler string, payload []byte) error {
 	// Invocation state (when present) distinguishes the production stream path
 	// from direct callers/tests: obsolete-removal is only treated as terminal
 	// on the production path. See the availability checks below.
@@ -1284,7 +1285,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 			)
 			return fmt.Errorf("%w: schedule function %q handler %q is exhausted", stream.ErrInvocationExhausted, fnName, handler)
 		}
-		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation)
+		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation, msgID)
 		if err != nil {
 			// A failed attempt — resolve extra env, marshal, execution, or
 			// timeout failures all land here. recordFailure decides retry vs
@@ -1294,7 +1295,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 			// attempt marks the invocation terminal and, because a schedule has
 			// exactly ONE invocation (this one), the message is terminal — wrap
 			// stream.ErrInvocationExhausted so the stream routes it to the DLQ.
-			outcome, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, "relay.schedule", "", "", err)
+			outcome, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, msgID, "", "", err)
 			if outcome == outcomeExhausted {
 				return fmt.Errorf("%w: %w", stream.ErrInvocationExhausted, retErr)
 			}
@@ -1306,7 +1307,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, fnName, handler string, payl
 	// No invocation state (direct callers/tests): preserve the legacy behavior
 	// exactly — execute the single handler and return the plain error (or nil on
 	// success). MarkComplete/success metrics still emit inside invokeOnce.
-	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "")
+	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "", msgID)
 }
 
 // invokeOnce is the smallest reusable single-handler execution core shared by
@@ -1327,6 +1328,7 @@ func (r *Runner) invokeOnce(
 	timeout time.Duration,
 	invState stream.InvocationState,
 	invocation string,
+	msgID string,
 ) error {
 	// Resolve the template's env values and secret references immediately before
 	// container creation, mirroring Handle's rule path.
@@ -1344,13 +1346,15 @@ func (r *Runner) invokeOnce(
 	)
 
 	invokeCtx, cancel := context.WithTimeout(ctx, timeout)
-	// Stamp the invocation's diagnostic metadata. MessageID identifies the
-	// scheduled dispatch (a constant, diagnostic-only label); EventID/EventName
-	// are empty, and "relay.schedule" makes scheduled containers attributable.
+	// Stamp the invocation's diagnostic metadata. MessageID is the schedule
+	// occurrence's real Redis stream message ID, stamped on relay.message_id;
+	// EventID/EventName are empty. Type: containerTypeSchedule is the strict
+	// relay.type marker that classifies this one-shot invocation container.
 	invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+		Type:      runtime.ContainerTypeSchedule,
 		Function:  pf.fn.Name,
 		Handler:   handler,
-		MessageID: "relay.schedule",
+		MessageID: msgID,
 		Hostname:  r.hostname,
 		Image:     toImage(pf),
 	})

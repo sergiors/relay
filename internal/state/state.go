@@ -54,6 +54,11 @@ type Detail struct {
 	LastError       string
 	Handlers        []Handler
 	Schedules       []Schedule
+	// Services lists the function's persistent services. It is configuration
+	// metadata (like the schedules): each entry holds the effective entrypoint
+	// file, internal TCP port, and desired replica count. It is nil when the
+	// template defines none.
+	Services []Service
 	// Env and Secrets are the function's env/secret MAPPINGS from its template:
 	// env-var name → literal value, and env-var name → secret reference. They
 	// are configuration metadata (like the handler timeouts), never secret
@@ -77,6 +82,15 @@ type Schedule struct {
 	Cron     string
 	Timezone string
 	Timeout  time.Duration
+}
+
+// Service is one persistent service's effective configuration as persisted
+// from the template: the entrypoint file, its internal TCP port, and the
+// desired replica count.
+type Service struct {
+	Handler  string
+	Port     int
+	Replicas int
 }
 
 // State is a concrete SQLite-backed local state view. It is safe for use from
@@ -208,6 +222,17 @@ func (c *State) initSchema(ctx context.Context) error {
 			timezone TEXT,
 			timeout TEXT,
 			PRIMARY KEY (function_name, handler, cron, timezone)
+		)`,
+		// services is keyed by function_name but carries no foreign key, like
+		// handlers and schedules: cleanup is explicit (removeTx), not relational,
+		// for the same reasoning documented above (function stats rows can exist
+		// without a functions row, and no PRAGMA foreign_keys is forced).
+		`CREATE TABLE IF NOT EXISTS services (
+			function_name TEXT,
+			handler TEXT,
+			port INTEGER,
+			replicas INTEGER,
+			PRIMARY KEY (function_name, handler)
 		)`,
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
@@ -365,6 +390,9 @@ func (c *State) RebuildFromFS(dir string) error {
 			if err := replaceSchedules(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
+			if err := replaceServices(tx, p.fn.Name, p.fn.Template); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -393,7 +421,10 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		if err := replaceHandlers(tx, fn.Name, fn.Template); err != nil {
 			return err
 		}
-		return replaceSchedules(tx, fn.Name, fn.Template)
+		if err := replaceSchedules(tx, fn.Name, fn.Template); err != nil {
+			return err
+		}
+		return replaceServices(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: record discovered %q: %v", fn.Name, err))
@@ -418,7 +449,10 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 		if err := replaceHandlers(tx, name, fn.Template); err != nil {
 			return err
 		}
-		return replaceSchedules(tx, name, fn.Template)
+		if err := replaceSchedules(tx, name, fn.Template); err != nil {
+			return err
+		}
+		return replaceServices(tx, name, fn.Template)
 	})
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: record success %q: %v", name, err))
@@ -513,15 +547,18 @@ func (c *State) PruneRemoved(dir string) {
 }
 
 // removeTx deletes a function and all of its state rows — handlers, schedules,
-// function_stats, and the functions row itself — inside tx. It is shared by the
-// live reconciler removal (RecordRemoved) and the startup sweep (PruneRemoved)
-// so both are behaviorally identical: a removed function never leaves a stale
-// handlers, schedules, or function_stats row behind.
+// services, function_stats, and the functions row itself — inside tx. It is
+// shared by the live reconciler removal (RecordRemoved) and the startup sweep
+// (PruneRemoved) so both are behaviorally identical: a removed function never
+// leaves a stale handlers, schedules, services, or function_stats row behind.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM schedules WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE function_name = ?`, name); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
@@ -632,6 +669,23 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		}
 		d.Schedules = append(d.Schedules, Schedule{Handler: sh, Cron: sc, Timezone: stz, Timeout: dur})
 	}
+
+	srows2, err := c.db.QueryContext(ctx,
+		`SELECT handler, port, replicas FROM services WHERE function_name = ? ORDER BY handler, port`, name)
+	if err != nil {
+		c.log.Warn(fmt.Sprintf("State: services %q: %v", name, err))
+		return d, true
+	}
+	defer srows2.Close()
+	for srows2.Next() {
+		var sh string
+		var sp, sr int
+		if err := srows2.Scan(&sh, &sp, &sr); err != nil {
+			c.log.Warn(fmt.Sprintf("State: scan service %q: %v", name, err))
+			continue
+		}
+		d.Services = append(d.Services, Service{Handler: sh, Port: sp, Replicas: sr})
+	}
 	return d, true
 }
 
@@ -697,6 +751,23 @@ func replaceSchedules(tx *sql.Tx, name string, tmpl *function.Template) error {
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO schedules (function_name, handler, cron, timezone, timeout) VALUES (?,?,?,?,?)`,
 			name, s.Handler, s.Cron, s.Location.String(), s.Timeout.String()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replaceServices deletes a function's services and re-inserts them from the
+// template, so the service list always mirrors the latest parsed template. Port
+// and replicas are stored as their effective integer values (defaults included).
+func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
+	if _, err := tx.Exec(`DELETE FROM services WHERE function_name = ?`, name); err != nil {
+		return err
+	}
+	for _, s := range tmpl.Services {
+		if _, err := tx.Exec(
+			`INSERT OR REPLACE INTO services (function_name, handler, port, replicas) VALUES (?,?,?,?)`,
+			name, s.Handler, s.Port, s.Replicas); err != nil {
 			return err
 		}
 	}

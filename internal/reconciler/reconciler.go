@@ -77,6 +77,23 @@ type Config struct {
 	// schedule dedup keys or stream entries: those represent occurrences valid
 	// when published and expire via the key TTL / stream retention.
 	UpdateSchedules func(name string, tmpl *function.Template)
+	// UpdateServices, when set, is called after a function's new version is
+	// prepared and swapped into the registry (discovery and update paths; never
+	// on the skip path and never on build failure), so the service reconciler
+	// (services.go) can converge the function's persistent containers to the new
+	// template+image.
+	// It is ALSO called on the skip path (unchanged, already-available function)
+	// when the function declares services, so crashed service replicas are
+	// recreated within the periodic reconcile cadence without a separate
+	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
+	// when converged. Nil-safe.
+	UpdateServices func(name string, tmpl *function.Template, image string)
+	// RemoveServices, when set, is called in remove() immediately BEFORE
+	// RemoveFunction and the function's images are retired. The ordering
+	// invariant: running service containers reference the function's images, so
+	// those containers must be stopped and removed before the images are
+	// retire-eligible. Nil-safe.
+	RemoveServices func(name string)
 }
 
 // Watches Root, debounces per-function events, and swaps the registry when a
@@ -90,11 +107,14 @@ type Reconciler struct {
 	builder Builder
 	log     *slog.Logger
 	st      *state.State
-	// retire/removeFunction/updateSchedules are optional image-lifecycle and
-	// schedule-convergence hooks (see Config).
+	// retire/removeFunction/updateSchedules/updateServices/removeServices are
+	// optional image-lifecycle, schedule-convergence, and service-convergence
+	// hooks (see Config).
 	retire          func(name, oldImage string)
 	removeFunction  func(name string)
 	updateSchedules func(name string, tmpl *function.Template)
+	updateServices  func(name string, tmpl *function.Template, image string)
+	removeServices  func(name string)
 
 	mu          sync.Mutex
 	fingerprnts map[string]string // name -> last-reconciled fingerprint
@@ -132,6 +152,8 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		retire:          cfg.Retire,
 		removeFunction:  cfg.RemoveFunction,
 		updateSchedules: cfg.UpdateSchedules,
+		updateServices:  cfg.UpdateServices,
+		removeServices:  cfg.RemoveServices,
 		fingerprnts:     map[string]string{},
 		timers:          map[string]*time.Timer{},
 		incoming:        make(chan string, DefaultQueueSize),
@@ -432,6 +454,18 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// its timestamp; a periodic no-op must not hide a recent success or
 		// failure. It is surfaced in debug logging only.
 		r.log.Debug(fmt.Sprintf("Function %q: unchanged; reconcile skipped", name))
+		// A skip path is NOT a full no-op when the function declares services:
+		// without converging here, a crashed service replica would only be
+		// repaired on the next content change. Reconcile is idempotent — when
+		// the desired set is already running it lists containers once and
+		// touches nothing — so calling updateServices on every periodic tick is
+		// cheap and gives crash replacement within the default cadence without
+		// a separate services-only loop. updateServices is only reachable when
+		// the current build is available (this skip branch already guarantees
+		// cur.Prepared() != nil via isAvailable).
+		if r.updateServices != nil && len(fn.Template.Services) > 0 {
+			r.updateServices(name, fn.Template, cur.Prepared().Image)
+		}
 		return
 	}
 
@@ -490,6 +524,15 @@ func (r *Reconciler) reconcileFunction(name string) {
 		r.updateSchedules(name, fn.Template)
 	}
 
+	// After the scheduler converges, converge the function's persistent service
+	// containers to the freshly prepared template and image. This runs on both
+	// discovery and update paths (the registry now serves the new version), and
+	// not on the skip path above nor on a build failure (where the previous
+	// version — and its service containers — are retained).
+	if r.updateServices != nil {
+		r.updateServices(name, fn.Template, built.Image)
+	}
+
 	if cur == nil {
 		r.log.Info("Function: discovered",
 			"function", name,
@@ -519,6 +562,14 @@ func (r *Reconciler) remove(name string) {
 	// wired RemoveFunction hook also deletes the function's Prometheus series at
 	// this same retirement point (the reconciler itself stays metrics-free; the
 	// worker wires the metrics deletion by wrapping the hook).
+	//
+	// RemoveServices runs FIRST, before RemoveFunction retires the images: a
+	// running service container still references the function's images, so those
+	// containers must be stopped and removed before the images become
+	// retire-eligible. Nil-safe.
+	if r.removeServices != nil {
+		r.removeServices(name)
+	}
 	if r.removeFunction != nil {
 		r.removeFunction(name)
 	}

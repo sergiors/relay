@@ -29,6 +29,14 @@ const DefaultRetries = 4
 // negative, or non-integer values fail validation.
 const DefaultConcurrency = 2
 
+// DefaultServicePort is the port applied to a service that omits an explicit
+// `port`. It is the standard HTTP port.
+const DefaultServicePort = 80
+
+// DefaultServiceReplicas is the replica count applied to a service that omits a
+// `replicas` key: Relay maintains a single long-running instance by default.
+const DefaultServiceReplicas = 1
+
 // MaxTimeout is the upper bound on any rule's handler timeout. It is the same
 // value as stream.MaxRuleTimeout (kept in sync; function is a leaf package and
 // stream may import it, not the reverse). The stream layer derives its
@@ -102,6 +110,10 @@ type Template struct {
 	// the template defines no `schedules` key. Each Schedule carries its
 	// resolved timezone and timeout (never zero after ParseTemplate).
 	Schedules []Schedule
+	// Services lists the function's persistent long-running services. It is nil
+	// when the template defines no `services` key. Port and Replicas carry their
+	// resolved defaults (never zero) after ParseTemplate.
+	Services []Service
 }
 
 // Schedule is one cron schedule from the template's `schedules` list: the
@@ -120,6 +132,18 @@ type Schedule struct {
 	// ParseTemplate; omitted schedules default to DefaultRetries. The total
 	// number of attempts for a failing invocation is 1 + Retries.
 	Retries int
+}
+
+// Service is one persistent HTTP service from the template's `services`
+// list: the application entrypoint file the runtime starts as the long-lived
+// process, the internal TCP port the application listens on, and the desired
+// replica count Relay maintains. Handler is an entrypoint file (e.g.
+// "service.js"), NOT the module.function invocation-handler form. Port and
+// Replicas are always effective (non-zero) after ParseTemplate.
+type Service struct {
+	Handler  string
+	Port     int
+	Replicas int
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -373,6 +397,15 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			// truncated or coerced by yaml.v3.
 			Retries any `yaml:"retries"`
 		} `yaml:"schedules"`
+		Services []struct {
+			Handler string `yaml:"handler"`
+			// Port and Replicas are decoded as `any` so a non-integer value
+			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
+			// and rejected with a clear message (see resolveServicePort /
+			// resolveServiceReplicas).
+			Port     any `yaml:"port"`
+			Replicas any `yaml:"replicas"`
+		} `yaml:"services"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse template yaml: %w", err)
@@ -402,8 +435,13 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	if !supportedRuntimes[t.Runtime] {
 		return nil, fmt.Errorf("unsupported runtime %q", t.Runtime)
 	}
-	if len(raw.Events) == 0 {
-		return nil, fmt.Errorf("events must contain at least one rule")
+	// A template must do SOMETHING: it must carry at least one event rule or at
+	// least one persistent service. A template with neither is inert and almost
+	// certainly a template-authoring mistake, so it is rejected rather than
+	// silently loading a function that can never run. A services-only template
+	// is legitimate: a persistent HTTP service does not consume events.
+	if len(raw.Events) == 0 && len(raw.Services) == 0 {
+		return nil, fmt.Errorf("template must contain at least one event rule or one service")
 	}
 
 	for _, ev := range raw.Events {
@@ -478,6 +516,37 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Handler, s.Cron, err)
 		}
 		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout, Retries: retries})
+	}
+
+	// Parse and validate the optional persistent services. Each entry requires a
+	// handler (an APPLICATION ENTRYPOINT file, e.g. "service.js", NOT the
+	// module.function event-handler form), so validateHandler is intentionally
+	// NOT applied. The handler string is the service's identity: duplicates
+	// would be ambiguous for reconciliation, so they are rejected. Port and
+	// replicas are optional with defaults (DefaultServicePort /
+	// DefaultServiceReplicas). Services are optional — a template without the
+	// `services` key parses exactly as before.
+	seen := make(map[string]bool, len(raw.Services))
+	for _, s := range raw.Services {
+		if s.Handler == "" {
+			return nil, fmt.Errorf("service is missing a handler")
+		}
+		if strings.ContainsAny(s.Handler, " \t\r\n") {
+			return nil, fmt.Errorf("service %q: handler %q contains whitespace", s.Handler, s.Handler)
+		}
+		if seen[s.Handler] {
+			return nil, fmt.Errorf("duplicate service handler %q", s.Handler)
+		}
+		seen[s.Handler] = true
+		port, err := resolveServicePort(s.Port)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Handler, err)
+		}
+		replicas, err := resolveServiceReplicas(s.Replicas)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Handler, err)
+		}
+		t.Services = append(t.Services, Service{Handler: s.Handler, Port: port, Replicas: replicas})
 	}
 	return t, nil
 }
@@ -661,6 +730,40 @@ func resolveRetries(raw any) (int, error) {
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("retries %d must be non-negative", n)
+	}
+	return n, nil
+}
+
+// resolveServicePort parses an optional service `port`. A nil value (omitted)
+// yields DefaultServicePort; any non-integer value (a string, a float, a bool,
+// ...) or an integer outside [1, 65535] is rejected.
+func resolveServicePort(raw any) (int, error) {
+	if raw == nil {
+		return DefaultServicePort, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, fmt.Errorf("port must be an integer, got %v", raw)
+	}
+	if n < 1 || n > 65535 {
+		return 0, fmt.Errorf("port %d must be between 1 and 65535", n)
+	}
+	return n, nil
+}
+
+// resolveServiceReplicas parses an optional service `replicas`. A nil value
+// (omitted) yields DefaultServiceReplicas; any non-integer value (a string, a
+// float, a bool, ...) or a non-positive integer is rejected.
+func resolveServiceReplicas(raw any) (int, error) {
+	if raw == nil {
+		return DefaultServiceReplicas, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, fmt.Errorf("replicas must be a positive integer, got %v", raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("replicas %d must be a positive integer", n)
 	}
 	return n, nil
 }

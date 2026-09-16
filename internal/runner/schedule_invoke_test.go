@@ -66,7 +66,7 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 	m := metrics.New()
 	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", exec, function.DefaultTimeout)}, silentLogger(), m)
 
-	err := r.InvokeHandler(context.Background(), "fn", "index.run", []byte(`{"source":"relay.schedule"}`))
+	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{"source":"relay.schedule"}`))
 	if err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestInvokeHandlerFailure(t *testing.T) {
 	m := metrics.New()
 	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", &fixedExecutor{err: true}, function.DefaultTimeout)}, silentLogger(), m)
 
-	err := r.InvokeHandler(context.Background(), "fn", "index.run", []byte(`{}`))
+	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{}`))
 	if err == nil {
 		t.Fatal("expected InvokeHandler to fail")
 	}
@@ -131,7 +131,7 @@ func TestInvokeHandlerMissingFunction(t *testing.T) {
 	exec := &payloadCaptureExecutor{}
 	r := New([]*PreparedFunction{schedFn(t, "present", exec, function.DefaultTimeout)}, silentLogger())
 
-	err := r.InvokeHandler(context.Background(), "ghost", "index.run", []byte(`{}`))
+	err := r.InvokeHandler(context.Background(), "1-0", "ghost", "index.run", []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), `function "ghost" is not available`) {
 		t.Fatalf("err = %v, want not-available error", err)
 	}
@@ -141,7 +141,7 @@ func TestInvokeHandlerMissingFunction(t *testing.T) {
 
 	// Unavailable (nil prepared) function.
 	r = New([]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})}, silentLogger())
-	err = r.InvokeHandler(context.Background(), "broken", "index.run", []byte(`{}`))
+	err = r.InvokeHandler(context.Background(), "1-0", "broken", "index.run", []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), `function "broken" is not available`) {
 		t.Fatalf("err = %v, want not-available error for unavailable function", err)
 	}
@@ -154,7 +154,7 @@ func TestInvokeHandlerTimeoutCap(t *testing.T) {
 	r.SetMaxHandlerTimeout(50 * time.Millisecond)
 
 	start := time.Now()
-	err := r.InvokeHandler(context.Background(), "fn", "index.run", []byte(`{}`))
+	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{}`))
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected a deadline error from the capped handler")
@@ -178,7 +178,7 @@ func TestInvokeHandlerSecretResolution(t *testing.T) {
 	r := New([]*PreparedFunction{pf}, silentLogger())
 	r.SetSecretProvider(prov)
 
-	err := r.InvokeHandler(context.Background(), "fn", "index.run", []byte(`{}`))
+	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{}`))
 	if err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}

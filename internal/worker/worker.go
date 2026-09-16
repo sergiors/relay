@@ -39,6 +39,16 @@ import (
 	"relay/internal/stream"
 )
 
+// Compile-time assertions that the runtime Manager satisfies the interfaces the
+// worker wires into it. The service reconciler takes the Manager as its Docker
+// seam; the secrets provider satisfies its SecretResolver (a structural alias
+// of secrets.Provider). These guard regressions in either signature at build
+// time rather than at runtime.
+var (
+	_ reconciler.Docker         = (*runtime.Manager)(nil)
+	_ reconciler.SecretResolver = secrets.Provider(nil)
+)
+
 // statsFlushInterval is the fixed SQLite snapshot cadence. Telemetry, not
 // event-processing state: Prometheus stays live in-process, while SQLite
 // receives the current absolute snapshot every interval. Deliberately NOT
@@ -188,6 +198,15 @@ func Run(logger *slog.Logger) {
 	}
 	defer manager.Close()
 
+	// The service controller converges each function's persistent service
+	// containers to its template. manager is the Docker seam; secretProvider is
+	// the shared secrets resolver (both asserted at compile time above).
+	//
+	// Service containers survive worker shutdown by design (they are persistent
+	// and long-lived): the next boot's per-function Apply + SweepOrphans
+	// converges any drift, so nothing here touches them on graceful shutdown.
+	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, logger)
+
 	// Conservative startup orphan sweep. Before any function is prepared or any
 	// execution container is created, remove execution containers left behind by
 	// a previous Relay process on THIS hostname (a crash mid-invocation, or a
@@ -232,6 +251,60 @@ func Run(logger *slog.Logger) {
 	}
 	logger.Info(fmt.Sprintf("Prepared %d function(s)", preparedCount))
 
+	// Converge each function's persistent service containers to its freshly
+	// prepared template and image. This runs AFTER every function's image is
+	// built (so the desired image is present) and BEFORE the startup image sweep
+	// below (so the sweep's keep-set can include images referenced by the
+	// containers we just started/kept). Prepared (available) functions are
+	// applied UNCONDITIONALLY — including templates that now declare no
+	// services: Reconcile with an empty desired set stops any containers a
+	// previous boot left behind when services were removed while Relay was down
+	// (the fingerprint was re-seeded from the changed content, so the reconciler
+	// would take the skip path and never converge them otherwise).
+	svcCtx, svcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer svcCancel()
+	for _, pf := range prepared {
+		fn := pf.Function()
+		p := pf.Prepared()
+		if p == nil {
+			// Unavailable function: no image this boot. When the current
+			// template still declares services, its stale containers from a
+			// previous boot are left alone (they may still be serving the old
+			// image) until a later successful reconcile Apply replaces them or
+			// the dir is removed (RemoveAll cleans them). When the template no
+			// longer declares services, any lingering containers are stale by
+			// definition — desired is zero — so they are removed now.
+			if len(fn.Template.Services) == 0 {
+				svcCtrl.Remove(svcCtx, fn.Name)
+			} else {
+				logger.Warn(fmt.Sprintf("Service: function %q unavailable; skipping service reconcile", fn.Name))
+			}
+			continue
+		}
+		svcCtrl.Apply(svcCtx, fn.Name, fn.Template, p.Image, p.Env)
+	}
+	// Startup stale-service sweep: remove any service container whose function
+	// is not on disk at all (a function removed while Relay was down, or stale
+	// containers from a previous boot on this host). hostname is NOT part of the
+	// predicate — same-host restart is a documented limitation — so this must run
+	// only once at startup against the full on-disk function set, not per
+	// reconcile.
+	//
+	// liveNames is built from the loaded `functions` slice (the set of on-disk
+	// function directories with valid templates). A function whose build failed
+	// (unavailable) is still "live" because its directory still exists and it
+	// may have stale containers serving the old image — those must NOT be swept.
+	// A function with a persistently-broken template whose directory still exists
+	// is also not in `functions` (the loader skips it), so its stale containers
+	// could linger: they are converged once its template is fixed (a later
+	// successful load re-applies) or its directory is removed (reconciler
+	// remove() -> RemoveServices -> RemoveAll). This is an accepted v1 edge.
+	liveNames := make(map[string]bool, len(functions))
+	for _, fn := range functions {
+		liveNames[fn.Name] = true
+	}
+	svcCtrl.SweepOrphans(context.Background(), liveNames)
+
 	// Conservative startup image sweep. After every current function's image is
 	// built (reused if unchanged), remove Relay-owned images that no longer
 	// correspond to a live function version: superseded versions of current
@@ -254,6 +327,21 @@ func Run(logger *slog.Logger) {
 		if fp, err := function.Fingerprint(fn.Dir); err == nil {
 			keep[runtime.ImageRef(fn.Name, fp)] = true
 		}
+	}
+	// Images still referenced by any Relay-owned service container are kept too:
+	// a container kept by the Applys above (unchanged image) or left over from a
+	// previous boot that this boot has not yet replaced references its image by
+	// label, and the sweep must not remove an image a running container depends
+	// on. Removing is deferred to the owning function's reconcile, which
+	// replaces the container first and only then retires the image.
+	if svcContainers, err := manager.ServiceContainerList(svcCtx); err == nil {
+		for _, c := range svcContainers {
+			if c.Image != "" {
+				keep[c.Image] = true
+			}
+		}
+	} else {
+		logger.Warn(fmt.Sprintf("Service: keep-set list (continuing without): %v", err))
 	}
 	// stateSweep is only armed when the DB was available.
 	if st != nil {
@@ -302,7 +390,8 @@ func Run(logger *slog.Logger) {
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
 		// Schedule occurrences route directly to the runner, bypassing event
 		// matching; the runner resolves the handler timeout from the function's
-		// current template.
+		// current template, and receives the message's real Redis stream ID so it
+		// can stamp the relay.message_id label on the scheduled container.
 		ScheduleRunner: runWorker.InvokeHandler,
 	})
 
@@ -431,6 +520,38 @@ func Run(logger *slog.Logger) {
 			},
 			UpdateSchedules: func(name string, tmpl *function.Template) {
 				sched.ReplaceFunction(name, tmpl)
+			},
+			// Converge the function's persistent service containers whenever its
+			// new version is swapped in (and on the skip path when it declares
+			// services, so crashes self-heal on the periodic tick). The hooks
+			// run synchronously in the reconciler pump goroutine, so each is
+			// bounded with its own timeout; a slow daemon must not stall a
+			// function's reconcile. The contexts are safe to create fresh here:
+			// the reconciler pump is a single goroutine, so these never race
+			// with themselves.
+			//
+			// The prepared env comes from the CURRENT registry entry (the
+			// runtime plan env, e.g. PYTHONDONTWRITEBYTECODE for Python). The
+			// hook carries only the image, so the registry is the source of
+			// truth: after the swap that preceded this hook, GetByName returns
+			// the new version. A nil Prepared (unavailable) falls back to no
+			// plan env, mirroring the runner's nil-safe behavior.
+			UpdateServices: func(name string, tmpl *function.Template, image string) {
+				uCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				var preparedEnv []string
+				if cur := runWorker.Registry().GetByName(name); cur != nil && cur.Prepared() != nil {
+					preparedEnv = cur.Prepared().Env
+				}
+				svcCtrl.Apply(uCtx, name, tmpl, image, preparedEnv)
+			},
+			// On removal, stop the function's service containers BEFORE the
+			// images are retired (reconciler calls RemoveServices before
+			// RemoveFunction): running service containers reference those images.
+			RemoveServices: func(name string) {
+				rCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				svcCtrl.Remove(rCtx, name)
 			},
 		},
 		runWorker.Registry(),

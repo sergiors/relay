@@ -6,11 +6,12 @@ import (
 )
 
 // TestRunLabels verifies that runLabels maps every RunMeta field to the exact
-// seven diagnostic label keys, that empty values are preserved as empty labels
+// diagnostic label keys, that empty values are preserved as empty labels
 // (total, greppable set), and that no unexpected keys are introduced. The label
 // set deliberately contains only bounded identifiers — never payload content.
 func TestRunLabels(t *testing.T) {
 	meta := RunMeta{
+		Type:      ContainerTypeEvent,
 		Function:  "user-events",
 		Handler:   "events.created.handler",
 		MessageID: "1791234567890-0",
@@ -22,6 +23,7 @@ func TestRunLabels(t *testing.T) {
 	got := runLabels(meta)
 
 	want := map[string]string{
+		labelType:      ContainerTypeEvent,
 		labelFunction:  "user-events",
 		labelHandler:   "events.created.handler",
 		labelMessageID: "1791234567890-0",
@@ -47,17 +49,17 @@ func TestRunLabels(t *testing.T) {
 	}
 }
 
-// TestRunLabelsEmptyValues verifies empty RunMeta fields are still materialized
-// as empty labels, so every Relay execution container carries the full label set
-// even when a value is unavailable. This is what keeps the sweep's grep-ability
-// and total set stable.
+// TestRunLabelsEmptyValues verifies empty RunMeta fields (including an empty
+// Type) are still materialized as empty labels, so every Relay execution
+// container carries the full label set even when a value is unavailable. This
+// is what keeps the sweep's grep-ability and total set stable.
 func TestRunLabelsEmptyValues(t *testing.T) {
 	got := runLabels(RunMeta{})
-	if len(got) != 7 {
-		t.Fatalf("label count with empty meta = %d, want 7", len(got))
+	if len(got) != 8 {
+		t.Fatalf("label count with empty meta = %d, want 8", len(got))
 	}
 	for _, k := range []string{
-		labelFunction, labelHandler, labelMessageID, labelEventID,
+		labelType, labelFunction, labelHandler, labelMessageID, labelEventID,
 		labelEventName, labelHostname, labelImage,
 	} {
 		if v, ok := got[k]; !ok || v != "" {

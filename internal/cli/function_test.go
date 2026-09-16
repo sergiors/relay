@@ -396,6 +396,135 @@ func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
 	}
 }
 
+// A function with services renders a Services section after Schedules (or
+// after Events when no schedules) and before Environment, showing the effective
+// entrypoint file, port, and replica count (defaults applied).
+func TestFunctionInspectServicesSection(t *testing.T) {
+	out := inspectServicesWithEnv(t, `  - handler: service.js
+`, true)
+	for _, want := range []string{"Services:", "service.js", "port=80", "replicas=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+	ei, si, env := strings.Index(out, "Events:"), strings.Index(out, "Services:"), strings.Index(out, "Environment:")
+	if ei == -1 || si == -1 || ei > si {
+		t.Fatalf("Services should follow Events:\n%s", out)
+	}
+	if env == -1 || env < si {
+		t.Fatalf("Environment should follow Services:\n%s", out)
+	}
+}
+
+// Explicit port/replicas override the defaults.
+func TestFunctionInspectServicesExplicit(t *testing.T) {
+	out := inspectServices(t, `  - handler: api.js
+    port: 3000
+    replicas: 3
+`)
+	for _, want := range []string{"Services:", "api.js", "port=3000", "replicas=3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+}
+
+// Services render after Schedules when both are present.
+func TestFunctionInspectServicesAfterSchedules(t *testing.T) {
+	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tmpl, err := function.ParseTemplate([]byte(`runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+services:
+  - handler: service.js
+`))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
+	si, se := strings.Index(out, "Schedules:"), strings.Index(out, "Services:")
+	if si == -1 || se == -1 || si > se {
+		t.Fatalf("Services should follow Schedules:\n%s", out)
+	}
+}
+
+// A template without services renders no Services: header.
+func TestFunctionInspectNoServicesHeader(t *testing.T) {
+	st := seedTestState(t)
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	if strings.Contains(w.String(), "Services:") {
+		t.Fatalf("inspect must omit Services: for a template without services:\n%s", w.String())
+	}
+}
+
+// inspectServices is a helper that seeds a temp state DB with a function whose
+// template services match svcs (yaml fragments), then returns the rendered
+// inspect output. When withEnv is true the template also defines an env var so
+// the Environment section renders (to assert ordering).
+func inspectServices(t *testing.T, svcs string) string {
+	t.Helper()
+	return inspectServicesWithEnv(t, svcs, false)
+}
+
+func inspectServicesWithEnv(t *testing.T, svcs string, withEnv bool) string {
+	t.Helper()
+	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
+	st, err := state.Open(statePath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	tmplBody := `runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+`
+	if withEnv {
+		tmplBody += "env:\n  FOO: bar\n"
+	}
+	tmpl, err := function.ParseTemplate([]byte(tmplBody + "services:\n" + svcs))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
+		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	return w.String()
+}
+
 // Arg handling: usage errors and the unknown-function error are returned with
 // their messages (cmd/main.go prints them and exits 1). `function` alone no
 // longer errors — it shows help (see TestFunctionBareShowsHelp). An unknown
