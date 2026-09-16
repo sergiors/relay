@@ -176,3 +176,101 @@ func TestLocalListMissingDir(t *testing.T) {
 		t.Fatalf("list = %v, want empty", names)
 	}
 }
+
+// pemValue is a canonical PEM-shaped private-key fixture (header/footer,
+// multiple internal newlines, a blank line, and an indented value with double
+// spaces). It is deliberately inert — not a real RSA key — so printing it in a
+// test failure is harmless. It has no trailing newline. Every multiline test in
+// this package uses exactly this fixture so a single corruption at any hop is
+// caught.
+const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n-----END PRIVATE KEY-----"
+
+// TestLocalStoreMultilinePEMRoundTrip pins that LocalStore.Set writes a
+// multiline (PEM-shaped) value byte-for-byte to disk with no normalization or
+// JSON-encoding at rest, and LocalStore.Resolve returns those stored bytes
+// verbatim — proving no hop transforms the bytes, even the raw file on disk.
+func TestLocalStoreMultilinePEMRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Set(context.Background(), "rsa", pemValue); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := s.Resolve(context.Background(), "rsa")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != pemValue {
+		t.Fatalf("resolved length = %d, want %d (byte-for-byte)", len(got), len(pemValue))
+	}
+	// The raw file on disk must equal the fixture exactly: no trimming, no
+	// trailing newline added, no JSON/base64 encoding.
+	raw, err := os.ReadFile(filepath.Join(s.Dir(), "rsa"))
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(raw) != pemValue {
+		t.Fatalf("on-disk length = %d, want %d (raw bytes verbatim)", len(raw), len(pemValue))
+	}
+	info, err := os.Stat(filepath.Join(s.Dir(), "rsa"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("file mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+// TestLocalStoreMultilinePEMRoundTripTrailingNewline pins that Resolve returns a
+// stored trailing newline verbatim (Resolve never trims; only the CLI strips one
+// trailing newline before writing).
+func TestLocalStoreMultilinePEMRoundTripTrailingNewline(t *testing.T) {
+	s := newTestStore(t)
+	val := "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
+	if err := s.Set(context.Background(), "rsa", val); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := s.Resolve(context.Background(), "rsa")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != val {
+		t.Fatalf("resolved length = %d, want %d (trailing newline preserved)", len(got), len(val))
+	}
+}
+
+// TestLocalStoreMultilineInternalBlanksAndTrailingSpaces pins that an internal
+// blank line and internal trailing spaces are preserved exactly.
+func TestLocalStoreMultilineInternalBlanksAndTrailingSpaces(t *testing.T) {
+	s := newTestStore(t)
+	val := "line   \n\nnext"
+	if err := s.Set(context.Background(), "ws", val); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := s.Resolve(context.Background(), "ws")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != val {
+		t.Fatalf("resolved length = %d, want %d (internal blanks/trailing spaces preserved)", len(got), len(val))
+	}
+}
+
+// TestLocalProviderMultilineResolve pins that LocalProvider.Resolve returns the
+// multiline fixture verbatim through the Provider interface — the exact seam the
+// runner uses to inject secret values into execution environments.
+func TestLocalProviderMultilineResolve(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Set(context.Background(), "rsa", pemValue); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	p, err := NewLocalProvider(s.Dir())
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+	got, err := p.Resolve(context.Background(), "rsa")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != pemValue {
+		t.Fatalf("resolved length = %d, want %d (byte-for-byte)", len(got), len(pemValue))
+	}
+}

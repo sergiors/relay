@@ -702,6 +702,90 @@ export function secret(event) {
 	}
 }
 
+// pemValue is a canonical PEM-shaped private-key fixture (header/footer,
+// multiple internal newlines, a blank line, and an indented value with double
+// spaces). It is deliberately inert — not a real RSA key — so no real key
+// material is required and printing it in a test failure is harmless. It has no
+// trailing newline. Every multiline test across the repo uses exactly this
+// fixture so a single corruption at any hop is caught.
+const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n-----END PRIVATE KEY-----"
+
+// TestIntegrationMultilineSecretInjection verifies a PEM-shaped secret value is
+// injected into an execution container's environment byte-for-byte and that the
+// handler process observes the EXACT original value (including every internal
+// newline, the blank line, and the indented line). It uses the same
+// Manager.Execute extraEnv injection path the runner uses, so it proves the
+// full chain: runner resolution -> runContainer -> container.Config.Env ->
+// handler process -> handler stdout. The handler logs the value between clear
+// delimiters so exact matching is robust against surrounding output. The
+// manager's operational log buffer must never contain any fragment of the
+// value (handler stdout goes to the function-output sink, not the op log).
+func TestIntegrationMultilineSecretInjection(t *testing.T) {
+	requireDocker(t)
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+secrets:
+  PRIVATE_KEY: rsa-private-key
+events:
+  - handler: index.secret
+    pattern:
+      event_name: [INSERT]
+`)
+	// The handler logs the value between clear delimiters so the container-side
+	// line is matched exactly.
+	writeFile(t, dir, "index.js", `
+export function secret(event) {
+  const v = process.env.PRIVATE_KEY ?? "";
+  console.log("PK<begin>" + v + "<end>");
+}
+`)
+	fn := function.Function{Name: "multiline-secret-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	m, logBuf := newManager(t)
+	out := newFunctionOutputSink(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// Same injection path the runner uses: the extraEnv entry carries the exact
+	// fixture (no trailing newline stripped here — raw injection).
+	if err := m.Execute(ctx, prepared, "index.secret", []byte(`{"event_name":"INSERT"}`), []string{"PRIVATE_KEY=" + pemValue}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// The handler writes one logical line, "PK<begin>" + value + "<end>", which
+	// the streamForwarder splits on internal '\n' and prefixes per line with
+	// "[<fn>/<handler>] stdout: ". Reconstruct that representation so the sink
+	// match is both robust against surrounding output and byte-for-byte exact
+	// (every segment of the fixture arrives, in order, including the blank line).
+	expected := "PK<begin>" + pemValue + "<end>"
+	var want strings.Builder
+	lineNo := 0
+	for _, seg := range strings.Split(expected, "\n") {
+		if lineNo > 0 {
+			want.WriteByte('\n')
+		}
+		want.WriteString("[multiline-secret-e2e/index.secret] stdout: ")
+		want.WriteString(seg)
+		lineNo++
+	}
+	if !strings.Contains(out.String(), want.String()) {
+		t.Errorf("handler output missing exact multiline value; expected:\n%s\n\ngot:\n%s", want.String(), out.String())
+	}
+	// Secret values must never appear in Relay operational logs; handler stdout
+	// is transport-forwarded to the function-output sink, so it must be absent
+	// from the manager's op log buffer.
+	ops := logBuf.String()
+	if strings.Contains(ops, "BEGIN PRIVATE KEY") || strings.Contains(ops, "MIIB") {
+		t.Errorf("operational log leaked a secret fragment:\n%s", ops)
+	}
+}
+
 // TestIntegrationMultipleFunctionsSameSecret verifies two functions referencing
 // the same secret both resolve it (the provider is shared, resolution is
 // per-invocation).

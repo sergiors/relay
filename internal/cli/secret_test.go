@@ -211,3 +211,100 @@ func TestSecretSetInvalidName(t *testing.T) {
 		t.Fatalf("returned error missing message: %v", err)
 	}
 }
+
+// pemValue is a canonical PEM-shaped private-key fixture (header/footer,
+// multiple internal newlines, a blank line, and an indented value with double
+// spaces). It is deliberately inert — not a real RSA key — so printing it in a
+// test failure is harmless. It has no trailing newline. Every multiline test in
+// this package uses exactly this fixture so a single corruption at any hop is
+// caught.
+const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n-----END PRIVATE KEY-----"
+
+// TestSecretSetMultilineStdin pins that `secret set` reads a whole multiline
+// (PEM-shaped) stdin value, strips exactly one trailing newline and one
+// trailing \r (the terminal-input convention), preserves every internal
+// newline, writes the result atomically with 0600 perms, and never echoes it.
+// readSecretValue's trailing trimming only ever removes ONE trailing \n and ONE
+// trailing \r after it; nothing else is normalized.
+func TestSecretSetMultilineStdin(t *testing.T) {
+	cases := []struct {
+		name  string
+		stdin string
+		want  string
+	}{
+		{"pem fixture no trailing newline", pemValue, pemValue},
+		{"pem fixture one trailing newline", pemValue + "\n", pemValue},
+		{"no trailing newline verbatim", "v1\nv2", "v1\nv2"},
+		// Internal \r\n line endings are preserved verbatim; only a trailing
+		// "\r\n" is adjusted (strip one "\n" then one "\r").
+		{"internal CRLF preserved", "-----BEGIN-----\r\na\r\n-----END-----", "-----BEGIN-----\r\na\r\n-----END-----"},
+		{"trailing CRLF stripped", "a\r\n", "a"},
+		{"empty value accepted", "", ""},
+		{"only newline becomes empty", "\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := seedSecretStore(t)
+			var out bytes.Buffer
+			if err := secretSetValue(context.Background(), store, "db", strings.NewReader(tc.stdin), &out); err != nil {
+				t.Fatalf("secretSetValue: %v", err)
+			}
+			// The value must never be echoed. Empty values are exempt: an empty
+			// substring matches any output trivially.
+			if tc.want != "" && strings.Contains(out.String(), tc.want) {
+				t.Fatalf("output leaked the secret value (len %d)", len(tc.want))
+			}
+			if !strings.Contains(out.String(), `Successfully set secret "db"`) {
+				t.Fatalf("output missing success message: %q", out.String())
+			}
+			got, err := store.Resolve(context.Background(), "db")
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("stored length = %d, want %d (byte-for-byte equality)", len(got), len(tc.want))
+			}
+			info, err := os.Stat(filepath.Join(secretsPath, "db"))
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("file mode = %o, want 0600", info.Mode().Perm())
+			}
+		})
+	}
+}
+
+// TestSecretSetMultilineViaCommandPipe drives the FULL command path
+// (`cat private_key.pem | relay secret set rsa-private-key` equivalently): a
+// PEM-shaped value with a single trailing newline piped through runCLI must be
+// stored byte-for-byte equal to the fixture (single trailing newline stripped)
+// and resolvable through a fresh store, with no fragment of the value echoed.
+func TestSecretSetMultilineViaCommandPipe(t *testing.T) {
+	_ = seedSecretStore(t)
+	out, _, err := runCLI(t, pemValue+"\n", "secret", "set", "db")
+	if err != nil {
+		t.Fatalf("secret set: err = %v, want nil", err)
+	}
+	for _, frag := range []string{"BEGIN PRIVATE KEY", "MIIB"} {
+		if strings.Contains(out, frag) {
+			t.Fatalf("output leaked secret fragment %q", frag)
+		}
+	}
+	if !strings.Contains(out, `Successfully set secret "db"`) {
+		t.Fatalf("output missing success message: %q", out)
+	}
+	// Resolve through a fresh store (not the CLI's) and require byte-for-byte
+	// equality with the fixture — proving the stored bytes are authoritative.
+	store, err := secrets.NewLocal(secretsPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	got, err := store.Resolve(context.Background(), "db")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got != pemValue {
+		t.Fatalf("stored length = %d, want %d (byte-for-byte equality)", len(got), len(pemValue))
+	}
+}

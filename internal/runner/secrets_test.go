@@ -212,3 +212,87 @@ func TestHandleSecretValueNeverLogged(t *testing.T) {
 		t.Fatalf("log leaked the secret value:\n%s", buf.String())
 	}
 }
+
+// pemValue is a canonical PEM-shaped private-key fixture (header/footer,
+// multiple internal newlines, a blank line, and an indented value with double
+// spaces). It is deliberately inert — not a real RSA key — so printing it in a
+// test failure is harmless. It has no trailing newline. Every multiline test in
+// this package uses exactly this fixture so a single corruption at any hop is
+// caught.
+const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n-----END PRIVATE KEY-----"
+
+// TestHandleInjectsMultilineSecret verifies a multiline (PEM-shaped) secret
+// value survives being resolved and injected into the per-invocation extra env
+// byte-for-byte: the executor receives exactly `NAME=<fixture>` with no
+// trimming, no escaping, and no transformation of internal newlines.
+func TestHandleInjectsMultilineSecret(t *testing.T) {
+	exec := &envCaptureExecutor{}
+	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	}, silentLogger(), nil)
+	r.SetSecretProvider(prov)
+
+	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	want := []string{"PRIVATE_KEY=" + pemValue}
+	got := exec.got()
+	if len(got) != 1 {
+		t.Fatalf("extraEnv = %v, want single entry of length %d", got, len(want[0]))
+	}
+	if got[0] != want[0] {
+		t.Fatalf("extraEnv value length = %d, want %d (byte-for-byte)", len(got[0]), len(want[0]))
+	}
+}
+
+// TestHandleMultilineSecretValueNeverLogged verifies a multiline (PEM-shaped)
+// secret value never appears in the runner's log output — neither the full
+// fixture nor distinctive fragments — and that Handle still succeeds (the log
+// leak guard must not come at the cost of a false failure).
+func TestHandleMultilineSecretValueNeverLogged(t *testing.T) {
+	logger, buf := bufferLogger()
+	exec := &envCaptureExecutor{}
+	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	}, logger, nil)
+	r.SetSecretProvider(prov)
+
+	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	logs := buf.String()
+	if strings.Contains(logs, pemValue) {
+		t.Fatalf("log leaked the full secret value (length %d)", len(pemValue))
+	}
+	for _, frag := range []string{"BEGIN PRIVATE KEY", "MIIB"} {
+		if strings.Contains(logs, frag) {
+			t.Fatalf("log leaked secret fragment %q", frag)
+		}
+	}
+}
+
+// TestHandleMultilineSecretResolutionFailureDoesNotLeak pins that a resolution
+// failure for a multiline secret error names the secret REFERENCE only — never
+// any value fragment — so a failed resolve on a PEM-shaped secret cannot leak
+// its content through the error path.
+func TestHandleMultilineSecretResolutionFailureDoesNotLeak(t *testing.T) {
+	// Use the error-only provider: no value ever exists to leak.
+	prov := &fakeProvider{err: errors.New("secret \"rsa-private-key\" not found")}
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithEnv(t, "user-events", &countingExecutor{}, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	}, silentLogger(), nil)
+	r.SetSecretProvider(prov)
+
+	err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"})
+	if err == nil {
+		t.Fatal("expected a resolution failure")
+	}
+	if !strings.Contains(err.Error(), "rsa-private-key") {
+		t.Fatalf("error should name the secret reference, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "BEGIN PRIVATE KEY") {
+		t.Fatalf("error leaked a secret fragment: %v", err)
+	}
+}

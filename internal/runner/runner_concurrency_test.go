@@ -311,11 +311,11 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 // holdingExecutor blocks in Execute until release closes, and records how many
 // times it was entered.
 type holdingExecutor struct {
-	release    chan struct{}
-	entered    chan struct{}
+	release     chan struct{}
+	entered     chan struct{}
 	enteredOnce sync.Once
-	callsMu    sync.Mutex
-	calls      int
+	callsMu     sync.Mutex
+	calls       int
 }
 
 // newHoldingExecutor builds a holdingExecutor whose entered channel is created
