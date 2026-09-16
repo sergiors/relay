@@ -31,6 +31,13 @@
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
 // runtime Manager's Docker seam.
 //
+// Ordering on a rebuild: the new version is prepared and swapped in, schedules
+// converge, persistent services converge to the new image, and only THEN is the
+// superseded image retired (via the Config.Retire hook). Retiring after service
+// converge ensures a service container still running on the old image is
+// replaced first, so the old image becomes removable; the runner's reference
+// guard is a second line of defense for partial failures.
+//
 // The package does NOT build images; it delegates image preparation and
 // invocation to a Builder.
 package reconciler

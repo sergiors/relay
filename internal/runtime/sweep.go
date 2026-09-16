@@ -31,7 +31,7 @@ import (
 // orphan sweep, before the ownership predicate is even considered. Three
 // populations are excluded: service containers (isServiceContainer — persistent
 // and reconciler-owned, never swept) and non-Relay containers that carry no
-// known relay.type (not isRelayContainer). Only invocation containers
+// known relay.type (not isManagedContainer). Only invocation containers
 // (isInvocationContainer) pass through to the hostname check.
 func sweepSkips(labels map[string]string) bool {
 	if isServiceContainer(labels) {
@@ -39,7 +39,7 @@ func sweepSkips(labels map[string]string) bool {
 		// startup orphan sweep must never kill a live service.
 		return true
 	}
-	return !isRelayContainer(labels)
+	return !isManagedContainer(labels)
 }
 
 // Running-container decision: at sweep time this process has not yet created any

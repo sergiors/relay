@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -261,7 +262,10 @@ func (m *Manager) RemoveFunctionServiceContainers(ctx context.Context, fnName st
 // container's labelImage. Building the keep-set across ALL remaining service
 // containers (any function) guarantees an image is never removed while an old
 // service container still depends on it, and only relay-fn-<name> tags are ever
-// touched (never non-Relay images, nor other functions' repos). Returns the
+// touched (never non-Relay images, nor other functions' repos). The keep-set is
+// further backed by RemoveImage's container-reference guard, so an image that
+// slips past the keep-set (e.g. a container whose label this boot has not yet
+// observed) is still skipped rather than removed while referenced. Returns the
 // number of images removed.
 func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, error) {
 	containers, err := m.ServiceContainerList(ctx)
@@ -286,6 +290,14 @@ func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, 
 			continue
 		}
 		if err := m.RemoveImage(ctx, tag); err != nil {
+			if errors.Is(err, ErrImageInUse) {
+				// A container still references this image; the keep-set built from
+				// ServiceContainerList above and the container-reference guard both
+				// recognize this as the normal transitional state. Defer to a later
+				// pass: log at debug, not counted, not surfaced as a failure.
+				m.log.Debug(fmt.Sprintf("Image cleanup: image still in use; skipping %s", tag))
+				continue
+			}
 			if firstErr == nil {
 				firstErr = err
 			}

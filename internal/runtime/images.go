@@ -116,12 +116,56 @@ func (m *Manager) imageExists(ctx context.Context, ref string) bool {
 	return true
 }
 
+// ErrImageInUse is returned (wrapped) by RemoveImage when the image is still
+// referenced by a Relay-owned container. It marks a normal transitional state —
+// a service container on the old image that the reconcile has not yet replaced —
+// so callers can treat it as a skip (retry/defer) rather than a genuine cleanup
+// failure. It must never be caused by forced removal: an image referenced by a
+// Relay-owned container is removable only after that container is gone.
+var ErrImageInUse = errors.New("image still referenced by a relay-owned container")
+
+// ImageReferencedByManagedContainer reports whether any Relay-owned container
+// (event, schedule, or service) still references the given image via its
+// relay.image label. It is strict: only containers whose labels classify them as
+// Relay-owned AND whose relay.image exactly matches are counted; non-Relay
+// containers are never inspected or touched. An error listing containers is
+// propagated to the caller so a conservative failure can refuse removal rather
+// than delete on unknown state.
+func (m *Manager) ImageReferencedByManagedContainer(ctx context.Context, image string) (bool, error) {
+	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return false, fmt.Errorf("list containers for %s: %w", image, err)
+	}
+	for _, c := range list.Items {
+		if isManagedContainer(c.Labels) && c.Labels[labelImage] == image {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RemoveImage removes a single image reference. Removing an image that is
 // already gone is a success (the daemon reports not-found): log at debug and
 // return nil. This is the only path that removes a named Relay image; it never
 // removes anything outside an exact reference the caller computed.
+//
+// Defensive guard: before calling docker, it consults
+// ImageReferencedByManagedContainer and refuses (returning a wrapped ErrImageInUse)
+// while any Relay-owned container still references the image. This is the single
+// enforcement point for "never remove an image a Relay-owned container still
+// depends on", guarding every caller (runner async removal, the startup sweep,
+// RetireServiceImages). The ImageRemove options stay FORCE-FREE: never Force, an
+// image referenced by a Relay-owned container must be removable only after that
+// container is gone.
 func (m *Manager) RemoveImage(ctx context.Context, image string) error {
-	_, err := m.cli.ImageRemove(ctx, image, client.ImageRemoveOptions{})
+	referenced, err := m.ImageReferencedByManagedContainer(ctx, image)
+	if err != nil {
+		return fmt.Errorf("remove image %s: %w", image, err)
+	}
+	if referenced {
+		return fmt.Errorf("remove image %s: %w", image, ErrImageInUse)
+	}
+	_, err = m.cli.ImageRemove(ctx, image, client.ImageRemoveOptions{})
 	if errors.Is(err, cerrdefs.ErrNotFound) {
 		return nil
 	}
@@ -157,8 +201,13 @@ func (m *Manager) FunctionImageTags(ctx context.Context, name string) ([]string,
 // and (b) the last-active image recorded in state (so a recovery mid-swap never
 // removes the version that may still serve). Everything Relay-owned outside keep
 // — superseded versions of existing functions and versions of functions removed
-// while the worker was down — is retired. It never touches non-Relay images, and
-// a failure removing one image is logged and does not abort the sweep.
+// while the worker was down — is retired. The sweep is double-defensive: the
+// keep-set covers the known-referenced images up front, and RemoveImage's
+// container-reference guard covers the transitional case where a container still
+// references an image not in the keep-set (a leftover that this boot has not
+// yet replaced). It never touches non-Relay images. A failure removing one image
+// is logged and does not abort the sweep; an in-use skip (ErrImageInUse) is the
+// normal transitional state and is neither counted nor surfaced.
 func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) (int, error) {
 	byName, err := m.relayTags(ctx)
 	if err != nil {
@@ -172,6 +221,15 @@ func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) 
 				continue
 			}
 			if err := m.RemoveImage(ctx, tag); err != nil {
+				if errors.Is(err, ErrImageInUse) {
+					// A container still references this image (a leftover not yet
+					// replaced this boot). This is expected during the sweep; the
+					// owning function's reconcile replaces the container first and
+					// only then retires the image. Log at debug and leave it for a
+					// later pass.
+					m.log.Debug(fmt.Sprintf("Image cleanup: image still in use; skipping %s", tag))
+					continue
+				}
 				if firstErr == nil {
 					firstErr = err
 				}

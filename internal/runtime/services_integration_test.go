@@ -9,6 +9,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -474,6 +475,97 @@ events:
 	if !imageExistsInDaemon(cli, ctx, pOther.Image) {
 		t.Error("unrelated function's image must not be touched by retirement")
 	}
+}
+
+// TestIntegrationImageRetirementWaitsForServiceContainers pins the NO-force,
+// skip-not-delete behavior at the Manager level: while a relay-owned (service)
+// container references an image, RemoveImage must refuse (ErrImageInUse) and the
+// image must still exist; only after the container is gone does removal succeed.
+// A forced remove would have succeeded while the container was up, so this test
+// proves the removal is force-free by construction.
+func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
+	cli := requireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		if c, err := m.ServiceContainerList(cc); err == nil {
+			_ = m.StopServiceContainers(cc, c)
+		}
+		cleanupImagePrefixes(cli, "relay-fn-svc-wait:")()
+	})
+
+	_, v1Ref := buildServiceHost(t, ctx, "svc-wait")
+	if !imageExistsInDaemon(cli, ctx, v1Ref) {
+		t.Fatalf("v1 image should exist after build")
+	}
+
+	// Start ONE replica of v1 (running, references v1Ref).
+	if _, err := m.StartService(ctx, ServiceSpec{
+		Function: "svc-wait", Entrypoint: "app/service.js", Port: 3000,
+		Image: v1Ref, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
+	}, 0); err != nil {
+		t.Fatalf("start v1 replica: %v", err)
+	}
+	waitForServiceRunning(t, ctx, m, cli, "svc-wait")
+
+	// The new method reports the image referenced; RemoveImage refuses.
+	referenced, err := m.ImageReferencedByManagedContainer(ctx, v1Ref)
+	if err != nil {
+		t.Fatalf("ImageReferencedByManagedContainer: %v", err)
+	}
+	if !referenced {
+		t.Fatal("ImageReferencedByManagedContainer should report the image referenced by the running service container")
+	}
+	if err := m.RemoveImage(ctx, v1Ref); err == nil || !errors.Is(err, ErrImageInUse) {
+		t.Fatalf("RemoveImage while referenced: err = %v, want a wrapped ErrImageInUse", err)
+	}
+	if !imageExistsInDaemon(cli, ctx, v1Ref) {
+		t.Fatalf("image must still exist after a refused (non-forced) removal")
+	}
+
+	// Stop the container and wait for it to be gone.
+	if c, err := m.ServiceContainerList(ctx); err == nil {
+		_ = m.StopServiceContainers(ctx, c)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		l, _ := m.ServiceContainerList(ctx)
+		if len(l) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Now the image is removable and gone.
+	if err := m.RemoveImage(ctx, v1Ref); err != nil {
+		t.Fatalf("RemoveImage after container gone: %v", err)
+	}
+	if imageExistsInDaemon(cli, ctx, v1Ref) {
+		t.Fatalf("image should have been removed once no container references it")
+	}
+}
+
+// waitForServiceRunning polls until at least one of fn's service containers is
+// running.
+func waitForServiceRunning(t *testing.T, ctx context.Context, m *Manager, cli *client.Client, fn string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		list, err := m.ServiceContainerList(ctx)
+		if err == nil {
+			for _, c := range list {
+				if c.Function == fn && c.State == container.StateRunning {
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no running service container for %s", fn)
 }
 
 // countServiceContainers returns how many service containers belong to fn.

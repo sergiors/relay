@@ -142,6 +142,53 @@ func TestReconcileNoRetireOnFailedBuild(t *testing.T) {
 	}
 }
 
+// The Retire hook runs AFTER UpdateServices on a rebuild: an image must not be
+// retired while a service container still references it, and service convergence
+// (which replaces that container) must happen first. This pins the
+// build → swap → schedules → services → retire ordering.
+func TestReconcileRetireRunsAfterServiceConvergence(t *testing.T) {
+	root := t.TempDir()
+	dir := writeServicesDir(t, root, "svc-retire-order")
+
+	b := &versionedBuilder{version: 1}
+	fn := initialServicesFn("svc-retire-order", dir, "img-svc-retire-order-v1", b)
+	reg := &runner.Registry{}
+	reg.Set([]*runner.PreparedFunction{fn})
+
+	// Wire BOTH hooks to a single shared, order-preserving recorder.
+	var order []string
+	var mu sync.Mutex
+	cfg := Config{
+		Root:     root,
+		Debounce: 10 * time.Millisecond,
+		Interval: time.Hour,
+		UpdateServices: func(name string, tmpl *function.Template, image string) {
+			mu.Lock()
+			order = append(order, "update "+name+"="+strconv.Itoa(len(tmpl.Services))+"@"+image)
+			mu.Unlock()
+		},
+		Retire: func(name, oldImage string) {
+			mu.Lock()
+			order = append(order, "retire "+name+"="+oldImage)
+			mu.Unlock()
+		},
+	}
+	r := New(cfg, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	r.Seed(fn.Function())
+
+	// Change source so a rebuild (to v2) warrants retiring v1.
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	r.reconcileFunction("svc-retire-order")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "update svc-retire-order=1@img-svc-retire-order-v2" || order[1] != "retire svc-retire-order=img-svc-retire-order-v1" {
+		t.Fatalf("hook order = %v, want [update svc-retire-order=1@img-svc-retire-order-v2, retire svc-retire-order=img-svc-retire-order-v1]", order)
+	}
+}
+
 // The Retire hook does not fire when the fingerprint is unchanged (skip path).
 func TestReconcileNoRetireOnSkipPath(t *testing.T) {
 	root := t.TempDir()

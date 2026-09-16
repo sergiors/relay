@@ -765,6 +765,16 @@ desired replicas (template)  vs  actual Relay-owned service containers
   `relay-fn-<name>` images — but only after no active container still
   references them, and never for images outside Relay's own namespace.
 
+Image retirement is ordered after service convergence: on a rebuild the new
+version is swapped in, schedules and persistent services converge to it, and
+only then is the superseded image retired. Removal is additionally guarded — an
+image is never removed while any Relay-owned (event, schedule, or service)
+container references it via its `relay.image` label. When a rebuild's retire
+would remove an image a service container still uses (e.g. a partial reconcile),
+removal is skipped at debug level, retried with a short bounded backoff, and
+finally deferred to a later natural cleanup pass (the next boot sweep, next
+rebuild, or function removal). Image removal is never forced.
+
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.function`, `relay.entrypoint`, plus the image,
 port, and replica slot), never by name alone. Service containers carry no

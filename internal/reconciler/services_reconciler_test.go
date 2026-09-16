@@ -351,6 +351,52 @@ func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	}
 }
 
+// A container running the OLD image (a rebuild left it on the superseded image)
+// is never counted toward the desired replica count: it is stale and replaced,
+// and exactly one new container on the desired image is started. This is the
+// stale-by-image pin for the image-retirement ordering.
+func TestReconcileServiceStaleByImage(t *testing.T) {
+	f := newFakeDocker()
+	// A running container for the old image on the desired function/entrypoint/
+	// port/replica slot.
+	f.ctrs["old-1"] = &fakeContainer{
+		id: "old-1", function: "fn", entrypoint: "service.js",
+		image: "img-old", port: 80, replica: 0, state: container.StateRunning,
+	}
+
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	if err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The old-image container was stopped.
+	if len(f.stops) != 1 || f.stops[0] != "old-1" {
+		t.Fatalf("stops = %v, want [old-1]", f.stops)
+	}
+	// Exactly one running container remains, on the desired image, replica 0. The
+	// old-image container must NEVER have counted toward the desired replica.
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want exactly 1", got)
+	}
+	var running *fakeContainer
+	f.mu.Lock()
+	for _, c := range f.ctrs {
+		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+			running = c
+		}
+	}
+	f.mu.Unlock()
+	if running == nil {
+		t.Fatal("no running container after reconcile")
+	}
+	if running.image != "img-new" {
+		t.Fatalf("started spec image = %q, want img-new (the desired image)", running.image)
+	}
+	if running.replica != 0 {
+		t.Fatalf("started replica = %d, want 0", running.replica)
+	}
+}
+
 func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})

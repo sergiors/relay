@@ -69,12 +69,12 @@ func isInvocationContainer(labels map[string]string) bool {
 	return t == ContainerTypeEvent || t == ContainerTypeSchedule
 }
 
-// isRelayContainer reports whether labels classify a container as Relay-owned:
+// isManagedContainer reports whether labels classify a container as Relay-owned:
 // its relay.type is one of the three known values. It is the "touch only
-// Relay-owned" guard. Note isRelayContainer does not by itself make a container
+// Relay-owned" guard. Note isManagedContainer does not by itself make a container
 // sweep-eligible — services are Relay-owned but reconciler-managed, so the
 // sweep excludes them via isServiceContainer.
-func isRelayContainer(labels map[string]string) bool {
+func isManagedContainer(labels map[string]string) bool {
 	t := labels[labelType]
 	return t == ContainerTypeEvent || t == ContainerTypeSchedule || t == ContainerTypeService
 }

@@ -231,6 +231,12 @@ type ImageCleaner interface {
 	// RemoveImage removes a single relay-owned image, treating an already-gone
 	// image as success.
 	RemoveImage(ctx context.Context, image string) error
+	// ImageReferencedByManagedContainer reports whether any relay-owned container
+	// (event, schedule, or service) still references the image via its
+	// relay.image label. It lets the runner confirm no relay-owned container still
+	// references an image before removing it, and to decide (conservatively) how
+	// to interpret a RemoveImage failure.
+	ImageReferencedByManagedContainer(ctx context.Context, image string) (bool, error)
 	// FunctionImageTags lists every local image tag (full references) belonging
 	// to a function's repository, so the runner can retire each version with
 	// in-flight safety.
@@ -444,28 +450,102 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	}
 }
 
+// imageCleanupRetryDelays is the bounded backoff between retries of an image
+// removal that was skipped because a relay-owned container still references it.
+// Production uses a ~60s horizon (2+4+8+16+30s across 5 attempts) before the
+// image is deferred to a later natural cleanup pass. Tests may override this
+// var (package-internal) to shrink it to milliseconds so the retry lifecycle is
+// exercised quickly.
+var imageCleanupRetryDelays = []time.Duration{
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	30 * time.Second,
+}
+
 // removeImageAsync removes a retired image off the event path so a docker round
-// trip can never add latency (or failure) to Handle. It re-checks in-use just
-// before removing because an execution may have (re)claimed the image after it
-// was retired; if so it is left in place for that execution and its own release
-// path. A nil cleaner is a no-op.
+// trip can never add latency (or failure) to Handle. Removal is gated by two
+// independent guards: the in-flight refcount (an execution may have (re)claimed
+// the image after it was retired) and the relay-owned container reference check
+// (a persistent service container may still reference it). When either guard
+// holds, removal is skipped and retried with a bounded backoff
+// (imageCleanupRetryDelays); when the attempts exhaust, the image is deferred to
+// a later natural cleanup pass rather than force-removed. A nil cleaner is a
+// no-op.
 func (r *Runner) removeImageAsync(image string) {
 	cleaner := r.resolver()
 	if cleaner == nil {
 		return
 	}
+	// Snapshot the retry backoff once so a goroutine that outlives a test
+	// (which may override imageCleanupRetryDelays) never races the shared
+	// package var. attempt is the retry counter shared across a single
+	// guard-skip chain; a later retire of the same image that reaches removal
+	// does not cancel it — the guards make duplicate attempts benign, so a
+	// bounded per-image cleanup is safe and keeps goroutine count bounded.
+	delays := append([]time.Duration(nil), imageCleanupRetryDelays...)
+	attempt := 0
+	r.retryImageCleanupAttempt(image, cleaner, delays, &attempt)
+}
+
+// retryImageCleanupAttempt performs one removal attempt off the event path. It
+// guards the removal with the in-flight refcount and the relay-owned container
+// reference check; a guard-skip schedules a bounded retry (sharing the attempt
+// counter) using the snapshot backoff, and exhausting the retries defers the
+// image to a later natural cleanup pass.
+func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, delays []time.Duration, attempt *int) {
 	go func() {
 		// A retirement that is superseded by a new execution must not remove an
 		// image a container is about to start; skip removal if it became in-use.
+		// The in-flight execution's release path re-owns the removal when it
+		// goes idle, so we do not burn a retry attempt here.
 		if r.ImageInUse(image) {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
+		referenced, err := cleaner.ImageReferencedByManagedContainer(ctx, image)
+		if err != nil {
+			// Never remove on unknown state: treat the reference check failure as
+			// conservatively referenced and retry.
+			r.skipAndRetryImageCleanup(image, delays, "reference check failed", attempt)
+			return
+		}
+		if referenced {
+			r.skipAndRetryImageCleanup(image, delays, "relay-owned container references it", attempt)
+			return
+		}
 		if err := cleaner.RemoveImage(ctx, image); err != nil {
+			// A removal that fails while a container references the image is a
+			// guard-skip (the daemon refused, or the reference appeared mid-call),
+			// not a genuine failure. Re-consult the reference to classify the
+			// error: referenced -> debug skip + retry; otherwise the genuine Warn.
+			if again, aerr := cleaner.ImageReferencedByManagedContainer(ctx, image); aerr == nil && again {
+				r.skipAndRetryImageCleanup(image, delays, "relay-owned container references it", attempt)
+				return
+			}
 			r.log.Warn(fmt.Sprintf("Image cleanup: remove retired %s: %v", image, err))
 		}
 	}()
+}
+
+// skipAndRetryImageCleanup logs a debug-level skip and schedules the next
+// removal attempt with bounded backoff (delays is the per-chain snapshot), or —
+// on the final attempt — logs a single Info deferring the image to a later natural
+// cleanup pass (boot sweep, the next rebuild's retire, or function-removal
+// retirement). It is context-free and off the event path.
+func (r *Runner) skipAndRetryImageCleanup(image string, delays []time.Duration, reason string, attempt *int) {
+	r.log.Debug("Image cleanup: image still in use; skipping", "image", image, "reason", reason)
+	*attempt++
+	if *attempt > len(delays) {
+		r.log.Info("Image cleanup: image still in use after retries; deferring to a later cleanup pass", "image", image)
+		return
+	}
+	delay := delays[*attempt-1]
+	time.AfterFunc(delay, func() {
+		r.retryImageCleanupAttempt(image, r.resolver(), delays, attempt)
+	})
 }
 
 // toImage returns the image a prepared function executes, or "" when it is

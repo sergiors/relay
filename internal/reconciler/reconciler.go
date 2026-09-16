@@ -60,11 +60,15 @@ type Config struct {
 	// state calls are logged, never fatal.
 	State *state.State
 	// Retire, when set, is called after a function's registry entry is swapped
-	// to a new image, passing the function name and the superseded image
-	// reference (the version being replaced). It is how the runner learns to
-	// retire an image once it is no longer in use. Nil-safe; a stale or equal
-	// image is skipped by the caller. Ignoring the name is fine — the image
-	// reference already embeds it.
+	// to a new image AND its persistent service containers have been converged
+	// to that new image, passing the function name and the superseded image
+	// reference (the version being replaced). Retiring after service converge
+	// guarantees a running service container on the old image has been replaced
+	// before the old image is retire-eligible; the runner-side reference guard is
+	// the second line of defense for partial failures. It is how the runner
+	// learns to retire an image once it is no longer in use. Nil-safe; a stale
+	// or equal image is skipped by the caller. Ignoring the name is fine — the
+	// image reference already embeds it.
 	Retire func(name, oldImage string)
 	// RemoveFunction, when set, is called after a function directory vanishes
 	// (and its registry entry and state are dropped) so the runner can retire
@@ -504,14 +508,6 @@ func (r *Reconciler) reconcileFunction(name string) {
 	r.fingerprnts[name] = fp
 	r.mu.Unlock()
 
-	// Retire the superseded version now that the registry serves the new one.
-	// The hook (when wired) defers removal until the old image is no longer in
-	// use. Skip a nil hook and an equal image (an unavailable->unavailable
-	// retry, or a same-image re-prepare).
-	if r.retire != nil && oldImage != "" && oldImage != built.Image {
-		r.retire(name, oldImage)
-	}
-
 	if r.st != nil {
 		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
 	}
@@ -531,6 +527,19 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// version — and its service containers — are retained).
 	if r.updateServices != nil {
 		r.updateServices(name, fn.Template, built.Image)
+	}
+
+	// Retire the superseded version now that the registry serves the new one,
+	// persistent services have been converged to it, and — crucially — the
+	// service containers that still ran on the old image have been replaced. The
+	// hook (when wired) defers removal until the old image is no longer in use;
+	// the runner-side reference guard (in-flight refcount plus Relay-owned
+	// container references) is the second line of defense for partial service
+	// reconcile failures, so a service container left on the old image keeps that
+	// image from being removed. Skip a nil hook and an equal image (an
+	// unavailable->unavailable retry, or a same-image re-prepare).
+	if r.retire != nil && oldImage != "" && oldImage != built.Image {
+		r.retire(name, oldImage)
 	}
 
 	if cur == nil {

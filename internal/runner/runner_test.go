@@ -627,10 +627,41 @@ func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 
 // bufferLogger returns a leveled logger that captures output into a buffer, so
 // tests can assert on the structured log lines the runner emits (e.g. the panic
-// log). It runs at DEBUG so nothing is filtered.
+// log). It runs at DEBUG so nothing is filtered. The returned builder is NOT
+// synchronized; callers must not feed a concurrently-running goroutine with it.
 func bufferLogger() (*slog.Logger, *strings.Builder) {
 	var b strings.Builder
 	return slog.New(slog.NewTextHandler(&b, nil)), &b
+}
+
+// debugBufferLogger is like bufferLogger but at DEBUG level, so the runner's
+// debug-level image-cleanup skip lines are captured too. The returned builder is
+// synchronized so concurrent async goroutines (e.g. the removal retry loop) and
+// the test goroutine can share it race-free; it exposes the strings.Builder
+// String()/Len() methods under a lock.
+func debugBufferLogger() (*slog.Logger, *syncBuffer) {
+	b := &syncBuffer{}
+	return slog.New(slog.NewTextHandler(b, &slog.HandlerOptions{Level: slog.LevelDebug})), b
+}
+
+// syncBuffer wraps a strings.Builder with a mutex so a logger fed by concurrent
+// goroutines can be read safely by a test. io.Writer writes (the logger) are
+// serialized; String() snapshots under the lock.
+type syncBuffer struct {
+	mu sync.Mutex
+	strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Builder.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Builder.String()
 }
 
 // TestHandleExecutorPanicTreatedAsFailedAttempt verifies that an executor panic
