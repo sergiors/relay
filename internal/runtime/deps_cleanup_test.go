@@ -65,13 +65,14 @@ func TestPartitionManagedImagesDependencyRef(t *testing.T) {
 	depA := "relay-dep-aaaaaaaaaaaaaaaa"
 	depB := "relay-dep-bbbbbbbbbbbbbbbb"
 	items := []image.Summary{
-		// A managed function image referencing depA.
-		{Labels: map[string]string{
+		// A managed function image referencing depA (tagged, as a real
+		// daemon-listed function image always is).
+		{RepoTags: []string{"relay-fn-a:aaaa"}, Labels: map[string]string{
 			labelType: ImageTypeFunction, labelFunction: "a",
 			labelDependency: depA,
 		}},
 		// A managed function image (no deps) — reference holder only.
-		{Labels: map[string]string{
+		{RepoTags: []string{"relay-fn-b:bbbb"}, Labels: map[string]string{
 			labelType: ImageTypeFunction, labelFunction: "b",
 		}},
 		// A managed dependency image with a tagged relay-dep- reference: a
@@ -124,7 +125,7 @@ func TestPartitionManagedImagesIgnoresLabels(t *testing.T) {
 		// A managed function image with a relay.dependency value that is NOT a
 		// present candidate: its reference is still collected (there is just no
 		// matching candidate to remove).
-		{Labels: map[string]string{
+		{RepoTags: []string{"relay-fn-a:cccc"}, Labels: map[string]string{
 			labelType: ImageTypeFunction, labelFunction: "a",
 			labelDependency: "relay-dep-cccccccccccccccc",
 		}},
@@ -165,5 +166,38 @@ func TestPartitionManagedImagesMultiTagAndDangling(t *testing.T) {
 		if !found {
 			t.Errorf("candidate %s missing", c)
 		}
+	}
+}
+
+// TestPartitionManagedImagesDanglingFunctionNotReference pins that a DANGLING
+// (untagged) labeled function image does NOT hold its relay.dependency as a
+// reference. Racing same-content builds (or a tag removal the daemon would not
+// turn into a full delete) leave the underlying image ID behind with its labels;
+// such residue must never pin a dependency image forever. The dependency GC
+// derives references from TAGGED function images only, with the daemon's
+// force-free parent-layer refusal as the safety net for the edge where the
+// dangling image genuinely still backs something live.
+func TestPartitionManagedImagesDanglingFunctionNotReference(t *testing.T) {
+	items := []image.Summary{
+		// Dangling labeled function image: build residue, no tags, still
+		// carrying a dependency label. Must NOT hold that dependency.
+		{Labels: map[string]string{
+			labelType:       ImageTypeFunction,
+			labelFunction:   "residue",
+			labelDependency: "relay-dep-aaaaaaaaaaaaaaaa",
+		}},
+		// Dangling labeled dependency image: likewise never a candidate.
+		{Labels: map[string]string{
+			labelType:        ImageTypeDependency,
+			labelRuntime:     "python3.14",
+			labelFingerprint: "aaaaaaaaaaaaaaaa",
+		}},
+	}
+	candidates, referenced := partitionManagedImages(items)
+	if len(candidates) != 0 {
+		t.Errorf("dangling images must never be candidates, got %v", candidates)
+	}
+	if referenced["relay-dep-aaaaaaaaaaaaaaaa"] {
+		t.Error("a dangling (untagged) function image must not hold its dependency as a reference")
 	}
 }

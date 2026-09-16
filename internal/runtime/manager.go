@@ -160,7 +160,11 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
 	if m.imageExists(ctx, image) {
-		m.log.Debug("Function %q: image %s exists; reusing", fn.Name, image)
+		m.log.Debug(
+			"Function: image exists; reusing",
+			"function", fn.Name,
+			"image", image,
+		)
 		return funcPrepared, nil
 	}
 

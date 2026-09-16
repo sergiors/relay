@@ -157,19 +157,32 @@ keep_alive()
 		t.Fatalf("entrypoint = %v, want [python -m app.main]", insp.Container.Config.Entrypoint)
 	}
 
-	// Fetch the logs and assert the module (with its relative import) actually ran.
-	rc, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
-	if err != nil {
-		t.Fatalf("logs: %v", err)
-	}
-	defer rc.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, rc); err != nil {
-		t.Fatalf("copy logs: %v", err)
-	}
-	logs := buf.String()
-	if !strings.Contains(logs, "module-entrypoint-started from-relative-import-ok") {
-		t.Fatalf("container logs do not show the module-entrypoint + relative-import proof, got:\n%s", logs)
+	// Poll the logs until the proof line appears. The entrypoint assertion
+	// above already proves the container was created with the module form, but
+	// State.Running flips true the instant the process starts — BEFORE the
+	// interpreter has booted, imported the package, and flushed the proof line.
+	// A single immediate fetch races that startup work (observed on CI: the
+	// fetched log was empty while the container was healthy), so fetch on a
+	// short deadline and require the proof to appear, not merely the container
+	// to be running.
+	deadlineLogs := time.Now().Add(30 * time.Second)
+	var logs string
+	for {
+		rc, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+		if err != nil {
+			t.Fatalf("logs: %v", err)
+		}
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, rc)
+		rc.Close()
+		logs = buf.String()
+		if strings.Contains(logs, "module-entrypoint-started from-relative-import-ok") {
+			break
+		}
+		if !time.Now().Before(deadlineLogs) {
+			t.Fatalf("container logs do not show the module-entrypoint + relative-import proof within 30s, got:\n%s", logs)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

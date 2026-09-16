@@ -116,14 +116,31 @@ func (m *Manager) removeUnreferencedDependencyImage(ctx context.Context, dep str
 // against synthetic image summaries. See CleanupUnusedDependencies for the
 // ownership semantics; this function implements the label-driven classification
 // only.
+//
+// DANGLING images (empty RepoTags) are classified as neither: they are
+// unreachable build residue. This matters because racing same-content builds
+// (TestIntegrationConcurrentDepBuilds) or a tag-removal that the daemon refused
+// to turn into a full delete leaves the underlying image ID behind WITH its
+// labels. A dangling labeled function image must not hold its dependency
+// hostage forever: its tags were removed, its lifecycle ended (nothing Relay
+// manages can start it — the reconciler, the state DB, and containers all
+// reference images by tag), so GC derives references from TAGGED function
+// images only. The force-free removal path remains the final safety net: if a
+// dangling image is genuinely still a parent layer of something live, the
+// daemon refuses the dependency removal and GC conservatively keeps it.
 func partitionManagedImages(items []image.Summary) (candidates []string, referenced map[string]bool) {
 	referenced = make(map[string]bool)
 	candidateSeen := make(map[string]bool)
 	for _, img := range items {
+		if len(img.RepoTags) == 0 {
+			// Dangling (untagged) image: build residue, classified as neither a
+			// reference holder nor a candidate. See the doc comment above.
+			continue
+		}
 		switch img.Labels[labelType] {
 		case ImageTypeFunction:
-			// A managed function image holds exactly one dependency reference
-			// (its parent). Collect it.
+			// A tagged managed function image holds exactly one dependency
+			// reference (its parent). Collect it.
 			if d := img.Labels[labelDependency]; d != "" {
 				referenced[d] = true
 			}

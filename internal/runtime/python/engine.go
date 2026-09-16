@@ -37,17 +37,10 @@ const installCommand = "pip install --no-cache-dir -r requirements.txt"
 const (
 	userID   = "10001:10001"
 	userName = "app"
-	// userSetup runs as root at build time. /app is on a read-only rootfs at
-	// runtime, but the user must own it so Python can write __pycache__ bytecode
-	// next to imported sources (see the PYTHONDONTWRITEBYTECODE env below, which
-	// disables that write so the read-only rootfs is never hit). /relay holds the
-	// bootstrap, which the user only needs to read. chown uses the numeric id so
-	// it is independent of the user/group name.
+	// Create the non-root runtime user and make application files readable
+	// under the same ownership used by the container process.
 	userSetup = "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app -s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay"
-	// PYTHONDONTWRITEBYTECODE stops Python from writing __pycache__ bytecode
-	// next to imported sources. /app is on a read-only rootfs, so without this
-	// the first import of a user module would fail trying to create a bytecode
-	// cache directory. It is a runtime env, not a build env.
+	// Disable Python bytecode writes because /app runs on a read-only rootfs.
 	noBytecodeEnv = "PYTHONDONTWRITEBYTECODE=1"
 )
 
