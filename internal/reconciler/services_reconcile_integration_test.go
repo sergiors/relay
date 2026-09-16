@@ -53,7 +53,10 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
 		t.Fatalf("write index: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "service.js"), []byte("setInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("setInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
 		t.Fatalf("write service: %v", err)
 	}
 
@@ -140,7 +143,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 
 // serviceReconcileTemplate renders a node24 template declaring one service.
 func serviceReconcileTemplate(port, replicas int) string {
-	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - handler: service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
+	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
 }
 
 // assertServiceCounts waits (up to 20s) until exactly want running service

@@ -432,7 +432,7 @@ schedules:
     timeout: 20s
 
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000
     replicas: 2
 ```
@@ -481,7 +481,7 @@ services:
   `events.created`, function `handler`. Handlers may live in nested modules
   (for example the `events/` package), not only in top-level files.
 - `services` (optional) is a list of persistent long-running HTTP services (see
-  _Services_ below). Each entry has a required `handler` (an application
+  _Services_ below). Each entry has a required `entrypoint` (an application
   entrypoint **file**, not the `module.function` form) plus optional `port`
   (default `80`, `1`–`65535`) and `replicas` (default `1`, positive integer).
   The template example above shows a service alongside events and schedules.
@@ -706,17 +706,20 @@ server, for example — that Relay keeps running and reconciling continuously.
 runtime: node24
 
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000
     replicas: 2
 ```
 
-- `handler` (required) is the application entrypoint **file** the runtime
-  starts as the long-lived process (`service.js` on the Node runtime). It is
+- `entrypoint` (required) is the application entrypoint **file** the runtime
+  starts as the long-lived process (`service.js` on the Node runtime, or a
+  nested file such as `app/main.py` for Python). It is
   not the `module.function` event-handler form, and it is not invoked
   per-request: HTTP requests are handled directly by the user's application
-  inside the container. It must be a plain filename (no path separators, no
-  whitespace).
+  inside the container. It must be a relative path inside the application
+  directory (e.g. `service.js`, `app/main.py`) — no whitespace, no absolute
+  paths, and no `..` path elements. The runtime starts it as `node <entrypoint>`
+  / `python <entrypoint>` within the application directory.
 - `port` (optional) is the internal TCP port the service application listens
   on. It defaults to `80` and must be between `1` and `65535`. Relay injects it
   as the `PORT` environment variable (it cannot be overridden by template env
@@ -732,7 +735,7 @@ services:
 The service lifecycle reuses the function image machinery with no separate
 build system: the function image is prepared exactly as for invocations, and a
 service container runs the **same image** with its entrypoint overridden to
-the service file (e.g. `node /app/service.js`). This keeps every version of a
+the service entrypoint (e.g. `node /app/service.js`). This keeps every version of a
 function in one image repository, so the existing image-retirement machinery
 covers services too.
 
@@ -759,9 +762,11 @@ desired replicas (template)  vs  actual Relay-owned service containers
   references them, and never for images outside Relay's own namespace.
 
 Containers are identified by deterministic Relay-owned labels
-(`relay.type=service`, `relay.function`, `relay.service`, plus the image,
-port, and replica slot), never by name alone. Stale containers left behind by a
-crashed Relay process are swept at the next startup.
+(`relay.type=service`, `relay.function`, `relay.entrypoint`, plus the image,
+port, and replica slot), never by name alone. Service containers carry no
+`relay.handler` label (that key identifies event/schedule handlers) — the
+entrypoint IS the service. Stale containers left behind by a crashed Relay
+process are swept at the next startup.
 
 The environment each replica gets: the runtime's plan environment (e.g.
 `PYTHONDONTWRITEBYTECODE=1` for Python), then the template's `env` values,
@@ -773,7 +778,7 @@ memory/CPU/pids limits, read-only rootfs, and a bounded `/tmp`.
 
 ```
 Services:
-  service.js   port=3000 replicas=2
+  app/service.js   port=3000 replicas=2
 ```
 
 Out of scope for this first version: host port publishing, Traefik/routing

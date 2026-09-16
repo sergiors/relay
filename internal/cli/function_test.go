@@ -400,7 +400,7 @@ func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
 // after Events when no schedules) and before Environment, showing the effective
 // entrypoint file, port, and replica count (defaults applied).
 func TestFunctionInspectServicesSection(t *testing.T) {
-	out := inspectServicesWithEnv(t, `  - handler: service.js
+	out := inspectServicesWithEnv(t, `  - entrypoint: service.js
 `, true)
 	for _, want := range []string{"Services:", "service.js", "port=80", "replicas=1"} {
 		if !strings.Contains(out, want) {
@@ -418,7 +418,7 @@ func TestFunctionInspectServicesSection(t *testing.T) {
 
 // Explicit port/replicas override the defaults.
 func TestFunctionInspectServicesExplicit(t *testing.T) {
-	out := inspectServices(t, `  - handler: api.js
+	out := inspectServices(t, `  - entrypoint: api.js
     port: 3000
     replicas: 3
 `)
@@ -447,7 +447,7 @@ schedules:
   - handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 services:
-  - handler: service.js
+  - entrypoint: service.js
 `))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)

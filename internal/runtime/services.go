@@ -16,17 +16,17 @@ import (
 // one-shot invocation containers (event/schedule), so sweeps/reconcilers can
 // never confuse the two populations.
 
-// ServiceSpec describes one desired service replica's container. The handler is
-// the service's identity: relay.handler is stamped with it (there is no separate
-// relay.service label), and it is what Reconcile uses to group a function's
-// containers by service.
+// ServiceSpec describes one desired service replica's container. The entrypoint
+// is the service's identity: relay.entrypoint is stamped with it (there is no
+// separate relay.service label, and services carry no relay.handler), and it is
+// what Reconcile uses to group a function's containers by service.
 type ServiceSpec struct {
-	Function string
-	Handler  string // handler/entrypoint identity, e.g. "service.js"
-	Port     int
-	Image    string
-	Entry    []string // the long-lived process command; empty = image entrypoint
-	Env      []string // runtime env (plan env), no RELAY_HANDLER
+	Function   string
+	Entrypoint string // application entrypoint file, e.g. "app/service.js"
+	Port       int
+	Image      string
+	Entry      []string // the long-lived process command; empty = image entrypoint
+	Env        []string // runtime env (plan env), no RELAY_HANDLER
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
@@ -34,13 +34,13 @@ type ServiceSpec struct {
 // ownership predicate, because services must be reconcilable across worker
 // restarts on the same host.
 type ServiceContainer struct {
-	ID       string
-	Function string
-	Handler  string
-	Image    string
-	Hostname string
-	State    container.ContainerState
-	Replica  int
+	ID         string
+	Function   string
+	Entrypoint string
+	Image      string
+	Hostname   string
+	State      container.ContainerState
+	Replica    int
 	// Port is the container's configured internal port, parsed from its
 	// relay.port label. It defaults to 0 when the label is missing/invalid.
 	// The service reconciler uses it to detect a port change (a stale-config
@@ -51,13 +51,13 @@ type ServiceContainer struct {
 // serviceContainerLabelName is the deterministic, docker-safe container name for
 // one service replica. Ownership is always derived from labels, never from this
 // name (names are not guaranteed unique/stable across restarts), so this is
-// purely for human greppability. The service handler part is sanitized to
+// purely for human greppability. The service entrypoint part is sanitized to
 // [A-Za-z0-9_.-] and the total is capped well under docker's name length limit.
 const serviceContainerNameLenCap = 100
 
 // sanitizeContainerNamePart replaces any character outside [A-Za-z0-9_.-] with
 // '-'. Function names are already validated to a legal docker repo charset, but
-// the service handler is an arbitrary filename the operator chose, so it is
+// the service entrypoint is an arbitrary filename the operator chose, so it is
 // sanitized defensively.
 func sanitizeContainerNamePart(s string) string {
 	var b strings.Builder
@@ -74,10 +74,10 @@ func sanitizeContainerNamePart(s string) string {
 }
 
 // serviceContainerName derives the deterministic container name for a replica:
-// relay-svc-<function>-<handler>-<replica>. Function names are already
-// validated; the handler part is sanitized and the whole name capped.
-func serviceContainerName(functionName, handler string, replica int) string {
-	name := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(handler) + "-" + strconv.Itoa(replica)
+// relay-svc-<function>-<entrypoint>-<replica>. Function names are already
+// validated; the entrypoint part is sanitized and the whole name capped.
+func serviceContainerName(functionName, entrypoint string, replica int) string {
+	name := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(entrypoint) + "-" + strconv.Itoa(replica)
 	if len(name) > serviceContainerNameLenCap {
 		name = name[:serviceContainerNameLenCap]
 	}
@@ -88,17 +88,18 @@ func serviceContainerName(functionName, handler string, replica int) string {
 // container: relay.type=service plus relay.function + relay.hostname make a
 // service container recognizable to Relay while the strict relay.type guard
 // lets sweeps/reconcilers distinguish the service population from one-shot
-// invocation containers. relay.handler is the service identity (the handler
-// string) — there is no relay.service label.
+// invocation containers. relay.entrypoint is the service identity (the
+// entrypoint string) — there is no relay.service label there, and service
+// containers carry no relay.handler.
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
 	return map[string]string{
-		labelType:     ContainerTypeService,
-		labelFunction: spec.Function,
-		labelHandler:  spec.Handler,
-		labelImage:    spec.Image,
-		labelHostname: hostname,
-		labelPort:     strconv.Itoa(spec.Port),
-		labelReplica:  strconv.Itoa(replica),
+		labelType:       ContainerTypeService,
+		labelFunction:   spec.Function,
+		labelEntrypoint: spec.Entrypoint,
+		labelImage:      spec.Image,
+		labelHostname:   hostname,
+		labelPort:       strconv.Itoa(spec.Port),
+		labelReplica:    strconv.Itoa(replica),
 	}
 }
 
@@ -135,7 +136,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		Config: cfg,
 		// No AutoRemove: persistent, reconciler-owned (see doc comment).
 		HostConfig: hardenedHostConfig(false),
-		Name:       serviceContainerName(spec.Function, spec.Handler, replica),
+		Name:       serviceContainerName(spec.Function, spec.Entrypoint, replica),
 	})
 	if err != nil {
 		return "", fmt.Errorf("service: create container: %w", err)
@@ -152,7 +153,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	m.log.Info("Service: started",
 		"function", spec.Function,
-		"handler", spec.Handler,
+		"entrypoint", spec.Entrypoint,
 		"replica", replica,
 		"container", id,
 	)
@@ -189,14 +190,14 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			port = p
 		}
 		out = append(out, ServiceContainer{
-			ID:       c.ID,
-			Function: c.Labels[labelFunction],
-			Handler:  c.Labels[labelHandler],
-			Image:    c.Labels[labelImage],
-			Hostname: c.Labels[labelHostname],
-			State:    c.State,
-			Replica:  replica,
-			Port:     port,
+			ID:         c.ID,
+			Function:   c.Labels[labelFunction],
+			Entrypoint: c.Labels[labelEntrypoint],
+			Image:      c.Labels[labelImage],
+			Hostname:   c.Labels[labelHostname],
+			State:      c.State,
+			Replica:    replica,
+			Port:       port,
 		})
 	}
 	return out, nil
@@ -218,7 +219,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 					firstErr = err
 				}
 				m.log.Warn(fmt.Sprintf("Service: stop container %s (%s %s): %v",
-					c.ID, c.Function, c.Handler, err))
+					c.ID, c.Function, c.Entrypoint, err))
 				continue
 			}
 		}
@@ -227,7 +228,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				firstErr = err
 			}
 			m.log.Warn(fmt.Sprintf("Service: remove container %s (%s %s): %v",
-				c.ID, c.Function, c.Handler, err))
+				c.ID, c.Function, c.Entrypoint, err))
 		}
 	}
 	return firstErr
@@ -297,39 +298,58 @@ func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, 
 	return removed, nil
 }
 
-// validateServiceHandler rejects a service entrypoint that cannot be launched
-// safely inside the container. v1 keeps it deliberately strict: a plain filename
-// with no path separators — no absolute paths, no "..", no subpaths — so the
-// launch path is always a directly-owned file in the image's WORKDIR.
-func validateServiceHandler(handler string) error {
-	if handler == "" {
-		return fmt.Errorf("service entrypoint: empty handler")
+// validateServiceEntrypoint rejects a service entrypoint that cannot be launched
+// safely inside the container. It must be a RELATIVE path inside the application
+// directory (e.g. "service.js" or "app/service.js"): non-empty, no whitespace,
+// no backslash, not absolute (no leading '/'), and every '/' -separated element
+// must be non-empty and not "."-leading and not "."-leading-equal-to-"..". This
+// allows nested files (app/main.py) while still refusing traversals that could
+// escape the copied application directory.
+func validateServiceEntrypoint(entrypoint string) error {
+	if entrypoint == "" {
+		return fmt.Errorf("service entrypoint: empty entrypoint")
 	}
-	if strings.ContainsAny(handler, " \t/") {
-		return fmt.Errorf("service entrypoint %q: must be a plain filename (no spaces or path separators)", handler)
+	if strings.ContainsAny(entrypoint, " \t\r\n") {
+		return fmt.Errorf("service entrypoint %q: must not contain whitespace", entrypoint)
 	}
-	if strings.HasPrefix(handler, "..") || strings.HasPrefix(handler, ".") {
-		return fmt.Errorf("service entrypoint %q: must be a plain filename, not a path", handler)
+	if strings.ContainsAny(entrypoint, "\\") {
+		return fmt.Errorf("service entrypoint %q: must not contain backslashes", entrypoint)
+	}
+	if strings.HasPrefix(entrypoint, "/") {
+		return fmt.Errorf("service entrypoint %q: must be a relative path inside the application directory", entrypoint)
+	}
+	for _, el := range strings.Split(entrypoint, "/") {
+		if el == "" {
+			return fmt.Errorf("service entrypoint %q: must not contain empty path elements", entrypoint)
+		}
+		if el == ".." {
+			return fmt.Errorf("service entrypoint %q: path must not contain \"..\"", entrypoint)
+		}
+		if strings.HasPrefix(el, ".") {
+			return fmt.Errorf("service entrypoint %q: invalid path element %q (path elements must not start with \".\")", entrypoint, el)
+		}
 	}
 	return nil
 }
 
 // ServiceEntry returns the container entrypoint override for a service
 // entrypoint file on the given runtime, or an error for an unsupported runtime
-// or an invalid handler filename. One image serves both invocations and services
+// or an invalid entrypoint. One image serves both invocations and services
 // (the function image's bootstrap entrypoint is overridden per-container), so
 // this is the only service-specific knowledge the runtime needs — no separate
 // plan or image per service. node24 and python3.14 are the runtimes Relay
-// supports as of this iteration.
-func ServiceEntry(runtimeName, handler string) ([]string, error) {
-	if err := validateServiceHandler(handler); err != nil {
+// supports as of this iteration. The file is launched as a relative path under
+// /app (the image's WORKDIR where the function dir is COPYied), so a nested
+// entrypoint like "app/service.js" resolves to /app/app/service.js.
+func ServiceEntry(runtimeName, entrypoint string) ([]string, error) {
+	if err := validateServiceEntrypoint(entrypoint); err != nil {
 		return nil, err
 	}
 	switch runtimeName {
 	case "node24":
-		return []string{"node", "/app/" + handler}, nil
+		return []string{"node", "/app/" + entrypoint}, nil
 	case "python3.14":
-		return []string{"python", "/app/" + handler}, nil
+		return []string{"python", "/app/" + entrypoint}, nil
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q for services", runtimeName)
 	}

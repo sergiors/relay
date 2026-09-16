@@ -33,14 +33,14 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: service.js
+  - entrypoint: service.js
 `)
 	if len(tmpl.Services) != 1 {
 		t.Fatalf("expected 1 service, got %d", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Handler != "service.js" {
-		t.Fatalf("handler = %q", s.Handler)
+	if s.Entrypoint != "service.js" {
+		t.Fatalf("entrypoint = %q", s.Entrypoint)
 	}
 	if s.Port != DefaultServicePort {
 		t.Fatalf("omitted port = %d, want default %d", s.Port, DefaultServicePort)
@@ -59,7 +59,7 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000
     replicas: 2
 `)
@@ -84,19 +84,19 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: api.js
+  - entrypoint: api.js
     port: 3000
-  - handler: worker.js
+  - entrypoint: worker.js
     port: 4000
     replicas: 3
 `)
 	if len(tmpl.Services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(tmpl.Services))
 	}
-	if tmpl.Services[0].Handler != "api.js" || tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != DefaultServiceReplicas {
+	if tmpl.Services[0].Entrypoint != "api.js" || tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != DefaultServiceReplicas {
 		t.Fatalf("service 0 = %+v", tmpl.Services[0])
 	}
-	if tmpl.Services[1].Handler != "worker.js" || tmpl.Services[1].Port != 4000 || tmpl.Services[1].Replicas != 3 {
+	if tmpl.Services[1].Entrypoint != "worker.js" || tmpl.Services[1].Port != 4000 || tmpl.Services[1].Replicas != 3 {
 		t.Fatalf("service 1 = %+v", tmpl.Services[1])
 	}
 }
@@ -124,7 +124,7 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: ` + tc.port + `
 `))
 			if err == nil {
@@ -162,7 +162,7 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: service.js
+  - entrypoint: service.js
     replicas: ` + tc.replicas + `
 `))
 			if err == nil {
@@ -178,8 +178,8 @@ services:
 	}
 }
 
-// A missing handler is rejected; a handler with whitespace is rejected.
-func TestParseServiceMissingHandler(t *testing.T) {
+// A missing entrypoint is rejected; an entrypoint with whitespace is rejected.
+func TestParseServiceMissingEntrypoint(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
 events:
@@ -189,12 +189,12 @@ events:
 services:
   - port: 3000
 `))
-	if err == nil || !strings.Contains(err.Error(), "service is missing a handler") {
-		t.Fatalf("err = %v, want missing-handler error", err)
+	if err == nil || !strings.Contains(err.Error(), "service is missing an entrypoint") {
+		t.Fatalf("err = %v, want missing-entrypoint error", err)
 	}
 }
 
-func TestParseServiceHandlerWhitespace(t *testing.T) {
+func TestParseServiceEntrypointWhitespace(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
 events:
@@ -202,17 +202,17 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: "my service.js"
+  - entrypoint: "my service.js"
 `))
 	if err == nil || !strings.Contains(err.Error(), "contains whitespace") {
 		t.Fatalf("err = %v, want whitespace rejection", err)
 	}
 }
 
-// Duplicate handlers within the services list are rejected: the handler string
-// is the service identity, and duplicates would be ambiguous for
+// Duplicate entrypoints within the services list are rejected: the entrypoint
+// string is the service identity, and duplicates would be ambiguous for
 // reconciliation.
-func TestParseServiceDuplicateHandler(t *testing.T) {
+func TestParseServiceDuplicateEntrypoint(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
 events:
@@ -220,11 +220,11 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: service.js
-  - handler: service.js
+  - entrypoint: service.js
+  - entrypoint: service.js
 `))
-	if err == nil || !strings.Contains(err.Error(), "duplicate service handler") {
-		t.Fatalf("err = %v, want duplicate-handler rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "duplicate service entrypoint") {
+		t.Fatalf("err = %v, want duplicate-entrypoint rejection", err)
 	}
 }
 
@@ -240,7 +240,7 @@ events:
     pattern:
       event_name: [MODIFY]
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000
     replicas: 2
 `)
@@ -250,7 +250,7 @@ services:
 	if len(tmpl.Services) != 1 {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
-	if tmpl.Services[0].Handler != "service.js" || tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != 2 {
+	if tmpl.Services[0].Entrypoint != "service.js" || tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != 2 {
 		t.Fatalf("service = %+v", tmpl.Services[0])
 	}
 }
@@ -268,7 +268,7 @@ schedules:
   - handler: jobs.cleanup.handler
     cron: 0 3 * * *
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 8080
 `)
 	if len(tmpl.Rules) != 1 {
@@ -277,7 +277,7 @@ services:
 	if len(tmpl.Schedules) != 1 || tmpl.Schedules[0].Handler != "jobs.cleanup.handler" {
 		t.Fatalf("schedules = %+v", tmpl.Schedules)
 	}
-	if len(tmpl.Services) != 1 || tmpl.Services[0].Handler != "service.js" || tmpl.Services[0].Port != 8080 {
+	if len(tmpl.Services) != 1 || tmpl.Services[0].Entrypoint != "service.js" || tmpl.Services[0].Port != 8080 {
 		t.Fatalf("services = %+v", tmpl.Services)
 	}
 }
@@ -291,9 +291,9 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - handler: min.js
+  - entrypoint: min.js
     port: 1
-  - handler: max.js
+  - entrypoint: max.js
     port: 65535
 `)
 	if tmpl.Services[0].Port != 1 || tmpl.Services[1].Port != 65535 {
@@ -307,7 +307,7 @@ func TestParseServicesOnlyTemplate(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000
     replicas: 2
 `))
@@ -317,7 +317,7 @@ services:
 	if len(tmpl.Rules) != 0 {
 		t.Fatalf("rules = %d, want 0", len(tmpl.Rules))
 	}
-	if len(tmpl.Services) != 1 || tmpl.Services[0].Handler != "service.js" ||
+	if len(tmpl.Services) != 1 || tmpl.Services[0].Entrypoint != "service.js" ||
 		tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != 2 {
 		t.Fatalf("services = %+v", tmpl.Services)
 	}
@@ -348,7 +348,32 @@ func TestExampleUsersAPITemplateParses(t *testing.T) {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Handler != "service.js" || s.Port != 3000 || s.Replicas != 1 {
+	if s.Entrypoint != "service.js" || s.Port != 3000 || s.Replicas != 1 {
 		t.Fatalf("service = %+v, want {service.js 3000 1}", s)
+	}
+}
+
+// Nested entrypoints (a relative path inside the application directory) parse
+// and round-trip into the Service entrypoint.
+func TestParseServiceNestedEntrypoint(t *testing.T) {
+	for _, ep := range []string{"app/service.js", "app/main.py", "a/b/c.js"} {
+		t.Run(ep, func(t *testing.T) {
+			tmpl := mustParse(t, `
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - entrypoint: `+ep+`
+    port: 3000
+`)
+			if len(tmpl.Services) != 1 || tmpl.Services[0].Entrypoint != ep {
+				t.Fatalf("services = %+v, want entrypoint %q", tmpl.Services, ep)
+			}
+			if tmpl.Services[0].Port != 3000 {
+				t.Fatalf("port = %d, want 3000", tmpl.Services[0].Port)
+			}
+		})
 	}
 }

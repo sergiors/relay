@@ -8,11 +8,15 @@ package runtime
 //	schedule — a one-shot invocation container for a schedule occurrence
 //	          (runner.InvokeHandler). relay.handler is the schedule handler.
 //	service  — a persistent, long-lived service container (Manager.StartService).
-//	          relay.handler is the service entrypoint file identity, so no
-//	          separate relay.service label exists: the handler IS the service.
+//	          relay.entrypoint is the application entrypoint file — the service
+//	          identity. Service containers carry relay.entrypoint and NO
+//	          relay.handler and NO relay.service label: the entrypoint IS the
+//	          service.
 //
-// relay.handler is the handler/entrypoint identity for ALL three types — there
-// is no relay.service label. The sweep and reconciliation predicates rely on
+// relay.handler identifies the handler for event/schedule containers only
+// (the one-shot invocation form); service containers instead carry
+// relay.entrypoint (the long-lived application entrypoint file). There is no
+// relay.service label. The sweep and reconciliation predicates rely on
 // relay.type being strict: an unknown or missing type is treated as NOT
 // Relay-owned, so the strict label set is the single mechanism that keeps
 // event/schedule/service populations distinguishable and non-Relay containers
@@ -30,8 +34,9 @@ const (
 	labelHostname  = "relay.hostname"
 	labelImage     = "relay.image"
 
-	labelPort    = "relay.port"
-	labelReplica = "relay.replica"
+	labelEntrypoint = "relay.entrypoint"
+	labelPort       = "relay.port"
+	labelReplica    = "relay.replica"
 )
 
 // The relay.type values. Every Relay-owned container carries exactly one; the

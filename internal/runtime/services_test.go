@@ -8,20 +8,20 @@ import (
 
 func TestServiceLabels(t *testing.T) {
 	got := serviceLabels(ServiceSpec{
-		Function: "user-events",
-		Handler:  "service.js",
-		Port:     3000,
-		Image:    "relay-fn-user-events:632aca75fa306911",
+		Function:   "user-events",
+		Entrypoint: "service.js",
+		Port:       3000,
+		Image:      "relay-fn-user-events:632aca75fa306911",
 	}, "worker-1", 2)
 
 	want := map[string]string{
-		labelType:     ContainerTypeService,
-		labelFunction: "user-events",
-		labelHandler:  "service.js",
-		labelImage:    "relay-fn-user-events:632aca75fa306911",
-		labelHostname: "worker-1",
-		labelPort:     "3000",
-		labelReplica:  "2",
+		labelType:       ContainerTypeService,
+		labelFunction:   "user-events",
+		labelEntrypoint: "service.js",
+		labelImage:      "relay-fn-user-events:632aca75fa306911",
+		labelHostname:   "worker-1",
+		labelPort:       "3000",
+		labelReplica:    "2",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -36,22 +36,31 @@ func TestServiceLabels(t *testing.T) {
 			t.Errorf("relay.type must be %q, got %q", ContainerTypeService, got[k])
 		}
 	}
+	// Service containers carry relay.entrypoint and NO relay.handler and NO
+	// relay.service label.
+	if _, ok := got[labelHandler]; ok {
+		t.Errorf("service labels must NOT carry relay.handler, got %v", got)
+	}
+	if _, ok := got["relay.service"]; ok {
+		t.Errorf("service labels must NOT carry relay.service, got %v", got)
+	}
 }
 
 func TestServiceContainerName(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		function string
-		handler  string
-		replica  int
-		want     string
+		name       string
+		function   string
+		entrypoint string
+		replica    int
+		want       string
 	}{
 		{"plain", "user-events", "service.js", 0, "relay-svc-user-events-service.js-0"},
-		{"sanitize handler", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-1"},
+		{"nested", "fn", "app/service.js", 0, "relay-svc-fn-app-service.js-0"},
+		{"sanitize entrypoint", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-1"},
 		{"cap over 100", "averylongfunctionname", strings.Repeat("x", 200), 99, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := serviceContainerName(tc.function, tc.handler, tc.replica)
+			got := serviceContainerName(tc.function, tc.entrypoint, tc.replica)
 			if len(got) > 100 {
 				t.Fatalf("name length %d exceeds cap 100", len(got))
 			}
@@ -70,23 +79,30 @@ func TestServiceContainerNameDeterministic(t *testing.T) {
 	}
 }
 
-func TestValidateServiceHandler(t *testing.T) {
+func TestValidateServiceEntrypoint(t *testing.T) {
 	for _, tc := range []struct {
-		handler string
-		wantErr string
+		entrypoint string
+		wantErr    string
 	}{
 		{"service.js", ""},
 		{"api.js", ""},
+		{"app/service.js", ""},
+		{"app/main.py", ""},
+		{"a/b/c.js", ""},
 		{"", "empty"},
-		{"a b.js", "no spaces"},
-		{"dir/service.js", "path separators"},
-		{"/etc/passwd", "path separators"},
-		{"../escape.js", "path separators"},
-		{"..hidden.js", "path"},
-		{".hidden.js", "path"},
+		{"a b.js", "whitespace"},
+		{"app service.js", "whitespace"},
+		{"/etc/passwd", "relative path"},
+		{"../escape.js", "must not contain"},
+		{"..hidden.js", "path elements must not"},
+		{".hidden.js", "path elements must not"},
+		{"a//b.js", "empty path elements"},
+		{"a/./b.js", "path elements must not"},
+		{"back\\slash.js", "backslashes"},
+		{"a/..hidden/b.js", "path elements must not"},
 	} {
-		t.Run(fmt.Sprintf("%q", tc.handler), func(t *testing.T) {
-			err := validateServiceHandler(tc.handler)
+		t.Run(fmt.Sprintf("%q", tc.entrypoint), func(t *testing.T) {
+			err := validateServiceEntrypoint(tc.entrypoint)
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -102,18 +118,21 @@ func TestValidateServiceHandler(t *testing.T) {
 
 func TestServiceEntry(t *testing.T) {
 	for _, tc := range []struct {
-		runtime string
-		handler string
-		want    []string
-		wantErr bool
+		runtime    string
+		entrypoint string
+		want       []string
+		wantErr    bool
 	}{
 		{"node24", "service.js", []string{"node", "/app/service.js"}, false},
 		{"python3.14", "server.py", []string{"python", "/app/server.py"}, false},
+		{"node24", "app/service.js", []string{"node", "/app/app/service.js"}, false},
+		{"python3.14", "app/main.py", []string{"python", "/app/app/main.py"}, false},
+		{"node24", "a/b/c.js", []string{"node", "/app/a/b/c.js"}, false},
 		{"unknown", "service.js", nil, true},
 		{"node24", "../../etc/passwd", nil, true},
 	} {
-		t.Run(tc.runtime+"/"+tc.handler, func(t *testing.T) {
-			got, err := ServiceEntry(tc.runtime, tc.handler)
+		t.Run(tc.runtime+"/"+tc.entrypoint, func(t *testing.T) {
+			got, err := ServiceEntry(tc.runtime, tc.entrypoint)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got %v", got)
@@ -140,7 +159,7 @@ func TestServiceEntry(t *testing.T) {
 // even though they carry relay.function + relay.hostname and would otherwise be
 // Relay-owned — a service must never be swept as an orphan.
 func TestSweepSkipsServiceContainers(t *testing.T) {
-	svc := serviceLabels(ServiceSpec{Function: "f", Handler: "svc", Image: "img"}, "test-host", 0)
+	svc := serviceLabels(ServiceSpec{Function: "f", Entrypoint: "svc", Image: "img"}, "test-host", 0)
 	if !sweepSkips(svc) {
 		t.Error("sweepSkips(service labels) = false, want true (services are persistent, reconciler-owned)")
 	}

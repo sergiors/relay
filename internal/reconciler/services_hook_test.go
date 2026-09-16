@@ -78,7 +78,7 @@ func newTestReconcilerServices(
 	return r, reg
 }
 
-const servicesTemplate = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - handler: service.js\n    port: 3000\n"
+const servicesTemplate = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: service.js\n    port: 3000\n"
 
 // writeServicesDir writes a function directory whose template declares a service.
 func writeServicesDir(t *testing.T, root, name string) string {

@@ -137,13 +137,14 @@ type Schedule struct {
 // Service is one persistent HTTP service from the template's `services`
 // list: the application entrypoint file the runtime starts as the long-lived
 // process, the internal TCP port the application listens on, and the desired
-// replica count Relay maintains. Handler is an entrypoint file (e.g.
-// "service.js"), NOT the module.function invocation-handler form. Port and
+// replica count Relay maintains. Entrypoint is an application entrypoint file
+// (e.g. "service.js" or "app/main.py"), a relative path inside the application
+// directory, NOT the module.function invocation-handler form. Port and
 // Replicas are always effective (non-zero) after ParseTemplate.
 type Service struct {
-	Handler  string
-	Port     int
-	Replicas int
+	Entrypoint string
+	Port       int
+	Replicas   int
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -398,7 +399,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Retries any `yaml:"retries"`
 		} `yaml:"schedules"`
 		Services []struct {
-			Handler string `yaml:"handler"`
+			Entrypoint string `yaml:"entrypoint"`
 			// Port and Replicas are decoded as `any` so a non-integer value
 			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
 			// and rejected with a clear message (see resolveServicePort /
@@ -518,35 +519,36 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout, Retries: retries})
 	}
 
-	// Parse and validate the optional persistent services. Each entry requires a
-	// handler (an APPLICATION ENTRYPOINT file, e.g. "service.js", NOT the
-	// module.function event-handler form), so validateHandler is intentionally
-	// NOT applied. The handler string is the service's identity: duplicates
+	// Parse and validate the optional persistent services. Each entry requires an
+	// entrypoint: an APPLICATION ENTRYPOINT file, a relative path inside the
+	// application directory, e.g. "service.js" or "app/main.py", NOT the
+	// module.function event-handler form, so validateHandler is intentionally
+	// NOT applied. The entrypoint string is the service's identity: duplicates
 	// would be ambiguous for reconciliation, so they are rejected. Port and
 	// replicas are optional with defaults (DefaultServicePort /
 	// DefaultServiceReplicas). Services are optional — a template without the
 	// `services` key parses exactly as before.
 	seen := make(map[string]bool, len(raw.Services))
 	for _, s := range raw.Services {
-		if s.Handler == "" {
-			return nil, fmt.Errorf("service is missing a handler")
+		if s.Entrypoint == "" {
+			return nil, fmt.Errorf("service is missing an entrypoint")
 		}
-		if strings.ContainsAny(s.Handler, " \t\r\n") {
-			return nil, fmt.Errorf("service %q: handler %q contains whitespace", s.Handler, s.Handler)
+		if strings.ContainsAny(s.Entrypoint, " \t\r\n") {
+			return nil, fmt.Errorf("service %q: entrypoint %q contains whitespace", s.Entrypoint, s.Entrypoint)
 		}
-		if seen[s.Handler] {
-			return nil, fmt.Errorf("duplicate service handler %q", s.Handler)
+		if seen[s.Entrypoint] {
+			return nil, fmt.Errorf("duplicate service entrypoint %q", s.Entrypoint)
 		}
-		seen[s.Handler] = true
+		seen[s.Entrypoint] = true
 		port, err := resolveServicePort(s.Port)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Handler, err)
+			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
 		}
 		replicas, err := resolveServiceReplicas(s.Replicas)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Handler, err)
+			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
 		}
-		t.Services = append(t.Services, Service{Handler: s.Handler, Port: port, Replicas: replicas})
+		t.Services = append(t.Services, Service{Entrypoint: s.Entrypoint, Port: port, Replicas: replicas})
 	}
 	return t, nil
 }

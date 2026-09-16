@@ -1,5 +1,5 @@
 runtime: node24
 
 services:
-  - handler: service.js
+  - entrypoint: service.js
     port: 3000

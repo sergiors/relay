@@ -85,12 +85,12 @@ type Schedule struct {
 }
 
 // Service is one persistent service's effective configuration as persisted
-// from the template: the entrypoint file, its internal TCP port, and the
-// desired replica count.
+// from the template: the application entrypoint file, its internal TCP port,
+// and the desired replica count.
 type Service struct {
-	Handler  string
-	Port     int
-	Replicas int
+	Entrypoint string
+	Port       int
+	Replicas   int
 }
 
 // State is a concrete SQLite-backed local state view. It is safe for use from
@@ -229,10 +229,10 @@ func (c *State) initSchema(ctx context.Context) error {
 		// without a functions row, and no PRAGMA foreign_keys is forced).
 		`CREATE TABLE IF NOT EXISTS services (
 			function_name TEXT,
-			handler TEXT,
+			entrypoint TEXT,
 			port INTEGER,
 			replicas INTEGER,
-			PRIMARY KEY (function_name, handler)
+			PRIMARY KEY (function_name, entrypoint)
 		)`,
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
@@ -276,6 +276,11 @@ func (c *State) initSchema(ctx context.Context) error {
 	if err := c.migrateFunctionsColumns(ctx); err != nil {
 		return err
 	}
+	// Idempotent migration for the services-handler -> services-entrypoint
+	// rename (see migrateServicesHandlerToEntrypoint).
+	if err := c.migrateServicesHandlerToEntrypoint(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -310,6 +315,66 @@ func (c *State) migrateFunctionsColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrateServicesHandlerToEntrypoint renames the services table's handler column
+// to entrypoint for databases that predate the rename. Renaming a PRIMARY KEY
+// column in SQLite requires a table rebuild (ALTER TABLE RENAME COLUMN cannot
+// rename a column that is part of an index, including a primary key), so it
+// creates a new services table with the entrypoint column, copies every row
+// (handler AS entrypoint), drops the old table, and renames the new one. It is
+// idempotent: it runs only when PRAGMA table_info(services) reports the
+// entrypoint column is missing (an already-migrated table has it). It runs in a
+// transaction so a partial failure never leaves a half-migrated database.
+func (c *State) migrateServicesHandlerToEntrypoint(ctx context.Context) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("migrate: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var haveEntrypoint bool
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(services)`)
+	if err != nil {
+		return fmt.Errorf("migrate: read services columns: %w", err)
+	}
+	for rows.Next() {
+		var name, ctype string
+		var cid, notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate: scan service column: %w", err)
+		}
+		if name == "entrypoint" {
+			haveEntrypoint = true
+		}
+	}
+	_ = rows.Close()
+	if haveEntrypoint {
+		// Already migrated; nothing to do.
+		return nil
+	}
+
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS services_new`,
+		`CREATE TABLE services_new (
+			function_name TEXT,
+			entrypoint TEXT,
+			port INTEGER,
+			replicas INTEGER,
+			PRIMARY KEY (function_name, entrypoint)
+		)`,
+		`INSERT INTO services_new (function_name, entrypoint, port, replicas)
+		 SELECT function_name, handler AS entrypoint, port, replicas FROM services`,
+		`DROP TABLE services`,
+		`ALTER TABLE services_new RENAME TO services`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate: rename services handler->entrypoint: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // now returns the current UTC time in RFC3339.
@@ -671,20 +736,20 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	}
 
 	srows2, err := c.db.QueryContext(ctx,
-		`SELECT handler, port, replicas FROM services WHERE function_name = ? ORDER BY handler, port`, name)
+		`SELECT entrypoint, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, port`, name)
 	if err != nil {
 		c.log.Warn(fmt.Sprintf("State: services %q: %v", name, err))
 		return d, true
 	}
 	defer srows2.Close()
 	for srows2.Next() {
-		var sh string
+		var se string
 		var sp, sr int
-		if err := srows2.Scan(&sh, &sp, &sr); err != nil {
+		if err := srows2.Scan(&se, &sp, &sr); err != nil {
 			c.log.Warn(fmt.Sprintf("State: scan service %q: %v", name, err))
 			continue
 		}
-		d.Services = append(d.Services, Service{Handler: sh, Port: sp, Replicas: sr})
+		d.Services = append(d.Services, Service{Entrypoint: se, Port: sp, Replicas: sr})
 	}
 	return d, true
 }
@@ -766,8 +831,8 @@ func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
 	}
 	for _, s := range tmpl.Services {
 		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO services (function_name, handler, port, replicas) VALUES (?,?,?,?)`,
-			name, s.Handler, s.Port, s.Replicas); err != nil {
+			`INSERT OR REPLACE INTO services (function_name, entrypoint, port, replicas) VALUES (?,?,?,?)`,
+			name, s.Entrypoint, s.Port, s.Replicas); err != nil {
 			return err
 		}
 	}

@@ -123,7 +123,7 @@ func Reconcile(
 
 	desired := make(map[string]function.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
-		desired[svc.Handler] = svc
+		desired[svc.Entrypoint] = svc
 	}
 
 	var firstErr error
@@ -141,17 +141,17 @@ func Reconcile(
 			// Another function owns this container; its reconcile handles it.
 			continue
 		}
-		if _, ok := desired[c.Handler]; !ok {
+		if _, ok := desired[c.Entrypoint]; !ok {
 			if err := d.StopServiceContainers(ctx, []runtime.ServiceContainer{c}); err != nil {
-				fail(fmt.Errorf("service %q removed: %w", c.Handler, err))
+				fail(fmt.Errorf("service %q removed: %w", c.Entrypoint, err))
 			}
 			continue
 		}
-		byService[c.Handler] = append(byService[c.Handler], c)
+		byService[c.Entrypoint] = append(byService[c.Entrypoint], c)
 	}
 
 	for _, svc := range tmpl.Services {
-		existing := byService[svc.Handler]
+		existing := byService[svc.Entrypoint]
 
 		// A container is a keep candidate only when it is both healthy (running)
 		// and currently configured correctly (image and port match the desired
@@ -191,7 +191,7 @@ func Reconcile(
 		// Stop every stale/excess container for this service.
 		if len(stale) > 0 {
 			if err := d.StopServiceContainers(ctx, stale); err != nil {
-				fail(fmt.Errorf("service %q stale: %w", svc.Handler, err))
+				fail(fmt.Errorf("service %q stale: %w", svc.Entrypoint, err))
 			}
 		}
 
@@ -199,9 +199,9 @@ func Reconcile(
 		// fails we cannot start replicas, but the stops above already happened.
 		// Log the reason before continuing so the missing-replica condition is
 		// diagnosable rather than silent.
-		entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Handler)
+		entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 		if err != nil {
-			fail(fmt.Errorf("service %q: %w", svc.Handler, err))
+			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
 			if log != nil {
 				log.Warn(fmt.Sprintf("Service: cannot start replicas: %v", err))
 			}
@@ -209,7 +209,7 @@ func Reconcile(
 		}
 		env, err := BuildEnv(ctx, tmpl, svc.Port, preparedEnv, secrets)
 		if err != nil {
-			fail(fmt.Errorf("service %q: %w", svc.Handler, err))
+			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
 			if log != nil {
 				log.Warn(fmt.Sprintf("Service: cannot start replicas: %v", err))
 			}
@@ -223,15 +223,15 @@ func Reconcile(
 				continue
 			}
 			spec := runtime.ServiceSpec{
-				Function: fnName,
-				Handler:  svc.Handler,
-				Port:     svc.Port,
-				Image:    image,
-				Entry:    entry,
-				Env:      env,
+				Function:   fnName,
+				Entrypoint: svc.Entrypoint,
+				Port:       svc.Port,
+				Image:      image,
+				Entry:      entry,
+				Env:        env,
 			}
 			if _, err := d.StartService(ctx, spec, slot); err != nil {
-				fail(fmt.Errorf("service %q replica %d: %w", svc.Handler, slot, err))
+				fail(fmt.Errorf("service %q replica %d: %w", svc.Entrypoint, slot, err))
 			}
 		}
 	}

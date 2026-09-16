@@ -192,7 +192,7 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 		fmt.Fprintln(w, "Services:")
 		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, svc := range d.Services {
-			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", svc.Handler, svc.Port, svc.Replicas)
+			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", svc.Entrypoint, svc.Port, svc.Replicas)
 		}
 		srw.Flush()
 	}

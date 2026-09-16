@@ -8,6 +8,8 @@ package runtime
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -32,8 +34,13 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
-	// Long-lived service entrypoint: an interval keeps node alive indefinitely.
-	writeFile(t, dir, "service.js", `
+	// Long-lived service entrypoint in a nested subdirectory: an interval keeps
+	// node alive indefinitely. The file lives at <dir>/app/service.js, which the
+	// image COPYies to /app/app/service.js (the function dir is the /app root).
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	writeFile(t, dir, "app/service.js", `
 console.log("started");
 setInterval(() => {}, 1 << 30);
 `)
@@ -67,12 +74,12 @@ func TestServiceStartListStop(t *testing.T) {
 	// Start 2 replicas.
 	for i := 0; i < 2; i++ {
 		if _, err := m.StartService(ctx, ServiceSpec{
-			Function: "svc-lifecycle",
-			Handler:  "service.js",
-			Port:     3000,
-			Image:    image,
-			Entry:    []string{"node", "/app/service.js"},
-			Env:      []string{"PORT=3000"},
+			Function:   "svc-lifecycle",
+			Entrypoint: "app/service.js",
+			Port:       3000,
+			Image:      image,
+			Entry:      []string{"node", "/app/app/service.js"},
+			Env:        []string{"PORT=3000"},
 		}, i); err != nil {
 			t.Fatalf("start replica %d: %v", i, err)
 		}
@@ -116,17 +123,24 @@ func TestServiceStartListStop(t *testing.T) {
 			t.Fatalf("inspect %s: nil Config", id)
 		}
 		want := map[string]string{
-			labelType:     ContainerTypeService,
-			labelFunction: "svc-lifecycle",
-			labelHandler:  "service.js",
-			labelImage:    image,
-			labelHostname: "test-host",
-			labelPort:     "3000",
+			labelType:       ContainerTypeService,
+			labelFunction:   "svc-lifecycle",
+			labelEntrypoint: "app/service.js",
+			labelImage:      image,
+			labelHostname:   "test-host",
+			labelPort:       "3000",
 		}
 		for k, v := range want {
 			if got := insp.Container.Config.Labels[k]; got != v {
 				t.Errorf("container %s label %q = %q, want %q", id, k, got, v)
 			}
+		}
+		// Service containers must carry NO relay.handler and NO relay.service.
+		if _, ok := insp.Container.Config.Labels[labelHandler]; ok {
+			t.Errorf("container %s must NOT carry relay.handler, got %v", id, insp.Container.Config.Labels)
+		}
+		if _, ok := insp.Container.Config.Labels["relay.service"]; ok {
+			t.Errorf("container %s must NOT carry relay.service, got %v", id, insp.Container.Config.Labels)
 		}
 		// Hardening assertions.
 		hc := insp.Container.HostConfig
@@ -158,8 +172,8 @@ func TestServiceStartListStop(t *testing.T) {
 			t.Errorf("config user = %q, want 10001:10001", insp.Container.Config.User)
 		}
 		if insp.Container.Config.Entrypoint == nil || len(insp.Container.Config.Entrypoint) != 2 ||
-			insp.Container.Config.Entrypoint[0] != "node" || insp.Container.Config.Entrypoint[1] != "/app/service.js" {
-			t.Errorf("entrypoint = %v, want [node /app/service.js]", insp.Container.Config.Entrypoint)
+			insp.Container.Config.Entrypoint[0] != "node" || insp.Container.Config.Entrypoint[1] != "/app/app/service.js" {
+			t.Errorf("entrypoint = %v, want [node /app/app/service.js]", insp.Container.Config.Entrypoint)
 		}
 		env := insp.Container.Config.Env
 		foundPort := false
@@ -245,7 +259,7 @@ events:
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	svc1, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Handler: "service.js", Port: 3000,
+		Function: "svc-retire", Entrypoint: "service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
@@ -283,7 +297,7 @@ events:
 	// depends on", start a NEW replica of v2 and retire -> v2 kept, v1 removed.
 	// Re-start v2 replica so it references v2Ref.
 	svc2, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Handler: "service.js", Port: 3000,
+		Function: "svc-retire", Entrypoint: "service.js", Port: 3000,
 		Image: v2Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
