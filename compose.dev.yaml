@@ -21,6 +21,7 @@ services:
       - BUILD=1
       - IMAGES=1
       - CONTAINERS=1
+      - NETWORKS=1
       - POST=1
       - DELETE=1
     volumes:

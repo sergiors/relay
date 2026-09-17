@@ -212,15 +212,28 @@ func Reconcile(
 				}
 				continue
 			}
-			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Port, traefik.Network)
+			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Port, traefik)
 			routeNetwork = traefik.Network
 			if log != nil {
+				// Optional routing values log only when set, omitting empty
+				// ones; the generated labels themselves are never logged.
+				var attrs []any
+				if traefik.Entrypoint != "" {
+					attrs = append(attrs, "entrypoints", traefik.Entrypoint)
+				}
+				if traefik.CertResolver != "" {
+					attrs = append(attrs, "certresolver", traefik.CertResolver)
+				}
+				if traefik.Priority != nil {
+					attrs = append(attrs, "priority", *traefik.Priority)
+				}
 				log.Debug("Service: routing configured",
-					"function", fnName,
-					"service", svc.Entrypoint,
-					"host", svc.Host,
-					"network", routeNetwork,
-				)
+					append([]any{
+						"function", fnName,
+						"service", svc.Entrypoint,
+						"host", svc.Host,
+						"network", routeNetwork,
+					}, attrs...)...)
 			}
 		}
 

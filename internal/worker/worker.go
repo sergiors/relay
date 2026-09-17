@@ -171,7 +171,12 @@ func Run(logger *slog.Logger) {
 	// The service reconciler itself decides whether routing applies (only
 	// services declaring a host are routed) and validates TRAEFIK_NETWORK per
 	// routed service; wiring only forwards the configured value.
-	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{Network: cfg.TraefikNetwork}, logger)
+	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
+		Network:      cfg.TraefikNetwork,
+		Entrypoint:   cfg.TraefikEntrypoint,
+		CertResolver: cfg.TraefikCertResolver,
+		Priority:     cfg.TraefikPriority,
+	}, logger)
 
 	// Conservative startup orphan sweep: before any function is prepared or any
 	// container created, remove execution containers a previous Relay process on

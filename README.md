@@ -170,6 +170,9 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
 | `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
 | `TRAEFIK_NETWORK`        | no       | Docker network Traefik is attached to; required only when a service declares `host`.   |
+| `TRAEFIK_ENTRYPOINT`     | no       | Traefik router `entrypoints` label on routed services; unset = label omitted.          |
+| `TRAEFIK_CERTRESOLVER`   | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.    |
+| `TRAEFIK_PRIORITY`       | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -832,6 +835,22 @@ traefik.http.routers.<id>.rule                          = Host(`api.example.com`
 traefik.http.services.<id>.loadbalancer.server.port     = <port>
 ```
 
+Routed services also pick up the optional HTTPS labels, whenever the
+corresponding value is set — nothing is defaulted (no implicit `websecure`,
+`letsencrypt`, or fallback priority; Traefik's own default behavior applies
+when a label is omitted):
+
+```
+traefik.http.routers.<id>.entrypoints                   = <TRAEFIK_ENTRYPOINT>          (only when set)
+traefik.http.routers.<id>.tls                           = true                          (only when TRAEFIK_CERTRESOLVER is set)
+traefik.http.routers.<id>.tls.certresolver              = <TRAEFIK_CERTRESOLVER>        (only when set)
+traefik.http.routers.<id>.priority                      = <TRAEFIK_PRIORITY>            (only when set)
+```
+
+So a routed service with
+`TRAEFIK_NETWORK=proxy TRAEFIK_ENTRYPOINT=websecure TRAEFIK_CERTRESOLVER=letsencrypt TRAEFIK_PRIORITY=100`
+gets all eight labels; with network-only config it gets exactly the four above.
+
 - `<id>` is a single deterministic Traefik-safe router/service id shared by the
   router and service slices: it is derived from the service identity (the
   function name + entrypoint, never the host) as `relay-<function>-<entrypoint>`,
@@ -846,11 +865,16 @@ traefik.http.services.<id>.loadbalancer.server.port     = <port>
   `TRAEFIK_NETWORK=proxy` and no such network, the reconcile reports
   `service "app/main.py": Traefik network "proxy" does not exist`.
 - A service without `host` gets no Traefik labels at all and joins no extra
-  network: it stays internal.
-- Reconciliation is label-aware: changing `host`, `port`, or `TRAEFIK_NETWORK`
-  makes the running container stale and it is **replaced** with one carrying
-  the updated routing labels. Removing `host` replaces the routed container
-  with an internal (unlabeled) one.
+  network: it stays internal. `TRAEFIK_ENTRYPOINT`, `TRAEFIK_CERTRESOLVER`, and
+  `TRAEFIK_PRIORITY` only affect routed services and always appear on the same
+  `<id>` as the router/service slices.
+- Reconciliation is label-aware: changing `host`, `port`, or any routing value
+  (`TRAEFIK_NETWORK`, `TRAEFIK_ENTRYPOINT`, `TRAEFIK_CERTRESOLVER`,
+  `TRAEFIK_PRIORITY`) makes the running container stale and it is **replaced**
+  with one carrying the updated routing labels. Removing `host` replaces the
+  routed container with an internal (unlabeled) one; clearing an optional value
+  (e.g. unsetting `TRAEFIK_CERTRESOLVER`) converges its labels away the same
+  way.
 
 ## Supported runtimes
 

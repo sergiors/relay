@@ -19,16 +19,38 @@ const TraefikLabelPrefix = "traefik."
 
 // TraefikConfig is the worker-level Traefik routing configuration: the Docker
 // network Traefik is attached to (from the TRAEFIK_NETWORK environment
-// variable). Empty means routing is not configured; a template service that
-// still declares a host then fails routing validation.
+// variable), plus the optional router-slice values TRAEFIK_ENTRYPOINT,
+// TRAEFIK_CERTRESOLVER, and TRAEFIK_PRIORITY. Empty/unset optional values mean
+// the corresponding label is simply omitted — nothing is defaulted here
+// (no implicit "websecure" entrypoint, "letsencrypt" resolver, or priority).
 type TraefikConfig struct {
 	Network string
+	// Entrypoint is the optional TRAEFIK_ENTRYPOINT value (e.g. "websecure"):
+	// when set it generates a router `entrypoints` label, pinning which
+	// Traefik entrypoint serves the router. Empty = no entrypoints label.
+	Entrypoint string
+	// CertResolver is the optional TRAEFIK_CERTRESOLVER value (e.g.
+	// "letsencrypt"): when set it generates BOTH the router `tls=true` and
+	// `tls.certresolver` labels (TLS on, certificate resolved by that
+	// resolver). Empty = neither tls label.
+	CertResolver string
+	// Priority is the optional TRAEFIK_PRIORITY value: nil = unset (no
+	// priority label; Traefik's own default priority behavior applies), and a
+	// non-nil pointer carries the configured positive value. A POINTER is
+	// needed deliberately: 0 is never a valid priority in Relay (env parsing
+	// requires positive ints), but only nil-vs-non-nil distinguishes "no
+	// priority configured" from any provided value in the Config struct — an
+	// int cannot express that, and the ability to CLEAR the value
+	// (converging the priority label away) is part of reconciliation.
+	Priority *int
 }
 
 // Validate reports whether the config is usable for a routed service. The
 // network is the only required piece: Traefik reads Docker labels per-network,
 // so without the network name the labels would attach to the wrong (or no)
-// provider-side network and routing would silently not work.
+// provider-side network and routing would silently not work. The optional
+// entrypoint/certresolver/priority values need no validation here — unset
+// simply means the corresponding label is omitted.
 func (c TraefikConfig) Validate() error {
 	if c.Network == "" {
 		return fmt.Errorf("TRAEFIK_NETWORK is required when Traefik routing is configured")
@@ -52,17 +74,28 @@ func MissingNetwork(network string) error {
 // container spec, never mutate it, so a nil return is safe to range over but
 // never safe to write to.
 //
-// A routed service gets exactly four labels (plus the shared router/service id):
+// A routed service always gets the four base labels (plus the shared
+// router/service id):
 //
 //	traefik.enable                                              = true
-//	traefik.docker.network                                      = <network>  (only when network != "")
+//	traefik.docker.network                                      = <network>  (only when cfg.Network != "")
 //	traefik.http.routers.<id>.rule                              = Host(`<host>`)
 //	traefik.http.services.<id>.loadbalancer.server.port         = <port>
 //
 // The docker.network label pins which network Traefik resolves the container
 // on; it is omitted without a configured network so the container's
 // membership alone decides.
-func TraefikLabels(functionName, entrypoint, host string, port int, network string) map[string]string {
+//
+// The optional config values then add router-slice labels on the SAME <id>,
+// exactly WHEN their value is set — nothing is defaulted (no implicit
+// "websecure" entrypoint, "letsencrypt" resolver, or fallback priority; the
+// Traefik-side default behavior applies whenever a label is omitted):
+//
+//	cfg.Entrypoint   != ""  → traefik.http.routers.<id>.entrypoints        = <cfg.Entrypoint>
+//	cfg.CertResolver != ""  → traefik.http.routers.<id>.tls                = true
+//	                            traefik.http.routers.<id>.tls.certresolver = <cfg.CertResolver>
+//	cfg.Priority     != nil → traefik.http.routers.<id>.priority           = <cfg.Priority>
+func TraefikLabels(functionName, entrypoint, host string, port int, cfg TraefikConfig) map[string]string {
 	if host == "" {
 		return nil
 	}
@@ -72,8 +105,18 @@ func TraefikLabels(functionName, entrypoint, host string, port int, network stri
 		fmt.Sprintf("traefik.http.routers.%s.rule", id):                      fmt.Sprintf("Host(`%s`)", host),
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", id): strconv.Itoa(port),
 	}
-	if network != "" {
-		labels["traefik.docker.network"] = network
+	if cfg.Network != "" {
+		labels["traefik.docker.network"] = cfg.Network
+	}
+	if cfg.Entrypoint != "" {
+		labels[fmt.Sprintf("traefik.http.routers.%s.entrypoints", id)] = cfg.Entrypoint
+	}
+	if cfg.CertResolver != "" {
+		labels[fmt.Sprintf("traefik.http.routers.%s.tls", id)] = "true"
+		labels[fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", id)] = cfg.CertResolver
+	}
+	if cfg.Priority != nil {
+		labels[fmt.Sprintf("traefik.http.routers.%s.priority", id)] = strconv.Itoa(*cfg.Priority)
 	}
 	return labels
 }

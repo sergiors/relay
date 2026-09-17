@@ -14,22 +14,25 @@ const (
 	servicePrefix = "traefik.http.services."
 	ruleSuffix    = ".rule"
 	portSuffix    = ".loadbalancer.server.port"
+	tlsSuffix     = ".tls"
 )
 
 // An unrouted service (empty host) gets NO Traefik labels at all.
 func TestTraefikLabelsUnroutedNil(t *testing.T) {
-	for _, network := range []string{"", "proxy"} {
-		labels := TraefikLabels("fn", "app/main.py", "", 8000, network)
+	for _, cfg := range []TraefikConfig{{}, {Network: "proxy"}, {Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}} {
+		labels := TraefikLabels("fn", "app/main.py", "", 8000, cfg)
 		if labels != nil {
 			t.Fatalf("unrouted service labels = %v, want nil", labels)
 		}
 	}
 }
 
+func ptr(i int) *int { return &i }
+
 // A routed service gets exactly the four expected keys with the expected
 // values, with router id == service id.
 func TestTraefikLabelsRouted(t *testing.T) {
-	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, "proxy")
+	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, TraefikConfig{Network: "proxy"})
 	want := []string{
 		enableKey,
 		"traefik.http.routers.relay-fastapi-service-app-main-py.rule",
@@ -56,6 +59,18 @@ func TestTraefikLabelsRouted(t *testing.T) {
 	if labels[networkKey] != "proxy" {
 		t.Fatalf("docker.network = %q, want proxy", labels[networkKey])
 	}
+	// No optional labels with a network-only config.
+	for _, k := range []string{"entrypoints", "tls", "tls.certresolver", "priority"} {
+		if v, ok := labels[routerPrefix+"x"+k]; ok {
+			t.Fatalf("unexpected optional label %s=%q in network-only config %v", k, v, labels)
+		}
+	}
+	for k := range labels {
+		if strings.Contains(k, ".entrypoints") || strings.HasSuffix(k, tlsSuffix) ||
+			strings.Contains(k, "certresolver") || strings.Contains(k, ".priority") {
+			t.Fatalf("optional label %s present in network-only config: %v", k, labels)
+		}
+	}
 	// Router id == service id (single deterministic id for both).
 	routerRuleKey, lbPortKey := "", ""
 	for k := range labels {
@@ -78,7 +93,7 @@ func TestTraefikLabelsRouted(t *testing.T) {
 
 // Without a network the docker.network label is omitted (three labels total).
 func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
-	labels := TraefikLabels("fn", "svc.js", "a.test", 80, "")
+	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{})
 	if _, ok := labels[networkKey]; ok {
 		t.Fatalf("docker.network label present without a configured network: %v", labels)
 	}
@@ -87,11 +102,95 @@ func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
 	}
 }
 
+// Each optional config value alone adds exactly its label(s) to the base set.
+func TestTraefikLabelsOptionalIndividual(t *testing.T) {
+	id := "relay-fn-svc-js"
+	t.Run("entrypoint", func(t *testing.T) {
+		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", Entrypoint: "websecure"})
+		if got := labels[routerPrefix+id+".entrypoints"]; got != "websecure" {
+			t.Fatalf("entrypoints = %q, want websecure; labels = %v", got, labels)
+		}
+		if len(labels) != 5 {
+			t.Fatalf("labels = %v, want 5 (4 base + entrypoints)", labels)
+		}
+		if _, ok := labels[routerPrefix+id+tlsSuffix]; ok {
+			t.Fatalf("unexpected tls label: %v", labels)
+		}
+	})
+	t.Run("certresolver", func(t *testing.T) {
+		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", CertResolver: "letsencrypt"})
+		if got := labels[routerPrefix+id+tlsSuffix]; got != "true" {
+			t.Fatalf("tls = %q, want true; labels = %v", got, labels)
+		}
+		if got := labels[routerPrefix+id+".tls.certresolver"]; got != "letsencrypt" {
+			t.Fatalf("tls.certresolver = %q, want letsencrypt; labels = %v", got, labels)
+		}
+		if len(labels) != 6 {
+			t.Fatalf("labels = %v, want 6 (4 base + tls + certresolver)", labels)
+		}
+		if _, ok := labels[routerPrefix+id+".entrypoints"]; ok {
+			t.Fatalf("unexpected entrypoints label: %v", labels)
+		}
+	})
+	t.Run("priority", func(t *testing.T) {
+		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", Priority: ptr(50)})
+		if got := labels[routerPrefix+id+".priority"]; got != "50" {
+			t.Fatalf("priority = %q, want 50; labels = %v", got, labels)
+		}
+		if len(labels) != 5 {
+			t.Fatalf("labels = %v, want 5 (4 base + priority)", labels)
+		}
+	})
+}
+
+// All three optional values set together: the full 8-label set on the same id.
+func TestTraefikLabelsFullHTTPS(t *testing.T) {
+	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, TraefikConfig{
+		Network:      "proxy",
+		Entrypoint:   "websecure",
+		CertResolver: "letsencrypt",
+		Priority:     ptr(100),
+	})
+	id := "relay-fastapi-service-app-main-py"
+	want := map[string]string{
+		enableKey:                               "true",
+		networkKey:                              "proxy",
+		routerPrefix + id + ruleSuffix:          "Host(`api.example.com`)",
+		servicePrefix + id + portSuffix:         "8000",
+		routerPrefix + id + ".entrypoints":      "websecure",
+		routerPrefix + id + tlsSuffix:           "true",
+		routerPrefix + id + ".tls.certresolver": "letsencrypt",
+		routerPrefix + id + ".priority":         "100",
+	}
+	if len(labels) != len(want) {
+		t.Fatalf("labels = %v (%d), want %d keys", labels, len(labels), len(want))
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			t.Fatalf("label %q = %q, want %q (all: %v)", k, labels[k], v, labels)
+		}
+	}
+}
+
+// Empty-string optional values are treated exactly as unset (nil priority).
+func TestTraefikLabelsEmptyOptionalsUnset(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{
+		Network:      "proxy",
+		Entrypoint:   "",
+		CertResolver: "",
+		Priority:     nil,
+	})
+	if len(labels) != 4 {
+		t.Fatalf("labels = %v, want exactly 4 base keys", labels)
+	}
+}
+
 // Deterministic: two calls produce identical maps; the fastapi example id is
 // relay-fastapi-service-app-main-py over the safe charset.
 func TestServiceProviderIDDeterministicAndSafe(t *testing.T) {
-	a := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, "proxy")
-	b := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, "proxy")
+	cfg := TraefikConfig{Network: "proxy"}
+	a := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, cfg)
+	b := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, cfg)
 	if len(a) != len(b) {
 		t.Fatalf("label counts differ: %v vs %v", a, b)
 	}

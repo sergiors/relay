@@ -54,6 +54,21 @@ type Config struct {
 	// network itself and verifies it exists on every routed reconcile. Empty
 	// means routing is not configured (unrouted services are unaffected).
 	TraefikNetwork string
+	// TraefikEntrypoint is the optional TRAEFIK_ENTRYPOINT value (e.g.
+	// "websecure"): when set on a routed service Relay generates the Traefik
+	// router `entrypoints` label. Empty = the label is omitted (no default).
+	TraefikEntrypoint string
+	// TraefikCertResolver is the optional TRAEFIK_CERTRESOLVER value (e.g.
+	// "letsencrypt"): when set on a routed service Relay generates both the
+	// Traefik router `tls=true` and `tls.certresolver` labels. Empty = both
+	// labels are omitted (no default; TLS stays off on the router).
+	TraefikCertResolver string
+	// TraefikPriority is the optional TRAEFIK_PRIORITY value: nil when unset
+	// (the router `priority` label is omitted and Traefik's own default
+	// priority behavior applies; no value is ever defaulted). When provided
+	// it must be a positive integer — an invalid value is a fatal
+	// configuration error — so &0 is never produced.
+	TraefikPriority *int
 }
 
 // Load reads Relay's configuration from the environment and returns a Config. It
@@ -76,17 +91,20 @@ type Config struct {
 // matching the loadLogLevel style.
 func Load(logger *slog.Logger) Config {
 	return Config{
-		RedisURI:          requiredEnv(logger, "REDIS_URI"),
-		RedisStream:       requiredEnv(logger, "REDIS_STREAM"),
-		RedisGroup:        requiredEnv(logger, "REDIS_GROUP"),
-		ConsumerName:      consumerNameFromHost(logger),
-		StreamRetention:   parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
-		MetricsAddr:       getEnv("METRICS_ADDR", ""),
-		GitWebhookAddr:    getEnv("GIT_WEBHOOK_ADDR", ""),
-		LogLevel:          loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
-		MaxConcurrency:    loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
-		MaxBufferedEvents: loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
-		TraefikNetwork:    getEnv("TRAEFIK_NETWORK", ""),
+		RedisURI:            requiredEnv(logger, "REDIS_URI"),
+		RedisStream:         requiredEnv(logger, "REDIS_STREAM"),
+		RedisGroup:          requiredEnv(logger, "REDIS_GROUP"),
+		ConsumerName:        consumerNameFromHost(logger),
+		StreamRetention:     parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
+		MetricsAddr:         getEnv("METRICS_ADDR", ""),
+		GitWebhookAddr:      getEnv("GIT_WEBHOOK_ADDR", ""),
+		LogLevel:            loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
+		MaxConcurrency:      loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
+		MaxBufferedEvents:   loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
+		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
+		TraefikEntrypoint:   getEnv("TRAEFIK_ENTRYPOINT", ""),
+		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
+		TraefikPriority:     loadOptionalPositiveInt(logger, "TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", "")),
 	}
 
 }
@@ -131,6 +149,38 @@ func ParsePositiveInt(name, value string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", name, value)
 	}
 	return n, nil
+}
+
+// ParseOptionalPositiveInt parses an optional positive-integer environment
+// value where absence is meaningful: unset/empty/whitespace-only returns
+// (nil, nil) — the pointer-nil "not configured" state — while any provided
+// value must parse as a positive integer (delegating to ParsePositiveInt,
+// whose error names the variable). A nil return is what distinguishes an unset
+// TRAEFIK_PRIORITY style value from &0: Relay never allows 0, but only
+// nil-vs-non-nil can express "no value provided" through a *int config field.
+func ParseOptionalPositiveInt(name, value string) (*int, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	n, err := ParsePositiveInt(name, value, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+// loadOptionalPositiveInt wraps ParseOptionalPositiveInt with the fatal style:
+// an invalid value logs a clear configuration error and aborts startup,
+// matching loadPositiveInt. It returns nil for an unset value (see the parse
+// helper for the nil-vs-provided contract). The injected logger is non-nil at
+// this entry point (the CLI owns logger creation).
+func loadOptionalPositiveInt(logger *slog.Logger, name, value string) *int {
+	n, err := ParseOptionalPositiveInt(name, value)
+	if err != nil {
+		logger.Error("Configuration error", "error", err)
+		os.Exit(1)
+	}
+	return n
 }
 
 // logLevelNames are the documented LOG_LEVEL values, in order of increasing

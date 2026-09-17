@@ -1034,7 +1034,142 @@ func TestReconcileRoutedHappyPath(t *testing.T) {
 	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
 		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
 	}
+	// Network-only config: no optional HTTPS labels at all.
+	for k := range c.labels {
+		if strings.Contains(k, ".entrypoints") || strings.HasSuffix(k, ".tls") ||
+			strings.Contains(k, "certresolver") || strings.Contains(k, ".priority") {
+			t.Fatalf("network-only routed container has optional label %s: %v", k, c.labels)
+		}
+	}
 }
+
+// A routed service under a full HTTPS Traefik config: the started container
+// carries the four base labels PLUS all four optional ones on the same id.
+func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test"})
+	cfg := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cfg, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if c.network != "proxy" {
+		t.Fatalf("network = %q, want proxy", c.network)
+	}
+	id := "relay-fn-service-js"
+	want := map[string]string{
+		routingEnableKey:                   "true",
+		routingNetworkKey:                  "proxy",
+		routingRouterPrefix + id + ".rule": "Host(`service.test`)",
+		"traefik.http.services." + id + ".loadbalancer.server.port": "3000",
+		routingRouterPrefix + id + ".entrypoints":                   "websecure",
+		routingRouterPrefix + id + ".tls":                           "true",
+		routingRouterPrefix + id + ".tls.certresolver":              "letsencrypt",
+		routingRouterPrefix + id + ".priority":                      "100",
+	}
+	if len(c.labels) != len(want) {
+		t.Fatalf("labels = %v (%d), want %d keys", c.labels, len(c.labels), len(want))
+	}
+	for k, v := range want {
+		if c.labels[k] != v {
+			t.Fatalf("label %q = %q, want %q (all: %v)", k, c.labels[k], v, c.labels)
+		}
+	}
+}
+
+// Changing any routing option replaces the routed container. Here the
+// certresolver (and thus both tls labels) is cleared: the old container is
+// stopped and the replacement carries NO tls/tls.certresolver labels.
+func TestReconcileCertResolverClearedReplacesWithoutTLS(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	start := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, start, noLog()); err != nil {
+		t.Fatalf("reconcile https: %v", err)
+	}
+
+	cleared := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", Priority: intPtr(100)}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cleared, noLog()); err != nil {
+		t.Fatalf("reconcile cleared: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want one replaced container", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	id := "relay-fn-service-js"
+	for _, k := range []string{routingRouterPrefix + id + ".tls", routingRouterPrefix + id + ".tls.certresolver"} {
+		if _, ok := c.labels[k]; ok {
+			t.Fatalf("replacement label %s present after clearing certresolver: %v", k, c.labels)
+		}
+	}
+	if c.labels[routingRouterPrefix+id+".entrypoints"] != "websecure" {
+		t.Fatalf("replacement entrypoints = %q, want websecure (still set)", c.labels[routingRouterPrefix+id+".entrypoints"])
+	}
+	if c.labels[routingRouterPrefix+id+".priority"] != "100" {
+		t.Fatalf("replacement priority = %q, want 100 (still set)", c.labels[routingRouterPrefix+id+".priority"])
+	}
+}
+
+// Clearing the priority (nil) also replaces the routed container: the
+// replacement carries NO priority label while entrypoints stays.
+func TestReconcilePriorityClearedReplacesWithoutPriority(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	start := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", Priority: intPtr(42)}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, start, noLog()); err != nil {
+		t.Fatalf("reconcile priority: %v", err)
+	}
+
+	cleared := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure"}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cleared, noLog()); err != nil {
+		t.Fatalf("reconcile cleared: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want one replaced container", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	if _, ok := c.labels[routingRouterPrefix+"relay-fn-service-js.priority"]; ok {
+		t.Fatalf("replacement priority label present after clearing priority: %v", c.labels)
+	}
+	if c.labels[routingRouterPrefix+"relay-fn-service-js.entrypoints"] != "websecure" {
+		t.Fatalf("replacement entrypoints = %q, want websecure", c.labels[routingRouterPrefix+"relay-fn-service-js.entrypoints"])
+	}
+}
+
+// Unrouted service with all HTTPS config values set: still no traefik labels
+// and no network lookup.
+func TestReconcileUnroutedWithHTTPSConfigNoRouting(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	cfg := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cfg, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(f.networkLookups) != 0 {
+		t.Fatalf("NetworkExists called for an unrouted service, want 0")
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if hasTraefikKey(c.labels) {
+		t.Fatalf("unrouted container labels contain traefik keys: %v", c.labels)
+	}
+	if c.network != "" {
+		t.Fatalf("network = %q, want \"\"", c.network)
+	}
+}
+
+func intPtr(i int) *int { return &i }
 
 // A host change (a.test -> b.test) replaces the existing routed container: the
 // old one is stopped and the replacement carries the new rule.

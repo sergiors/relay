@@ -363,6 +363,86 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 	}
 }
 
+// TestLoadTraefikOptionalValues pins the three optional Traefik routing
+// values: all empty/nil when unset (labels omitted; no defaults forced), and
+// passed through as-is when set (including TRAEFIK_PRIORITY to a pointer).
+func TestLoadTraefikOptionalValues(t *testing.T) {
+	setRequiredEnv(t)
+	cfg := Load(discardLogger())
+	if cfg.TraefikEntrypoint != "" || cfg.TraefikCertResolver != "" || cfg.TraefikPriority != nil {
+		t.Fatalf("Traefik optional fields = %+v, want zero/nil when unset", cfg)
+	}
+
+	t.Setenv("TRAEFIK_ENTRYPOINT", "websecure")
+	t.Setenv("TRAEFIK_CERTRESOLVER", "letsencrypt")
+	t.Setenv("TRAEFIK_PRIORITY", "100")
+	cfg = Load(discardLogger())
+	if cfg.TraefikEntrypoint != "websecure" {
+		t.Fatalf("TraefikEntrypoint = %q, want websecure", cfg.TraefikEntrypoint)
+	}
+	if cfg.TraefikCertResolver != "letsencrypt" {
+		t.Fatalf("TraefikCertResolver = %q, want letsencrypt", cfg.TraefikCertResolver)
+	}
+	if cfg.TraefikPriority == nil || *cfg.TraefikPriority != 100 {
+		t.Fatalf("TraefikPriority = %v, want &100", cfg.TraefikPriority)
+	}
+}
+
+// TestParseOptionalPositiveInt pins the ParseOptionalPositiveInt contract:
+// unset/empty/whitespace → (nil, nil) — the "not configured" pointer-nil state;
+// positive ints parse to a pointer; zero, negative, non-numeric, and float
+// values error naming the variable. The os.Exit path in loadOptionalPositiveInt
+// is not exercised here (it cannot run in-process); this exported helper is
+// where the validation logic lives.
+func TestParseOptionalPositiveInt(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		wantNil   bool
+		want      int
+		wantError bool
+	}{
+		{"unset → nil", "", true, 0, false},
+		{"empty → nil", "  ", true, 0, false},
+		{"whitespace → nil", "\t\n ", true, 0, false},
+		{"positive parses to pointer", "100", false, 100, false},
+		{"trimmed positive", " 7 ", false, 7, false},
+		{"zero rejected", "0", true, 0, true},
+		{"negative rejected", "-1", true, 0, true},
+		{"non-numeric rejected", "abc", true, 0, true},
+		{"float rejected", "1.5", true, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseOptionalPositiveInt("TRAEFIK_PRIORITY", tt.value)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("ParseOptionalPositiveInt(%q) = %v, nil; want error", tt.value, got)
+				}
+				if !strings.Contains(err.Error(), "TRAEFIK_PRIORITY") {
+					t.Fatalf("error should name the variable: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseOptionalPositiveInt(%q) error: %v", tt.value, err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("ParseOptionalPositiveInt(%q) = %v, want nil", tt.value, *got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("ParseOptionalPositiveInt(%q) = nil, want non-nil pointer", tt.value)
+			}
+			if *got != tt.want {
+				t.Fatalf("ParseOptionalPositiveInt(%q) = %d, want %d", tt.value, *got, tt.want)
+			}
+		})
+	}
+}
+
 // TestParsePositiveInt exercises the shared positive-integer parser directly:
 // unset → default; whitespace-trimmed positive ints parse; and zero, negative,
 // non-numeric, float, and overflow values error. The os.Exit path in Load is
