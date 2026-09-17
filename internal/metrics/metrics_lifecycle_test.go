@@ -12,29 +12,31 @@ import (
 // and function build are observed as histograms; handler_invocations_total gets
 // both success and failure outcomes.
 func seedFunction(r *Registry, name string) {
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "success"}, {"function", name}, {"handler", "x"}})
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "failure"}, {"function", name}, {"handler", "x"}})
-	r.IncLabels("build_failures_total", []Label{{"function", name}})
-	r.IncLabels("function_events_total", []Label{{"function", name}})
-	r.IncLabels("function_handler_success_total", []Label{{"function", name}})
-	r.IncLabels("function_handler_failure_total", []Label{{"function", name}})
-	r.IncLabels("function_retries_total", []Label{{"function", name}})
-	r.IncLabels("function_dlq_total", []Label{{"function", name}})
-	r.ObserveDurationLabels("handler_duration_seconds", []Label{{"function", name}, {"handler", "x"}}, time.Millisecond)
-	r.ObserveDurationLabels("function_build_seconds", []Label{{"function", name}}, time.Millisecond)
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", name}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", name}, {"handler", "x"}})
+	r.IncLabels(MetricBuildFailures, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionEvents, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionRetries, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionDLQ, []Label{{"function", name}})
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", name}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", name}}, time.Millisecond)
 }
 
 // seriesPresent reports whether the snapshot contains a series whose rendered
-// name carries the given metric name and the function label value. sampleName
-// sorts labels by name, so the function label may be followed by another label
-// (",other=..."), by the closing brace ("}>"), or be the entire label set
-// ("} count=...") — the check matches the function label token with any of those
-// following contexts.
+// name carries the given metric name and the function label value. The metric
+// argument is the canonical (relay_-prefixed) name; the snapshot renders
+// display names (prefix stripped, see sampleName), so the prefix is trimmed
+// before prefixing the line. sampleName sorts labels by name, so the function
+// label may be followed by another label (",other=..."), by the closing brace
+// ("}>"), or be the entire label set ("} count=...") — the check matches the
+// function label token with any of those following contexts.
 func seriesPresent(t *testing.T, snapshot, metric, name string) bool {
 	t.Helper()
 	token := "function=" + name
 	for line := range strings.SplitSeq(snapshot, "\n") {
-		if !strings.HasPrefix(line, metric+"{") {
+		if !strings.HasPrefix(line, metricDisplayName(metric)+"{") {
 			continue
 		}
 		idx := strings.Index(line, token)
@@ -77,22 +79,22 @@ func assertFunctionSeries(t *testing.T, r *Registry, name string) {
 // seedGlobals sets distinctive global counters/gauges and returns their total
 // values so a test can assert they never change under function cleanup.
 func seedGlobals(r *Registry) map[string]int64 {
-	r.Inc("events_processed_total")
-	r.SeedCounter("events_processed_total", 4)
-	r.Inc("dlq_entries_total")
-	r.Inc("dlq_entries_total")
-	r.Inc("retries_total")
-	r.Inc("handler_success_total")
-	r.Inc("handler_success_total")
-	r.Inc("handler_success_total")
-	r.Inc("handler_failure_total")
-	r.SetGauge("pending_entries", 9)
+	r.Inc(MetricEventsProcessed)
+	r.SeedCounter(MetricEventsProcessed, 4)
+	r.Inc(MetricDLQEntries)
+	r.Inc(MetricDLQEntries)
+	r.Inc(MetricRetries)
+	r.Inc(MetricHandlerSuccess)
+	r.Inc(MetricHandlerSuccess)
+	r.Inc(MetricHandlerSuccess)
+	r.Inc(MetricHandlerFailure)
+	r.SetGauge(MetricPendingEntries, 9)
 	return map[string]int64{
-		"events_processed_total": 5, // 1 + 4 via SeedCounter
-		"dlq_entries_total":      2,
-		"retries_total":          1,
-		"handler_success_total":  3,
-		"handler_failure_total":  1,
+		MetricEventsProcessed: 5, // 1 + 4 via SeedCounter
+		MetricDLQEntries:      2,
+		MetricRetries:         1,
+		MetricHandlerSuccess:  3,
+		MetricHandlerFailure:  1,
 	}
 }
 
@@ -103,7 +105,7 @@ func assertGlobalTotals(t *testing.T, r *Registry, want map[string]int64) {
 			t.Fatalf("global %s = %d, want %d", name, got, wantVal)
 		}
 	}
-	if got := r.Gauge("pending_entries"); got != 9 {
+	if got := r.Gauge(MetricPendingEntries); got != 9 {
 		t.Fatalf("global pending_entries = %v, want 9", got)
 	}
 }
@@ -138,18 +140,18 @@ func TestRemoveFunctionDeletesOnlyFunctionSeries(t *testing.T) {
 // for foo (DeletePartialMatch path) while leaving bar's intact.
 func TestRemoveFunctionDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
 	r := New()
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "success"}, {"function", "foo"}, {"handler", "x"}})
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "failure"}, {"function", "foo"}, {"handler", "x"}})
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "success"}, {"function", "bar"}, {"handler", "x"}})
-	r.IncLabels("handler_invocations_total", []Label{{"outcome", "failure"}, {"function", "bar"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "foo"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", "foo"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "bar"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", "bar"}, {"handler", "x"}})
 
 	r.RemoveFunction("foo")
 
 	s := r.Snapshot()
-	if seriesPresent(t, s, "handler_invocations_total", "foo") {
+	if seriesPresent(t, s, MetricHandlerInvocations, "foo") {
 		t.Fatalf("foo handler_invocations_total must be removed:\n%s", s)
 	}
-	if !seriesPresent(t, s, "handler_invocations_total", "bar") {
+	if !seriesPresent(t, s, MetricHandlerInvocations, "bar") {
 		t.Fatalf("bar handler_invocations_total must survive:\n%s", s)
 	}
 	if strings.Contains(s, "outcome=success} count=2") || strings.Contains(s, "outcome=failure} count=2") {
@@ -161,16 +163,16 @@ func TestRemoveFunctionDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
 // histogram series (DeleteLabelValues path) while leaving bar's intact.
 func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
 	r := New()
-	r.ObserveDurationLabels("handler_duration_seconds", []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
-	r.ObserveDurationLabels("handler_duration_seconds", []Label{{"function", "bar"}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "bar"}, {"handler", "x"}}, time.Millisecond)
 
 	r.RemoveFunction("foo")
 
 	s := r.Snapshot()
-	if seriesPresent(t, s, "handler_duration_seconds", "foo") {
+	if seriesPresent(t, s, MetricHandlerDuration, "foo") {
 		t.Fatalf("foo handler_duration_seconds must be removed:\n%s", s)
 	}
-	if !seriesPresent(t, s, "handler_duration_seconds", "bar") {
+	if !seriesPresent(t, s, MetricHandlerDuration, "bar") {
 		t.Fatalf("bar handler_duration_seconds must survive:\n%s", s)
 	}
 }
@@ -179,11 +181,11 @@ func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
 // not the pre-removal one.
 func TestRemoveFunctionReAddStartsFreshCount(t *testing.T) {
 	r := New()
-	r.IncLabels("function_events_total", []Label{{"function", "foo"}})
-	r.IncLabels("function_events_total", []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
 	r.RemoveFunction("foo")
 
-	r.IncLabels("function_events_total", []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
 	s := r.Snapshot()
 	if !strings.Contains(s, "function_events_total{function=foo} count=1") {
 		t.Fatalf("re-added foo must count 1, not the stale value; got:\n%s", s)
@@ -210,7 +212,7 @@ func TestSweepFunctionMetrics(t *testing.T) {
 
 	assertGlobalTotals(t, r, globals)
 	assertNoFunctionSeries(t, r, "remove")
-	if !seriesPresent(t, r.Snapshot(), "function_events_total", "keep") {
+	if !seriesPresent(t, r.Snapshot(), MetricFunctionEvents, "keep") {
 		t.Fatal("keep's series must survive the sweep")
 	}
 
@@ -240,9 +242,9 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
-				r.IncLabels("function_events_total", []Label{{"function", "foo"}})
-				r.IncLabels("function_handler_success_total", []Label{{"function", "foo"}})
-				r.ObserveDurationLabels("handler_duration_seconds", []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
+				r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
+				r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "foo"}})
+				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
 			}
 		}()
 	}
@@ -289,7 +291,7 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 		t.Fatalf("foo must be absent from FunctionStatsSnapshot after convergence:\n%+v", r.FunctionStatsSnapshot())
 	}
 	assertNoFunctionSeries(t, r, "foo")
-	if !seriesPresent(t, r.Snapshot(), "function_events_total", "bar") {
+	if !seriesPresent(t, r.Snapshot(), MetricFunctionEvents, "bar") {
 		t.Fatal("bar's series must survive the concurrent cleanup")
 	}
 	// Globals equal their exact seeded totals.

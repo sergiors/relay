@@ -174,7 +174,7 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 	seedMetricsFunction(m, "victim")
 	seedMetricsFunction(m, "bystander")
 	// A global counter the removal must never touch.
-	m.Inc("events_received_total")
+	m.Inc(metrics.MetricEventsReceived)
 	before := m.Snapshot()
 	if !strings.Contains(before, "function_events_total{function=victim}") {
 		t.Fatalf("expected victim series before removal:\n%s", before)
@@ -220,7 +220,7 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 	if !strings.Contains(got, "function_events_total{function=bystander}") {
 		t.Fatalf("bystander series must survive removal:\n%s", got)
 	}
-	if got := m.Counter("events_received_total"); got != 1 {
+	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
 		t.Fatalf("events_received_total = %d, want 1", got)
 	}
 }
@@ -228,16 +228,16 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 // seedMetricsFunction increments every function-carrying vec for name on the
 // given registry, so a function has a full set of series for the removal test.
 func seedMetricsFunction(m *metrics.Registry, name string) {
-	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
-	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "failure"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
-	m.IncLabels("build_failures_total", []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels("function_handler_failure_total", []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels("function_retries_total", []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels("function_dlq_total", []metrics.Label{{Name: "function", Value: name}})
-	m.ObserveDurationLabels("handler_duration_seconds", []metrics.Label{{Name: "function", Value: name}, {Name: "handler", Value: "x"}}, time.Millisecond)
-	m.ObserveDurationLabels("function_build_seconds", []metrics.Label{{Name: "function", Value: name}}, time.Millisecond)
+	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
+	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "failure"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
+	m.IncLabels(metrics.MetricBuildFailures, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionDLQ, []metrics.Label{{Name: "function", Value: name}})
+	m.ObserveDurationLabels(metrics.MetricHandlerDuration, []metrics.Label{{Name: "function", Value: name}, {Name: "handler", Value: "x"}}, time.Millisecond)
+	m.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{{Name: "function", Value: name}}, time.Millisecond)
 }
 
 // Invalid template -> NO state write (no success/failure/skipped recorded).

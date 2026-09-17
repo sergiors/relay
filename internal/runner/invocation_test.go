@@ -197,13 +197,13 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 		t.Fatalf("delivery 2: %v", err)
 	}
 
-	if got := m.Counter("handler_success_total"); got != 2 {
+	if got := m.Counter(metrics.MetricHandlerSuccess); got != 2 {
 		t.Errorf("handler_success_total = %d, want 2 (one alpha + one beta, not the alpha skip)", got)
 	}
-	if got := m.Counter("handler_failure_total"); got != 1 {
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 1 {
 		t.Errorf("handler_failure_total = %d, want 1", got)
 	}
-	if got := m.Counter("events_received_total"); got != 2 {
+	if got := m.Counter(metrics.MetricEventsReceived); got != 2 {
 		t.Errorf("events_received_total = %d, want 2", got)
 	}
 

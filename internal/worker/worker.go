@@ -658,11 +658,11 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 		return
 	}
 	if gs, ok := st.Stats(); ok {
-		metricsInstance.SeedCounter("events_processed_total", gs.EventsProcessedTotal)
-		metricsInstance.SeedCounter("handler_success_total", gs.HandlerSuccessTotal)
-		metricsInstance.SeedCounter("handler_failure_total", gs.HandlerFailureTotal)
-		metricsInstance.SeedCounter("retries_total", gs.RetryTotal)
-		metricsInstance.SeedCounter("dlq_entries_total", gs.DLQTotal)
+		metricsInstance.SeedCounter(metrics.MetricEventsProcessed, gs.EventsProcessedTotal)
+		metricsInstance.SeedCounter(metrics.MetricHandlerSuccess, gs.HandlerSuccessTotal)
+		metricsInstance.SeedCounter(metrics.MetricHandlerFailure, gs.HandlerFailureTotal)
+		metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
+		metricsInstance.SeedCounter(metrics.MetricDLQEntries, gs.DLQTotal)
 	}
 	for _, fs := range st.AllFunctionStats() {
 		metricsInstance.SeedFunctionStat(metrics.FunctionStat{
@@ -720,13 +720,13 @@ func snapshotStats(metricsInstance *metrics.Registry) state.Stats {
 		return state.Stats{}
 	}
 	return state.Stats{
-		EventsProcessedTotal:    metricsInstance.Counter("events_processed_total"),
-		HandlerSuccessTotal:     metricsInstance.Counter("handler_success_total"),
-		HandlerFailureTotal:     metricsInstance.Counter("handler_failure_total"),
-		RetryTotal:              metricsInstance.Counter("retries_total"),
-		DLQTotal:                metricsInstance.Counter("dlq_entries_total"),
-		PendingEntries:          int64(metricsInstance.Gauge("pending_entries")),
-		OldestPendingAgeSeconds: int64(metricsInstance.Gauge("pending_oldest_age_seconds")),
+		EventsProcessedTotal:    metricsInstance.Counter(metrics.MetricEventsProcessed),
+		HandlerSuccessTotal:     metricsInstance.Counter(metrics.MetricHandlerSuccess),
+		HandlerFailureTotal:     metricsInstance.Counter(metrics.MetricHandlerFailure),
+		RetryTotal:              metricsInstance.Counter(metrics.MetricRetries),
+		DLQTotal:                metricsInstance.Counter(metrics.MetricDLQEntries),
+		PendingEntries:          int64(metricsInstance.Gauge(metrics.MetricPendingEntries)),
+		OldestPendingAgeSeconds: int64(metricsInstance.Gauge(metrics.MetricPendingOldestAge)),
 	}
 }
 

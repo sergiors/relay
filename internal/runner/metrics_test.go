@@ -74,7 +74,7 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 	if strings.Contains(got, "outcome=failure") {
 		t.Errorf("unexpected failure metric; got:\n%s", got)
 	}
-	if strings.Contains(got, "handler_failure_total") {
+	if strings.Contains(got, metrics.MetricHandlerFailure) {
 		t.Errorf("unexpected failure total; got:\n%s", got)
 	}
 	// The duration observation must be recorded (count 1, non-zero sum/max).
@@ -101,7 +101,7 @@ func TestHandleRecordsFailureMetrics(t *testing.T) {
 	if strings.Contains(got, "outcome=success") {
 		t.Errorf("unexpected success metric; got:\n%s", got)
 	}
-	if strings.Contains(got, "handler_success_total") {
+	if strings.Contains(got, metrics.MetricHandlerSuccess) {
 		t.Errorf("unexpected success total; got:\n%s", got)
 	}
 }
@@ -152,8 +152,8 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 		t.Fatalf("expected other series before removal; got:\n%s", before)
 	}
 	// Capture the global totals: removal must never touch them.
-	wantSuccess := m.Counter("handler_success_total")
-	wantFailure := m.Counter("handler_failure_total")
+	wantSuccess := m.Counter(metrics.MetricHandlerSuccess)
+	wantFailure := m.Counter(metrics.MetricHandlerFailure)
 
 	m.RemoveFunction("user-events")
 
@@ -161,11 +161,11 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 	// All of user-events' function-scoped series are gone — no series at all
 	// carrying the function=user-events label on any of the functionMetrics vecs.
 	for _, mname := range []string{
-		"function_events_total",
-		"function_handler_success_total",
-		"function_handler_failure_total",
-		"handler_invocations_total",
-		"handler_duration_seconds",
+		metrics.MetricFunctionEvents,
+		metrics.MetricFunctionHandlerSuccess,
+		metrics.MetricFunctionHandlerFailure,
+		metrics.MetricHandlerInvocations,
+		metrics.MetricHandlerDuration,
 	} {
 		for _, line := range strings.Split(got, "\n") {
 			if strings.HasPrefix(line, mname+"{") && fnLabelIs(line, "user-events") {
@@ -178,10 +178,10 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 		t.Fatalf("other function's series must survive removal; got:\n%s", got)
 	}
 	// Global totals unchanged.
-	if got := m.Counter("handler_success_total"); got != wantSuccess {
+	if got := m.Counter(metrics.MetricHandlerSuccess); got != wantSuccess {
 		t.Fatalf("handler_success_total = %d, want %d", got, wantSuccess)
 	}
-	if got := m.Counter("handler_failure_total"); got != wantFailure {
+	if got := m.Counter(metrics.MetricHandlerFailure); got != wantFailure {
 		t.Fatalf("handler_failure_total = %d, want %d", got, wantFailure)
 	}
 }
@@ -223,7 +223,7 @@ func TestHandleFunctionLevelCounters(t *testing.T) {
 
 	// One event matching two functions: global message-level counter is 1, but
 	// each function is engaged once.
-	if got := m.Counter("events_received_total"); got != 1 {
+	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
 		t.Fatalf("events_received_total = %d, want 1", got)
 	}
 	fs := m.FunctionStatsSnapshot()

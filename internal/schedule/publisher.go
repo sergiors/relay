@@ -91,24 +91,24 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 	id := o.ID()
 	envelope, err := o.Envelope()
 	if err != nil {
-		p.metrics.Inc("schedule_publish_failures_total")
+		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed", "function", o.Function, "handler", o.Handler, "occurrence_id", id, "reason", err)
 		return false, fmt.Errorf("schedule publish: marshal envelope: %w", err)
 	}
 	key := dedupKey(o)
 	res, err := publishScript.Run(ctx, p.client, []string{key, p.stream}, id, occurrenceTTL.Milliseconds(), string(envelope)).Int()
 	if err != nil {
-		p.metrics.Inc("schedule_publish_failures_total")
+		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed", "function", o.Function, "handler", o.Handler, "occurrence_id", id, "reason", err)
 		return false, fmt.Errorf("schedule publish: %w", err)
 	}
 	switch res {
 	case 1:
-		p.metrics.Inc("schedule_occurrences_published_total")
+		p.metrics.Inc(metrics.MetricScheduleOccurrencesPublished)
 		p.log.Debug("Schedule: occurrence published", "function", o.Function, "handler", o.Handler, "scheduled_at", o.ScheduledAt.UTC().Format(time.RFC3339), "occurrence_id", id)
 		return true, nil
 	default:
-		p.metrics.Inc("schedule_occurrences_duplicate_total")
+		p.metrics.Inc(metrics.MetricScheduleOccurrencesDuplicate)
 		p.log.Debug("Schedule: occurrence already published", "function", o.Function, "handler", o.Handler, "occurrence_id", id)
 		return false, nil
 	}

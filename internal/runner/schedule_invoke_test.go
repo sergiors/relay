@@ -93,10 +93,10 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 	// inflate the event counters: events_processed_total is counted by the stream
 	// layer (stream.processScheduleMessage) and events_received_total by Handle's
 	// message path, not by the schedule execution path.
-	if strings.Contains(got, "events_received_total") || strings.Contains(got, "events_processed_total") {
+	if strings.Contains(got, metrics.MetricEventsReceived) || strings.Contains(got, metrics.MetricEventsProcessed) {
 		t.Fatalf("schedule must not inflate event counters:\n%s", got)
 	}
-	if strings.Contains(got, "function_events_total") {
+	if strings.Contains(got, metrics.MetricFunctionEvents) {
 		t.Fatalf("schedule must not inflate function_events_total:\n%s", got)
 	}
 }

@@ -191,10 +191,10 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	start := time.Now()
 	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef)); err != nil {
 		d := time.Since(start)
-		m.metrics.ObserveDurationLabels("function_build_seconds", []metrics.Label{
+		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
 		}, d)
-		m.metrics.IncLabels("build_failures_total", []metrics.Label{
+		m.metrics.IncLabels(metrics.MetricBuildFailures, []metrics.Label{
 			{Name: "function", Value: fn.Name},
 		})
 		// Function names are validated to [a-z0-9][a-z0-9._-]* (bounded by
@@ -207,7 +207,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		return nil, err
 	}
 	d := time.Since(start)
-	m.metrics.ObserveDurationLabels("function_build_seconds",
+	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
 	m.log.Info("Function: built",
 		"function", fn.Name,
@@ -254,7 +254,7 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 		// Dependency-image build failures count as function build failures so the
 		// existing failure metric/label surface stays the single observability
 		// contract for "this function could not be prepared".
-		m.metrics.IncLabels("build_failures_total", []metrics.Label{
+		m.metrics.IncLabels(metrics.MetricBuildFailures, []metrics.Label{
 			{Name: "function", Value: fn.Name},
 		})
 		m.log.Error("Function: dependency build failed",
@@ -266,7 +266,7 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 		return "", err
 	}
 	d := time.Since(start)
-	m.metrics.ObserveDurationLabels("function_build_seconds",
+	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
 	m.log.Info("Function: dependency layer built",
 		"function", fn.Name,

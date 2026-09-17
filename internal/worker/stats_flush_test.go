@@ -41,11 +41,11 @@ func TestRecordSnapshotsSweepsStaleFunctionSeries(t *testing.T) {
 	st.RecordFunctionStats(state.FunctionStats{Function: "ghost", EventsProcessedTotal: 5})
 
 	m := metrics.New()
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "ghost"}})
-	m.Add("events_processed_total", 42)
-	m.Add("handler_success_total", 30)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "ghost"}})
+	m.Add(metrics.MetricEventsProcessed, 42)
+	m.Add(metrics.MetricHandlerSuccess, 30)
 
 	// Remove ghost's functions row (the reconciler's RecordRemoved) but KEEP its
 	// series in the registry, simulating an in-flight invocation that recreated
@@ -86,8 +86,8 @@ func TestRecordSnapshotsSweepsStaleFunctionSeries(t *testing.T) {
 	if gs.HandlerSuccessTotal != 30 {
 		t.Fatalf("global success = %d, want 30", gs.HandlerSuccessTotal)
 	}
-	if m.Counter("events_processed_total") != 42 {
-		t.Fatalf("registry events = %d, want 42", m.Counter("events_processed_total"))
+	if m.Counter(metrics.MetricEventsProcessed) != 42 {
+		t.Fatalf("registry events = %d, want 42", m.Counter(metrics.MetricEventsProcessed))
 	}
 }
 
@@ -102,13 +102,13 @@ func TestReaddFunctionFreshSeries(t *testing.T) {
 
 	// Seed and flush an initial value, then remove the series as the reconciler
 	// would on removal.
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 	recordSnapshots(context.Background(), st, m)
 	m.RemoveFunction("alpha")
 
 	// Re-add: a fresh series at count 1.
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 	if !strings.Contains(m.Snapshot(), "function_events_total{function=alpha} count=1") {
 		t.Fatalf("re-added alpha must count 1:\n%s", m.Snapshot())
 	}
@@ -138,10 +138,10 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 	st.RecordDiscovered(stateFunction("ghost", t.TempDir()))
 
 	m := metrics.New()
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "ghost"}})
-	m.Add("events_processed_total", 42)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "ghost"}})
+	m.Add(metrics.MetricEventsProcessed, 42)
 
 	// Close the DB so the pooled (single) connection is gone: FunctionNames and
 	// RecordStatsSnapshot both error, but the sweep must fail open.
@@ -160,8 +160,8 @@ func TestSweepSkippedOnStateReadError(t *testing.T) {
 		t.Fatalf("ghost series must NOT be swept when the live set read fails:\n%s", m.Snapshot())
 	}
 	// Globals unchanged in the registry.
-	if m.Counter("events_processed_total") != 42 {
-		t.Fatalf("registry events = %d, want 42", m.Counter("events_processed_total"))
+	if m.Counter(metrics.MetricEventsProcessed) != 42 {
+		t.Fatalf("registry events = %d, want 42", m.Counter(metrics.MetricEventsProcessed))
 	}
 
 	// Reopen on the same path (Open's schema init is idempotent) and flush; the
@@ -204,16 +204,16 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 
 	const loops = 500
 	for i := 0; i < loops; i++ {
-		m.Inc("events_processed_total")
-		m.Inc("handler_success_total")
-		m.Inc("handler_failure_total")
-		m.Inc("retries_total")
-		m.Inc("dlq_entries_total")
-		m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-		m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-		m.IncLabels("function_handler_failure_total", []metrics.Label{{Name: "function", Value: "beta"}})
-		m.SetGauge("pending_entries", float64(i))
-		m.SetGauge("pending_oldest_age_seconds", float64(i/2))
+		m.Inc(metrics.MetricEventsProcessed)
+		m.Inc(metrics.MetricHandlerSuccess)
+		m.Inc(metrics.MetricHandlerFailure)
+		m.Inc(metrics.MetricRetries)
+		m.Inc(metrics.MetricDLQEntries)
+		m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+		m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
+		m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "beta"}})
+		m.SetGauge(metrics.MetricPendingEntries, float64(i))
+		m.SetGauge(metrics.MetricPendingOldestAge, float64(i/2))
 	}
 
 	// No per-event writes: state DB has no stats row before any flush.
@@ -223,7 +223,7 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 
 	// A further 1000 increments must STILL not write to SQLite.
 	for i := 0; i < 1000; i++ {
-		m.Inc("events_processed_total")
+		m.Inc(metrics.MetricEventsProcessed)
 	}
 	if _, ok := st.Stats(); ok {
 		t.Fatal("per-event activity must not write to SQLite")
@@ -231,10 +231,10 @@ func TestSnapshotStatsAndFuncSnapshotAreInMemoryOnly(t *testing.T) {
 
 	// Registry reflects the exact totals immediately.
 	const wantEvents = loops + 1000
-	if got := m.Counter("events_processed_total"); got != wantEvents {
+	if got := m.Counter(metrics.MetricEventsProcessed); got != wantEvents {
 		t.Fatalf("events = %d, want %d", got, wantEvents)
 	}
-	if got := m.Counter("handler_success_total"); got != loops {
+	if got := m.Counter(metrics.MetricHandlerSuccess); got != loops {
 		t.Fatalf("success = %d, want %d", got, loops)
 	}
 
@@ -270,10 +270,10 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	m := metrics.New()
-	m.Add("events_processed_total", 10)
-	m.Add("handler_success_total", 7)
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.Add(metrics.MetricEventsProcessed, 10)
+	m.Add(metrics.MetricHandlerSuccess, 7)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -302,7 +302,7 @@ func TestStatsLoopFlushesEveryInterval(t *testing.T) {
 	// Increment the registry once more and wait >= 2 ticks while the loop keeps
 	// running; the persisted absolute total must track the new value (repeated
 	// flushes track absolutes, not deltas).
-	m.Inc("events_processed_total")
+	m.Inc(metrics.MetricEventsProcessed)
 	waitForStatsRow(t, "statsLoop to flush the incremented value", func() bool {
 		gs, ok := st.Stats()
 		return ok && gs.EventsProcessedTotal == 11
@@ -329,13 +329,13 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	m := metrics.New()
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
-	m.Add("events_processed_total", 42)
-	m.Add("handler_success_total", 30)
-	m.Add("handler_failure_total", 12)
-	m.Add("retries_total", 4)
-	m.Add("dlq_entries_total", 1)
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.Add(metrics.MetricEventsProcessed, 42)
+	m.Add(metrics.MetricHandlerSuccess, 30)
+	m.Add(metrics.MetricHandlerFailure, 12)
+	m.Add(metrics.MetricRetries, 4)
+	m.Add(metrics.MetricDLQEntries, 1)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
 
 	finalStatsFlush(m, st)
 
@@ -374,9 +374,9 @@ func TestRecordSnapshotsIdempotent(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	m := metrics.New()
-	m.Add("events_processed_total", 100)
-	m.Add("handler_success_total", 90)
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.Add(metrics.MetricEventsProcessed, 100)
+	m.Add(metrics.MetricHandlerSuccess, 90)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 
 	ctx := context.Background()
 	recordSnapshots(ctx, st, m)
@@ -398,8 +398,8 @@ func TestRecordSnapshotsIdempotent(t *testing.T) {
 	}
 
 	// Bump the registry; a single flush persists the new absolute value.
-	m.Inc("events_processed_total")
-	m.Inc("events_processed_total")
+	m.Inc(metrics.MetricEventsProcessed)
+	m.Inc(metrics.MetricEventsProcessed)
 	recordSnapshots(ctx, st, m)
 	gs, ok := st.Stats()
 	if !ok {
@@ -437,16 +437,16 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
-				m.Inc("events_processed_total")
-				m.Inc("handler_success_total")
-				m.Inc("handler_failure_total")
-				m.Inc("retries_total")
-				m.Inc("dlq_entries_total")
-				m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "fn-a"}})
-				m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "fn-a"}})
-				m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "fn-b"}})
-				m.IncLabels("function_handler_failure_total", []metrics.Label{{Name: "function", Value: "fn-b"}})
-				m.SetGauge("pending_entries", float64(j))
+				m.Inc(metrics.MetricEventsProcessed)
+				m.Inc(metrics.MetricHandlerSuccess)
+				m.Inc(metrics.MetricHandlerFailure)
+				m.Inc(metrics.MetricRetries)
+				m.Inc(metrics.MetricDLQEntries)
+				m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "fn-a"}})
+				m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "fn-a"}})
+				m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "fn-b"}})
+				m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "fn-b"}})
+				m.SetGauge(metrics.MetricPendingEntries, float64(j))
 			}
 		}()
 	}

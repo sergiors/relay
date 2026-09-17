@@ -19,8 +19,8 @@ const handlerContentType = "text/plain; version=0.0.4"
 // the registry exposition with the expected body and Content-Type.
 func TestMuxServesMetrics(t *testing.T) {
 	r := New()
-	r.Inc("events_received_total")
-	r.SetGauge("pending_entries", 2)
+	r.Inc(MetricEventsReceived)
+	r.SetGauge(MetricPendingEntries, 2)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
@@ -33,10 +33,10 @@ func TestMuxServesMetrics(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want prefix %q", ct, handlerContentType)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "events_received_total 1") {
+	if !strings.Contains(body, "relay_events_received_total 1") {
 		t.Fatalf("body missing counter:\n%s", body)
 	}
-	if !strings.Contains(body, "pending_entries 2") {
+	if !strings.Contains(body, "relay_pending_entries 2") {
 		t.Fatalf("body missing gauge:\n%s", body)
 	}
 }
@@ -45,7 +45,7 @@ func TestMuxServesMetrics(t *testing.T) {
 // registers only /metrics, so "/" now 404s (the old "/" alias is gone).
 func TestMuxRootNotFound(t *testing.T) {
 	r := New()
-	r.SetGauge("pending_entries", 1)
+	r.SetGauge(MetricPendingEntries, 1)
 	rec := httptest.NewRecorder()
 	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusNotFound {
@@ -86,7 +86,7 @@ func TestMuxMethodNotAllowed(t *testing.T) {
 // body-less response.
 func TestMuxHead(t *testing.T) {
 	r := New()
-	r.SetGauge("pending_entries", 1)
+	r.SetGauge(MetricPendingEntries, 1)
 	rec := httptest.NewRecorder()
 	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/metrics", nil))
 	if rec.Code != http.StatusOK {
@@ -115,7 +115,7 @@ func TestMuxNilHandlerPanics(t *testing.T) {
 // scrape succeeds without requiring Stop.
 func TestServerStartServesInBackground(t *testing.T) {
 	r := New()
-	r.SetGauge("pending_entries", 1)
+	r.SetGauge(MetricPendingEntries, 1)
 
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -136,7 +136,7 @@ func TestServerStartServesInBackground(t *testing.T) {
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if !strings.Contains(string(body), "pending_entries 1") {
+			if !strings.Contains(string(body), "relay_pending_entries 1") {
 				t.Fatalf("scrape body missing metric:\n%s", body)
 			}
 			break
@@ -259,10 +259,10 @@ func TestConcurrentIncrementAndRender(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					r.Inc("events_received_total")
-					r.IncLabels("handler_invocations_total", []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
-					r.ObserveDurationLabels("handler_duration_seconds", []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
-					r.SetGauge("pending_entries", 1)
+					r.Inc(MetricEventsReceived)
+					r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
+					r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
+					r.SetGauge(MetricPendingEntries, 1)
 				}
 			}
 		}()

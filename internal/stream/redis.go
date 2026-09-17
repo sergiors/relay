@@ -306,7 +306,7 @@ func (s *bufferSemaphore) release() {
 // setGauge publishes the current occupancy to the buffered_events gauge (nil-safe
 // in the registry).
 func (c *Consumer) setBufferGauge() {
-	c.metrics.SetGauge("buffered_events", float64(c.buffer.inflight()))
+	c.metrics.SetGauge(metrics.MetricBufferedEvents, float64(c.buffer.inflight()))
 }
 
 // freeSlots returns the number of slots currently available (capacity - inFlight).
@@ -540,9 +540,9 @@ func (p *PendingGaugeSource) Refresh(ctx context.Context) {
 		p.log.Debug("Metrics: xpending failed", "stream", p.stream, "group", p.group, "error", err)
 		return
 	}
-	p.metrics.SetGauge("pending_entries", float64(pending.Count))
+	p.metrics.SetGauge(metrics.MetricPendingEntries, float64(pending.Count))
 	if age, ok := pendingAge(pending.Lower); ok {
-		p.metrics.SetGauge("pending_oldest_age_seconds", age.Seconds())
+		p.metrics.SetGauge(metrics.MetricPendingOldestAge, age.Seconds())
 	}
 }
 
@@ -703,7 +703,7 @@ func (c *Consumer) deliverClaimed(
 	retryCount int64,
 	handler Handler,
 ) {
-	c.metrics.Inc("retries_total")
+	c.metrics.Inc(metrics.MetricRetries)
 	if !c.buffer.tryAcquire() {
 		// Buffer full: leave the message pending; a later reclaim tick retries
 		// it. Never block the reclaim goroutine on the semaphore.
@@ -776,7 +776,7 @@ func (c *Consumer) processMessage(
 	// delivery attempt that reaches the handler handoff, including redeliveries,
 	// so retries increment it too — it is a delivery-attempt counter, not a
 	// unique-event counter.
-	c.metrics.Inc("events_processed_total")
+	c.metrics.Inc(metrics.MetricEventsProcessed)
 
 	// Inject a per-message invocation-state handle so the runner can skip
 	// invocations that already completed on a previous delivery or are protected
@@ -864,7 +864,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	// counter as processMessage: it keeps the global events_processed_total
 	// semantics uniform across message kinds (a redelivered schedule increments
 	// it again, like any other delivery attempt).
-	c.metrics.Inc("events_processed_total")
+	c.metrics.Inc(metrics.MetricEventsProcessed)
 
 	c.log.Debug("Schedule: executing occurrence",
 		"function", occ.Function,
@@ -994,7 +994,7 @@ func (c *Consumer) routeToDLQ(
 		c.noteOutcome(err, 0)
 		return
 	}
-	c.metrics.Inc("dlq_entries_total")
+	c.metrics.Inc(metrics.MetricDLQEntries)
 	c.log.Error("Message: routed to DLQ",
 		"message_id", msg.ID,
 		"dlq_stream", c.dlqStream,

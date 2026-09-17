@@ -44,19 +44,19 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 
 	restorePersistedStats(m, st)
 
-	if got := m.Counter("events_processed_total"); got != 100 {
+	if got := m.Counter(metrics.MetricEventsProcessed); got != 100 {
 		t.Fatalf("events_processed_total = %d, want 100", got)
 	}
-	if got := m.Counter("handler_success_total"); got != 70 {
+	if got := m.Counter(metrics.MetricHandlerSuccess); got != 70 {
 		t.Fatalf("handler_success_total = %d, want 70", got)
 	}
-	if got := m.Counter("handler_failure_total"); got != 30 {
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 30 {
 		t.Fatalf("handler_failure_total = %d, want 30", got)
 	}
-	if got := m.Counter("retries_total"); got != 5 {
+	if got := m.Counter(metrics.MetricRetries); got != 5 {
 		t.Fatalf("retries_total = %d, want 5", got)
 	}
-	if got := m.Counter("dlq_entries_total"); got != 2 {
+	if got := m.Counter(metrics.MetricDLQEntries); got != 2 {
 		t.Fatalf("dlq_entries_total = %d, want 2", got)
 	}
 
@@ -105,8 +105,8 @@ func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
 	restorePersistedStats(m, st)
 
 	// Simulate ONE new event after restart.
-	m.Inc("events_processed_total")
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.Inc(metrics.MetricEventsProcessed)
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 
 	// The worker's statsLoop snapshots immediately on start.
 	recordSnapshots(context.Background(), st, m)
@@ -135,7 +135,7 @@ func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
 
 	// A second snapshot with no further activity must be idempotent: counters
 	// stay put while the gauge is refreshed.
-	m.SetGauge("pending_entries", 9)
+	m.SetGauge(metrics.MetricPendingEntries, 9)
 	recordSnapshots(context.Background(), st, m)
 
 	gs, ok = st.Stats()
@@ -347,8 +347,8 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 
 	// Simulate ONE post-restart activity in the restored registry: the live
 	// (seeded) timestamps are republished untouched.
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
-	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
 	recordSnapshots(context.Background(), st, m)
 	got, ok := st.FunctionStats("alpha")
 	if !ok {
@@ -363,7 +363,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// must keep the persisted timestamps (an empty incoming value never
 	// clobbers them).
 	fresh := metrics.New()
-	fresh.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	fresh.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 	recordSnapshots(context.Background(), st, fresh)
 	got, ok = st.FunctionStats("alpha")
 	if !ok {
@@ -404,9 +404,9 @@ func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
 func TestFuncSnapshotStatsTimestampsMapping(t *testing.T) {
 	m := metrics.New()
 	ts := int64(1700000000)
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
 	m.SetFunctionTimestamp("a", metrics.FunctionTimestampExecution, ts)
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "b"}})
 	m.SetFunctionTimestamp("b", metrics.FunctionTimestampDLQ, ts+60)
 
 	got := funcSnapshotStats(m)

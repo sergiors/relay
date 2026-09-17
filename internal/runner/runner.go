@@ -679,7 +679,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 	// counts a wait, whether it eventually succeeds or not.
 	got, w := global.acquire(ctx, r.slotWait)
 	if w {
-		r.metrics.Inc("concurrency_waits_total")
+		r.metrics.Inc(metrics.MetricConcurrencyWaits)
 	}
 	waited = waited || w
 	if !got {
@@ -691,7 +691,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 	// leak to another function's wait.
 	got, w = fn.acquire(ctx, r.slotWait)
 	if w {
-		r.metrics.Inc("concurrency_waits_total")
+		r.metrics.Inc(metrics.MetricConcurrencyWaits)
 	}
 	waited = waited || w
 	if !got {
@@ -702,7 +702,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 	// Both slots held and the invocation is about to execute: publish the
 	// in-flight gauge for it.
 	r.inFlight.Add(1)
-	r.metrics.SetGauge("in_flight_invocations", float64(r.inFlight.Load()))
+	r.metrics.SetGauge(metrics.MetricInFlightInvocations, float64(r.inFlight.Load()))
 
 	released := false
 	release = func() {
@@ -714,7 +714,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 		global.release()
 		// Publish the in-flight gauge AFTER dropping below the cap.
 		r.inFlight.Add(-1)
-		r.metrics.SetGauge("in_flight_invocations", float64(r.inFlight.Load()))
+		r.metrics.SetGauge(metrics.MetricInFlightInvocations, float64(r.inFlight.Load()))
 	}
 	return release, waited
 }
@@ -821,7 +821,7 @@ func (r *Runner) runInvocation(
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
 	// A message received at the runner is one logical event handled across all
 	// matching rules. This is the message-level counter.
-	r.metrics.Inc("events_received_total")
+	r.metrics.Inc(metrics.MetricEventsReceived)
 	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
 	// it (e.g. when the runner is driven directly in tests). It is the delivery
 	// attempt used for logging; without invocation state the handler attempt is
@@ -881,7 +881,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		// per function here, while the message-level events_processed_total
 		// (stream) and events_received_total (above) count it once globally.
 		if len(rules) > 0 {
-			r.metrics.IncLabels("function_events_total",
+			r.metrics.IncLabels(metrics.MetricFunctionEvents,
 				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 		}
 		for _, rule := range rules {
@@ -1090,7 +1090,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					)
 				}
 				if err != nil {
-					r.metrics.IncLabels("handler_invocations_total",
+					r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 						[]metrics.Label{
 							{Name: "outcome", Value: "failure"},
 							{Name: "function", Value: pf.fn.Name},
@@ -1098,15 +1098,15 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						})
 					// Unlabeled total for the SQLite snapshot; the labeled counter
 					// above stays for Prometheus.
-					r.metrics.Inc("handler_failure_total")
+					r.metrics.Inc(metrics.MetricHandlerFailure)
 					// Per-function failure attribution (per rule execution). A
 					// failed attempt that will retry still counts as a failure
 					// (and as an execution above); only a DLQ-routed exhaustion
 					// additionally sets last_dlq_at (see recordFailure).
-					r.metrics.IncLabels("function_handler_failure_total",
+					r.metrics.IncLabels(metrics.MetricFunctionHandlerFailure,
 						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 					r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampFailure, time.Now().Unix())
-					r.metrics.ObserveDurationLabels("handler_duration_seconds",
+					r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 						[]metrics.Label{
 							{Name: "function", Value: pf.fn.Name},
 							{Name: "handler", Value: rule.Handler},
@@ -1138,7 +1138,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// here either. The DLQ metric is only meaningful with
 					// invocation state, where exhaustion is actually persisted
 					// and observable.
-					r.metrics.IncLabels("function_retries_total",
+					r.metrics.IncLabels(metrics.MetricFunctionRetries,
 						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 					return outcomeRetryable, err
 				}
@@ -1150,7 +1150,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				if hasState {
 					invState.MarkComplete(invocation)
 				}
-				r.metrics.IncLabels("handler_invocations_total",
+				r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 					[]metrics.Label{
 						{Name: "outcome", Value: "success"},
 						{Name: "function", Value: pf.fn.Name},
@@ -1158,12 +1158,12 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					})
 				// Unlabeled total for the SQLite snapshot; the labeled counter
 				// above stays for Prometheus.
-				r.metrics.Inc("handler_success_total")
+				r.metrics.Inc(metrics.MetricHandlerSuccess)
 				// Per-function success attribution (per rule execution).
-				r.metrics.IncLabels("function_handler_success_total",
+				r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
 					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 				r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
-				r.metrics.ObserveDurationLabels("handler_duration_seconds",
+				r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 					[]metrics.Label{
 						{Name: "function", Value: pf.fn.Name},
 						{Name: "handler", Value: rule.Handler},
@@ -1509,7 +1509,7 @@ func (r *Runner) invokeOnce(
 	if invState != nil {
 		invState.MarkComplete(invocation)
 	}
-	r.metrics.IncLabels("handler_invocations_total",
+	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "success"},
 			{Name: "function", Value: pf.fn.Name},
@@ -1517,12 +1517,12 @@ func (r *Runner) invokeOnce(
 		})
 	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
 	// for Prometheus.
-	r.metrics.Inc("handler_success_total")
+	r.metrics.Inc(metrics.MetricHandlerSuccess)
 	// Per-function success attribution.
-	r.metrics.IncLabels("function_handler_success_total",
+	r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
 		[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
 	r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
-	r.metrics.ObserveDurationLabels("handler_duration_seconds",
+	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{
 			{Name: "function", Value: pf.fn.Name},
 			{Name: "handler", Value: handler},
@@ -1545,17 +1545,17 @@ func (r *Runner) invokeOnce(
 // events_processed_total for a schedule delivery (see stream.processScheduleMessage),
 // so those are not double-counted here.
 func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
-	r.metrics.IncLabels("handler_invocations_total",
+	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "failure"},
 			{Name: "function", Value: fnName},
 			{Name: "handler", Value: handler},
 		})
-	r.metrics.Inc("handler_failure_total")
-	r.metrics.IncLabels("function_handler_failure_total",
+	r.metrics.Inc(metrics.MetricHandlerFailure)
+	r.metrics.IncLabels(metrics.MetricFunctionHandlerFailure,
 		[]metrics.Label{{Name: "function", Value: fnName}})
 	r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampFailure, time.Now().Unix())
-	r.metrics.ObserveDurationLabels("handler_duration_seconds",
+	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{
 			{Name: "function", Value: fnName},
 			{Name: "handler", Value: handler},
@@ -1596,7 +1596,7 @@ func (r *Runner) recordFailure(
 		// failure, and not again on the later terminal-skip redeliveries of the
 		// same invocation.
 		invState.MarkExhausted(invocation, handlerAttempt)
-		r.metrics.IncLabels("function_dlq_total",
+		r.metrics.IncLabels(metrics.MetricFunctionDLQ,
 			[]metrics.Label{{Name: "function", Value: fnName}})
 		r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampDLQ, time.Now().Unix())
 		r.log.Error("Function handler: exhausted; invocation terminal",
@@ -1613,7 +1613,7 @@ func (r *Runner) recordFailure(
 	// Retryable: schedule a retry backoff and count the retry.
 	backoff := retryBackoff(handlerAttempt)
 	invState.RecordFailure(invocation, backoff)
-	r.metrics.IncLabels("function_retries_total",
+	r.metrics.IncLabels(metrics.MetricFunctionRetries,
 		[]metrics.Label{{Name: "function", Value: fnName}})
 	r.log.Warn("Function handler: failed attempt; retrying later",
 		"function", fnName,

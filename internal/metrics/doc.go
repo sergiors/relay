@@ -22,16 +22,18 @@
 //     snapshot as logfmt lines, reading the same registry the Server serves on
 //     /metrics.
 //
-// Metric kinds:
+// Metric kinds (canonical Prometheus names carry the "relay_" namespace
+// prefix; log snapshots render without it):
 //
-//   - Counters: events_received_total, events_processed_total, retries_total,
-//     dlq_entries_total, handler_success_total, handler_failure_total, plus
-//     CounterVecs handler_invocations_total{outcome,function,handler} and
-//     build_failures_total{function}.
-//   - Histograms: handler_duration_seconds{function,handler} and
-//     function_build_seconds{function} (prometheus.DefBuckets).
-//   - Gauges: pending_entries and pending_oldest_age_seconds (Redis backlog
-//     depth and age sampled by the stream consumer).
+//   - Counters: relay_events_received_total, relay_events_processed_total,
+//     relay_retries_total, relay_dlq_entries_total, relay_handler_success_total,
+//     relay_handler_failure_total, plus CounterVecs
+//     relay_handler_invocations_total{outcome,function,handler} and
+//     relay_build_failures_total{function}.
+//   - Histograms: relay_handler_duration_seconds{function,handler} and
+//     relay_function_build_seconds{function} (prometheus.DefBuckets).
+//   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
+//     (Redis backlog depth and age sampled by the stream consumer).
 //
 // Cardinality is bounded: labels are limited to function/handler/outcome, which
 // are validated low-cardinality identifiers. High-cardinality values such as

@@ -43,11 +43,11 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 	_ = l.Close()
 
 	metricsInstance := metrics.New()
-	metricsInstance.Inc("events_processed_total")
-	metricsInstance.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
-	metricsInstance.ObserveDurationLabels("handler_duration_seconds",
+	metricsInstance.Inc(metrics.MetricEventsProcessed)
+	metricsInstance.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
+	metricsInstance.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
-	metricsInstance.SetGauge("pending_entries", 3)
+	metricsInstance.SetGauge(metrics.MetricPendingEntries, 3)
 
 	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err := metricsServer.Start(); err != nil {
@@ -75,10 +75,10 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	for _, want := range []string{
-		"events_processed_total 1",
+		"relay_events_processed_total 1",
 		`handler_invocations_total{function="demo",handler="index.hi",outcome="success"} 1`,
 		`handler_duration_seconds_count{function="demo",handler="index.hi"} 1`,
-		"pending_entries 3",
+		"relay_pending_entries 3",
 		"# TYPE",
 	} {
 		if !strings.Contains(body, want) {

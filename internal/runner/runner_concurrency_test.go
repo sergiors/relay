@@ -295,7 +295,7 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	// A second invocation blocks (the slot is held) and times out; this counts a
 	// wait even though it does not execute.
 	_ = r.Handle(context.Background(), "f-2", map[string]any{"status": "ok"})
-	if got := m.Counter("concurrency_waits_total"); got == 0 {
+	if got := m.Counter(metrics.MetricConcurrencyWaits); got == 0 {
 		t.Fatalf("concurrency_waits_total = %d, want >= 1 after a blocked acquire", got)
 	}
 
@@ -303,7 +303,7 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	// return to zero (all slots released).
 	close(release)
 	<-firstDone
-	if got := m.Gauge("in_flight_invocations"); got != 0 {
+	if got := m.Gauge(metrics.MetricInFlightInvocations); got != 0 {
 		t.Fatalf("in_flight_invocations = %g, want 0 after drain", got)
 	}
 }

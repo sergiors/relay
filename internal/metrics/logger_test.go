@@ -11,7 +11,7 @@ import (
 
 func TestMetricsLoggerTicksAndStopsOnCancel(t *testing.T) {
 	r := New()
-	r.Inc("events_received_total")
+	r.Inc(MetricEventsReceived)
 
 	var mu sync.Mutex
 	var lines []string

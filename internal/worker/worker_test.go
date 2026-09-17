@@ -15,13 +15,13 @@ import (
 
 func TestSnapshotStatsMapping(t *testing.T) {
 	m := metrics.New()
-	m.Add("events_processed_total", 10)
-	m.Add("handler_success_total", 7)
-	m.Add("handler_failure_total", 3)
-	m.Add("retries_total", 2)
-	m.Add("dlq_entries_total", 1)
-	m.SetGauge("pending_entries", 4.9)
-	m.SetGauge("pending_oldest_age_seconds", 12.7)
+	m.Add(metrics.MetricEventsProcessed, 10)
+	m.Add(metrics.MetricHandlerSuccess, 7)
+	m.Add(metrics.MetricHandlerFailure, 3)
+	m.Add(metrics.MetricRetries, 2)
+	m.Add(metrics.MetricDLQEntries, 1)
+	m.SetGauge(metrics.MetricPendingEntries, 4.9)
+	m.SetGauge(metrics.MetricPendingOldestAge, 12.7)
 
 	got := snapshotStats(m)
 	want := state.Stats{
@@ -47,12 +47,12 @@ func TestSnapshotStatsNilRegistry(t *testing.T) {
 
 func TestFuncSnapshotStatsMapping(t *testing.T) {
 	m := metrics.New()
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "a"}})
-	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "a"}})
-	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "a"}})
-	m.IncLabels("function_handler_failure_total", []metrics.Label{{Name: "function", Value: "b"}})
-	m.IncLabels("function_retries_total", []metrics.Label{{Name: "function", Value: "b"}})
-	m.IncLabels("function_dlq_total", []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionDLQ, []metrics.Label{{Name: "function", Value: "b"}})
 
 	got := funcSnapshotStats(m)
 	if len(got) != 2 {
@@ -110,7 +110,7 @@ func TestStatsLoopNilStateExitsOnCancel(t *testing.T) {
 // accidentally reading labeled-only metrics (which would double-count).
 func TestSnapshotStatsIgnoresLabeledCounters(t *testing.T) {
 	m := metrics.New()
-	m.IncLabels("handler_invocations_total", []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "a"}, {Name: "handler", Value: "x"}})
+	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "a"}, {Name: "handler", Value: "x"}})
 	got := snapshotStats(m)
 	if got.HandlerSuccessTotal != 0 {
 		t.Fatalf("HandlerSuccessTotal = %d, want 0 (labeled only)", got.HandlerSuccessTotal)

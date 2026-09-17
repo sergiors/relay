@@ -29,6 +29,49 @@ type Label struct {
 	Name, Value string
 }
 
+// metricNamespacePrefix is the Prometheus namespace for Relay-owned metrics:
+// every canonical (registered) metric name carries it, both to avoid colliding
+// with other exporters' series and to make scraping dashboards unambiguous.
+// The internal/registry/exposition path serves the prefixed name as the
+// canonical metric name; the unprefixed form is only ever surfaced in
+// human-readable log snapshots (see metricDisplayName). The exported Metric*
+// name constants below are built from this prefix — hard-coded unprefixed
+// metric-name strings must not appear anywhere else.
+const metricNamespacePrefix = "relay_"
+
+// Metric name constants. These are the CANONICAL (Prometheus-facing, prefixed)
+// names callers must use for every Inc/Add/SetGauge/Counter/Observe call and
+// lookup, because the Registry routes all updates and reads through its
+// name-keyed maps by exactly these strings. They exist to prevent scattered
+// prefixed literals: a call site needs a metric name only via one of these
+// constants, which stay in lockstep with the registrations in New by
+// construction.
+const (
+	MetricEventsReceived               = metricNamespacePrefix + "events_received_total"
+	MetricEventsProcessed              = metricNamespacePrefix + "events_processed_total"
+	MetricRetries                      = metricNamespacePrefix + "retries_total"
+	MetricDLQEntries                   = metricNamespacePrefix + "dlq_entries_total"
+	MetricHandlerSuccess               = metricNamespacePrefix + "handler_success_total"
+	MetricHandlerFailure               = metricNamespacePrefix + "handler_failure_total"
+	MetricConcurrencyWaits             = metricNamespacePrefix + "concurrency_waits_total"
+	MetricScheduleOccurrencesPublished = metricNamespacePrefix + "schedule_occurrences_published_total"
+	MetricScheduleOccurrencesDuplicate = metricNamespacePrefix + "schedule_occurrences_duplicate_total"
+	MetricSchedulePublishFailures      = metricNamespacePrefix + "schedule_publish_failures_total"
+	MetricHandlerInvocations           = metricNamespacePrefix + "handler_invocations_total"
+	MetricBuildFailures                = metricNamespacePrefix + "build_failures_total"
+	MetricFunctionEvents               = metricNamespacePrefix + "function_events_total"
+	MetricFunctionHandlerSuccess       = metricNamespacePrefix + "function_handler_success_total"
+	MetricFunctionHandlerFailure       = metricNamespacePrefix + "function_handler_failure_total"
+	MetricFunctionRetries              = metricNamespacePrefix + "function_retries_total"
+	MetricFunctionDLQ                  = metricNamespacePrefix + "function_dlq_total"
+	MetricHandlerDuration              = metricNamespacePrefix + "handler_duration_seconds"
+	MetricFunctionBuild                = metricNamespacePrefix + "function_build_seconds"
+	MetricPendingEntries               = metricNamespacePrefix + "pending_entries"
+	MetricPendingOldestAge             = metricNamespacePrefix + "pending_oldest_age_seconds"
+	MetricBufferedEvents               = metricNamespacePrefix + "buffered_events"
+	MetricInFlightInvocations          = metricNamespacePrefix + "in_flight_invocations"
+)
+
 // buckets are the histogram bucket boundaries. prometheus.DefBuckets is used
 // because the observed durations (handler execution and image builds) span the
 // sub-second-to-minute range those buckets are designed for, and the project
@@ -155,22 +198,22 @@ func New() *Registry {
 	// Unlabeled counters fed by the runner, stream, and manager (worker reads
 	// these via Counter in snapshotStats).
 	for _, name := range []string{
-		"events_received_total",
-		"events_processed_total",
-		"retries_total",
-		"dlq_entries_total",
-		"handler_success_total",
-		"handler_failure_total",
-		// concurrency_waits_total counts each time an invocation's acquisition
+		MetricEventsReceived,
+		MetricEventsProcessed,
+		MetricRetries,
+		MetricDLQEntries,
+		MetricHandlerSuccess,
+		MetricHandlerFailure,
+		// MetricConcurrencyWaits counts each time an invocation's acquisition
 		// of a concurrency slot had to block (regardless of eventual success) —
 		// a cheap proxy for slot contention in the runner.
-		"concurrency_waits_total",
-		// schedule_occurrences_* are the cluster-wide schedule coordination
+		MetricConcurrencyWaits,
+		// MetricScheduleOccurrences* are the cluster-wide schedule coordination
 		// counters (see internal/schedule). They are Prometheus-only: they are
 		// deliberately NOT wired into the SQLite stats snapshot.
-		"schedule_occurrences_published_total",
-		"schedule_occurrences_duplicate_total",
-		"schedule_publish_failures_total",
+		MetricScheduleOccurrencesPublished,
+		MetricScheduleOccurrencesDuplicate,
+		MetricSchedulePublishFailures,
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name})
 		reg.MustRegister(c)
@@ -181,10 +224,10 @@ func New() *Registry {
 	// outcome label (success/failure) is the first of the canonical order; the
 	// runner passes labels unsorted, so routing matches by name below.
 	handlerInvocations := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "handler_invocations_total",
+		Name: MetricHandlerInvocations,
 	}, []string{"outcome", "function", "handler"})
 	reg.MustRegister(handlerInvocations)
-	r.counterVecs["handler_invocations_total"] = &labeledCounterVec{
+	r.counterVecs[MetricHandlerInvocations] = &labeledCounterVec{
 		order: []string{"outcome", "function", "handler"},
 		vec:   handlerInvocations,
 	}
@@ -193,10 +236,10 @@ func New() *Registry {
 	// [a-z0-9][a-z0-9._-]* and bounded by the function count, so this label is
 	// low-cardinality.
 	buildFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "build_failures_total",
+		Name: MetricBuildFailures,
 	}, []string{"function"})
 	reg.MustRegister(buildFailures)
-	r.counterVecs["build_failures_total"] = &labeledCounterVec{
+	r.counterVecs[MetricBuildFailures] = &labeledCounterVec{
 		order: []string{"function"},
 		vec:   buildFailures,
 	}
@@ -207,21 +250,21 @@ func New() *Registry {
 	// multi-label handler_invocations_total vec. The function label is
 	// low-cardinality (bounded by the function count), matching build_failures.
 	//
-	// Semantics (see runner.Handle): function_events_total counts a function
+	// Semantics (see runner.Handle): RelayFunctionEvents counts a function
 	// once per event for which at least one of its rules matched — a
 	// functions-engaged counter, distinct from the message-level
-	// events_processed_total. handler success/failure are per rule execution.
-	// function_retries_total counts every failing rule execution that will be
-	// retried (a retry driver); function_dlq_total counts a function once when
+	// MetricEventsProcessed. handler success/failure are per rule execution.
+	// MetricFunctionRetries counts every failing rule execution that will be
+	// retried (a retry driver); MetricFunctionDLQ counts a function once when
 	// its failing rule execution is the one that exhausts the rule's retry
 	// budget (attempt >= 1+retries, per-invocation) and the message is routed
 	// to the DLQ.
 	for _, name := range []string{
-		"function_events_total",
-		"function_handler_success_total",
-		"function_handler_failure_total",
-		"function_retries_total",
-		"function_dlq_total",
+		MetricFunctionEvents,
+		MetricFunctionHandlerSuccess,
+		MetricFunctionHandlerFailure,
+		MetricFunctionRetries,
+		MetricFunctionDLQ,
 	} {
 		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name}, []string{"function"})
 		reg.MustRegister(vec)
@@ -232,11 +275,11 @@ func New() *Registry {
 	// duration aggregates (count/sum/max) are superseded, so there is no _max
 	// series anymore — a histogram's bucket bounds convey the same spread.
 	handlerDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "handler_duration_seconds",
+		Name:    MetricHandlerDuration,
 		Buckets: buckets,
 	}, []string{"function", "handler"})
 	reg.MustRegister(handlerDuration)
-	r.histogramVecs["handler_duration_seconds"] = &labeledHistogramVec{
+	r.histogramVecs[MetricHandlerDuration] = &labeledHistogramVec{
 		order: []string{"function", "handler"},
 		vec:   handlerDuration,
 	}
@@ -245,32 +288,32 @@ func New() *Registry {
 	// is deliberately no unlabeled build timer, which would otherwise collide
 	// with the labeled histogram under the same name.
 	buildDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "function_build_seconds",
+		Name:    MetricFunctionBuild,
 		Buckets: buckets,
 	}, []string{"function"})
 	reg.MustRegister(buildDuration)
-	r.histogramVecs["function_build_seconds"] = &labeledHistogramVec{
+	r.histogramVecs[MetricFunctionBuild] = &labeledHistogramVec{
 		order: []string{"function"},
 		vec:   buildDuration,
 	}
 
 	// Pending-backlog gauges fed by the stream consumer's XPENDING sampler.
 	for _, name := range []string{
-		"pending_entries",
-		"pending_oldest_age_seconds",
+		MetricPendingEntries,
+		MetricPendingOldestAge,
 	} {
 		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
 		reg.MustRegister(g)
 		r.gauges[name] = g
 	}
 
-	// Buffer/backpressure gauges. buffered_events is the stream consumer's
+	// Buffer/backpressure gauges. MetricBufferedEvents is the stream consumer's
 	// current in-flight local buffer occupancy (events read from Redis but not
-	// yet finished); in_flight_invocations is the runner's current globally
+	// yet finished); MetricInFlightInvocations is the runner's current globally
 	// executing invocation count. Both are set on acquire/release.
 	for _, name := range []string{
-		"buffered_events",
-		"in_flight_invocations",
+		MetricBufferedEvents,
+		MetricInFlightInvocations,
 	} {
 		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
 		reg.MustRegister(g)
@@ -354,11 +397,11 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 		return
 	}
 	labels := []Label{{Name: "function", Value: f.Function}}
-	r.AddLabels("function_events_total", labels, f.Events)
-	r.AddLabels("function_handler_success_total", labels, f.HandlerSuccessTotal)
-	r.AddLabels("function_handler_failure_total", labels, f.HandlerFailureTotal)
-	r.AddLabels("function_retries_total", labels, f.RetriesTotal)
-	r.AddLabels("function_dlq_total", labels, f.DLQTotal)
+	r.AddLabels(MetricFunctionEvents, labels, f.Events)
+	r.AddLabels(MetricFunctionHandlerSuccess, labels, f.HandlerSuccessTotal)
+	r.AddLabels(MetricFunctionHandlerFailure, labels, f.HandlerFailureTotal)
+	r.AddLabels(MetricFunctionRetries, labels, f.RetriesTotal)
+	r.AddLabels(MetricFunctionDLQ, labels, f.DLQTotal)
 	r.funcTimestampsMu.Lock()
 	if r.funcTimestamps == nil {
 		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
@@ -386,7 +429,7 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 
 // ObserveDuration records a single duration observation against the labeled
 // histogram for name (see ObserveDurationLabels). A nil receiver is a no-op.
-// The only caller that once used the unlabeled form (function_build_seconds in
+// The only caller that once used the unlabeled form (MetricFunctionBuild in
 // runtime/manager.go) now records the labeled version, so an unlabeled histogram
 // is unnecessary and this method routes to the labeled one.
 func (r *Registry) ObserveDuration(name string, d time.Duration) {
@@ -476,8 +519,8 @@ type FunctionStat struct {
 // preserves persisted timestamps across empty incoming values anyway — so
 // dropping a timestamp-only read here never erases SQLite history.
 // It is nil-safe and returns nil when no function has been attributed yet. The
-// function_* metrics are Relay-specific, so this Relay-specific helper lives
-// here rather than in the worker.
+// relay_function_* metrics are Relay-specific, so this Relay-specific helper
+// lives here rather than in the worker.
 func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 	if r == nil {
 		return nil
@@ -492,9 +535,9 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 		tsByFn[fn] = arr
 	}
 	r.funcTimestampsMu.RUnlock()
-	// Gather the whole registry once and group the function_* series by function
-	// name. The label order is fixed to ["function"], so the single label value
-	// is the name.
+	// Gather the whole registry once and group the relay_function_* series by
+	// function name. The label order is fixed to ["function"], so the single
+	// label value is the name.
 	families, err := r.reg.Gather()
 	if err != nil {
 		return nil
@@ -517,15 +560,15 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 			}
 			v := int64(m.Counter.GetValue())
 			switch name {
-			case "function_events_total":
+			case MetricFunctionEvents:
 				fs.Events = v
-			case "function_handler_success_total":
+			case MetricFunctionHandlerSuccess:
 				fs.HandlerSuccessTotal = v
-			case "function_handler_failure_total":
+			case MetricFunctionHandlerFailure:
 				fs.HandlerFailureTotal = v
-			case "function_retries_total":
+			case MetricFunctionRetries:
 				fs.RetriesTotal = v
-			case "function_dlq_total":
+			case MetricFunctionDLQ:
 				fs.DLQTotal = v
 			}
 		}
@@ -556,11 +599,11 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 // read by FunctionStatsSnapshot.
 func isFunctionMetric(name string) bool {
 	switch name {
-	case "function_events_total",
-		"function_handler_success_total",
-		"function_handler_failure_total",
-		"function_retries_total",
-		"function_dlq_total":
+	case MetricFunctionEvents,
+		MetricFunctionHandlerSuccess,
+		MetricFunctionHandlerFailure,
+		MetricFunctionRetries,
+		MetricFunctionDLQ:
 		return true
 	}
 	return false
@@ -572,15 +615,15 @@ func isFunctionMetric(name string) bool {
 // pass. Global (unlabeled) metrics are deliberately absent: they are
 // process-lifetime and never deleted.
 var functionMetrics = []string{
-	"handler_invocations_total",
-	"build_failures_total",
-	"function_events_total",
-	"function_handler_success_total",
-	"function_handler_failure_total",
-	"function_retries_total",
-	"function_dlq_total",
-	"handler_duration_seconds",
-	"function_build_seconds",
+	MetricHandlerInvocations,
+	MetricBuildFailures,
+	MetricFunctionEvents,
+	MetricFunctionHandlerSuccess,
+	MetricFunctionHandlerFailure,
+	MetricFunctionRetries,
+	MetricFunctionDLQ,
+	MetricHandlerDuration,
+	MetricFunctionBuild,
 }
 
 // isFunctionCarryingMetric reports whether name is one of the labeled vecs that
@@ -603,7 +646,7 @@ func isFunctionCarryingMetric(name string) bool {
 // (see internal/worker) calls this so its stale Prometheus series do not linger
 // on /metrics after SQLite state is dropped.
 //
-// handler_invocations_total and handler_duration_seconds carry a second
+// MetricHandlerInvocations and MetricHandlerDuration carry a second
 // variable label alongside function (outcome/handler respectively), and
 // prometheus DeleteLabelValues requires a value for EVERY variable label — so
 // those two are deleted by partial match on the function label. Every
@@ -671,8 +714,8 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 // using the delete strategy appropriate to its label set. It is shared by
 // RemoveFunction and SweepFunctionMetrics so both retirement paths behave
 // identically. Each vec that carries function plus another variable label — the
-// counter handler_invocations_total (outcome,function,handler) and the
-// histogram handler_duration_seconds (function,handler) — is deleted by
+// counter MetricHandlerInvocations (outcome,function,handler) and the
+// histogram MetricHandlerDuration (function,handler) — is deleted by
 // partial match: prometheus DeleteLabelValues requires a value for EVERY
 // variable label, so passing only the function name matches nothing on a
 // multi-label vec. Every single-function-label vec is deleted by label value
@@ -683,7 +726,7 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 // label, classified for DeletePartialMatch by setting the `partial` flag below —
 // otherwise function lifecycle cleanup silently misses it.
 func (r *Registry) deleteFunction(name, fn string) {
-	partial := name == "handler_invocations_total" || name == "handler_duration_seconds"
+	partial := name == MetricHandlerInvocations || name == MetricHandlerDuration
 	if lc, ok := r.counterVecs[name]; ok {
 		if partial {
 			lc.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
@@ -696,7 +739,7 @@ func (r *Registry) deleteFunction(name, fn string) {
 		if partial {
 			lh.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
 		} else {
-			// function_build_seconds (sole label).
+			// MetricFunctionBuild (sole label).
 			lh.vec.DeleteLabelValues(fn)
 		}
 	}
@@ -731,7 +774,10 @@ func (r *Registry) Gauge(name string) float64 {
 }
 
 // Snapshot renders every registered metric as a logfmt-style line, one per
-// metric, sorted for deterministic output:
+// metric, sorted for deterministic output. Names are rendered via
+// metricDisplayName, i.e. WITHOUT the relay_ namespace prefix — this output is
+// purely for human logs (the MetricsLogger); the /metrics exposition keeps the
+// canonical prefixed names. The shapes are:
 //
 //	name count=N
 //	name{a=1,b=2} value=V
@@ -779,8 +825,12 @@ func (r *Registry) Snapshot() string {
 }
 
 // sampleName renders a single gathered metric as "name" or "name{a=1,b=2}" in
-// the logfmt convention, using the family's label set (sorted by name).
+// the logfmt convention, using the family's label set (sorted by name). The
+// family name goes through metricDisplayName (the relay_ prefix is stripped):
+// this is the single log/display boundary — the Prometheus exposition path
+// renders the canonical prefixed name directly and never passes through here.
 func sampleName(familyName string, m *dto.Metric) string {
+	familyName = metricDisplayName(familyName)
 	if len(m.GetLabel()) == 0 {
 		return familyName
 	}
@@ -790,6 +840,15 @@ func sampleName(familyName string, m *dto.Metric) string {
 	}
 	sort.Strings(parts)
 	return familyName + "{" + strings.Join(parts, ",") + "}"
+}
+
+// metricDisplayName maps a canonical metric name onto its human-readable
+// display form by stripping the relay_ namespace prefix. It is applied ONLY at
+// the log/display boundary (sampleName, feeding Snapshot and thus the
+// MetricsLogger) — the Prometheus exposition must keep emitting the canonical
+// prefixed names.
+func metricDisplayName(name string) string {
+	return strings.TrimPrefix(name, metricNamespacePrefix)
 }
 
 // values maps a []Label onto the labeled collector's canonical label positions
