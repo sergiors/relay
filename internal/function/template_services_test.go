@@ -371,8 +371,8 @@ func TestExampleFastAPITemplateParses(t *testing.T) {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Entrypoint != "app/main.py" || s.Port != 8000 || s.Replicas != 1 {
-		t.Fatalf("service = %+v, want {app/main.py 8000 1}", s)
+	if s.Entrypoint != "app/main.py" || s.Host != "api.example.com" || s.Port != 8000 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want {app/main.py api.example.com 8000 1}", s)
 	}
 }
 
@@ -398,5 +398,109 @@ services:
 				t.Fatalf("port = %d, want 3000", tmpl.Services[0].Port)
 			}
 		})
+	}
+}
+
+// A declared `host` parses into Service.Host; an empty host parses to "" (an
+// internal unrouted service); an omitted host is nil -> "" too.
+func TestParseServiceHost(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - entrypoint: routed.js
+    host: api.example.com
+  - entrypoint: blank.js
+    host: ""
+  - entrypoint: plain.js
+`)
+	if len(tmpl.Services) != 3 {
+		t.Fatalf("services = %d, want 3", len(tmpl.Services))
+	}
+	if tmpl.Services[0].Host != "api.example.com" {
+		t.Fatalf("routed host = %q, want api.example.com", tmpl.Services[0].Host)
+	}
+	if tmpl.Services[1].Host != "" {
+		t.Fatalf("empty host = %q, want \"\" (unrouted)", tmpl.Services[1].Host)
+	}
+	if tmpl.Services[2].Host != "" {
+		t.Fatalf("omitted host = %q, want \"\" (unrouted)", tmpl.Services[2].Host)
+	}
+}
+
+// Invalid hosts are rejected, with the error naming the service entrypoint.
+func TestParseServiceHostRejected(t *testing.T) {
+	long := "a" + "." + strings.Repeat("b", 248) + ".com" // 254 chars total
+	cases := []struct {
+		name string
+		host string
+	}{
+		{"space", "has space"},
+		{"underscore", "under_score.com"},
+		{"leading hyphen", "-leading.com"},
+		{"trailing hyphen label", "trailing-.com"},
+		{"empty label", "a..b.com"},
+		{"too long", long},
+		{"port suffix", "api.example.com:8080"},
+		{"only dots", ".com"},
+		{"hyphen in middle of nothing", "-"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - entrypoint: service.js
+    host: "` + tc.host + `"
+`))
+			if err == nil {
+				t.Fatalf("expected error for host %q", tc.host)
+			}
+			if !strings.Contains(err.Error(), "service.js") {
+				t.Errorf("expected error to name the service, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "host") {
+				t.Errorf("expected error to mention host, got: %v", err)
+			}
+		})
+	}
+}
+
+// Hostname boundary: a 253-char host is accepted and a single-label host ("api")
+// is accepted.
+func TestParseServiceHostBoundaries(t *testing.T) {
+	// 253 chars as four valid labels (each <= 63 chars, no hyphen bounds):
+	// 63 + 1 + 63 + 1 + 62 + 1 + 62 = 253.
+	host253 := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." +
+		strings.Repeat("c", 62) + "." + strings.Repeat("d", 62)
+	if len(host253) != 253 {
+		t.Fatalf("test host length = %d, want 253", len(host253))
+	}
+	tmpl := mustParse(t, `
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - entrypoint: long.js
+    host: "`+host253+`"
+  - entrypoint: short.js
+    host: api
+  - entrypoint: numeric.js
+    host: 123.io
+`)
+	if tmpl.Services[0].Host != host253 {
+		t.Fatalf("253-char host = %q, want the full host accepted", tmpl.Services[0].Host)
+	}
+	if tmpl.Services[1].Host != "api" || tmpl.Services[2].Host != "123.io" {
+		t.Fatalf("boundary hosts = %v", tmpl.Services)
 	}
 }

@@ -319,7 +319,7 @@ func subsystemConfigNoSecret(t *testing.T) Config {
 // when the git source config does not exist at the configured ConfigPath
 // override.
 func TestNewDisabledWithoutGitSource(t *testing.T) {
-	logger, buf := 	testLogger()
+	logger, buf := testLogger()
 	// Pass a temp ConfigPath pointing at a nonexistent file.
 	cfg := Config{
 		Secrets:    mustProvider(t),
@@ -406,7 +406,7 @@ func TestServerAssemblesAndServesUnsignedGitHub(t *testing.T) {
 // TestNewDisabledWithoutSecretResolver verifies NewServer returns nil
 // (defensive) when no secret resolver is configured.
 func TestNewDisabledWithoutSecretResolver(t *testing.T) {
-	logger, buf := 	testLogger()
+	logger, buf := testLogger()
 	cfgPath := filepath.Join(t.TempDir(), "source.json")
 	if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", "gh_secret"); err != nil {
 		t.Fatalf("set source: %v", err)
@@ -426,7 +426,7 @@ func TestNewDisabledWithoutSecretResolver(t *testing.T) {
 // Start after Stop errors. The capturing log must never contain the secret
 // value.
 func TestServerAssemblesAndServesGitHub(t *testing.T) {
-	logger, logBuf := 	testLogger()
+	logger, logBuf := testLogger()
 	s := NewServer(freeAddr(t), logger, subsystemConfig(t))
 	if s == nil {
 		t.Fatal("NewServer returned nil for an enabled server")

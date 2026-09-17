@@ -193,3 +193,43 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 		t.Error("sweepSkips(relay.function but no relay.type) = false, want true")
 	}
 }
+
+// serviceLabels merges the spec's extra labels onto the relay ownership set,
+// and Relay ownership ALWAYS wins: a spec label colliding with a relay.* key
+// is overwritten by the authoritative relay value.
+func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
+	spec := ServiceSpec{
+		Function:   "user-events",
+		Entrypoint: "service.js",
+		Port:       3000,
+		Image:      "relay-fn-user-events:deadbeef",
+		Labels: map[string]string{
+			"traefik.enable": "true",
+			// Attempted spoof of Relay ownership keys.
+			labelType:     ContainerTypeEvent,
+			labelFunction: "spoofed",
+			labelPort:     "9999",
+			"custom.key":  "custom-value",
+		},
+	}
+	got := serviceLabels(spec, "worker-1", 0)
+
+	if got[labelType] != ContainerTypeService {
+		t.Fatalf("relay.type = %q, want %q (ownership must win)", got[labelType], ContainerTypeService)
+	}
+	if got[labelFunction] != "user-events" {
+		t.Fatalf("relay.function = %q, want user-events (ownership must win)", got[labelFunction])
+	}
+	if got[labelPort] != "3000" {
+		t.Fatalf("relay.port = %q, want 3000 (ownership must win)", got[labelPort])
+	}
+	if got["traefik.enable"] != "true" {
+		t.Fatalf("extra routing label missing: %v", got)
+	}
+	if got["custom.key"] != "custom-value" {
+		t.Fatalf("custom label missing: %v", got)
+	}
+	if got[labelEntrypoint] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
+		t.Fatalf("ownership labels corrupted: %v", got)
+	}
+}

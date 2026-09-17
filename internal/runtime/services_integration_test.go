@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -595,4 +596,109 @@ func countServiceContainers(t *testing.T, ctx context.Context, m *Manager, fn st
 		}
 	}
 	return n
+}
+
+// TestIntegrationServiceJoinsExternalNetwork pins the ServiceSpec.Network +
+// ServiceSpec.Labels wiring end to end: a service started with Network=<name>
+// is created attached to that external Docker network (created by the TEST as
+// the infra owner — Relay never creates networks), and its supplied extra
+// labels land on the container next to the relay.* ownership labels. The
+// negative case: starting a service against a NONEXISTENT network fails and
+// leaves no container behind.
+func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
+	cli := requireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	// A dedicated network with a unique name, created here (the test is the
+	// infra owner) and removed in cleanup along with any service containers.
+	networkName := "relay-test-traefik-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if _, err := cli.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{Driver: "bridge"}); err != nil {
+		t.Fatalf("create test network: %v", err)
+	}
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		if c, err := m.ServiceContainerList(cc); err == nil {
+			_ = m.StopServiceContainers(cc, c)
+		}
+		_, _ = cli.NetworkRemove(cc, networkName, client.NetworkRemoveOptions{})
+		cleanupImagePrefixes(cli, "relay-fn-svc-network:")()
+	})
+
+	_, image := buildServiceHost(t, ctx, "svc-network")
+
+	// Happy path: start a routed-looking service with the network + an extra
+	// Traefik label; assert both reach the container.
+	id, err := m.StartService(ctx, ServiceSpec{
+		Function:   "svc-network",
+		Entrypoint: "app/service.js",
+		Port:       3000,
+		Image:      image,
+		Entry:      []string{"node", "/app/app/service.js"},
+		Env:        []string{"PORT=3000"},
+		Labels:     map[string]string{"traefik.enable": "true"},
+		Network:    networkName,
+	}, 0)
+	if err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if insp.Container.Config == nil {
+		t.Fatal("inspect: nil Config")
+	}
+	labels := insp.Container.Config.Labels
+	// The supplied extra label and the Relay ownership labels coexist.
+	if labels["traefik.enable"] != "true" {
+		t.Fatalf("extra routing label missing on container: %v", labels)
+	}
+	if labels[labelType] != ContainerTypeService || labels[labelFunction] != "svc-network" ||
+		labels[labelEntrypoint] != "app/service.js" || labels[labelImage] != image ||
+		labels[labelHostname] != "test-host" {
+		t.Fatalf("relay ownership labels missing/corrupted on container: %v", labels)
+	}
+	// The container joined the external network.
+	if insp.Container.NetworkSettings == nil {
+		t.Fatal("inspect: nil NetworkSettings")
+	}
+	if _, ok := insp.Container.NetworkSettings.Networks[networkName]; !ok {
+		t.Fatalf("container is not attached to network %q; networks = %v", networkName, insp.Container.NetworkSettings.Networks)
+	}
+
+	// Negative: a nonexistent network fails and leaves NO container behind.
+	_, err = m.StartService(ctx, ServiceSpec{
+		Function:   "svc-network",
+		Entrypoint: "app/service.js",
+		Port:       3000,
+		Image:      image,
+		Entry:      []string{"node", "/app/app/service.js"},
+		Env:        []string{"PORT=3000"},
+		Network:    "relay-test-nonexistent-network",
+	}, 1)
+	if err == nil {
+		t.Fatal("expected an error starting a service on a nonexistent network")
+	}
+	deadlineNoLeftover := time.Now().Add(15 * time.Second)
+	remaining := countServiceContainers(t, ctx, m, "svc-network")
+	for remaining > 1 && time.Now().Before(deadlineNoLeftover) {
+		time.Sleep(200 * time.Millisecond)
+		remaining = countServiceContainers(t, ctx, m, "svc-network")
+	}
+	// The extra replica must not exist: exactly the one happy-path container.
+	if remaining != 1 {
+		t.Fatalf("after a failed create left %d containers for the function; want 1 (the routed one only)", remaining)
+	}
 }

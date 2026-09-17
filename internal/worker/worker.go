@@ -31,6 +31,7 @@ import (
 	gitwh "relay/internal/git/webhook"
 	"relay/internal/metrics"
 	"relay/internal/reconciler"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/schedule"
@@ -167,7 +168,10 @@ func Run(logger *slog.Logger) {
 	// the shared secrets resolver). Service containers survive worker shutdown by
 	// design — they are persistent and long-lived — so the next boot's per-function
 	// Apply + SweepOrphans converges any drift; nothing touches them on shutdown.
-	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, logger)
+	// The service reconciler itself decides whether routing applies (only
+	// services declaring a host are routed) and validates TRAEFIK_NETWORK per
+	// routed service; wiring only forwards the configured value.
+	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{Network: cfg.TraefikNetwork}, logger)
 
 	// Conservative startup orphan sweep: before any function is prepared or any
 	// container created, remove execution containers a previous Relay process on

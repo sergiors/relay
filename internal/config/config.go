@@ -48,6 +48,12 @@ type Config struct {
 	// worker before they complete/ACK. It bounds the local buffer so the
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
+	// TraefikNetwork is the optional TRAEFIK_NETWORK value: the Docker network
+	// Traefik is attached to. It is required only when a function's template
+	// service declares a `host` (routed service); Relay never creates the
+	// network itself and verifies it exists on every routed reconcile. Empty
+	// means routing is not configured (unrouted services are unaffected).
+	TraefikNetwork string
 }
 
 // Load reads Relay's configuration from the environment and returns a Config. It
@@ -80,6 +86,7 @@ func Load(logger *slog.Logger) Config {
 		LogLevel:          loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
 		MaxConcurrency:    loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
 		MaxBufferedEvents: loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
+		TraefikNetwork:    getEnv("TRAEFIK_NETWORK", ""),
 	}
 
 }

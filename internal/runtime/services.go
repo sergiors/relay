@@ -11,6 +11,8 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"relay/internal/runtime/python"
 )
 
@@ -30,6 +32,19 @@ type ServiceSpec struct {
 	Image      string
 	Entry      []string // the long-lived process command; empty = image entrypoint
 	Env        []string // runtime env (plan env), no RELAY_HANDLER
+	// Labels are EXTRA labels the caller wants on the container (routing
+	// labels supplied by the service reconciler). They are merged onto the
+	// relay ownership set, with Relay ownership keys always winning: a caller
+	// can never spoof or clobber relay.* labels, which define ownership and
+	// discovery.
+	Labels map[string]string
+	// Network is an additional Docker network the container must join at
+	// create time (e.g. the routing layer's network). Empty means no extra
+	// network (default bridge/network mode only). The network itself is
+	// infrastructure owned OUTSIDE Relay — it is never created here — and the
+	// caller (the service reconciler) validates it exists before starting
+	// routed containers.
+	Network string
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
@@ -49,6 +64,10 @@ type ServiceContainer struct {
 	// The service reconciler uses it to detect a port change (a stale-config
 	// container whose labelPort != the template's desired port is replaced).
 	Port int
+	// Labels is the container's FULL label set (nil-safe; nil when the
+	// container has none). The service reconciler compares routing metadata
+	// through it without Relay parsing or interpreting foreign label names.
+	Labels map[string]string
 }
 
 // serviceContainerLabelName is the deterministic, docker-safe container name for
@@ -94,8 +113,13 @@ func serviceContainerName(functionName, entrypoint string, replica int) string {
 // invocation containers. relay.entrypoint is the service identity (the
 // entrypoint string) — there is no relay.service label there, and service
 // containers carry no relay.handler.
+//
+// Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
+// on top, then the relay ownership keys are RE-applied last so Relay's
+// ownership labels are always authoritative: a caller can add labels but never
+// clobber or spoof a relay.* key.
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
-	return map[string]string{
+	labels := map[string]string{
 		labelType:       ContainerTypeService,
 		labelFunction:   spec.Function,
 		labelEntrypoint: spec.Entrypoint,
@@ -104,6 +128,17 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 		labelPort:       strconv.Itoa(spec.Port),
 		labelReplica:    strconv.Itoa(replica),
 	}
+	for k, v := range spec.Labels {
+		labels[k] = v
+	}
+	labels[labelType] = ContainerTypeService
+	labels[labelFunction] = spec.Function
+	labels[labelEntrypoint] = spec.Entrypoint
+	labels[labelImage] = spec.Image
+	labels[labelHostname] = hostname
+	labels[labelPort] = strconv.Itoa(spec.Port)
+	labels[labelReplica] = strconv.Itoa(replica)
+	return labels
 }
 
 // StartService creates and starts ONE persistent service container. spec.Env is
@@ -135,12 +170,24 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		cfg.Entrypoint = spec.Entry
 	}
 
-	createResp, err := m.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+	createOps := client.ContainerCreateOptions{
 		Config: cfg,
 		// No AutoRemove: persistent, reconciler-owned (see doc comment).
 		HostConfig: hardenedHostConfig(false),
 		Name:       serviceContainerName(spec.Function, spec.Entrypoint, replica),
-	})
+	}
+	if spec.Network != "" {
+		// Join an additional Docker network at create time (containers must
+		// belong to a network from creation to be on it at start). The network
+		// is infrastructure owned OUTSIDE Relay — it is never created here —
+		// and the caller (the service reconciler) validates it exists before
+		// starting routed containers; a missing network surfaces as a create
+		// error below rather than a chaos fix-up.
+		createOps.NetworkingConfig = &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{spec.Network: {}},
+		}
+	}
+	createResp, err := m.cli.ContainerCreate(ctx, createOps)
 	if err != nil {
 		return "", fmt.Errorf("service: create container: %w", err)
 	}
@@ -192,6 +239,16 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 		if p, err := strconv.Atoi(c.Labels[labelPort]); err == nil {
 			port = p
 		}
+		// The full label set is copied as-is (nil when the container has none)
+		// so the reconciler can compare routing metadata without Relay owning
+		// or interpreting foreign label names.
+		var labelsCopy map[string]string
+		if len(c.Labels) > 0 {
+			labelsCopy = make(map[string]string, len(c.Labels))
+			for k, v := range c.Labels {
+				labelsCopy[k] = v
+			}
+		}
 		out = append(out, ServiceContainer{
 			ID:         c.ID,
 			Function:   c.Labels[labelFunction],
@@ -201,9 +258,24 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			State:      c.State,
 			Replica:    replica,
 			Port:       port,
+			Labels:     labelsCopy,
 		})
 	}
 	return out, nil
+}
+
+// NetworkExists reports whether a Docker network exists on the daemon. It is
+// verification only — Relay NEVER creates networking infrastructure — used by
+// the service reconciler to refuse starting routed containers whose routing
+// network does not exist. Others' networks are inspected but never modified.
+func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, error) {
+	if _, err := m.cli.NetworkInspect(ctx, network, client.NetworkInspectOptions{}); err != nil {
+		if errors.Is(err, cerrdefs.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("network inspect %q: %w", network, err)
+	}
+	return true, nil
 }
 
 // StopServiceContainers stops and removes the given service containers,

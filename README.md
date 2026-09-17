@@ -169,6 +169,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
 | `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
 | `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
+| `TRAEFIK_NETWORK`        | no       | Docker network Traefik is attached to; required only when a service declares `host`.   |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -738,8 +739,17 @@ services:
   on. It defaults to `80` and must be between `1` and `65535`. Relay injects it
   as the `PORT` environment variable (it cannot be overridden by template env
   or secrets), and exposes the port as container metadata only — **no host
-  port is published, and no proxy/routing layer is attached yet**: how requests
-  reach the service (Traefik, host routing, TLS) is a later concern.
+  port is published**. When the service declares a `host`, Traefik routes
+  traffic to that port (see _Traefik routing_ below).
+- `host` (optional) is a hostname (e.g. `api.example.com`) exposing this
+  service through Traefik. It is validated as a hostname at template parse
+  time (empty or omitted = an internal **unrouted** service). At reconcile
+  time a routed service requires `TRAEFIK_NETWORK`: if the variable is unset
+  Relay reports `service "app/main.py": TRAEFIK_NETWORK is required when
+  Traefik routing is configured`, and if the configured network does not exist
+  on the daemon it reports `service "app/main.py": Traefik network "proxy"
+  does not exist` — Relay never creates the network. Changing `host` (or the
+  port, or `TRAEFIK_NETWORK`) reconciles: the running container is replaced.
 - `replicas` (optional) is the desired replica count Relay maintains. It
   defaults to `1` and must be a positive integer. No autoscaling — the count
   is always exactly what the template declares.
@@ -806,9 +816,41 @@ Services:
   app/service.js   port=3000 replicas=2
 ```
 
-Out of scope for this first version: host port publishing, Traefik/routing
-integration, host/domain configuration, autoscaling, and request-level handler
-invocation.
+Out of scope for this first version: host port publishing, autoscaling, and
+request-level handler invocation. Routing is Traefik-only (see below).
+
+### Traefik routing (optional)
+
+A service that declares a `host` is routed through Traefik (operator-provided
+infrastructure outside Relay). Relay attaches four labels to the service
+container so Traefik picks it up from its Docker provider:
+
+```
+traefik.enable                                          = true
+traefik.docker.network                                  = <TRAEFIK_NETWORK>
+traefik.http.routers.<id>.rule                          = Host(`api.example.com`)
+traefik.http.services.<id>.loadbalancer.server.port     = <port>
+```
+
+- `<id>` is a single deterministic Traefik-safe router/service id shared by the
+  router and service slices: it is derived from the service identity (the
+  function name + entrypoint, never the host) as `relay-<function>-<entrypoint>`,
+  lowercased, with every character outside `[a-z0-9-]` sanitized to `-`
+  (entrypoints like `app/main.py` contain `/` and `.`), consecutive `-`
+  collapsed, and trimmed/capped at 100 characters. Because the id is
+  deterministic, reconciliation produces stable labels.
+- `traefik.docker.network` tells Traefik which network the container routes on
+  (the `TRAEFIK_NETWORK` Docker network). The container is **created attached
+  to that network**. The network itself is owned outside Relay: Relay never
+  creates it, and verifies it exists before starting routed containers — with
+  `TRAEFIK_NETWORK=proxy` and no such network, the reconcile reports
+  `service "app/main.py": Traefik network "proxy" does not exist`.
+- A service without `host` gets no Traefik labels at all and joins no extra
+  network: it stays internal.
+- Reconciliation is label-aware: changing `host`, `port`, or `TRAEFIK_NETWORK`
+  makes the running container stale and it is **replaced** with one carrying
+  the updated routing labels. Removing `host` replaces the routed container
+  with an internal (unlabeled) one.
 
 ## Supported runtimes
 

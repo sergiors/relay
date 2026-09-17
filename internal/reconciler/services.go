@@ -20,6 +20,11 @@
 //   - RemoveAll (via the reconciler's RemoveServices hook) must run BEFORE the
 //     function's images are retired, because running service containers still
 //     reference those images.
+//   - Routing (Traefik) for routed services (a service declaring a host) is
+//     validated before any container action for that service: the routing
+//     config must be present and the routing network must exist (Relay never
+//     creates it); a routed service failing routing validation is reported and
+//     skipped, not half-reconciled.
 package reconciler
 
 import (
@@ -32,6 +37,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/function"
+	"relay/internal/routing"
 	"relay/internal/runtime"
 )
 
@@ -45,6 +51,10 @@ type Docker interface {
 	// RemoveFunctionServiceContainers stops and removes every service container
 	// belonging to one function, returning how many were removed.
 	RemoveFunctionServiceContainers(ctx context.Context, fnName string) (int, error)
+	// NetworkExists reports whether a Docker network exists on the daemon. The
+	// service reconciler uses it to refuse routed services whose routing
+	// network is missing; Relay never creates networks.
+	NetworkExists(ctx context.Context, network string) (bool, error)
 }
 
 // SecretResolver resolves a secret reference to its value. It is a structural
@@ -119,6 +129,7 @@ func Reconcile(
 	image string,
 	preparedEnv []string,
 	secrets SecretResolver,
+	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
 	containers, err := d.ServiceContainerList(ctx)
@@ -165,18 +176,71 @@ func Reconcile(
 	for _, svc := range tmpl.Services {
 		existing := byService[svc.Entrypoint]
 
+		// Routing validation runs FIRST, before any classification or stops:
+		// a routed service (one declaring a host) whose routing config is
+		// unusable must be reported and skipped entirely — no stops, no
+		// starts — replacing it half-way would break the existing container
+		// for nothing.
+		var routeLabels map[string]string
+		routeNetwork := ""
+		if svc.Host != "" {
+			if err := traefik.Validate(); err != nil {
+				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
+				fail(err)
+				if log != nil {
+					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				}
+				continue
+			}
+			// The routing network (e.g. the Traefik network) is infrastructure
+			// owned outside Relay; Relay verifies it exists and refuses to
+			// start routed containers otherwise — it never creates it.
+			ok, err := d.NetworkExists(ctx, traefik.Network)
+			if err != nil {
+				err := fmt.Errorf("service %q: check routing network: %w", svc.Entrypoint, err)
+				fail(err)
+				if log != nil {
+					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				}
+				continue
+			}
+			if !ok {
+				err := fmt.Errorf("service %q: %w", svc.Entrypoint, routing.MissingNetwork(traefik.Network))
+				fail(err)
+				if log != nil {
+					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				}
+				continue
+			}
+			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Port, traefik.Network)
+			routeNetwork = traefik.Network
+			if log != nil {
+				log.Debug("Service: routing configured",
+					"function", fnName,
+					"service", svc.Entrypoint,
+					"host", svc.Host,
+					"network", routeNetwork,
+				)
+			}
+		}
+
 		// A container is a keep candidate only when it is both healthy (running)
 		// and currently configured correctly (image and port match the desired
 		// value) and carries a real replica label. Anything else — exited/dead/
 		// removing, a changed image (rebuild), a changed port, or an unlabeled
-		// legacy container (Replica == -1) — is stale and must be replaced.
+		// legacy container (Replica == -1) — is stale and must be replaced. In
+		// addition, the container's labels must match the desired routing label
+		// set exactly: a changed host/port/network leaves stale Traefik labels
+		// pointing traffic at whatever the old container served, so the
+		// container is replaced.
 		var candidates []runtime.ServiceContainer
 		var stale []runtime.ServiceContainer
 		for _, c := range existing {
 			if c.State == container.StateRunning &&
 				c.Image == image &&
 				c.Port == svc.Port &&
-				c.Replica >= 0 {
+				c.Replica >= 0 &&
+				routingLabelsMatch(routeLabels, c.Labels) {
 				candidates = append(candidates, c)
 			} else {
 				stale = append(stale, c)
@@ -243,6 +307,8 @@ func Reconcile(
 				Image:      image,
 				Entry:      entry,
 				Env:        env,
+				Labels:     routeLabels,
+				Network:    routeNetwork,
 			}
 			if _, err := d.StartService(ctx, spec, slot); err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", svc.Entrypoint, slot, err))
@@ -251,6 +317,31 @@ func Reconcile(
 	}
 
 	return changed, firstErr
+}
+
+// routingLabelsMatch reports whether a container's actual label set matches the
+// desired routing label set: every desired key/value must be present equal in
+// the actual set, and the actual set must carry NO extra Traefik-owned key
+// (routing.IsTraefikLabel) — stale routing labels from a previous host/config
+// would keep routing old traffic, so they make the container stale. nil-vs-nil
+// (an unrouted service and an unlabeled container) matches. Non-Traefik extra
+// labels (Relay ownership itself, future additions) are ignored here — Relay
+// ownership matching happens via the structured fields above.
+func routingLabelsMatch(desired, actual map[string]string) bool {
+	for k, want := range desired {
+		if actual[k] != want {
+			return false
+		}
+	}
+	for k := range actual {
+		if _, isDesired := desired[k]; isDesired {
+			continue
+		}
+		if routing.IsTraefikLabel(k) {
+			return false
+		}
+	}
+	return true
 }
 
 // RemoveAll stops and removes every service container belonging to fnName,
@@ -277,14 +368,17 @@ func RemoveAll(ctx context.Context, d Docker, fnName string, log *slog.Logger) {
 type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
+	traefik routing.TraefikConfig
 	log     *slog.Logger
 	mu      sync.Mutex
 }
 
-// NewServiceReconciler builds a ServiceReconciler. log may be nil (then no
-// messages are emitted).
-func NewServiceReconciler(d Docker, secrets SecretResolver, log *slog.Logger) *ServiceReconciler {
-	return &ServiceReconciler{docker: d, secrets: secrets, log: log}
+// NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
+// Traefik routing config (empty = routing not configured; required only for
+// services whose template declares a host). log may be nil (then no messages
+// are emitted).
+func NewServiceReconciler(d Docker, secrets SecretResolver, traefik routing.TraefikConfig, log *slog.Logger) *ServiceReconciler {
+	return &ServiceReconciler{docker: d, secrets: secrets, traefik: traefik, log: log}
 }
 
 // Apply converges fnName's services to tmpl+image: it runs Reconcile and logs
@@ -302,7 +396,7 @@ func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *func
 		replicas += svc.Replicas
 	}
 
-	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.log)
+	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log)
 	if err != nil {
 		if c.log != nil {
 			c.log.Warn("Service: reconciled with errors",

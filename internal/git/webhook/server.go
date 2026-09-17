@@ -85,10 +85,10 @@ type Server struct {
 	// Server is built by newServer for pure routing/lifecycle tests). Stop drains
 	// it after the HTTP server. It is nil-safe: SyncScheduler.Stop tolerates a
 	// nil receiver and Stop also guards s.scheduler != nil.
-	scheduler   *SyncScheduler
-	srv         *http.Server
-	serveErr    chan error
-	started     atomic.Bool
+	scheduler    *SyncScheduler
+	srv          *http.Server
+	serveErr     chan error
+	started      atomic.Bool
 	shutdownOnce sync.Once
 }
 

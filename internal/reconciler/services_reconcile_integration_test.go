@@ -21,6 +21,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 )
@@ -94,7 +95,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// reconciler, so discovery/update converge service containers and removal
 	// stops them (before the images would be retired by the worker's removal
 	// hook, which this test does not wire).
-	svcCtrl := NewServiceReconciler(m, nil, logger)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
 	rec := New(
 		Config{
 			Root:     root,

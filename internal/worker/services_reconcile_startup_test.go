@@ -10,6 +10,7 @@ import (
 
 	"relay/internal/function"
 	"relay/internal/reconciler"
+	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 )
@@ -47,6 +48,10 @@ func (f *svcDeadlineDocker) RemoveFunctionServiceContainers(_ context.Context, _
 	return 0, nil
 }
 
+func (f *svcDeadlineDocker) NetworkExists(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
 func (f *svcDeadlineDocker) recordedDeadlines() []time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -63,7 +68,7 @@ func (f *svcDeadlineDocker) recordedDeadlines() []time.Time {
 func TestReconcileStartupServicesBoundedPerFunction(t *testing.T) {
 	fake := &svcDeadlineDocker{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, logger)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger)
 
 	tmpl := &function.Template{
 		Runtime: "node24",

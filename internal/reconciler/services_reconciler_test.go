@@ -12,6 +12,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/function"
+	"relay/internal/routing"
 	"relay/internal/runtime"
 )
 
@@ -25,20 +26,27 @@ type fakeContainer struct {
 	replica    int
 	state      container.ContainerState
 	entry      []string // the long-lived process command passed to StartService
+	labels     map[string]string
+	network    string // spec.Network passed to StartService
 }
 
 // fakeDocker is an in-memory Docker for Reconcile unit tests. Containers are
 // keyed by a deterministic id so tests can inspect and manipulate them.
 type fakeDocker struct {
-	mu          sync.Mutex
-	nextID      int
-	ctrs        map[string]*fakeContainer
-	stops       []string // container ids stopped (in order), for ordering assertions
-	failStopFor string   // when non-empty, StopServiceContainers errors for this id
+	mu              sync.Mutex
+	nextID          int
+	ctrs            map[string]*fakeContainer
+	stops           []string        // container ids stopped (in order), for ordering assertions
+	failStopFor     string          // when non-empty, StopServiceContainers errors for this id
+	missingNetworks map[string]bool // NetworkExists reports false for these
+	networkLookups  []string        // network names passed to NetworkExists, in order
 }
 
 func newFakeDocker() *fakeDocker {
-	return &fakeDocker{ctrs: map[string]*fakeContainer{}}
+	return &fakeDocker{
+		ctrs:            map[string]*fakeContainer{},
+		missingNetworks: map[string]bool{},
+	}
 }
 
 func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, replica int) (string, error) {
@@ -55,8 +63,17 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		replica:    replica,
 		state:      container.StateRunning,
 		entry:      spec.Entry,
+		labels:     spec.Labels,
+		network:    spec.Network,
 	}
 	return id, nil
+}
+
+func (f *fakeDocker) NetworkExists(_ context.Context, network string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.networkLookups = append(f.networkLookups, network)
+	return !f.missingNetworks[network], nil
 }
 
 func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceContainer, error) {
@@ -72,6 +89,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			State:      c.state,
 			Replica:    c.replica,
 			Port:       c.port,
+			Labels:     c.labels,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -192,7 +210,7 @@ func TestReconcileInitialCreation(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
 
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -203,7 +221,7 @@ func TestReconcileInitialCreation(t *testing.T) {
 		t.Fatalf("slots = %v, want [0 1]", slots)
 	}
 	// Idempotent second pass is a no-op (replicas unchanged).
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -214,12 +232,12 @@ func TestReconcileInitialCreation(t *testing.T) {
 func TestReconcileScaleUp(t *testing.T) {
 	f := newFakeDocker()
 	svc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
-	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 
 	svc.Replicas = 3
-	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile 3: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 3 {
@@ -240,7 +258,7 @@ func TestReconcileScaleUp(t *testing.T) {
 func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 	f := newFakeDocker()
 	svc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 3}
-	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile 3: %v", err)
 	}
 	slots3 := f.replicas("fn", "service.js")
@@ -249,7 +267,7 @@ func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 	}
 
 	svc.Replicas = 1
-	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", serviceTemplate("node24", svc), "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
@@ -267,7 +285,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 		function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2},
 		function.Service{Entrypoint: "old.js", Port: 80, Replicas: 1},
 	)
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "old.js"); got != 1 {
@@ -276,7 +294,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 
 	// Remove old.js from the template; only service.js remains.
 	reduced := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if _, err := Reconcile(context.Background(), f, "fn", reduced, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", reduced, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile reduced: %v", err)
 	}
 	if got := f.runningCount("fn", "old.js"); got != 0 {
@@ -290,7 +308,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 func TestReconcilePortChange(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	old := f.replicas("fn", "service.js")
@@ -300,7 +318,7 @@ func TestReconcilePortChange(t *testing.T) {
 
 	// Change the port: the now-stale-config container must be replaced.
 	changed := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", changed, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", changed, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile changed: %v", err)
 	}
 	// The single container should still run (replaced), on the new port.
@@ -326,7 +344,7 @@ func TestReconcilePortChange(t *testing.T) {
 func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile img-1: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -334,7 +352,7 @@ func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	}
 
 	// New image -> all stale -> replaced with the new image.
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-2", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-2", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile img-2: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -365,7 +383,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 	}
 
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -400,7 +418,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	slots0 := f.replicas("fn", "service.js")
@@ -420,7 +438,7 @@ func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f.mu.Unlock()
 	f.setState(toCrash, container.StateExited)
 
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile after crash: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -437,7 +455,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	// A Replica == -1 container (legacy/unlabeled) is always stale and replaced.
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	slots0 := f.replicas("fn", "service.js")
@@ -454,7 +472,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile unlabeled: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 1 {
@@ -481,7 +499,7 @@ func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
 	}
 
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile fn: %v", err)
 	}
 	// "other"'s container is untouched.
@@ -505,7 +523,7 @@ func TestReconcileStopFailureDoesNotAbort(t *testing.T) {
 	f.mu.Unlock()
 	f.failStopFor = "id-1"
 
-	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog())
 	if err == nil {
 		t.Fatal("expected an error surfaced from the failing stop")
 	}
@@ -526,7 +544,7 @@ func containsErr(err error, substr string) bool {
 func TestRemoveAll(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 2})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "service.js"); got != 2 {
@@ -542,7 +560,7 @@ func TestRemoveAll(t *testing.T) {
 func TestSweepOrphans(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "live", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "live", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile live: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
@@ -551,7 +569,7 @@ func TestSweepOrphans(t *testing.T) {
 		t.Fatalf("start ghost: %v", err)
 	}
 
-	c := NewServiceReconciler(f, nil, noLog())
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, noLog())
 	c.SweepOrphans(context.Background(), map[string]bool{"live": true})
 
 	if got := f.runningCount("live", "service.js"); got != 1 {
@@ -623,7 +641,7 @@ func TestReconcileEmptyDesiredRemovesLeftovers(t *testing.T) {
 	f.ctrs["leftover-2"] = &fakeContainer{id: "leftover-2", function: "fn", entrypoint: "other.js", image: "img-old", port: 3000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("node24") // no services
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.countForFunction("fn"); got != 0 {
@@ -640,7 +658,7 @@ func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
 
 	// An unsupported runtime makes ServiceEntry fail for any entrypoint.
 	tmpl := serviceTemplate("rust", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, routing.TraefikConfig{}, noLog())
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable entrypoint (unsupported runtime)")
 	}
@@ -657,7 +675,7 @@ func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
 func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "app/service.js"); got != 1 {
@@ -682,7 +700,7 @@ func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.py", Port: 8000, Replicas: 1})
-	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog()); err != nil {
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := f.runningCount("fn", "app/main.py"); got != 1 {
@@ -709,7 +727,7 @@ func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
 	f.ctrs["stale-1"] = &fakeContainer{id: "stale-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
-	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, noLog())
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-new", nil, nil, routing.TraefikConfig{}, noLog())
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable python entrypoint")
 	}
@@ -735,7 +753,7 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
-	changed, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, noLog())
+	changed, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -771,7 +789,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelDebug)
-	c := NewServiceReconciler(f, nil, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
 
 	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
 	c.Apply(context.Background(), "fn", tmpl, "img-1", nil) // idempotent second pass
@@ -795,7 +813,7 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
-	c := NewServiceReconciler(f, nil, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
 	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
 
 	out := capture.String()
@@ -819,7 +837,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
-	c := NewServiceReconciler(f, nil, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
 	c.Apply(context.Background(), "fn", tmpl, "img-new", nil)
 
 	out := capture.String()
@@ -859,7 +877,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 	tmpl := serviceTemplate("node24")
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
-	c := NewServiceReconciler(f, nil, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
 	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
 
 	out := capture.String()
@@ -877,4 +895,270 @@ func newCaptureLogger(level slog.Level) (*slog.Logger, *captureLogger) {
 	c := &captureLogger{}
 	h := slog.NewTextHandler(c, &slog.HandlerOptions{Level: level})
 	return slog.New(h), c
+}
+
+// Traefik-label helpers used by the routing tests below.
+const (
+	routingEnableKey     = "traefik.enable"
+	routingNetworkKey    = "traefik.docker.network"
+	routingRouterPrefix  = "traefik.http.routers."
+	routingServicePrefix = "traefik.http.services."
+)
+
+// lastStartedFor returns the most recently started fakeContainer for fn/entry.
+func (f *fakeDocker) lastStartedFor(fn, entrypoint string) *fakeContainer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var found *fakeContainer
+	for _, c := range f.ctrs {
+		if c.function == fn && c.entrypoint == entrypoint {
+			found = c
+		}
+	}
+	return found
+}
+
+// hasTraefikKey reports whether the label map carries any traefik.* key.
+func hasTraefikKey(labels map[string]string) bool {
+	for k := range labels {
+		if strings.HasPrefix(k, "traefik.") {
+			return true
+		}
+	}
+	return false
+}
+
+// An unrouted service with a zero TraefikConfig reconciles normally: no
+// NetworkExists lookup, no traefik.* labels on the started container.
+func TestReconcileUnroutedNoRoutingActivity(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(f.networkLookups) != 0 {
+		t.Fatalf("NetworkExists called %d times for an unrouted service, want 0", len(f.networkLookups))
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if hasTraefikKey(c.labels) {
+		t.Fatalf("unrouted container labels contain traefik keys: %v", c.labels)
+	}
+	if c.network != "" {
+		t.Fatalf("unrouted container network = %q, want \"\"", c.network)
+	}
+}
+
+// A routed service with an empty TraefikConfig fails validation and performs
+// no container action: no stops, no starts, existing containers left alone.
+func TestReconcileRoutedMissingTraefikConfig(t *testing.T) {
+	f := newFakeDocker()
+	f.mu.Lock()
+	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", function: "fn", entrypoint: "service.js", image: "img-1", port: 80, replica: 0, state: container.StateRunning}
+	f.mu.Unlock()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "service.test"})
+
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{}, noLog())
+	if err == nil {
+		t.Fatal("expected a routing-validation error")
+	}
+	if !strings.Contains(err.Error(), `service "service.js": TRAEFIK_NETWORK is required when Traefik routing is configured`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(f.networkLookups) != 0 {
+		t.Fatalf("NetworkExists called, want 0 (validate fails first)")
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("stops = %v, want none (existing containers left alone)", f.stops)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1 (nothing replaced)", got)
+	}
+}
+
+// A routed service whose configured network does not exist is refused; Relay
+// does NOT create the network (zero StartService calls).
+func TestReconcileRoutedMissingNetwork(t *testing.T) {
+	f := newFakeDocker()
+	f.missingNetworks["proxy"] = true
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "service.test"})
+
+	_, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog())
+	if err == nil {
+		t.Fatal("expected a missing-network error")
+	}
+	if !strings.Contains(err.Error(), `service "service.js": Traefik network "proxy" does not exist`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
+		t.Fatalf("networkLookups = %v, want a single [proxy] lookup", f.networkLookups)
+	}
+	if len(f.ctrs) != 0 {
+		t.Fatalf("StartService was called for a missing routing network; want none, ctrs = %v", f.ctrs)
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("stops = %v, want none", f.stops)
+	}
+}
+
+// A routed service happy path: labels and network reach the started container.
+func TestReconcileRoutedHappyPath(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	if c.labels[routingEnableKey] != "true" {
+		t.Fatalf("traefik.enable = %q, want true", c.labels[routingEnableKey])
+	}
+	if c.labels[routingNetworkKey] != "proxy" {
+		t.Fatalf("traefik.docker.network = %q, want proxy", c.labels[routingNetworkKey])
+	}
+	id := "relay-fn-service-js" // relay-<fn>-<entrypoint>
+	wantRule := "Host(`service.test`)"
+	if c.labels[routingRouterPrefix+id+".rule"] != wantRule {
+		t.Fatalf("router rule = %q, want %q", c.labels[routingRouterPrefix+id+".rule"], wantRule)
+	}
+	if _, ok := c.labels[routingServicePrefix+id+".loadbalancer.server.port"]; !ok {
+		t.Fatalf("loadbalancer port label missing in %v", c.labels)
+	}
+	if c.network != "proxy" {
+		t.Fatalf("started network = %q, want proxy", c.network)
+	}
+	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
+		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
+	}
+}
+
+// A host change (a.test -> b.test) replaces the existing routed container: the
+// old one is stopped and the replacement carries the new rule.
+func TestReconcileHostChangeReplaces(t *testing.T) {
+	f := newFakeDocker()
+	start := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", start, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile a.test: %v", err)
+	}
+
+	changed := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "b.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", changed, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile b.test: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want one replaced container", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	id := "relay-fn-service-js"
+	if c.labels[routingRouterPrefix+id+".rule"] != "Host(`b.test`)" {
+		t.Fatalf("replacement rule = %q, want Host(`b.test`)", c.labels[routingRouterPrefix+id+".rule"])
+	}
+}
+
+// A TRAEFIK_NETWORK change also replaces the routed container.
+func TestReconcileNetworkChangeReplaces(t *testing.T) {
+	f := newFakeDocker()
+	start := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", start, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile proxy: %v", err)
+	}
+	if _, err := Reconcile(context.Background(), f, "fn", start, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy2"}, noLog()); err != nil {
+		t.Fatalf("reconcile proxy2: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want one replaced container", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil || c.network != "proxy2" || c.labels[routingNetworkKey] != "proxy2" {
+		t.Fatalf("replacement container = %+v, want network/labels proxy2", c)
+	}
+}
+
+// A HOST removed from a routed template makes the previously routed container
+// stale: it is replaced with an unlabeled (no traefik.*) container and it no
+// longer joins the routing network.
+func TestReconcileHostRemovedReplacesUnrouted(t *testing.T) {
+	f := newFakeDocker()
+	routed := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", routed, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile routed: %v", err)
+	}
+
+	unrouted := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1})
+	if _, err := Reconcile(context.Background(), f, "fn", unrouted, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile unrouted: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the routed container replaced", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	if hasTraefikKey(c.labels) {
+		t.Fatalf("replacement labels contain traefik keys: %v", c.labels)
+	}
+	if c.network != "" {
+		t.Fatalf("replacement network = %q, want \"\"", c.network)
+	}
+}
+
+// A converged ROUTED state (running container with matching labels) is a no-op
+// pass: changed == false, no stops, no starts.
+func TestReconcileRoutedConvergedNoOp(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
+	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stopsSoFar := len(f.stops)
+	changed, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, routing.TraefikConfig{Network: "proxy"}, noLog())
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if changed {
+		t.Fatal("converged routed state must be a no-op (changed = false)")
+	}
+	if len(f.stops) != stopsSoFar {
+		t.Fatalf("stops grew from %d to %d on a converged pass", stopsSoFar, len(f.stops))
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1 (untouched)", got)
+	}
+}
+
+// routingLabelsMatch unit tests pin the nil-vs-nil and extra-traefik-key rules.
+func TestRoutingLabelsMatch(t *testing.T) {
+	if !routingLabelsMatch(nil, nil) {
+		t.Error("nil-vs-nil must match (unrouted, unlabeled)")
+	}
+	desired := map[string]string{"traefik.enable": "true", "traefik.docker.network": "proxy"}
+	if !routingLabelsMatch(desired, map[string]string{
+		"relay.type":             "service",
+		"relay.function":         "fn",
+		"traefik.enable":         "true",
+		"traefik.docker.network": "proxy",
+	}) {
+		t.Error("actual with all desired keys plus non-traefik extras must match")
+	}
+	if routingLabelsMatch(desired, map[string]string{"traefik.enable": "false"}) {
+		t.Error("wrong desired value must not match")
+	}
+	if routingLabelsMatch(nil, map[string]string{"traefik.enable": "true"}) {
+		t.Error("a container with traefik labels must never match an unrouted service")
+	}
+	if routingLabelsMatch(desired, map[string]string{"traefik.enable": "true", "traefik.docker.network": "proxy", "traefik.http.routers.old.rule": "Host(`old.test`)"}) {
+		t.Error("a stale extra traefik key must not match")
+	}
+	// The desired nil actual case: routed service, container without the labels.
+	if routingLabelsMatch(map[string]string{"traefik.enable": "true"}, nil) {
+		t.Error("routed desired vs unlabeled container must not match")
+	}
 }

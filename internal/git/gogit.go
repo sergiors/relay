@@ -73,15 +73,15 @@ func (g *goGitRepo) fetch(ctx context.Context, url string, auth gitssh.AuthMetho
 //
 // Resolution order:
 //
-	//  1. Exact/abbreviated hash: if ref looks like a commit SHA (4-64 hex chars),
-	//     resolve it directly via go-git's hash-prefix resolution and return
-	//     regardless of remote state. A 40-hex ref is a full SHA and must resolve to
-	//     itself even if a branch happens to share its spelling; an abbreviated
-	//     prefix resolves through the same hash-prefix lookup. The classification is
-	//     the exported IsHashLike; it is a heuristic gate, so a full 40-hex SHA
-	//     resolves to itself, an abbreviated prefix resolves through hash-prefix
-	//     resolution, and a value that only LOOKS hex but matches no object falls
-	//     through to the ref resolution chain below.
+//  1. Exact/abbreviated hash: if ref looks like a commit SHA (4-64 hex chars),
+//     resolve it directly via go-git's hash-prefix resolution and return
+//     regardless of remote state. A 40-hex ref is a full SHA and must resolve to
+//     itself even if a branch happens to share its spelling; an abbreviated
+//     prefix resolves through the same hash-prefix lookup. The classification is
+//     the exported IsHashLike; it is a heuristic gate, so a full 40-hex SHA
+//     resolves to itself, an abbreviated prefix resolves through hash-prefix
+//     resolution, and a value that only LOOKS hex but matches no object falls
+//     through to the ref resolution chain below.
 //  2. Fully-qualified ref: a refs/... prefixed value (branch, tag, remote
 //     tracking) resolves directly, never against origin/.
 //  3. Bare branch name (the default case, e.g. main): resolve

@@ -143,8 +143,14 @@ type Schedule struct {
 // Replicas are always effective (non-zero) after ParseTemplate.
 type Service struct {
 	Entrypoint string
-	Port       int
-	Replicas   int
+	// Host is the optional hostname (e.g. "api.example.com") this service is
+	// exposed through the routing layer (Traefik, at the wiring level); empty
+	// means an internal unrouted service with no routing labels. It is generic
+	// template config (a plain hostname), never a Traefik-specific term. It
+	// must be a valid hostname and is validated at parse time.
+	Host     string
+	Port     int
+	Replicas int
 }
 
 // Rule pairs a handler (module.function) with a matching pattern and a resolved
@@ -400,6 +406,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		} `yaml:"schedules"`
 		Services []struct {
 			Entrypoint string `yaml:"entrypoint"`
+			Host       string `yaml:"host"`
 			// Port and Replicas are decoded as `any` so a non-integer value
 			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
 			// and rejected with a clear message (see resolveServicePort /
@@ -548,7 +555,10 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err != nil {
 			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
 		}
-		t.Services = append(t.Services, Service{Entrypoint: s.Entrypoint, Port: port, Replicas: replicas})
+		if err := validateServiceHost(s.Host); err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+		}
+		t.Services = append(t.Services, Service{Entrypoint: s.Entrypoint, Host: s.Host, Port: port, Replicas: replicas})
 	}
 	return t, nil
 }
@@ -768,6 +778,32 @@ func resolveServiceReplicas(raw any) (int, error) {
 		return 0, fmt.Errorf("replicas %d must be a positive integer", n)
 	}
 	return n, nil
+}
+
+// hostnamePattern is an RFC-1123-style hostname: case-insensitive alphanumeric
+// labels separated by dots, each label 1-63 chars and not hyphen-bounded.
+// Validation is additionally gated on the total length (<= 253) and early
+// whitespace rejection below.
+var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
+
+// validateServiceHost validates the optional service `host`. Empty is valid
+// (an internal unrouted service); anything else must be a valid hostname,
+// because the value is handed to the routing layer verbatim, and a malformed
+// host would silently never match any request.
+func validateServiceHost(host string) error {
+	if host == "" {
+		return nil
+	}
+	if len(host) > 253 {
+		return fmt.Errorf("host %q exceeds the 253-character hostname limit", host)
+	}
+	if strings.ContainsAny(host, " \t\r\n") {
+		return fmt.Errorf("host %q contains whitespace", host)
+	}
+	if !hostnamePattern.MatchString(host) {
+		return fmt.Errorf("host %q is not a valid hostname", host)
+	}
+	return nil
 }
 
 // validateHandler requires the form module.function (splitting at the last dot)
