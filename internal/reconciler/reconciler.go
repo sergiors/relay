@@ -391,7 +391,11 @@ func (r *Reconciler) reconcileAll() {
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(r.root)
 	if err != nil {
-		r.log.Warn(fmt.Sprintf("Reconciler: read root %q: %v", r.root, err))
+		r.log.Warn(
+			"Reconciler: read root",
+			"root", r.root,
+			"error", err,
+		)
 		return
 	}
 	for _, e := range entries {
@@ -423,7 +427,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	} else if err != nil {
 		// Unexpected stat error (permissions, I/O): don't drop the function on a
 		// flaky read, but surface it so staleness isn't silently ignored.
-		r.log.Warn(fmt.Sprintf("Function %q stat error: %v; retaining previous version", name, err))
+		r.log.Warn(
+			"Function: stat error; retaining previous version",
+			"function", name,
+			"error", err,
+		)
 		return
 	}
 
@@ -434,13 +442,21 @@ func (r *Reconciler) reconcileFunction(name string) {
 			// more events rather than dropping a previously-active function.
 			return
 		}
-		r.log.Warn(fmt.Sprintf("Function %q template invalid; retaining previous version: %v", name, err))
+		r.log.Warn(
+			"Function: template invalid; retaining previous version",
+			"function", name,
+			"error", err,
+		)
 		return
 	}
 
 	fp, err := function.Fingerprint(dir)
 	if err != nil {
-		r.log.Warn(fmt.Sprintf("Function %q fingerprint error; retaining previous version: %v", name, err))
+		r.log.Warn(
+			"Function: fingerprint error; retaining previous version",
+			"function", name,
+			"error", err,
+		)
 		return
 	}
 
@@ -457,7 +473,10 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// RecordReconcileSuccess/Failure record the last MEANINGFUL operation and
 		// its timestamp; a periodic no-op must not hide a recent success or
 		// failure. It is surfaced in debug logging only.
-		r.log.Debug(fmt.Sprintf("Function %q: unchanged; reconcile skipped", name))
+		r.log.Debug(
+			"Function: unchanged; reconcile skipped",
+			"function", name,
+		)
 		// A skip path is NOT a full no-op when the function declares services:
 		// without converging here, a crashed service replica would only be
 		// repaired on the next content change. Reconcile is idempotent — when
@@ -475,14 +494,18 @@ func (r *Reconciler) reconcileFunction(name string) {
 		return
 	}
 
-	r.log.Debug(fmt.Sprintf("Function %q changed; rebuilding", name))
+	r.log.Debug(
+		"Function: changed; rebuilding",
+		"function", name,
+	)
 
 	start := time.Now()
 	built, err := r.builder.Prepare(r.rctx(), fn)
 	if err != nil {
-		r.log.Error("Function %q reload failed (retaining previous version): %v",
-			name, err,
+		r.log.Error(
+			"Function: reload failed; retaining previous version",
 			"function", name,
+			"error", err,
 			"duration", time.Since(start),
 			"outcome", "failed",
 		)
@@ -584,7 +607,10 @@ func (r *Reconciler) remove(name string) {
 	if r.removeFunction != nil {
 		r.removeFunction(name)
 	}
-	r.log.Info(fmt.Sprintf("Function %q removed", name))
+	r.log.Info(
+		"Function: removed",
+		"function", name,
+	)
 }
 
 // isAvailable reports whether a prepared function has a usable image.

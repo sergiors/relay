@@ -1538,6 +1538,13 @@ func isClassicBuilderIntermediate(cmd []string) bool {
 	return false
 }
 
+// isClassicBuilderIntermediateCmd is isClassicBuilderIntermediate for the
+// flat command string a ContainerList Summary carries (Summary has no Config;
+// the daemon joins the argv with spaces). Same detection, one argument.
+func isClassicBuilderIntermediateCmd(command string) bool {
+	return strings.Contains(command, "#(nop)") || strings.Contains(command, "/bin/sh -c")
+}
+
 // TestIntegrationRebuildLeavesNoIntermediateContainers verifies that rebuilding
 // a function (v1 -> v2 -> v3) does not leak classic-builder intermediate
 // containers. It snapshots the daemon's container set before each build and
@@ -1580,18 +1587,26 @@ events:
 	for _, ver := range versions {
 		// Write this version's distinct source before building it.
 		writeFile(t, dir, "index.js", "export function hi(e){ console.log('"+ver+"'); }\n")
-		// Snapshot the container set BEFORE this build, and count the non-relay
-		// containers present so we can assert no growth.
+		// Snapshot the container set BEFORE this build, and count the
+		// classic-intermediate-shaped non-relay containers so we can assert no
+		// growth. The count is scoped to the intermediate SHAPE (not all
+		// non-relay containers) because the daemon is global: unrelated
+		// transient containers (another package's concurrent tests under
+		// `go test ./...`, the daemon's own async AutoRemove of an earlier
+		// test's container, buildkit helpers) can appear in the build window
+		// and must never fail this assertion — only a genuine intermediate
+		// leak should. The per-container shape check below is the primary
+		// assertion; this count is the redundant secondary signal.
 		preList, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 		if err != nil {
 			t.Fatalf("snapshot containers before %s: %v", ver, err)
 		}
 		before := make(map[string]bool, len(preList.Items))
-		nonRelayBefore := 0
+		interBefore := 0
 		for _, c := range preList.Items {
 			before[c.ID] = true
-			if _, ok := c.Labels[labelFunction]; !ok {
-				nonRelayBefore++
+			if _, ok := c.Labels[labelFunction]; !ok && isClassicBuilderIntermediateCmd(c.Command) {
+				interBefore++
 			}
 		}
 
@@ -1613,10 +1628,12 @@ events:
 			t.Fatalf("list containers after %s: %v", ver, err)
 		}
 		var newNonRelay []string
-		nonRelayAfter := 0
+		interAfter := 0
 		for _, c := range after.Items {
 			if _, ok := c.Labels[labelFunction]; !ok {
-				nonRelayAfter++
+				if isClassicBuilderIntermediateCmd(c.Command) {
+					interAfter++
+				}
 			}
 			if before[c.ID] {
 				continue // pre-existing; not ours
@@ -1643,10 +1660,10 @@ events:
 			}
 		}
 
-		// The count of non-relay-labeled containers must not grow across the
-		// rebuild (no linear accumulation of intermediates).
-		if nonRelayAfter > nonRelayBefore {
-			t.Errorf("non-relay container count grew across %s build: before=%d after=%d (leaked intermediates)", ver, nonRelayBefore, nonRelayAfter)
+		// The count of classic-intermediate-shaped non-relay containers must not
+		// grow across the rebuild (no linear accumulation of intermediates).
+		if interAfter > interBefore {
+			t.Errorf("intermediate-shaped container count grew across %s build: before=%d after=%d (leaked intermediates)", ver, interBefore, interAfter)
 		}
 	}
 }
