@@ -82,7 +82,7 @@ func TestNoteOutcomeFailureMarksUnhealthyAndLogsOnce(t *testing.T) {
 	if c.Healthy() {
 		t.Fatalf("consumer should be unhealthy after failure")
 	}
-	if got := buf.String(); !strings.Contains(got, "Redis read failed: boom; retrying in 1s") {
+	if got := buf.String(); !strings.Contains(got, "Redis: read failed; retrying") {
 		t.Fatalf("expected one failure log, got: %q", got)
 	}
 }

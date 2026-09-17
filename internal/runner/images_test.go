@@ -527,10 +527,10 @@ func TestDependencyGCFailureDoesNotAffectRemoval(t *testing.T) {
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 
 	// GC was attempted and failed: the failure is logged as a Warn ("Dependency
-	// image cleanup: ..."), and the removal outcome is unchanged (the image was
+	// image cleanup failed"), and the removal outcome is unchanged (the image was
 	// removed).
 	waitFor(t, func() bool { return exec.gcCallCount() == 1 })
-	if !strings.Contains(buf.String(), "Dependency image cleanup:") {
+	if !strings.Contains(buf.String(), "Dependency image cleanup failed") {
 		t.Fatalf("expected a Warn logging the dependency-GC failure, got:\n%s", buf.String())
 	}
 	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {

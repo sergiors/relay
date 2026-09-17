@@ -78,7 +78,7 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 			if firstErr == nil {
 				firstErr = err
 			}
-			m.log.Debug(fmt.Sprintf("Dependency image still referenced; keeping %s: %v", dep, err))
+			m.log.Debug("Dependency image still referenced; keeping", "dep_image", dep, "error", err)
 			continue
 		}
 		removed++

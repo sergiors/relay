@@ -449,7 +449,7 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	defer cancel()
 	tags, err := cleaner.FunctionImageTags(ctx, name)
 	if err != nil {
-		r.log.Warn(fmt.Sprintf("Image cleanup: list function %q versions: %v", name, err))
+		r.log.Warn("Image cleanup: list function versions failed", "function", name, "error", err)
 		return
 	}
 	for _, tag := range tags {
@@ -532,7 +532,7 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 				r.skipAndRetryImageCleanup(image, delays, "relay-owned container references it", attempt)
 				return
 			}
-			r.log.Warn(fmt.Sprintf("Image cleanup: remove retired %s: %v", image, err))
+			r.log.Warn("Image cleanup: remove retired failed", "image", image, "error", err)
 			return
 		}
 
@@ -548,7 +548,7 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 		// reconciler pump is serial with this retire hook, so this cannot race a
 		// build that FROM the dependency.
 		if _, err := cleaner.CleanupUnusedDependencies(ctx); err != nil {
-			r.log.Warn(fmt.Sprintf("Dependency image cleanup: %v", err))
+			r.log.Warn("Dependency image cleanup failed", "error", err)
 		}
 	}()
 }
@@ -1276,20 +1276,20 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	pf := r.reg.GetByName(fnName)
 	if pf == nil {
 		if hasState {
-			r.log.Warn(fmt.Sprintf("Schedule: occurrence obsolete; function %q removed; acknowledging", fnName),
+			r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
 				"function", fnName,
 				"handler", handler,
 			)
 			return fmt.Errorf("%w: schedule function %q handler %q no longer in configuration", stream.ErrInvocationObsolete, fnName, handler)
 		}
-		r.log.Warn(fmt.Sprintf("Schedule: function %q is not available", fnName))
+		r.log.Warn("Schedule: function is not available", "function", fnName)
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 	if pf.Prepared() == nil {
 		// The function exists but its image could not be built yet: temporarily
 		// unavailable, so the occurrence is retryable (not obsolete — the function
 		// is still configured).
-		r.log.Warn(fmt.Sprintf("Schedule: function %q is temporarily unavailable", fnName))
+		r.log.Warn("Schedule: function is temporarily unavailable", "function", fnName)
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 
@@ -1314,7 +1314,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 		}
 	}
 	if hasState && !found {
-		r.log.Warn(fmt.Sprintf("Schedule: occurrence obsolete; schedule handler %q no longer in template; acknowledging", handler),
+		r.log.Warn("Schedule: occurrence obsolete; schedule handler no longer in template; acknowledging",
 			"function", fnName,
 			"handler", handler,
 		)
@@ -1338,7 +1338,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	// accounting); without state it preserves the legacy plain error.
 	releaseSlots, _ := r.reserveSlots(ctx, fnName, pf.fn.Template.Concurrency)
 	if releaseSlots == nil {
-		r.log.Warn(fmt.Sprintf("Schedule: concurrency slot wait timed out for %q/%q", fnName, handler))
+		r.log.Warn("Schedule: concurrency slot wait timed out", "function", fnName, "handler", handler)
 		if hasState {
 			return stream.ErrInvocationNotEligible
 		}

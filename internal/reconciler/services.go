@@ -216,7 +216,7 @@ func Reconcile(
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
 			if log != nil {
-				log.Warn(fmt.Sprintf("Service: cannot start replicas: %v", err))
+				log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
 			}
 			continue
 		}
@@ -224,7 +224,7 @@ func Reconcile(
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
 			if log != nil {
-				log.Warn(fmt.Sprintf("Service: cannot start replicas: %v", err))
+				log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
 			}
 			continue
 		}
@@ -261,12 +261,12 @@ func RemoveAll(ctx context.Context, d Docker, fnName string, log *slog.Logger) {
 	n, err := d.RemoveFunctionServiceContainers(ctx, fnName)
 	if err != nil {
 		if log != nil {
-			log.Warn(fmt.Sprintf("Service: remove function %q containers: %v", fnName, err))
+			log.Warn("Service: remove function containers failed", "function", fnName, "error", err)
 		}
 		return
 	}
 	if log != nil && n > 0 {
-		log.Info(fmt.Sprintf("Service: removed %d container(s) for %s", n, fnName))
+		log.Info("Service: removed function containers", "function", fnName, "count", n)
 	}
 }
 
@@ -305,9 +305,10 @@ func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *func
 	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.log)
 	if err != nil {
 		if c.log != nil {
-			c.log.Warn(fmt.Sprintf("Service: reconciled with errors: %v", err),
+			c.log.Warn("Service: reconciled with errors",
 				"function", fnName,
 				"replicas", replicas,
+				"error", err,
 			)
 		}
 		return
@@ -351,7 +352,7 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[
 	containers, err := c.docker.ServiceContainerList(ctx)
 	if err != nil {
 		if c.log != nil {
-			c.log.Warn(fmt.Sprintf("Service: orphan sweep list: %v", err))
+			c.log.Warn("Service: orphan sweep list failed", "error", err)
 		}
 		return
 	}
@@ -366,7 +367,7 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[
 	}
 	if err := c.docker.StopServiceContainers(ctx, stale); err != nil {
 		if c.log != nil {
-			c.log.Warn(fmt.Sprintf("Service: orphan sweep stop: %v", err))
+			c.log.Warn("Service: orphan sweep stop failed", "count", len(stale), "error", err)
 		}
 		return
 	}

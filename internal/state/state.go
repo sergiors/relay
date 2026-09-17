@@ -436,7 +436,7 @@ func (c *State) RebuildFromFS(dir string) error {
 	for _, fn := range fns {
 		fp, ferr := function.Fingerprint(fn.Dir)
 		if ferr != nil {
-			c.log.Warn(fmt.Sprintf("State: fingerprint %q: %v", fn.Name, ferr))
+			c.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
 			fp = ""
 		}
 		prepared = append(prepared, fpFn{fn: fn, fp: fp})
@@ -475,7 +475,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 	// errors are logged and fall back to fp="" exactly as before.
 	fp, ferr := function.Fingerprint(fn.Dir)
 	if ferr != nil {
-		c.log.Warn(fmt.Sprintf("State: fingerprint %q: %v", fn.Name, ferr))
+		c.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
 		fp = ""
 	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -492,7 +492,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		return replaceServices(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record discovered %q: %v", fn.Name, err))
+		c.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
 	}
 }
 
@@ -520,7 +520,7 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 		return replaceServices(tx, name, fn.Template)
 	})
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record success %q: %v", name, err))
+		c.log.Warn("State: record success failed", "function", name, "error", err)
 	}
 }
 
@@ -543,7 +543,7 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 		return err
 	})
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record failure %q: %v", name, err))
+		c.log.Warn("State: record failure failed", "function", name, "error", err)
 	}
 }
 
@@ -556,7 +556,7 @@ func (c *State) RecordRemoved(name string) {
 		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record removed %q: %v", name, err))
+		c.log.Warn("State: record removed failed", "function", name, "error", err)
 	}
 }
 
@@ -579,14 +579,14 @@ func (c *State) PruneRemoved(dir string) {
 	// fully consuming the query first keeps the read and write paths independent.
 	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: prune removed: list functions: %v", err))
+		c.log.Warn("State: prune removed: list functions failed", "error", err)
 		return
 	}
 	var names []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Warn(fmt.Sprintf("State: prune removed: scan name: %v", err))
+			c.log.Warn("State: prune removed: scan name failed", "error", err)
 			_ = rows.Close()
 			return
 		}
@@ -601,10 +601,10 @@ func (c *State) PruneRemoved(dir string) {
 			if rerr := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
-				c.log.Warn(fmt.Sprintf("State: prune removed %q: %v", name, rerr))
+				c.log.Warn("State: prune removed failed", "function", name, "error", rerr)
 				continue
 			}
-			c.log.Info(fmt.Sprintf("State: function %q removed (pruned at startup)", name))
+			c.log.Info("State: function pruned at startup", "function", name)
 		}
 		// Any other stat error (permissions/I/O) is skipped: only a genuine
 		// os.IsNotExist means the function was removed from the filesystem.
@@ -645,7 +645,7 @@ func (c *State) ListFunctions() []Row {
 		 GROUP BY f.name
 		 ORDER BY f.name`)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: list functions: %v", err))
+		c.log.Warn("State: list functions failed", "error", err)
 		return nil
 	}
 	defer rows.Close()
@@ -662,7 +662,7 @@ func (c *State) ListFunctions() []Row {
 			&r.UpdatedAt,
 			&r.HandlerCount,
 		); err != nil {
-			c.log.Warn(fmt.Sprintf("State: scan list: %v", err))
+			c.log.Warn("State: scan list failed", "error", err)
 			return out
 		}
 		out = append(out, r)
@@ -683,7 +683,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		return Detail{}, false
 	}
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: get %q: %v", name, err))
+		c.log.Warn("State: get failed", "function", name, "error", err)
 		return Detail{}, false
 	}
 	// Decode the env/secret MAPPINGS (never values). A NULL or unparseable
@@ -698,14 +698,14 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	hrows, err := c.db.QueryContext(ctx,
 		`SELECT handler, timeout FROM handlers WHERE function_name = ? ORDER BY handler`, name)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: handlers %q: %v", name, err))
+		c.log.Warn("State: handlers read failed", "function", name, "error", err)
 		return d, true
 	}
 	defer hrows.Close()
 	for hrows.Next() {
 		var hn, ht string
 		if err := hrows.Scan(&hn, &ht); err != nil {
-			c.log.Warn(fmt.Sprintf("State: scan handler %q: %v", name, err))
+			c.log.Warn("State: scan handler failed", "function", name, "error", err)
 			continue
 		}
 		dur, derr := time.ParseDuration(ht)
@@ -718,14 +718,14 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	srows, err := c.db.QueryContext(ctx,
 		`SELECT handler, cron, timezone, timeout FROM schedules WHERE function_name = ? ORDER BY handler, cron`, name)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: schedules %q: %v", name, err))
+		c.log.Warn("State: schedules read failed", "function", name, "error", err)
 		return d, true
 	}
 	defer srows.Close()
 	for srows.Next() {
 		var sh, sc, stz, sto string
 		if err := srows.Scan(&sh, &sc, &stz, &sto); err != nil {
-			c.log.Warn(fmt.Sprintf("State: scan schedule %q: %v", name, err))
+			c.log.Warn("State: scan schedule failed", "function", name, "error", err)
 			continue
 		}
 		dur, derr := time.ParseDuration(sto)
@@ -738,7 +738,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	srows2, err := c.db.QueryContext(ctx,
 		`SELECT entrypoint, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, port`, name)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: services %q: %v", name, err))
+		c.log.Warn("State: services read failed", "function", name, "error", err)
 		return d, true
 	}
 	defer srows2.Close()
@@ -746,7 +746,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 		var se string
 		var sp, sr int
 		if err := srows2.Scan(&se, &sp, &sr); err != nil {
-			c.log.Warn(fmt.Sprintf("State: scan service %q: %v", name, err))
+			c.log.Warn("State: scan service failed", "function", name, "error", err)
 			continue
 		}
 		d.Services = append(d.Services, Service{Entrypoint: se, Port: sp, Replicas: sr})

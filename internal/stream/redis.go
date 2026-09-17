@@ -230,7 +230,7 @@ func (c *Consumer) Healthy() bool {
 func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 	if err != nil && !errors.Is(err, redis.Nil) {
 		if c.healthy.Swap(false) {
-			c.log.Warn(fmt.Sprintf("Redis read failed: %v; retrying in %s", err, delay))
+			c.log.Warn("Redis: read failed; retrying", "error", err, "delay", delay)
 		}
 		return
 	}
@@ -478,7 +478,7 @@ Drain:
 					// effectively unreachable in normal operation.
 					defer func() {
 						if pv := recover(); pv != nil {
-							c.log.Error(fmt.Sprintf("Message %q: PANIC outside processMessage: %v\n%s", m.ID, pv, debug.Stack()))
+							c.log.Error("Message: panic outside processMessage", "message_id", m.ID, "error", pv, "stack", string(debug.Stack()))
 						}
 					}()
 					defer c.buffer.release()
@@ -537,7 +537,7 @@ func (p *PendingGaugeSource) Refresh(ctx context.Context) {
 	// Count plus the oldest pending message ID in Lower.
 	pending, err := p.client.XPending(ctx, p.stream, p.group).Result()
 	if err != nil {
-		p.log.Debug(fmt.Sprintf("Metrics: xpending %q/%q: %v", p.stream, p.group, err))
+		p.log.Debug("Metrics: xpending failed", "stream", p.stream, "group", p.group, "error", err)
 		return
 	}
 	p.metrics.SetGauge("pending_entries", float64(pending.Count))
@@ -641,9 +641,9 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			// A pending entry whose message was deleted returns nil values; ack it
 			// only to clear the PEL — there is nothing to process.
 			if msg.Values == nil {
-				c.log.Debug(fmt.Sprintf("Message %q: deleted from stream; acking to clear PEL", msg.ID))
+				c.log.Debug("Message: deleted from stream; acking to clear PEL", "message_id", msg.ID)
 				if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-					c.log.Warn(fmt.Sprintf("Message %q: ack deleted entry: %v", msg.ID, err))
+					c.log.Warn("Message: ack deleted entry failed", "message_id", msg.ID, "error", err)
 				}
 				continue
 			}
@@ -660,13 +660,17 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
 				}).Result()
 				if err != nil || len(entries) == 0 {
-					c.log.Debug(fmt.Sprintf("Message %q: beyond reclaim window and pending lookup failed (%v); skipping this tick", msg.ID, err))
+					c.log.Debug("Message: beyond reclaim window and pending lookup failed; skipping this tick", "message_id", msg.ID, "error", err)
 					continue
 				}
 				pe = entries[0]
 			}
-			c.log.Debug(fmt.Sprintf("Reclaimed message %q for consumer %q (idle %s, delivery_attempt %d)",
-				msg.ID, c.consumer, pe.Idle, pe.RetryCount))
+			c.log.Debug("Reclaimed message",
+				"message_id", msg.ID,
+				"consumer", c.consumer,
+				"idle", pe.Idle,
+				"delivery_attempt", pe.RetryCount,
+			)
 			c.deliverClaimed(ctx, msg, pe.RetryCount, handler)
 		}
 		if len(msgs) == 0 || next == "0-0" {
@@ -703,7 +707,7 @@ func (c *Consumer) deliverClaimed(
 	if !c.buffer.tryAcquire() {
 		// Buffer full: leave the message pending; a later reclaim tick retries
 		// it. Never block the reclaim goroutine on the semaphore.
-		c.log.Debug(fmt.Sprintf("Message %q: buffer full; deferring reclaimed delivery", msg.ID))
+		c.log.Debug("Message: buffer full; deferring reclaimed delivery", "message_id", msg.ID)
 		return
 	}
 	// Release the slot when the message finishes (ACK/DLQ/pending).
@@ -749,18 +753,17 @@ func (c *Consumer) processMessage(
 	// a new failure class.
 	defer func() {
 		if pv := recover(); pv != nil {
-			c.log.Error(fmt.Sprintf("Message %q: PANIC in handler: %v\n%s", msg.ID, pv, debug.Stack()))
+			c.log.Error("Message: panic in handler", "message_id", msg.ID, "error", pv, "stack", string(debug.Stack()))
 		}
 	}()
 	event, err := classifyMessage(msg)
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on
 		// first encounter rather than consuming retry cycles.
-		c.log.Error("Message %q: non-retryable failure (%v); routing to DLQ",
-			msg.ID, err,
+		c.log.Error("Message: non-retryable failure; routing to DLQ",
 			"message_id", msg.ID,
 			"delivery_attempt", deliveryNum,
-			"reason", err,
+			"error", err,
 		)
 		c.routeToDLQ(ctx, msg, err, deliveryNum)
 		return
@@ -796,7 +799,7 @@ func (c *Consumer) processMessage(
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
 		if ctx.Err() != nil {
-			c.log.Debug(fmt.Sprintf("Message %q: handler canceled during shutdown; leaving pending", msg.ID))
+			c.log.Debug("Message: handler canceled during shutdown; leaving pending", "message_id", msg.ID)
 			return
 		}
 		// A protected invocation (running on another replica, or waiting out its
@@ -834,7 +837,7 @@ func (c *Consumer) processMessage(
 	}
 
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-		c.log.Warn(fmt.Sprintf("Message %q: ack: %v", msg.ID, err))
+		c.log.Warn("Message: ack failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
@@ -845,7 +848,7 @@ func (c *Consumer) processMessage(
 	// completed handlers. A clear failure is logged only; the TTL is the
 	// fallback cleanup.
 	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-		c.log.Warn(fmt.Sprintf("Message %q: clear invocation state: %v", msg.ID, err))
+		c.log.Warn("Message: clear invocation state failed", "message_id", msg.ID, "error", err)
 	}
 }
 
@@ -887,7 +890,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	if err != nil {
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {
-			c.log.Debug(fmt.Sprintf("Schedule: message %q canceled during shutdown; leaving pending", msgID))
+			c.log.Debug("Schedule: message canceled during shutdown; leaving pending", "message_id", msgID)
 			return
 		}
 		// A protected invocation (running on another replica, or waiting out its
@@ -916,7 +919,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			)
 			ackErr := c.client.XAck(ctx, c.stream, c.group, msgID).Err()
 			if ackErr != nil {
-				c.log.Warn(fmt.Sprintf("Schedule: message %q: ack: %v", msgID, ackErr))
+				c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", ackErr)
 				c.noteOutcome(ackErr, 0)
 				return
 			}
@@ -924,7 +927,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// like the success tail. A clear failure is logged only; the TTL is
 			// the fallback cleanup.
 			if cerr := c.invStateStore.clear(ctx, c.stream, c.group, msgID); cerr != nil {
-				c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, cerr))
+				c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", cerr)
 			}
 			return
 		}
@@ -955,14 +958,14 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	}
 
 	if err := c.client.XAck(ctx, c.stream, c.group, msgID).Err(); err != nil {
-		c.log.Warn(fmt.Sprintf("Schedule: message %q: ack: %v", msgID, err))
+		c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
 	// Eagerly clear the invocation-state hash after a successful ACK, exactly
 	// like processMessage. A clear failure is logged only; the TTL is the fallback.
 	if err := c.invStateStore.clear(ctx, c.stream, c.group, msgID); err != nil {
-		c.log.Warn(fmt.Sprintf("Schedule: message %q: clear invocation state: %v", msgID, err))
+		c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", err)
 	}
 }
 
@@ -999,7 +1002,7 @@ func (c *Consumer) routeToDLQ(
 		"reason", reason,
 	)
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-		c.log.Warn(fmt.Sprintf("Message %q: ack after DLQ: %v", msg.ID, err))
+		c.log.Warn("Message: ack after DLQ failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
@@ -1009,7 +1012,7 @@ func (c *Consumer) routeToDLQ(
 	// stays in the PEL and may be redelivered, so its state must remain. A clear
 	// failure is logged only; the TTL is the fallback cleanup.
 	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-		c.log.Warn(fmt.Sprintf("Message %q: clear invocation state after DLQ: %v", msg.ID, err))
+		c.log.Warn("Message: clear invocation state after DLQ failed", "message_id", msg.ID, "error", err)
 	}
 }
 

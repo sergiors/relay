@@ -77,7 +77,7 @@ func (l *Loader) Load() ([]Function, error) {
 		// better than crashing on it. A stray non-function directory then simply
 		// logs and is ignored.
 		if err := ValidName(name); err != nil {
-			l.log.Warn(fmt.Sprintf("Function %q: invalid name: %v; skipping", name, err))
+			l.log.Warn("Function: invalid name; skipping", "function", name, "error", err)
 			continue
 		}
 
@@ -89,13 +89,13 @@ func (l *Loader) Load() ([]Function, error) {
 				// No template.yaml -> silently skip (unlike template errors, which log).
 				continue
 			}
-			l.log.Warn(fmt.Sprintf("Function %q: read template: %v", name, err))
+			l.log.Warn("Function: read template failed", "function", name, "error", err)
 			continue
 		}
 
 		tmpl, err := ParseTemplate(data)
 		if err != nil {
-			l.log.Warn(fmt.Sprintf("Function %q: invalid template: %v", name, err))
+			l.log.Warn("Function: invalid template", "function", name, "error", err)
 			continue
 		}
 

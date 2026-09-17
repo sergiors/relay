@@ -82,7 +82,7 @@ func Run(logger *slog.Logger) {
 	if err != nil {
 		// Fatal: Redis config is a hard startup requirement (this worker cannot
 		// consume without a valid DSN), so exit the process rather than return.
-		logger.Error(fmt.Sprintf("Redis config: %v", err))
+		logger.Error("Redis config invalid", "error", err)
 		os.Exit(1)
 	}
 	client := redis.NewClient(redisOpts)
@@ -101,7 +101,7 @@ func Run(logger *slog.Logger) {
 	// and the webhook.
 	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Secrets: %v", err))
+		logger.Error("Secrets: new local provider failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -120,23 +120,23 @@ func Run(logger *slog.Logger) {
 	if err != nil {
 		// Fatal: the worker cannot run without its function set, so exit the
 		// process rather than continue with nothing to serve.
-		logger.Error(fmt.Sprintf("Load functions: %v", err))
+		logger.Error("Load functions failed", "error", err)
 		os.Exit(1)
 	}
-	logger.Info(fmt.Sprintf("Loaded %d function(s) from %s", len(functions), function.Dir))
+	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
 
 	// The state database is a read-only local state view (see internal/state),
 	// NOT the source of truth and never drives matching or building. All state
 	// errors are non-fatal — Relay runs without the state DB if it is broken.
 	st, err := state.Open(state.DBPath)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("State: open (continuing without): %v", err))
+		logger.Warn("State: open failed; continuing without", "error", err)
 		st = nil
 	}
 	if st != nil {
 		defer st.Close()
 		if err := st.RebuildFromFS(function.Dir); err != nil {
-			logger.Warn(fmt.Sprintf("State: rebuild from fs (continuing): %v", err))
+			logger.Warn("State: rebuild from fs failed; continuing", "error", err)
 		}
 		// Prune state rows for functions no longer on disk BEFORE
 		// restorePersistedStats, so a pruned function's stats row is gone before
@@ -157,7 +157,7 @@ func Run(logger *slog.Logger) {
 	if err != nil {
 		// Fatal: the runtime manager owns container execution, which the worker
 		// cannot serve without, so exit the process on construction failure.
-		logger.Error(fmt.Sprintf("Runtime: %v", err))
+		logger.Error("Runtime: new manager failed", "error", err)
 		os.Exit(1)
 	}
 	defer manager.Close()
@@ -179,11 +179,9 @@ func Run(logger *slog.Logger) {
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
-		logger.Warn(fmt.Sprintf("Startup: orphan container sweep: %v", sweepErr))
+		logger.Warn("Startup: orphan container sweep failed", "error", sweepErr)
 	} else if n > 0 {
-		logger.Info(
-			fmt.Sprintf("Startup: removed %d orphan container(s) from a previous relay process", n),
-		)
+		logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
 	}
 
 	// Build every function's image. A function whose image cannot be built is
@@ -258,10 +256,10 @@ func Run(logger *slog.Logger) {
 		if err := metricsServer.Start(); err != nil {
 			// Fatal: a bind failure (taken metrics port) is a config error that
 			// should surface at startup, not retry invisibly.
-			logger.Error(fmt.Sprintf("Metrics server: %v", err))
+			logger.Error("Metrics server: start failed", "error", err)
 			os.Exit(1)
 		}
-		logger.Info(fmt.Sprintf("Metrics http server listening on %s", cfg.MetricsAddr))
+		logger.Info("Metrics http server listening", "addr", cfg.MetricsAddr)
 	}
 
 	// Start the webhook server (created above) right after metrics. It binds
@@ -270,10 +268,10 @@ func Run(logger *slog.Logger) {
 	// server means the webhook was disabled, so there is nothing to start.
 	if gitWebhookServer != nil {
 		if err := gitWebhookServer.Start(); err != nil {
-			logger.Error(fmt.Sprintf("Git webhook server: %v", err))
+			logger.Error("Git webhook server: start failed", "error", err)
 			os.Exit(1)
 		}
-		logger.Info(fmt.Sprintf("Webhook http server listening on %s", cfg.GitWebhookAddr))
+		logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
 	}
 
 	// Flush the registry into the state database on the fixed cadence. Gated on
@@ -298,7 +296,7 @@ func Run(logger *slog.Logger) {
 	if err := consumer.EnsureGroup(ctx); err != nil {
 		// Fatal: the consumer group is a hard prerequisite for consumption, so
 		// exit the process rather than retry a misconfiguration silently.
-		logger.Error(fmt.Sprintf("Ensure consumer group: %v", err))
+		logger.Error("Ensure consumer group failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -315,13 +313,11 @@ func Run(logger *slog.Logger) {
 	for _, fn := range functions {
 		sched.ReplaceFunction(fn.Name, fn.Template)
 	}
-	logger.Info(fmt.Sprintf("Scheduler: %d schedule job(s) registered", sched.JobCount()))
+	logger.Info("Scheduler: schedule jobs registered", "count", sched.JobCount())
 	logger.Info(
-		fmt.Sprintf(
-			"Concurrency limits: MAX_CONCURRENCY=%d MAX_BUFFERED_EVENTS=%d",
-			effectiveMaxConcurrency(cfg.MaxConcurrency),
-			effectiveMaxBuffered(cfg.MaxBufferedEvents),
-		),
+		"Concurrency limits",
+		"max_concurrency", effectiveMaxConcurrency(cfg.MaxConcurrency),
+		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
 	)
 
 	// Watch /functions and reconcile functions live: rebuild changed images,
@@ -382,7 +378,7 @@ func Run(logger *slog.Logger) {
 	for _, fn := range functions {
 		rec.Seed(fn)
 	}
-	logger.Info(fmt.Sprintf("Watching %s for changes", function.Dir))
+	logger.Info("Watching functions for changes", "root", function.Dir)
 
 	// Runs in its own goroutine and stops when ctx is cancelled.
 	go rec.Start(ctx)
@@ -392,13 +388,13 @@ func Run(logger *slog.Logger) {
 	// reconciler later converges schedule immediately.
 	sched.Start()
 
-	logger.Info(fmt.Sprintf("Consuming stream %q as group %q consumer %q",
-		cfg.RedisStream,
-		cfg.RedisGroup,
-		cfg.ConsumerName,
-	))
+	logger.Info("Consuming stream",
+		"stream", cfg.RedisStream,
+		"group", cfg.RedisGroup,
+		"consumer", cfg.ConsumerName,
+	)
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
-		logger.Error(fmt.Sprintf("Consume: %v", err))
+		logger.Error("Consume failed", "error", err)
 		// The consumer is the worker's raison d'être; a Consume error means the
 		// consumption loop has stopped, so exit the process rather than return
 		// with nothing running. (Shutdown via a cancelled ctx returns nil, so a
@@ -418,7 +414,7 @@ func Run(logger *slog.Logger) {
 	stopSD, cancelSD := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSD()
 	if err := sched.Stop(stopSD); err != nil {
-		logger.Warn(fmt.Sprintf("Scheduler: graceful shutdown: %v", err))
+		logger.Warn("Scheduler: graceful shutdown failed", "error", err)
 	}
 
 	// Final flush of the registry into SQLite before the deferred st.Close() runs.
@@ -434,7 +430,7 @@ func Run(logger *slog.Logger) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := metricsServer.Stop(stopCtx); err != nil {
-			logger.Warn(fmt.Sprintf("Metrics server: graceful shutdown: %v", err))
+			logger.Warn("Metrics server: graceful shutdown failed", "error", err)
 		}
 	}
 
@@ -446,7 +442,7 @@ func Run(logger *slog.Logger) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := gitWebhookServer.Stop(stopCtx); err != nil {
-			logger.Warn(fmt.Sprintf("Git webhook server: graceful shutdown: %v", err))
+			logger.Warn("Git webhook server: graceful shutdown failed", "error", err)
 		}
 	}
 
@@ -486,7 +482,7 @@ func prepareFunctions(
 	for _, fn := range functions {
 		p, err := manager.Prepare(context.Background(), fn)
 		if err != nil {
-			logger.Warn(fmt.Sprintf("Function %q: prepare: %v", fn.Name, err))
+			logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
 			if st != nil {
 				st.RecordReconcileFailure(fn.Name, err)
 			}
@@ -498,7 +494,7 @@ func prepareFunctions(
 			// between load and build; the state DB records the final state.
 			fp, fperr := function.Fingerprint(fn.Dir)
 			if fperr != nil {
-				logger.Warn(fmt.Sprintf("Function %q: fingerprint: %v", fn.Name, fperr))
+				logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", fperr)
 				fp = ""
 			}
 			st.RecordReconcileSuccess(fn.Name, p.Image, fp, time.Now(), fn)
@@ -506,7 +502,7 @@ func prepareFunctions(
 		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
 		preparedCount++
 	}
-	logger.Info(fmt.Sprintf("Prepared %d function(s)", preparedCount))
+	logger.Info("Prepared functions", "count", preparedCount)
 	return prepared
 }
 
@@ -545,7 +541,7 @@ func reconcileStartupServices(
 				svcCtrl.Remove(ctx, fn.Name)
 				cancel()
 			} else {
-				logger.Warn(fmt.Sprintf("Service: function %q unavailable; skipping service reconcile", fn.Name))
+				logger.Warn("Service: function unavailable; skipping service reconcile", "function", fn.Name)
 			}
 			continue
 		}
@@ -614,7 +610,7 @@ func sweepStartupImages(
 			}
 		}
 	} else {
-		logger.Warn(fmt.Sprintf("Service: keep-set list (continuing without): %v", err))
+		logger.Warn("Service: keep-set list failed; continuing without", "error", err)
 	}
 	// The state keep-set is only armed when the DB was available.
 	if st != nil {
@@ -624,7 +620,7 @@ func sweepStartupImages(
 			}
 		}
 		if _, err := manager.RemoveImagesExcept(context.Background(), keep); err != nil {
-			logger.Warn(fmt.Sprintf("Image cleanup: startup sweep: %v", err))
+			logger.Warn("Image cleanup: startup sweep failed", "error", err)
 		}
 	}
 }
@@ -638,7 +634,7 @@ func sweepStartupImages(
 // next natural lifecycle point; it never retries in a loop.
 func cleanupStartupDependencies(manager *runtime.Manager, logger *slog.Logger) {
 	if _, err := manager.CleanupUnusedDependencies(context.Background()); err != nil {
-		logger.Warn(fmt.Sprintf("Dependency image cleanup: %v", err))
+		logger.Warn("Dependency image cleanup failed", "error", err)
 	}
 }
 

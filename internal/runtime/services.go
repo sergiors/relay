@@ -221,8 +221,12 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				if firstErr == nil {
 					firstErr = err
 				}
-				m.log.Warn(fmt.Sprintf("Service: stop container %s (%s %s): %v",
-					c.ID, c.Function, c.Entrypoint, err))
+				m.log.Warn("Service: stop container failed",
+					"container", c.ID,
+					"function", c.Function,
+					"entrypoint", c.Entrypoint,
+					"error", err,
+				)
 				continue
 			}
 		}
@@ -230,8 +234,12 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 			if firstErr == nil {
 				firstErr = err
 			}
-			m.log.Warn(fmt.Sprintf("Service: remove container %s (%s %s): %v",
-				c.ID, c.Function, c.Entrypoint, err))
+			m.log.Warn("Service: remove container failed",
+				"container", c.ID,
+				"function", c.Function,
+				"entrypoint", c.Entrypoint,
+				"error", err,
+			)
 		}
 	}
 	return firstErr
@@ -295,13 +303,13 @@ func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, 
 				// ServiceContainerList above and the container-reference guard both
 				// recognize this as the normal transitional state. Defer to a later
 				// pass: log at debug, not counted, not surfaced as a failure.
-				m.log.Debug(fmt.Sprintf("Image cleanup: image still in use; skipping %s", tag))
+				m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
 				continue
 			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			m.log.Warn(fmt.Sprintf("Service: retire image %s: %v", tag, err))
+			m.log.Warn("Service: retire image failed", "image", tag, "error", err)
 			continue
 		}
 		removed++

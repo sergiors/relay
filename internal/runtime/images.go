@@ -227,13 +227,13 @@ func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) 
 					// owning function's reconcile replaces the container first and
 					// only then retires the image. Log at debug and leave it for a
 					// later pass.
-					m.log.Debug(fmt.Sprintf("Image cleanup: image still in use; skipping %s", tag))
+					m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
 					continue
 				}
 				if firstErr == nil {
 					firstErr = err
 				}
-				m.log.Warn(fmt.Sprintf("Image cleanup: skip %s: %v", tag, err))
+				m.log.Warn("Image cleanup: skip failed", "image", tag, "error", err)
 				continue
 			}
 			removed++

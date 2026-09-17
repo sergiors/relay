@@ -842,7 +842,7 @@ func TestIntegrationConsumeSurvivesOutage(t *testing.T) {
 	if c.Healthy() {
 		t.Fatalf("consumer should be unhealthy during outage")
 	}
-	if !strings.Contains(buf.String(), "Redis read failed") {
+	if !strings.Contains(buf.String(), "Redis: read failed; retrying") {
 		t.Fatalf("expected backoff failure log, got: %q", buf.String())
 	}
 
@@ -946,7 +946,7 @@ func TestIntegrationReconnectAndResume(t *testing.T) {
 		t.Fatalf("stop redis: %v", err)
 	}
 	WaitFor(t, 8*time.Second, "consumer unhealthy during outage", func() bool { return !consumer.Healthy() })
-	if !strings.Contains(buf.String(), "Redis read failed") {
+	if !strings.Contains(buf.String(), "Redis: read failed; retrying") {
 		t.Fatalf("expected backoff log during outage, got: %q", buf.String())
 	}
 
@@ -1577,7 +1577,7 @@ func TestIntegrationPanicLeavesPendingAndRetries(t *testing.T) {
 	// The panic must have been logged and the message must NOT have been acked
 	// (still pending right after the panic log line appears).
 	WaitFor(t, 8*time.Second, "panic log line", func() bool {
-		return strings.Contains(buf.String(), "PANIC in handler")
+		return strings.Contains(buf.String(), "panic in handler")
 	})
 	if _, ok := pendingOf(cli, stream, group, id); !ok {
 		t.Fatalf("message was acked after the panicking attempt; want it left pending")

@@ -95,11 +95,11 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 			gocron.WithSingletonMode(gocron.LimitModeReschedule),
 		)
 		if err != nil {
-			s.log.Warn(fmt.Sprintf("Cron: register schedule %q for function %q: %v", sch.Handler, name, err))
+			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler, "error", err)
 			continue
 		}
 	}
-	s.log.Debug(fmt.Sprintf("Cron: registered %d schedule(s) for function %q", len(tmpl.Schedules), name))
+	s.log.Debug("Cron: registered schedules", "function", name, "count", len(tmpl.Schedules))
 }
 
 // RemoveFunction removes every schedule job belonging to name, so stale gocron
@@ -124,7 +124,7 @@ func (s *Scheduler) Start() {
 		return
 	}
 	s.g.Start()
-	s.log.Info(fmt.Sprintf("Cron scheduler started with %d schedule job(s)", len(s.g.Jobs())))
+	s.log.Info("Cron scheduler started", "count", len(s.g.Jobs()))
 }
 
 // JobCount returns the current number of registered schedule jobs. It is used

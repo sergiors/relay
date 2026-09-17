@@ -29,7 +29,7 @@ func killContainer(cli *client.Client, id string) {
 // when the daemon is already removing the container.
 func removeBackstop(cli *client.Client, log *slog.Logger, id string) {
 	if err := removeContainer(cli, id); err != nil {
-		log.Warn(fmt.Sprintf("docker run: remove container %s: %v", id, err))
+		log.Warn("docker run: remove container failed", "container", id, "error", err)
 	}
 }
 

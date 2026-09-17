@@ -3,7 +3,6 @@ package state
 import (
 	"context"
 	"database/sql"
-	"fmt"
 )
 
 // Stats is the current operational snapshot of Relay's runtime, persisted in the
@@ -61,7 +60,7 @@ func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
 		s.EventsProcessedTotal, s.HandlerSuccessTotal, s.HandlerFailureTotal,
 		s.RetryTotal, s.DLQTotal, s.PendingEntries, s.OldestPendingAgeSeconds, ts)
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: record stats: %v", err))
+		c.log.Warn("State: record stats failed", "error", err)
 	}
 }
 
@@ -126,7 +125,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 		return nil
 	})
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: flush stats snapshot: %v", err))
+		c.log.Warn("State: flush stats snapshot failed", "error", err)
 	}
 	return err
 }
@@ -147,7 +146,7 @@ func (c *State) Stats() (Stats, bool) {
 		return Stats{}, false
 	}
 	if err != nil {
-		c.log.Warn(fmt.Sprintf("State: read stats: %v", err))
+		c.log.Warn("State: read stats failed", "error", err)
 		return Stats{}, false
 	}
 	return s, true

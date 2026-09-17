@@ -3,7 +3,6 @@ package reconciler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -184,7 +183,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		r.log.Error(fmt.Sprintf("Reconciler: fsnotify: %v", err))
+		r.log.Error("Reconciler: fsnotify error", "error", err)
 		return
 	}
 	r.w = w
@@ -316,7 +315,7 @@ func (r *Reconciler) eventLoop() {
 			if !ok {
 				return
 			}
-			r.log.Warn(fmt.Sprintf("Reconciler: watch error: %v", err))
+			r.log.Warn("Reconciler: watch error", "error", err)
 		}
 	}
 }
