@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,6 +48,81 @@ type Registry struct {
 
 	counterVecs   map[string]*labeledCounterVec
 	histogramVecs map[string]*labeledHistogramVec
+
+	// funcTimestampsMu guards funcTimestamps, the per-function latest
+	// execution-history timestamps (see SetFunctionTimestamp for the semantics
+	// and the deliberate non-Prometheus representation).
+	funcTimestampsMu sync.RWMutex
+
+	// funcTimestamps maps a function name to its latest per-kind unix-seconds
+	// timestamps. It is the latest-known-value stage of the per-function stats
+	// pipeline: the runner overwrites entries as executions happen, and the
+	// worker's periodic SQLite snapshot (via FunctionStatsSnapshot) persists
+	// whatever it last read. Timestamps are RELAY-side state (when did this
+	// function's handler last run?), not scrape-time observations, so they are
+	// deliberately NOT Prometheus vecs — a gauge that flips forward on every
+	// execution would be misuse, and the worker must read a coherent
+	// latest-value struct rather than scrape four series. Removal paths
+	// (RemoveFunction / SweepFunctionMetrics) delete entries alongside the
+	// function's series so a removed function cannot linger here.
+	funcTimestamps map[string][functionTimestampCount]int64
+}
+
+// FunctionTimestampKind selects exactly one of the four per-function
+// execution-history timestamps (see SetFunctionTimestamp). The constants are
+// ordered to also serve as indexes into a function's timestamp array.
+type FunctionTimestampKind int
+
+const (
+	// FunctionTimestampExecution is the last handler-execution attempt: set
+	// when an invocation attempt actually begins (when TryStart claims the
+	// invocation on the event path, or when the schedule path begins
+	// executing). Retries are executions: every claimed attempt updates it.
+	FunctionTimestampExecution FunctionTimestampKind = iota
+	// FunctionTimestampSuccess is the last successful handler execution.
+	FunctionTimestampSuccess
+	// FunctionTimestampFailure is the last failed handler execution attempt
+	// (a failed attempt that will still retry counts here — it is not
+	// reserved for DLQ-routed failures).
+	FunctionTimestampFailure
+	// FunctionTimestampDLQ is the last invocation that exhausted its retries
+	// and was routed to the DLQ. It is the DLQ attribution point, set only
+	// where the runner routes an exhausted invocation to the DLQ — not on
+	// every failure.
+	FunctionTimestampDLQ
+
+	// functionTimestampCount bounds the kind space (array size below).
+	functionTimestampCount
+)
+
+// SetFunctionTimestamp records the latest value for exactly one of the four
+// kinds on function. The runner always passes time.Now(), and startup seeding
+// (SeedFunctionStat) passes the persisted value BEFORE any live execution, so a
+// simple overwrite is the correct update rule — there is never a case where a
+// caller supplies an older value that must lose to a newer one. Zero values may
+// be passed (they stand for "never observed"); seeding deliberately skips them
+// before calling, so a persisted zero/empty never materializes as an entry. A
+// nil receiver is a no-op; unknown kinds are ignored. It is nil-safe.
+func (r *Registry) SetFunctionTimestamp(function string, kind FunctionTimestampKind, ts int64) {
+	if r == nil || kind < 0 || kind >= functionTimestampCount {
+		return
+	}
+	r.funcTimestampsMu.Lock()
+	defer r.funcTimestampsMu.Unlock()
+	if r.funcTimestamps == nil {
+		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
+	}
+	arr := r.funcTimestamps[function]
+	arr[kind] = ts
+	r.funcTimestamps[function] = arr
+}
+
+// deleteFunctionTimestamps drops function's timestamp entry entirely. It is
+// shared by RemoveFunction and SweepFunctionMetrics so both retirement paths
+// clear the Relay-side timestamps too, not only the Prometheus series. The
+// caller must hold funcTimestampsMu.
+func (r *Registry) deleteFunctionTimestamps(function string) {
+	delete(r.funcTimestamps, function)
 }
 
 // labeledCounterVec pairs a CounterVec with the canonical order of its label
@@ -266,9 +342,12 @@ func (r *Registry) SeedCounter(name string, v int64) {
 }
 
 // SeedFunctionStat restores a function's persisted cumulative counters into the
-// per-function CounterVecs. It is the labeled counterpart of SeedCounter: the
-// worker calls it at startup for every function_stats row so idle functions keep
-// their prior totals instead of being reset by the first snapshot. A nil
+// per-function CounterVecs, and its persisted execution-history timestamps into
+// the timestamp map (zero values are SKIPPED: a persisted zero/empty timestamp
+// stands for "never observed" and must not materialize as an entry that could
+// later look newer than nothing). It is the labeled counterpart of SeedCounter:
+// the worker calls it at startup for every function_stats row so idle functions
+// keep their prior totals instead of being reset by the first snapshot. A nil
 // receiver is a no-op.
 func (r *Registry) SeedFunctionStat(f FunctionStat) {
 	if r == nil {
@@ -280,6 +359,29 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 	r.AddLabels("function_handler_failure_total", labels, f.HandlerFailureTotal)
 	r.AddLabels("function_retries_total", labels, f.RetriesTotal)
 	r.AddLabels("function_dlq_total", labels, f.DLQTotal)
+	r.funcTimestampsMu.Lock()
+	if r.funcTimestamps == nil {
+		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
+	}
+	arr := r.funcTimestamps[f.Function]
+	if f.LastExecution > 0 {
+		arr[FunctionTimestampExecution] = f.LastExecution
+	}
+	if f.LastSuccess > 0 {
+		arr[FunctionTimestampSuccess] = f.LastSuccess
+	}
+	if f.LastFailure > 0 {
+		arr[FunctionTimestampFailure] = f.LastFailure
+	}
+	if f.LastDLQ > 0 {
+		arr[FunctionTimestampDLQ] = f.LastDLQ
+	}
+	// Store the (possibly untouched) array only when at least one timestamp was
+	// seeded — a function with no counters and no timestamps gains nothing.
+	if f.LastExecution > 0 || f.LastSuccess > 0 || f.LastFailure > 0 || f.LastDLQ > 0 {
+		r.funcTimestamps[f.Function] = arr
+	}
+	r.funcTimestampsMu.Unlock()
 }
 
 // ObserveDuration records a single duration observation against the labeled
@@ -347,17 +449,49 @@ type FunctionStat struct {
 	HandlerFailureTotal int64
 	RetriesTotal        int64
 	DLQTotal            int64
+
+	// Unix-seconds timestamps (0 = never observed), fed by SetFunctionTimestamp
+	// and seeded from SQLite at startup (see SeedFunctionStat). They mirror the
+	// runner's execution-history attribution:
+	//   - LastExecution: the last handler-execution attempt (retries included,
+	//     since every claimed attempt is an execution).
+	//   - LastSuccess / LastFailure: the last successful / failed handler
+	//     execution (a failed attempt that will retry counts as a failure).
+	//   - LastDLQ: the last invocation that exhausted its retries and was
+	//     routed to the DLQ (the actual DLQ attribution point, NOT every
+	//     failure).
+	LastExecution int64
+	LastSuccess   int64
+	LastFailure   int64
+	LastDLQ       int64
 }
 
-// FunctionStatsSnapshot reads the five per-function CounterVecs and groups them
-// by function name, returning one FunctionStat per function that has any
-// non-zero counter. It is nil-safe and returns nil when no function has been
-// attributed yet. The function_* metrics are Relay-specific, so this
-// Relay-specific helper lives here rather than in the worker.
+// FunctionStatsSnapshot reads the five per-function CounterVecs and, for every
+// function that has at least one series, fills the four execution-history
+// timestamp fields from the timestamp map (a function with counters but no
+// timestamp entry gets zeros). A timestamp-only entry (in place but no series,
+// i.e. all counters zero) does NOT create a snapshot entry on its own: the
+// series absence and Prometheus's zero-value lazy semantics make such an entry
+// inconsistent with the counters, and the state layer's case-guarded upsert
+// preserves persisted timestamps across empty incoming values anyway — so
+// dropping a timestamp-only read here never erases SQLite history.
+// It is nil-safe and returns nil when no function has been attributed yet. The
+// function_* metrics are Relay-specific, so this Relay-specific helper lives
+// here rather than in the worker.
 func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 	if r == nil {
 		return nil
 	}
+	// Read the timestamp map under its lock FIRST, so a timestamp entry alone
+	// (all counters benignly zero) still surfaces in the snapshot, and counters
+	// then fill the (possibly zero) timestamp fields for counter-only
+	// functions.
+	tsByFn := make(map[string][functionTimestampCount]int64)
+	r.funcTimestampsMu.RLock()
+	for fn, arr := range r.funcTimestamps {
+		tsByFn[fn] = arr
+	}
+	r.funcTimestampsMu.RUnlock()
 	// Gather the whole registry once and group the function_* series by function
 	// name. The label order is fixed to ["function"], so the single label value
 	// is the name.
@@ -394,6 +528,17 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 			case "function_dlq_total":
 				fs.DLQTotal = v
 			}
+		}
+	}
+	// Merge the timestamp map into the grouped stats: only functions that
+	// already surfaced via series get their timestamp fields filled (see the
+	// doc comment's rationale for NOT creating timestamp-only entries).
+	for fn, arr := range tsByFn {
+		if fs, ok := byName[fn]; ok {
+			fs.LastExecution = arr[FunctionTimestampExecution]
+			fs.LastSuccess = arr[FunctionTimestampSuccess]
+			fs.LastFailure = arr[FunctionTimestampFailure]
+			fs.LastDLQ = arr[FunctionTimestampDLQ]
 		}
 	}
 	if len(byName) == 0 {
@@ -465,7 +610,9 @@ func isFunctionCarryingMetric(name string) bool {
 // single-function-label vec is deleted by label value. DeletePartialMatch and
 // DeleteLabelValues each lock the vec's metricMap internally, so no additional
 // lock is taken here. It is idempotent: calling it repeatedly (or for a name
-// with no series) is safe and a no-op.
+// with no series) is safe and a no-op. The Relay-side timestamp entry is deleted
+// alongside the series, so a removed function never lingers in
+// FunctionStatsSnapshot via its timestamps.
 func (r *Registry) RemoveFunction(name string) {
 	if r == nil {
 		return
@@ -473,6 +620,9 @@ func (r *Registry) RemoveFunction(name string) {
 	for _, n := range functionMetrics {
 		r.deleteFunction(n, name)
 	}
+	r.funcTimestampsMu.Lock()
+	r.deleteFunctionTimestamps(name)
+	r.funcTimestampsMu.Unlock()
 }
 
 // SweepFunctionMetrics deletes stale function-scoped series for every function
@@ -506,6 +656,15 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 			r.deleteFunction(name, fn)
 		}
 	}
+	// Sweep the timestamp map with the same live set, so a removed function's
+	// Relay-side execution-history entry is dropped alongside its series.
+	r.funcTimestampsMu.Lock()
+	for fn := range r.funcTimestamps {
+		if !live[fn] {
+			delete(r.funcTimestamps, fn)
+		}
+	}
+	r.funcTimestampsMu.Unlock()
 }
 
 // deleteFunction removes every series labeled function=fn from the named vec,

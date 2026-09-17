@@ -1011,6 +1011,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					}
 					handlerAttempt = n
 				}
+				// The invocation attempt has actually begun: the TryStart above
+				// (or the absence of invocation state, for direct callers)
+				// claimed it and the slots are held. This is the
+				// last_execution_at attribution point — every claimed attempt
+				// counts, retries included (they are real executions), while
+				// the skip branches returned above never reach it.
+				r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampExecution, time.Now().Unix())
 				r.log.Debug("Function rule: matched event",
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
@@ -1092,9 +1099,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// Unlabeled total for the SQLite snapshot; the labeled counter
 					// above stays for Prometheus.
 					r.metrics.Inc("handler_failure_total")
-					// Per-function failure attribution (per rule execution).
+					// Per-function failure attribution (per rule execution). A
+					// failed attempt that will retry still counts as a failure
+					// (and as an execution above); only a DLQ-routed exhaustion
+					// additionally sets last_dlq_at (see recordFailure).
 					r.metrics.IncLabels("function_handler_failure_total",
 						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+					r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampFailure, time.Now().Unix())
 					r.metrics.ObserveDurationLabels("handler_duration_seconds",
 						[]metrics.Label{
 							{Name: "function", Value: pf.fn.Name},
@@ -1151,6 +1162,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// Per-function success attribution (per rule execution).
 				r.metrics.IncLabels("function_handler_success_total",
 					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+				r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
 				r.metrics.ObserveDurationLabels("handler_duration_seconds",
 					[]metrics.Label{
 						{Name: "function", Value: pf.fn.Name},
@@ -1433,6 +1445,12 @@ func (r *Runner) invokeOnce(
 	invocation string,
 	msgID string,
 ) error {
+	// The invocation attempt has actually begun: the caller claimed it via
+	// TryStart (or is a direct no-state caller) and holds the concurrency
+	// slots. This is the schedule path's last_execution_at attribution point —
+	// every claimed attempt counts, retries included.
+	r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampExecution, time.Now().Unix())
+
 	// Resolve the template's env values and secret references immediately before
 	// container creation, mirroring Handle's rule path.
 	extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
@@ -1503,6 +1521,7 @@ func (r *Runner) invokeOnce(
 	// Per-function success attribution.
 	r.metrics.IncLabels("function_handler_success_total",
 		[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+	r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
 	r.metrics.ObserveDurationLabels("handler_duration_seconds",
 		[]metrics.Label{
 			{Name: "function", Value: pf.fn.Name},
@@ -1519,10 +1538,12 @@ func (r *Runner) invokeOnce(
 // recordHandlerFailure increments the failure metrics shared by Handle's
 // failure branch and InvokeHandler: the labeled invocation outcome counter, the
 // unlabeled total, per-function failure attribution, and the duration
-// histogram. It deliberately does NOT touch events_received/processed or
-// function_events_total — the stream layer counts events_processed_total for a
-// schedule delivery (see stream.processScheduleMessage), so those are not
-// double-counted here.
+// histogram. A failed attempt that will retry still counts as a failure here
+// (it sets last_failure_at); only the DLQ-routed exhaustion additionally sets
+// last_dlq_at (see recordFailure). It deliberately does NOT touch
+// events_received/processed or function_events_total — the stream layer counts
+// events_processed_total for a schedule delivery (see stream.processScheduleMessage),
+// so those are not double-counted here.
 func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 	r.metrics.IncLabels("handler_invocations_total",
 		[]metrics.Label{
@@ -1533,6 +1554,7 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 	r.metrics.Inc("handler_failure_total")
 	r.metrics.IncLabels("function_handler_failure_total",
 		[]metrics.Label{{Name: "function", Value: fnName}})
+	r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampFailure, time.Now().Unix())
 	r.metrics.ObserveDurationLabels("handler_duration_seconds",
 		[]metrics.Label{
 			{Name: "function", Value: fnName},
@@ -1568,10 +1590,15 @@ func (r *Runner) recordFailure(
 ) (invocationOutcome, error) {
 	maxAttempts := 1 + retries
 	if handlerAttempt >= maxAttempts {
-		// Exhausted: mark the invocation terminal.
+		// Exhausted: mark the invocation terminal. This is the DLQ attribution
+		// point: the invocation exhausted its retries and the message is being
+		// routed to the DLQ, so last_dlq_at is stamped HERE — not on every
+		// failure, and not again on the later terminal-skip redeliveries of the
+		// same invocation.
 		invState.MarkExhausted(invocation, handlerAttempt)
 		r.metrics.IncLabels("function_dlq_total",
 			[]metrics.Label{{Name: "function", Value: fnName}})
+		r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampDLQ, time.Now().Unix())
 		r.log.Error("Function handler: exhausted; invocation terminal",
 			"function", fnName,
 			"handler", handler,

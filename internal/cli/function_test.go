@@ -655,3 +655,73 @@ func TestFunctionCommandHelp(t *testing.T) {
 		}
 	}
 }
+
+// The Stats section renders the four per-function execution-history timestamps
+// as relative ages ("2s ago"-style rows) after the DLQ entries line.
+func TestFunctionInspectStatsTimestamps(t *testing.T) {
+	st := seedTestState(t)
+	exec := time.Now().Add(-2 * time.Second).UTC()
+	failure := time.Now().Add(-90 * time.Second).UTC()
+	dlq := time.Now().Add(-48 * time.Hour).UTC()
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "user-events-python",
+		EventsProcessedTotal: 10,
+		HandlerSuccessTotal:  8,
+		HandlerFailureTotal:  2,
+		RetryTotal:           4,
+		DLQTotal:             1,
+		LastExecutionAt:      exec.Format(time.RFC3339),
+		LastSuccessAt:        exec.Format(time.RFC3339),
+		LastFailureAt:        failure.Format(time.RFC3339),
+		LastDLQAt:            dlq.Format(time.RFC3339),
+	})
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
+	for _, want := range []string{
+		"Last execution:      2s ago",
+		"Last success:        2s ago",
+		"Last failure:        1m ago",
+		"Last DLQ:            2d ago",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+	// The rows come after "DLQ entries:".
+	after := strings.Index(out, "DLQ entries:")
+	for _, row := range []string{"Last execution:", "Last success:", "Last failure:", "Last DLQ:"} {
+		i := strings.Index(out, row)
+		if i == -1 || i < after {
+			t.Errorf("%s must follow DLQ entries (order):\n%s", row, out)
+		}
+	}
+}
+
+// A function whose timestamps were never observed renders "never" instead of
+// an empty relative age.
+func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
+	st := seedTestState(t)
+	st.RecordFunctionStats(state.FunctionStats{Function: "user-events-python", EventsProcessedTotal: 3})
+	d, ok := st.GetFunction("user-events-python")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
+	for _, want := range []string{
+		"Last execution:      never",
+		"Last success:        never",
+		"Last failure:        never",
+		"Last DLQ:            never",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+}

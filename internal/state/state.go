@@ -254,6 +254,10 @@ func (c *State) initSchema(ctx context.Context) error {
 		// counter to a single function (see FunctionStats for the semantics).
 		// Backlog metrics (pending_entries/oldest_pending_age) stay global-only
 		// in stats: they describe the stream backlog, not any one function.
+		// The four last_*_at TEXT columns record per-function execution-history
+		// timestamps in the same RFC3339 convention as updated_at (empty = the
+		// event was never observed); see FunctionStats and
+		// migrateFunctionStatsTimestampColumns.
 		`CREATE TABLE IF NOT EXISTS function_stats (
 			function_name TEXT PRIMARY KEY,
 			events_processed_total INTEGER NOT NULL DEFAULT 0,
@@ -261,6 +265,10 @@ func (c *State) initSchema(ctx context.Context) error {
 			handler_failure_total INTEGER NOT NULL DEFAULT 0,
 			retry_total INTEGER NOT NULL DEFAULT 0,
 			dlq_total INTEGER NOT NULL DEFAULT 0,
+			last_execution_at TEXT,
+			last_success_at TEXT,
+			last_failure_at TEXT,
+			last_dlq_at TEXT,
 			updated_at TEXT
 		)`,
 	}
@@ -274,6 +282,12 @@ func (c *State) initSchema(ctx context.Context) error {
 	// table, so check PRAGMA table_info and ALTER TABLE ADD COLUMN when missing.
 	// Plain SQL, consistent with the "no migration framework" comment above.
 	if err := c.migrateFunctionsColumns(ctx); err != nil {
+		return err
+	}
+	// Idempotent migration adding the four per-function execution-history
+	// timestamp columns to databases created before they existed (see
+	// migrateFunctionStatsTimestampColumns).
+	if err := c.migrateFunctionStatsTimestampColumns(ctx); err != nil {
 		return err
 	}
 	// Idempotent migration for the services-handler -> services-entrypoint
@@ -311,6 +325,44 @@ func (c *State) migrateFunctionsColumns(ctx context.Context) error {
 			continue
 		}
 		if _, err := c.db.ExecContext(ctx, `ALTER TABLE functions ADD COLUMN `+col+` TEXT`); err != nil {
+			return fmt.Errorf("migrate: add column %s: %w", col, err)
+		}
+	}
+	return nil
+}
+
+// migrateFunctionStatsTimestampColumns adds the four per-function
+// execution-history timestamp columns (last_execution_at, last_success_at,
+// last_failure_at, last_dlq_at) to an existing function_stats table that
+// predates them. It is idempotent: each column is added only when PRAGMA
+// table_info reports it missing, following the migrateFunctionsColumns pattern.
+// Existing rows gain NULL in the new columns, which the readers and the
+// upsert's COALESCE guards treat exactly like the empty string: "never
+// observed".
+func (c *State) migrateFunctionStatsTimestampColumns(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(function_stats)`)
+	if err != nil {
+		return fmt.Errorf("migrate: read function_stats columns: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate: scan column: %w", err)
+		}
+		have[name] = true
+	}
+	_ = rows.Close()
+	for _, col := range []string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"} {
+		if have[col] {
+			continue
+		}
+		if _, err := c.db.ExecContext(ctx, `ALTER TABLE function_stats ADD COLUMN `+col+` TEXT`); err != nil {
 			return fmt.Errorf("migrate: add column %s: %w", col, err)
 		}
 	}

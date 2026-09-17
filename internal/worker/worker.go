@@ -672,8 +672,42 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 			HandlerFailureTotal: fs.HandlerFailureTotal,
 			RetriesTotal:        fs.RetryTotal,
 			DLQTotal:            fs.DLQTotal,
+			// Parse the RFC3339 timestamp columns back to unix seconds for the
+			// registry (an unparseable/empty value parses to a zero time, which
+			// SeedFunctionStat skips as "never observed").
+			LastExecution: rfc3339ToUnix(fs.LastExecutionAt),
+			LastSuccess:   rfc3339ToUnix(fs.LastSuccessAt),
+			LastFailure:   rfc3339ToUnix(fs.LastFailureAt),
+			LastDLQ:       rfc3339ToUnix(fs.LastDLQAt),
 		})
 	}
+}
+
+// rfc3339ToUnix parses an RFC3339 timestamp string into its unix-seconds value,
+// returning 0 ("never observed") for the empty string or an unparseable value.
+// It is the inverse of unixSecToRFC3339 at restore time: the state layer stores
+// RFC3339 strings, the registry stores unix seconds, and a stale or corrupt
+// persisted value is treated exactly like absence rather than erroring the
+// restore path (observability is non-fatal).
+func rfc3339ToUnix(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return 0
+	}
+	return t.Unix()
+}
+
+// unixSecToRFC3339 renders a unix-seconds value as an RFC3339 timestamp,
+// rendering 0 ("never observed") as the empty string — the state layer's
+// convention for "never". It is the inverse of rfc3339ToUnix at flush time.
+func unixSecToRFC3339(ts int64) string {
+	if ts <= 0 {
+		return ""
+	}
+	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
 }
 
 // snapshotStats maps the metrics registry into the state database's Stats row.
@@ -696,9 +730,12 @@ func snapshotStats(metricsInstance *metrics.Registry) state.Stats {
 	}
 }
 
-// funcSnapshotStats maps the registry's per-function counters into the state
-// layer's FunctionStats rows. It is nil-safe: a nil registry yields an empty
-// slice so the snapshot path can never panic or block processing.
+// funcSnapshotStats maps the registry's per-function counters AND latest
+// execution-history timestamps into the state layer's FunctionStats rows. The
+// registry stores unix seconds; the state layer stores RFC3339 strings in the
+// updated_at convention (empty = never observed), so zero timestamps map to "".
+// It is nil-safe: a nil registry yields an empty slice so the snapshot path can
+// never panic or block processing.
 func funcSnapshotStats(metricsInstance *metrics.Registry) []state.FunctionStats {
 	if metricsInstance == nil {
 		return nil
@@ -713,6 +750,10 @@ func funcSnapshotStats(metricsInstance *metrics.Registry) []state.FunctionStats 
 			HandlerFailureTotal:  fs.HandlerFailureTotal,
 			RetryTotal:           fs.RetriesTotal,
 			DLQTotal:             fs.DLQTotal,
+			LastExecutionAt:      unixSecToRFC3339(fs.LastExecution),
+			LastSuccessAt:        unixSecToRFC3339(fs.LastSuccess),
+			LastFailureAt:        unixSecToRFC3339(fs.LastFailure),
+			LastDLQAt:            unixSecToRFC3339(fs.LastDLQ),
 		})
 	}
 	return out

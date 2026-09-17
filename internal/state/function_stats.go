@@ -17,6 +17,17 @@ import (
 // RetryTotal counts every failing rule execution (a retry driver);
 // DLQTotal counts a function once when its failing rule execution is the one
 // that exhausts the delivery attempts and the message is routed to the DLQ.
+//
+// The four Last*At fields are per-function execution-history timestamps in the
+// RFC3339 convention of UpdatedAt (empty string = never observed):
+// LastExecutionAt is the last handler-execution attempt (retries count — every
+// claimed attempt is an execution); LastSuccessAt / LastFailureAt the last
+// successful / failed handler execution (a failed attempt that will retry
+// counts as a failure); LastDLQAt the last invocation that exhausted its
+// retries and was ROUTED TO THE DLQ (the actual DLQ attribution point, not
+// every failure). They are reset by nothing but a genuine removal: unlike the
+// counters, an incoming empty value must never clobber a persisted timestamp
+// (see the upsert's CASE guards).
 type FunctionStats struct {
 	Function             string
 	EventsProcessedTotal int64
@@ -24,7 +35,39 @@ type FunctionStats struct {
 	HandlerFailureTotal  int64
 	RetryTotal           int64
 	DLQTotal             int64
+	LastExecutionAt      string
+	LastSuccessAt        string
+	LastFailureAt        string
+	LastDLQAt            string
 	UpdatedAt            string
+}
+
+// tsColumns lists the four execution-history timestamp columns and their
+// FunctionStats destination fields, in the order the upsert and the readers use.
+var tsCols = []struct {
+	col, field string
+}{
+	{"last_execution_at", "LastExecutionAt"},
+	{"last_success_at", "LastSuccessAt"},
+	{"last_failure_at", "LastFailureAt"},
+	{"last_dlq_at", "LastDLQAt"},
+}
+
+// functionStatsTSUpsert builds the ON CONFLICT DO UPDATE SET clauses for the
+// four timestamp columns: counters are plainly REPLACED above it, while an
+// empty incoming timestamp PRESERVES the previously stored one (services must
+// never regress to "never" because one flush had no timestamp observation).
+// Each guard also COALESCEs the stored column so the value never becomes NULL
+// (a legacy row migrated from a pre-column schema stores NULL, which the
+// readers treat as empty).
+func functionStatsTSUpsert() []string {
+	out := make([]string, 0, len(tsCols))
+	for _, c := range tsCols {
+		out = append(out, c.col+` = CASE
+			        WHEN excluded.`+c.col+` IS NOT NULL AND excluded.`+c.col+` <> ''
+			        THEN excluded.`+c.col+` ELSE COALESCE(function_stats.`+c.col+`, '') END`)
+	}
+	return out
 }
 
 // RecordFunctionStats upserts the function_stats row for s.Function. It is a
@@ -36,28 +79,36 @@ func (c *State) RecordFunctionStats(s FunctionStats) {
 
 // RecordFunctionStatsContext upserts the function_stats row for s.Function,
 // replacing every counter column with the supplied value and setting updated_at
-// to now(). There is no accumulation: the worker hands over the CURRENT
-// cumulative registry values, so the row always mirrors the latest known
-// totals. Callers must pass CURRENT cumulative values; the worker seeds the
+// to now(). Counter columns behave as an absolute snapshot (see RecordStats);
+// the four last_*_at timestamp columns are additionally CASE-guarded so an
+// EMPTY incoming value preserves the previously stored timestamp instead of
+// overwriting it with "" — "no observation" must never erase "last observed
+// at". Callers must pass CURRENT cumulative values; the worker seeds the
 // fresh process registry from this table at startup so the first snapshot
 // never resets counters. It is non-fatal on error: it logs and returns.
 func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats) {
 	ts := now()
-	_, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats
-		   (function_name, events_processed_total, handler_success_total,
-		    handler_failure_total, retry_total, dlq_total, updated_at)
-		 VALUES
-		   (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(function_name) DO UPDATE SET
-		   events_processed_total  = excluded.events_processed_total,
+	upd := `events_processed_total  = excluded.events_processed_total,
 		   handler_success_total   = excluded.handler_success_total,
 		   handler_failure_total   = excluded.handler_failure_total,
 		   retry_total             = excluded.retry_total,
-		   dlq_total               = excluded.dlq_total,
-		   updated_at              = excluded.updated_at`,
+		   dlq_total               = excluded.dlq_total,`
+	for _, g := range functionStatsTSUpsert() {
+		upd += "\n" + g + ","
+	}
+	upd += "\n	   updated_at              = excluded.updated_at"
+	_, err := c.db.ExecContext(ctx,
+		`INSERT INTO function_stats
+		   (function_name, events_processed_total, handler_success_total,
+		    handler_failure_total, retry_total, dlq_total,
+		    last_execution_at, last_success_at, last_failure_at, last_dlq_at, updated_at)
+		 VALUES
+		   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(function_name) DO UPDATE SET
+		   `+upd,
 		s.Function, s.EventsProcessedTotal, s.HandlerSuccessTotal,
-		s.HandlerFailureTotal, s.RetryTotal, s.DLQTotal, ts)
+		s.HandlerFailureTotal, s.RetryTotal, s.DLQTotal,
+		s.LastExecutionAt, s.LastSuccessAt, s.LastFailureAt, s.LastDLQAt, ts)
 	if err != nil {
 		c.log.Warn("State: record function stats failed", "function", s.Function, "error", err)
 	}
@@ -71,10 +122,13 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 	var s FunctionStats
 	err := c.db.QueryRowContext(ctx,
 		`SELECT function_name, events_processed_total, handler_success_total,
-		        handler_failure_total, retry_total, dlq_total, updated_at
+		        handler_failure_total, retry_total, dlq_total,
+		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
+		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
 		 FROM function_stats WHERE function_name = ?`, name,
 	).Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
-		&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal, &s.UpdatedAt)
+		&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
+		&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}, false
 	}
@@ -126,7 +180,9 @@ func (c *State) AllFunctionStats() []FunctionStats {
 	ctx := context.Background()
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT function_name, events_processed_total, handler_success_total,
-		        handler_failure_total, retry_total, dlq_total, updated_at
+		        handler_failure_total, retry_total, dlq_total,
+		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
+		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
 		 FROM function_stats ORDER BY function_name`)
 	if err != nil {
 		c.log.Warn("State: list function stats failed", "error", err)
@@ -138,7 +194,8 @@ func (c *State) AllFunctionStats() []FunctionStats {
 	for rows.Next() {
 		var s FunctionStats
 		if err := rows.Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
-			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal, &s.UpdatedAt); err != nil {
+			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
+			&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt); err != nil {
 			c.log.Warn("State: scan function stats failed", "error", err)
 			return out
 		}

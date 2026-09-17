@@ -313,3 +313,138 @@ func stateFunction(name, dir string) function.Function {
 	}
 	return function.Function{Name: name, Dir: dir, Template: tmpl}
 }
+
+// TestRestoreSeedsAndFlushesTimestamps is the end-to-end timestamp regression:
+// a DB sealed with RecordFunctionStats including timestamps (simulating a prior
+// process), restorePersistedStats seeding, a flush from a FRESH registry entry
+// WITHOUT timestamps, and the persisted timestamps must still survive the
+// flush's case-guarded upsert.
+func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+
+	exec := time.Now().Add(-time.Minute).UTC()
+	dlq := exec.Add(-time.Minute)
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "alpha",
+		EventsProcessedTotal: 10,
+		LastExecutionAt:      exec.Format(time.RFC3339),
+		LastSuccessAt:        exec.Format(time.RFC3339),
+		LastDLQAt:            dlq.Format(time.RFC3339),
+	})
+
+	// Restore: the registry's unix-seconds timestamps must round-trip.
+	m := metrics.New()
+	restorePersistedStats(m, st)
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 {
+		t.Fatalf("snapshot len = %d, want 1: %+v", len(fs), fs)
+	}
+	wantExec := exec.Unix()
+	if fs[0].LastExecution != wantExec || fs[0].LastSuccess != wantExec || fs[0].LastDLQ != dlq.Unix() || fs[0].LastFailure != 0 {
+		t.Fatalf("seeded timestamps = %+v", fs[0])
+	}
+
+	// Simulate ONE post-restart activity in the restored registry: the live
+	// (seeded) timestamps are republished untouched.
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels("function_handler_success_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	recordSnapshots(context.Background(), st, m)
+	got, ok := st.FunctionStats("alpha")
+	if !ok {
+		t.Fatal("expected alpha stats after flush")
+	}
+	if got.LastExecutionAt != exec.Format(time.RFC3339) || got.LastSuccessAt != exec.Format(time.RFC3339) {
+		t.Fatalf("flush must republish the seeded timestamps: %+v", got)
+	}
+
+	// Now the case guard in isolation: flush from a FRESH registry WITHOUT any
+	// timestamps for alpha (only a counters series) — the function_stats row
+	// must keep the persisted timestamps (an empty incoming value never
+	// clobbers them).
+	fresh := metrics.New()
+	fresh.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "alpha"}})
+	recordSnapshots(context.Background(), st, fresh)
+	got, ok = st.FunctionStats("alpha")
+	if !ok {
+		t.Fatal("expected alpha stats after fresh-registry flush")
+	}
+	wantDLQ := dlq.Format(time.RFC3339)
+	if got.LastDLQAt != wantDLQ {
+		t.Fatalf("flush with NO DLQ observation must preserve the persisted LastDLQAt %q: %+v", wantDLQ, got)
+	}
+	if got.LastExecutionAt != exec.Format(time.RFC3339) {
+		t.Fatalf("flush with NO execution observation must preserve the persisted LastExecutionAt: %+v", got)
+	}
+}
+
+// TestRestoreSkipsInvalidTimestamps pins the restore parser's tolerance: empty
+// and unparseable persisted strings restore as 0 ("never observed") and the
+// worker never errors the startup path over a corrupt timestamp column.
+func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "alpha",
+		EventsProcessedTotal: 1,
+		LastExecutionAt:      "not-a-timestamp",
+		LastSuccessAt:        "",
+	})
+
+	m := metrics.New()
+	restorePersistedStats(m, st)
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].LastExecution != 0 || fs[0].LastSuccess != 0 {
+		t.Fatalf("invalid/empty timestamps must restore as 0: %+v", fs)
+	}
+}
+
+// TestFuncSnapshotStatsTimestampsMapping verifies the flush mapper: unix
+// seconds map to RFC3339 strings and zeros map to "" (never observed).
+func TestFuncSnapshotStatsTimestampsMapping(t *testing.T) {
+	m := metrics.New()
+	ts := int64(1700000000)
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "a"}})
+	m.SetFunctionTimestamp("a", metrics.FunctionTimestampExecution, ts)
+	m.IncLabels("function_events_total", []metrics.Label{{Name: "function", Value: "b"}})
+	m.SetFunctionTimestamp("b", metrics.FunctionTimestampDLQ, ts+60)
+
+	got := funcSnapshotStats(m)
+	byName := map[string]state.FunctionStats{}
+	for _, fs := range got {
+		byName[fs.Function] = fs
+	}
+	a, ok := byName["a"]
+	if !ok {
+		t.Fatalf("a missing: %+v", got)
+	}
+	if a.LastExecutionAt != time.Unix(ts, 0).UTC().Format(time.RFC3339) {
+		t.Fatalf("a = %+v; want execution %s", a, time.Unix(ts, 0).UTC().Format(time.RFC3339))
+	}
+	if a.LastSuccessAt != "" || a.LastFailureAt != "" || a.LastDLQAt != "" {
+		t.Fatalf("unobserved timestamps must map to empty strings: %+v", a)
+	}
+	b := byName["b"]
+	if b.LastDLQAt != time.Unix(ts+60, 0).UTC().Format(time.RFC3339) || b.LastExecutionAt != "" {
+		t.Fatalf("b = %+v", b)
+	}
+}
+
+// TestRfc3339ToUnixRoundTrip pins the two conversion helpers as strict
+// inverses for valid values and "never" sentinels at the boundaries.
+func TestRfc3339ToUnixRoundTrip(t *testing.T) {
+	ts := int64(1700000000)
+	if got := unixSecToRFC3339(ts); got != "2023-11-14T22:13:20Z" {
+		t.Fatalf("unixSecToRFC3339(%d) = %q", ts, got)
+	}
+	if got := rfc3339ToUnix(unixSecToRFC3339(ts)); got != ts {
+		t.Fatalf("round trip = %d, want %d", got, ts)
+	}
+	// "never" conventions: zero in → empty out; empty/invalid in → 0 out.
+	if unixSecToRFC3339(0) != "" || unixSecToRFC3339(-5) != "" {
+		t.Fatal("non-positive timestamps must map to empty strings")
+	}
+	if rfc3339ToUnix("") != 0 || rfc3339ToUnix("garbage") != 0 {
+		t.Fatal("empty/invalid values must map to 0")
+	}
+}

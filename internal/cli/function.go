@@ -153,6 +153,10 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
 	fmt.Fprintf(sw, "  Retries:\t%d\n", fs.RetryTotal)
 	fmt.Fprintf(sw, "  DLQ entries:\t%d\n", fs.DLQTotal)
+	fmt.Fprintf(sw, "  Last execution:\t%s\n", lastAgo(fs.LastExecutionAt))
+	fmt.Fprintf(sw, "  Last success:\t%s\n", lastAgo(fs.LastSuccessAt))
+	fmt.Fprintf(sw, "  Last failure:\t%s\n", lastAgo(fs.LastFailureAt))
+	fmt.Fprintf(sw, "  Last DLQ:\t%s\n", lastAgo(fs.LastDLQAt))
 	sw.Flush()
 
 	fmt.Fprintln(w, "")
@@ -228,6 +232,17 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// lastAgo renders a per-function timestamp for inspect: the empty string means
+// the event was never observed ("never"); any other value renders through
+// state.RelativeAgo, which falls back to the raw string when parsing fails — an
+// acceptable cosmetic fallback that keeps inspect rendering non-fatal.
+func lastAgo(rfc3339 string) string {
+	if rfc3339 == "" {
+		return "never"
+	}
+	return state.RelativeAgo(rfc3339)
 }
 
 // displayTime returns the UPDATED column value: prepared_at (if set) else

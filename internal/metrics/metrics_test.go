@@ -221,3 +221,125 @@ func TestHandlerNilRegistryServesEmpty(t *testing.T) {
 		t.Fatalf("nil registry body = %q, want empty", rec.Body.String())
 	}
 }
+
+// TestSetFunctionTimestampSnapshot verifies SetFunctionTimestamp stores the
+// latest per-kind values and FunctionStatsSnapshot surfaces them, including the
+// counter-without-timestamp (all-zero timestamps) and timestamp-without-counter
+// shapes.
+func TestSetFunctionTimestampSnapshot(t *testing.T) {
+	r := New()
+	// "a": counters + all four timestamps.
+	r.IncLabels("function_events_total", []Label{{"function", "a"}})
+	ts := int64(1700000000)
+	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
+	r.SetFunctionTimestamp("a", FunctionTimestampSuccess, ts+1)
+	r.SetFunctionTimestamp("a", FunctionTimestampFailure, ts+2)
+	r.SetFunctionTimestamp("a", FunctionTimestampDLQ, ts+3)
+
+	// SetTimestamp entries survive repeated overwrites (latest wins).
+	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts+10)
+
+	got := r.FunctionStatsSnapshot()
+	byName := map[string]FunctionStat{}
+	for _, f := range got {
+		byName[f.Function] = f
+	}
+	a, ok := byName["a"]
+	if !ok {
+		t.Fatalf("a missing from snapshot: %+v", got)
+	}
+	if a.LastExecution != ts+10 || a.LastSuccess != ts+1 || a.LastFailure != ts+2 || a.LastDLQ != ts+3 {
+		t.Fatalf("a timestamps = %+v", a)
+	}
+
+	// A function with counters but NO timestamp entry reads zeros (counters-only shape).
+	r.IncLabels("function_events_total", []Label{{"function", "c"}})
+	got = r.FunctionStatsSnapshot()
+	c := byFn(got, "c")
+	if c.Events != 1 || c.LastExecution != 0 || c.LastSuccess != 0 || c.LastFailure != 0 || c.LastDLQ != 0 {
+		t.Fatalf("c (counters-only) = %+v", c)
+	}
+
+	// Nil-safe: a nil receiver is a no-op.
+	var nilR *Registry
+	nilR.SetFunctionTimestamp("x", FunctionTimestampExecution, ts)
+	// An unknown kind is ignored.
+	r.SetFunctionTimestamp("a", FunctionTimestampKind(99), ts+20)
+	if a := byFn(r.FunctionStatsSnapshot(), "a"); a.LastExecution != ts+10 {
+		t.Fatalf("unknown kind must not write: %+v", a)
+	}
+}
+
+// byFn finds the FunctionStat for name in a snapshot, or a zero value.
+func byFn(fs []FunctionStat, name string) FunctionStat {
+	for _, f := range fs {
+		if f.Function == name {
+			return f
+		}
+	}
+	return FunctionStat{}
+}
+
+// TestSeedFunctionStatTimestamps verifies SeedFunctionStat restores persisted
+// timestamps into the snapshot and SKIPS zeros (a persisted zero never
+// materializes as an entry that could later look newer than nothing).
+func TestSeedFunctionStatTimestamps(t *testing.T) {
+	r := New()
+	ts := int64(1700000000)
+	r.SeedFunctionStat(FunctionStat{Function: "alpha", Events: 1, LastExecution: ts, LastSuccess: ts + 1})
+	// beta has counters but only zero timestamps: nothing is stored.
+	r.SeedFunctionStat(FunctionStat{Function: "beta", Events: 1})
+
+	got := r.FunctionStatsSnapshot()
+	a := byFn(got, "alpha")
+	if a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != 0 || a.LastDLQ != 0 {
+		t.Fatalf("alpha = %+v", a)
+	}
+	if b := byFn(got, "beta"); b.LastExecution != 0 || b.LastSuccess != 0 {
+		t.Fatalf("beta must have no timestamp entries: %+v", b)
+	}
+
+	// A partial overwrite preserves the kinds that were not seeded.
+	r.SeedFunctionStat(FunctionStat{Function: "alpha", Events: 2, LastFailure: ts + 5})
+	a = byFn(r.FunctionStatsSnapshot(), "alpha")
+	if a.Events != 3 || a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != ts+5 {
+		t.Fatalf("alpha after partial seed = %+v", a)
+	}
+}
+
+// TestRemoveFunctionClearsTimestamps verifies RemoveFunction deletes the
+// Relay-side timestamp entry alongside the Prometheus series.
+func TestRemoveFunctionClearsTimestamps(t *testing.T) {
+	r := New()
+	ts := int64(1700000000)
+	r.IncLabels("function_events_total", []Label{{"function", "a"}})
+	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
+	r.IncLabels("function_events_total", []Label{{"function", "b"}})
+	r.SetFunctionTimestamp("b", FunctionTimestampExecution, ts)
+
+	r.RemoveFunction("a")
+	got := r.FunctionStatsSnapshot()
+	if byFn(got, "a").Function != "" {
+		t.Fatalf("a (series+timestamps) must be fully removed: %+v", got)
+	}
+	if byFn(got, "b").LastExecution != ts {
+		t.Fatalf("b must survive: %+v", got)
+	}
+
+	// Sweep does the same with the live set: with live={"a"} (no series at all
+	// after the removal, so a is absent from the snapshot entirely) b's
+	// timestamps and series are swept; with live={"b"} b survives fully.
+	r.SweepFunctionMetrics(map[string]bool{"b": true})
+	if a := byFn(r.FunctionStatsSnapshot(), "b"); a.LastExecution != ts {
+		t.Fatalf("sweep must keep live b's timestamps:\n%+v", r.FunctionStatsSnapshot())
+	}
+	r.SweepFunctionMetrics(map[string]bool{"a": true})
+	if fs := r.FunctionStatsSnapshot(); len(fs) != 0 {
+		t.Fatalf("sweep must clear non-live b's timestamps too:\n%+v", fs)
+	}
+
+	// Nil-safety: none of these cleanup paths panic on a nil receiver.
+	var nilR *Registry
+	nilR.RemoveFunction("a")
+	nilR.SweepFunctionMetrics(map[string]bool{})
+}

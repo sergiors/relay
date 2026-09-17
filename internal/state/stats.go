@@ -104,21 +104,33 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 			return err
 		}
 		for _, fs := range fns {
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO function_stats
-				   (function_name, events_processed_total, handler_success_total,
-				    handler_failure_total, retry_total, dlq_total, updated_at)
-				 SELECT ?, ?, ?, ?, ?, ?, ?
-				 WHERE EXISTS (SELECT 1 FROM functions WHERE name = ?)
-				 ON CONFLICT(function_name) DO UPDATE SET
-				   events_processed_total  = excluded.events_processed_total,
+			// Counters are plainly replaced; the four last_*_at timestamps are
+			// CASE-guarded so an empty incoming value PRESERVES the previously
+			// stored timestamp (and never turns a stored value back into
+			// NULL) — a flush that observed no timestamp must not erase the
+			// last known one. See functionStatsTSUpsert for the shared clause
+			// construction.
+			upd := `events_processed_total  = excluded.events_processed_total,
 				   handler_success_total   = excluded.handler_success_total,
 				   handler_failure_total   = excluded.handler_failure_total,
 				   retry_total             = excluded.retry_total,
-				   dlq_total               = excluded.dlq_total,
-				   updated_at              = excluded.updated_at`,
+				   dlq_total               = excluded.dlq_total,`
+			for _, g := range functionStatsTSUpsert() {
+				upd += "\n" + g + ","
+			}
+			upd += "\n				   updated_at              = excluded.updated_at"
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO function_stats
+				   (function_name, events_processed_total, handler_success_total,
+				    handler_failure_total, retry_total, dlq_total,
+				    last_execution_at, last_success_at, last_failure_at, last_dlq_at, updated_at)
+				 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+				 WHERE EXISTS (SELECT 1 FROM functions WHERE name = ?)
+				 ON CONFLICT(function_name) DO UPDATE SET
+				   `+upd,
 				fs.Function, fs.EventsProcessedTotal, fs.HandlerSuccessTotal,
-				fs.HandlerFailureTotal, fs.RetryTotal, fs.DLQTotal, ts, fs.Function); err != nil {
+				fs.HandlerFailureTotal, fs.RetryTotal, fs.DLQTotal,
+				fs.LastExecutionAt, fs.LastSuccessAt, fs.LastFailureAt, fs.LastDLQAt, ts, fs.Function); err != nil {
 				return err
 			}
 		}
