@@ -55,6 +55,11 @@ const statsFlushInterval = 5 * time.Second
 // bound (see Run's shutdown tail), not this constant.
 const startupTimeout = 30 * time.Second
 
+// shutdownServiceTimeout bounds the service-container cleanup during graceful
+// shutdown: stopping and removing this worker's persistent service containers
+// must not block shutdown forever.
+const shutdownServiceTimeout = 30 * time.Second
+
 // effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
 // (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
 // the value actually enforced regardless of the configured raw value.
@@ -165,15 +170,17 @@ func Run(logger *slog.Logger) {
 
 	// The service controller converges each function's persistent service
 	// containers to its template (manager is the Docker seam; secretProvider is
-	// the shared secrets resolver). Service containers survive worker shutdown by
-	// design — they are persistent and long-lived — so the next boot's per-function
-	// Apply + SweepOrphans converges any drift; nothing touches them on shutdown.
-	// The service reconciler itself decides whether routing applies (only
-	// services declaring a host are routed) and validates TRAEFIK_NETWORK per
-	// routed service; wiring only forwards the configured value.
+	// the shared secrets resolver). Service containers now stop on graceful
+	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
+	// hostname (cfg.ConsumerName). Startup reconciliation (per-function Apply +
+	// SweepOrphans) remains the crash-recovery path when shutdown cleanup did
+	// not execute. The service reconciler itself decides whether routing
+	// applies (only services declaring a host are routed) and validates
+	// TRAEFIK_NETWORK per routed service; wiring only forwards the configured
+	// value.
 	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
 		Network:      cfg.TraefikNetwork,
-		Entrypoint:   cfg.TraefikEntrypoint,
+		EntryPoints:  cfg.TraefikEntryPoints,
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 	}, logger)
@@ -426,6 +433,14 @@ func Run(logger *slog.Logger) {
 		logger.Warn("Scheduler: graceful shutdown failed", "error", err)
 	}
 
+	// Stop and remove this worker's persistent service containers. Order:
+	// AFTER the scheduler stop (no more schedule work can start new services),
+	// BEFORE the final stats flush (cleanup is bounded work; the flush is the
+	// last-chance telemetry write and must not wait behind it). Non-fatal:
+	// ShutdownCleanup logs internally, and a Docker problem or timeout must
+	// never fail the process.
+	shutdownServices(svcCtrl, cfg.ConsumerName, logger)
+
 	// Final flush of the registry into SQLite before the deferred st.Close() runs.
 	// Bounded by a short timeout so a wedged SQLite cannot hang shutdown; failure
 	// is logged and shutdown continues (telemetry, not state). No-op when metrics
@@ -456,6 +471,20 @@ func Run(logger *slog.Logger) {
 	}
 
 	logger.Info("Shutdown complete")
+}
+
+// shutdownServices stops and removes THIS worker's persistent service
+// containers during graceful shutdown, bounded by shutdownServiceTimeout.
+// Deliberately non-fatal: ShutdownCleanup logs internally, and a Docker problem
+// or timeout must never fail the process (no os.Exit anywhere on this path).
+func shutdownServices(svcCtrl *reconciler.ServiceReconciler, hostname string, logger *slog.Logger) {
+	svcCtx, svcCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
+	defer svcCancel()
+	if _, err := svcCtrl.ShutdownCleanup(svcCtx, hostname); err != nil {
+		// ShutdownCleanup already logged the Warn; a Debug here marks the
+		// (non-fatal) failure in the shutdown trace without duplicating it.
+		logger.Debug("Service: shutdown cleanup returned error", "error", err)
+	}
 }
 
 // setupMetrics constructs the optional metrics components: a registry and the

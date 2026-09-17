@@ -181,3 +181,98 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 	}
 	t.Fatalf("expected %d running service containers for %s, got %d", want, name, got)
 }
+
+// TestIntegrationShutdownCleanupHostnameScoped proves graceful-shutdown cleanup
+// is hostname-scoped against a real daemon: two managers with distinct worker
+// identities each start a persistent service container; ShutdownCleanup of w1
+// removes only w1's container while w2's remains (and the container list
+// structurally contains ONLY relay service containers, so no unrelated
+// container could ever be touched by this path).
+func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
+	requireDocker(t)
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	w1host, w2host := "relay-it-w1", "relay-it-w2"
+	m1, err := runtime.NewManager(logger, nil, w1host)
+	if err != nil {
+		t.Fatalf("new manager w1: %v", err)
+	}
+	defer m1.Close()
+	m2, err := runtime.NewManager(logger, nil, w2host)
+	if err != nil {
+		t.Fatalf("new manager w2: %v", err)
+	}
+	defer m2.Close()
+
+	// Start one persistent service container per worker (distinct functions, a
+	// long-lived sleep under the shared node:24-alpine image). Unrelated
+	// non-Relay containers cannot appear in ServiceContainerList structurally
+	// (the strict relay.type=service filter), so hostname preservation is the
+	// complete scoping assertion; a plain no-label container sub-assertion is
+	// omitted because no relay-labeled start path exists for one.
+	fn1, fn2 := "int-sc-a", "int-sc-b"
+	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
+		Function:   fn1,
+		Entrypoint: "svc.js",
+		Port:       80,
+		Image:      "node:24-alpine",
+		Entry:      []string{"sh", "-c", "sleep 600"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("start w1 service: %v", err)
+	}
+	id2, err := m2.StartService(context.Background(), runtime.ServiceSpec{
+		Function:   fn2,
+		Entrypoint: "svc.js",
+		Port:       80,
+		Image:      "node:24-alpine",
+		Entry:      []string{"sh", "-c", "sleep 600"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("start w2 service: %v", err)
+	}
+
+	// Cleanup: stop whatever this test left running on either manager.
+	t.Cleanup(func() {
+		cc, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, m := range []*runtime.Manager{m1, m2} {
+			if list, err := m.ServiceContainerList(cc); err == nil {
+				_ = m.StopServiceContainers(cc, list)
+			}
+		}
+	})
+
+	svcW1 := NewServiceReconciler(m1, nil, routing.TraefikConfig{}, logger)
+	n, err := svcW1.ShutdownCleanup(context.Background(), w1host)
+	if err != nil {
+		t.Fatalf("shutdown cleanup w1: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("removed count = %d, want 1", n)
+	}
+
+	list, err := m1.ServiceContainerList(context.Background())
+	if err != nil {
+		t.Fatalf("list after cleanup: %v", err)
+	}
+	for _, c := range list {
+		if c.ID == id1 {
+			t.Fatal("w1's container survived ShutdownCleanup of w1")
+		}
+	}
+	list2, err := m2.ServiceContainerList(context.Background())
+	if err != nil {
+		t.Fatalf("list w2: %v", err)
+	}
+	found := false
+	for _, c := range list2 {
+		if c.ID == id2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("w2's container must survive ShutdownCleanup of w1")
+	}
+}

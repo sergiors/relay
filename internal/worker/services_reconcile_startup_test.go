@@ -123,3 +123,125 @@ func TestReconcileStartupServicesBoundedPerFunction(t *testing.T) {
 		t.Fatalf("Apply deadlines are identical (%v); want distinct per-function bounds", applyDeadlines)
 	}
 }
+
+// svcShutdownDocker is a minimal reconciler.Docker fake for the graceful
+// shutdown cleanup tests: it holds in-memory service containers (with worker
+// hostname identities) and records which containers ShutdownCleanup sent to
+// StopServiceContainers.
+type svcShutdownDocker struct {
+	mu         sync.Mutex
+	nextID     int
+	containers map[string]runtime.ServiceContainer
+	stopped    []string
+	stopDelay  time.Duration // optional artificial stop latency
+}
+
+func newSvcShutdownDocker() *svcShutdownDocker {
+	return &svcShutdownDocker{containers: map[string]runtime.ServiceContainer{}}
+}
+
+func (f *svcShutdownDocker) StartService(_ context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
+	return "", nil
+}
+
+func (f *svcShutdownDocker) NetworkExists(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
+
+func (f *svcShutdownDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+
+func (f *svcShutdownDocker) ServiceContainerList(context.Context) ([]runtime.ServiceContainer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]runtime.ServiceContainer, 0, len(f.containers))
+	for _, c := range f.containers {
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+func (f *svcShutdownDocker) StopServiceContainers(_ context.Context, containers []runtime.ServiceContainer) error {
+	if f.stopDelay > 0 {
+		time.Sleep(f.stopDelay)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range containers {
+		f.stopped = append(f.stopped, c.ID)
+		delete(f.containers, c.ID)
+	}
+	return nil
+}
+
+// addService inserts one service container for the given worker hostname.
+func (f *svcShutdownDocker) addService(id, hostname string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	f.containers[id] = runtime.ServiceContainer{
+		ID:       id,
+		Function: "fn",
+		Hostname: hostname,
+		Image:    "img-1",
+	}
+}
+
+func (f *svcShutdownDocker) stoppedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.stopped...)
+}
+
+func (f *svcShutdownDocker) remainingCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.containers)
+}
+
+// TestShutdownCleanupHostnameScopedWorkerSide: the worker-side ShutdownCleanup
+// path (via shutdownServices with the bound the helper applies internally)
+// removes only the containers owned by this worker's hostname, preserves other
+// workers', and returns promptly even with an already-cancelled context (the
+// deadline is the caller's responsibility; shutdown continues anyway).
+func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
+	fake := newSvcShutdownDocker()
+	fake.addService("own-1", "relay-worker-a")
+	fake.addService("own-2", "relay-worker-a")
+	fake.addService("other-1", "relay-worker-b")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger)
+
+	shutdownServices(svcCtrl, "relay-worker-a", logger)
+
+	consoleFake := fake // the same fake: shutdownServices already ran the cleanup
+	stopped := consoleFake.stoppedIDs()
+	if len(stopped) != 2 {
+		t.Fatalf("stops = %v, want [own-1 own-2] (own hostname only)", stopped)
+	}
+	for _, id := range stopped {
+		if id != "own-1" && id != "own-2" {
+			t.Fatalf("stop of foreign container %s; want own hostname only: %v", id, stopped)
+		}
+	}
+	if remaining := fake.remainingCount(); remaining != 1 {
+		t.Fatalf("remaining containers = %d, want 1 (other worker preserved)", remaining)
+	}
+
+	// Already-cancelled-context tolerance: ShutdownCleanup must return promptly
+	// when the fake's StopServiceContainers is instantaneous — the deadline is
+	// the caller's (shutdownServices') responsibility, not the reconciler's.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, err := svcCtrl.ShutdownCleanup(cancelCtx, "relay-worker-b"); err != nil {
+		t.Fatalf("ShutdownCleanup with cancelled ctx: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > shutdownServiceTimeout {
+		t.Fatalf("ShutdownCleanup took %v; must not exceed the bound", elapsed)
+	}
+	if remaining := fake.remainingCount(); remaining != 0 {
+		t.Fatalf("remaining containers = %d, want 0 (cancelled ctx still removes via the fake)", remaining)
+	}
+}

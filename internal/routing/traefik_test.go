@@ -19,7 +19,7 @@ const (
 
 // An unrouted service (empty host) gets NO Traefik labels at all.
 func TestTraefikLabelsUnroutedNil(t *testing.T) {
-	for _, cfg := range []TraefikConfig{{}, {Network: "proxy"}, {Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}} {
+	for _, cfg := range []TraefikConfig{{}, {Network: "proxy"}, {Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}} {
 		labels := TraefikLabels("fn", "app/main.py", "", 8000, cfg)
 		if labels != nil {
 			t.Fatalf("unrouted service labels = %v, want nil", labels)
@@ -106,7 +106,7 @@ func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
 func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 	id := "relay-fn-svc-js"
 	t.Run("entrypoint", func(t *testing.T) {
-		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", Entrypoint: "websecure"})
+		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", EntryPoints: "websecure"})
 		if got := labels[routerPrefix+id+".entrypoints"]; got != "websecure" {
 			t.Fatalf("entrypoints = %q, want websecure; labels = %v", got, labels)
 		}
@@ -143,11 +143,25 @@ func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 	})
 }
 
+// A comma-separated entrypoint value is passed through verbatim into the
+// label: no trimming, splitting, or reordering (Traefik accepts the raw
+// comma-separated string in its label grammar).
+func TestTraefikLabelsEntryPointsCommaSeparatedVerbatim(t *testing.T) {
+	id := "relay-fn-svc-js"
+	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", EntryPoints: "web,websecure"})
+	if got := labels[routerPrefix+id+".entrypoints"]; got != "web,websecure" {
+		t.Fatalf("entrypoints = %q, want web,websecure verbatim; labels = %v", got, labels)
+	}
+	if len(labels) != 5 {
+		t.Fatalf("labels = %v, want 5 (4 base + entrypoints)", labels)
+	}
+}
+
 // All three optional values set together: the full 8-label set on the same id.
 func TestTraefikLabelsFullHTTPS(t *testing.T) {
 	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, TraefikConfig{
 		Network:      "proxy",
-		Entrypoint:   "websecure",
+		EntryPoints:  "websecure",
 		CertResolver: "letsencrypt",
 		Priority:     ptr(100),
 	})
@@ -176,7 +190,7 @@ func TestTraefikLabelsFullHTTPS(t *testing.T) {
 func TestTraefikLabelsEmptyOptionalsUnset(t *testing.T) {
 	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{
 		Network:      "proxy",
-		Entrypoint:   "",
+		EntryPoints:  "",
 		CertResolver: "",
 		Priority:     nil,
 	})

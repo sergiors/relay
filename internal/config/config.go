@@ -54,10 +54,12 @@ type Config struct {
 	// network itself and verifies it exists on every routed reconcile. Empty
 	// means routing is not configured (unrouted services are unaffected).
 	TraefikNetwork string
-	// TraefikEntrypoint is the optional TRAEFIK_ENTRYPOINT value (e.g.
-	// "websecure"): when set on a routed service Relay generates the Traefik
-	// router `entrypoints` label. Empty = the label is omitted (no default).
-	TraefikEntrypoint string
+	// TraefikEntryPoints is the optional TRAEFIK_ENTRYPOINTS value: one or
+	// more comma-separated Traefik entrypoint names (e.g. "websecure" or
+	// "web,websecure", passed through verbatim). When set on a routed service
+	// Relay generates the Traefik router `entrypoints` label. Empty = the
+	// label is omitted (no default).
+	TraefikEntryPoints string
 	// TraefikCertResolver is the optional TRAEFIK_CERTRESOLVER value (e.g.
 	// "letsencrypt"): when set on a routed service Relay generates both the
 	// Traefik router `tls=true` and `tls.certresolver` labels. Empty = both
@@ -102,7 +104,7 @@ func Load(logger *slog.Logger) Config {
 		MaxConcurrency:      loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
 		MaxBufferedEvents:   loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
 		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
-		TraefikEntrypoint:   getEnv("TRAEFIK_ENTRYPOINT", ""),
+		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
 		TraefikPriority:     loadOptionalPositiveInt(logger, "TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", "")),
 	}

@@ -10,7 +10,9 @@
 // touched here: each function's reconcile owns only its own containers, and
 // SweepOrphans is the single cross-function pass (called once at startup with
 // the set of live function names) that removes containers whose function no
-// longer exists.
+// longer exists. ShutdownCleanup is the graceful-shutdown counterpart: it
+// removes service containers owned by this worker only; startup convergence
+// remains the crash-recovery path when shutdown cleanup did not execute.
 //
 // Ordering guarantees relied on by the worker:
 //   - Reconcile is idempotent: when already converged it lists containers once
@@ -218,8 +220,8 @@ func Reconcile(
 				// Optional routing values log only when set, omitting empty
 				// ones; the generated labels themselves are never logged.
 				var attrs []any
-				if traefik.Entrypoint != "" {
-					attrs = append(attrs, "entrypoints", traefik.Entrypoint)
+				if traefik.EntryPoints != "" {
+					attrs = append(attrs, "entrypoints", traefik.EntryPoints)
 				}
 				if traefik.CertResolver != "" {
 					attrs = append(attrs, "certresolver", traefik.CertResolver)
@@ -374,7 +376,65 @@ func RemoveAll(ctx context.Context, d Docker, fnName string, log *slog.Logger) {
 	}
 }
 
-// ServiceReconciler ties Reconcile, RemoveAll, and SweepOrphans to a single
+// ShutdownCleanup stops and removes every persistent service container owned
+// by THIS worker: relay.hostname == hostname (the consumer identity). Graceful
+// Relay shutdown removes this worker's persistent service containers; crash
+// recovery remains handled by startup reconciliation.
+//
+// It exists as its own smallest operation because RemoveAll is function-scoped
+// and SweepOrphans is cross-function (neither is hostname-scoped by design);
+// here ownership is hostname-scoped only. The returned count is the number of
+// this worker's containers selected for removal.
+//
+// A container with an empty Hostname is NOT claimed by any worker: the hostname
+// is unmatchable, so ownership is unknowable — startup reconciliation handles
+// such strays. As a defensive guard, an empty hostname argument selects nothing.
+func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if hostname == "" {
+		return 0, nil
+	}
+	containers, err := c.docker.ServiceContainerList(ctx)
+	if err != nil {
+		logErr := fmt.Errorf("service: list containers: %w", err)
+		if c.log != nil {
+			c.log.Warn("Service: shutdown cleanup failed", "error", logErr)
+		}
+		return 0, logErr
+	}
+	var own []runtime.ServiceContainer
+	for _, ct := range containers {
+		// Strict equality: a container without a hostname label is not claimed
+		// by any worker's shutdown (ownership unknowable; startup reconciliation
+		// handles strays).
+		if ct.Hostname == hostname {
+			own = append(own, ct)
+		}
+	}
+	if len(own) == 0 {
+		if c.log != nil {
+			c.log.Debug("Service: shutdown cleanup: nothing to clean", "hostname", hostname)
+		}
+		return 0, nil
+	}
+	err = c.docker.StopServiceContainers(ctx, own)
+	if c.log != nil {
+		if err != nil {
+			// StopServiceContainers keeps the partial progress (everything it
+			// could stop/remove is gone); the error is still returned to the
+			// caller — cleanup is never fatal to shutdown itself.
+			c.log.Warn("Service: shutdown cleanup failed", "error", err)
+		} else {
+			c.log.Info("Service: shutdown cleanup complete", "containers", len(own))
+		}
+	}
+	return len(own), err
+}
+
+// ServiceReconciler ties Reconcile, RemoveAll, SweepOrphans, and ShutdownCleanup
+// to a single
 // Docker implementation, secret resolver, and logger, serializing all service
 // mutations with one mutex so concurrent reconciler ticks and startup sweeps
 // cannot interleave container operations.

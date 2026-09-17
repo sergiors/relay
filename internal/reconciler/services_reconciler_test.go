@@ -28,7 +28,13 @@ type fakeContainer struct {
 	entry      []string // the long-lived process command passed to StartService
 	labels     map[string]string
 	network    string // spec.Network passed to StartService
+	hostname   string // the worker identity (relay.hostname) that owns the container
 }
+
+// defaultFakeHostname is the worker identity containers get when started via
+// StartService; ShutdownCleanup tests create containers for other workers by
+// seeding f.ctrs directly.
+const defaultFakeHostname = "w1"
 
 // fakeDocker is an in-memory Docker for Reconcile unit tests. Containers are
 // keyed by a deterministic id so tests can inspect and manipulate them.
@@ -65,6 +71,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		entry:      spec.Entry,
 		labels:     spec.Labels,
 		network:    spec.Network,
+		hostname:   defaultFakeHostname,
 	}
 	return id, nil
 }
@@ -89,6 +96,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			State:      c.state,
 			Replica:    c.replica,
 			Port:       c.port,
+			Hostname:   c.hostname,
 			Labels:     c.labels,
 		})
 	}
@@ -1048,7 +1056,7 @@ func TestReconcileRoutedHappyPath(t *testing.T) {
 func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test"})
-	cfg := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	cfg := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cfg, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1086,12 +1094,12 @@ func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
 func TestReconcileCertResolverClearedReplacesWithoutTLS(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	start := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	start := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, start, noLog()); err != nil {
 		t.Fatalf("reconcile https: %v", err)
 	}
 
-	cleared := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", Priority: intPtr(100)}
+	cleared := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", Priority: intPtr(100)}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cleared, noLog()); err != nil {
 		t.Fatalf("reconcile cleared: %v", err)
 	}
@@ -1121,12 +1129,12 @@ func TestReconcileCertResolverClearedReplacesWithoutTLS(t *testing.T) {
 func TestReconcilePriorityClearedReplacesWithoutPriority(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test"})
-	start := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", Priority: intPtr(42)}
+	start := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", Priority: intPtr(42)}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, start, noLog()); err != nil {
 		t.Fatalf("reconcile priority: %v", err)
 	}
 
-	cleared := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure"}
+	cleared := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure"}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cleared, noLog()); err != nil {
 		t.Fatalf("reconcile cleared: %v", err)
 	}
@@ -1150,7 +1158,7 @@ func TestReconcilePriorityClearedReplacesWithoutPriority(t *testing.T) {
 func TestReconcileUnroutedWithHTTPSConfigNoRouting(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
-	cfg := routing.TraefikConfig{Network: "proxy", Entrypoint: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
+	cfg := routing.TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: intPtr(100)}
 	if _, err := Reconcile(context.Background(), f, "fn", tmpl, "img-1", nil, nil, cfg, noLog()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1295,5 +1303,119 @@ func TestRoutingLabelsMatch(t *testing.T) {
 	// The desired nil actual case: routed service, container without the labels.
 	if routingLabelsMatch(map[string]string{"traefik.enable": "true"}, nil) {
 		t.Error("routed desired vs unlabeled container must not match")
+	}
+}
+
+// TestShutdownCleanupRemovesOwnContainers: cleanup(hostname) selects exactly the
+// containers whose Hostname == hostname (2 replicas of one function) and stops
+// them all, returning the count.
+func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
+	f := newFakeDocker()
+	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
+		Function: "fn", Entrypoint: "svc.js", Port: 80, Image: "img-1",
+	}, 0); err != nil {
+		t.Fatalf("start replica 0: %v", err)
+	}
+	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
+		Function: "fn", Entrypoint: "svc.js", Port: 80, Image: "img-1",
+	}, 1); err != nil {
+		t.Fatalf("start replica 1: %v", err)
+	}
+
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, noLog())
+	n, err := c.ShutdownCleanup(context.Background(), defaultFakeHostname)
+	if err != nil {
+		t.Fatalf("shutdown cleanup: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("removed count = %d, want 2", n)
+	}
+	if got := len(f.stops); got != 2 {
+		t.Fatalf("stops = %d, want 2", got)
+	}
+	if got := f.countForFunction("fn"); got != 0 {
+		t.Fatalf("containers left = %d, want 0", got)
+	}
+}
+
+// TestShutdownCleanupPreservesOtherWorkers: cleanup("w1") removes only w1's
+// containers; another worker's (w2) and a container without a hostname label
+// (empty Hostname — ownership unknowable) are preserved.
+func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
+	f := newFakeDocker()
+	seed := func(id, hostname string) {
+		f.ctrs[id] = &fakeContainer{
+			id: id, function: "fn", entrypoint: "svc.js", image: "img-1",
+			port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
+		}
+	}
+	seed("w1-a", "w1")
+	seed("w1-b", "w1")
+	seed("w2-a", "w2")
+	seed("none-a", "") // no hostname label: never claimed by any worker
+
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, noLog())
+	n, err := c.ShutdownCleanup(context.Background(), "w1")
+	if err != nil {
+		t.Fatalf("shutdown cleanup: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("removed count = %d, want 2", n)
+	}
+	if got := len(f.stops); got != 2 || f.stops[0] != "w1-a" || f.stops[1] != "w1-b" {
+		t.Fatalf("stops = %v, want [w1-a w1-b]", f.stops)
+	}
+	f.mu.Lock()
+	_, w2Alive := f.ctrs["w2-a"]
+	_, noneAlive := f.ctrs["none-a"]
+	f.mu.Unlock()
+	if !w2Alive || !noneAlive {
+		t.Fatalf("other workers' containers must be preserved (w2Alive=%v noneAlive=%v)", w2Alive, noneAlive)
+	}
+	if got := f.countForFunction("fn"); got != 2 {
+		t.Fatalf("preserved count = %d, want 2", got)
+	}
+}
+
+// TestShutdownCleanupStopFailureDoesNotBlock: a failing stop surfaces the
+// error and logs the Warn, but the other own containers are still removed
+// (partial progress is kept).
+func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["fail-1"] = &fakeContainer{
+		id: "fail-1", function: "fn", entrypoint: "svc.js", image: "img-1",
+		port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
+	}
+	f.ctrs["ok-1"] = &fakeContainer{
+		id: "ok-1", function: "fn", entrypoint: "svc.js", image: "img-1",
+		port: 80, replica: 1, state: container.StateRunning, hostname: "w1",
+	}
+	f.failStopFor = "fail-1"
+
+	logger, capture := newCaptureLogger(slog.LevelWarn)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	n, err := c.ShutdownCleanup(context.Background(), "w1")
+	if err == nil {
+		t.Fatal("expected the stop failure to be surfaced")
+	}
+	if !strings.Contains(err.Error(), "stop failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("selected count = %d, want 2", n)
+	}
+	if !strings.Contains(capture.String(), "Service: shutdown cleanup failed") {
+		t.Fatalf("expected the Warn \"Service: shutdown cleanup failed\", got:\n%s", capture.String())
+	}
+	// Partial progress: the non-failing own container is gone, the failing one remains.
+	f.mu.Lock()
+	_, failAlive := f.ctrs["fail-1"]
+	_, okAlive := f.ctrs["ok-1"]
+	f.mu.Unlock()
+	if okAlive {
+		t.Fatal("the non-failing own container must have been removed despite the failing stop")
+	}
+	if !failAlive {
+		t.Fatal("the failing container must remain (it could not be stopped)")
 	}
 }

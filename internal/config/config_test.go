@@ -369,16 +369,16 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 func TestLoadTraefikOptionalValues(t *testing.T) {
 	setRequiredEnv(t)
 	cfg := Load(discardLogger())
-	if cfg.TraefikEntrypoint != "" || cfg.TraefikCertResolver != "" || cfg.TraefikPriority != nil {
+	if cfg.TraefikEntryPoints != "" || cfg.TraefikCertResolver != "" || cfg.TraefikPriority != nil {
 		t.Fatalf("Traefik optional fields = %+v, want zero/nil when unset", cfg)
 	}
 
-	t.Setenv("TRAEFIK_ENTRYPOINT", "websecure")
+	t.Setenv("TRAEFIK_ENTRYPOINTS", "websecure")
 	t.Setenv("TRAEFIK_CERTRESOLVER", "letsencrypt")
 	t.Setenv("TRAEFIK_PRIORITY", "100")
 	cfg = Load(discardLogger())
-	if cfg.TraefikEntrypoint != "websecure" {
-		t.Fatalf("TraefikEntrypoint = %q, want websecure", cfg.TraefikEntrypoint)
+	if cfg.TraefikEntryPoints != "websecure" {
+		t.Fatalf("TraefikEntryPoints = %q, want websecure", cfg.TraefikEntryPoints)
 	}
 	if cfg.TraefikCertResolver != "letsencrypt" {
 		t.Fatalf("TraefikCertResolver = %q, want letsencrypt", cfg.TraefikCertResolver)

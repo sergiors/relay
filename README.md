@@ -170,7 +170,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
 | `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
 | `TRAEFIK_NETWORK`        | no       | Docker network Traefik is attached to; required only when a service declares `host`.   |
-| `TRAEFIK_ENTRYPOINT`     | no       | Traefik router `entrypoints` label on routed services; unset = label omitted.          |
+| `TRAEFIK_ENTRYPOINTS`    | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted. |
 | `TRAEFIK_CERTRESOLVER`   | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.    |
 | `TRAEFIK_PRIORITY`       | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer. |
 
@@ -803,8 +803,11 @@ Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.function`, `relay.entrypoint`, plus the image,
 port, and replica slot), never by name alone. Service containers carry no
 `relay.handler` label (that key identifies event/schedule handlers) — the
-entrypoint IS the service. Stale containers left behind by a crashed Relay
-process are swept at the next startup.
+entrypoint IS the service. On graceful shutdown, Relay stops and removes the
+service containers owned by that worker (scoped by `relay.hostname`, so other
+workers' containers are untouched); stale containers left behind by a crashed
+Relay process are swept at the next startup (per-function reconcile plus the
+startup orphan sweep).
 
 The environment each replica gets: the runtime's plan environment (e.g.
 `PYTHONDONTWRITEBYTECODE=1` for Python), then the template's `env` values,
@@ -841,14 +844,14 @@ corresponding value is set — nothing is defaulted (no implicit `websecure`,
 when a label is omitted):
 
 ```
-traefik.http.routers.<id>.entrypoints                   = <TRAEFIK_ENTRYPOINT>          (only when set)
+traefik.http.routers.<id>.entrypoints                   = <TRAEFIK_ENTRYPOINTS>         (only when set)
 traefik.http.routers.<id>.tls                           = true                          (only when TRAEFIK_CERTRESOLVER is set)
 traefik.http.routers.<id>.tls.certresolver              = <TRAEFIK_CERTRESOLVER>        (only when set)
 traefik.http.routers.<id>.priority                      = <TRAEFIK_PRIORITY>            (only when set)
 ```
 
 So a routed service with
-`TRAEFIK_NETWORK=proxy TRAEFIK_ENTRYPOINT=websecure TRAEFIK_CERTRESOLVER=letsencrypt TRAEFIK_PRIORITY=100`
+`TRAEFIK_NETWORK=proxy TRAEFIK_ENTRYPOINTS=websecure TRAEFIK_CERTRESOLVER=letsencrypt TRAEFIK_PRIORITY=100`
 gets all eight labels; with network-only config it gets exactly the four above.
 
 - `<id>` is a single deterministic Traefik-safe router/service id shared by the
@@ -865,11 +868,11 @@ gets all eight labels; with network-only config it gets exactly the four above.
   `TRAEFIK_NETWORK=proxy` and no such network, the reconcile reports
   `service "app/main.py": Traefik network "proxy" does not exist`.
 - A service without `host` gets no Traefik labels at all and joins no extra
-  network: it stays internal. `TRAEFIK_ENTRYPOINT`, `TRAEFIK_CERTRESOLVER`, and
+  network: it stays internal. `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`, and
   `TRAEFIK_PRIORITY` only affect routed services and always appear on the same
   `<id>` as the router/service slices.
 - Reconciliation is label-aware: changing `host`, `port`, or any routing value
-  (`TRAEFIK_NETWORK`, `TRAEFIK_ENTRYPOINT`, `TRAEFIK_CERTRESOLVER`,
+  (`TRAEFIK_NETWORK`, `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`,
   `TRAEFIK_PRIORITY`) makes the running container stale and it is **replaced**
   with one carrying the updated routing labels. Removing `host` replaces the
   routed container with an internal (unlabeled) one; clearing an optional value
