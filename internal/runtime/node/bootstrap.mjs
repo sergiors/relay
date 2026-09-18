@@ -1,6 +1,6 @@
 // Relay's Node.js function bootstrap.
 //
-// Since Relay 1.x one execution container per function STAYS ALIVE between
+// One execution container per function STAYS ALIVE between
 // invocations and serves a persistent, line-delimited JSON protocol on
 // stdin/stdout (see internal/runtime/protocol.go in the Relay source):
 //
@@ -114,7 +114,8 @@ async function handle(line) {
   try {
     const idx = handler.lastIndexOf(".");
     const modulePart = idx > 0 ? handler.slice(0, idx) : "";
-    const funcName = idx > 0 && idx < handler.length - 1 ? handler.slice(idx + 1) : "";
+    const funcName =
+      idx > 0 && idx < handler.length - 1 ? handler.slice(idx + 1) : "";
     if (!modulePart || !funcName) {
       throw new Error("invalid handler " + JSON.stringify(handler));
     }
@@ -130,17 +131,28 @@ async function handle(line) {
       fn = mod.default[funcName];
     }
     if (typeof fn !== "function") {
-      throw new Error("module " + JSON.stringify(modulePart) + " has no function " + JSON.stringify(funcName));
+      throw new Error(
+        "module " +
+          JSON.stringify(modulePart) +
+          " has no function " +
+          JSON.stringify(funcName),
+      );
     }
 
     await fn(req.event ?? null);
   } catch (e) {
     // Module resolution, import errors, and handler errors are all
     // invocation failures (ok:false): the container stays healthy.
-    const stack = e && e.stack ? e.stack : e && e.message ? e.message : String(e);
+    const stack =
+      e && e.stack ? e.stack : e && e.message ? e.message : String(e);
     error = "handler " + JSON.stringify(handler) + " failed: " + stack;
     // Mirror the operator-visible stderr output of the one-shot bootstrap.
-    console.error("handler " + JSON.stringify(handler) + " failed: " + (e && e.stack ? e.stack : e));
+    console.error(
+      "handler " +
+        JSON.stringify(handler) +
+        " failed: " +
+        (e && e.stack ? e.stack : e),
+    );
   }
 
   respond(id, error === null, error ?? undefined);
@@ -158,7 +170,9 @@ rl.on("line", (line) => {
     .catch((e) => {
       // A error escaping the handler's own try/catch (e.g. the env loop) is a
       // fatal protocol failure: crash the process so Relay discards.
-      console.error("bootstrap internal error: " + (e && e.stack ? e.stack : e));
+      console.error(
+        "bootstrap internal error: " + (e && e.stack ? e.stack : e),
+      );
       process.exit(1);
     });
 });

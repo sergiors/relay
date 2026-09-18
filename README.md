@@ -381,14 +381,18 @@ only when no managed function image references them. An image with no
 
 ### Execution container lifecycle
 
-Each function keeps **one reused execution container** per image version: the
-first invocation starts it and subsequent invocations exchange request/response
-frames with the same long-running process instead of paying container startup on
-every event. Because the interpreter process persists, function code must not
-assume process-global state is fresh per invocation (module-level state and
+Each function keeps a **bounded warm pool of reused execution containers**, up
+to its resolved `concurrency`, per image version: the first invocation starts a
+container and subsequent invocations exchange request/response frames with the
+same long-running process instead of paying container startup on every event,
+while concurrent invocations of the same function lease **distinct** containers.
+Because the interpreter process persists, function code must not assume
+process-global state is fresh per invocation (module-level state and
 per-invocation env values survive). Timeouts, process exits, protocol errors,
-image changes, and shutdown still invalidate the container, and the next
-invocation starts a fresh one.
+image changes, and shutdown still invalidate a container, and the next
+invocation starts a fresh one. On an image change, idle old-version containers
+are discarded immediately and busy ones are retired and discarded as soon as
+their invocation releases; a retired container is never leased again.
 
 Every function execution container is created with Docker **AutoRemove**, so the
 daemon removes the container once its process exits. Relay relies on AutoRemove
@@ -1553,7 +1557,7 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 ## Out of scope
 
 Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
-concurrency, warm containers, build caching, source hashing,
+build caching, source hashing,
 registries, k8s, configurable retry _policies per rule_ (delays/attempt counts
 are fixed internals — a rule's `retries` count is configurable, the backoff
 schedule is not), idempotency, exactly-once, per-function

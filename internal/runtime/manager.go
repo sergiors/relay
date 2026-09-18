@@ -44,10 +44,10 @@ func engineFor(spec plan.Spec) (interface {
 
 // Manager prepares function images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation, and a
-// per-function execution-container cache: each function runs ONE reused
-// container per image version (see container_cache.go), kept alive between
-// invocations and discarded on timeout/process exit/protocol error/image
-// change/shutdown.
+// per-function warm container pool: each function keeps up to its resolved
+// concurrency reused containers per image version (see container_cache.go),
+// kept alive between invocations and leased one-per-invocation, and discarded
+// on timeout/process exit/protocol error/image change/shutdown.
 type Manager struct {
 	log *slog.Logger
 	cli *client.Client
@@ -117,6 +117,13 @@ type Prepared struct {
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
 	// execution container for this function, after the base RELAY_HANDLER var.
 	Env []string
+	// Concurrency is the function's RESOLVED per-function concurrency (the
+	// template's `concurrency`, defaulted at template parse). It is the bound on
+	// the function's warm container pool: at most this many containers are kept
+	// and leased concurrently. It intentionally matches the runner's
+	// per-function semaphore so the pool is not a second limiter in the runner
+	// path; direct Execute callers that bypass the runner are bounded by it.
+	Concurrency int
 	// Dependency is the full "relay-dep-*" reference this function image was
 	// built FROM, or "" when the function declares no dependency layer. It is
 	// the function image's parent, so a caller (the runner) knows which
@@ -173,7 +180,13 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// the existing function image — which inherits its layers — would never have
 	// built). Computing the dependency fingerprint needs the same fnDir reads the
 	// function fingerprint above already performed, so it stays cheap.
-	funcPrepared := &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env}
+	funcPrepared := &Prepared{
+		Name:        fn.Name,
+		Image:       image,
+		Fingerprint: fp,
+		Env:         p.Env,
+		Concurrency: resolveConcurrency(fn),
+	}
 	if !p.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
 		// name the function image's dependency without touching the daemon.
@@ -243,7 +256,26 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		"duration", d,
 		"result", "success",
 	)
-	return &Prepared{Name: fn.Name, Image: image, Fingerprint: fp, Env: p.Env, Dependency: funcPrepared.Dependency}, nil
+	return &Prepared{
+		Name:        fn.Name,
+		Image:       image,
+		Fingerprint: fp,
+		Env:         p.Env,
+		Concurrency: funcPrepared.Concurrency,
+		Dependency:  funcPrepared.Dependency,
+	}, nil
+}
+
+// resolveConcurrency returns the function's resolved per-function concurrency
+// for the warm container pool. It reads the template's parsed value, defaulting
+// a zero value (a function built without parsing, or a nil template) to
+// function.DefaultConcurrency — the same fallback the runner applies to its
+// per-function semaphore, so the pool's bound and the runner's bound agree.
+func resolveConcurrency(fn function.Function) int {
+	if fn.Template == nil || fn.Template.Concurrency < 1 {
+		return function.DefaultConcurrency
+	}
+	return fn.Template.Concurrency
 }
 
 // ensureDependencyImage builds the dependency image for the function's
@@ -306,14 +338,22 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 	return depRef, nil
 }
 
-// Execute runs the given handler invocation against the function's REUSED
-// execution container (one per function per image version; see
-// container_cache.go and execution_container.go). The first invocation for a
-// function starts the container (stamping its creation-time identity labels
-// from the RunMeta in ctx); subsequent invocations reuse the same container
-// over the line-JSON invocation protocol until it is discarded (timeout,
-// process exit, protocol error, image change). A handler failure (ok:false)
-// does NOT discard it.
+// Execute runs the given handler invocation against a REUSED execution
+// container leased from the function's warm pool (up to Prepared.Concurrency
+// containers per function per image version; see container_cache.go and
+// execution_container.go). The first invocation for a function starts a
+// container (stamping its creation-time identity labels from the RunMeta in
+// ctx); concurrent invocations of the same function lease distinct containers,
+// and each container serves one invocation at a time over the line-JSON
+// invocation protocol until it is discarded (timeout, process exit, protocol
+// error, image change). A handler failure (ok:false) does NOT discard it.
+//
+// The pool's bound is Prepared.Concurrency, the same resolved value the
+// runner's per-function semaphore uses, so in the runner path the pool never
+// blocks (the semaphore already admits at most that many concurrent calls).
+// Direct callers that bypass the runner are bounded by the pool itself; when
+// the pool is at capacity, Execute blocks until a lease is released, ctx is
+// done, or the Manager is closed (errPoolClosed).
 //
 // The context must carry the per-invocation timeout; a timeout discards the
 // container (kill + remove, reason "timeout") and is treated as an invocation
@@ -367,15 +407,25 @@ func (m *Manager) Execute(
 	start := func() (reusableContainer, error) {
 		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, idMeta)
 	}
+	// Prepared.Concurrency is populated by Prepare from the function's resolved
+	// template; a hand-built Prepared (direct/integration callers) may leave it
+	// zero, so fall back to the function default — the same bound the runner
+	// applies, keeping the pool from ever being a stricter limiter than the
+	// runner's per-function semaphore.
+	max := prepared.Concurrency
+	if max < 1 {
+		max = function.DefaultConcurrency
+	}
 	return m.containers.execute(
-		ctx, prepared.Name, prepared.Image, start, handler, eventJSON, envMap(extraEnv),
+		ctx, prepared.Name, prepared.Image, max, start, handler, eventJSON, envMap(extraEnv),
 	)
 }
 
-// InvalidateImage discards any cached execution container running the given
-// image, WITHOUT blocking: an entry mid-Invoke records the invalidation and
-// drains it right after the in-flight invocation completes (TryLock
-// semantics). It is called by the runner when retiring an image so the image's
+// InvalidateImage retires any cached execution container running the given
+// image, WITHOUT blocking: idle containers are discarded immediately and busy
+// ones are marked retired and discarded as soon as their invocation releases.
+// No later acquire can be handed a pre-invalidation container for that image.
+// It is called by the runner when retiring an image so the image's
 // ErrImageInUse container-reference guard clears promptly.
 func (m *Manager) InvalidateImage(image string) {
 	m.containers.invalidateImage(image)

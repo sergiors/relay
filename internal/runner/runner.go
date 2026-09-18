@@ -232,11 +232,12 @@ type Runner struct {
 // images without depending on the runtime package concretely; test fakes that
 // do not implement it simply yield a nil cleaner (no retirement).
 // ContainerInvalidator is the optional capability of the runtime executor
-// that image retirement needs on top of ImageCleaner: invalidate cached
+// that image retirement needs on top of ImageCleaner: invalidate pooled
 // execution containers for a retired image so the image's
 // container-reference guard clears promptly. Implementations must never
-// block: Manager.InvalidateImage TryLocks and skips when an invocation is in
-// flight.
+// block on an in-flight invocation: Manager.InvalidateImage discards idle
+// containers immediately and retires busy ones (discarded on release) without
+// waiting for them.
 type ContainerInvalidator interface {
 	// InvalidateImage discards any cached execution container running the
 	// given image.
@@ -460,12 +461,12 @@ func (r *Runner) RetireImage(image string) {
 		// Already retired (first retirement owns removal); nothing to do.
 		return
 	}
-	// Invalidate cached execution containers running this image BEFORE any
+	// Invalidate pooled execution containers running this image BEFORE any
 	// removal attempt: the discard clears the image's relay-owned-container
 	// reference promptly, so ErrImageInUse / the reference guard does not wait
-	// for a retry pass. InvalidateImage is strictly non-blocking (TryLock
-	// semantics manager-side), so retirement never stalls on an in-flight
-	// invocation.
+	// for a retry pass. InvalidateImage is strictly non-blocking manager-side
+	// (idle containers are discarded now, busy ones retired until release), so
+	// retirement never stalls on an in-flight invocation.
 	if inv := r.invalidatorResolver(); inv != nil {
 		inv.InvalidateImage(image)
 	}
@@ -642,6 +643,12 @@ func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context
 // concurrency limit and never resized mid-flight: per-function semaphores are
 // created first-wins by name, and the global semaphore is rebuilt by
 // SetMaxConcurrency.
+//
+// The per-function semaphore is the ONLY per-function invocation limiter: the
+// runtime's warm container pool is sized from the same resolved concurrency, so
+// the semaphore always admits no more concurrent Execute calls than the pool
+// has containers, and the pool never blocks in the runner path. The global
+// semaphore is the broader cap shared across functions.
 type semaphore struct {
 	slots chan struct{}
 }

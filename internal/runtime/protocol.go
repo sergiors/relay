@@ -5,10 +5,11 @@ import (
 	"sync"
 )
 
-// The persistent invocation protocol. Since Relay 1.x execution containers are
-// REUSED across invocations for the same function: one container per function
-// (per image version) stays alive as a long-running bootstrap process, and each
-// invocation is one request/response frame exchange over the container's stdin
+// The persistent invocation protocol. Execution containers are
+// REUSED across invocations for the same function: each pooled container (up to
+// the function's concurrency, per image version) stays alive as a long-running
+// bootstrap process and is leased to one invocation at a time, and each
+// invocation is one request/response frame exchange over that container's stdin
 // and stdout. The bootstrap is a line-JSON server side:
 //
 //	Relay → stdin:   {"id":"<8-16 hex>","handler":"mod.func","event":<raw>,"env":{"K":"V"}}

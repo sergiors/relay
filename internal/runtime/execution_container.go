@@ -21,15 +21,15 @@ import (
 // invocation protocol (see protocol.go): Start creates and starts the container
 // and its output demultiplexers, Invoke performs one sequential
 // request/response exchange. All protocol I/O is serialized: the owning
-// Manager's per-function entry lock queues overlapping invocations (phase-1
-// serialization), and ioMu below is the belt-and-braces guard inside the
-// container itself.
+// Manager's per-function pool leases a container to exactly one invocation at a
+// time (distinct invocations of the same function run on distinct containers),
+// and ioMu below is the belt-and-braces guard inside the container itself.
 //
 // Discard semantics: the container is discarded (killed, removed, and poisoned
 // against reuse) on timeout, process exit, protocol error, image change, or
 // shutdown. A handler failure (ok:false response) is NOT a discard — the
-// container stays healthy for the next invocation. On any discard the Manager
-// observes (or cache drops) the container and starts a fresh one on demand.
+// container stays healthy for the next invocation. On any discard the pool
+// observes (or drops) the container on release and starts a fresh one on demand.
 type executionContainer struct {
 	cli   *client.Client
 	log   *slog.Logger
@@ -306,8 +306,8 @@ func exitEvent(info exitInfo) error {
 // Invoke performs one invocation against the reuse container: registers the
 // response channel, writes one request frame line to stdin, and blocks for the
 // response, the container's death, the unexpected-protocol signal, or ctx
-// cancellation. It must be called with the owning entry's lock held (the
-// manager serializes); ioMu additionally prevents any racing writer.
+// cancellation. It is called by the pool on a container leased to exactly one
+// invocation; ioMu additionally prevents any racing writer on this container.
 //
 // Timeout: ctx.Done while in flight kills + removes + discards the container
 // (reason "timeout") and returns the ctx error wrapped exactly like the

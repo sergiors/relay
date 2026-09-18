@@ -581,6 +581,37 @@ func findContainerByLabel(ctx context.Context, cli *client.Client, key, value st
 	return ""
 }
 
+// countContainersByLabel counts All containers carrying the exact
+// relay.<key>=<value> label. It complements findContainerByLabel for
+// pool-size assertions (at most one container per function before Phase 2,
+// up to the function's concurrency now).
+func countContainersByLabel(ctx context.Context, cli *client.Client, key, value string) int {
+	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, c := range list.Items {
+		if c.Labels[key] == value {
+			n++
+		}
+	}
+	return n
+}
+
+// waitForContainersCount polls until exactly want running-or-exited containers
+// carry the given label pair, or the deadline passes.
+func waitForContainersCount(ctx context.Context, cli *client.Client, key, value string, want int) bool {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if countContainersByLabel(ctx, cli, key, value) == want {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 // waitForContainerGone polls until no running-or-exited container carries the
 // given label pair, or the deadline passes. AutoRemove removes the container on
 // exit asynchronously: ContainerWait delivers the exit code the moment the

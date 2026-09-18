@@ -193,67 +193,220 @@ events:
 	}
 }
 
-// TestIntegrationConcurrentInvocationsSerialize verifies two concurrent
-// Execute calls for the SAME function both succeed (phase-1 serialization does
-// not corrupt the protocol) on the same container, with different handlers.
-func TestIntegrationConcurrentInvocationsSerialize(t *testing.T) {
+// pollingSink is a concurrency-safe function-output sink that lets a test
+// observe handler progress WHILE invocations are in flight. newFunctionOutputSink's
+// bytes.Buffer cannot be read concurrently with the container output reader
+// goroutines (and would race under -race), so this sink guards every write and
+// read with a mutex.
+type pollingSink struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (s *pollingSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *pollingSink) contains(sub string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Contains(s.buf.String(), sub)
+}
+
+func (s *pollingSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// waitForSinkContains polls until the sink holds sub or the deadline passes. It
+// bridges container start plus output-forwarding latency without a fixed sleep.
+func waitForSinkContains(ctx context.Context, sink *pollingSink, sub string) bool {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if sink.contains(sub) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(30 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+// TestIntegrationConcurrentInvocationsDistinctContainers verifies the warm pool
+// at the function's resolved concurrency (2): two concurrent Execute calls for
+// the SAME function lease DISTINCT containers and run concurrently, and a THIRD
+// concurrent call CANNOT start until one of the first two releases — it is
+// bounded by the pool instead of starting a third container — then runs on the
+// released (reused) container. The scenario is made deterministic with handler
+// timing as a barrier: A and B print a START line and then block in their
+// handlers, so the test starts C only after observing BOTH mid-flight, and then
+// asserts C has not started while both remain blocked.
+func TestIntegrationConcurrentInvocationsDistinctContainers(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	sink := &pollingSink{}
+	prev := SetFunctionOutput(sink)
+	t.Cleanup(func() { SetFunctionOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
 runtime: node24
+concurrency: 2
 events:
-  - handler: index.one
+  - handler: index.a
     pattern:
       event_name: [INSERT]
 `)
+	// A and B print a START marker immediately, then block (blockMs from the
+	// event) before returning; C prints its marker and returns at once. The
+	// markers are the observable barrier: seeing START a and START b means both
+	// pool slots are leased and both handlers are mid-flight, so C must wait.
 	writeFile(t, dir, "index.js", `
-export async function one(event) {
-  await new Promise(r => setTimeout(r, 300));
-  console.log("one " + event.n);
+export async function a(event) {
+  console.log("START a");
+  await new Promise(r => setTimeout(r, event.blockMs));
+  console.log("END a");
 }
-export async function two(event) {
-  await new Promise(r => setTimeout(r, 200));
-  console.log("two " + event.msg);
+export async function b(event) {
+  console.log("START b");
+  await new Promise(r => setTimeout(r, event.blockMs));
+  console.log("END b");
+}
+export async function c(event) {
+  console.log("START c");
 }
 `)
-	fn := function.Function{Name: "concurrent-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := function.Function{Name: "concurrent-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 2}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
+	if prepared.Concurrency != 2 {
+		t.Fatalf("prepared concurrency = %d, want 2", prepared.Concurrency)
+	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	exec := func(handler, event string) error {
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: "concurrent-e2e", Image: prepared.Image})
-		errCh <- m.Execute(execCtx, prepared, "index.one", []byte(`{"event_name":"INSERT"}`), nil)
-	}()
-	go func() {
-		defer wg.Done()
-		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: "concurrent-e2e", Image: prepared.Image})
-		errCh <- m.Execute(execCtx, prepared, "index.two", []byte(`{"event_name":"INSERT"}`), nil)
-	}()
-	wg.Wait()
-	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil {
-			t.Fatalf("concurrent execute failed: %v", err)
+			RunMeta{Hostname: "test-host", Function: "concurrent-e2e", Handler: handler, Image: prepared.Image})
+		return m.Execute(execCtx, prepared, handler, []byte(event), nil)
+	}
+
+	// A and B occupy both pool slots and block in their handlers long enough
+	// for the assertions below (6s; the blocked-C window is <1s).
+	aErr := make(chan error, 1)
+	bErr := make(chan error, 1)
+	go func() { aErr <- exec("index.a", `{"event_name":"INSERT","blockMs":6000}`) }()
+	go func() { bErr <- exec("index.b", `{"event_name":"INSERT","blockMs":6000}`) }()
+
+	if !waitForSinkContains(ctx, sink, "START a") || !waitForSinkContains(ctx, sink, "START b") {
+		t.Fatalf("expected both handlers to start concurrently; sink:\n%s", sink.String())
+	}
+	if !waitForContainersCount(ctx, m.cli, labelFunction, "concurrent-e2e", 2) {
+		t.Fatalf("expected 2 pooled containers while A and B run, got %d:\n%s",
+			countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"), sink.String())
+	}
+
+	// C is the third concurrent invocation. Both slots are leased and blocked,
+	// so C must WAIT for a release rather than start a third container.
+	cErr := make(chan error, 1)
+	go func() { cErr <- exec("index.c", `{"event_name":"INSERT"}`) }()
+
+	// Barrier: while A and B are still blocked (observed started above and
+	// sleeping 6s), C must not have started and the pool must not exceed its
+	// bound. A third container here would mean the pool is not bounded by the
+	// function's concurrency.
+	deadline := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if sink.contains("START c") {
+			t.Fatalf("C started before A or B released:\n%s", sink.String())
+		}
+		if got := countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"); got != 2 {
+			t.Fatalf("pool exceeded its concurrency bound while C waited: %d containers", got)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	// Once A or B releases, C runs on a released (reused) container.
+	for i, ch := range []chan error{aErr, bErr, cErr} {
+		if err := <-ch; err != nil {
+			t.Fatalf("concurrent execute %d failed: %v", i, err)
 		}
 	}
-	logs := out.String()
-	if !strings.Contains(logs, "one") && !strings.Contains(logs, "two") {
-		t.Errorf("expected both handler outputs, got:\n%s", logs)
+	if !sink.contains("START c") {
+		t.Errorf("C never ran after A or B released:\n%s", sink.String())
 	}
-	if strings.Contains(logs, relayProtocolSentinel) {
-		t.Errorf("protocol frames leaked to the function-output sink:\n%s", logs)
+	// Exactly the two pooled containers remain: C reused a released one rather
+	// than starting a third.
+	if got := countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"); got != 2 {
+		t.Errorf("pooled containers after execution = %d, want 2", got)
+	}
+	if strings.Contains(sink.String(), relayProtocolSentinel) {
+		t.Errorf("protocol frames leaked to the function-output sink:\n%s", sink.String())
+	}
+}
+
+// TestIntegrationPoolBoundedByConcurrency verifies the pool max is the
+// function's resolved concurrency: with concurrency 1, three concurrent
+// Execute calls serialize over a single container (never a second one), and all
+// succeed.
+func TestIntegrationPoolBoundedByConcurrency(t *testing.T) {
+	requireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 1
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function run(event) {
+  await new Promise(r => setTimeout(r, 150));
+}
+`)
+	fn := function.Function{Name: "bounded-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 1}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if prepared.Concurrency != 1 {
+		t.Fatalf("prepared concurrency = %d, want 1", prepared.Concurrency)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			execCtx := context.WithValue(context.Background(), runMetaKey{},
+				RunMeta{Hostname: "test-host", Function: "bounded-e2e", Image: prepared.Image})
+			errCh <- m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < 3; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("execute failed: %v", err)
+		}
+	}
+	// Never more than the concurrency bound of containers, and exactly one
+	// pooled after all three serialized over it.
+	if got := countContainersByLabel(ctx, m.cli, labelFunction, "bounded-e2e"); got != 1 {
+		t.Errorf("pooled containers = %d, want exactly 1 (concurrency bound)", got)
 	}
 }
 

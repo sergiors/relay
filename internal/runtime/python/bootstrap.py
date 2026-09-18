@@ -1,8 +1,8 @@
 """Relay's Python function bootstrap.
 
-Since Relay 1.x one execution container per function STAYS ALIVE between
-invocations and serves a persistent, line-delimited JSON protocol on
-stdin/stdout (see internal/runtime/protocol.go in the Relay source):
+One execution container per function STAYS ALIVE between invocations and serves
+a persistent, line-delimited JSON protocol on stdin/stdout (see
+internal/runtime/protocol.go in the Relay source):
 
   Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>, "env":{"K":"V"}}
   stdout:          @@RELAY@@{"id":"<id>","ok":true}

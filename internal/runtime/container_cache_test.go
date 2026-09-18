@@ -2,23 +2,41 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"relay/internal/function"
 )
 
-// fakeContainer implements reusableContainer for cache tests.
+// fakeContainer implements reusableContainer for pool tests.
 type fakeContainer struct {
-	mu        sync.Mutex
-	discarded []string
-	deadFlag  bool
-	// release, when non-nil, makes Invoke block until it is closed (to
-	// exercise serialization and busy-entry invalidation). err is returned.
+	mu          sync.Mutex
+	discarded   []string
+	deadFlag    bool
+	invocations int
+	// release, when non-nil, makes Invoke block until it is closed (to exercise
+	// capacity waits and busy-entry invalidation). err is returned.
 	release chan struct{}
-	err     error
+	// entered, when non-nil, receives one signal per Invoke entry so a test can
+	// deterministically observe that an invocation reached the container.
+	entered chan struct{}
+	// panicOnInvoke makes Invoke panic (to exercise panic-safe lease release).
+	panicOnInvoke bool
+	err           error
 }
 
 func (f *fakeContainer) Invoke(_ context.Context, _ string, _ []byte, _ map[string]string) error {
+	f.mu.Lock()
+	f.invocations++
+	f.mu.Unlock()
+	if f.entered != nil {
+		f.entered <- struct{}{}
+	}
+	if f.panicOnInvoke {
+		panic("boom")
+	}
 	if f.release != nil {
 		<-f.release
 	}
@@ -48,16 +66,28 @@ func (f *fakeContainer) reasons() []string {
 	return append([]string(nil), f.discarded...)
 }
 
+func (f *fakeContainer) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.invocations
+}
+
 // fakeFactory is the injected start seam: it creates containers, counts them,
-// and detects concurrent factory calls (the cache's per-entry serialization
-// must never let two factory runs overlap: that would corrupt the protocol).
+// and tracks whether two factory runs overlapped (legitimate when the pool has
+// capacity for more than one; never when max == 1).
 type fakeFactory struct {
 	mu          sync.Mutex
 	creations   int
 	inside      int
 	overlapSeen bool
-	build       func() *fakeContainer
-	all         []*fakeContainer
+	// startErr, when non-nil, is consumed by the next create to simulate a
+	// failed lazy start.
+	startErr error
+	build    func() *fakeContainer
+	all      []*fakeContainer
+	// created receives every container as it is built so a test can synchronize
+	// on lazy creation without polling.
+	created chan *fakeContainer
 }
 
 func (ff *fakeFactory) lastContainer() *fakeContainer {
@@ -77,10 +107,15 @@ func (ff *fakeFactory) allContainers() []*fakeContainer {
 
 func (ff *fakeFactory) create() (reusableContainer, error) {
 	ff.mu.Lock()
+	if ff.startErr != nil {
+		err := ff.startErr
+		ff.startErr = nil
+		ff.mu.Unlock()
+		return nil, err
+	}
 	ff.creations++
 	ff.inside++
-	overlap := ff.inside > 1
-	if overlap {
+	if ff.inside > 1 {
 		ff.overlapSeen = true
 	}
 	ff.mu.Unlock()
@@ -89,9 +124,6 @@ func (ff *fakeFactory) create() (reusableContainer, error) {
 		ff.inside--
 		ff.mu.Unlock()
 	}()
-	if overlap {
-		return nil, errOverlap
-	}
 	var c *fakeContainer
 	if ff.build != nil {
 		c = ff.build()
@@ -100,9 +132,13 @@ func (ff *fakeFactory) create() (reusableContainer, error) {
 	}
 	ff.mu.Lock()
 	ff.all = append(ff.all, c)
+	created := ff.created
 	ff.mu.Unlock()
+	if created != nil {
+		created <- c
+	}
 	// A small delay makes a (broken) overlap observable under the overlap
-	// detection above; the serialization contract must make it impossible.
+	// detection above; at max == 1 the reservation must make it impossible.
 	time.Sleep(20 * time.Millisecond)
 	return c, nil
 }
@@ -117,40 +153,221 @@ func (ff *fakeFactory) count() int {
 	return ff.creations
 }
 
-var errOverlap = &overlapError{}
-
-type overlapError struct{}
-
-func (*overlapError) Error() string { return "concurrent factory calls" }
+func (ff *fakeFactory) overlapped() bool {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	return ff.overlapSeen
+}
 
 func mkCache() (*containerCache, *fakeFactory) {
 	return newContainerCache(), &fakeFactory{}
 }
 
-func run(t *testing.T, cc *containerCache, ff *fakeFactory, fnName, image, handler string) error {
+func run(t *testing.T, cc *containerCache, ff *fakeFactory, fnName, image string, max int, handler string) error {
 	t.Helper()
-	return cc.execute(context.Background(), fnName, image, ff.start(), handler, []byte(`{}`), nil)
+	return cc.execute(context.Background(), fnName, image, max, ff.start(), handler, []byte(`{}`), nil)
 }
 
-func TestContainerCacheCreatesThenReuses(t *testing.T) {
+func TestContainerPoolCreatesThenReuses(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h1"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h1"); err != nil {
 		t.Fatalf("first execute: %v", err)
 	}
 	if ff.count() != 1 {
 		t.Fatalf("creations = %d, want 1", ff.count())
 	}
-	if err := run(t, cc, ff, "fn-a", "img-1", "h2"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h2"); err != nil {
 		t.Fatalf("second execute: %v", err)
 	}
 	if ff.count() != 1 {
 		t.Fatalf("after reuse creations = %d, want 1 (same container reused)", ff.count())
 	}
+	if got := ff.lastContainer().calls(); got != 2 {
+		t.Fatalf("container invocations = %d, want 2", got)
+	}
 }
 
-func TestContainerCacheDiscardsOnImageChange(t *testing.T) {
+func TestContainerPoolFunctionsNeverShare(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if err := run(t, cc, ff, "fn-b", "img-1", 2, "h"); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	if ff.count() != 2 {
+		t.Fatalf("creations = %d, want 2 (each function gets its own container)", ff.count())
+	}
+}
+
+// TestContainerPoolConcurrentDistinctContainers proves that with capacity the
+// pool hands two concurrent invocations of the SAME function two distinct
+// containers that are in flight simultaneously.
+func TestContainerPoolConcurrentDistinctContainers(t *testing.T) {
+	cc, ff := mkCache()
+	ff.created = make(chan *fakeContainer, 2)
+	ff.build = func() *fakeContainer {
+		return &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 2)}
+	}
+
+	const max = 2
+	var wg sync.WaitGroup
+	for i := 0; i < max; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = cc.execute(context.Background(), "fn-a", "img-1", max, ff.start(), "h", []byte(`{}`), nil)
+		}()
+	}
+	// Wait for both lazy creations, then for both invocations to enter.
+	c1 := <-ff.created
+	c2 := <-ff.created
+	if c1 == c2 {
+		t.Fatal("pool handed the same container to two concurrent invocations")
+	}
+	<-c1.entered
+	<-c2.entered
+	if ff.count() != 2 {
+		t.Fatalf("creations = %d, want 2", ff.count())
+	}
+	if !ff.overlapped() {
+		t.Fatal("expected lazy starts to overlap at capacity >= 2")
+	}
+	close(c1.release)
+	close(c2.release)
+	wg.Wait()
+}
+
+// TestContainerPoolBlocksAtCapacity proves that with max == 1 the second
+// invocation blocks until the first releases, then reuses the same container;
+// the lazy start never overlaps.
+func TestContainerPoolBlocksAtCapacity(t *testing.T) {
+	cc, ff := mkCache()
+	// max == 1: the factory is used exactly once, and the second invocation
+	// must reuse the released container.
+	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 2)}
+	ff.build = func() *fakeContainer { return c1 }
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	<-c1.entered // first is in flight, holding the sole slot
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second invocation completed while the pool was at capacity: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+	if ff.count() != 1 {
+		t.Fatalf("creations = %d, want 1 (second must wait, not start)", ff.count())
+	}
+
+	close(c1.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second execute: %v", err)
+	}
+	if ff.count() != 1 {
+		t.Fatalf("creations = %d, want 1 (second reuses the released container)", ff.count())
+	}
+	if got := c1.calls(); got != 2 {
+		t.Fatalf("container invocations = %d, want 2", got)
+	}
+}
+
+// TestContainerPoolAcquireCanceled proves a capacity wait is interruptible by
+// context cancellation without creating a container or leaking a reservation.
+func TestContainerPoolAcquireCanceled(t *testing.T) {
+	cc, ff := mkCache()
+	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	ff.build = func() *fakeContainer { return c1 }
+
+	firstDone := make(chan struct{})
+	go func() {
+		_ = cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+		close(firstDone)
+	}()
+	<-c1.entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	err := cc.execute(ctx, "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiter error = %v, want context.DeadlineExceeded", err)
+	}
+	if ff.count() != 1 {
+		t.Fatalf("creations = %d, want 1 (waiter must not start a container)", ff.count())
+	}
+
+	close(c1.release)
+	<-firstDone
+}
+
+// TestContainerPoolStartFailureRollsBackReservation proves a failed lazy start
+// releases its capacity reservation so a later acquire can start instead of
+// blocking forever.
+func TestContainerPoolStartFailureRollsBackReservation(t *testing.T) {
+	cc, ff := mkCache()
+	ff.startErr = errors.New("start boom")
+
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err == nil {
+		t.Fatal("expected the failed start to surface")
+	}
+	if ff.count() != 0 {
+		t.Fatalf("creations = %d, want 0", ff.count())
+	}
+
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("execute after failed start: %v", err)
+	}
+	if ff.count() != 1 {
+		t.Fatalf("creations = %d, want 1 (reservation rolled back)", ff.count())
+	}
+}
+
+// TestContainerPoolPanicInStartRollsBackReservation proves a panicking start
+// factory does not leak capacity: the reservation is rolled back, so a later
+// acquire can still start (the pool is not permanently at capacity).
+func TestContainerPoolPanicInStartRollsBackReservation(t *testing.T) {
+	cc, ff := mkCache()
+	panicked := false
+	ff.build = func() *fakeContainer { return &fakeContainer{} }
+	start := func() (reusableContainer, error) {
+		if !panicked {
+			panicked = true
+			panic("factory boom")
+		}
+		return ff.create()
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected the factory panic to propagate")
+			}
+		}()
+		_ = cc.execute(context.Background(), "fn-a", "img-1", 1, start, "h", []byte(`{}`), nil)
+	}()
+
+	// The reservation must have rolled back: a fresh acquire starts.
+	if err := cc.execute(context.Background(), "fn-a", "img-1", 1, start, "h", []byte(`{}`), nil); err != nil {
+		t.Fatalf("execute after factory panic: %v", err)
+	}
+	if ff.count() != 1 {
+		t.Fatalf("creations = %d, want 1 (reservation rolled back after panic)", ff.count())
+	}
+}
+
+func TestContainerPoolDiscardsOnImageChange(t *testing.T) {
+	cc, ff := mkCache()
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -158,9 +375,9 @@ func TestContainerCacheDiscardsOnImageChange(t *testing.T) {
 		t.Fatal("first container not tracked")
 	}
 
-	// Same function, new image: the old container gets the "image_changed"
-	// discard and a fresh container is created.
-	if err := run(t, cc, ff, "fn-a", "img-2", "h"); err != nil {
+	// Same function, new image: the idle old container is discarded immediately
+	// on the new acquire and a fresh container is created.
+	if err := run(t, cc, ff, "fn-a", "img-2", 1, "h"); err != nil {
 		t.Fatalf("execute v2: %v", err)
 	}
 	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
@@ -171,50 +388,257 @@ func TestContainerCacheDiscardsOnImageChange(t *testing.T) {
 	}
 }
 
-func TestContainerCacheFunctionsNeverShare(t *testing.T) {
+// TestContainerPoolImageChangeRetiresBusy proves a BUSY old-image container is
+// marked retired (not discarded mid-invocation) and discarded on release, and
+// can never be leased again.
+func TestContainerPoolImageChangeRetiresBusy(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
-		t.Fatalf("A: %v", err)
+	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	built := 0
+	ff.build = func() *fakeContainer {
+		built++
+		if built == 1 {
+			return c1
+		}
+		return &fakeContainer{}
 	}
-	if err := run(t, cc, ff, "fn-b", "img-1", "h"); err != nil {
-		t.Fatalf("B: %v", err)
+
+	v1Done := make(chan error, 1)
+	go func() {
+		v1Done <- cc.execute(context.Background(), "fn-a", "img-1", 2, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	<-c1.entered
+
+	// New image: c1 is busy, so it is retired, not discarded yet; a second
+	// container serves the new image.
+	if err := run(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
+		t.Fatalf("execute v2: %v", err)
+	}
+	if got := c1.reasons(); len(got) != 0 {
+		t.Fatalf("busy old container discarded mid-invocation: %v", got)
 	}
 	if ff.count() != 2 {
-		t.Fatalf("creations = %d, want 2 (each function gets its own container)", ff.count())
+		t.Fatalf("creations = %d, want 2", ff.count())
+	}
+
+	close(c1.release)
+	if err := <-v1Done; err != nil {
+		t.Fatalf("v1 execute: %v", err)
+	}
+	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("retired container discards on release = %v, want [image_changed]", got)
+	}
+
+	// A later img-1 acquire must NOT reuse the discarded old container.
+	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+		t.Fatalf("execute v1 again: %v", err)
+	}
+	if ff.count() != 3 {
+		t.Fatalf("creations = %d, want 3 (no re-acquire of the old container)", ff.count())
 	}
 }
 
-func TestContainerCacheSerializesConcurrentCalls(t *testing.T) {
+// TestContainerPoolImageTransitionRetiresIdleAndBusy proves a forward image
+// transition (a request for a new image) discards a superseded idle container
+// immediately, retires a superseded busy container until release, and pools the
+// new version. This covers direct callers that never call InvalidateImage.
+func TestContainerPoolImageTransitionRetiresIdleAndBusy(t *testing.T) {
 	cc, ff := mkCache()
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs <- cc.execute(context.Background(), "fn-a", "img-1", ff.start(), "h", []byte(`{}`), nil)
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("concurrent execute: %v", err)
+	const max = 2
+
+	// busy1 is created first and blocks, holding one of the two slots.
+	busy1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	idle1 := &fakeContainer{}
+	created := 0
+	ff.build = func() *fakeContainer {
+		created++
+		if created == 1 {
+			return busy1
 		}
+		return idle1
 	}
-	ff.mu.Lock()
-	defer ff.mu.Unlock()
-	if ff.overlapSeen {
-		t.Fatal("factory must never run concurrently (per-entry serialization broken)")
+	busyDone := make(chan error, 1)
+	go func() {
+		busyDone <- cc.execute(context.Background(), "fn-a", "img-1", max, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	<-busy1.entered
+
+	// idle1 is the second img-1 container, released to idle.
+	if err := run(t, cc, ff, "fn-a", "img-1", max, "h"); err != nil {
+		t.Fatalf("seed idle img-1: %v", err)
 	}
-	if ff.creations != 1 {
-		t.Fatalf("creations = %d, want 1 (serialized reuse)", ff.creations)
+
+	// Transition to img-2: idle1 is discarded immediately, busy1 kept busy.
+	ff.build = func() *fakeContainer { return &fakeContainer{} }
+	if err := run(t, cc, ff, "fn-a", "img-2", max, "h"); err != nil {
+		t.Fatalf("execute img-2: %v", err)
+	}
+	if got := idle1.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("superseded idle discards = %v, want [image_changed]", got)
+	}
+	if got := busy1.reasons(); len(got) != 0 {
+		t.Fatalf("superseded busy container discarded mid-invocation: %v", got)
+	}
+
+	close(busy1.release)
+	if err := <-busyDone; err != nil {
+		t.Fatalf("busy img-1 execute: %v", err)
+	}
+	if got := busy1.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("superseded busy discards on release = %v, want [image_changed]", got)
+	}
+
+	// The new version's idle container is reused, not recreated.
+	before := ff.count()
+	if err := run(t, cc, ff, "fn-a", "img-2", max, "h"); err != nil {
+		t.Fatalf("reuse img-2: %v", err)
+	}
+	if ff.count() != before {
+		t.Fatalf("creations = %d, want %d (img-2 container reused)", ff.count(), before)
 	}
 }
 
-func TestContainerCacheInvalidateImage(t *testing.T) {
+// TestContainerPoolRetiredImageNeverPooled proves a stale acquire for an
+// invalidated image is served on a throwaway container that is discarded on
+// release and never reused by a later acquire.
+func TestContainerPoolRetiredImageNeverPooled(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	c1 := ff.lastContainer()
+	cc.invalidateImage("img-1")
+	if got := c1.reasons(); len(got) != 1 {
+		t.Fatalf("idle invalidated container discards = %v, want one", got)
+	}
+
+	// A stale img-1 request is served at-least-once but not pooled.
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("stale acquire: %v", err)
+	}
+	c2 := ff.lastContainer()
+	if c2 == c1 {
+		t.Fatal("stale acquire reused the invalidated container")
+	}
+	if got := c2.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("throwaway container discards on release = %v, want [image_changed]", got)
+	}
+
+	// Another stale request must start a NEW throwaway, not reuse c2.
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("second stale acquire: %v", err)
+	}
+	c3 := ff.lastContainer()
+	if c3 == c2 {
+		t.Fatal("second stale acquire reused the discarded throwaway container")
+	}
+	if ff.count() != 3 {
+		t.Fatalf("creations = %d, want 3 (one per stale acquire)", ff.count())
+	}
+}
+
+// TestContainerPoolInvalidateBeforePoolExists is the deterministic regression
+// for the invalidate-vs-first-acquire race: invalidation runs BEFORE any pool
+// for the function exists (so the invalidate snapshot cannot include it), and
+// the first acquire must still treat the image as retired — a throwaway
+// container that is never pooled — rather than a warm one.
+func TestContainerPoolInvalidateBeforePoolExists(t *testing.T) {
+	cc, ff := mkCache()
+	// No acquire has run, so fn-a has no pool at all.
+	cc.invalidateImage("img-1")
+
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("first acquire after invalidate: %v", err)
+	}
+	c1 := ff.lastContainer()
+	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("first-acquire container discards = %v, want [image_changed] (must not be pooled)", got)
+	}
+
+	// A second stale acquire must start a NEW throwaway, proving the first was
+	// never retained as an idle pooled container.
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("second acquire after invalidate: %v", err)
+	}
+	c2 := ff.lastContainer()
+	if c2 == c1 {
+		t.Fatal("second acquire reused the throwaway container; retired image was pooled")
+	}
+	if ff.count() != 2 {
+		t.Fatalf("creations = %d, want 2 (one throwaway per stale acquire)", ff.count())
+	}
+}
+
+// TestContainerPoolInvalidateDuringFirstLazyStart forces the brand-new-pool
+// interleaving: the very first acquire creates the pool and blocks in start;
+// an invalidation runs while that start is in flight. The completed container
+// must be marked retired/transient and discarded on release, never pooled.
+func TestContainerPoolInvalidateDuringFirstLazyStart(t *testing.T) {
+	cc, ff := mkCache()
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	var first sync.Once
+	ff.build = func() *fakeContainer {
+		first.Do(func() {
+			close(started)
+			<-unblock
+		})
+		return &fakeContainer{}
+	}
+
+	leaseCh := make(chan *containerLease, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		l, err := cc.acquire(context.Background(), "fn-a", "img-1", 1, ff.start())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		leaseCh <- l
+	}()
+	<-started
+
+	// The pool now exists and the start is in flight; invalidate the image.
+	invDone := make(chan struct{})
+	go func() {
+		cc.invalidateImage("img-1")
+		close(invDone)
+	}()
+	select {
+	case <-invDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("InvalidateImage blocked on the in-flight start")
+	}
+
+	close(unblock)
+	var lease *containerLease
+	select {
+	case lease = <-leaseCh:
+	case err := <-errCh:
+		t.Fatalf("acquire after in-flight invalidation: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("acquire did not complete after unblocking the start")
+	}
+
+	// The container served the invocation but must be discarded on release and
+	// never pooled, so a later acquire starts a fresh throwaway.
+	c1 := ff.lastContainer()
+	lease.release()
+	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
+		t.Fatalf("in-flight-start container discards = %v, want [image_changed]", got)
+	}
+
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("later acquire: %v", err)
+	}
+	if c2 := ff.lastContainer(); c2 == c1 {
+		t.Fatal("later acquire reused the invalidated in-flight container")
+	}
+}
+
+func TestContainerPoolInvalidateImageIdleImmediate(t *testing.T) {
+	cc, ff := mkCache()
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -228,14 +652,14 @@ func TestContainerCacheInvalidateImage(t *testing.T) {
 		t.Fatalf("unrelated invalidation discarded our container: %v", got)
 	}
 
-	// Our image: discard with "image_changed"; the entry is dropped.
+	// Our image, idle: discard with "image_changed" immediately.
 	cc.invalidateImage("img-1")
 	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
 		t.Fatalf("discard reasons = %v, want [image_changed]", got)
 	}
 
 	// The next execute starts a fresh container.
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after invalidate: %v", err)
 	}
 	if ff.count() != 2 {
@@ -243,29 +667,21 @@ func TestContainerCacheInvalidateImage(t *testing.T) {
 	}
 }
 
-func TestContainerCacheInvalidationWhileInFlightDefers(t *testing.T) {
+func TestContainerPoolInvalidationWhileInFlightDefers(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	c1 := ff.lastContainer()
-	if c1 == nil {
-		t.Fatal("container not tracked")
-	}
+	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	ff.build = func() *fakeContainer { return c1 }
 
-	// Occupy the entry with a blocking Invoke.
-	c1.mu.Lock()
-	c1.release = make(chan struct{})
-	c1.mu.Unlock()
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		errCh <- cc.execute(context.Background(), "fn-a", "img-1", ff.start(), "h2", []byte(`{}`), nil)
+		errCh <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
 	}()
-	time.Sleep(50 * time.Millisecond) // let it enter Invoke (blocked on release)
+	<-c1.entered
 
-	// The invalidation must NOT block on the busy entry (TryLock).
+	// The invalidation must NOT block and must NOT discard the busy container;
+	// it is retired and discarded on release.
 	invDone := make(chan struct{})
 	go func() {
 		cc.invalidateImage("img-1")
@@ -274,14 +690,12 @@ func TestContainerCacheInvalidationWhileInFlightDefers(t *testing.T) {
 	select {
 	case <-invDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("InvalidateImage blocked on a busy entry")
+		t.Fatal("InvalidateImage blocked on an in-flight invocation")
 	}
 	if got := c1.reasons(); len(got) != 0 {
 		t.Fatalf("busy-entry invalidation must defer, discarded now: %v", got)
 	}
 
-	// Unblock the in-flight Invoke; the deferred discard drains on the
-	// post-Invoke path.
 	close(c1.release)
 	if err := <-errCh; err != nil {
 		t.Fatalf("in-flight execute: %v", err)
@@ -290,18 +704,42 @@ func TestContainerCacheInvalidationWhileInFlightDefers(t *testing.T) {
 	if got := c1.reasons(); len(got) != 1 || got[0] != "image_changed" {
 		t.Fatalf("deferred discard reasons = %v, want [image_changed]", got)
 	}
-	// A subsequent execute creates a fresh container.
-	if err := run(t, cc, ff, "fn-a", "img-2", "h"); err != nil {
-		t.Fatalf("execute after deferred discard: %v", err)
+}
+
+// TestContainerPoolPanicDiscardsAndFreesCapacity proves a panicking Invoke
+// discards the container (never returning a corrupt one to the pool) and still
+// releases capacity.
+func TestContainerPoolPanicDiscardsAndFreesCapacity(t *testing.T) {
+	cc, ff := mkCache()
+	panicking := &fakeContainer{panicOnInvoke: true}
+	ff.build = func() *fakeContainer { return panicking }
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected the invocation panic to propagate")
+			}
+		}()
+		_ = cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	if got := panicking.reasons(); len(got) != 1 || got[0] != "protocol_error" {
+		t.Fatalf("panicking container discards = %v, want [protocol_error]", got)
+	}
+
+	// Capacity must have been freed: a second execute succeeds and starts fresh
+	// (the panicking container is not reused).
+	ff.build = func() *fakeContainer { return &fakeContainer{} }
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("execute after panic: %v", err)
 	}
 	if ff.count() != 2 {
-		t.Errorf("creations = %d, want 2", ff.count())
+		t.Fatalf("creations = %d, want 2", ff.count())
 	}
 }
 
-func TestContainerCacheReplacesDiscardedContainer(t *testing.T) {
+func TestContainerPoolReplacesDeadContainer(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -311,7 +749,7 @@ func TestContainerCacheReplacesDiscardedContainer(t *testing.T) {
 	if got := c1.reasons(); len(got) != 0 {
 		t.Fatalf("manual dead flag must not add a discard reason, got %v", got)
 	}
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after discard: %v", err)
 	}
 	if ff.count() != 2 {
@@ -319,24 +757,170 @@ func TestContainerCacheReplacesDiscardedContainer(t *testing.T) {
 	}
 }
 
-func TestContainerCacheCloseDiscardsAll(t *testing.T) {
+// TestContainerPoolCloseWakesWaitersAndDiscardsAll proves close discards idle
+// AND active containers, wakes a capacity waiter with errPoolClosed, and
+// prevents further acquires.
+func TestContainerPoolCloseWakesWaitersAndDiscardsAll(t *testing.T) {
 	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", "h"); err != nil {
+
+	// fn-a: one idle container.
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("A: %v", err)
 	}
-	if err := run(t, cc, ff, "fn-b", "img-1", "h"); err != nil {
-		t.Fatalf("B: %v", err)
-	}
-	// The second invocation created a new container and discarded... no image
-	// change here, so both entries hold their own containers.
+	idle := ff.lastContainer()
+
+	// fn-b: one busy container holding the sole slot.
+	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	ff.build = func() *fakeContainer { return busy }
+	busyDone := make(chan error, 1)
+	go func() {
+		busyDone <- cc.execute(context.Background(), "fn-b", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	<-busy.entered
+
+	// fn-b: a waiter blocked at capacity.
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- cc.execute(context.Background(), "fn-b", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+
 	cc.close()
-	for _, c := range ff.allContainers() {
-		got := c.reasons()
-		if len(got) != 1 || got[0] != "shutdown" {
-			t.Fatalf("container discards = %v, want [shutdown]", got)
-		}
+
+	if err := <-waiterDone; !errors.Is(err, errPoolClosed) {
+		t.Fatalf("waiter after close = %v, want errPoolClosed", err)
 	}
-	if n := len(ff.allContainers()); n != 2 {
-		t.Fatalf("tracked containers = %d, want 2", n)
+	if got := idle.reasons(); len(got) != 1 || got[0] != "shutdown" {
+		t.Fatalf("idle container discards = %v, want [shutdown]", got)
+	}
+	if got := busy.reasons(); len(got) != 1 || got[0] != "shutdown" {
+		t.Fatalf("busy container discards = %v, want [shutdown]", got)
+	}
+
+	// A subsequent acquire fails immediately.
+	if err := run(t, cc, ff, "fn-c", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+		t.Fatalf("execute after close = %v, want errPoolClosed", err)
+	}
+
+	// Unblock the busy invocation; the lease release is a harmless no-op.
+	close(busy.release)
+	if err := <-busyDone; err != nil {
+		t.Fatalf("busy execute: %v", err)
+	}
+	if got := busy.reasons(); len(got) != 1 {
+		t.Fatalf("busy discard must be exactly once, got %v", got)
+	}
+}
+
+// TestContainerPoolTransientBounded proves concurrent stale (retired-image)
+// acquires are bounded among themselves by max and wake as transients release.
+func TestContainerPoolTransientBounded(t *testing.T) {
+	cc, ff := mkCache()
+	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cc.invalidateImage("img-1")
+
+	ff.build = func() *fakeContainer {
+		return &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	}
+	before := ff.count()
+
+	start := func() (reusableContainer, error) { return ff.create() }
+	done := make(chan *containerLease, 2)
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			l, err := cc.acquire(context.Background(), "fn-a", "img-1", 2, start)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			done <- l
+		}()
+	}
+	l1 := <-done
+	l2 := <-done
+	if got := ff.count() - before; got != 2 {
+		t.Fatalf("transient creations = %d, want 2", got)
+	}
+
+	// A third stale acquire must block at the transient bound.
+	third := make(chan *containerLease, 1)
+	go func() {
+		l, err := cc.acquire(context.Background(), "fn-a", "img-1", 2, start)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		third <- l
+	}()
+	select {
+	case l := <-third:
+		l.release()
+		t.Fatal("third transient acquire must block at the bound")
+	case err := <-errCh:
+		t.Fatalf("third transient acquire: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	// Releasing one transient frees a slot and wakes the third.
+	l1.release()
+	select {
+	case l := <-third:
+		l.release()
+	case err := <-errCh:
+		t.Fatalf("third transient acquire after release: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("third transient acquire not woken by release")
+	}
+	l2.release()
+}
+
+// TestContainerPoolCloseDiscardsTransient proves Close tears down a leased
+// throwaway container serving a stale (retired-image) request.
+func TestContainerPoolCloseDiscardsTransient(t *testing.T) {
+	cc, ff := mkCache()
+	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cc.invalidateImage("img-1")
+
+	transient := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	ff.build = func() *fakeContainer { return transient }
+	done := make(chan error, 1)
+	go func() {
+		done <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	}()
+	<-transient.entered
+
+	cc.close()
+	if got := transient.reasons(); len(got) != 1 || got[0] != "shutdown" {
+		t.Fatalf("transient container discards = %v, want [shutdown]", got)
+	}
+	close(transient.release)
+	if err := <-done; err != nil {
+		t.Fatalf("transient execute: %v", err)
+	}
+	// Release after close must not discard a second time.
+	if got := transient.reasons(); len(got) != 1 {
+		t.Fatalf("transient discard must be exactly once, got %v", got)
+	}
+}
+
+func TestResolveConcurrency(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   function.Function
+		want int
+	}{
+		{"nil template", function.Function{}, function.DefaultConcurrency},
+		{"zero", function.Function{Template: &function.Template{Concurrency: 0}}, function.DefaultConcurrency},
+		{"negative", function.Function{Template: &function.Template{Concurrency: -3}}, function.DefaultConcurrency},
+		{"explicit", function.Function{Template: &function.Template{Concurrency: 5}}, 5},
+	}
+	for _, tc := range cases {
+		if got := resolveConcurrency(tc.fn); got != tc.want {
+			t.Errorf("%s: resolveConcurrency = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
