@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // reusableContainer is the seam the per-function container pool programs: the
 // production implementation is *executionContainer; tests inject fake
-// containers to exercise the pool's get-or-create, leasing, capacity, and
-// invalidation logic without a Docker daemon.
+// containers to exercise the pool's get-or-create, leasing, capacity,
+// invalidation, eviction, and removal logic without a Docker daemon.
 type reusableContainer interface {
 	// Invoke runs one handler invocation against the container.
 	Invoke(ctx context.Context, handler string, eventJSON []byte, env map[string]string) error
@@ -21,9 +22,19 @@ type reusableContainer interface {
 	dead() bool
 }
 
+// Discard reasons. They are labels on the discard path (logs, tests), not a
+// control mechanism: any of them means the container must never be leased again.
+const (
+	reasonImageChanged   = "image_changed"
+	reasonShutdown       = "shutdown"
+	reasonFunctionRemove = "function_removed"
+	reasonIdleTimeout    = "idle_timeout"
+)
+
 // errPoolClosed is returned when an acquire is attempted on a cache/pool that
-// has been closed (graceful shutdown). It is not a container failure: the
-// stream layer leaves the invocation pending and a live worker replays it.
+// has been closed (graceful shutdown) or whose function has been removed. It is
+// not a container failure: the stream layer leaves the invocation pending and a
+// live worker replays it.
 var errPoolClosed = errors.New("runtime: container pool closed")
 
 // containerCache owns a bounded warm pool of execution containers per FUNCTION
@@ -44,9 +55,11 @@ var errPoolClosed = errors.New("runtime: container pool closed")
 //
 // Locking: a manager-wide mu guards the map itself; each function pool carries
 // its own mutex. The manager-wide mu is never held during create/Invoke, and a
-// pool mutex is never held across start() or Invoke.
+// pool mutex is never held across start() or Invoke. When a cache-level mutex
+// must be combined with a pool mutex the order is always cache.mu -> pool.mu;
+// no path takes pool.mu and then cache.mu.
 type containerCache struct {
-	// mu guards pools, retiredImages, and closed.
+	// mu guards pools, retiredImages, removedFunctions, and closed.
 	mu    sync.Mutex
 	pools map[string]*functionPool
 	// retiredImages is the cache-level retirement set. invalidateImage records
@@ -58,41 +71,80 @@ type containerCache struct {
 	// is always covered by either the snapshot (it already existed) or the seed
 	// (it is created after the retirement was recorded).
 	//
-	// Like the per-pool set, retirements are permanent for the process and
-	// bounded by the number of distinct image versions retired in a worker's
-	// lifetime. Guarded by mu.
+	// Like the per-pool set, retirements persist for the process UNLESS a
+	// function is successfully re-activated for the same image
+	// (activateFunction deletes it), and are bounded by the number of distinct
+	// image versions retired in a worker's lifetime. Guarded by mu.
 	retiredImages map[string]bool
-	closed        bool
+	// removedFunctions holds function names whose removal has been requested and
+	// whose pool may still be draining (busy containers completing) or may
+	// already have been deleted once empty. While set, poolFor refuses to create
+	// a new pool for the name, so a stale acquire cannot recreate warm state for
+	// a removed function. Manager.Prepare clears the mark (activateFunction) only
+	// after a successful prepare, so a removed-then-recreated function warms
+	// again. Guarded by mu.
+	removedFunctions map[string]bool
+	closed           bool
+
+	// idleTimeout is how long a healthy idle pooled container may stay before
+	// the maintenance sweep evicts it (see evictIdle). Set once at construction;
+	// read without the lock.
+	idleTimeout time.Duration
+	// now is the injectable clock seam used to stamp idleSince and to decide
+	// eviction with a deterministic test clock. A nil clock means time.Now.
+	now func() time.Time
+}
+
+// generation is one image version's container set inside a function pool. A
+// pool has exactly one active generation (the image new acquires serve) plus
+// zero or more draining generations: superseded or invalidated versions whose
+// busy containers are still completing. Idle containers of a non-active
+// generation are never kept — they are discarded the moment the generation is
+// superseded — and a draining generation is dropped as soon as its last busy
+// container releases. Grouping by generation makes "no new acquires of an old
+// image" structural: acquire only ever leases from or appends to p.active.
+type generation struct {
+	image string
+	idle  []*pooledContainer
+	busy  map[*pooledContainer]struct{}
+}
+
+func newGeneration(image string) *generation {
+	return &generation{image: image, busy: map[*pooledContainer]struct{}{}}
 }
 
 // functionPool is one function's bounded warm container pool.
 //
-// Capacity accounting: len(idle)+len(busy)+creating must stay <= max.
-// creating is the number of capacity reservations in flight (a lazy start that
-// has not yet registered its container); it is rolled back if start fails.
+// Capacity accounting: usedLocked() (active idle+busy, draining busy, and
+// creating reservations) must stay <= max. creating is the number of capacity
+// reservations in flight (a lazy start that has not yet registered its
+// container); it is rolled back if start fails.
 type functionPool struct {
-	mu   sync.Mutex
-	max  int
-	idle []*pooledContainer
-	// busy holds leased REGULAR containers; each counts toward max and is
-	// returned to idle (or discarded) on release.
-	busy map[*pooledContainer]struct{}
+	// name and cache back the pool's ability to delete itself from the cache
+	// once a removal has drained it empty.
+	name  string
+	cache *containerCache
+
+	mu  sync.Mutex
+	max int
+
+	// active is the generation new acquires serve. It is nil until the first
+	// acquire fixes the pool's image. Guarded by mu.
+	active *generation
+	// draining holds superseded/invalidated generations that still have busy
+	// containers. An entry is removed once it has no idle and no busy
+	// containers. Guarded by mu.
+	draining []*generation
+
 	// transient holds leased THROWAWAY containers serving a stale request for
 	// an already-retired image. They are never pooled and deliberately do NOT
 	// count against the regular capacity (a stale request must not be blocked
 	// by, nor evict, the current version's containers). They are bounded among
 	// themselves by max; transientCreating reserves those starts so concurrent
-	// stale acquires cannot race past the bound. close tears them down; release
-	// discards them.
+	// stale acquires cannot race past the bound. close/removal tear them down;
+	// release discards them.
 	transient         map[*pooledContainer]struct{}
 	transientCreating int
-
-	// activeImage is the image version the pool currently serves. When an
-	// acquire requests a DIFFERENT image, the pool has moved forward: every
-	// container from the superseded version is retired (idle ones immediately,
-	// busy ones on release) and the old image is recorded in retiredImages.
-	// Guarded by mu.
-	activeImage string
 
 	// retiredImages holds image references whose containers must never be
 	// pooled again (image retirement/invalidation or a superseded active
@@ -100,62 +152,85 @@ type functionPool struct {
 	// creation: it serves its invocation at-least-once and is discarded on
 	// release, so no later acquire can reuse it ("no new acquires old image").
 	//
-	// Retirements are permanent for the process: a content-addressed image
-	// whose source is reverted to a previously-retired fingerprint is treated
-	// as retired too, so its invocations run on throwaway containers (correct,
-	// just not warm). Distinguishing a revert from a stale in-flight request is
-	// impossible from Execute alone, and mistaking a stale request for a revert
-	// would let it tear down the current version. The set is bounded by the
-	// number of distinct function versions retired in a worker's lifetime.
-	// Guarded by mu.
+	// Retirements are permanent for the pool's lifetime UNLESS the image is
+	// re-activated: a content-addressed image whose source is reverted to a
+	// previously-retired fingerprint is treated as retired, so its invocations
+	// run on throwaway containers (correct, just not warm), until a successful
+	// Prepare for that exact image re-activates it (activateFunction clears the
+	// entry), at which point it warms again. The set is bounded by the number of
+	// distinct function versions retired in a worker's lifetime (and is
+	// discarded with the pool on function removal). Guarded by mu.
 	retiredImages map[string]bool
 
 	// creating is the number of in-progress lazy starts holding a capacity
 	// reservation. Guarded by mu.
 	creating int
 
-	// closed is set once by close; acquire then fails immediately and every
-	// current container is discarded.
+	// removing is set once by remove: acquire then fails immediately, idle
+	// containers are discarded, and busy ones are retired so release discards
+	// them. The pool is deleted from the cache once it is empty.
+	removing bool
+	// closed is set once by close (graceful shutdown); acquire fails
+	// immediately and every current container is discarded.
 	closed bool
 
 	// notify is closed (and replaced) on every state change that may unblock a
-	// waiter: a release, an idle container becoming available, invalidation
-	// freeing capacity, or close. Waiters select on a snapshot of it plus ctx,
-	// so blocked acquires are woken by notification, never by polling and never
-	// by a goroutine per waiter.
+	// waiter: a release, an idle container becoming available, invalidation or
+	// transition freeing capacity, eviction, removal, or close. Waiters select
+	// on a snapshot of it plus ctx, so blocked acquires are woken by
+	// notification, never by polling and never by a goroutine per waiter.
 	notify chan struct{}
 }
 
 // pooledContainer is one reusable container in a function pool, with its image
-// version and retirement state. retired/retireReason are guarded by the owning
-// functionPool.mu; membership in idle/busy is the lease state.
+// version, owning generation, and retirement state. retired/retireReason/idleSince
+// are guarded by the owning functionPool.mu; membership in a generation's
+// idle/busy set (or the pool's transient set) is the lease state. gen is nil for
+// transient containers.
 type pooledContainer struct {
 	c     reusableContainer
 	image string
+	gen   *generation
 	// retired marks a container that must not be leased again and must be
 	// discarded as soon as it is not busy (busy ones are discarded on release).
 	retired      bool
 	retireReason string
+	// idleSince is when the container was last returned to a generation's idle
+	// list; the maintenance sweep evicts a healthy idle container once
+	// now-idleSince reaches the configured timeout.
+	idleSince time.Time
 }
 
 func newContainerCache() *containerCache {
 	return &containerCache{
-		pools:         map[string]*functionPool{},
-		retiredImages: map[string]bool{},
+		pools:            map[string]*functionPool{},
+		retiredImages:    map[string]bool{},
+		removedFunctions: map[string]bool{},
 	}
 }
 
-func newFunctionPool(max int) *functionPool {
+func newFunctionPool(name string, max int, cache *containerCache) *functionPool {
 	if max < 1 {
 		max = 1
 	}
 	return &functionPool{
+		name:          name,
+		cache:         cache,
 		max:           max,
-		busy:          map[*pooledContainer]struct{}{},
 		transient:     map[*pooledContainer]struct{}{},
 		retiredImages: map[string]bool{},
 		notify:        make(chan struct{}),
 	}
+}
+
+// clock returns the cache's current time from the injected seam, or the wall
+// clock when unset. It is called with the owning pool's lock held, so the seam
+// must be set before the cache is used (tests do).
+func (p *functionPool) clock() time.Time {
+	if p.cache != nil && p.cache.now != nil {
+		return p.cache.now()
+	}
+	return time.Now()
 }
 
 // lazyInit ensures the maps exist (a zero-valued Manager from tests must still
@@ -167,13 +242,21 @@ func (cc *containerCache) lazyInit() {
 	if cc.retiredImages == nil {
 		cc.retiredImages = map[string]bool{}
 	}
+	if cc.removedFunctions == nil {
+		cc.removedFunctions = map[string]bool{}
+	}
 }
 
 // poolFor returns (creating) the pool for fnName. Capacity is first-wins: the
 // first acquire fixes the pool size to the function's resolved concurrency; a
 // later value is ignored, mirroring the runner's per-function semaphore policy
-// (a hot-swapped concurrency change requires a worker restart). A pool requested
-// after the cache is closed is returned closed so acquire fails immediately.
+// (a hot-swapped concurrency change requires a worker restart).
+//
+// A pool requested after the cache is closed is returned closed so acquire
+// fails immediately. A function whose removal has been requested (and whose
+// pool may already have been deleted) gets a detached, closed pool so a stale
+// acquire can neither recreate warm state nor block: poolFor never inserts a
+// pool for a removed function until activateFunction clears the mark.
 func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -181,7 +264,14 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	if p, ok := cc.pools[fnName]; ok {
 		return p
 	}
-	p := newFunctionPool(max)
+	if cc.removedFunctions[fnName] {
+		p := newFunctionPool(fnName, max, cc)
+		p.removing = true
+		p.closed = true
+		close(p.notify)
+		return p
+	}
+	p := newFunctionPool(fnName, max, cc)
 	// Seed the new pool from the cache-level retirement set under the same mu
 	// that snapshots it below, so an invalidation that already happened (and
 	// therefore may have missed this pool) is still honored: a stale acquire
@@ -216,45 +306,45 @@ func (cc *containerCache) execute(ctx context.Context, fnName, image string, max
 }
 
 // acquire leases one container for fnName/image, blocking (context-aware) when
-// the pool is at capacity until a release/close notifies it. It:
+// the pool is at capacity until a release/close/eviction/transition/removal
+// notifies it. It:
 //
-//   - reaps idle containers that are dead, retired, or from a superseded image
-//     version (they are discarded, never leased again). A request for a NEW
-//     image retires the previously active image — discarding its idle
-//     containers now and its busy ones on release — and moves activeImage
-//     forward;
+//   - refuses to serve a REMOVED or CLOSED pool, returning errPoolClosed;
 //   - refuses to POOL containers for an image that has been invalidated: a
 //     stale request for a RETIRED image is served at-least-once on a throwaway
 //     (transient) container that is never pooled and is discarded on release
 //     ("no new acquires old image"), without reaping, rewinding, or waiting on
 //     the current (newer) version. The runner's per-function semaphore keeps
 //     the number of such in-flight stale requests bounded in production;
-//   - leases an idle matching container, or lazily starts a new one while
-//     capacity remains (reserving the slot before start so concurrent waiters
-//     account for it, and rolling the reservation back on start failure).
+//   - on a request for a NEW image, supersedes the active generation: the old
+//     image is retired, its idle containers are discarded immediately, its busy
+//     ones are moved to a draining generation and discarded on release, and the
+//     new image becomes the sole active generation. No further acquire can
+//     lease an old-image container, and no new old-image generation is created;
+//   - leases an idle matching container from the active generation, or lazily
+//     starts a new one while capacity remains (reserving the slot before start
+//     so concurrent waiters account for it, and rolling the reservation back on
+//     start failure).
 //
-// invalidateImage (the runner's image-retirement path) is what retires busy
-// containers for a known-dead image; the forward transition above covers direct
-// callers that switch Prepared without an explicit invalidation.
+// invalidateImage (the runner's image-retirement path) is what retires a
+// known-dead image's busy containers; the forward transition above covers
+// direct callers that switch Prepared without an explicit invalidation.
 func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max int, start func() (reusableContainer, error)) (*containerLease, error) {
 	// A panic escaping start() must not leak a capacity reservation, or the
 	// pool would be permanently at capacity. reserved/transientReserved track
-	// which reservation is currently held so the unwind path can roll it back.
+	// which reservation is currently held so the unwind path can roll it back
+	// (and delete a pool whose removal landed while the start was in flight).
 	var reserved *functionPool
 	var transientReserved *functionPool
 	defer func() {
 		if r := recover(); r != nil {
 			if reserved != nil {
 				reserved.mu.Lock()
-				reserved.creating--
-				reserved.signalLocked()
-				reserved.mu.Unlock()
+				reserved.rollbackStartLocked(false)
 			}
 			if transientReserved != nil {
 				transientReserved.mu.Lock()
-				transientReserved.transientCreating--
-				transientReserved.signalLocked()
-				transientReserved.mu.Unlock()
+				transientReserved.rollbackStartLocked(true)
 			}
 			panic(r)
 		}
@@ -264,7 +354,7 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 		p := cc.poolFor(fnName, max)
 
 		p.mu.Lock()
-		if p.closed {
+		if p.closed || p.removing {
 			p.mu.Unlock()
 			return nil, errPoolClosed
 		}
@@ -290,96 +380,98 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 			p.mu.Unlock()
 			c, err := start()
 			p.mu.Lock()
-			p.transientCreating--
 			transientReserved = nil
 			if err != nil {
-				p.signalLocked()
-				p.mu.Unlock()
+				p.rollbackStartLocked(true)
 				return nil, err
 			}
-			if p.closed {
+			p.transientCreating--
+			if p.closed || p.removing {
+				reason := poolDiscardReason(p.removing)
+				removing := p.removing
 				p.signalLocked()
 				p.mu.Unlock()
 				if !c.dead() {
-					c.discard("shutdown")
+					c.discard(reason)
+				}
+				if removing {
+					// The removal may have run while this transient was starting,
+					// when the pool was not yet empty; it can be deleted now.
+					p.cache.maybeDeletePool(p.name, p)
 				}
 				return nil, errPoolClosed
 			}
-			pc := &pooledContainer{c: c, image: image, retired: true, retireReason: "image_changed"}
+			pc := &pooledContainer{c: c, image: image, retired: true, retireReason: reasonImageChanged}
 			p.transient[pc] = struct{}{}
 			p.mu.Unlock()
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
 		// Forward image transition: a request for a new image supersedes the
-		// active version. The old image is retired so its idle containers are
-		// discarded now and its busy ones on release, and it can never be
-		// pooled again. This also covers direct callers that use a new Prepared
-		// without a runner InvalidateImage call.
+		// active generation. The old image is retired so its idle containers are
+		// discarded now and its busy ones on release, and it can never be pooled
+		// again. This also covers direct callers that use a new Prepared without
+		// a runner InvalidateImage call.
 		var transitioned []*pooledContainer
-		if p.activeImage != "" && p.activeImage != image {
-			old := p.activeImage
-			p.retiredImages[old] = true
-			kept := p.idle[:0]
-			for _, pc := range p.idle {
-				if pc.image == old && !pc.retired {
+		switch {
+		case p.active == nil:
+			p.active = newGeneration(image)
+		case p.active.image != image:
+			old := p.active
+			p.retiredImages[old.image] = true
+			transitioned = append(transitioned, old.idle...)
+			old.idle = nil
+			for pc := range old.busy {
+				if !pc.retired {
 					pc.retired = true
-					pc.retireReason = "image_changed"
-					transitioned = append(transitioned, pc)
-					continue
-				}
-				kept = append(kept, pc)
-			}
-			p.idle = kept
-			for pc := range p.busy {
-				if pc.image == old && !pc.retired {
-					pc.retired = true
-					pc.retireReason = "image_changed"
+					pc.retireReason = reasonImageChanged
 				}
 			}
+			if len(old.busy) > 0 {
+				p.draining = append(p.draining, old)
+			}
+			p.active = newGeneration(image)
 		}
-		p.activeImage = image
 
 		// Reap idle containers that may not be leased, before the capacity check
-		// so a stale idle container does not consume a slot: dead ones, retired
-		// ones, and live ones from a superseded image version.
+		// so a stale or unhealthy idle container does not consume a slot.
 		var reaped []*pooledContainer
-		kept := p.idle[:0]
-		for _, pc := range p.idle {
+		kept := p.active.idle[:0]
+		for _, pc := range p.active.idle {
 			if pc.c.dead() {
 				continue
 			}
 			if pc.retired || pc.image != image {
 				pc.retired = true
 				if pc.retireReason == "" {
-					pc.retireReason = "image_changed"
+					pc.retireReason = reasonImageChanged
 				}
 				reaped = append(reaped, pc)
 				continue
 			}
 			kept = append(kept, pc)
 		}
-		p.idle = kept
+		p.active.idle = kept
 		reaped = append(reaped, transitioned...)
 		if len(transitioned) > 0 {
 			p.signalLocked()
 		}
 
 		// Prefer an idle matching container.
-		for i := len(p.idle) - 1; i >= 0; i-- {
-			pc := p.idle[i]
+		for i := len(p.active.idle) - 1; i >= 0; i-- {
+			pc := p.active.idle[i]
 			if pc.image != image || pc.retired {
 				continue
 			}
-			p.idle = append(p.idle[:i], p.idle[i+1:]...)
-			p.busy[pc] = struct{}{}
+			p.active.idle = append(p.active.idle[:i], p.active.idle[i+1:]...)
+			p.active.busy[pc] = struct{}{}
 			p.mu.Unlock()
 			cc.discardReaped(reaped)
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
 		// Lazily create a fresh container while total capacity remains.
-		if len(p.idle)+len(p.busy)+p.creating < p.max {
+		if p.usedLocked() < p.max {
 			p.creating++
 			reserved = p
 			p.mu.Unlock()
@@ -387,41 +479,53 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 
 			c, err := start()
 			p.mu.Lock()
-			p.creating--
 			reserved = nil
 			if err != nil {
 				// Roll the reservation back and wake a waiter so the freed
-				// slot can be used by a fresh start.
-				p.signalLocked()
-				p.mu.Unlock()
+				// slot can be used by a fresh start. A removal that raced this
+				// start may have left the pool with nothing else, so delete it.
+				p.rollbackStartLocked(false)
 				return nil, err
 			}
-			if p.closed {
-				// Shutdown won the race: never register or lease the fresh
-				// container; discard it through the shutdown path.
+			p.creating--
+			if p.closed || p.removing {
+				// Shutdown/removal won the race: never register or lease the
+				// fresh container; discard it through the appropriate path.
+				reason := poolDiscardReason(p.removing)
+				removing := p.removing
 				p.signalLocked()
 				p.mu.Unlock()
 				if !c.dead() {
-					c.discard("shutdown")
+					c.discard(reason)
+				}
+				if removing {
+					// The removal may have run while this start was in flight,
+					// when the pool still held the reservation; it can be
+					// deleted now that this last slot is gone.
+					p.cache.maybeDeletePool(p.name, p)
 				}
 				return nil, errPoolClosed
 			}
 			pc := &pooledContainer{c: c, image: image}
-			if p.retiredImages[image] {
-				// Invalidation landed while this start was in flight: serve the
-				// invocation, but never pool the container.
+			// Invalidation or transition landed while this start was in flight:
+			// serve the invocation, but never pool the container. The active
+			// generation's image is the requested one only when no transition
+			// occurred; if it is retired, this start still loses its slot.
+			if p.active == nil || p.active.image != image || p.retiredImages[image] {
 				pc.retired = true
-				pc.retireReason = "image_changed"
+				pc.retireReason = reasonImageChanged
 				p.transient[pc] = struct{}{}
 			} else {
-				p.busy[pc] = struct{}{}
+				pc.gen = p.active
+				p.active.busy[pc] = struct{}{}
 			}
 			p.mu.Unlock()
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
-		// At capacity: wait for a release/close notification. The pool mutex is
-		// dropped while blocked so release/invalidate/close can make progress.
+		// At capacity: wait for a release/eviction/transition/removal/close
+		// notification. The pool mutex is dropped while blocked so those paths
+		// can make progress.
 		notify := p.notify
 		p.mu.Unlock()
 		cc.discardReaped(reaped)
@@ -435,10 +539,50 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 	}
 }
 
+// usedLocked returns the number of regular capacity slots currently consumed:
+// the active generation's containers (idle and busy), every draining
+// generation's busy containers (they are real containers still completing, so
+// they count), and in-flight start reservations. Transients are deliberately
+// excluded. It must be called with p.mu held.
+func (p *functionPool) usedLocked() int {
+	n := p.creating
+	if p.active != nil {
+		n += len(p.active.idle) + len(p.active.busy)
+	}
+	for _, g := range p.draining {
+		n += len(g.busy)
+	}
+	return n
+}
+
+// rollbackStartLocked releases an in-flight start reservation after start()
+// returned an error (or panicked): it decrements the reservation (regular or
+// transient), wakes waiters so the freed slot can be reused, and deletes an
+// empty removing pool from the cache. A removal that raced the start may have
+// run while this reservation was the only thing keeping the pool non-empty, so
+// without the delete the cache would keep serving errPoolClosed from a stale
+// empty pool. It must be called with p.mu held; it unlocks p.mu before
+// returning, so the caller must not touch p afterwards. maybeDeletePool is
+// called without p.mu (it takes cache.mu -> pool.mu, and this path must not
+// invert that order).
+func (p *functionPool) rollbackStartLocked(transient bool) {
+	if transient {
+		p.transientCreating--
+	} else {
+		p.creating--
+	}
+	removing := p.removing
+	p.signalLocked()
+	p.mu.Unlock()
+	if removing {
+		p.cache.maybeDeletePool(p.name, p)
+	}
+}
+
 // discardReaped discards (idempotently) containers acquire removed from the
-// idle list. It runs outside the pool lock; dead containers are skipped because
-// their own discard path already ran. The recorded retire reason is used so an
-// image-change discard keeps its cause.
+// idle list or discarded on a transition. It runs outside the pool lock; dead
+// containers are skipped because their own discard path already ran. The
+// recorded retire reason is used so an image-change discard keeps its cause.
 func (cc *containerCache) discardReaped(reaped []*pooledContainer) {
 	for _, pc := range reaped {
 		if pc.c.dead() {
@@ -446,7 +590,7 @@ func (cc *containerCache) discardReaped(reaped []*pooledContainer) {
 		}
 		reason := pc.retireReason
 		if reason == "" {
-			reason = "image_changed"
+			reason = reasonImageChanged
 		}
 		pc.c.discard(reason)
 	}
@@ -479,9 +623,9 @@ func (cc *containerCache) invalidateImage(image string) {
 }
 
 // invalidateImage retires image's containers in this pool. Idle matching
-// containers are removed and discarded immediately; busy matching containers
-// are marked retired so release discards them. Waiters are notified because
-// discarding idle containers frees capacity.
+// containers (active or draining) are removed and discarded immediately; busy
+// matching containers are marked retired so release discards them. Waiters are
+// notified because discarding idle containers frees capacity.
 func (p *functionPool) invalidateImage(image string) {
 	p.mu.Lock()
 	// Remember the retirement so any start already in flight (or any later
@@ -489,23 +633,30 @@ func (p *functionPool) invalidateImage(image string) {
 	// discarded on release rather than pooled.
 	p.retiredImages[image] = true
 	var discard []*pooledContainer
-	kept := p.idle[:0]
-	for _, pc := range p.idle {
-		if pc.image == image && !pc.retired {
-			pc.retired = true
-			pc.retireReason = "image_changed"
-			discard = append(discard, pc)
+	if p.active != nil && p.active.image == image {
+		discard = append(discard, p.active.idle...)
+		p.active.idle = nil
+		for pc := range p.active.busy {
+			if !pc.retired {
+				pc.retired = true
+				pc.retireReason = reasonImageChanged
+			}
+		}
+	}
+	for _, g := range p.draining {
+		if g.image != image {
 			continue
 		}
-		kept = append(kept, pc)
-	}
-	p.idle = kept
-	for pc := range p.busy {
-		if pc.image == image && !pc.retired {
-			pc.retired = true
-			pc.retireReason = "image_changed"
+		discard = append(discard, g.idle...)
+		g.idle = nil
+		for pc := range g.busy {
+			if !pc.retired {
+				pc.retired = true
+				pc.retireReason = reasonImageChanged
+			}
 		}
 	}
+	p.pruneDrainingLocked()
 	if len(discard) > 0 {
 		p.signalLocked()
 	}
@@ -513,17 +664,287 @@ func (p *functionPool) invalidateImage(image string) {
 
 	for _, pc := range discard {
 		if !pc.c.dead() {
-			pc.c.discard("image_changed")
+			pc.c.discard(reasonImageChanged)
 		}
+	}
+}
+
+// removeFunction requests the removal of fnName's warm container state. The
+// request is linearized under the cache lock: it sets the removed mark and, in
+// the SAME critical section (cache.mu -> pool.mu), marks the pool removing, so
+// a concurrent activateFunction can never be undone by this removal's later
+// teardown (activation observes removing and detaches the pool), and no
+// concurrent acquire can create warm state after this point (poolFor refuses
+// while the mark is set). Idle containers are then discarded outside the locks,
+// busy ones were retired so their release discards them, and once the pool is
+// empty its state is deleted from the cache.
+func (cc *containerCache) removeFunction(fnName string) {
+	cc.mu.Lock()
+	cc.lazyInit()
+	cc.removedFunctions[fnName] = true
+	p := cc.pools[fnName]
+	var discard []*pooledContainer
+	if p != nil {
+		p.mu.Lock()
+		discard = p.beginRemoveLocked()
+		p.mu.Unlock()
+	}
+	cc.mu.Unlock()
+
+	if p == nil {
+		return
+	}
+	p.teardownDiscards(discard)
+	p.cache.maybeDeletePool(p.name, p)
+}
+
+// activateFunction clears a previous removal mark for fnName so a
+// removed-then-recreated function warms again, and un-retires exactly the
+// function's own image so a same-image recreation is not permanently treated as
+// retired. Clearing the mark, un-retiring the image, and detaching a
+// removal-draining pool all happen in one critical section, so:
+//   - a concurrent acquire after this point sees the function active;
+//   - a removal that already began cannot leave a stale removing pool in the
+//     map to permanently serve errPoolClosed (the pool is detached; the next
+//     acquire builds a fresh one with the current capacity);
+//   - only fnName's own image is touched. A foreign image reference is never
+//     cleared, so a stale request for another function's image cannot be
+//     un-retired.
+//
+// image is the image Prepare resolved for this function ("" means "no image to
+// un-retire", e.g. a caller that only wants the removal mark cleared).
+func (cc *containerCache) activateFunction(fnName, image string) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.lazyInit()
+	delete(cc.removedFunctions, fnName)
+	if image == "" {
+		// No image to un-retire: only the removal mark is cleared.
+	} else if name, ok := functionNameFromImage(image); ok && name == fnName {
+		// The image is fnName's own: its same-image recreation must warm.
+		// Retirements of OTHER versions of this function stay in place so a
+		// stale old-version request can never supersede the active version.
+		delete(cc.retiredImages, image)
+	} else {
+		// A foreign or unparseable reference is never un-retired, so a caller
+		// cannot clear another function's (or an arbitrary) retirement.
+		image = ""
+	}
+	if p, ok := cc.pools[fnName]; ok {
+		if p.activate(image) {
+			// Detach the draining pool: a later acquire must build a fresh pool
+			// (with the function's current capacity) rather than be served the
+			// removed one. Its own maybeDeletePool becomes a no-op because the
+			// map no longer points at it.
+			delete(cc.pools, fnName)
+		}
+	}
+}
+
+// activate clears the retirement of image on this pool if the pool is live, and
+// reports whether the pool must be detached because a removal is (or was)
+// draining it. It takes the pool lock, so the caller must not hold it; the
+// caller holds cc.mu (the allowed cache -> pool order).
+func (p *functionPool) activate(image string) (detach bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.removing {
+		return true
+	}
+	if image != "" {
+		delete(p.retiredImages, image)
+	}
+	return false
+}
+
+// beginRemoveLocked marks the pool removed and collects every container that
+// must be torn down immediately: active and draining idle containers, while
+// active and draining busy containers are marked retired (discarded on release)
+// and transient throwaways are marked retired. It is idempotent and returns the
+// discards to perform outside the pool lock. It must be called with p.mu held
+// (and, for the removeFunction path, with cc.mu held so the mark is linearized
+// against activation).
+func (p *functionPool) beginRemoveLocked() []*pooledContainer {
+	if p.removing {
+		return nil
+	}
+	p.removing = true
+	p.signalLocked()
+
+	var discard []*pooledContainer
+	retire := func(gens []*generation) {
+		for _, g := range gens {
+			discard = append(discard, g.idle...)
+			g.idle = nil
+			for pc := range g.busy {
+				if !pc.retired {
+					pc.retired = true
+					pc.retireReason = reasonFunctionRemove
+				}
+			}
+		}
+	}
+	if p.active != nil {
+		retire([]*generation{p.active})
+	}
+	retire(p.draining)
+	for pc := range p.transient {
+		if !pc.retired {
+			pc.retired = true
+			pc.retireReason = reasonFunctionRemove
+		}
+	}
+	p.pruneDrainingLocked()
+	return discard
+}
+
+// teardownDiscards discards the containers beginRemoveLocked removed from the
+// pool's ownership. It runs outside the pool lock; dead containers are skipped
+// because their own discard path already ran.
+func (p *functionPool) teardownDiscards(discard []*pooledContainer) {
+	for _, pc := range discard {
+		if !pc.c.dead() {
+			pc.c.discard(reasonFunctionRemove)
+		}
+	}
+}
+
+// maybeDeletePool deletes p from the cache map when it has been removed and is
+// now empty, so a removed function's state does not linger and a later
+// reactivation starts from a clean pool. It is a no-op for a pool that is not
+// removing, has work in flight, or has already been replaced in the map. Lock
+// order is cache.mu -> pool.mu (the pool lock must not be held by the caller).
+func (cc *containerCache) maybeDeletePool(fnName string, p *functionPool) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.lazyInit()
+	if cc.pools[fnName] != p {
+		return
+	}
+	p.mu.Lock()
+	empty := p.removing && p.isEmptyLocked()
+	p.mu.Unlock()
+	if empty {
+		delete(cc.pools, fnName)
+	}
+}
+
+// pruneDrainingLocked drops draining generations that hold nothing. It must be
+// called with p.mu held.
+func (p *functionPool) pruneDrainingLocked() {
+	if len(p.draining) == 0 {
+		return
+	}
+	kept := p.draining[:0]
+	for _, g := range p.draining {
+		if len(g.idle) == 0 && len(g.busy) == 0 {
+			continue
+		}
+		kept = append(kept, g)
+	}
+	p.draining = kept
+}
+
+// isEmptyLocked reports whether the pool holds no containers and no in-flight
+// starts. It must be called with p.mu held.
+func (p *functionPool) isEmptyLocked() bool {
+	if p.creating > 0 || p.transientCreating > 0 || len(p.transient) > 0 {
+		return false
+	}
+	if p.active != nil && (len(p.active.idle) > 0 || len(p.active.busy) > 0) {
+		return false
+	}
+	for _, g := range p.draining {
+		if len(g.idle) > 0 || len(g.busy) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// evictIdle runs one maintenance pass over every pool, discarding healthy idle
+// containers that have been idle at least the configured timeout. It is the
+// only eviction path and is driven by Manager's single ticker (never a ticker
+// or goroutine per container). Ownership is removed from the idle list under the
+// pool lock and the actual teardown runs outside it; a failed teardown is never
+// reinserted (the container has already lost its idle slot), so a cleanup
+// failure can only leak the container, never resurrect it.
+func (cc *containerCache) evictIdle() {
+	now := time.Now()
+	if cc.now != nil {
+		now = cc.now()
+	}
+	cc.mu.Lock()
+	pools := make([]*functionPool, 0, len(cc.pools))
+	for _, p := range cc.pools {
+		pools = append(pools, p)
+	}
+	cc.mu.Unlock()
+	for _, p := range pools {
+		p.evictIdle(now, cc.idleTimeout)
+	}
+}
+
+// evictIdle discards this pool's healthy idle containers older than timeout.
+func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || p.removing {
+		p.mu.Unlock()
+		return
+	}
+	var evict []*pooledContainer
+	evictFrom := func(g *generation) {
+		kept := g.idle[:0]
+		for _, pc := range g.idle {
+			switch {
+			case pc.retired:
+				// Defensive: a retired idle container should already have been
+				// discarded; never leave it to be leased again.
+				evict = append(evict, pc)
+			case pc.c.dead():
+				// Defensive: already discarded by its own path; drop the slot.
+				continue
+			case now.Sub(pc.idleSince) >= timeout:
+				evict = append(evict, pc)
+			default:
+				kept = append(kept, pc)
+			}
+		}
+		g.idle = kept
+	}
+	if p.active != nil {
+		evictFrom(p.active)
+	}
+	for _, g := range p.draining {
+		evictFrom(g)
+	}
+	p.pruneDrainingLocked()
+	if len(evict) > 0 {
+		p.signalLocked()
+	}
+	p.mu.Unlock()
+
+	for _, pc := range evict {
+		if pc.c.dead() {
+			continue
+		}
+		reason := pc.retireReason
+		if reason == "" {
+			reason = reasonIdleTimeout
+		}
+		pc.c.discard(reason)
 	}
 }
 
 // close discards EVERY pooled container with reason "shutdown", wakes all
 // waiters, and prevents further acquires. Idle containers are discarded
-// immediately; busy (active) containers are marked retired AND discarded, so a
-// later release is a no-op (discard is idempotent) and no container survives
-// shutdown even if a lease is never returned. It is the graceful-shutdown hook
-// the worker's defer Manager.Close() flows into.
+// immediately; busy (active or draining) and transient containers are marked
+// retired AND discarded, so a later release is a no-op (discard is idempotent)
+// and no container survives shutdown even if a lease is never returned. It is
+// the graceful-shutdown hook the worker's defer Manager.Close() flows into.
 func (cc *containerCache) close() {
 	cc.mu.Lock()
 	cc.closed = true
@@ -548,12 +969,22 @@ func (p *functionPool) close() {
 	p.closed = true
 	close(p.notify)
 
-	all := make([]*pooledContainer, 0, len(p.idle)+len(p.busy)+len(p.transient))
-	all = append(all, p.idle...)
-	p.idle = nil
-	for pc := range p.busy {
-		pc.retired = true
-		all = append(all, pc)
+	all := make([]*pooledContainer, 0, p.usedLocked()+len(p.transient))
+	if p.active != nil {
+		all = append(all, p.active.idle...)
+		p.active.idle = nil
+		for pc := range p.active.busy {
+			pc.retired = true
+			all = append(all, pc)
+		}
+	}
+	for _, g := range p.draining {
+		all = append(all, g.idle...)
+		g.idle = nil
+		for pc := range g.busy {
+			pc.retired = true
+			all = append(all, pc)
+		}
 	}
 	for pc := range p.transient {
 		pc.retired = true
@@ -563,9 +994,20 @@ func (p *functionPool) close() {
 
 	for _, pc := range all {
 		if !pc.c.dead() {
-			pc.c.discard("shutdown")
+			pc.c.discard(reasonShutdown)
 		}
 	}
+}
+
+// poolDiscardReason picks the teardown reason for an unregistered container
+// whose pool was removed mid-start: a removed function is reported as
+// function_removed, otherwise the pool is shutting down. It is a pure helper
+// for the acquire unwind path.
+func poolDiscardReason(removing bool) string {
+	if removing {
+		return reasonFunctionRemove
+	}
+	return reasonShutdown
 }
 
 // signalLocked wakes every waiter. It must be called with p.mu held. A pool
@@ -580,47 +1022,79 @@ func (p *functionPool) signalLocked() {
 }
 
 // release returns a leased container to the pool. It is idempotent (a lease is
-// released exactly once). A container that is retired, dead, or owned by a
-// closed pool is discarded rather than returned to idle, so a stale or
-// unhealthy container can never be leased again. Waiters are always notified:
-// a release either frees capacity or makes an idle container available.
+// released exactly once). A container that is retired, dead, superseded by a
+// later generation, or owned by a closed/removed pool is discarded rather than
+// returned to idle, so a stale or unhealthy container can never be leased
+// again. Waiters are always notified: a release either frees capacity or makes
+// an idle container available. A removed pool that becomes empty here is
+// deleted from the cache.
 func (p *functionPool) release(pc *pooledContainer) {
 	p.mu.Lock()
 	if _, transient := p.transient[pc]; transient {
 		delete(p.transient, pc)
+		reason := pc.retireReason
+		if reason == "" {
+			reason = reasonImageChanged
+		}
+		removing := p.removing
+		if p.closed {
+			reason = reasonShutdown
+		} else if removing {
+			reason = reasonFunctionRemove
+		}
 		// Wake a stale-request waiter now that a transient slot has freed.
 		p.signalLocked()
 		p.mu.Unlock()
 		if !pc.c.dead() {
-			pc.c.discard("image_changed")
+			pc.c.discard(reason)
+		}
+		if removing {
+			p.cache.maybeDeletePool(p.name, p)
 		}
 		return
 	}
-	delete(p.busy, pc)
+
+	gen := pc.gen
+	if gen != nil {
+		delete(gen.busy, pc)
+	}
 	drop := false
 	reason := ""
 	switch {
 	case p.closed:
-		drop, reason = true, "shutdown"
+		drop, reason = true, reasonShutdown
+	case p.removing:
+		drop, reason = true, reasonFunctionRemove
 	case pc.retired:
 		drop = true
 		reason = pc.retireReason
 		if reason == "" {
-			reason = "image_changed"
+			reason = reasonImageChanged
 		}
 	case pc.c.dead():
 		// Already discarded by its own path (timeout/process exit/protocol
 		// error): drop it, nothing to tear down.
 		drop = true
+	case gen != p.active:
+		// A draining generation's container finished after being superseded:
+		// its image is no longer active, so it is discarded rather than pooled.
+		drop = true
+		reason = reasonImageChanged
 	}
 	if !drop {
-		p.idle = append(p.idle, pc)
+		pc.idleSince = p.clock()
+		gen.idle = append(gen.idle, pc)
 	}
+	p.pruneDrainingLocked()
+	removing := p.removing
 	p.signalLocked()
 	p.mu.Unlock()
 
 	if reason != "" && !pc.c.dead() {
 		pc.c.discard(reason)
+	}
+	if removing {
+		p.cache.maybeDeletePool(p.name, p)
 	}
 }
 

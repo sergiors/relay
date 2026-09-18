@@ -158,21 +158,22 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                  | Required | Description                                                                            |
-| ------------------------ | -------- | -------------------------------------------------------------------------------------- |
-| `REDIS_URI`              | yes      | Redis address or DSN (see below).                                                      |
-| `REDIS_STREAM`           | yes      | Redis stream to consume.                                                               |
-| `REDIS_GROUP`            | yes      | Consumer group name.                                                                   |
-| `REDIS_STREAM_RETENTION` | no       | Stream retention window; unset disables trimming.                                      |
-| `METRICS_ADDR`           | no       | Metrics HTTP listen address; unset disables Prometheus.                                |
-| `GIT_WEBHOOK_ADDR`       | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).          |
-| `LOG_LEVEL`              | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`. |
-| `MAX_CONCURRENCY`        | no       | Max concurrent function invocations per worker; default `8`.                           |
-| `MAX_BUFFERED_EVENTS`    | no       | Max events read from Redis and held locally before completion; default `16`.           |
-| `TRAEFIK_NETWORK`        | no       | Docker network Traefik is attached to; required only when a service declares `host`.   |
-| `TRAEFIK_ENTRYPOINTS`    | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted. |
-| `TRAEFIK_CERTRESOLVER`   | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.    |
-| `TRAEFIK_PRIORITY`       | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer. |
+| Env var                       | Required | Description                                                                                                                                           |
+| ----------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_URI`                   | yes      | Redis address or DSN (see below).                                                                                                                     |
+| `REDIS_STREAM`                | yes      | Redis stream to consume.                                                                                                                              |
+| `REDIS_GROUP`                 | yes      | Consumer group name.                                                                                                                                  |
+| `REDIS_STREAM_RETENTION`      | no       | Stream retention window; unset disables trimming.                                                                                                     |
+| `METRICS_ADDR`                | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                               |
+| `GIT_WEBHOOK_ADDR`            | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).                                                                         |
+| `LOG_LEVEL`                   | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                |
+| `MAX_CONCURRENCY`             | no       | Max concurrent function invocations per worker; default `8`.                                                                                          |
+| `MAX_BUFFERED_EVENTS`         | no       | Max events read from Redis and held locally before completion; default `16`.                                                                          |
+| `WARM_CONTAINER_IDLE_TIMEOUT` | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                  |
+| `TRAEFIK_NETWORK`             | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                  |
+| `TRAEFIK_ENTRYPOINTS`         | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted. |
+| `TRAEFIK_CERTRESOLVER`        | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.                                                                   |
+| `TRAEFIK_PRIORITY`            | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer.                                                                |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -184,6 +185,12 @@ server is started. An unbindable address is logged and retried, never fatal.
 endpoint on that address (see _Git_), and when unset or empty the webhook
 server is not started. Unlike the metrics server, a webhook bind failure (a
 taken port) is fatal at startup.
+
+`WARM_CONTAINER_IDLE_TIMEOUT` is optional and controls warm-container idle
+eviction (see _Execution container lifecycle_): it takes a Go duration (for
+example `90s`, `5m`, `1h`) and defaults to `5m` when unset or empty. A
+malformed or non-positive duration is a configuration error that fails startup
+(unlike `REDIS_STREAM_RETENTION`, which logs and disables).
 
 ### Concurrency and backpressure
 
@@ -382,22 +389,49 @@ only when no managed function image references them. An image with no
 ### Execution container lifecycle
 
 Each function keeps a **bounded warm pool of reused execution containers**, up
-to its resolved `concurrency`, per image version: the first invocation starts a
-container and subsequent invocations exchange request/response frames with the
-same long-running process instead of paying container startup on every event,
-while concurrent invocations of the same function lease **distinct** containers.
+to its resolved `concurrency`, per image version. Containers are created lazily:
+the first invocation starts one, and additional containers are started only when
+concurrent demand requires them, up to the function's concurrency limit.
+
+Subsequent invocations reuse healthy idle containers instead of paying container
+startup on every event. Concurrent invocations of the same function lease
+distinct containers; each individual container still processes one invocation at
+a time.
+
 Because the interpreter process persists, function code must not assume
-process-global state is fresh per invocation (module-level state and
-per-invocation env values survive). Timeouts, process exits, protocol errors,
-image changes, and shutdown still invalidate a container, and the next
-invocation starts a fresh one. On an image change, idle old-version containers
-are discarded immediately and busy ones are retired and discarded as soon as
-their invocation releases; a retired container is never leased again.
+process-global state is fresh per invocation. Module-level state may survive
+between invocations, and per-invocation environment values are applied to the
+long-running process for each request.
+
+A container is returned to the idle pool only while it remains healthy.
+Timeouts, process exits, protocol errors, image changes, and shutdown invalidate
+the container and it is discarded instead of reused.
+
+On an image change, the old image generation enters a draining state. Idle
+old-version containers are discarded immediately, while busy containers are
+allowed to finish their current invocation and are discarded when released. No
+new invocation is leased to a draining generation, and all new invocations use
+the current image version.
+
+Idle containers are not kept forever. A healthy container is evicted once it
+has remained idle longer than `WARM_CONTAINER_IDLE_TIMEOUT`; eviction never
+interrupts a busy invocation, and later demand simply starts a container
+lazily. `WARM_CONTAINER_IDLE_TIMEOUT` is global and defaults to `5m`. It
+accepts Go duration syntax such as `90s`, `10m`, or `1h`. An unset or empty
+value uses the default; malformed or non-positive values are configuration
+errors and fail startup.
+
+When a function is removed, no new containers are created for it. Idle
+containers are discarded immediately, busy containers are allowed to finish
+their current invocation and are discarded on release, and the function's pool
+state is removed once fully drained. If the function is later recreated — even
+with the same content and image — a successful prepare re-activates it, so its
+new containers warm normally rather than being treated as permanently retired.
 
 Every function execution container is created with Docker **AutoRemove**, so the
 daemon removes the container once its process exits. Relay relies on AutoRemove
-for crash cleanup and does not explicitly remove containers that exit on their
-own.
+for normal process-exit cleanup and does not explicitly remove containers that
+exit on their own.
 
 Explicit removal is used only as a backstop for abnormal lifecycle paths where a
 container may still be running or may never have started correctly, such as
@@ -405,31 +439,24 @@ start failures, timeouts, cancellation, or wait errors. Backstop removal is
 idempotent: a container that was already removed, or is already being removed by
 the daemon, is treated as successfully cleaned up.
 
-Every execution container also carries seven **diagnostic-only** Docker labels —
-`relay.function`, `relay.handler`, `relay.message_id`, `relay.event_id`,
-`relay.event_name`, `relay.hostname`, `relay.image` — so an orphan container can
-be attributed to its function/handler/message/event/worker/image. They carry no
-payload contents (only bounded IDs and function/handler names) and Relay's
-event-processing correctness never depends on them. On the reused container the
-per-invocation labels (`relay.handler`, `relay.message_id`, `relay.event_id`,
-`relay.event_name`) are empty at creation — labels are immutable per container
-while it outlives individual invocations — and only `relay.type`,
-`relay.function`, `relay.hostname`, and `relay.image` are stamped.
+Execution containers carry diagnostic-only Docker labels. Because a reused
+container outlives individual invocations, per-invocation labels such as
+`relay.handler`, `relay.message_id`, `relay.event_id`, and `relay.event_name`
+cannot represent the currently running invocation and remain empty at container
+creation. Stable container-level labels such as `relay.type`,
+`relay.function`, `relay.hostname`, and `relay.image` identify ownership and
+image generation.
 
-At startup, before any function is prepared or any container created, Relay runs
-a conservative **orphan sweep** (bounded to 30s): it lists containers and removes
-only those carrying the `relay.function` label **and** a `relay.hostname` label
-matching its own hostname (= its Redis consumer name) — leftovers from a previous
-crashed process on the same host. It removes both exited and running stale
-containers (running ones are force-removed/stopped). It **never** touches
-containers owned by other hostnames (another replica's property, live or crashed)
-or any non-Relay container, and does no global pruning.
+At startup, before functions begin serving invocations, Relay runs a conservative
+orphan sweep bounded to 30 seconds. It removes only stale Relay containers whose
+ownership labels match the current worker hostname. Containers belonging to
+other workers and non-Relay containers are never touched, and Relay performs no
+global Docker pruning.
 
-Every execution container is hardened: it runs as a non-root user (uid 10001,
-baked into the generated image), is limited to 128 MiB memory / 1 CPU / 128 PIDs,
-drops all Linux capabilities, has a read-only root filesystem with a bounded
-`/tmp` tmpfs, and keeps outbound networking enabled (a documented residual, not a
-sandbox for untrusted code).
+Every execution container is hardened: it runs as a non-root user (uid 10001),
+is limited to 128 MiB memory / 1 CPU / 128 PIDs, drops all Linux capabilities,
+has a read-only root filesystem with a bounded `/tmp` tmpfs, and keeps outbound
+networking enabled.
 
 ## Template format
 
@@ -476,8 +503,8 @@ services:
 - `schedules` (optional) is a list of cron-triggered handlers; each entry
   requires `handler` (module.function) and `cron`.
 - `cron` is a cron expression in either the standard 5-field form `minute hour
-  day-of-month month day-of-week` or the 6-field (seconds) form `second minute
-  hour day-of-month month day-of-week`. The exact expression is shown by
+day-of-month month day-of-week` or the 6-field (seconds) form `second minute
+hour day-of-month month day-of-week`. The exact expression is shown by
   `relay function inspect`, alongside a human-readable description in 24-hour
   time.
 - `timezone` (optional) is an IANA timezone (e.g. `Europe/Rome`,
@@ -766,9 +793,9 @@ services:
   time (empty or omitted = an internal **unrouted** service). At reconcile
   time a routed service requires `TRAEFIK_NETWORK`: if the variable is unset
   Relay reports `service "app/main.py": TRAEFIK_NETWORK is required when
-  Traefik routing is configured`, and if the configured network does not exist
+Traefik routing is configured`, and if the configured network does not exist
   on the daemon it reports `service "app/main.py": Traefik network "proxy"
-  does not exist` — Relay never creates the network. Changing `host` (or the
+does not exist` — Relay never creates the network. Changing `host` (or the
   port, or `TRAEFIK_NETWORK`) reconciles: the running container is replaced.
 - `replicas` (optional) is the desired replica count Relay maintains. It
   defaults to `1` and must be a positive integer. No autoscaling — the count
@@ -1511,7 +1538,7 @@ above.
 - `examples/functions/fastapi-service/` (python3.14): a persistent **service**
   demonstrating that `entrypoint: app/main.py` runs as `python -m app.main`,
   so package-relative imports work: `main.py` imports `from .deps import
-  get_settings` and serves `GET /health` (started via `uvicorn.run` in user
+get_settings` and serves `GET /health` (started via `uvicorn.run` in user
   code, reading `PORT`). FastAPI/Uvicorn live in the user's code — Relay only
   decides how the entrypoint file is executed.
 

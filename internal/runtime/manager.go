@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -42,12 +43,19 @@ func engineFor(spec plan.Spec) (interface {
 	}
 }
 
+// DefaultWarmContainerIdleTimeout is the idle-eviction window applied by
+// NewManager when no WithWarmContainerIdleTimeout option is given. It mirrors
+// config.DefaultWarmContainerIdleTimeout (this leaf package cannot import
+// config); the worker always passes config's resolved value explicitly.
+const DefaultWarmContainerIdleTimeout = 5 * time.Minute
+
 // Manager prepares function images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation, and a
 // per-function warm container pool: each function keeps up to its resolved
 // concurrency reused containers per image version (see container_cache.go),
 // kept alive between invocations and leased one-per-invocation, and discarded
-// on timeout/process exit/protocol error/image change/shutdown.
+// on timeout/process exit/protocol error/image change/function removal/shutdown
+// or evicted when it has been idle longer than the configured idle timeout.
 type Manager struct {
 	log *slog.Logger
 	cli *client.Client
@@ -62,6 +70,47 @@ type Manager struct {
 	hostname string
 	// containers caches the per-function reusable execution containers.
 	containers *containerCache
+
+	// done is closed by Close to stop the single maintenance loop (the only
+	// eviction driver; there is never a ticker or goroutine per container).
+	done chan struct{}
+	// maintDone is closed by the maintenance loop when it exits.
+	maintDone chan struct{}
+	// closeOnce makes Close idempotent and keeps the maintenance loop's stop
+	// handshake single-fire.
+	closeOnce sync.Once
+	// closeErr stores the client-close result so repeated Close calls are
+	// idempotent.
+	closeErr error
+}
+
+// ManagerOption tunes NewManager. Options keep the three-argument constructor
+// backward-compatible for every existing caller while letting the worker pass
+// its resolved environment configuration without the runtime reading env.
+type ManagerOption func(*managerOptions)
+
+// managerOptions is the resolved configuration applied by NewManager.
+type managerOptions struct {
+	// idleTimeout is the warm-container idle-eviction window. Zero means the
+	// package default (DefaultWarmContainerIdleTimeout).
+	idleTimeout time.Duration
+	// now is the injectable clock seam for deterministic tests. Nil means the
+	// wall clock.
+	now func() time.Time
+}
+
+// WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
+// container is kept before the maintenance loop evicts it. A non-positive value
+// is treated as the package default, so a caller cannot accidentally disable
+// eviction; config.Load rejects non-positive values before they reach here.
+func WithWarmContainerIdleTimeout(d time.Duration) ManagerOption {
+	return func(o *managerOptions) { o.idleTimeout = d }
+}
+
+// withClock injects a deterministic clock for tests. It is unexported because
+// only in-package tests need it; production always uses the wall clock.
+func withClock(now func() time.Time) ManagerOption {
+	return func(o *managerOptions) { o.now = now }
 }
 
 // NewManager connects to the Docker daemon so failures surface at startup
@@ -72,10 +121,17 @@ type Manager struct {
 // hostname-scoped container ownership identity (e.g. config.ConsumerName()); it
 // is stamped as the relay.hostname label on every execution container and gates
 // the startup orphan sweep.
-func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string) (*Manager, error) {
+//
+// Options are variadic so the original three-argument call remains valid; the
+// worker passes WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout).
+// NewManager starts the single warm-container maintenance loop, stopped by
+// Close.
+func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string, opts ...ManagerOption) (*Manager, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
+	resolved := resolveManagerOptions(opts)
+
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
@@ -84,18 +140,109 @@ func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string) (*Man
 		_ = cli.Close()
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
-	mgr := &Manager{log: logger, cli: cli, metrics: m, hostname: hostname}
+	mgr := &Manager{
+		log:       logger,
+		cli:       cli,
+		metrics:   m,
+		hostname:  hostname,
+		done:      make(chan struct{}),
+		maintDone: make(chan struct{}),
+	}
 	mgr.containers = newContainerCache()
+	mgr.containers.idleTimeout = resolved.idleTimeout
+	mgr.containers.now = resolved.now
+	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
 	return mgr, nil
 }
 
-// Close discards every cached execution container (reason "shutdown"; each
-// kill/remove runs on bounded, detached contexts so a cancelled shutdown ctx
-// cannot strand them), then releases the Docker Engine client. It is safe to
-// call once during shutdown; the worker defers it at startup.
+// resolveManagerOptions applies the options in order and normalizes a
+// non-positive idle timeout to the package default, so NewManager never starts
+// the maintenance loop with a disabled eviction window. It is a pure function
+// so the resolution logic is unit-testable without Docker.
+func resolveManagerOptions(opts []ManagerOption) managerOptions {
+	resolved := managerOptions{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&resolved)
+		}
+	}
+	if resolved.idleTimeout <= 0 {
+		resolved.idleTimeout = DefaultWarmContainerIdleTimeout
+	}
+	return resolved
+}
+
+// maintenanceInterval derives the single maintenance-loop tick from the idle
+// timeout: half the window (so an idle container is evicted within one half
+// window of crossing the threshold), capped at one minute so a very large
+// timeout still gets prompt eviction, and floored at 10ms so a tiny test
+// timeout does not busy-loop. This is the ONLY ticker driving eviction.
+func maintenanceInterval(idle time.Duration) time.Duration {
+	d := idle / 2
+	if d > time.Minute {
+		d = time.Minute
+	}
+	if d < 10*time.Millisecond {
+		d = 10 * time.Millisecond
+	}
+	return d
+}
+
+// startMaintenance launches the single maintenance loop. It is a method so
+// tests that construct a Manager directly (bypassing NewManager/Docker) can
+// start the loop with a test clock.
+func (m *Manager) startMaintenance(interval time.Duration) {
+	if m.done == nil {
+		m.done = make(chan struct{})
+	}
+	if m.maintDone == nil {
+		m.maintDone = make(chan struct{})
+	}
+	go m.maintenanceLoop(interval)
+}
+
+// maintenanceLoop runs evictIdle on a single ticker until Close, then closes
+// maintDone so Close can join it before tearing the cache down. It is the only
+// eviction driver: there is no per-container goroutine or ticker.
+func (m *Manager) maintenanceLoop(interval time.Duration) {
+	defer close(m.maintDone)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-t.C:
+			m.containers.evictIdle()
+		}
+	}
+}
+
+// Close stops the maintenance loop, discards every cached execution container
+// (reason "shutdown"; each kill/remove runs on bounded, detached contexts so a
+// cancelled shutdown ctx cannot strand them), then releases the Docker Engine
+// client. It is idempotent and safe to call more than once during shutdown; the
+// worker defers it at startup. The loop is joined before the cache is closed so
+// a concurrent eviction can never race the shutdown discard.
 func (m *Manager) Close() error {
-	m.containers.close()
-	return m.cli.Close()
+	m.closeOnce.Do(func() {
+		if m.done != nil {
+			close(m.done)
+			if m.maintDone != nil {
+				<-m.maintDone
+			}
+		}
+		if m.containers != nil {
+			m.containers.close()
+		}
+		if m.cli == nil {
+			// A Manager constructed directly by a test (no Docker) still owns a
+			// cache and maintenance loop, so Close must be safe without a client.
+			return
+		}
+		m.closeErr = m.cli.Close()
+	})
+	return m.closeErr
 }
 
 // startContainer builds one fresh execution container for a function version.
@@ -144,6 +291,12 @@ type Prepared struct {
 // fingerprint before calling Prepare and retains the previous version on error,
 // and for startup a fingerprint failure marks the function unavailable, which is
 // consistent with the existing build-failure handling.
+//
+// A successful Prepare (re)activates the function in the warm-container cache,
+// clearing any prior removal mark and un-retiring THIS exact image so a
+// removed-then-recreated function warms again. Activation is deliberately NOT
+// done up front: a failed prepare must not lift a removal, or a stale acquire
+// could warm a function the reconciler has not actually reconciled.
 func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared, error) {
 	fp, err := function.Fingerprint(fn.Dir)
 	if err != nil {
@@ -207,6 +360,10 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 			"function", fn.Name,
 			"image", image,
 		)
+		// The prepare succeeded (the image is present and current), so activate
+		// the exact image: a previously removed function warms again, and a
+		// reverted same-source image is no longer treated as retired.
+		m.containers.activateFunction(fn.Name, image)
 		return funcPrepared, nil
 	}
 
@@ -256,6 +413,9 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		"duration", d,
 		"result", "success",
 	)
+	// The build succeeded: activate the exact image so a removed-then-recreated
+	// function warms again and a same-content rebuild is not left retired.
+	m.containers.activateFunction(fn.Name, image)
 	return &Prepared{
 		Name:        fn.Name,
 		Image:       image,
@@ -429,6 +589,21 @@ func (m *Manager) Execute(
 // ErrImageInUse container-reference guard clears promptly.
 func (m *Manager) InvalidateImage(image string) {
 	m.containers.invalidateImage(image)
+}
+
+// RemoveFunction discards a removed function's warm container state: new
+// acquires for the function fail immediately, idle containers are discarded now,
+// busy ones are retired and discarded when their invocation releases, and the
+// pool's state is deleted once it is empty. A later release of a busy container
+// can never recreate the state (the function name is remembered as removed until
+// Prepared reactivates it). It is non-blocking, so the reconciler's removal hook
+// is never stalled by an in-flight invocation, and it is the runtime half of
+// function removal; the runner separately retires the function's images.
+func (m *Manager) RemoveFunction(name string) {
+	if name == "" {
+		return
+	}
+	m.containers.removeFunction(name)
 }
 
 // envMap parses "K=V" entries into a map, later entries winning on duplicate

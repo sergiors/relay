@@ -25,6 +25,14 @@ type fakeContainer struct {
 	// panicOnInvoke makes Invoke panic (to exercise panic-safe lease release).
 	panicOnInvoke bool
 	err           error
+	// discardFails makes discard report failure WITHOUT marking the container
+	// dead (and without recording a reason), modelling a teardown that could not
+	// clean up the container. Used to prove eviction never reinserts a container
+	// whose cleanup failed.
+	discardFails bool
+	// discardAttempts counts every discard call (even failed ones), so a test
+	// can prove cleanup is not retried/reinserted.
+	discardAttempts int
 }
 
 func (f *fakeContainer) Invoke(_ context.Context, _ string, _ []byte, _ map[string]string) error {
@@ -46,12 +54,22 @@ func (f *fakeContainer) Invoke(_ context.Context, _ string, _ []byte, _ map[stri
 func (f *fakeContainer) discard(reason string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.discardAttempts++
+	if f.discardFails {
+		return false
+	}
 	if f.deadFlag {
 		return false
 	}
 	f.deadFlag = true
 	f.discarded = append(f.discarded, reason)
 	return true
+}
+
+func (f *fakeContainer) attempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discardAttempts
 }
 
 func (f *fakeContainer) dead() bool {

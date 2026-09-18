@@ -72,6 +72,19 @@ func nameFromRepo(repo string) (string, bool) {
 	return name, true
 }
 
+// functionNameFromImage returns the function name encoded in a Relay-owned
+// image reference ("relay-fn-<name>:<tag>"), reporting false for a reference
+// without a tag or outside the Relay namespace. It is the scoping guard that
+// ensures a re-activation can only un-retire the activating function's OWN
+// image, never a foreign function's retired reference.
+func functionNameFromImage(image string) (string, bool) {
+	repo, _, ok := strings.Cut(image, ":")
+	if !ok {
+		return "", false
+	}
+	return nameFromRepo(repo)
+}
+
 // relayTags lists every local image RepoTag carrying the Relay namespace prefix,
 // returning name -> set of full tags. It lists all images and filters client-side
 // rather than using server-side filters: single client implementation reused by

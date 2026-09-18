@@ -2025,16 +2025,66 @@ func cleanupNewDepImagesSince(cli *client.Client, before map[string]bool) func()
 	}
 }
 
+// expectedDependencyRef computes the dependency image reference a function's
+// current manifest set must resolve to, using the exact production helpers
+// Prepare uses (lookup -> engine Plan -> DependencyFingerprint -> depImageRef).
+// Integration tests use it to name the shared, content-addressed dependency
+// image deterministically, instead of inferring it from a before/after tag
+// delta that is racy when the image already exists on a shared daemon. It fails
+// the test if the function declares no dependency layer.
+func expectedDependencyRef(t *testing.T, fn function.Function) string {
+	t.Helper()
+	if fn.Template == nil {
+		t.Fatalf("function %q has no template", fn.Name)
+	}
+	spec, err := lookup(fn.Template.Runtime)
+	if err != nil {
+		t.Fatalf("lookup %q: %v", fn.Template.Runtime, err)
+	}
+	eng, err := engineFor(spec)
+	if err != nil {
+		t.Fatalf("engine for %q: %v", fn.Template.Runtime, err)
+	}
+	p, err := eng.Plan(spec, fn.Dir)
+	if err != nil {
+		t.Fatalf("plan %q: %v", fn.Name, err)
+	}
+	if p.Deps.IsZero() {
+		t.Fatalf("function %q declares no dependency layer", fn.Name)
+	}
+	fp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, p.Deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint %q: %v", fn.Name, err)
+	}
+	return depImageRef(fp)
+}
+
+// depRepoName normalizes a dependency image reference or daemon tag to its
+// repository name (tag stripped), so an untagged depImageRef such as
+// "relay-dep-<fp>" compares equal to the daemon's RepoTag
+// "relay-dep-<fp>:latest".
+func depRepoName(ref string) string {
+	repo, _, _ := strings.Cut(ref, ":")
+	return repo
+}
+
 // TestIntegrationDependencyLayerReuse verifies the shared dependency layer is
 // reused across source changes: build v1 (with requirements.txt), then change
 // ONLY the handler source and build v2. The dependency image must exist
-// unchanged BEFORE and AFTER (same tag, no new dep image), while the function
+// unchanged BEFORE and AFTER (same reference and image ID), while the function
 // image gets a NEW tag for the changed source.
 //
-// NOTE: the relay-dep-* namespace is content-addressed and shared daemon-wide,
-// so the assertions count only the dep layers THIS test creates (the delta vs a
-// snapshot taken at test start), never the whole-daemon relay-dep-* population —
-// other tests or workers on a shared daemon legitimately create their own.
+// The dependency reference is computed deterministically with the production
+// helpers (lookup -> engine Plan -> DependencyFingerprint -> depImageRef) rather
+// than inferred from a before/after tag delta. The relay-dep-* namespace is
+// content-addressed and shared daemon-wide, so the expected image may already
+// exist when the test runs (an earlier run or another worker built the same
+// manifest); existence must therefore be handled, not assumed. Reuse is proven
+// by the image ID being identical across the source change, and a wrong/new
+// layer is detected by re-deriving the reference across the source change (a
+// correct dependency fingerprint must not depend on handler source), by Prepare
+// reporting the same dependency reference for both versions, and by the v2
+// function image's relay.dependency label naming that exact layer.
 func TestIntegrationDependencyLayerReuse(t *testing.T) {
 	cli := requireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -2061,6 +2111,22 @@ events:
 
 	fn := function.Function{Name: "dep-reuse", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 
+	// The dependency reference is content-addressed from the manifest set +
+	// runtime + arch + install command — NOT from the handler source. Derive it
+	// with the production helpers so the test names the exact shared image
+	// instead of inferring it from a tag delta that is empty when the image
+	// already exists on the shared daemon.
+	depRef := expectedDependencyRef(t, fn)
+
+	// The dependency image may already exist (an earlier run or a concurrent
+	// worker on the shared daemon). Record its identity now so reuse across the
+	// source change is proven by ID, and a preexisting image is not mistaken for
+	// one this test created.
+	preexistingDepID := ""
+	if insp, err := cli.ImageInspect(ctx, depRef); err == nil {
+		preexistingDepID = insp.ID
+	}
+
 	// v1 source.
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('v1')\n")
 	fp1, err := function.Fingerprint(dir)
@@ -2076,18 +2142,28 @@ events:
 	if p1.Image != ref1 {
 		t.Fatalf("prepare v1 image = %q, want %q", p1.Image, ref1)
 	}
-	depsAfterV1 := newDepTagsSince(ctx, cli, depBefore)
-	if len(depsAfterV1) != 1 {
-		t.Fatalf("expected exactly one NEW dependency image after v1 build, got %v", depsAfterV1)
+	if p1.Dependency != depRef {
+		t.Fatalf("prepare v1 dependency = %q, want %q", p1.Dependency, depRef)
 	}
-	depRef := depsAfterV1[0]
-	depIDBefore, err := cli.ImageInspect(ctx, depRef)
+	if !imageExistsInDaemon(cli, ctx, depRef) {
+		t.Fatalf("dependency image %s must exist after v1 build", depRef)
+	}
+	inspV1, err := cli.ImageInspect(ctx, depRef)
 	if err != nil {
-		t.Fatalf("inspect dep image: %v", err)
+		t.Fatalf("inspect dep image after v1: %v", err)
+	}
+	if preexistingDepID != "" && inspV1.ID != preexistingDepID {
+		t.Errorf("preexisting dependency image %s was rebuilt by v1 (before %s after %s) — it should be reused", depRef, preexistingDepID, inspV1.ID)
 	}
 
-	// v2 source: ONLY the handler changes.
+	// v2 source: ONLY the handler changes. The dependency fingerprint covers the
+	// manifest, not the handler source, so re-deriving it must yield the SAME
+	// reference. A regression that folded source into the dependency identity
+	// would change it here and fail immediately (no daemon race involved).
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('v2')\n")
+	if depRef2 := expectedDependencyRef(t, fn); depRef2 != depRef {
+		t.Fatalf("dependency reference changed across a pure source change: %s -> %s", depRef, depRef2)
+	}
 	fp2, err := function.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v2: %v", err)
@@ -2104,24 +2180,40 @@ events:
 	if p2.Image != ref2 {
 		t.Fatalf("prepare v2 image = %q, want %q", p2.Image, ref2)
 	}
+	if p2.Dependency != depRef {
+		t.Fatalf("prepare v2 dependency = %q, want %q — a source change must reuse the dependency layer", p2.Dependency, depRef)
+	}
 
-	// The same dependency tag exists after v2, and it inspects to the SAME image
-	// ID (identical content — not rebuilt). Count only THIS test's delta vs the
-	// snapshot: still exactly one NEW layer and it is the same tag we captured
-	// after v1.
-	depsAfterV2 := newDepTagsSince(ctx, cli, depBefore)
-	if len(depsAfterV2) != 1 {
-		t.Fatalf("expected still exactly one NEW dependency image after v2 built from source change, got %v", depsAfterV2)
-	}
-	if depsAfterV2[0] != depRef {
-		t.Fatalf("dep image tag changed across pure source change: %s -> %s", depRef, depsAfterV2[0])
-	}
-	depIDAfter, err := cli.ImageInspect(ctx, depRef)
+	// The same dependency reference still exists after v2 and inspects to the
+	// SAME image ID (identical content — not rebuilt).
+	inspV2, err := cli.ImageInspect(ctx, depRef)
 	if err != nil {
 		t.Fatalf("inspect dep image after v2: %v", err)
 	}
-	if depIDAfter.ID != depIDBefore.ID {
-		t.Errorf("dependency layer was rebuilt across a pure source change (before %s after %s) — it should be reused", depIDBefore.ID, depIDAfter.ID)
+	if inspV2.ID != inspV1.ID {
+		t.Errorf("dependency layer was rebuilt across a pure source change (before %s after %s) — it should be reused", inspV1.ID, inspV2.ID)
+	}
+
+	// Wrong/new dependency layer guard: the v2 function image must actually be
+	// wired to the expected dependency layer via its relay.dependency label. The
+	// label is the strict wiring the dependency GC reads, so a function image
+	// built FROM the wrong dependency layer fails here even if its own image
+	// reference happened to be correct. This is a deterministic, per-image check
+	// against the reference derived with the production helpers; it deliberately
+	// does NOT compare whole-daemon relay-dep-* counts, which race concurrent
+	// builders on a shared daemon. The dependency image's OWN labels are not
+	// asserted here: it may be a preexisting content-addressed image built by a
+	// label-less older Relay, and Prepare reuses it on existence alone (see
+	// TestIntegrationDependencyImageLabels for the label contract).
+	fnInsp, err := cli.ImageInspect(ctx, p2.Image)
+	if err != nil {
+		t.Fatalf("inspect v2 function image: %v", err)
+	}
+	if fnInsp.Config == nil || fnInsp.Config.Labels == nil {
+		t.Fatalf("v2 function image %s carries no config labels", p2.Image)
+	}
+	if got := fnInsp.Config.Labels[labelDependency]; got != depRepoName(depRef) {
+		t.Errorf("v2 function image %s relay.dependency = %q, want %q", p2.Image, got, depRepoName(depRef))
 	}
 }
 

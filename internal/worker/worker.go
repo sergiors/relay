@@ -159,7 +159,12 @@ func Run(logger *slog.Logger) {
 	// restored (they are point-in-time snapshots refreshed each interval).
 	restorePersistedStats(metricsInstance, st)
 
-	manager, err := runtime.NewManager(logger, metricsInstance, cfg.ConsumerName)
+	manager, err := runtime.NewManager(
+		logger,
+		metricsInstance,
+		cfg.ConsumerName,
+		runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
+	)
 	if err != nil {
 		// Fatal: the runtime manager owns container execution, which the worker
 		// cannot serve without, so exit the process on construction failure.
@@ -352,6 +357,12 @@ func Run(logger *slog.Logger) {
 			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
 			RemoveFunction: func(name string) {
 				metricsInstance.RemoveFunction(name)
+				// Drop the function's warm container state first: no new acquire
+				// may warm a removed function, idle containers are discarded now,
+				// and busy ones are discarded on release. Then retire every image
+				// version once idle (the runner's reference guard keeps an image
+				// an in-flight execution still needs).
+				manager.RemoveFunction(name)
 				runWorker.RemoveFunctionImages(name)
 				sched.RemoveFunction(name) // a removed function never keeps firing
 			},

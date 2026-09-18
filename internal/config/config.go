@@ -71,7 +71,29 @@ type Config struct {
 	// it must be a positive integer — an invalid value is a fatal
 	// configuration error — so &0 is never produced.
 	TraefikPriority *int
+	// WarmContainerIdleTimeout is the WARM_CONTAINER_IDLE_TIMEOUT value: how
+	// long a healthy idle warm execution container is kept before the runtime
+	// evicts it. Unset/empty defaults to DefaultWarmContainerIdleTimeout (5m);
+	// it must be a positive Go duration (e.g. "5m", "90s") — an invalid or
+	// non-positive value is a fatal configuration error, matching
+	// MAX_CONCURRENCY rather than REDIS_STREAM_RETENTION's log-and-disable
+	// style (a typo in a container-warmth knob must not silently change runtime
+	// behavior). It is always positive after Load.
+	WarmContainerIdleTimeout time.Duration
 }
+
+// Default max-concurrency and max-buffered-events values. The runner and stream
+// layers keep their own copies of these constants (a leaf package cannot import
+// config); this package owns the env-facing defaults.
+const (
+	DefaultMaxConcurrency    = 8
+	DefaultMaxBufferedEvents = 16
+	// DefaultWarmContainerIdleTimeout is the idle-eviction window applied when
+	// WARM_CONTAINER_IDLE_TIMEOUT is unset/empty. The runtime package's own
+	// default is only a fallback for direct NewManager callers; the worker
+	// always passes config's resolved value.
+	DefaultWarmContainerIdleTimeout = 5 * time.Minute
+)
 
 // Load reads Relay's configuration from the environment and returns a Config. It
 // is the single entry point for application configuration: callers get a Config
@@ -101,31 +123,28 @@ func Load(logger *slog.Logger) Config {
 		MetricsAddr:         getEnv("METRICS_ADDR", ""),
 		GitWebhookAddr:      getEnv("GIT_WEBHOOK_ADDR", ""),
 		LogLevel:            loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
-		MaxConcurrency:      loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", ""), DefaultMaxConcurrency),
-		MaxBufferedEvents:   loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", ""), DefaultMaxBufferedEvents),
+		MaxConcurrency:      loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency))),
+		MaxBufferedEvents:   loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents))),
 		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
 		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
 		TraefikPriority:     loadOptionalPositiveInt(logger, "TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", "")),
+		WarmContainerIdleTimeout: loadPositiveDuration(
+			logger,
+			"WARM_CONTAINER_IDLE_TIMEOUT",
+			getEnv("WARM_CONTAINER_IDLE_TIMEOUT", DefaultWarmContainerIdleTimeout.String()),
+		),
 	}
 
 }
 
-// Default max-concurrency and max-buffered-events values. The runner and stream
-// layers keep their own copies of these constants (a leaf package cannot import
-// config); this package owns the env-facing defaults.
-const (
-	DefaultMaxConcurrency    = 8
-	DefaultMaxBufferedEvents = 16
-)
-
-// loadPositiveInt parses an optional positive-integer environment value,
-// falling back to def when unset/empty. An unparseable, zero, or negative value
-// is a configuration error: it logs and aborts startup, matching loadLogLevel.
-// The injected logger is non-nil at this entry point (the CLI owns logger
-// creation).
-func loadPositiveInt(logger *slog.Logger, name, value string, def int) int {
-	n, err := ParsePositiveInt(name, value, def)
+// loadPositiveInt parses a positive-integer environment value. Defaults are
+// resolved at the getEnv call site (the env value is already non-empty), so an
+// unparseable, zero, or negative value is a configuration error: it logs and
+// aborts startup, matching loadLogLevel. The injected logger is non-nil at this
+// entry point (the CLI owns logger creation).
+func loadPositiveInt(logger *slog.Logger, name, value string) int {
+	n, err := ParsePositiveInt(name, value)
 	if err != nil {
 		logger.Error("Configuration error", "error", err)
 		os.Exit(1)
@@ -133,16 +152,28 @@ func loadPositiveInt(logger *slog.Logger, name, value string, def int) int {
 	return n
 }
 
-// ParsePositiveInt parses a positive-integer environment value, returning def
-// when value is unset/empty. It accepts any parseable positive integer
-// (surrounding whitespace is trimmed) and rejects non-numeric, float, negative,
-// zero, and overflow values. The error names the variable and the required
-// form so callers (Load and tests) render a clear configuration error.
-func ParsePositiveInt(name, value string, def int) (int, error) {
-	v := strings.TrimSpace(value)
-	if v == "" {
-		return def, nil
+// loadPositiveDuration wraps ParsePositiveDuration with the fatal style: an
+// invalid (malformed or non-positive) value logs a clear configuration error
+// and aborts startup, matching loadPositiveInt. Defaults are resolved at the
+// getEnv call site. The injected logger is non-nil at this entry point (the CLI
+// owns logger creation).
+func loadPositiveDuration(logger *slog.Logger, name, value string) time.Duration {
+	d, err := ParsePositiveDuration(name, value)
+	if err != nil {
+		logger.Error("Configuration error", "error", err)
+		os.Exit(1)
 	}
+	return d
+}
+
+// ParsePositiveInt parses a positive-integer environment value. Callers resolve
+// any default at the getEnv call site, so the value here is the provided one. It
+// accepts any parseable positive integer (surrounding whitespace is trimmed) and
+// rejects empty, non-numeric, float, negative, zero, and overflow values. The
+// error names the variable and the required form so callers (Load and tests)
+// render a clear configuration error.
+func ParsePositiveInt(name, value string) (int, error) {
+	v := strings.TrimSpace(value)
 	n, err := strconv.Atoi(v)
 	if err != nil {
 		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", name, value)
@@ -151,6 +182,25 @@ func ParsePositiveInt(name, value string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid %s %q: must be a positive integer", name, value)
 	}
 	return n, nil
+}
+
+// ParsePositiveDuration parses a positive Go duration environment value.
+// Callers resolve any default at the getEnv call site, so the value here is the
+// provided one. It must parse via time.ParseDuration AND be strictly positive
+// (e.g. "5m", "90s", "1h30m"); empty, zero, negative, and malformed values are
+// errors naming the variable. It is the duration analogue of ParsePositiveInt,
+// used for WARM_CONTAINER_IDLE_TIMEOUT so a typo fails startup instead of
+// silently disabling container eviction.
+func ParsePositiveDuration(name, value string) (time.Duration, error) {
+	v := strings.TrimSpace(value)
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive duration", name, value)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive duration", name, value)
+	}
+	return d, nil
 }
 
 // ParseOptionalPositiveInt parses an optional positive-integer environment
@@ -164,7 +214,7 @@ func ParseOptionalPositiveInt(name, value string) (*int, error) {
 	if strings.TrimSpace(value) == "" {
 		return nil, nil
 	}
-	n, err := ParsePositiveInt(name, value, 0)
+	n, err := ParsePositiveInt(name, value)
 	if err != nil {
 		return nil, err
 	}

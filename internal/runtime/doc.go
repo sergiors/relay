@@ -11,7 +11,9 @@
 //   - Execute: a leased container from the function's warm pool (bounded by the
 //     function's resolved concurrency), event JSON on stdin, stdout/stderr
 //     forwarded verbatim to the process output sink as a raw transport (not
-//     slog)
+//     slog); healthy idle containers are evicted by a single maintenance loop
+//     once idle longer than the configured timeout, and a removed function's
+//     warm state is discarded (see container_cache.go)
 //
 // Env and secrets injection: each execution container's environment is the base
 // RELAY_HANDLER var, then the function's plan env (runtime needs), then the

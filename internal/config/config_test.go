@@ -443,33 +443,33 @@ func TestParseOptionalPositiveInt(t *testing.T) {
 	}
 }
 
-// TestParsePositiveInt exercises the shared positive-integer parser directly:
-// unset → default; whitespace-trimmed positive ints parse; and zero, negative,
-// non-numeric, float, and overflow values error. The os.Exit path in Load is
-// not exercised here (it cannot run in-process); ParsePositiveInt is where the
-// actual validation logic lives.
+// TestParsePositiveInt exercises the shared positive-integer parser directly.
+// Defaults are resolved at the getEnv call site (see Load), so an empty value is
+// a parse error here; whitespace-trimmed positive ints parse; and empty, zero,
+// negative, non-numeric, float, and overflow values error. The os.Exit path in
+// Load is not exercised here (it cannot run in-process); ParsePositiveInt is
+// where the actual validation logic lives.
 func TestParsePositiveInt(t *testing.T) {
 	tests := []struct {
 		name      string
 		value     string
-		def       int
 		want      int
 		wantError bool
 	}{
-		{"unset returns default", "", 8, 8, false},
-		{"empty string returns default", "  ", 16, 16, false},
-		{"positive", "8", 0, 8, false},
-		{"trimmed positive", " 8 ", 0, 8, false},
-		{"explicit buffers", "32", 0, 32, false},
-		{"zero rejected", "0", 0, 0, true},
-		{"negative rejected", "-1", 0, 0, true},
-		{"non-numeric rejected", "abc", 0, 0, true},
-		{"float rejected", "1.5", 0, 0, true},
-		{"overflow rejected", "999999999999999999999", 0, 0, true},
+		{"empty rejected", "", 0, true},
+		{"whitespace rejected", "  ", 0, true},
+		{"positive", "8", 8, false},
+		{"trimmed positive", " 8 ", 8, false},
+		{"explicit buffers", "32", 32, false},
+		{"zero rejected", "0", 0, true},
+		{"negative rejected", "-1", 0, true},
+		{"non-numeric rejected", "abc", 0, true},
+		{"float rejected", "1.5", 0, true},
+		{"overflow rejected", "999999999999999999999", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParsePositiveInt("MAX_CONCURRENCY", tt.value, tt.def)
+			got, err := ParsePositiveInt("MAX_CONCURRENCY", tt.value)
 			if tt.wantError {
 				if err == nil {
 					t.Fatalf("ParsePositiveInt(%q) = %d, nil; want error", tt.value, got)
@@ -530,4 +530,117 @@ func TestLoadInvalidConcurrencyFatalSubprocess(t *testing.T) {
 	t.Setenv(env, value)
 	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	t.Fatal("Load returned instead of calling logger.Fatalf on invalid positive-integer value")
+}
+
+// TestParsePositiveDuration exercises the shared positive-duration parser.
+// Defaults are resolved at the getEnv call site (see Load), so an empty value is
+// a parse error here; valid Go durations parse (trimmed); and empty, zero,
+// negative, and malformed values error naming the variable. The os.Exit path in
+// Load is not exercised here (it cannot run in-process); ParsePositiveDuration is
+// where the validation logic lives.
+func TestParsePositiveDuration(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      time.Duration
+		wantError bool
+	}{
+		{"empty rejected", "", 0, true},
+		{"whitespace rejected", "  ", 0, true},
+		{"whitespace only rejected", "\t\n ", 0, true},
+		{"valid 5m", "5m", 5 * time.Minute, false},
+		{"valid 90s", "90s", 90 * time.Second, false},
+		{"valid compound", "1h30m", 90 * time.Minute, false},
+		{"trimmed valid", " 30s ", 30 * time.Second, false},
+		{"zero rejected", "0", 0, true},
+		{"zero duration rejected", "0s", 0, true},
+		{"negative rejected", "-5m", 0, true},
+		{"malformed rejected", "bogus", 0, true},
+		{"bare number rejected", "300", 0, true},
+		{"fractional valid", "1.5s", 1500 * time.Millisecond, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParsePositiveDuration("WARM_CONTAINER_IDLE_TIMEOUT", tt.value)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("ParsePositiveDuration(%q) = %v, nil; want error", tt.value, got)
+				}
+				if !strings.Contains(err.Error(), "WARM_CONTAINER_IDLE_TIMEOUT") {
+					t.Fatalf("error should name the variable: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParsePositiveDuration(%q) error: %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParsePositiveDuration(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadWarmContainerIdleTimeoutDefault pins that an unset
+// WARM_CONTAINER_IDLE_TIMEOUT resolves to the documented 5m default.
+func TestLoadWarmContainerIdleTimeoutDefault(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", "")
+	cfg := Load(discardLogger())
+	if cfg.WarmContainerIdleTimeout != DefaultWarmContainerIdleTimeout {
+		t.Fatalf("WarmContainerIdleTimeout = %v, want default %v", cfg.WarmContainerIdleTimeout, DefaultWarmContainerIdleTimeout)
+	}
+	if DefaultWarmContainerIdleTimeout != 5*time.Minute {
+		t.Fatalf("DefaultWarmContainerIdleTimeout = %v, want 5m", DefaultWarmContainerIdleTimeout)
+	}
+}
+
+// TestLoadWarmContainerIdleTimeoutExplicit pins that an explicit Go duration is
+// honored exactly.
+func TestLoadWarmContainerIdleTimeoutExplicit(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", "90s")
+	cfg := Load(discardLogger())
+	if cfg.WarmContainerIdleTimeout != 90*time.Second {
+		t.Fatalf("WarmContainerIdleTimeout = %v, want 90s", cfg.WarmContainerIdleTimeout)
+	}
+}
+
+// TestLoadInvalidWarmContainerIdleTimeoutFatal exercises the fatal path for an
+// invalid WARM_CONTAINER_IDLE_TIMEOUT via the subprocess pattern, matching
+// TestLoadInvalidConcurrencyFatal. A malformed or non-positive duration is a
+// configuration error that aborts startup (unlike
+// REDIS_STREAM_RETENTION's log-and-disable).
+func TestLoadInvalidWarmContainerIdleTimeoutFatal(t *testing.T) {
+	for _, value := range []string{"0", "-5m", "bogus", "300"} {
+		t.Run(value, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess$")
+			cmd.Env = append(os.Environ(), "RELAY_TEST_IDLE_TIMEOUT="+value)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("subprocess exited 0; want non-zero exit for invalid WARM_CONTAINER_IDLE_TIMEOUT=%q", value)
+			}
+			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
+				t.Fatalf("subprocess error = %v, want non-zero exit", err)
+			}
+			for _, want := range []string{"WARM_CONTAINER_IDLE_TIMEOUT", "Configuration error", "positive duration"} {
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("subprocess output does not mention %q:\n%s", want, string(out))
+				}
+			}
+		})
+	}
+}
+
+// TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess is the child side of
+// the fatal idle-timeout test.
+func TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess(t *testing.T) {
+	value := os.Getenv("RELAY_TEST_IDLE_TIMEOUT")
+	if value == "" {
+		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_IDLE_TIMEOUT unset)")
+	}
+	setRequiredEnv(t)
+	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", value)
+	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	t.Fatal("Load returned instead of calling logger.Fatalf on invalid WARM_CONTAINER_IDLE_TIMEOUT")
 }

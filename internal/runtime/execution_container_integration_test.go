@@ -9,6 +9,9 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +19,24 @@ import (
 
 	"relay/internal/function"
 )
+
+// newManagerWithIdleTimeout builds a Manager with an explicit warm-container
+// idle timeout, used by the idle-eviction integration test (the default 5m
+// window is impractical for a test). Close is registered as cleanup.
+func newManagerWithIdleTimeout(t *testing.T, idle time.Duration) *Manager {
+	t.Helper()
+	m, err := NewManager(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
+		"test-host",
+		WithWarmContainerIdleTimeout(idle),
+	)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
 
 // reusedContainerID polls (bridging start latency) for the running container
 // carrying the function's label and returns its id.
@@ -458,5 +479,208 @@ events:
 	// cleared) and succeeds.
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after invalidation: %v", err)
+	}
+}
+
+// TestIntegrationIdleEviction verifies the warm-container idle timeout end to
+// end against Docker: a healthy idle container is evicted after the configured
+// window, and the next invocation starts a fresh container. The window is
+// short (1s) because the production default (5m) is impractical here; the
+// maintenance loop derives its tick from the timeout, so eviction happens
+// within a small multiple of the window. No Docker protocol changes are
+// involved.
+func TestIntegrationIdleEviction(t *testing.T) {
+	requireDocker(t)
+	m := newManagerWithIdleTimeout(t, time.Second)
+	out := newFunctionOutputSink(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	fn := function.Function{Name: "idle-evict-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "idle-evict-e2e", Image: prepared.Image})
+	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	id1 := reusedContainerID(t, ctx, m, "idle-evict-e2e")
+	if id1 == "" {
+		t.Fatal("expected a warm container after execute")
+	}
+
+	// The container must be evicted within a bounded multiple of the 1s window
+	// (tick = 500ms, so ~1.5s worst case; allow generous Docker latency).
+	if !waitForContainerGone(ctx, m.cli, labelFunction, "idle-evict-e2e") {
+		t.Fatal("idle container was not evicted after the configured timeout")
+	}
+
+	// The next invocation starts a fresh, distinct container.
+	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute after eviction: %v", err)
+	}
+	id2 := reusedContainerID(t, ctx, m, "idle-evict-e2e")
+	if id2 == "" || id2 == id1 {
+		t.Errorf("expected a FRESH container after eviction: id1=%s id2=%s", id1, id2)
+	}
+	if !strings.Contains(out.String(), "ok") {
+		t.Errorf("expected handler output after re-execution, got: %s", out.String())
+	}
+}
+
+// TestIntegrationBusyImageChangeDrains verifies the generation/draining model
+// end to end: while an old-image invocation is BUSY, a new image's Execute
+// retires (not discards) the old busy container; when the invocation finishes,
+// the old container is discarded and the new image is served by its own
+// container. The old image is never reused.
+func TestIntegrationBusyImageChangeDrains(t *testing.T) {
+	requireDocker(t)
+	m, _ := newManager(t)
+	sink := &pollingSink{}
+	prev := SetFunctionOutput(sink)
+	t.Cleanup(func() { SetFunctionOutput(prev) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-fn-busy-change:"))
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 2
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	// v1 blocks (printing START/END v1 around a delay) so the test can hold an
+	// old-image invocation in flight while v2 is prepared and executed.
+	writeFile(t, dir, "index.js", `
+export async function run(event) {
+  console.log("START v1");
+  await new Promise(r => setTimeout(r, event.blockMs));
+  console.log("END v1");
+}
+`)
+	fn := function.Function{Name: "busy-change", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 2}}
+	p1, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+
+	v1Ctx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "busy-change", Handler: "index.run", Image: p1.Image})
+	v1Done := make(chan error, 1)
+	go func() {
+		v1Done <- m.Execute(v1Ctx, p1, "index.run", []byte(`{"event_name":"INSERT","blockMs":4000}`), nil)
+	}()
+	if !waitForSinkContains(ctx, sink, "START v1") {
+		t.Fatalf("v1 did not start; sink:\n%s", sink.String())
+	}
+
+	// Change source -> v2 image while v1 is busy.
+	writeFile(t, dir, "index.js", "export function run(e){ console.log('v2'); }\n")
+	p2, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	if p2.Image == p1.Image {
+		t.Fatalf("v2 image = %q, want different from v1", p2.Image)
+	}
+
+	// A v2 execute must NOT block on the busy v1 container: it starts its own
+	// container (the draining generation stays within capacity). The old v1
+	// container must not be discarded mid-invocation.
+	v2Ctx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "busy-change", Handler: "index.run", Image: p2.Image})
+	if err := m.Execute(v2Ctx, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute v2 while v1 busy: %v", err)
+	}
+	if !sink.contains("v2") {
+		t.Errorf("v2 did not run; sink:\n%s", sink.String())
+	}
+
+	// Let v1 finish: its container is drained (discarded) rather than pooled.
+	if err := <-v1Done; err != nil {
+		t.Fatalf("v1 execute: %v", err)
+	}
+	if !sink.contains("END v1") {
+		t.Errorf("expected v1 to complete; sink:\n%s", sink.String())
+	}
+	// Exactly the v2 container remains: the v1 container is gone.
+	if !waitForContainersCount(ctx, m.cli, labelFunction, "busy-change", 1) {
+		t.Errorf("expected exactly one pooled container after drain, got %d:\n%s",
+			countContainersByLabel(ctx, m.cli, labelFunction, "busy-change"), sink.String())
+	}
+}
+
+// TestIntegrationRemoveFunctionDiscardsContainers verifies the function-removal
+// lifecycle end to end: m.RemoveFunction discards its idle warm container, a
+// new Execute for the removed function fails with errPoolClosed (and the
+// invocation is left pending, not run on stale state), and re-preparing the
+// function warms it again.
+func TestIntegrationRemoveFunctionDiscardsContainers(t *testing.T) {
+	requireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	fn := function.Function{Name: "remove-fn-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "remove-fn-e2e", Image: prepared.Image})
+	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if id := reusedContainerID(t, ctx, m, "remove-fn-e2e"); id == "" {
+		t.Fatal("expected a warm container")
+	}
+
+	m.RemoveFunction("remove-fn-e2e")
+	if !waitForContainerGone(ctx, m.cli, labelFunction, "remove-fn-e2e") {
+		t.Fatal("idle container should have been discarded on RemoveFunction")
+	}
+
+	// A new execute for the removed function must fail without running a
+	// throwaway container (the invocation stays pending for replay).
+	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); !errors.Is(err, errPoolClosed) {
+		t.Fatalf("execute after RemoveFunction = %v, want errPoolClosed", err)
+	}
+	if countContainersByLabel(ctx, m.cli, labelFunction, "remove-fn-e2e") != 0 {
+		t.Fatal("a removed function must not start new warm containers")
+	}
+
+	// Re-preparing (reactivation) warms it again.
+	if _, err := m.Prepare(ctx, fn); err != nil {
+		t.Fatalf("re-prepare: %v", err)
+	}
+	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute after reactivation: %v", err)
+	}
+	if id := reusedContainerID(t, ctx, m, "remove-fn-e2e"); id == "" {
+		t.Fatal("expected a warm container after reactivation")
 	}
 }
