@@ -72,6 +72,75 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 	}
 }
 
+// TestRestorePersistedStatsSeedsPoolCounters verifies the restart contract for
+// the cumulative warm-container pool counters: a fresh registry seeded from the
+// persisted values keeps them monotonic, and the flush writes back the same
+// totals (never zeroing them).
+func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
+	m := metrics.New()
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "alpha",
+		EventsProcessedTotal: 1,
+		WarmAcquiresTotal:    7,
+		ColdStartsTotal:      3,
+		DiscardedTotal:       2,
+	})
+
+	restorePersistedStats(m, st)
+	fs := m.FunctionStatsSnapshot()
+	a := byFunction(fs, "alpha")
+	if a.WarmAcquiresTotal != 7 || a.ColdStartsTotal != 3 || a.DiscardedTotal != 2 {
+		t.Fatalf("seeded pool counters = %+v, want warm 7 cold 3 discarded 2", a)
+	}
+
+	// A live acquire/discard after the restore accumulates on top.
+	m.IncLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
+	m.IncLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "reason", Value: "idle_timeout"}})
+
+	recordSnapshots(context.Background(), st, m)
+	got, ok := st.FunctionStats("alpha")
+	if !ok {
+		t.Fatal("expected alpha function stats after flush")
+	}
+	if got.WarmAcquiresTotal != 8 || got.ColdStartsTotal != 3 || got.DiscardedTotal != 3 {
+		t.Fatalf("pool counters after flush = %+v, want warm 8 cold 3 discarded 3", got)
+	}
+}
+
+// TestFuncSnapshotStatsPoolCountersMapping verifies the flush mapper carries the
+// pool counters from the registry snapshot into the state rows.
+func TestFuncSnapshotStatsPoolCountersMapping(t *testing.T) {
+	m := metrics.New()
+	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "a"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 4)
+	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "a"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}}, 1)
+	m.AddLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "a"}, {Name: "reason", Value: "timeout"}}, 2)
+
+	got := funcSnapshotStats(m)
+	byName := map[string]state.FunctionStats{}
+	for _, fs := range got {
+		byName[fs.Function] = fs
+	}
+	a, ok := byName["a"]
+	if !ok {
+		t.Fatalf("a missing from flush mapping: %+v", got)
+	}
+	if a.WarmAcquiresTotal != 4 || a.ColdStartsTotal != 1 || a.DiscardedTotal != 2 {
+		t.Fatalf("a pool counters = %+v, want warm 4 cold 1 discarded 2", a)
+	}
+}
+
+// byFunction finds the FunctionStat for name in a snapshot, or a zero value.
+func byFunction(fs []metrics.FunctionStat, name string) metrics.FunctionStat {
+	for _, f := range fs {
+		if f.Function == name {
+			return f
+		}
+	}
+	return metrics.FunctionStat{}
+}
+
 // TestRestorePersistedStatsNilSafe guards the nil-safety contract: a nil
 // registry or nil state handle must never panic.
 func TestRestorePersistedStatsNilSafe(t *testing.T) {

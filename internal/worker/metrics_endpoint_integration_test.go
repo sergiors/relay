@@ -48,6 +48,20 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 	metricsInstance.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
 	metricsInstance.SetGauge(metrics.MetricPendingEntries, 3)
+	// Warm-container pool observability series.
+	metricsInstance.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "function", Value: "demo"}}, 2)
+	metricsInstance.SetGaugeLabels(metrics.MetricRuntimeContainers,
+		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 1)
+	metricsInstance.SetGaugeLabels(metrics.MetricRuntimeContainers,
+		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateBusy}}, 1)
+	metricsInstance.IncLabels(metrics.MetricRuntimeContainerAcquires,
+		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}})
+	metricsInstance.IncLabels(metrics.MetricRuntimeContainerAcquires,
+		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
+	metricsInstance.IncLabels(metrics.MetricRuntimeContainerDiscards,
+		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "reason", Value: "timeout"}})
+	metricsInstance.ObserveDurationLabels(metrics.MetricRuntimeContainerAcquireDuration,
+		[]metrics.Label{{Name: "function", Value: "demo"}}, 100*time.Millisecond)
 
 	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err := metricsServer.Start(); err != nil {
@@ -80,6 +94,14 @@ func TestIntegrationMetricsEndpoint(t *testing.T) {
 		`handler_duration_seconds_count{function="demo",handler="index.hi"} 1`,
 		"relay_pending_entries 3",
 		"# TYPE",
+		// Warm-container pool observability.
+		`relay_runtime_pool_capacity{function="demo"} 2`,
+		`relay_runtime_containers{function="demo",state="idle"} 1`,
+		`relay_runtime_containers{function="demo",state="busy"} 1`,
+		`relay_runtime_container_acquires_total{function="demo",outcome="cold"} 1`,
+		`relay_runtime_container_acquires_total{function="demo",outcome="warm"} 1`,
+		`relay_runtime_container_discards_total{function="demo",reason="timeout"} 1`,
+		`relay_runtime_container_acquire_duration_seconds_count{function="demo"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/metrics missing %q:\n%s", want, body)

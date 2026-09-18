@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"relay/internal/metrics"
 )
 
 // reusableContainer is the seam the per-function container pool programs: the
@@ -18,17 +20,27 @@ type reusableContainer interface {
 	// discard tears the container down (idempotent). reason is one of the
 	// documented discard reasons.
 	discard(reason string) bool
+	// discardReason returns the reason recorded by the container's own teardown
+	// path (timeout/process_exit/protocol_error), or "" when the container did
+	// not tear itself down. The pool uses it so a self-initiated death is
+	// attributed correctly rather than to the pool's fallback reason.
+	discardReason() string
 	// dead reports whether the container has been discarded.
 	dead() bool
 }
 
-// Discard reasons. They are labels on the discard path (logs, tests), not a
-// control mechanism: any of them means the container must never be leased again.
+// Discard reasons. They are labels on the discard path (logs, metrics, tests),
+// not a control mechanism: any of them means the container must never be leased
+// again. reasonProtocolError (and timeout/process_exit) are recorded by the
+// container itself on self-initiated teardown; the others are pool-initiated.
 const (
 	reasonImageChanged   = "image_changed"
 	reasonShutdown       = "shutdown"
 	reasonFunctionRemove = "function_removed"
 	reasonIdleTimeout    = "idle_timeout"
+	reasonTimeout        = "timeout"
+	reasonProcessExit    = "process_exit"
+	reasonProtocolError  = "protocol_error"
 )
 
 // errPoolClosed is returned when an acquire is attempted on a cache/pool that
@@ -93,6 +105,11 @@ type containerCache struct {
 	// now is the injectable clock seam used to stamp idleSince and to decide
 	// eviction with a deterministic test clock. A nil clock means time.Now.
 	now func() time.Time
+	// metrics is the optional observability registry the pool publishes its
+	// authoritative state to (see container_metrics.go). A nil registry disables
+	// all pool metric recording; every call is a no-op. Set once at construction
+	// and read without the lock.
+	metrics *metrics.Registry
 }
 
 // generation is one image version's container set inside a function pool. A
@@ -199,6 +216,10 @@ type pooledContainer struct {
 	// list; the maintenance sweep evicts a healthy idle container once
 	// now-idleSince reaches the configured timeout.
 	idleSince time.Time
+	// discardOnce guards the per-container discard metric: several teardown
+	// paths may race to discard the same wrapper (lease release, eviction,
+	// removal, close), but the discard counter increments exactly once.
+	discardOnce sync.Once
 }
 
 func newContainerCache() *containerCache {
@@ -284,6 +305,10 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 		close(p.notify)
 	}
 	cc.pools[fnName] = p
+	// Publish the pool's bound exactly once, when it is registered: capacity is
+	// first-wins for the pool's lifetime, so a later acquire's max is ignored
+	// (mirroring the runner's per-function semaphore policy).
+	p.publishPoolCapacity()
 	return p
 }
 
@@ -330,6 +355,21 @@ func (cc *containerCache) execute(ctx context.Context, fnName, image string, max
 // known-dead image's busy containers; the forward transition above covers
 // direct callers that switch Prepared without an explicit invalidation.
 func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max int, start func() (reusableContainer, error)) (*containerLease, error) {
+	// acquiredAt bounds the SUCCESSFUL acquire duration recorded below: it
+	// covers the whole call including any capacity wait, but is observed only
+	// when a lease is actually returned. waitRecorded makes the waits counter
+	// count one logical acquire that had to block, not each retry iteration.
+	// Both records happen under the owning pool's lock (see container_metrics.go)
+	// so a concurrent removal cannot delete the series underneath a late write.
+	acquiredAt := time.Now()
+	waitRecorded := false
+	recordWait := func(p *functionPool) {
+		if !waitRecorded {
+			waitRecorded = true
+			p.recordWaitLocked()
+		}
+	}
+
 	// A panic escaping start() must not leak a capacity reservation, or the
 	// pool would be permanently at capacity. reserved/transientReserved track
 	// which reservation is currently held so the unwind path can roll it back
@@ -366,6 +406,7 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 		// blocked by nor evict the current version's idle containers.
 		if p.retiredImages[image] {
 			if len(p.transient)+p.transientCreating >= p.max {
+				recordWait(p)
 				notify := p.notify
 				p.mu.Unlock()
 				select {
@@ -376,6 +417,7 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 				}
 			}
 			p.transientCreating++
+			p.publishPoolGaugesLocked()
 			transientReserved = p
 			p.mu.Unlock()
 			c, err := start()
@@ -389,11 +431,10 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 			if p.closed || p.removing {
 				reason := poolDiscardReason(p.removing)
 				removing := p.removing
+				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				if !c.dead() {
-					c.discard(reason)
-				}
+				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
 				if removing {
 					// The removal may have run while this transient was starting,
 					// when the pool was not yet empty; it can be deleted now.
@@ -403,6 +444,8 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 			}
 			pc := &pooledContainer{c: c, image: image, retired: true, retireReason: reasonImageChanged}
 			p.transient[pc] = struct{}{}
+			p.publishPoolGaugesLocked()
+			p.recordAcquireLocked(metrics.RuntimeOutcomeCold, time.Since(acquiredAt))
 			p.mu.Unlock()
 			return &containerLease{pool: p, pc: pc}, nil
 		}
@@ -439,6 +482,10 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 		kept := p.active.idle[:0]
 		for _, pc := range p.active.idle {
 			if pc.c.dead() {
+				// The container tore itself down while idle (its own monitor
+				// path): drop the slot AND record the discard once, using the
+				// reason it recorded. discardReaped skips the redundant teardown.
+				reaped = append(reaped, pc)
 				continue
 			}
 			if pc.retired || pc.image != image {
@@ -456,6 +503,12 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 		if len(transitioned) > 0 {
 			p.signalLocked()
 		}
+		// The transition/reap above may have dropped idle containers (and a
+		// forward transition moved busy ones to a draining generation); publish
+		// the new counts before any branch that can return or block.
+		if len(reaped) > 0 {
+			p.publishPoolGaugesLocked()
+		}
 
 		// Prefer an idle matching container.
 		for i := len(p.active.idle) - 1; i >= 0; i-- {
@@ -465,17 +518,20 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 			}
 			p.active.idle = append(p.active.idle[:i], p.active.idle[i+1:]...)
 			p.active.busy[pc] = struct{}{}
+			p.publishPoolGaugesLocked()
+			p.recordAcquireLocked(metrics.RuntimeOutcomeWarm, time.Since(acquiredAt))
 			p.mu.Unlock()
-			cc.discardReaped(reaped)
+			p.discardReaped(reaped)
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
 		// Lazily create a fresh container while total capacity remains.
 		if p.usedLocked() < p.max {
 			p.creating++
+			p.publishPoolGaugesLocked()
 			reserved = p
 			p.mu.Unlock()
-			cc.discardReaped(reaped)
+			p.discardReaped(reaped)
 
 			c, err := start()
 			p.mu.Lock()
@@ -493,11 +549,10 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 				// fresh container; discard it through the appropriate path.
 				reason := poolDiscardReason(p.removing)
 				removing := p.removing
+				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				if !c.dead() {
-					c.discard(reason)
-				}
+				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
 				if removing {
 					// The removal may have run while this start was in flight,
 					// when the pool still held the reservation; it can be
@@ -519,6 +574,8 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 				pc.gen = p.active
 				p.active.busy[pc] = struct{}{}
 			}
+			p.publishPoolGaugesLocked()
+			p.recordAcquireLocked(metrics.RuntimeOutcomeCold, time.Since(acquiredAt))
 			p.mu.Unlock()
 			return &containerLease{pool: p, pc: pc}, nil
 		}
@@ -526,9 +583,10 @@ func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max
 		// At capacity: wait for a release/eviction/transition/removal/close
 		// notification. The pool mutex is dropped while blocked so those paths
 		// can make progress.
+		recordWait(p)
 		notify := p.notify
 		p.mu.Unlock()
-		cc.discardReaped(reaped)
+		p.discardReaped(reaped)
 
 		select {
 		case <-notify:
@@ -572,27 +630,11 @@ func (p *functionPool) rollbackStartLocked(transient bool) {
 		p.creating--
 	}
 	removing := p.removing
+	p.publishPoolGaugesLocked()
 	p.signalLocked()
 	p.mu.Unlock()
 	if removing {
 		p.cache.maybeDeletePool(p.name, p)
-	}
-}
-
-// discardReaped discards (idempotently) containers acquire removed from the
-// idle list or discarded on a transition. It runs outside the pool lock; dead
-// containers are skipped because their own discard path already ran. The
-// recorded retire reason is used so an image-change discard keeps its cause.
-func (cc *containerCache) discardReaped(reaped []*pooledContainer) {
-	for _, pc := range reaped {
-		if pc.c.dead() {
-			continue
-		}
-		reason := pc.retireReason
-		if reason == "" {
-			reason = reasonImageChanged
-		}
-		pc.c.discard(reason)
 	}
 }
 
@@ -658,14 +700,13 @@ func (p *functionPool) invalidateImage(image string) {
 	}
 	p.pruneDrainingLocked()
 	if len(discard) > 0 {
+		p.publishPoolGaugesLocked()
 		p.signalLocked()
 	}
 	p.mu.Unlock()
 
 	for _, pc := range discard {
-		if !pc.c.dead() {
-			pc.c.discard(reasonImageChanged)
-		}
+		p.discardContainer(pc, reasonImageChanged)
 	}
 }
 
@@ -678,6 +719,18 @@ func (p *functionPool) invalidateImage(image string) {
 // while the mark is set). Idle containers are then discarded outside the locks,
 // busy ones were retired so their release discards them, and once the pool is
 // empty its state is deleted from the cache.
+//
+// The function's runtime-pool metric series are deleted in the SAME critical
+// section that installs the removal tombstone (p.removing), under BOTH cc.mu and
+// p.mu. This is what makes metric cleanup atomic with the lifecycle transition:
+// every pool metric writer checks the tombstone under p.mu, so a writer runs
+// entirely before the delete (its series are then deleted) or entirely after
+// (it observes the tombstone and writes nothing) — it can never recreate a
+// series after the delete. Holding cc.mu additionally excludes a concurrent
+// reactivation: activateFunction needs cc.mu, so it cannot clear the removal
+// mark and let a fresh pool publish between the tombstone and the delete (which
+// would delete the reactivated pool's brand-new series). A genuinely reactivated
+// function gets a fresh pool after this critical section and publishes normally.
 func (cc *containerCache) removeFunction(fnName string) {
 	cc.mu.Lock()
 	cc.lazyInit()
@@ -687,7 +740,14 @@ func (cc *containerCache) removeFunction(fnName string) {
 	if p != nil {
 		p.mu.Lock()
 		discard = p.beginRemoveLocked()
+		cc.deleteRuntimePoolMetrics(fnName)
 		p.mu.Unlock()
+	} else {
+		// No live pool, but a late writer from an already-detached pool could
+		// have left lingering series. The removed mark is set under cc.mu (so no
+		// new pool can be created) and any detached pool is tombstoned, so
+		// deleting here is safe and completes the removal's cleanup.
+		cc.deleteRuntimePoolMetrics(fnName)
 	}
 	cc.mu.Unlock()
 
@@ -696,6 +756,16 @@ func (cc *containerCache) removeFunction(fnName string) {
 	}
 	p.teardownDiscards(discard)
 	p.cache.maybeDeletePool(p.name, p)
+}
+
+// deleteRuntimePoolMetrics deletes fnName's runtime-pool series when a registry
+// is attached. It is called from removeFunction's critical section (cc.mu held,
+// and p.mu held when a pool exists) so the delete is atomic with the removal
+// tombstone; it must not be hoisted outside that section.
+func (cc *containerCache) deleteRuntimePoolMetrics(fnName string) {
+	if cc.metrics != nil {
+		cc.metrics.DeleteRuntimePool(fnName)
+	}
 }
 
 // activateFunction clears a previous removal mark for fnName so a
@@ -795,17 +865,19 @@ func (p *functionPool) beginRemoveLocked() []*pooledContainer {
 		}
 	}
 	p.pruneDrainingLocked()
+	// No gauge publish here: p.removing is now set, so the pool is a metric
+	// tombstone (publishPoolGaugesLocked is a no-op). The caller
+	// (containerCache.removeFunction) deletes the function's runtime-pool series
+	// in this same critical section, which is the removal-visible transition.
 	return discard
 }
 
 // teardownDiscards discards the containers beginRemoveLocked removed from the
-// pool's ownership. It runs outside the pool lock; dead containers are skipped
-// because their own discard path already ran.
+// pool's ownership. It runs outside the pool lock; dead containers are still
+// recorded (their own path already tore them down) but not discarded again.
 func (p *functionPool) teardownDiscards(discard []*pooledContainer) {
 	for _, pc := range discard {
-		if !pc.c.dead() {
-			pc.c.discard(reasonFunctionRemove)
-		}
+		p.discardContainer(pc, reasonFunctionRemove)
 	}
 }
 
@@ -862,10 +934,13 @@ func (p *functionPool) isEmptyLocked() bool {
 	return true
 }
 
-// evictIdle runs one maintenance pass over every pool, discarding healthy idle
-// containers that have been idle at least the configured timeout. It is the
-// only eviction path and is driven by Manager's single ticker (never a ticker
-// or goroutine per container). Ownership is removed from the idle list under the
+// evictIdle runs one maintenance pass over every pool. It always reaps idle
+// containers that are already dead (a container tore itself down while idle, so
+// its slot must be dropped and its gauges republished), plus retired idle
+// containers; when timeout is positive it additionally evicts healthy idle
+// containers that have been idle at least the timeout. It is the only
+// age-eviction path and is driven by Manager's single ticker (never a ticker or
+// goroutine per container). Ownership is removed from the idle list under the
 // pool lock and the actual teardown runs outside it; a failed teardown is never
 // reinserted (the container has already lost its idle slot), so a cleanup
 // failure can only leak the container, never resurrect it.
@@ -885,13 +960,16 @@ func (cc *containerCache) evictIdle() {
 	}
 }
 
-// evictIdle discards this pool's healthy idle containers older than timeout.
+// evictIdle reaps dead/retired idle containers from this pool and, when timeout
+// is positive, evicts healthy idle containers older than timeout. Dead idle
+// containers are reaped even when age eviction is disabled (a non-positive
+// timeout), so a self-terminated container can never leave a stale idle gauge;
+// the pool's authoritative counts are republished whenever anything is dropped.
 func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
-	if timeout <= 0 {
-		return
-	}
 	p.mu.Lock()
 	if p.closed || p.removing {
+		// A closed pool has already zeroed its gauges; a removing pool is a
+		// metric tombstone and must not publish (its series were deleted).
 		p.mu.Unlock()
 		return
 	}
@@ -905,9 +983,11 @@ func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
 				// discarded; never leave it to be leased again.
 				evict = append(evict, pc)
 			case pc.c.dead():
-				// Defensive: already discarded by its own path; drop the slot.
-				continue
-			case now.Sub(pc.idleSince) >= timeout:
+				// Already discarded by its own path: the slot is dropped, but
+				// the container's death is still counted as one discard (its own
+				// reason, e.g. process_exit, is recorded).
+				evict = append(evict, pc)
+			case timeout > 0 && now.Sub(pc.idleSince) >= timeout:
 				evict = append(evict, pc)
 			default:
 				kept = append(kept, pc)
@@ -923,19 +1003,17 @@ func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
 	}
 	p.pruneDrainingLocked()
 	if len(evict) > 0 {
+		p.publishPoolGaugesLocked()
 		p.signalLocked()
 	}
 	p.mu.Unlock()
 
 	for _, pc := range evict {
-		if pc.c.dead() {
-			continue
-		}
 		reason := pc.retireReason
 		if reason == "" {
 			reason = reasonIdleTimeout
 		}
-		pc.c.discard(reason)
+		p.discardContainer(pc, reason)
 	}
 }
 
@@ -990,12 +1068,13 @@ func (p *functionPool) close() {
 		pc.retired = true
 		all = append(all, pc)
 	}
+	// publishPoolGaugesLocked observes p.closed == true, so it publishes all
+	// three state gauges as zero; signalLocked is a no-op on a closed pool.
+	p.publishPoolGaugesLocked()
 	p.mu.Unlock()
 
 	for _, pc := range all {
-		if !pc.c.dead() {
-			pc.c.discard(reasonShutdown)
-		}
+		p.discardContainer(pc, reasonShutdown)
 	}
 }
 
@@ -1043,11 +1122,10 @@ func (p *functionPool) release(pc *pooledContainer) {
 			reason = reasonFunctionRemove
 		}
 		// Wake a stale-request waiter now that a transient slot has freed.
+		p.publishPoolGaugesLocked()
 		p.signalLocked()
 		p.mu.Unlock()
-		if !pc.c.dead() {
-			pc.c.discard(reason)
-		}
+		p.discardContainer(pc, reason)
 		if removing {
 			p.cache.maybeDeletePool(p.name, p)
 		}
@@ -1087,11 +1165,16 @@ func (p *functionPool) release(pc *pooledContainer) {
 	}
 	p.pruneDrainingLocked()
 	removing := p.removing
+	p.publishPoolGaugesLocked()
 	p.signalLocked()
 	p.mu.Unlock()
 
-	if reason != "" && !pc.c.dead() {
-		pc.c.discard(reason)
+	// Always funnel through discardContainer: when reason is "" the container
+	// already tore itself down (timeout/process_exit/protocol_error) and its own
+	// recorded reason is used for the discard metric; otherwise the pool reason
+	// is applied.
+	if drop {
+		p.discardContainer(pc, reason)
 	}
 	if removing {
 		p.cache.maybeDeletePool(p.name, p)

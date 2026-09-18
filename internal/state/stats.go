@@ -114,7 +114,10 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 				   handler_success_total   = excluded.handler_success_total,
 				   handler_failure_total   = excluded.handler_failure_total,
 				   retry_total             = excluded.retry_total,
-				   dlq_total               = excluded.dlq_total,`
+				   dlq_total               = excluded.dlq_total,
+				   warm_acquires_total     = excluded.warm_acquires_total,
+				   cold_starts_total       = excluded.cold_starts_total,
+				   discarded_total         = excluded.discarded_total,`
 			for _, g := range functionStatsTSUpsert() {
 				upd += "\n" + g + ","
 			}
@@ -123,13 +126,15 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 				`INSERT INTO function_stats
 				   (function_name, events_processed_total, handler_success_total,
 				    handler_failure_total, retry_total, dlq_total,
+				    warm_acquires_total, cold_starts_total, discarded_total,
 				    last_execution_at, last_success_at, last_failure_at, last_dlq_at, updated_at)
-				 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+				 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 				 WHERE EXISTS (SELECT 1 FROM functions WHERE name = ?)
 				 ON CONFLICT(function_name) DO UPDATE SET
 				   `+upd,
 				fs.Function, fs.EventsProcessedTotal, fs.HandlerSuccessTotal,
 				fs.HandlerFailureTotal, fs.RetryTotal, fs.DLQTotal,
+				fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal,
 				fs.LastExecutionAt, fs.LastSuccessAt, fs.LastFailureAt, fs.LastDLQAt, ts, fs.Function); err != nil {
 				return err
 			}

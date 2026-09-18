@@ -721,6 +721,12 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 			HandlerFailureTotal: fs.HandlerFailureTotal,
 			RetriesTotal:        fs.RetryTotal,
 			DLQTotal:            fs.DLQTotal,
+			// Restore the cumulative warm-container pool counters so they stay
+			// monotonic across restarts (the same contract as the counters
+			// above). The live pool gauges are deliberately not restored.
+			WarmAcquiresTotal: fs.WarmAcquiresTotal,
+			ColdStartsTotal:   fs.ColdStartsTotal,
+			DiscardedTotal:    fs.DiscardedTotal,
 			// Parse the RFC3339 timestamp columns back to unix seconds for the
 			// registry (an unparseable/empty value parses to a zero time, which
 			// SeedFunctionStat skips as "never observed").
@@ -799,6 +805,9 @@ func funcSnapshotStats(metricsInstance *metrics.Registry) []state.FunctionStats 
 			HandlerFailureTotal:  fs.HandlerFailureTotal,
 			RetryTotal:           fs.RetriesTotal,
 			DLQTotal:             fs.DLQTotal,
+			WarmAcquiresTotal:    fs.WarmAcquiresTotal,
+			ColdStartsTotal:      fs.ColdStartsTotal,
+			DiscardedTotal:       fs.DiscardedTotal,
 			LastExecutionAt:      unixSecToRFC3339(fs.LastExecution),
 			LastSuccessAt:        unixSecToRFC3339(fs.LastSuccess),
 			LastFailureAt:        unixSecToRFC3339(fs.LastFailure),

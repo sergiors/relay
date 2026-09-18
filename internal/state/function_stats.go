@@ -28,6 +28,16 @@ import (
 // every failure). They are reset by nothing but a genuine removal: unlike the
 // counters, an incoming empty value must never clobber a persisted timestamp
 // (see the upsert's CASE guards).
+//
+// WarmAcquiresTotal / ColdStartsTotal / DiscardedTotal are the cumulative
+// warm-container pool counters (see runtime.PoolSnapshot): warm acquires served
+// by an existing idle container, cold starts that created a fresh container,
+// and container discards (all reasons summed). They are cumulative absolute
+// totals like the other counters, persisted so the standalone
+// `relay function inspect` process can render the Runtime pool section without
+// access to the worker's in-memory pool. The LIVE pool gauges (capacity,
+// container counts by lease state) are deliberately NOT persisted: a persisted
+// live gauge would go stale between flushes.
 type FunctionStats struct {
 	Function             string
 	EventsProcessedTotal int64
@@ -35,6 +45,9 @@ type FunctionStats struct {
 	HandlerFailureTotal  int64
 	RetryTotal           int64
 	DLQTotal             int64
+	WarmAcquiresTotal    int64
+	ColdStartsTotal      int64
+	DiscardedTotal       int64
 	LastExecutionAt      string
 	LastSuccessAt        string
 	LastFailureAt        string
@@ -92,7 +105,10 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 		   handler_success_total   = excluded.handler_success_total,
 		   handler_failure_total   = excluded.handler_failure_total,
 		   retry_total             = excluded.retry_total,
-		   dlq_total               = excluded.dlq_total,`
+		   dlq_total               = excluded.dlq_total,
+		   warm_acquires_total     = excluded.warm_acquires_total,
+		   cold_starts_total       = excluded.cold_starts_total,
+		   discarded_total         = excluded.discarded_total,`
 	for _, g := range functionStatsTSUpsert() {
 		upd += "\n" + g + ","
 	}
@@ -101,13 +117,15 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 		`INSERT INTO function_stats
 		   (function_name, events_processed_total, handler_success_total,
 		    handler_failure_total, retry_total, dlq_total,
+		    warm_acquires_total, cold_starts_total, discarded_total,
 		    last_execution_at, last_success_at, last_failure_at, last_dlq_at, updated_at)
 		 VALUES
-		   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(function_name) DO UPDATE SET
 		   `+upd,
 		s.Function, s.EventsProcessedTotal, s.HandlerSuccessTotal,
 		s.HandlerFailureTotal, s.RetryTotal, s.DLQTotal,
+		s.WarmAcquiresTotal, s.ColdStartsTotal, s.DiscardedTotal,
 		s.LastExecutionAt, s.LastSuccessAt, s.LastFailureAt, s.LastDLQAt, ts)
 	if err != nil {
 		c.log.Warn("State: record function stats failed", "function", s.Function, "error", err)
@@ -123,11 +141,13 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 	err := c.db.QueryRowContext(ctx,
 		`SELECT function_name, events_processed_total, handler_success_total,
 		        handler_failure_total, retry_total, dlq_total,
+		        warm_acquires_total, cold_starts_total, discarded_total,
 		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
 		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
 		 FROM function_stats WHERE function_name = ?`, name,
 	).Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
 		&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
+		&s.WarmAcquiresTotal, &s.ColdStartsTotal, &s.DiscardedTotal,
 		&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}, false
@@ -181,6 +201,7 @@ func (c *State) AllFunctionStats() []FunctionStats {
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT function_name, events_processed_total, handler_success_total,
 		        handler_failure_total, retry_total, dlq_total,
+		        warm_acquires_total, cold_starts_total, discarded_total,
 		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
 		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
 		 FROM function_stats ORDER BY function_name`)
@@ -195,6 +216,7 @@ func (c *State) AllFunctionStats() []FunctionStats {
 		var s FunctionStats
 		if err := rows.Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
 			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
+			&s.WarmAcquiresTotal, &s.ColdStartsTotal, &s.DiscardedTotal,
 			&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt); err != nil {
 			c.log.Warn("State: scan function stats failed", "error", err)
 			return out

@@ -12,12 +12,15 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"relay/internal/function"
+	"relay/internal/metrics"
 )
 
 // newManagerWithIdleTimeout builds a Manager with an explicit warm-container
@@ -36,6 +39,20 @@ func newManagerWithIdleTimeout(t *testing.T, idle time.Duration) *Manager {
 	}
 	t.Cleanup(func() { _ = m.Close() })
 	return m
+}
+
+// newMetricsManager builds a Manager wired to a fresh metrics registry so the
+// warm-container pool observability can be asserted end to end against a real
+// Docker daemon. Close is registered as cleanup.
+func newMetricsManager(t *testing.T) (*Manager, *metrics.Registry) {
+	t.Helper()
+	reg := metrics.New()
+	m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), reg, "test-host")
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m, reg
 }
 
 // reusedContainerID polls (bridging start latency) for the running container
@@ -682,5 +699,183 @@ events:
 	}
 	if id := reusedContainerID(t, ctx, m, "remove-fn-e2e"); id == "" {
 		t.Fatal("expected a warm container after reactivation")
+	}
+}
+
+// TestIntegrationPoolMetricsColdWarmDiscard drives the warm-container pool
+// observability end to end against Docker: a first invocation is a cold start,
+// a second reuses (warm), a timeout discards with the timeout reason, and the
+// live gauges settle at the expected values. It also reads the /metrics
+// exposition to prove the new series are scrapeable.
+func TestIntegrationPoolMetricsColdWarmDiscard(t *testing.T) {
+	requireDocker(t)
+	m, reg := newMetricsManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+events:
+  - handler: index.ok
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function ok(event) { console.log("ok"); }
+export async function slow(event) {
+  await new Promise(r => setTimeout(r, 10000));
+}
+`)
+	fn := function.Function{Name: "pool-metrics-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	exec := func(handler string, timeout time.Duration) error {
+		ectx := context.WithValue(context.Background(), runMetaKey{},
+			RunMeta{Hostname: "test-host", Function: "pool-metrics-e2e", Handler: handler, Image: prepared.Image})
+		if timeout > 0 {
+			var cancelFn context.CancelFunc
+			ectx, cancelFn = context.WithTimeout(ectx, timeout)
+			defer cancelFn()
+		}
+		return m.Execute(ectx, prepared, handler, []byte(`{"event_name":"INSERT"}`), nil)
+	}
+
+	// First invocation: cold.
+	if err := exec("index.ok", 0); err != nil {
+		t.Fatalf("execute 1: %v", err)
+	}
+	if got := poolAcquireCount(reg, "pool-metrics-e2e", metrics.RuntimeOutcomeCold); got != 1 {
+		t.Fatalf("cold acquires = %d, want 1", got)
+	}
+
+	// Second invocation: warm (same container reused).
+	if err := exec("index.ok", 0); err != nil {
+		t.Fatalf("execute 2: %v", err)
+	}
+	if got := poolAcquireCount(reg, "pool-metrics-e2e", metrics.RuntimeOutcomeWarm); got != 1 {
+		t.Fatalf("warm acquires = %d, want 1", got)
+	}
+
+	// Capacity gauge is the function's resolved concurrency.
+	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
+		[]metrics.Label{{Name: "function", Value: "pool-metrics-e2e"}}); got != float64(function.DefaultConcurrency) {
+		t.Fatalf("capacity gauge = %v, want %d", got, function.DefaultConcurrency)
+	}
+
+	// Timeout discards the container with the timeout reason.
+	if err := exec("index.slow", 1*time.Second); err == nil {
+		t.Fatal("expected the slow handler to time out")
+	}
+	if got := reg.CounterLabels(metrics.MetricRuntimeContainerDiscards,
+		[]metrics.Label{{Name: "function", Value: "pool-metrics-e2e"}, {Name: "reason", Value: "timeout"}}); got != 1 {
+		t.Fatalf("timeout discards = %d, want 1", got)
+	}
+	if !waitForContainerGone(ctx, m.cli, labelFunction, "pool-metrics-e2e") {
+		t.Error("timed-out container should have been discarded")
+	}
+
+	// The new series are scrapeable on /metrics.
+	rec := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		"relay_runtime_container_acquires_total",
+		"relay_runtime_container_discards_total",
+		"relay_runtime_container_acquire_duration_seconds_count",
+		"relay_runtime_pool_capacity",
+		`relay_runtime_containers{function="pool-metrics-e2e",state="idle"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// poolAcquireCount reads one outcome's acquire counter for an integration test.
+func poolAcquireCount(reg *metrics.Registry, fn, outcome string) int64 {
+	return reg.CounterLabels(metrics.MetricRuntimeContainerAcquires,
+		[]metrics.Label{{Name: "function", Value: fn}, {Name: "outcome", Value: outcome}})
+}
+
+// TestIntegrationPoolMetricsConcurrent drives concurrent invocations of the
+// same function end to end and asserts the pool observes only cold starts (all
+// pool slots start fresh), the starting gauge rolls back to zero, and the busy
+// gauge equals the function's concurrency.
+func TestIntegrationPoolMetricsConcurrent(t *testing.T) {
+	requireDocker(t)
+	m, reg := newMetricsManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 2
+events:
+  - handler: index.sleep
+    pattern:
+      event_name: [INSERT]
+`)
+	writeFile(t, dir, "index.js", `
+export async function sleep(event) {
+  await new Promise(r => setTimeout(r, 3000));
+  console.log("done");
+}
+`)
+	fn := function.Function{Name: "pool-metrics-conc", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 2}}
+	prepared, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if prepared.Concurrency != 2 {
+		t.Fatalf("prepared concurrency = %d, want 2", prepared.Concurrency)
+	}
+
+	const n = 2
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ectx := context.WithValue(context.Background(), runMetaKey{},
+				RunMeta{Hostname: "test-host", Function: "pool-metrics-conc", Handler: "index.sleep", Image: prepared.Image})
+			errCh <- m.Execute(ectx, prepared, "index.sleep", []byte(`{"event_name":"INSERT"}`), nil)
+		}()
+	}
+	// Wait until both containers are leased (busy == 2).
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if reg.GaugeLabels(metrics.MetricRuntimeContainers,
+			[]metrics.Label{{Name: "function", Value: "pool-metrics-conc"}, {Name: "state", Value: metrics.RuntimeStateBusy}}) == 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := reg.GaugeLabels(metrics.MetricRuntimeContainers,
+		[]metrics.Label{{Name: "function", Value: "pool-metrics-conc"}, {Name: "state", Value: metrics.RuntimeStateBusy}}); got != 2 {
+		t.Fatalf("busy gauge during concurrent run = %v, want 2", got)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent execute: %v", err)
+		}
+	}
+	if got := poolAcquireCount(reg, "pool-metrics-conc", metrics.RuntimeOutcomeCold); got != 2 {
+		t.Fatalf("cold acquires = %d, want 2", got)
+	}
+	if got := poolAcquireCount(reg, "pool-metrics-conc", metrics.RuntimeOutcomeWarm); got != 0 {
+		t.Fatalf("warm acquires = %d, want 0", got)
+	}
+	for _, state := range []string{metrics.RuntimeStateStarting} {
+		if got := reg.GaugeLabels(metrics.MetricRuntimeContainers,
+			[]metrics.Label{{Name: "function", Value: "pool-metrics-conc"}, {Name: "state", Value: state}}); got != 0 {
+			t.Fatalf("%s gauge after run = %v, want 0", state, got)
+		}
 	}
 }

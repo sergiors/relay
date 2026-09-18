@@ -41,7 +41,13 @@
 // Stats persistence model:
 //
 // The stats and function_stats tables store the latest persisted ABSOLUTE
-// snapshot of Relay's operational counters — idempotent, no deltas. The worker
+// snapshot of Relay's operational counters — idempotent, no deltas. In addition
+// to the event/handler counters, function_stats carries the CUMULATIVE
+// warm-container pool counters (warm acquires, cold starts, discarded) so the
+// standalone `relay function inspect` process can render the Runtime pool
+// section without access to the worker's in-memory pool. The LIVE pool gauges
+// (capacity, container counts by lease state) are deliberately NOT persisted:
+// a persisted live gauge would go stale between flushes. The worker
 // flushes the current in-memory metrics registry into them every 5 seconds
 // (fixed, non-configurable) via RecordStatsSnapshot, which writes the global
 // row and every per-function row in one short transaction. SQLite is never on

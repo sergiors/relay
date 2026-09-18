@@ -100,9 +100,10 @@ func TestIdleEvictionAfterTimeout(t *testing.T) {
 }
 
 // TestIdleEvictionOnlyHealthyIdle proves a BUSY container is never evicted by
-// the sweep, no matter how long the invocation runs, and a DEAD idle container
-// is dropped from the idle list without an eviction discard (its own path
-// already tore it down).
+// the sweep, no matter how long the invocation runs. (A DEAD idle container is
+// reaped by the same sweep — see
+// TestPoolMetricsDeadIdleReapedByMaintenanceEvenWithoutTimeout — recorded under
+// its own self-termination reason rather than idle_timeout.)
 func TestIdleEvictionOnlyHealthyIdle(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)

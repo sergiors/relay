@@ -151,6 +151,7 @@ func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string, opts 
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
+	mgr.containers.metrics = m
 	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
 	return mgr, nil
 }
@@ -591,6 +592,27 @@ func (m *Manager) InvalidateImage(image string) {
 	m.containers.invalidateImage(image)
 }
 
+// PoolSnapshot returns a point-in-time view of name's live warm-container pool:
+// capacity, container counts by lease state, and the cumulative acquire/discard
+// counters. The gauges are read from the pool's authoritative in-memory state
+// (no Docker round trip); the counters are read from the same metrics registry
+// the worker exposes on /metrics. ok is false when the function has never warmed
+// a pool (or its pool was already removed), so a caller can omit the section
+// rather than render stale zeros. It is safe for concurrent use.
+//
+// This is a LIVE, worker-local view. It exists for in-process callers (an
+// embedded CLI/provider, tests); the standalone `relay function inspect` process
+// has no access to the worker's memory and therefore renders only the persisted
+// cumulative counters with the live gauges marked unavailable (see
+// internal/cli). The live gauges are deliberately NOT persisted to SQLite: a
+// persisted live gauge would go stale between flushes.
+func (m *Manager) PoolSnapshot(name string) (PoolSnapshot, bool) {
+	if m == nil || m.containers == nil {
+		return PoolSnapshot{}, false
+	}
+	return m.containers.snapshot(name, m.metrics)
+}
+
 // RemoveFunction discards a removed function's warm container state: new
 // acquires for the function fail immediately, idle containers are discarded now,
 // busy ones are retired and discarded when their invocation releases, and the
@@ -599,6 +621,14 @@ func (m *Manager) InvalidateImage(image string) {
 // Prepared reactivates it). It is non-blocking, so the reconciler's removal hook
 // is never stalled by an in-flight invocation, and it is the runtime half of
 // function removal; the runner separately retires the function's images.
+//
+// The function's runtime-pool metric series are deleted by the cache inside the
+// SAME critical section that installs the removal tombstone, so no concurrent
+// acquire/discard can recreate them (see containerCache.removeFunction). A
+// genuinely reactivated function gets a fresh pool (and fresh series) after that
+// section. The worker's own metricsInstance.RemoveFunction and the flush-time
+// SweepFunctionMetrics still cover the runner's series; the runtime no longer
+// performs a second, racy delete here.
 func (m *Manager) RemoveFunction(name string) {
 	if name == "" {
 		return

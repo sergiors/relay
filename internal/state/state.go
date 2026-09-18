@@ -254,6 +254,11 @@ func (c *State) initSchema(ctx context.Context) error {
 		// counter to a single function (see FunctionStats for the semantics).
 		// Backlog metrics (pending_entries/oldest_pending_age) stay global-only
 		// in stats: they describe the stream backlog, not any one function.
+		// The three warm-container pool counters (warm_acquires_total,
+		// cold_starts_total, discarded_total) are cumulative absolute pool
+		// totals (see FunctionStats and runtime.PoolSnapshot) persisted so the
+		// standalone CLI can render the Runtime pool section; the live pool
+		// gauges are deliberately not persisted.
 		// The four last_*_at TEXT columns record per-function execution-history
 		// timestamps in the same RFC3339 convention as updated_at (empty = the
 		// event was never observed); see FunctionStats and
@@ -265,6 +270,9 @@ func (c *State) initSchema(ctx context.Context) error {
 			handler_failure_total INTEGER NOT NULL DEFAULT 0,
 			retry_total INTEGER NOT NULL DEFAULT 0,
 			dlq_total INTEGER NOT NULL DEFAULT 0,
+			warm_acquires_total INTEGER NOT NULL DEFAULT 0,
+			cold_starts_total INTEGER NOT NULL DEFAULT 0,
+			discarded_total INTEGER NOT NULL DEFAULT 0,
 			last_execution_at TEXT,
 			last_success_at TEXT,
 			last_failure_at TEXT,
@@ -290,6 +298,12 @@ func (c *State) initSchema(ctx context.Context) error {
 	if err := c.migrateFunctionStatsTimestampColumns(ctx); err != nil {
 		return err
 	}
+	// Idempotent migration adding the three cumulative warm-container pool
+	// counter columns to databases created before they existed (see
+	// migrateFunctionStatsPoolColumns).
+	if err := c.migrateFunctionStatsPoolColumns(ctx); err != nil {
+		return err
+	}
 	// Idempotent migration for the services-handler -> services-entrypoint
 	// rename (see migrateServicesHandlerToEntrypoint).
 	if err := c.migrateServicesHandlerToEntrypoint(ctx); err != nil {
@@ -300,11 +314,23 @@ func (c *State) initSchema(ctx context.Context) error {
 
 // migrateFunctionsColumns adds the env and secrets columns to an existing
 // functions table that predates them. It is idempotent: each column is added
-// only when PRAGMA table_info reports it missing.
+// only when PRAGMA table_info reports it missing (see addColumnIfMissing, which
+// also tolerates a concurrent Open winning the same ALTER).
 func (c *State) migrateFunctionsColumns(ctx context.Context) error {
-	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(functions)`)
+	for _, col := range []string{"env", "secrets"} {
+		if err := c.addColumnIfMissing(ctx, "functions", col, "TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tableColumns returns the set of column names on table via PRAGMA table_info.
+// Plain SQL, consistent with the "no migration framework" comment above.
+func (c *State) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
-		return fmt.Errorf("migrate: read functions columns: %w", err)
+		return nil, fmt.Errorf("migrate: read %s columns: %w", table, err)
 	}
 	have := map[string]bool{}
 	for rows.Next() {
@@ -315,18 +341,44 @@ func (c *State) migrateFunctionsColumns(ctx context.Context) error {
 		var pk int
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
 			_ = rows.Close()
-			return fmt.Errorf("migrate: scan column: %w", err)
+			return nil, fmt.Errorf("migrate: scan %s column: %w", table, err)
 		}
 		have[name] = true
 	}
 	_ = rows.Close()
-	for _, col := range []string{"env", "secrets"} {
-		if have[col] {
-			continue
+	return have, nil
+}
+
+// addColumnIfMissing adds col (decl is the full column declaration, e.g.
+// "INTEGER NOT NULL DEFAULT 0") to table when PRAGMA table_info does not
+// already report it.
+func (c *State) addColumnIfMissing(ctx context.Context, table, col, decl string) error {
+	have, err := c.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	if have[col] {
+		return nil
+	}
+	return c.execAddColumn(ctx, table, col, decl)
+}
+
+// execAddColumn runs the ADD COLUMN, tolerating the concurrent-Open race: two
+// Open calls (in-process or a CLI alongside the worker) can both observe the
+// column missing and both attempt the ALTER, and SQLite rejects the loser with a
+// duplicate-column error. Rather than parse that error string, on failure PRAGMA
+// is re-read: a column that now exists is a concurrent migrator's win and is
+// treated as success, while any genuine failure (still missing) is returned.
+// This keeps the existing PRAGMA-then-ALTER style without a lock or migration
+// framework.
+func (c *State) execAddColumn(ctx context.Context, table, col, decl string) error {
+	if _, err := c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+col+` `+decl); err != nil {
+		// Lost a concurrent ALTER: a column that now exists means the schema is
+		// already correct despite our duplicate-column error.
+		if have, rerr := c.tableColumns(ctx, table); rerr == nil && have[col] {
+			return nil
 		}
-		if _, err := c.db.ExecContext(ctx, `ALTER TABLE functions ADD COLUMN `+col+` TEXT`); err != nil {
-			return fmt.Errorf("migrate: add column %s: %w", col, err)
-		}
+		return fmt.Errorf("migrate: add column %s.%s: %w", table, col, err)
 	}
 	return nil
 }
@@ -340,30 +392,29 @@ func (c *State) migrateFunctionsColumns(ctx context.Context) error {
 // upsert's COALESCE guards treat exactly like the empty string: "never
 // observed".
 func (c *State) migrateFunctionStatsTimestampColumns(ctx context.Context) error {
-	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(function_stats)`)
-	if err != nil {
-		return fmt.Errorf("migrate: read function_stats columns: %w", err)
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull int
-		var dflt any
-		var pk int
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("migrate: scan column: %w", err)
-		}
-		have[name] = true
-	}
-	_ = rows.Close()
 	for _, col := range []string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"} {
-		if have[col] {
-			continue
+		if err := c.addColumnIfMissing(ctx, "function_stats", col, "TEXT"); err != nil {
+			return err
 		}
-		if _, err := c.db.ExecContext(ctx, `ALTER TABLE function_stats ADD COLUMN `+col+` TEXT`); err != nil {
-			return fmt.Errorf("migrate: add column %s: %w", col, err)
+	}
+	return nil
+}
+
+// migrateFunctionStatsPoolColumns adds the three cumulative warm-container pool
+// counter columns (warm_acquires_total, cold_starts_total, discarded_total) to
+// an existing function_stats table that predates them. It is idempotent: each
+// column is added only when PRAGMA table_info reports it missing (see
+// addColumnIfMissing, which also tolerates a concurrent Open winning the same
+// ALTER), following the migrateFunctionStatsTimestampColumns pattern. The
+// columns are added with DEFAULT 0 so every pre-existing row reads as "no pool
+// activity observed yet" instead of NULL, keeping the readers' plain integer
+// scans NULL-free.
+func (c *State) migrateFunctionStatsPoolColumns(ctx context.Context) error {
+	for _, col := range []string{"warm_acquires_total", "cold_starts_total", "discarded_total"} {
+		// SQLite's ALTER TABLE ADD COLUMN fills existing rows with the DEFAULT,
+		// so a legacy row reads 0 rather than NULL.
+		if err := c.addColumnIfMissing(ctx, "function_stats", col, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
 		}
 	}
 	return nil

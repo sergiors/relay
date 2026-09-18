@@ -34,11 +34,27 @@
 //     relay_function_build_seconds{function} (prometheus.DefBuckets).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
 //     (Redis backlog depth and age sampled by the stream consumer).
+//   - Warm-container pool (runtime, function-scoped):
+//     relay_runtime_pool_capacity{function} and
+//     relay_runtime_containers{function,state=idle|busy|starting} gauges,
+//     relay_runtime_container_acquires_total{function,outcome=warm|cold} and
+//     relay_runtime_container_discards_total{function,reason} counters,
+//     relay_runtime_container_waits_total{function}, and the successful-acquire
+//     histogram relay_runtime_container_acquire_duration_seconds{function}.
 //
-// Cardinality is bounded: labels are limited to function/handler/outcome, which
-// are validated low-cardinality identifiers. High-cardinality values such as
-// event IDs, message IDs, container IDs, or fingerprints must never be used as
-// labels.
+// Cardinality is bounded: labels are limited to function/handler/outcome plus
+// the small closed runtime-pool value sets (state=idle|busy|starting,
+// outcome=warm|cold, and the finite discard reasons), which are validated
+// low-cardinality identifiers. High-cardinality values such as event IDs,
+// message IDs, container IDs, or fingerprints must never be used as labels.
+//
+// The discard reason label carries ONLY real, finite teardown causes. Persisted
+// per-function discards are one a-causal aggregate, so rather than expose a
+// synthetic reason series at startup, the restored total is held in an internal
+// per-function baseline (see Registry.restoredDiscards, seeded by
+// SeedFunctionStat) and folded into the cumulative total reported by
+// RuntimePoolCounters and FunctionStatsSnapshot. The baseline is never exposed
+// on /metrics and is cleared by every function retirement path.
 //
 // Single source of truth: stats are accumulated IN MEMORY in this registry —
 // the runner, stream consumer, and runtime manager record against it directly,

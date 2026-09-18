@@ -11,6 +11,7 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	"relay/internal/runtime"
 	"relay/internal/state"
 )
 
@@ -18,6 +19,27 @@ import (
 // the fixed internal path; tests replace it with a temp file so they never
 // touch /var/lib/relay.
 var statePath = state.DBPath
+
+// poolSnapshotProvider is the optional seam for the live warm-container pool
+// view rendered by `relay function inspect`. It defaults to nil: the standalone
+// inspect process is a SEPARATE process from the worker and has no access to the
+// worker's in-memory pool, so the LIVE gauges render as explicitly unavailable
+// rather than from stale persisted state (a persisted live gauge would be
+// misleading). The cumulative acquire/discard counters are persisted per
+// function, so the standalone section still shows those. An in-process host
+// (embedding the worker, an admin path, or a test) wires the provider via
+// SetPoolSnapshotProvider; it deliberately returns the runtime's own snapshot
+// value, so no copy of the live state model exists here.
+var poolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
+
+// SetPoolSnapshotProvider installs the live warm-container pool provider used by
+// `relay function inspect`. Passing nil (the default) leaves the Runtime pool
+// section rendering persisted cumulative counters with the live gauges marked
+// unavailable. It is safe to call before any command runs; the worker does not
+// call it today (inspect is a distinct process), but an embedding host may.
+func SetPoolSnapshotProvider(fn func(name string) (runtime.PoolSnapshot, bool)) {
+	poolSnapshotProvider = fn
+}
 
 // functionCommand builds the read-only `relay function ...` subcommand family.
 // It touches the local state database only — never Redis, Docker, or the
@@ -49,7 +71,8 @@ func functionCommand() *cli.Command {
 				Usage:     "Show detailed information about a function",
 				UsageText: "relay function inspect NAME",
 				Description: "Show the full detail record for a single function, including " +
-					"its runtime, status, events and schedules, and env/secret mappings.",
+					"its runtime, status, events and schedules, env/secret mappings, and " +
+					"its cumulative container pool counters.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
 				},
@@ -99,7 +122,8 @@ func functionInspect(ctx context.Context, w io.Writer, name string) error {
 	if !ok {
 		return fmt.Errorf("unknown function %q", name)
 	}
-	printInspect(w, st, d)
+	fs := printInspect(w, st, d)
+	appendRuntimePool(w, name, fs)
 	return nil
 }
 
@@ -118,11 +142,13 @@ func printList(w io.Writer, st *state.State) error {
 	return tw.Flush()
 }
 
-// printInspect renders the full detail record to w. Labels are tab-aligned
-// through a tabwriter so padding matches the longest label without hand-
-// maintained spaces. The Events, Schedules, and Services sections are rendered
-// with the same alignment, using a wider padding for visual grouping.
-func printInspect(w io.Writer, st *state.State, d state.Detail) {
+// printInspect renders the full detail record to w and returns the per-function
+// stats it read, so the caller can render the Runtime pool section from the same
+// persisted snapshot without a second read. Labels are tab-aligned through a
+// tabwriter so padding matches the longest label without hand-maintained spaces.
+// The Events, Schedules, and Services sections are rendered with the same
+// alignment, using a wider padding for visual grouping.
+func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionStats {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
 	fmt.Fprintf(tw, "Runtime:\t%s\n", d.Runtime)
@@ -222,6 +248,7 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) {
 		}
 		sw.Flush()
 	}
+	return fs
 }
 
 // sortedKeys returns the map's keys sorted, for deterministic inspect output.
@@ -232,6 +259,80 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// appendRuntimePool appends the Runtime pool section to an inspect output for
+// name. The cumulative counters always come from the persisted function_stats
+// row (fs.WarmAcquiresTotal/ColdStartsTotal/DiscardedTotal), so the standalone
+// process renders them with no worker access. The LIVE gauges (capacity,
+// container counts by lease state) are rendered only when an in-process provider
+// reports the function's live pool; otherwise they are explicitly marked
+// unavailable rather than invented from stale persisted state. name is passed
+// separately because fs is the zero value when no stats row exists yet (a
+// function with no pool activity still has a name to look up).
+func appendRuntimePool(w io.Writer, name string, fs state.FunctionStats) {
+	if snap, ok := livePoolSnapshot(name); ok {
+		printRuntimePool(w, &snap, fs)
+		return
+	}
+	printRuntimePool(w, nil, fs)
+}
+
+// livePoolSnapshot consults the optional in-process provider. It returns
+// (zero, false) when no provider is wired (the standalone inspect process) or
+// the provider does not report a live pool for the function.
+func livePoolSnapshot(name string) (runtime.PoolSnapshot, bool) {
+	if poolSnapshotProvider == nil {
+		return runtime.PoolSnapshot{}, false
+	}
+	return poolSnapshotProvider(name)
+}
+
+// printRuntimePool renders the compact Runtime pool section for one function.
+// It has two shapes:
+//
+//   - live != nil: an in-process provider reported the live pool, so the
+//     authoritative gauges (capacity, container counts by lease state, and the
+//     transient starting reservation) are shown alongside the cumulative
+//     counters read from the live snapshot.
+//   - live == nil: the standalone inspect process, which has no access to the
+//     worker's in-memory pool. The live gauges are rendered as unavailable
+//     ("unknown") and the cumulative acquire/discard counters come from the
+//     persisted per-function stats snapshot (fs).
+//
+// Starting is shown only when non-zero (an in-flight lazy start is transient
+// and usually zero). The layout matches the wider padding of the Services
+// section.
+func printRuntimePool(w io.Writer, live *runtime.PoolSnapshot, fs state.FunctionStats) {
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Runtime pool:")
+	tw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+	if live != nil {
+		fmt.Fprintf(tw, "  Capacity:\t%d\n", live.Capacity)
+		fmt.Fprintf(tw, "  Containers:\t%d\n", live.Containers)
+		fmt.Fprintf(tw, "  Busy:\t%d\n", live.Busy)
+		fmt.Fprintf(tw, "  Idle:\t%d\n", live.Idle)
+		if live.Starting > 0 {
+			fmt.Fprintf(tw, "  Starting:\t%d\n", live.Starting)
+		}
+		fmt.Fprintf(tw, "  Warm acquires:\t%d\n", live.WarmAcquires)
+		fmt.Fprintf(tw, "  Cold starts:\t%d\n", live.ColdStarts)
+		fmt.Fprintf(tw, "  Discarded:\t%d\n", live.Discarded)
+		tw.Flush()
+		return
+	}
+	// No live pool: the gauges are unavailable (the worker's in-memory pool is
+	// not reachable from this process). "unknown" is explicit rather than a
+	// stale number so an operator never mistakes a persisted value for a live
+	// reading.
+	fmt.Fprintf(tw, "  Capacity:\tunknown\n")
+	fmt.Fprintf(tw, "  Containers:\tunknown\n")
+	fmt.Fprintf(tw, "  Busy:\tunknown\n")
+	fmt.Fprintf(tw, "  Idle:\tunknown\n")
+	fmt.Fprintf(tw, "  Warm acquires:\t%d\n", fs.WarmAcquiresTotal)
+	fmt.Fprintf(tw, "  Cold starts:\t%d\n", fs.ColdStartsTotal)
+	fmt.Fprintf(tw, "  Discarded:\t%d\n", fs.DiscardedTotal)
+	tw.Flush()
 }
 
 // lastAgo renders a per-function timestamp for inspect: the empty string means

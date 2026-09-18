@@ -40,6 +40,13 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.IncLabels(MetricFunctionDLQ, []Label{{"function", "a"}})
 	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
 	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", "a"}}, time.Millisecond)
+	// Warm-container pool vecs.
+	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", "a"}, {"state", RuntimeStateIdle}}, 1)
+	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", "a"}}, 1)
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeCold}})
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}})
+	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", "a"}}, time.Millisecond)
+	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", "a"}})
 	r.SetGauge(MetricPendingEntries, 1)
 	r.SetGauge(MetricPendingOldestAge, 1)
 	r.SetGauge(MetricBufferedEvents, 1)
@@ -65,7 +72,7 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 		}
 	}
 	if len(seen) != len(functionMetrics)+14 {
-		t.Errorf("gathered %d families, want 23 (14 static + 9 function-carrying vecs seeded)", len(seen))
+		t.Errorf("gathered %d families, want %d (14 static + %d function-carrying vecs seeded)", len(seen), len(functionMetrics)+14, len(functionMetrics))
 	}
 }
 
@@ -238,6 +245,149 @@ func TestFunctionStatsSnapshot(t *testing.T) {
 	if got[1].Events != 1 || got[1].HandlerFailureTotal != 1 || got[1].RetriesTotal != 1 || got[1].DLQTotal != 1 {
 		t.Fatalf("function b stats = %+v", got[1])
 	}
+}
+
+// TestFunctionStatsSnapshotIncludesPoolCounters verifies the per-function
+// snapshot reads the cumulative warm-container pool counters: warm/cold acquires
+// by outcome and discards summed across every reason. It also pins that a
+// function with ONLY pool activity still surfaces (the pool series is a
+// function-scoped series the snapshot groups).
+func TestFunctionStatsSnapshotIncludesPoolCounters(t *testing.T) {
+	r := New()
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeWarm}}, 7)
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeCold}}, 3)
+	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "timeout"}}, 2)
+	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}}, 1)
+
+	got := byFn(r.FunctionStatsSnapshot(), "a")
+	if got.WarmAcquiresTotal != 7 || got.ColdStartsTotal != 3 {
+		t.Fatalf("acquires = %+v, want warm 7 cold 3", got)
+	}
+	if got.DiscardedTotal != 3 {
+		t.Fatalf("discarded = %d, want 3 (all reasons summed)", got.DiscardedTotal)
+	}
+
+	// A pool-only function (no operational counter series) still surfaces.
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "poolonly"}, {"outcome", RuntimeOutcomeCold}}, 1)
+	got = byFn(r.FunctionStatsSnapshot(), "poolonly")
+	if got.Function != "poolonly" || got.ColdStartsTotal != 1 || got.Events != 0 {
+		t.Fatalf("pool-only function = %+v, want cold 1", got)
+	}
+}
+
+// TestSeedFunctionStatPoolCounters verifies SeedFunctionStat restores the
+// cumulative pool counters: acquires into their fixed outcome series and the
+// aggregate discard total into the INTERNAL restored baseline rather than a
+// synthetic Prometheus reason series — so the aggregate the snapshot later reads
+// stays monotonic while the exposed per-reason series remain strictly causal.
+// Zero values seed nothing.
+func TestSeedFunctionStatPoolCounters(t *testing.T) {
+	r := New()
+	r.SeedFunctionStat(FunctionStat{
+		Function:          "alpha",
+		WarmAcquiresTotal: 5,
+		ColdStartsTotal:   2,
+		DiscardedTotal:    4,
+	})
+	r.SeedFunctionStat(FunctionStat{Function: "beta"}) // zero pool counters
+
+	got := byFn(r.FunctionStatsSnapshot(), "alpha")
+	if got.WarmAcquiresTotal != 5 || got.ColdStartsTotal != 2 || got.DiscardedTotal != 4 {
+		t.Fatalf("seeded pool counters = %+v, want warm 5 cold 2 discarded 4", got)
+	}
+	// The restored discard aggregate must NOT surface as a Prometheus series:
+	// the discard counter carries only real reasons. alpha has ONLY restored
+	// discards, so the discard vec has no series at all.
+	if seriesPresent(t, r.Snapshot(), MetricRuntimeContainerDiscards, "alpha") {
+		t.Fatalf("restored discards must not create a reason series:\n%s", r.Snapshot())
+	}
+	// RuntimePoolCounters (the live inspect read) folds the baseline in too.
+	if _, _, d := r.RuntimePoolCounters("alpha"); d != 4 {
+		t.Fatalf("RuntimePoolCounters(alpha) discarded = %d, want 4", d)
+	}
+	// A zero-valued pool seed writes no pool counters (the pre-existing
+	// operational counter series are still created by SeedFunctionStat).
+	if b := byFn(r.FunctionStatsSnapshot(), "beta"); b.WarmAcquiresTotal != 0 || b.ColdStartsTotal != 0 || b.DiscardedTotal != 0 {
+		t.Fatalf("zero-valued pool seed must not create pool counters: %+v", b)
+	}
+
+	// A function whose ONLY restored pool counter is a discard total still
+	// surfaces in the snapshot (it had a synthetic series before the baseline
+	// change), and no Prometheus discard series is created for it.
+	r.SeedFunctionStat(FunctionStat{Function: "gamma", DiscardedTotal: 3})
+	if g := byFn(r.FunctionStatsSnapshot(), "gamma"); g.Function != "gamma" || g.DiscardedTotal != 3 {
+		t.Fatalf("discard-only restored function must surface: %+v", g)
+	}
+	if seriesPresent(t, r.Snapshot(), MetricRuntimeContainerDiscards, "gamma") {
+		t.Fatalf("restored discard-only function must not expose a reason series:\n%s", r.Snapshot())
+	}
+
+	// A live discard after the seed keeps accumulating on top of the restored
+	// total rather than replacing it, and the live series is causal (its real
+	// reason), not the restored aggregate.
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "alpha"}, {"reason", "idle_timeout"}})
+	if d := byFn(r.FunctionStatsSnapshot(), "alpha").DiscardedTotal; d != 5 {
+		t.Fatalf("discarded after live increment = %d, want 5", d)
+	}
+	s := r.Snapshot()
+	if !strings.Contains(s, "runtime_container_discards_total{function=alpha,reason=idle_timeout} count=1") {
+		t.Fatalf("live discard must be causal:\n%s", s)
+	}
+	if strings.Contains(s, "reason=restored") {
+		t.Fatalf("no synthetic restored reason series may exist:\n%s", s)
+	}
+	// RuntimePoolCounters also reports the causal series plus the baseline.
+	if _, _, d := r.RuntimePoolCounters("alpha"); d != 5 {
+		t.Fatalf("RuntimePoolCounters(alpha) discarded = %d, want 5", d)
+	}
+}
+
+// TestRestoredDiscardsClearedOnRemoval pins that the internal restored discard
+// baseline is cleared by every function retirement path — RemoveFunction,
+// SweepFunctionMetrics, and DeleteRuntimePool — so a removed function's restored
+// aggregate never lingers in a future snapshot or inspect read.
+func TestRestoredDiscardsClearedOnRemoval(t *testing.T) {
+	t.Run("RemoveFunction", func(t *testing.T) {
+		r := New()
+		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
+		if _, _, d := r.RuntimePoolCounters("alpha"); d != 4 {
+			t.Fatalf("baseline not seeded: %d", d)
+		}
+		r.RemoveFunction("alpha")
+		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
+			t.Fatalf("RemoveFunction must clear the restored baseline: %d", d)
+		}
+		if len(r.FunctionStatsSnapshot()) != 0 {
+			t.Fatalf("snapshot must be empty after removal: %+v", r.FunctionStatsSnapshot())
+		}
+	})
+
+	t.Run("SweepFunctionMetrics", func(t *testing.T) {
+		r := New()
+		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
+		r.SweepFunctionMetrics(map[string]bool{"other": true})
+		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
+			t.Fatalf("sweep must clear the restored baseline: %d", d)
+		}
+	})
+
+	t.Run("DeleteRuntimePool", func(t *testing.T) {
+		r := New()
+		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
+		r.DeleteRuntimePool("alpha")
+		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
+			t.Fatalf("DeleteRuntimePool must clear the restored baseline: %d", d)
+		}
+	})
+
+	t.Run("NilSafe", func(t *testing.T) {
+		var nilR *Registry
+		if _, _, d := nilR.RuntimePoolCounters("alpha"); d != 0 {
+			t.Fatalf("nil registry discarded = %d, want 0", d)
+		}
+		nilR.DeleteRuntimePool("alpha")
+		nilR.RemoveFunction("alpha")
+	})
 }
 
 func TestFunctionStatsSnapshotEmptyAndNil(t *testing.T) {

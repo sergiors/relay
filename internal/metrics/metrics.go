@@ -70,6 +70,35 @@ const (
 	MetricPendingOldestAge             = metricNamespacePrefix + "pending_oldest_age_seconds"
 	MetricBufferedEvents               = metricNamespacePrefix + "buffered_events"
 	MetricInFlightInvocations          = metricNamespacePrefix + "in_flight_invocations"
+
+	// Warm-container pool observability (Phase 4). The state gauge is labeled by
+	// function and by a fixed state set (idle/busy/starting); acquires are split
+	// into the warm (reused idle container) and cold (freshly started) outcomes;
+	// discards are labeled by the finite existing discard reasons; the acquire
+	// histogram is observed for SUCCESSFUL acquires only; waits counts acquires
+	// that had to block at the pool bound. Capacity is the function's resolved
+	// per-function concurrency (the pool's bound).
+	MetricRuntimeContainers               = metricNamespacePrefix + "runtime_containers"
+	MetricRuntimePoolCapacity             = metricNamespacePrefix + "runtime_pool_capacity"
+	MetricRuntimeContainerAcquires        = metricNamespacePrefix + "runtime_container_acquires_total"
+	MetricRuntimeContainerDiscards        = metricNamespacePrefix + "runtime_container_discards_total"
+	MetricRuntimeContainerAcquireDuration = metricNamespacePrefix + "runtime_container_acquire_duration_seconds"
+	MetricRuntimeContainerWaits           = metricNamespacePrefix + "runtime_container_waits_total"
+)
+
+// Runtime pool gauge label values. They are a closed set so the
+// runtime_containers gauge's cardinality stays bounded by function × 3.
+const (
+	RuntimeStateIdle     = "idle"
+	RuntimeStateBusy     = "busy"
+	RuntimeStateStarting = "starting"
+)
+
+// Runtime acquire outcome label values: warm means an existing idle pooled
+// container was leased; cold means a fresh container was started.
+const (
+	RuntimeOutcomeWarm = "warm"
+	RuntimeOutcomeCold = "cold"
 )
 
 // buckets are the histogram bucket boundaries. prometheus.DefBuckets is used
@@ -91,6 +120,26 @@ type Registry struct {
 
 	counterVecs   map[string]*labeledCounterVec
 	histogramVecs map[string]*labeledHistogramVec
+	gaugeVecs     map[string]*labeledGaugeVec
+
+	// restoredMu guards restoredDiscards, the Relay-side per-function discard
+	// aggregate restored from persisted state at startup (see SeedFunctionStat).
+	restoredMu sync.RWMutex
+
+	// restoredDiscards maps a function name to the cumulative warm-container
+	// pool discard total recovered from SQLite at worker startup. Persisted
+	// discards are stored as one per-function aggregate across the real, finite
+	// teardown reasons, so the total cannot be reconstructed into causal
+	// per-reason series. Rather than invent a synthetic Prometheus reason (which
+	// would make an a-causal `reason="restored"` series look like a real teardown
+	// cause), the restored aggregate is kept here and added to the live per-reason
+	// series when a cumulative total is reported (RuntimePoolCounters and
+	// FunctionStatsSnapshot). This keeps the exposed per-reason series strictly
+	// causal while the restored total stays monotonic across restarts. It is a
+	// metrics-internal baseline, never exposed on /metrics; SeedFunctionStat
+	// seeds it, and RemoveFunction / SweepFunctionMetrics / DeleteRuntimePool
+	// clear it alongside the function's series.
+	restoredDiscards map[string]int64
 
 	// funcTimestampsMu guards funcTimestamps, the per-function latest
 	// execution-history timestamps (see SetFunctionTimestamp for the semantics
@@ -168,6 +217,28 @@ func (r *Registry) deleteFunctionTimestamps(function string) {
 	delete(r.funcTimestamps, function)
 }
 
+// restoredDiscardsFor returns the internal per-function discard baseline seeded
+// from persisted state. It takes restoredMu so SeedFunctionStat can run
+// concurrently with readers; a missing entry reads 0. It is nil-safe.
+func (r *Registry) restoredDiscardsFor(function string) int64 {
+	if r == nil {
+		return 0
+	}
+	r.restoredMu.RLock()
+	defer r.restoredMu.RUnlock()
+	return r.restoredDiscards[function]
+}
+
+// deleteRestoredDiscards drops function's internal restored discard baseline.
+// It is shared by RemoveFunction, SweepFunctionMetrics, and DeleteRuntimePool
+// so every retirement path clears the Relay-side baseline alongside the
+// function's Prometheus series.
+func (r *Registry) deleteRestoredDiscards(function string) {
+	r.restoredMu.Lock()
+	delete(r.restoredDiscards, function)
+	r.restoredMu.Unlock()
+}
+
 // labeledCounterVec pairs a CounterVec with the canonical order of its label
 // names, so IncLabels can map an incoming []Label onto the fixed label positions
 // WithLabelValues expects.
@@ -182,6 +253,13 @@ type labeledHistogramVec struct {
 	vec   *prometheus.HistogramVec
 }
 
+// labeledGaugeVec pairs a GaugeVec with the canonical order of its label names,
+// so SetGaugeLabels can map an incoming []Label onto the fixed label positions.
+type labeledGaugeVec struct {
+	order []string
+	vec   *prometheus.GaugeVec
+}
+
 // New returns an empty Registry backed by a fresh, dedicated Prometheus
 // registry registered with the fixed collectors callers use.
 func New() *Registry {
@@ -193,6 +271,7 @@ func New() *Registry {
 		gauges:        make(map[string]prometheus.Gauge, 2),
 		counterVecs:   make(map[string]*labeledCounterVec, 7),
 		histogramVecs: make(map[string]*labeledHistogramVec, 2),
+		gaugeVecs:     make(map[string]*labeledGaugeVec, 1),
 	}
 
 	// Unlabeled counters fed by the runner, stream, and manager (worker reads
@@ -320,6 +399,68 @@ func New() *Registry {
 		r.gauges[name] = g
 	}
 
+	// Warm-container pool observability. All four are function-scoped (the
+	// existing low-cardinality label) plus a small closed value set, and all are
+	// wired from the runtime pool's authoritative state (see
+	// internal/runtime/container_cache.go). They are added to functionMetrics so
+	// a removed function's series are deleted alongside its other series.
+	poolContainers := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricRuntimeContainers,
+	}, []string{"function", "state"})
+	reg.MustRegister(poolContainers)
+	r.gaugeVecs[MetricRuntimeContainers] = &labeledGaugeVec{
+		order: []string{"function", "state"},
+		vec:   poolContainers,
+	}
+
+	poolCapacity := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricRuntimePoolCapacity,
+	}, []string{"function"})
+	reg.MustRegister(poolCapacity)
+	r.gaugeVecs[MetricRuntimePoolCapacity] = &labeledGaugeVec{
+		order: []string{"function"},
+		vec:   poolCapacity,
+	}
+
+	containerAcquires := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricRuntimeContainerAcquires,
+	}, []string{"function", "outcome"})
+	reg.MustRegister(containerAcquires)
+	r.counterVecs[MetricRuntimeContainerAcquires] = &labeledCounterVec{
+		order: []string{"function", "outcome"},
+		vec:   containerAcquires,
+	}
+
+	containerDiscards := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricRuntimeContainerDiscards,
+	}, []string{"function", "reason"})
+	reg.MustRegister(containerDiscards)
+	r.counterVecs[MetricRuntimeContainerDiscards] = &labeledCounterVec{
+		order: []string{"function", "reason"},
+		vec:   containerDiscards,
+	}
+
+	containerAcquireDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    MetricRuntimeContainerAcquireDuration,
+		Buckets: buckets,
+	}, []string{"function"})
+	reg.MustRegister(containerAcquireDuration)
+	r.histogramVecs[MetricRuntimeContainerAcquireDuration] = &labeledHistogramVec{
+		order: []string{"function"},
+		vec:   containerAcquireDuration,
+	}
+
+	// Waits count acquires that had to block at the pool bound (regardless of
+	// eventual success), mirroring concurrency_waits_total at the pool layer.
+	containerWaits := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricRuntimeContainerWaits,
+	}, []string{"function"})
+	reg.MustRegister(containerWaits)
+	r.counterVecs[MetricRuntimeContainerWaits] = &labeledCounterVec{
+		order: []string{"function"},
+		vec:   containerWaits,
+	}
+
 	return r
 }
 
@@ -402,6 +543,31 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 	r.AddLabels(MetricFunctionHandlerFailure, labels, f.HandlerFailureTotal)
 	r.AddLabels(MetricFunctionRetries, labels, f.RetriesTotal)
 	r.AddLabels(MetricFunctionDLQ, labels, f.DLQTotal)
+	// Restore the cumulative warm-container pool counters. Acquires split cleanly
+	// over the warm/cold outcome set, so they are added back to their causal
+	// series. Discards were persisted as one aggregate across the real reasons
+	// and cannot be reconstructed causally, so the total is kept as an internal
+	// per-function baseline (restoredDiscards) and folded into the cumulative
+	// total read back by RuntimePoolCounters / FunctionStatsSnapshot — the
+	// exposed per-reason series stay strictly causal. Seeding a pool series also
+	// makes a function with pool activity but no event counters surface in
+	// FunctionStatsSnapshot.
+	if f.WarmAcquiresTotal > 0 {
+		r.AddLabels(MetricRuntimeContainerAcquires,
+			[]Label{{Name: "function", Value: f.Function}, {Name: "outcome", Value: RuntimeOutcomeWarm}}, f.WarmAcquiresTotal)
+	}
+	if f.ColdStartsTotal > 0 {
+		r.AddLabels(MetricRuntimeContainerAcquires,
+			[]Label{{Name: "function", Value: f.Function}, {Name: "outcome", Value: RuntimeOutcomeCold}}, f.ColdStartsTotal)
+	}
+	if f.DiscardedTotal > 0 {
+		r.restoredMu.Lock()
+		if r.restoredDiscards == nil {
+			r.restoredDiscards = make(map[string]int64)
+		}
+		r.restoredDiscards[f.Function] += f.DiscardedTotal
+		r.restoredMu.Unlock()
+	}
 	r.funcTimestampsMu.Lock()
 	if r.funcTimestamps == nil {
 		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
@@ -453,11 +619,21 @@ func (r *Registry) SetGauge(name string, v float64) {
 	r.SetGaugeLabels(name, nil, v)
 }
 
-// SetGaugeLabels sets the labeled gauge to v. There are no labeled gauges in
-// the current metric set, so a labeled call is a no-op (only an unlabeled gauge
-// with the given name is set). A nil receiver is a no-op.
+// SetGaugeLabels sets the named gauge to v. For an unlabeled gauge the labels
+// must be empty; for a labeled gauge (the warm-container pool gauges) the label
+// subset is mapped onto the metric's canonical label order by name, exactly as
+// IncLabels does for counters — the caller's argument order does not matter. A
+// nil receiver is a no-op; an unknown name is ignored.
 func (r *Registry) SetGaugeLabels(name string, labels []Label, v float64) {
-	if r == nil || len(labels) != 0 {
+	if r == nil {
+		return
+	}
+	if gv, ok := r.gaugeVecs[name]; ok {
+		gv.vec.WithLabelValues(r.values(gv.order, labels)...).Set(v)
+		return
+	}
+	// Labeled set on an unlabeled gauge is a no-op (the old contract).
+	if len(labels) != 0 {
 		return
 	}
 	if g, ok := r.gauges[name]; ok {
@@ -493,6 +669,16 @@ type FunctionStat struct {
 	RetriesTotal        int64
 	DLQTotal            int64
 
+	// Warm-container pool cumulative counters, read from the pool CounterVecs.
+	// DiscardedTotal is the sum of the live, causal per-reason series PLUS the
+	// internal restored baseline (persisted state seeded at startup), so it stays
+	// monotonic across restarts without exposing a synthetic reason series. They
+	// are the metrics-side source for the persisted per-function pool counters
+	// and the standalone CLI's Runtime pool section.
+	WarmAcquiresTotal int64
+	ColdStartsTotal   int64
+	DiscardedTotal    int64
+
 	// Unix-seconds timestamps (0 = never observed), fed by SetFunctionTimestamp
 	// and seeded from SQLite at startup (see SeedFunctionStat). They mirror the
 	// runner's execution-history attribution:
@@ -509,10 +695,13 @@ type FunctionStat struct {
 	LastDLQ       int64
 }
 
-// FunctionStatsSnapshot reads the five per-function CounterVecs and, for every
-// function that has at least one series, fills the four execution-history
-// timestamp fields from the timestamp map (a function with counters but no
-// timestamp entry gets zeros). A timestamp-only entry (in place but no series,
+// FunctionStatsSnapshot reads the per-function CounterVecs — the five
+// operational counters plus the warm-container pool acquires/discards counters
+// (discards summed across every live reason, plus the internal restored
+// baseline) — and, for every function that has at
+// least one series, fills the four execution-history timestamp fields from the
+// timestamp map (a function with counters but no timestamp entry gets zeros). A
+// timestamp-only entry (in place but no series,
 // i.e. all counters zero) does NOT create a snapshot entry on its own: the
 // series absence and Prometheus's zero-value lazy semantics make such an entry
 // inconsistent with the counters, and the state layer's case-guarded upsert
@@ -570,9 +759,38 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 				fs.RetriesTotal = v
 			case MetricFunctionDLQ:
 				fs.DLQTotal = v
+			case MetricRuntimeContainerAcquires:
+				switch labelValue(m, "outcome") {
+				case RuntimeOutcomeWarm:
+					fs.WarmAcquiresTotal += v
+				case RuntimeOutcomeCold:
+					fs.ColdStartsTotal += v
+				}
+			case MetricRuntimeContainerDiscards:
+				fs.DiscardedTotal += v
 			}
 		}
 	}
+	// Fold the internal restored discard baseline into the cumulative
+	// per-function total. Persisted discards could not be reconstructed into
+	// causal per-reason series, so the baseline lives outside Prometheus; adding
+	// it here keeps DiscardedTotal monotonic across restarts (and lets a function
+	// with ONLY a restored discard total still surface, preserving the prior
+	// behavior of the removed synthetic series). The exposed per-reason series
+	// remain strictly causal.
+	r.restoredMu.RLock()
+	for fn, baseline := range r.restoredDiscards {
+		if baseline == 0 {
+			continue
+		}
+		fs := byName[fn]
+		if fs == nil {
+			fs = &FunctionStat{Function: fn}
+			byName[fn] = fs
+		}
+		fs.DiscardedTotal += baseline
+	}
+	r.restoredMu.RUnlock()
 	// Merge the timestamp map into the grouped stats: only functions that
 	// already surfaced via series get their timestamp fields filled (see the
 	// doc comment's rationale for NOT creating timestamp-only entries).
@@ -596,14 +814,19 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 }
 
 // isFunctionMetric reports whether name is one of the per-function CounterVecs
-// read by FunctionStatsSnapshot.
+// read by FunctionStatsSnapshot. It includes the warm-container pool counters
+// (acquires and discards) so their cumulative totals are persisted alongside
+// the operational counters; the pool's gauges/histogram are deliberately absent
+// (they are not cumulative per-function snapshots).
 func isFunctionMetric(name string) bool {
 	switch name {
 	case MetricFunctionEvents,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
-		MetricFunctionDLQ:
+		MetricFunctionDLQ,
+		MetricRuntimeContainerAcquires,
+		MetricRuntimeContainerDiscards:
 		return true
 	}
 	return false
@@ -624,6 +847,12 @@ var functionMetrics = []string{
 	MetricFunctionDLQ,
 	MetricHandlerDuration,
 	MetricFunctionBuild,
+	MetricRuntimeContainers,
+	MetricRuntimePoolCapacity,
+	MetricRuntimeContainerAcquires,
+	MetricRuntimeContainerDiscards,
+	MetricRuntimeContainerAcquireDuration,
+	MetricRuntimeContainerWaits,
 }
 
 // isFunctionCarryingMetric reports whether name is one of the labeled vecs that
@@ -637,6 +866,39 @@ func isFunctionCarryingMetric(name string) bool {
 		}
 	}
 	return false
+}
+
+// functionRemovedRuntimeMetrics lists the warm-container pool vecs for the
+// narrow deletion performed by DeleteRuntimePool. It is a subset of
+// functionMetrics.
+var functionRemovedRuntimeMetrics = []string{
+	MetricRuntimeContainers,
+	MetricRuntimePoolCapacity,
+	MetricRuntimeContainerAcquires,
+	MetricRuntimeContainerDiscards,
+	MetricRuntimeContainerAcquireDuration,
+	MetricRuntimeContainerWaits,
+}
+
+// DeleteRuntimePool deletes only the warm-container pool series labeled
+// function=name, leaving every other function-scoped collector untouched. It is
+// the runtime's own cleanup hook: containerCache.removeFunction calls it while
+// holding the removal tombstone (both the cache lock and, when a pool exists,
+// the pool lock), so no concurrent pool metric writer can recreate a deleted
+// series. The broader Registry.RemoveFunction (the worker's hook) deletes all of
+// a function's series too; this narrower method lets the runtime be
+// self-sufficient without reaching into the runner's collectors. Nil-safe and
+// idempotent, and it does not create any series.
+func (r *Registry) DeleteRuntimePool(name string) {
+	if r == nil {
+		return
+	}
+	for _, n := range functionRemovedRuntimeMetrics {
+		r.deleteFunction(n, name)
+	}
+	// Drop the internal restored discard baseline too, so a removed function's
+	// restored aggregate is not folded into a (now nonexistent) pool total.
+	r.deleteRestoredDiscards(name)
 }
 
 // RemoveFunction deletes every metric series labeled function=<name> across all
@@ -666,6 +928,7 @@ func (r *Registry) RemoveFunction(name string) {
 	r.funcTimestampsMu.Lock()
 	r.deleteFunctionTimestamps(name)
 	r.funcTimestampsMu.Unlock()
+	r.deleteRestoredDiscards(name)
 }
 
 // SweepFunctionMetrics deletes stale function-scoped series for every function
@@ -708,25 +971,34 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 		}
 	}
 	r.funcTimestampsMu.Unlock()
+	// Sweep the internal restored discard baseline with the same live set so a
+	// removed function's restored aggregate is not folded into a future snapshot.
+	r.restoredMu.Lock()
+	for fn := range r.restoredDiscards {
+		if !live[fn] {
+			delete(r.restoredDiscards, fn)
+		}
+	}
+	r.restoredMu.Unlock()
 }
 
 // deleteFunction removes every series labeled function=fn from the named vec,
 // using the delete strategy appropriate to its label set. It is shared by
 // RemoveFunction and SweepFunctionMetrics so both retirement paths behave
 // identically. Each vec that carries function plus another variable label — the
-// counter MetricHandlerInvocations (outcome,function,handler) and the
-// histogram MetricHandlerDuration (function,handler) — is deleted by
-// partial match: prometheus DeleteLabelValues requires a value for EVERY
-// variable label, so passing only the function name matches nothing on a
-// multi-label vec. Every single-function-label vec is deleted by label value
-// directly.
+// counter MetricHandlerInvocations (outcome,function,handler), the histogram
+// MetricHandlerDuration (function,handler), and the runtime pool gauges/counters
+// (function,state/outcome/reason) — is deleted by partial match: prometheus
+// DeleteLabelValues requires a value for EVERY variable label, so passing only
+// the function name matches nothing on a multi-label vec. Every
+// single-function-label vec is deleted by label value directly.
 //
 // WARNING: any NEW vec carrying the function label must be added to
 // functionMetrics AND, when it has more than the single function variable
 // label, classified for DeletePartialMatch by setting the `partial` flag below —
 // otherwise function lifecycle cleanup silently misses it.
 func (r *Registry) deleteFunction(name, fn string) {
-	partial := name == MetricHandlerInvocations || name == MetricHandlerDuration
+	partial := isPartialFunctionMetric(name)
 	if lc, ok := r.counterVecs[name]; ok {
 		if partial {
 			lc.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
@@ -739,10 +1011,33 @@ func (r *Registry) deleteFunction(name, fn string) {
 		if partial {
 			lh.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
 		} else {
-			// MetricFunctionBuild (sole label).
+			// MetricFunctionBuild, MetricRuntimeContainerAcquireDuration.
 			lh.vec.DeleteLabelValues(fn)
 		}
+		return
 	}
+	if gv, ok := r.gaugeVecs[name]; ok {
+		if partial {
+			gv.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+		} else {
+			gv.vec.DeleteLabelValues(fn)
+		}
+	}
+}
+
+// isPartialFunctionMetric reports whether the named function-carrying vec has
+// more than the single function variable label, and therefore must be deleted
+// with DeletePartialMatch (see deleteFunction).
+func isPartialFunctionMetric(name string) bool {
+	switch name {
+	case MetricHandlerInvocations,
+		MetricHandlerDuration,
+		MetricRuntimeContainers,
+		MetricRuntimeContainerAcquires,
+		MetricRuntimeContainerDiscards:
+		return true
+	}
+	return false
 }
 
 // labelValue returns the value of the named label on a gathered metric, or ""
@@ -771,6 +1066,129 @@ func (r *Registry) Gauge(name string) float64 {
 		return 0
 	}
 	return m.Gauge.GetValue()
+}
+
+// GaugeLabels returns the current value of the labeled gauge name under the
+// given label subset, or 0 when the metric or series has no value yet. It is the
+// read counterpart of SetGaugeLabels used by the `relay function inspect`
+// runtime-pool section (which reads live gauges) and by tests. A nil receiver
+// returns 0.
+func (r *Registry) GaugeLabels(name string, labels []Label) float64 {
+	if r == nil {
+		return 0
+	}
+	gv, ok := r.gaugeVecs[name]
+	if !ok {
+		return 0
+	}
+	var m dto.Metric
+	if err := gv.vec.WithLabelValues(r.values(gv.order, labels)...).Write(&m); err != nil {
+		return 0
+	}
+	return m.Gauge.GetValue()
+}
+
+// CounterLabels returns the current value of the labeled counter name under the
+// given label subset, or 0 when the metric or series has no value yet. A nil
+// receiver returns 0.
+func (r *Registry) CounterLabels(name string, labels []Label) int64 {
+	if r == nil {
+		return 0
+	}
+	lc, ok := r.counterVecs[name]
+	if !ok {
+		return 0
+	}
+	var m dto.Metric
+	if err := lc.vec.WithLabelValues(r.values(lc.order, labels)...).Write(&m); err != nil {
+		return 0
+	}
+	return int64(m.Counter.GetValue())
+}
+
+// HistogramLabels returns the observation count and sum (seconds) of the labeled
+// histogram name under the given label subset. A metric or series with no
+// observations reads (0, 0). A nil receiver returns (0, 0). It is the read
+// counterpart of ObserveDurationLabels, used by tests (the warm-container
+// acquire histogram is otherwise only visible on /metrics).
+func (r *Registry) HistogramLabels(name string, labels []Label) (count uint64, sum float64) {
+	if r == nil {
+		return 0, 0
+	}
+	lh, ok := r.histogramVecs[name]
+	if !ok {
+		return 0, 0
+	}
+	want := r.values(lh.order, labels)
+	families, err := r.reg.Gather()
+	if err != nil {
+		return 0, 0
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if labelValuesMatch(m, lh.order, want) {
+				return m.GetHistogram().GetSampleCount(), m.GetHistogram().GetSampleSum()
+			}
+		}
+	}
+	return 0, 0
+}
+
+// labelValuesMatch reports whether m carries exactly the wanted value for every
+// label in order. It is used by the histogram reader, which finds a series in a
+// gathered family rather than creating one.
+func labelValuesMatch(m *dto.Metric, order, want []string) bool {
+	for i, name := range order {
+		if labelValue(m, name) != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// RuntimePoolCounters reads the cumulative warm-container pool counters for one
+// function: warm acquires, cold starts, and discards (all reasons summed). It is
+// a convenience for the runtime's PoolSnapshot, and it reads only EXISTING
+// series from a single Gather — unlike CounterLabels it never creates a
+// zero-valued series as a side effect of an inspect read. A nil receiver
+// returns zeros.
+func (r *Registry) RuntimePoolCounters(function string) (warm, cold, discarded int64) {
+	if r == nil {
+		return 0, 0, 0
+	}
+	families, err := r.reg.Gather()
+	if err != nil {
+		return 0, 0, 0
+	}
+	for _, f := range families {
+		switch f.GetName() {
+		case MetricRuntimeContainerAcquires:
+			for _, m := range f.GetMetric() {
+				if labelValue(m, "function") != function {
+					continue
+				}
+				switch labelValue(m, "outcome") {
+				case RuntimeOutcomeWarm:
+					warm += int64(m.Counter.GetValue())
+				case RuntimeOutcomeCold:
+					cold += int64(m.Counter.GetValue())
+				}
+			}
+		case MetricRuntimeContainerDiscards:
+			for _, m := range f.GetMetric() {
+				if labelValue(m, "function") == function {
+					discarded += int64(m.Counter.GetValue())
+				}
+			}
+		}
+	}
+	// Add the internal restored baseline so the cumulative total stays monotonic
+	// across restarts without exposing a synthetic reason series.
+	discarded += r.restoredDiscardsFor(function)
+	return warm, cold, discarded
 }
 
 // Snapshot renders every registered metric as a logfmt-style line, one per

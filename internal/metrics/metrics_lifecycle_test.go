@@ -8,9 +8,9 @@ import (
 )
 
 // seedFunction increments every function-carrying vec for name, so a function
-// has a series in each of the nine functionMetrics collectors. handler duration
-// and function build are observed as histograms; handler_invocations_total gets
-// both success and failure outcomes.
+// has a series in each of the functionMetrics collectors. handler duration and
+// function build are observed as histograms; handler_invocations_total gets
+// both success and failure outcomes; the runtime pool vecs get one series each.
 func seedFunction(r *Registry, name string) {
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", name}, {"handler", "x"}})
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", name}, {"handler", "x"}})
@@ -22,6 +22,12 @@ func seedFunction(r *Registry, name string) {
 	r.IncLabels(MetricFunctionDLQ, []Label{{"function", name}})
 	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", name}, {"handler", "x"}}, time.Millisecond)
 	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", name}}, time.Millisecond)
+	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", name}, {"state", RuntimeStateIdle}}, 1)
+	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", name}}, 2)
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", name}, {"outcome", RuntimeOutcomeCold}})
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", name}, {"reason", "shutdown"}})
+	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", name}}, time.Millisecond)
+	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", name}})
 }
 
 // seriesPresent reports whether the snapshot contains a series whose rendered
@@ -53,7 +59,7 @@ func seriesPresent(t *testing.T, snapshot, metric, name string) bool {
 	return false
 }
 
-// assertNoFunctionSeries asserts no series across any of the nine
+// assertNoFunctionSeries asserts no series across any of the functionMetrics
 // functionMetrics vecs carries function=name.
 func assertNoFunctionSeries(t *testing.T, r *Registry, name string) {
 	t.Helper()
@@ -65,7 +71,7 @@ func assertNoFunctionSeries(t *testing.T, r *Registry, name string) {
 	}
 }
 
-// assertFunctionSeries asserts every one of the nine vecs has a series for name.
+// assertFunctionSeries asserts every one of the functionMetrics vecs has a series for name.
 func assertFunctionSeries(t *testing.T, r *Registry, name string) {
 	t.Helper()
 	s := r.Snapshot()
@@ -110,7 +116,7 @@ func assertGlobalTotals(t *testing.T, r *Registry, want map[string]int64) {
 	}
 }
 
-// Series exist for a function across all nine function-carrying vecs while the
+// Series exist for a function across all functionMetrics vecs while the
 // function exists, with a second function's series isolated alongside.
 func TestFunctionSeriesExistWhileFunctionExists(t *testing.T) {
 	r := New()
@@ -120,7 +126,7 @@ func TestFunctionSeriesExistWhileFunctionExists(t *testing.T) {
 	assertFunctionSeries(t, r, "bar")
 }
 
-// RemoveFunction removes exactly foo's series across all nine vecs, leaves
+// RemoveFunction removes exactly foo's series across all functionMetrics vecs, leaves
 // bar's series untouched in each, and leaves every global metric unchanged.
 func TestRemoveFunctionDeletesOnlyFunctionSeries(t *testing.T) {
 	r := New()
@@ -159,8 +165,69 @@ func TestRemoveFunctionDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
 	}
 }
 
-// RemoveFunction on handler_duration_seconds must delete foo's multi-label
-// histogram series (DeleteLabelValues path) while leaving bar's intact.
+// TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries verifies function
+// lifecycle cleanup deletes the warm-container pool series, which carry an
+// extra variable label (state/outcome/reason) and therefore require the
+// DeletePartialMatch path: foo's series in EVERY value of each extra label are
+// removed while bar's survive.
+func TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries(t *testing.T) {
+	r := New()
+	for _, fn := range []string{"foo", "bar"} {
+		for _, state := range []string{RuntimeStateIdle, RuntimeStateBusy, RuntimeStateStarting} {
+			r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", fn}, {"state", state}}, 1)
+		}
+		for _, outcome := range []string{RuntimeOutcomeWarm, RuntimeOutcomeCold} {
+			r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", fn}, {"outcome", outcome}})
+		}
+		for _, reason := range []string{"timeout", "image_changed", "shutdown"} {
+			r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", fn}, {"reason", reason}})
+		}
+		r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", fn}})
+	}
+
+	r.RemoveFunction("foo")
+
+	s := r.Snapshot()
+	for _, m := range []string{MetricRuntimeContainers, MetricRuntimeContainerAcquires, MetricRuntimeContainerDiscards, MetricRuntimeContainerWaits} {
+		if seriesPresent(t, s, m, "foo") {
+			t.Fatalf("foo %s series must be removed:\n%s", m, s)
+		}
+		if !seriesPresent(t, s, m, "bar") {
+			t.Fatalf("bar %s series must survive:\n%s", m, s)
+		}
+	}
+	// Re-incrementing foo starts fresh, not from foo's pre-removal value.
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", "foo"}, {"outcome", RuntimeOutcomeCold}})
+	r.RemoveFunction("foo")
+	if seriesPresent(t, r.Snapshot(), MetricRuntimeContainerAcquires, "foo") {
+		t.Fatal("re-added foo must be removable again")
+	}
+}
+
+// TestRemoveFunctionDeletesRuntimePoolSingleLabelSeries verifies the
+// single-function-label pool vecs (capacity, acquire duration) are deleted by
+// label value, independent of the multi-label vecs above.
+func TestRemoveFunctionDeletesRuntimePoolSingleLabelSeries(t *testing.T) {
+	r := New()
+	for _, fn := range []string{"foo", "bar"} {
+		r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", fn}}, 2)
+		r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", fn}}, time.Millisecond)
+	}
+	r.RemoveFunction("foo")
+	s := r.Snapshot()
+	for _, m := range []string{MetricRuntimePoolCapacity, MetricRuntimeContainerAcquireDuration} {
+		if seriesPresent(t, s, m, "foo") {
+			t.Fatalf("foo %s series must be removed:\n%s", m, s)
+		}
+		if !seriesPresent(t, s, m, "bar") {
+			t.Fatalf("bar %s series must survive:\n%s", m, s)
+		}
+	}
+}
+
+// TestRemoveFunctionDeletesHandlerDurationMultiLabel verifies RemoveFunction on
+// handler_duration_seconds deletes foo's multi-label histogram series
+// (DeleteLabelValues path) while leaving bar's intact.
 func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
 	r := New()
 	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)

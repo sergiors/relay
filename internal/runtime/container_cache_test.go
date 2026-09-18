@@ -16,6 +16,10 @@ type fakeContainer struct {
 	discarded   []string
 	deadFlag    bool
 	invocations int
+	// reason is the reason recorded by the container's own teardown path, read
+	// back via discardReason (mirrors executionContainer's self-recorded
+	// timeout/process_exit/protocol_error reasons).
+	reason string
 	// release, when non-nil, makes Invoke block until it is closed (to exercise
 	// capacity waits and busy-entry invalidation). err is returned.
 	release chan struct{}
@@ -25,6 +29,10 @@ type fakeContainer struct {
 	// panicOnInvoke makes Invoke panic (to exercise panic-safe lease release).
 	panicOnInvoke bool
 	err           error
+	// selfDiscardReason, when non-empty, makes Invoke tear the container down
+	// itself with that reason (mirroring executionContainer's timeout/
+	// process_exit/protocol_error paths) before returning an error.
+	selfDiscardReason string
 	// discardFails makes discard report failure WITHOUT marking the container
 	// dead (and without recording a reason), modelling a teardown that could not
 	// clean up the container. Used to prove eviction never reinserts a container
@@ -48,6 +56,9 @@ func (f *fakeContainer) Invoke(_ context.Context, _ string, _ []byte, _ map[stri
 	if f.release != nil {
 		<-f.release
 	}
+	if f.selfDiscardReason != "" {
+		f.discard(f.selfDiscardReason)
+	}
 	return f.err
 }
 
@@ -62,8 +73,17 @@ func (f *fakeContainer) discard(reason string) bool {
 		return false
 	}
 	f.deadFlag = true
+	f.reason = reason
 	f.discarded = append(f.discarded, reason)
 	return true
+}
+
+// discardReason returns the reason recorded by the container's own discard, or
+// "" when it did not tear itself down.
+func (f *fakeContainer) discardReason() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reason
 }
 
 func (f *fakeContainer) attempts() int {
