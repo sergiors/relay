@@ -146,7 +146,7 @@ func TestEngineForSharedEngine(t *testing.T) {
 		if p.BaseImage != spec.BaseImage {
 			t.Errorf("%s plan base image = %q, want %q", name, p.BaseImage, spec.BaseImage)
 		}
-		if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "python" {
+		if p.Entrypoint[0] != "python" {
 			t.Errorf("%s plan entrypoint = %v, want python entrypoint", name, p.Entrypoint)
 		}
 	}

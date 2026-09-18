@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -42,7 +43,11 @@ func engineFor(spec plan.Spec) (interface {
 }
 
 // Manager prepares function images and executes handler invocations. It owns a
-// single Docker Engine client, reused for every build and invocation.
+// single Docker Engine client, reused for every build and invocation, and a
+// per-function execution-container cache: each function runs ONE reused
+// container per image version (see container_cache.go), kept alive between
+// invocations and discarded on timeout/process exit/protocol error/image
+// change/shutdown.
 type Manager struct {
 	log *slog.Logger
 	cli *client.Client
@@ -55,6 +60,8 @@ type Manager struct {
 	// same. The startup orphan sweep uses it to distinguish this worker's
 	// stalled containers from those of every other worker sharing the daemon.
 	hostname string
+	// containers caches the per-function reusable execution containers.
+	containers *containerCache
 }
 
 // NewManager connects to the Docker daemon so failures surface at startup
@@ -77,13 +84,28 @@ func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string) (*Man
 		_ = cli.Close()
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
-	return &Manager{log: logger, cli: cli, metrics: m, hostname: hostname}, nil
+	mgr := &Manager{log: logger, cli: cli, metrics: m, hostname: hostname}
+	mgr.containers = newContainerCache()
+	return mgr, nil
 }
 
-// Close releases the Docker Engine client. It is safe to call once during
-// shutdown.
+// Close discards every cached execution container (reason "shutdown"; each
+// kill/remove runs on bounded, detached contexts so a cancelled shutdown ctx
+// cannot strand them), then releases the Docker Engine client. It is safe to
+// call once during shutdown; the worker defers it at startup.
 func (m *Manager) Close() error {
+	m.containers.close()
 	return m.cli.Close()
+}
+
+// startContainer builds one fresh execution container for a function version.
+// It is the containerCache factory, called with the creating invocation's
+// parameters: env is the function's plan env (per-function, applied at
+// container create) and meta is the creation-time identity RunMeta stamped as
+// labels (per-invocation fields left empty — labels are immutable while the
+// container outlives invocations).
+func (m *Manager) startContainer(ctx context.Context, fnName, image string, env []string, meta RunMeta) (reusableContainer, error) {
+	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, meta)
 }
 
 // Prepared is a function whose image has been built.
@@ -138,6 +160,13 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 
 	image := ImageRef(fn.Name, fp)
 
+	// bootstrapHash pins the runtime-injected bootstrap content (the engine's
+	// embedded plan files) plus the entrypoint onto the image as a label. The
+	// fingerprint above covers ONLY the function dir, so the label is what
+	// lets the reuse path below detect an image built with a stale bootstrap
+	// (e.g. by an older Relay version) under the exact same tag.
+	bHash := bootstrapHash(p)
+
 	// Prepare the dependency label reference for the return value on both paths.
 	// On the build path it is the dependency image built FROM; on the reuse path
 	// it is computed WITHOUT building (the dependency image obviously exists, or
@@ -159,7 +188,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// the identity: an image carrying this exact tag was necessarily built from
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
-	if m.imageExists(ctx, image) {
+	if m.imageExists(ctx, image) && m.bootstrapLabelMatches(ctx, image, bHash) {
 		m.log.Debug(
 			"Function: image exists; reusing",
 			"function", fn.Name,
@@ -189,7 +218,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	}
 
 	start := time.Now()
-	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef)); err != nil {
+	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash)); err != nil {
 		d := time.Since(start)
 		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
@@ -277,19 +306,28 @@ func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Functio
 	return depRef, nil
 }
 
-// Execute runs the container for one invocation of the given handler with the
-// event JSON on stdin. The context must carry the per-invocation timeout; a
-// timeout kills the invocation and is treated as a failure. The invocation's
-// diagnostic RunMeta is read from ctx (see WithRunMeta); when absent the labels
-// are empty, which is harmless (labels are diagnostic-only).
+// Execute runs the given handler invocation against the function's REUSED
+// execution container (one per function per image version; see
+// container_cache.go and execution_container.go). The first invocation for a
+// function starts the container (stamping its creation-time identity labels
+// from the RunMeta in ctx); subsequent invocations reuse the same container
+// over the line-JSON invocation protocol until it is discarded (timeout,
+// process exit, protocol error, image change). A handler failure (ok:false)
+// does NOT discard it.
 //
-// extraEnv are additional environment variables applied to the container after
-// the function's plan env (and after the base RELAY_HANDLER var). They carry the
-// template's literal env values and the resolved secret values for this single
-// invocation. They are resolved per execution by the runner and never stored on
-// Prepared, so rotating a secret value never requires a rebuild. Later entries
-// win on duplicate names (container env semantics), so a template env var may
-// intentionally override a runtime default like PYTHONDONTWRITEBYTECODE.
+// The context must carry the per-invocation timeout; a timeout discards the
+// container (kill + remove, reason "timeout") and is treated as an invocation
+// failure. The invocation's diagnostic RunMeta is read from ctx (see
+// WithRunMeta); when absent the labels are empty except the hostname fallback
+// below, which is harmless (labels are diagnostic-only beyond the sweep
+// predicate).
+//
+// extraEnv are additional environment variables carried INTO the request frame
+// (see invokeRequest.Env) so per-invocation values — template env values and
+// resolved secrets — take effect per invocation on the reused container.
+// Later entries win on duplicate names ("K=V" parse; later entries overwrite),
+// matching the old container-env semantics, so rotating a secret value never
+// requires a rebuild.
 func (m *Manager) Execute(
 	ctx context.Context,
 	prepared *Prepared,
@@ -306,16 +344,54 @@ func (m *Manager) Execute(
 		// net for direct/integration callers.
 		meta.Hostname = m.hostname
 	}
-	return runContainer(
-		ctx,
-		m.cli,
-		m.log,
-		prepared.Name,
-		prepared.Image,
-		prepared.Env,
-		extraEnv,
-		handler,
-		eventJSON,
-		meta,
+	if meta.Image == "" {
+		// Same safety net for the image identity: the owning function image is
+		// known here, so the label (and RemoveImage's in-use guard) stays
+		// accurate for direct callers that never set it.
+		meta.Image = prepared.Image
+	}
+	if meta.Function == "" {
+		meta.Function = prepared.Name
+	}
+
+	// Creation-time identity meta: per-invocation fields (Handler, MessageID,
+	// EventID, EventName) are EMPTY because container labels are immutable at
+	// creation while the reused container outlives individual invocations;
+	// per-invocation attribution lives only in the request frame and the
+	// in-flight output prefix.
+	idMeta := meta
+	idMeta.Handler = ""
+	idMeta.MessageID = ""
+	idMeta.EventID = ""
+	idMeta.EventName = ""
+	start := func() (reusableContainer, error) {
+		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, idMeta)
+	}
+	return m.containers.execute(
+		ctx, prepared.Name, prepared.Image, start, handler, eventJSON, envMap(extraEnv),
 	)
+}
+
+// InvalidateImage discards any cached execution container running the given
+// image, WITHOUT blocking: an entry mid-Invoke records the invalidation and
+// drains it right after the in-flight invocation completes (TryLock
+// semantics). It is called by the runner when retiring an image so the image's
+// ErrImageInUse container-reference guard clears promptly.
+func (m *Manager) InvalidateImage(image string) {
+	m.containers.invalidateImage(image)
+}
+
+// envMap parses "K=V" entries into a map, later entries winning on duplicate
+// names (the same semantics the old container env argument had).
+func envMap(extraEnv []string) map[string]string {
+	if len(extraEnv) == 0 {
+		return nil
+	}
+	env := make(map[string]string, len(extraEnv))
+	for _, kv := range extraEnv {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	return env
 }

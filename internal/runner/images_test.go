@@ -133,7 +133,7 @@ func (*removeBoomErr) Error() string { return "remove boom" }
 
 // fp is a valid, always-matching prepared function whose executor doubles as an
 // ImageCleaner so the runner's resolver finds it.
-func fpClean(t *testing.T, name, image string, exec *blockExecutor) *PreparedFunction {
+func fpClean(t *testing.T, name, image string, exec Executor) *PreparedFunction {
 	t.Helper()
 	return NewPrepared(
 		function.Function{

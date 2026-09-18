@@ -10,7 +10,7 @@ import (
 // the managed function-image label set (type + function + fingerprint plus an
 // optional dependency reference), and that an empty dependency is omitted.
 func TestImageLabelsFunction(t *testing.T) {
-	got := functionImageLabels("my-fn", "fpb1c2d3e4f5a6b7c", "relay-dep-abcdef1234567890")
+	got := functionImageLabels("my-fn", "fpb1c2d3e4f5a6b7c", "relay-dep-abcdef1234567890", "bootstrap1")
 	if got[labelType] != ImageTypeFunction {
 		t.Errorf("relay.type = %q, want function", got[labelType])
 	}
@@ -30,7 +30,7 @@ func TestImageLabelsFunction(t *testing.T) {
 	}
 
 	// No dependency: omitted entirely.
-	noDep := functionImageLabels("my-fn", "fp", "")
+	noDep := functionImageLabels("my-fn", "fp", "", "")
 	if _, ok := noDep[labelDependency]; ok {
 		t.Error("a function without deps must not carry a relay.dependency label")
 	}

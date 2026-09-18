@@ -381,10 +381,19 @@ only when no managed function image references them. An image with no
 
 ### Execution container lifecycle
 
+Each function keeps **one reused execution container** per image version: the
+first invocation starts it and subsequent invocations exchange request/response
+frames with the same long-running process instead of paying container startup on
+every event. Because the interpreter process persists, function code must not
+assume process-global state is fresh per invocation (module-level state and
+per-invocation env values survive). Timeouts, process exits, protocol errors,
+image changes, and shutdown still invalidate the container, and the next
+invocation starts a fresh one.
+
 Every function execution container is created with Docker **AutoRemove**, so the
 daemon removes the container once its process exits. Relay relies on AutoRemove
-for the normal execution path and does not explicitly remove containers that
-exit on their own.
+for crash cleanup and does not explicitly remove containers that exit on their
+own.
 
 Explicit removal is used only as a backstop for abnormal lifecycle paths where a
 container may still be running or may never have started correctly, such as
@@ -397,7 +406,11 @@ Every execution container also carries seven **diagnostic-only** Docker labels �
 `relay.event_name`, `relay.hostname`, `relay.image` — so an orphan container can
 be attributed to its function/handler/message/event/worker/image. They carry no
 payload contents (only bounded IDs and function/handler names) and Relay's
-event-processing correctness never depends on them.
+event-processing correctness never depends on them. On the reused container the
+per-invocation labels (`relay.handler`, `relay.message_id`, `relay.event_id`,
+`relay.event_name`) are empty at creation — labels are immutable per container
+while it outlives individual invocations — and only `relay.type`,
+`relay.function`, `relay.hostname`, and `relay.image` are stamped.
 
 At startup, before any function is prepared or any container created, Relay runs
 a conservative **orphan sweep** (bounded to 30s): it lists containers and removes

@@ -60,7 +60,9 @@ func requireDocker(t *testing.T) *client.Client {
 
 // newManager returns a Manager wired to a logger that writes into the returned
 // buffer, capturing Relay operational logs for assertions. The manager owns
-// hostname "test-host" so container-ownership tests are deterministic.
+// hostname "test-host" so container-ownership tests are deterministic. Close is
+// registered as cleanup: Manager.Close discards the per-function reused
+// execution containers it may have started.
 //
 // Handler stdout/stderr is NO LONGER routed through the logger (it is forwarded
 // as a raw transport to the function-output sink; see output.go and
@@ -75,6 +77,7 @@ func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	t.Cleanup(func() { _ = m.Close() })
 	return m, &buf
 }
 
@@ -836,12 +839,12 @@ export function secret(event) {
 	}
 }
 
-// TestIntegrationSuccessfulRunNoExplicitRemove verifies the normal completion
-// path does NOT issue an explicit container removal: a handler that exits 0 is
-// cleaned up by AutoRemove alone, so no "remove container" log line is emitted
-// (the previous blanket deferred remove logged a spurious 409 "removal already
-// in progress" on this path) and the container is gone.
-func TestIntegrationSuccessfulRunNoExplicitRemove(t *testing.T) {
+// TestIntegrationSuccessfulRunKeepsContainer verifies the reused-container
+// contract: the FIRST successful invocation starts a container (no explicit
+// remove beyond AutoRemove-on-exit), it is NOT removed while healthy, and a
+// second invocation REUSES the same container id. Manager.Close discards it
+// (reason "shutdown"), the daemon removes it, and no leftover remains.
+func TestIntegrationSuccessfulRunKeepsContainer(t *testing.T) {
 	requireDocker(t)
 	m, buf := newManager(t)
 	out := newFunctionOutputSink(t)
@@ -870,20 +873,58 @@ export function ok(event) {
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
 		RunMeta{Hostname: "test-host", Function: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.ok", []byte(`{"event_id":"evt_1","event_name":"INSERT"}`), nil); err != nil {
-		t.Fatalf("execute: %v", err)
+		t.Fatalf("execute 1: %v", err)
 	}
 
+	// The reuse container is still running (Polled by its function label; the
+	// per-invocation labels are empty at creation time by design).
+	id1 := waitForContainerByLabel(ctx, m.cli, labelFunction, "no-remove-e2e")
+	if id1 == "" {
+		t.Fatal("reused execution container not found while healthy")
+	}
 	if !strings.Contains(out.String(), "ok evt_1") {
 		t.Errorf("expected handler output, got: %s", out.String())
 	}
+
 	// The normal path must NOT emit an explicit removal log line.
 	if strings.Contains(buf.String(), "remove container") {
 		t.Errorf("normal completion path must not log an explicit container removal, got: %s", buf.String())
 	}
-	// AutoRemove: the container must vanish after exit.
-	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.ok") {
-		t.Error("container should have been auto-removed after successful exit")
+
+	if err := m.Execute(execCtx, prepared, "index.ok", []byte(`{"event_id":"evt_2","event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute 2: %v", err)
 	}
+	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "no-remove-e2e")
+	if id2 != id1 {
+		t.Errorf("second invocation must REUSE the same container: id1=%s id2=%s", id1, id2)
+	}
+	// Successful reuse is logged DEBUG.
+	if !strings.Contains(buf.String(), "Runtime container: reused") {
+		t.Errorf("expected a 'Runtime container: reused' DEBUG log, got:\n%s", buf.String())
+	}
+
+	// Close discards (reason "shutdown"); the container must then vanish.
+	if err := m.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !waitForContainerGone(ctx, m.cli, labelFunction, "no-remove-e2e") {
+		t.Error("container should have been removed on Manager.Close (shutdown)")
+	}
+}
+
+// waitForContainerByLabel polls until a (running) container carries the exact
+// relay.<key>=<value> label, returning its ID or "". The reuse container stays
+// running between invocations, so polling is only needed to bridge the start
+// gap.
+func waitForContainerByLabel(ctx context.Context, cli *client.Client, key, value string) string {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if id := findContainerByLabel(ctx, cli, key, value); id != "" {
+			return id
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return ""
 }
 
 // panicWriter is an io.Writer whose Write always panics. It backs the
@@ -894,13 +935,11 @@ type panicWriter struct{}
 
 func (panicWriter) Write(p []byte) (int, error) { panic("function output sink exploded") }
 
-// TestIntegrationPanickingSinkDoesNotBreakInvocation drives runContainer with a
-// function-output sink whose Writer panics while forwarding handler output. Since
-// forwarding is a best-effort transport, the panic must be swallowed: runContainer
-// must return nil (invocation succeeds), the panic must not leak out of the
-// process, and the container must still be auto-removed. This preserves the old
-// test's cleanup/no-removal-noise intent while asserting the new transport-based
-// behavior (a broken sink can never fail an invocation).
+// TestIntegrationPanickingSinkDoesNotBreakInvocation drives a reused execution
+// container with a function-output sink whose Writer panics while forwarding
+// handler output. Since forwarding is a best-effort transport, the panic must
+// be swallowed: the invocation succeeds, the panic must not leak out of the
+// process, and the container stays healthy for reuse (Close removes it).
 func TestIntegrationPanickingSinkDoesNotBreakInvocation(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
@@ -928,35 +967,26 @@ export function paniclog(event) {
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// Drive runContainer directly so output forwarding hits the panicking sink
-	// on the first forwarded line. The panic must be swallowed by the transport;
-	// runContainer must return nil and MUST NOT propagate the panic.
 	panicked := make(chan any, 1)
 	done := make(chan error, 1)
 	go func() {
 		defer func() { panicked <- recover() }()
-		done <- runContainer(ctx, m.cli,
-			slog.New(slog.NewTextHandler(io.Discard, nil)),
-			"paniclog-e2e", prepared.Image, nil, nil, "index.paniclog",
-			[]byte(`{"event_name":"INSERT"}`),
-			RunMeta{Hostname: "test-host", Function: "paniclog-e2e", Handler: "index.paniclog", Image: prepared.Image},
-		)
+		done <- m.Execute(ctx, prepared, "index.paniclog", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
 	select {
 	case pv := <-panicked:
 		if pv != nil {
-			t.Fatalf("sink panic leaked out of runContainer: %v", pv)
+			t.Fatalf("sink panic leaked out of Execute: %v", pv)
 		}
 	case <-time.After(2 * time.Minute):
-		t.Fatal("runContainer did not return")
+		t.Fatal("Execute did not return")
 	}
 	if err := <-done; err != nil {
-		t.Fatalf("runContainer returned error despite swallowed sink panic: %v", err)
+		t.Fatalf("Execute returned error despite swallowed sink panic: %v", err)
 	}
-
-	// The container exited on its own; AutoRemove (not the backstop) removed it.
-	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.paniclog") {
-		t.Error("container should have been auto-removed after exit despite the sink panic")
+	// The container stays healthy for reuse; Close discards it.
+	if waitForContainerByLabel(ctx, m.cli, labelFunction, "paniclog-e2e") == "" {
+		t.Error("healthy container should survive a panicking sink for reuse")
 	}
 }
 
@@ -1028,12 +1058,16 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 	}
 }
 
-// TestIntegrationContainerLabelsAndAutoRemove drives a real execution while
-// verifying the seven diagnostic labels are present mid-flight (polled while the
-// handler runs), that AutoRemove removes the container the moment it exits, that
-// stdout is still captured, and that a non-zero exit code surfaces as an error
-// while the container is still removed.
-func TestIntegrationContainerLabelsAndAutoRemove(t *testing.T) {
+// TestIntegrationContainerCreationLabels drives a real execution while
+// verifying the creation-time label set on the reused container: the IDENTITY
+// labels (relay.type, relay.function, relay.hostname, relay.image) are stamped
+// from the creating invocation's RunMeta, while the per-invocation labels
+// (relay.handler, relay.message_id, relay.event_id, relay.event_name) are
+// EMPTY — labels are immutable per container and this container outlives
+// individual invocations. It also verifies a second invocation reuses the same
+// container id and the output prefix carries the invocation context while in
+// flight.
+func TestIntegrationContainerCreationLabels(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
 	out := newFunctionOutputSink(t)
@@ -1076,20 +1110,20 @@ export async function slow(event) {
 		done <- m.Execute(execCtx, prepared, "index.slow", []byte(`{"event_id":"evt_777","event_name":"INSERT"}`), nil)
 	}()
 
-	// Poll while the handler runs (sleeep 1.5s) for the container carrying our
-	// handler label, then assert the full label set before it exits.
+	// Poll while the handler runs (sleeps 1.5s) for the container carrying our
+	// function label, then assert the full label set while it runs.
 	id := ""
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if id = findContainerByLabel(ctx, m.cli, labelHandler, "index.slow"); id != "" {
+		if id = findContainerByLabel(ctx, m.cli, labelFunction, "labels-e2e"); id != "" {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if id == "" {
-		t.Fatal("container with relay.handler=index.slow not found during execution")
+		t.Fatal("container with relay.function=labels-e2e not found during execution")
 	}
-	// Inspect what we saw to assert all seven labels.
+	// Inspect what we saw to assert all labels.
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		t.Fatalf("list containers: %v", err)
@@ -1106,10 +1140,10 @@ export async function slow(event) {
 	for k, want := range map[string]string{
 		labelType:      ContainerTypeEvent,
 		labelFunction:  "labels-e2e",
-		labelHandler:   "index.slow",
-		labelMessageID: "1791234567890-0",
-		labelEventID:   "evt_777",
-		labelEventName: "INSERT",
+		labelHandler:   "",
+		labelMessageID: "",
+		labelEventID:   "",
+		labelEventName: "",
 		labelHostname:  "test-host",
 		labelImage:     prepared.Image,
 	} {
@@ -1124,17 +1158,27 @@ export async function slow(event) {
 	if !strings.Contains(out.String(), "completed evt_777") {
 		t.Errorf("expected stdout to contain %q, got: %s", "completed evt_777", out.String())
 	}
-	// AutoRemove: the container must vanish after exit (asynchronously on the
-	// daemon side, so poll).
-	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.slow") {
-		t.Error("container should have been auto-removed after exit")
+	// The per-invocation output prefix was applied while in flight...
+	if !strings.Contains(out.String(), "[labels-e2e/index.slow@1791234567890-0] stdout: completed evt_777") {
+		t.Errorf("expected the in-flight invocation prefix, got:\n%s", out.String())
+	}
+
+	// ... and the container persists for reuse: a second invocation must use
+	// the SAME container.
+	if err := m.Execute(execCtx, prepared, "index.slow", []byte(`{"event_id":"evt_778","event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute 2: %v", err)
+	}
+	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "labels-e2e")
+	if id2 != id {
+		t.Errorf("second invocation must reuse the container: id1=%s id2=%s", id, id2)
 	}
 }
 
-// TestIntegrationNonZeroExitAutoRemove verifies a handler that exits non-zero
-// surfaces as an Execute error AND is still auto-removed (attach + exit code
-// handling preserve the existing contract with AutoRemove enabled).
-func TestIntegrationNonZeroExitAutoRemove(t *testing.T) {
+// TestIntegrationHandlerErrorKeepsContainer verifies the new invocation
+// protocol's handler-failure semantics: an erroring handler surfaces as an
+// Execute error carrying the handler's message, the container is RETAINED, the
+// NEXT invocation succeeds on the SAME container, and Close removes it.
+func TestIntegrationHandlerErrorKeepsContainer(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
 	out := newFunctionOutputSink(t)
@@ -1150,9 +1194,12 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", `
-export async function fail(event) {
+export function fail(event) {
   console.error("boom");
-  process.exit(1);
+  throw new Error("kaboom");
+}
+export function ok(event) {
+  console.log("recovered " + event.n);
 }
 `)
 	fn := function.Function{Name: "fail-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
@@ -1165,18 +1212,38 @@ export async function fail(event) {
 		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
 	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
-		t.Fatal("expected execute to fail for non-zero exit")
+		t.Fatal("expected execute to fail for the erroring handler")
 	}
-	if !strings.Contains(err.Error(), "exited with status 1") {
-		t.Errorf("expected exit-status error, got: %v", err)
+	if !strings.Contains(err.Error(), `handler "index.fail" failed`) {
+		t.Errorf("expected handler-failure error, got: %v", err)
 	}
 	// stderr (console.error) is forwarded to the function-output sink and must
 	// carry the function/handler prefix.
 	if !strings.Contains(out.String(), "[fail-e2e/index.fail] stderr: boom") {
 		t.Errorf("expected stderr 'boom' forwarded with prefix, got: %q", out.String())
 	}
-	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.fail") {
-		t.Error("container should have been auto-removed after non-zero exit")
+	// The container is healthy and RETAINED after a handler error.
+	id1 := waitForContainerByLabel(ctx, m.cli, labelFunction, "fail-e2e")
+	if id1 == "" {
+		t.Fatal("container should be retained after a handler error")
+	}
+
+	// The next invocation succeeds on the SAME container.
+	okCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.ok", Image: prepared.Image})
+	if err := m.Execute(okCtx, prepared, "index.ok", []byte(`{"n":1}`), nil); err != nil {
+		t.Fatalf("execute after failure: %v", err)
+	}
+	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "fail-e2e")
+	if id2 != id1 {
+		t.Errorf("post-error invocation must reuse the same container: id1=%s id2=%s", id1, id2)
+	}
+	if !strings.Contains(out.String(), "recovered 1") {
+		t.Errorf("expected 'recovered 1', got: %s", out.String())
+	}
+	// Protocol frames must never leak to the function-output sink.
+	if strings.Contains(out.String(), relayProtocolSentinel) {
+		t.Errorf("protocol frames leaked into the function output sink:\n%s", out.String())
 	}
 }
 
@@ -1239,10 +1306,11 @@ export function emit(event) {
 	}
 }
 
-// TestIntegrationTimeoutAutoRemove verifies the existing per-rule timeout path
-// still works with AutoRemove: an over-long handler is killed on cancellation,
-// the error surfaces, and the killed container is removed.
-func TestIntegrationTimeoutAutoRemove(t *testing.T) {
+// TestIntegrationTimeoutDiscardsContainer verifies the per-rule timeout path:
+// an over-long handler is killed on ctx cancellation ("docker run: context
+// deadline exceeded"), the container is DISCARDED (killed/removed), and the
+// next invocation starts a FRESH container.
+func TestIntegrationTimeoutDiscardsContainer(t *testing.T) {
 	requireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -1261,6 +1329,9 @@ export async function sleeper(event) {
   await new Promise(r => setTimeout(r, 10000));
   console.log("done");
 }
+export function quick(event) {
+  console.log("quick done");
+}
 `)
 	fn := function.Function{Name: "timeout-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
@@ -1269,17 +1340,30 @@ export async function sleeper(event) {
 	}
 
 	// Timeout the invocation after 1s: the handler sleeps 10s, so the ctx
-	// cancel path must kill the container.
-	invokeCtx, invokeCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// timeout path must kill and discard the container.
+	invokeCtx, invokeCancel := context.WithTimeout(context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}), 1*time.Second)
 	defer invokeCancel()
-	execCtx := context.WithValue(invokeCtx, runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image})
-	err = m.Execute(execCtx, prepared, "index.sleeper", []byte(`{"event_name":"INSERT"}`), nil)
+	err = m.Execute(invokeCtx, prepared, "index.sleeper", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
 		t.Fatal("expected execute to fail on timeout")
 	}
-	if !waitForContainerGone(ctx, m.cli, labelHandler, "index.sleeper") {
-		t.Error("timed-out container should have been auto-removed after kill/exit")
+	if !strings.Contains(err.Error(), "docker run:") {
+		t.Errorf("expected the wrapped ctx error wording, got: %v", err)
+	}
+	if !waitForContainerGone(ctx, m.cli, labelFunction, "timeout-e2e") {
+		t.Error("timed-out container should have been killed and removed (discarded)")
+	}
+
+	// The next invocation uses a FRESH container (the cache dropped the dead
+	// one) and succeeds.
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.quick", Image: prepared.Image})
+	if err := m.Execute(execCtx, prepared, "index.quick", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute after timeout: %v", err)
+	}
+	if id := waitForContainerByLabel(ctx, m.cli, labelFunction, "timeout-e2e"); id == "" {
+		t.Error("expected a fresh container to be running after the timeout discard")
 	}
 }
 
@@ -1433,18 +1517,21 @@ export function check(event) {
 			// Run the handler in a goroutine so we can inspect the container
 			// mid-flight while it runs.
 			execCtx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", Function: "harden-" + tc.name, Handler: tc.handler, Image: prepared.Image})
+				RunMeta{Hostname: "test-host", Function: "harden-" + tc.name, Image: prepared.Image})
 			done := make(chan error, 1)
 			go func() {
 				done <- m.Execute(execCtx, prepared, tc.handler, tc.event, nil)
 			}()
 
-			// Poll for the running container, then inspect it to assert the
-			// host-config hardening is actually applied by the daemon.
+			// Poll for the running container (the reused container stays
+			// running between invocations; it is polled by the creation-time
+			// function label), then inspect it to assert the host-config
+			// hardening is actually applied by the daemon.
 			id := ""
 			deadline := time.Now().Add(15 * time.Second)
 			for time.Now().Before(deadline) {
-				if id = findContainerByLabel(ctx, m.cli, labelHandler, tc.handler); id != "" {
+				if id = findContainerByLabel(ctx, m.cli, labelFunction, "harden-"+tc.name); id != "" {
+					time.Sleep(200 * time.Millisecond) // let the attach settle
 					break
 				}
 				time.Sleep(50 * time.Millisecond)

@@ -23,7 +23,10 @@ var Bootstrap = bootstrap
 
 type Engine struct{}
 
-var entrypoint = []string{"python", "/relay/bootstrap.py"}
+// entrypoint runs the bootstrap unbuffered (-u): user print() output must
+// keep streaming live through the attach pipe while the reused container
+// stays running, instead of block-buffering into the pipe for its lifetime.
+var entrypoint = []string{"python", "-u", "/relay/bootstrap.py"}
 
 const workDir = "/app"
 const dependenciesFile = "requirements.txt"

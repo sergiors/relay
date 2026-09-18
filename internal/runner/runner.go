@@ -175,6 +175,10 @@ type Runner struct {
 	// makes every retirement a no-op.
 	cleanerOnce sync.Once
 	cleaner     ImageCleaner
+	// invalidator resolves to the executor's ContainerInvalidator capability
+	// the same way cleaner above is resolved (one pass over the registry).
+	invalidatorOnce sync.Once
+	invalidator     ContainerInvalidator
 	// hostname is this worker's container-ownership identity, stamped as the
 	// relay.hostname label on every execution container via RunMeta. It is the
 	// same value as the Redis consumer identity. It must be set (via
@@ -227,6 +231,18 @@ type Runner struct {
 // needs. It is a small interface so the runner can retire superseded function
 // images without depending on the runtime package concretely; test fakes that
 // do not implement it simply yield a nil cleaner (no retirement).
+// ContainerInvalidator is the optional capability of the runtime executor
+// that image retirement needs on top of ImageCleaner: invalidate cached
+// execution containers for a retired image so the image's
+// container-reference guard clears promptly. Implementations must never
+// block: Manager.InvalidateImage TryLocks and skips when an invocation is in
+// flight.
+type ContainerInvalidator interface {
+	// InvalidateImage discards any cached execution container running the
+	// given image.
+	InvalidateImage(image string)
+}
+
 type ImageCleaner interface {
 	// RemoveImage removes a single relay-owned image, treating an already-gone
 	// image as success.
@@ -407,6 +423,21 @@ func (r *Runner) resolver() ImageCleaner {
 	return r.cleaner
 }
 
+// invalidatorResolver returns the runner's resolved container invalidator, or
+// nil when the executor does not implement retirement (tests, unavailable-only
+// runners). Resolution scans the registry snapshot once and caches.
+func (r *Runner) invalidatorResolver() ContainerInvalidator {
+	r.invalidatorOnce.Do(func() {
+		for _, pf := range r.reg.snapshot() {
+			if c, ok := pf.executor.(ContainerInvalidator); ok {
+				r.invalidator = c
+				return
+			}
+		}
+	})
+	return r.invalidator
+}
+
 // ImageInUse reports whether any execution is currently holding a reference to
 // the given image (in-flight Handle). It is the guard the reconciler consults
 // before removing a superseded image, and Release uses it to know when a retired
@@ -428,6 +459,15 @@ func (r *Runner) RetireImage(image string) {
 	if !r.refs.recordRetired(image) {
 		// Already retired (first retirement owns removal); nothing to do.
 		return
+	}
+	// Invalidate cached execution containers running this image BEFORE any
+	// removal attempt: the discard clears the image's relay-owned-container
+	// reference promptly, so ErrImageInUse / the reference guard does not wait
+	// for a retry pass. InvalidateImage is strictly non-blocking (TryLock
+	// semantics manager-side), so retirement never stalls on an in-flight
+	// invocation.
+	if inv := r.invalidatorResolver(); inv != nil {
+		inv.InvalidateImage(image)
 	}
 	if !r.ImageInUse(image) {
 		// Idle right now: remove immediately instead of waiting for a release

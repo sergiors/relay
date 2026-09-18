@@ -60,6 +60,14 @@ const (
 	labelRuntime     = "relay.runtime"
 	labelFingerprint = "relay.fingerprint"
 	labelDependency  = "relay.dependency"
+	// labelBootstrap pins the content hash of the runtime-injected bootstrap
+	// (and the entrypoint) a function image was built with. Tags are
+	// fingerprinted over the FUNCTION DIR only, so an image built by a previous
+	// Relay version with an older one-shot bootstrap carries the same tag as a
+	// new build would. The label lets Prepare detect stale-bootstrap images
+	// holding a current tag and rebuild them (upgrade safety for the
+	// persistent invocation protocol).
+	labelBootstrap = "relay.bootstrap"
 )
 
 // The relay.type values. Every Relay-owned container carries exactly one; the
@@ -113,9 +121,14 @@ func imageLabels(imageType string, fnName, runtimeName, fingerprint, dependency 
 
 // functionImageLabels returns the managed function-image label set for a
 // function version built from the given dependency reference ("" when the
-// function declares no deps).
-func functionImageLabels(fnName, fingerprint, dependency string) map[string]string {
-	return imageLabels(ImageTypeFunction, fnName, "", fingerprint, dependency)
+// function declares no deps) and the bootstrap content hash the image was
+// built with.
+func functionImageLabels(fnName, fingerprint, dependency, bootstrap string) map[string]string {
+	l := imageLabels(ImageTypeFunction, fnName, "", fingerprint, dependency)
+	if bootstrap != "" {
+		l[labelBootstrap] = bootstrap
+	}
+	return l
 }
 
 // dependencyImageLabels returns the managed dependency-image label set for a

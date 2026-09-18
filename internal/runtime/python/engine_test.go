@@ -40,8 +40,8 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if len(p.Install) != 0 {
 				t.Errorf("expected no build-step install without requirements.txt, got %v", p.Install)
 			}
-			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "python" || p.Entrypoint[1] != "/relay/bootstrap.py" {
-				t.Errorf("entrypoint = %v, want [python /relay/bootstrap.py]", p.Entrypoint)
+			if len(p.Entrypoint) != 3 || p.Entrypoint[0] != "python" || p.Entrypoint[1] != "-u" || p.Entrypoint[2] != "/relay/bootstrap.py" {
+				t.Errorf("entrypoint = %v, want [python -u /relay/bootstrap.py]", p.Entrypoint)
 			}
 			if p.User != "10001:10001" {
 				t.Errorf("user = %q, want 10001:10001", p.User)

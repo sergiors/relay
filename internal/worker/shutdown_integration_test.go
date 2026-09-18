@@ -481,10 +481,12 @@ export async function slow(event) {
 	msgID := xadd(t, env.client, streamName, `{"event_id":"evt_shutdown","event_name":"INSERT"}`)
 
 	// Synchronize on the handler actually executing: poll for the execution
-	// container carrying the function/handler/hostname labels.
+	// container carrying the identity labels. (relay.handler is EMPTY at
+	// creation on the reused execution container — per-invocation attribution
+	// lives in the request frame and the output prefix — so the identity label
+	// set is the stable wait predicate.)
 	containerID := waitForContainer(t, dcli, map[string]string{
 		"relay.function": "shutdowntest",
-		"relay.handler":  "index.slow",
 		"relay.hostname": consumerName,
 	})
 	t.Logf("in-flight container %s observed", containerID)
@@ -553,7 +555,7 @@ export async function slow(event) {
 	// Docker cleanup completed: the in-flight container is gone (AutoRemove after
 	// the kill, plus the deferred best-effort remove).
 	if !waitForContainerGone(t, dcli, map[string]string{
-		"relay.handler":  "index.slow",
+		"relay.function": "shutdowntest",
 		"relay.hostname": consumerName,
 	}) {
 		t.Error("in-flight container should have been removed after shutdown")
