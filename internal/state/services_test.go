@@ -132,8 +132,8 @@ func TestServicesHandlerToEntrypointMigration(t *testing.T) {
 		`CREATE TABLE IF NOT EXISTS handlers (function_name TEXT, handler TEXT, timeout TEXT, PRIMARY KEY (function_name, handler))`,
 		`CREATE TABLE IF NOT EXISTS schedules (function_name TEXT, handler TEXT, cron TEXT, timezone TEXT, timeout TEXT, PRIMARY KEY (function_name, handler, cron, timezone))`,
 		`CREATE TABLE IF NOT EXISTS services (function_name TEXT, handler TEXT, port INTEGER, replicas INTEGER, PRIMARY KEY (function_name, handler))`,
-		`CREATE TABLE IF NOT EXISTS stats (id INTEGER PRIMARY KEY CHECK (id = 1))`,
-		`CREATE TABLE IF NOT EXISTS function_stats (function_name TEXT PRIMARY KEY)`,
+		`CREATE TABLE IF NOT EXISTS stats (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT, updated_at TEXT)`,
+		`CREATE TABLE IF NOT EXISTS function_stats (function_name TEXT PRIMARY KEY, data TEXT, updated_at TEXT)`,
 		`INSERT INTO services (function_name, handler, port, replicas) VALUES ('demo', 'service.js', 3000, 2)`,
 	} {
 		if _, err := old.ExecContext(ctx, stmt); err != nil {

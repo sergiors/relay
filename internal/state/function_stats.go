@@ -5,9 +5,10 @@ import (
 	"database/sql"
 )
 
-// FunctionStats is the per-function operational snapshot persisted in the
-// function_stats table. Unlike the single-row global Stats, it is keyed by
-// function name so each function's counters are attributed independently.
+// FunctionStats is the per-function operational snapshot persisted as the JSON
+// payload of the function_stats table. Unlike the single-row global Stats, it is
+// keyed by function name (the relational function_stats.function_name column) so
+// each function's payload is attributed independently.
 //
 // Semantics (see runner.Handle): EventsProcessedTotal counts a function once
 // per event for which at least one of its rules matched — a functions-engaged
@@ -27,7 +28,7 @@ import (
 // retries and was ROUTED TO THE DLQ (the actual DLQ attribution point, not
 // every failure). They are reset by nothing but a genuine removal: unlike the
 // counters, an incoming empty value must never clobber a persisted timestamp
-// (see the upsert's CASE guards).
+// (see mergeFunctionStatsTimestamps).
 //
 // WarmAcquiresTotal / ColdStartsTotal / DiscardedTotal are the cumulative
 // warm-container pool counters (see runtime.PoolSnapshot): warm acquires served
@@ -38,49 +39,30 @@ import (
 // access to the worker's in-memory pool. The LIVE pool gauges (capacity,
 // container counts by lease state) are deliberately NOT persisted: a persisted
 // live gauge would go stale between flushes.
+//
+// The struct is the source of truth for the payload. Function and UpdatedAt are
+// stable relational metadata (function_stats.function_name / .updated_at) and
+// are excluded from the JSON by their json:"-" tags; JSON (un)marshalling is
+// centralized in stats_json.go.
 type FunctionStats struct {
-	Function             string
-	EventsProcessedTotal int64
-	HandlerSuccessTotal  int64
-	HandlerFailureTotal  int64
-	RetryTotal           int64
-	DLQTotal             int64
-	WarmAcquiresTotal    int64
-	ColdStartsTotal      int64
-	DiscardedTotal       int64
-	LastExecutionAt      string
-	LastSuccessAt        string
-	LastFailureAt        string
-	LastDLQAt            string
-	UpdatedAt            string
-}
-
-// tsColumns lists the four execution-history timestamp columns and their
-// FunctionStats destination fields, in the order the upsert and the readers use.
-var tsCols = []struct {
-	col, field string
-}{
-	{"last_execution_at", "LastExecutionAt"},
-	{"last_success_at", "LastSuccessAt"},
-	{"last_failure_at", "LastFailureAt"},
-	{"last_dlq_at", "LastDLQAt"},
-}
-
-// functionStatsTSUpsert builds the ON CONFLICT DO UPDATE SET clauses for the
-// four timestamp columns: counters are plainly REPLACED above it, while an
-// empty incoming timestamp PRESERVES the previously stored one (services must
-// never regress to "never" because one flush had no timestamp observation).
-// Each guard also COALESCEs the stored column so the value never becomes NULL
-// (a legacy row migrated from a pre-column schema stores NULL, which the
-// readers treat as empty).
-func functionStatsTSUpsert() []string {
-	out := make([]string, 0, len(tsCols))
-	for _, c := range tsCols {
-		out = append(out, c.col+` = CASE
-			        WHEN excluded.`+c.col+` IS NOT NULL AND excluded.`+c.col+` <> ''
-			        THEN excluded.`+c.col+` ELSE COALESCE(function_stats.`+c.col+`, '') END`)
-	}
-	return out
+	Function string `json:"-"`
+	// Counters are absolute snapshots: always emitted (even when 0) so a
+	// legitimate reset is representable. The Last*At fields are omitted when
+	// empty, which is what lets an empty incoming value preserve the persisted
+	// timestamp during the flush merge.
+	EventsProcessedTotal int64  `json:"events_processed_total"`
+	HandlerSuccessTotal  int64  `json:"handler_success_total"`
+	HandlerFailureTotal  int64  `json:"handler_failure_total"`
+	RetryTotal           int64  `json:"retry_total"`
+	DLQTotal             int64  `json:"dlq_total"`
+	WarmAcquiresTotal    int64  `json:"warm_acquires_total"`
+	ColdStartsTotal      int64  `json:"cold_starts_total"`
+	DiscardedTotal       int64  `json:"discarded_total"`
+	LastExecutionAt      string `json:"last_execution_at,omitempty"`
+	LastSuccessAt        string `json:"last_success_at,omitempty"`
+	LastFailureAt        string `json:"last_failure_at,omitempty"`
+	LastDLQAt            string `json:"last_dlq_at,omitempty"`
+	UpdatedAt            string `json:"-"`
 }
 
 // RecordFunctionStats upserts the function_stats row for s.Function. It is a
@@ -91,64 +73,48 @@ func (c *State) RecordFunctionStats(s FunctionStats) {
 }
 
 // RecordFunctionStatsContext upserts the function_stats row for s.Function,
-// replacing every counter column with the supplied value and setting updated_at
-// to now(). Counter columns behave as an absolute snapshot (see RecordStats);
-// the four last_*_at timestamp columns are additionally CASE-guarded so an
-// EMPTY incoming value preserves the previously stored timestamp instead of
-// overwriting it with "" — "no observation" must never erase "last observed
-// at". Callers must pass CURRENT cumulative values; the worker seeds the
-// fresh process registry from this table at startup so the first snapshot
-// never resets counters. It is non-fatal on error: it logs and returns.
+// replacing the JSON payload with the supplied value and setting updated_at to
+// now(). Counters behave as an absolute snapshot (see RecordStats); the
+// four Last*At timestamps are additionally merged so an EMPTY incoming value
+// preserves the previously stored timestamp instead of overwriting it with ""
+// — "no observation" must never erase "last observed at". The read and write
+// happen in one transaction (the same short-transaction pattern as
+// RecordStatsSnapshot), so the merge is atomic with respect to other writers.
+// Callers must pass CURRENT cumulative values; the worker seeds the fresh
+// process registry from this table at startup so the first snapshot never
+// resets counters. It is non-fatal on error: it logs and returns.
 func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats) {
-	ts := now()
-	upd := `events_processed_total  = excluded.events_processed_total,
-		   handler_success_total   = excluded.handler_success_total,
-		   handler_failure_total   = excluded.handler_failure_total,
-		   retry_total             = excluded.retry_total,
-		   dlq_total               = excluded.dlq_total,
-		   warm_acquires_total     = excluded.warm_acquires_total,
-		   cold_starts_total       = excluded.cold_starts_total,
-		   discarded_total         = excluded.discarded_total,`
-	for _, g := range functionStatsTSUpsert() {
-		upd += "\n" + g + ","
-	}
-	upd += "\n	   updated_at              = excluded.updated_at"
-	_, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats
-		   (function_name, events_processed_total, handler_success_total,
-		    handler_failure_total, retry_total, dlq_total,
-		    warm_acquires_total, cold_starts_total, discarded_total,
-		    last_execution_at, last_success_at, last_failure_at, last_dlq_at, updated_at)
-		 VALUES
-		   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(function_name) DO UPDATE SET
-		   `+upd,
-		s.Function, s.EventsProcessedTotal, s.HandlerSuccessTotal,
-		s.HandlerFailureTotal, s.RetryTotal, s.DLQTotal,
-		s.WarmAcquiresTotal, s.ColdStartsTotal, s.DiscardedTotal,
-		s.LastExecutionAt, s.LastSuccessAt, s.LastFailureAt, s.LastDLQAt, ts)
+	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+		stored := c.storedFunctionStatsTx(ctx, tx, s.Function)
+		merged := mergeFunctionStatsTimestamps(stored, s)
+		payload, err := marshalFunctionStats(merged)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)
+			 ON CONFLICT(function_name) DO UPDATE SET
+			   data       = excluded.data,
+			   updated_at = excluded.updated_at`,
+			s.Function, payload, now())
+		return err
+	})
 	if err != nil {
 		c.log.Warn("State: record function stats failed", "function", s.Function, "error", err)
 	}
 }
 
 // FunctionStats returns the per-function snapshot for name, or (zero, false)
-// when no row has been recorded yet or the read fails (which is logged). The
-// Function field is set to name on success.
+// when no row has been recorded yet or the read/decoding fails (which is
+// logged). The Function field is set to name on success (it is relational
+// metadata, not part of the JSON payload).
 func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 	ctx := context.Background()
-	var s FunctionStats
+	var data sql.NullString
+	var updatedAt sql.NullString
 	err := c.db.QueryRowContext(ctx,
-		`SELECT function_name, events_processed_total, handler_success_total,
-		        handler_failure_total, retry_total, dlq_total,
-		        warm_acquires_total, cold_starts_total, discarded_total,
-		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
-		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
-		 FROM function_stats WHERE function_name = ?`, name,
-	).Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
-		&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
-		&s.WarmAcquiresTotal, &s.ColdStartsTotal, &s.DiscardedTotal,
-		&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt)
+		`SELECT data, updated_at FROM function_stats WHERE function_name = ?`, name,
+	).Scan(&data, &updatedAt)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}, false
 	}
@@ -156,6 +122,13 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 		c.log.Warn("State: read function stats failed", "function", name, "error", err)
 		return FunctionStats{}, false
 	}
+	s, err := unmarshalFunctionStats(data)
+	if err != nil {
+		c.log.Warn("State: read function stats failed", "function", name, "error", err)
+		return FunctionStats{}, false
+	}
+	s.Function = name
+	s.UpdatedAt = updatedAt.String
 	return s, true
 }
 
@@ -194,17 +167,14 @@ func (c *State) FunctionNames() ([]string, bool) {
 // AllFunctionStats returns every function_stats row ordered by function name.
 // The worker uses it at startup to restore counters for functions that have
 // persisted stats even when the fresh registry snapshot is empty (e.g. a
-// function idle this process but active last process). It returns nil on error
-// (which is logged), matching the file's non-fatal style.
+// function idle this process but active last process). The Function field is
+// taken from the relational key column (not the JSON payload). A row whose JSON
+// is invalid is logged and skipped (its stats are unknowable); it returns nil
+// on a read error, matching the file's non-fatal style.
 func (c *State) AllFunctionStats() []FunctionStats {
 	ctx := context.Background()
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT function_name, events_processed_total, handler_success_total,
-		        handler_failure_total, retry_total, dlq_total,
-		        warm_acquires_total, cold_starts_total, discarded_total,
-		        COALESCE(last_execution_at, ''), COALESCE(last_success_at, ''),
-		        COALESCE(last_failure_at, ''), COALESCE(last_dlq_at, ''), updated_at
-		 FROM function_stats ORDER BY function_name`)
+		`SELECT function_name, data, updated_at FROM function_stats ORDER BY function_name`)
 	if err != nil {
 		c.log.Warn("State: list function stats failed", "error", err)
 		return nil
@@ -213,14 +183,19 @@ func (c *State) AllFunctionStats() []FunctionStats {
 
 	var out []FunctionStats
 	for rows.Next() {
-		var s FunctionStats
-		if err := rows.Scan(&s.Function, &s.EventsProcessedTotal, &s.HandlerSuccessTotal,
-			&s.HandlerFailureTotal, &s.RetryTotal, &s.DLQTotal,
-			&s.WarmAcquiresTotal, &s.ColdStartsTotal, &s.DiscardedTotal,
-			&s.LastExecutionAt, &s.LastSuccessAt, &s.LastFailureAt, &s.LastDLQAt, &s.UpdatedAt); err != nil {
+		var name string
+		var data, updatedAt sql.NullString
+		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
 			c.log.Warn("State: scan function stats failed", "error", err)
 			return out
 		}
+		s, err := unmarshalFunctionStats(data)
+		if err != nil {
+			c.log.Warn("State: read function stats failed", "function", name, "error", err)
+			continue
+		}
+		s.Function = name
+		s.UpdatedAt = updatedAt.String
 		out = append(out, s)
 	}
 	return out

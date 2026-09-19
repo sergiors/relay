@@ -237,46 +237,31 @@ func (c *State) initSchema(ctx context.Context) error {
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
 		// restarts plus gauge snapshots of the pending backlog, never a
-		// time-series. All columns are INTEGER except updated_at TEXT.
+		// time-series. Only the stable relational metadata is a column — the
+		// fixed single-row id and the write timestamp updated_at — while the
+		// evolving counter/gauge payload is the JSON object in data (see Stats
+		// and stats_json.go). JSON, not a column per field: the payload grows
+		// as instrumentation is added, and an ALTER-free schema keeps old rows
+		// readable (absent fields decode to zero).
 		`CREATE TABLE IF NOT EXISTS stats (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
-			events_processed_total INTEGER NOT NULL DEFAULT 0,
-			handler_success_total INTEGER NOT NULL DEFAULT 0,
-			handler_failure_total INTEGER NOT NULL DEFAULT 0,
-			retry_total INTEGER NOT NULL DEFAULT 0,
-			dlq_total INTEGER NOT NULL DEFAULT 0,
-			pending_entries INTEGER NOT NULL DEFAULT 0,
-			oldest_pending_age_seconds INTEGER NOT NULL DEFAULT 0,
+			data TEXT,
 			updated_at TEXT
 		)`,
 		// function_stats holds the per-function operational snapshot, keyed by
 		// function name. It mirrors the global stats table but attributes each
-		// counter to a single function (see FunctionStats for the semantics).
-		// Backlog metrics (pending_entries/oldest_pending_age) stay global-only
-		// in stats: they describe the stream backlog, not any one function.
-		// The three warm-container pool counters (warm_acquires_total,
-		// cold_starts_total, discarded_total) are cumulative absolute pool
-		// totals (see FunctionStats and runtime.PoolSnapshot) persisted so the
-		// standalone CLI can render the Runtime pool section; the live pool
-		// gauges are deliberately not persisted.
-		// The four last_*_at TEXT columns record per-function execution-history
-		// timestamps in the same RFC3339 convention as updated_at (empty = the
-		// event was never observed); see FunctionStats and
-		// migrateFunctionStatsTimestampColumns.
+		// payload to a single function (see FunctionStats for the semantics).
+		// The key function_name and the write timestamp updated_at stay
+		// relational; the payload — including the cumulative warm-container pool
+		// counters (warm_acquires_total, cold_starts_total, discarded_total) and
+		// the four last_*_at execution-history timestamps — lives in the JSON
+		// data column (see stats_json.go). Backlog metrics
+		// (pending_entries/oldest_pending_age) stay global-only in stats: they
+		// describe the stream backlog, not any one function. The live pool
+		// gauges are deliberately never persisted.
 		`CREATE TABLE IF NOT EXISTS function_stats (
 			function_name TEXT PRIMARY KEY,
-			events_processed_total INTEGER NOT NULL DEFAULT 0,
-			handler_success_total INTEGER NOT NULL DEFAULT 0,
-			handler_failure_total INTEGER NOT NULL DEFAULT 0,
-			retry_total INTEGER NOT NULL DEFAULT 0,
-			dlq_total INTEGER NOT NULL DEFAULT 0,
-			warm_acquires_total INTEGER NOT NULL DEFAULT 0,
-			cold_starts_total INTEGER NOT NULL DEFAULT 0,
-			discarded_total INTEGER NOT NULL DEFAULT 0,
-			last_execution_at TEXT,
-			last_success_at TEXT,
-			last_failure_at TEXT,
-			last_dlq_at TEXT,
+			data TEXT,
 			updated_at TEXT
 		)`,
 	}
@@ -290,18 +275,6 @@ func (c *State) initSchema(ctx context.Context) error {
 	// table, so check PRAGMA table_info and ALTER TABLE ADD COLUMN when missing.
 	// Plain SQL, consistent with the "no migration framework" comment above.
 	if err := c.migrateFunctionsColumns(ctx); err != nil {
-		return err
-	}
-	// Idempotent migration adding the four per-function execution-history
-	// timestamp columns to databases created before they existed (see
-	// migrateFunctionStatsTimestampColumns).
-	if err := c.migrateFunctionStatsTimestampColumns(ctx); err != nil {
-		return err
-	}
-	// Idempotent migration adding the three cumulative warm-container pool
-	// counter columns to databases created before they existed (see
-	// migrateFunctionStatsPoolColumns).
-	if err := c.migrateFunctionStatsPoolColumns(ctx); err != nil {
 		return err
 	}
 	// Idempotent migration for the services-handler -> services-entrypoint
@@ -379,43 +352,6 @@ func (c *State) execAddColumn(ctx context.Context, table, col, decl string) erro
 			return nil
 		}
 		return fmt.Errorf("migrate: add column %s.%s: %w", table, col, err)
-	}
-	return nil
-}
-
-// migrateFunctionStatsTimestampColumns adds the four per-function
-// execution-history timestamp columns (last_execution_at, last_success_at,
-// last_failure_at, last_dlq_at) to an existing function_stats table that
-// predates them. It is idempotent: each column is added only when PRAGMA
-// table_info reports it missing, following the migrateFunctionsColumns pattern.
-// Existing rows gain NULL in the new columns, which the readers and the
-// upsert's COALESCE guards treat exactly like the empty string: "never
-// observed".
-func (c *State) migrateFunctionStatsTimestampColumns(ctx context.Context) error {
-	for _, col := range []string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"} {
-		if err := c.addColumnIfMissing(ctx, "function_stats", col, "TEXT"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// migrateFunctionStatsPoolColumns adds the three cumulative warm-container pool
-// counter columns (warm_acquires_total, cold_starts_total, discarded_total) to
-// an existing function_stats table that predates them. It is idempotent: each
-// column is added only when PRAGMA table_info reports it missing (see
-// addColumnIfMissing, which also tolerates a concurrent Open winning the same
-// ALTER), following the migrateFunctionStatsTimestampColumns pattern. The
-// columns are added with DEFAULT 0 so every pre-existing row reads as "no pool
-// activity observed yet" instead of NULL, keeping the readers' plain integer
-// scans NULL-free.
-func (c *State) migrateFunctionStatsPoolColumns(ctx context.Context) error {
-	for _, col := range []string{"warm_acquires_total", "cold_starts_total", "discarded_total"} {
-		// SQLite's ALTER TABLE ADD COLUMN fills existing rows with the DEFAULT,
-		// so a legacy row reads 0 rather than NULL.
-		if err := c.addColumnIfMissing(ctx, "function_stats", col, "INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
 	}
 	return nil
 }

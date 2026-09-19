@@ -41,13 +41,23 @@
 // Stats persistence model:
 //
 // The stats and function_stats tables store the latest persisted ABSOLUTE
-// snapshot of Relay's operational counters — idempotent, no deltas. In addition
-// to the event/handler counters, function_stats carries the CUMULATIVE
-// warm-container pool counters (warm acquires, cold starts, discarded) so the
-// standalone `relay function inspect` process can render the Runtime pool
-// section without access to the worker's in-memory pool. The LIVE pool gauges
-// (capacity, container counts by lease state) are deliberately NOT persisted:
-// a persisted live gauge would go stale between flushes. The worker
+// snapshot of Relay's operational counters — idempotent, no deltas. Only stable
+// relational metadata is kept as columns: stats.id and stats.updated_at, and
+// function_stats.function_name and function_stats.updated_at. The evolving
+// counter/gauge/execution-history payload is a JSON object in the data TEXT
+// column of each table, marshalled and unmarshalled ONLY through stats_json.go;
+// the worker, CLI, runtime, and metrics layers pass typed Stats/FunctionStats
+// values and never touch the JSON. This keeps the schema stable as
+// instrumentation grows: absent fields decode to zero, so a payload written by
+// an older or newer Relay remains readable. The typed structs are the source of
+// truth.
+//
+// In addition to the event/handler counters, function_stats carries the
+// CUMULATIVE warm-container pool counters (warm acquires, cold starts,
+// discarded) so the standalone `relay function inspect` process can render the
+// Runtime pool section without access to the worker's in-memory pool. The LIVE
+// pool gauges (capacity, container counts by lease state) are deliberately NOT
+// persisted: a persisted live gauge would go stale between flushes. The worker
 // flushes the current in-memory metrics registry into them every 5 seconds
 // (fixed, non-configurable) via RecordStatsSnapshot, which writes the global
 // row and every per-function row in one short transaction. SQLite is never on

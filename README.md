@@ -1032,12 +1032,15 @@ how the last reconcile of each function went without touching Redis or Docker.
 - **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
   prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at,
   env, secrets), a `handlers` table (function_name, handler, timeout), a
-  single-row `stats` table (current global operational counters plus backlog
-  gauges and `updated_at`), and a `function_stats` table (per-function counters
-  and `updated_at`). The `env` and `secrets` columns store the function's
-  env/secret **mappings** (JSON) — never secret values. These are **current
-  snapshots only** — no per-event rows, no metric history (Prometheus is the
-  time-series source).
+  single-row `stats` table (`id`, `updated_at`, and a JSON `data` payload
+  holding the current global operational counters plus backlog gauges), and a
+  `function_stats` table (`function_name`, `updated_at`, and a JSON `data`
+  payload holding the per-function counters). Only stable relational metadata is
+  a column; the evolving payload is JSON so new instrumentation needs no schema
+  change, and absent fields decode to zero for old/new readers alike. The `env`
+  and `secrets` columns store the function's env/secret **mappings** (JSON) —
+  never secret values. These are **current snapshots only** — no per-event rows,
+  no metric history (Prometheus is the time-series source).
 - **State model**: `status` is `ready` (an active version is built and serving)
   or `pending` (loaded but not yet built). `last_reconcile_status` is
   `success` / `failed` (the last MEANINGFUL reconcile outcome; unchanged periodic

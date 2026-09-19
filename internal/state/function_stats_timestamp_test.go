@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 	"time"
 )
@@ -109,78 +108,6 @@ func TestRecordStatsSnapshotTimestampsPersist(t *testing.T) {
 	if s.LastExecutionAt != exec.Format(time.RFC3339) {
 		t.Fatalf("snapshot empty timestamp must preserve persisted value: %+v", s)
 	}
-}
-
-// TestMigrateFunctionStatsTimestampColumns builds a legacy function_stats
-// table WITHOUT the four timestamp columns (as an old database would have),
-// rows included, then reopens it THROUGH Open (which runs the migrations) —
-// PRAGMA table_info must report the columns after the reopen (checking via a
-// raw read) and the old rows' counters must be preserved.
-func TestMigrateFunctionStatsTimestampColumns(t *testing.T) {
-	path := t.TempDir() + "/db.sqlite3"
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("legacy open: %v", err)
-	}
-	_, err = db.ExecContext(context.Background(), `
-		CREATE TABLE functions (
-			name TEXT PRIMARY KEY, runtime TEXT, status TEXT, image TEXT,
-			fingerprint TEXT, prepared_at TEXT, last_reconcile_at TEXT,
-			last_reconcile_status TEXT, last_error TEXT, updated_at TEXT,
-			env TEXT, secrets TEXT
-		);
-		CREATE TABLE function_stats (
-			function_name TEXT PRIMARY KEY,
-			events_processed_total INTEGER NOT NULL DEFAULT 0,
-			handler_success_total INTEGER NOT NULL DEFAULT 0,
-			handler_failure_total INTEGER NOT NULL DEFAULT 0,
-			retry_total INTEGER NOT NULL DEFAULT 0,
-			dlq_total INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT
-		);`)
-	if err != nil {
-		t.Fatalf("legacy schema: %v", err)
-	}
-	_, err = db.ExecContext(context.Background(),
-		`INSERT INTO function_stats (function_name, events_processed_total, updated_at) VALUES ('alpha', 7, '2020-01-01T00:00:00Z')`)
-	if err != nil {
-		t.Fatalf("legacy seed: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("legacy close: %v", err)
-	}
-
-	// Reopen through Open: the migrateFunctionStatsTimestampColumns ALTERs must
-	// add the missing columns idempotently without touching existing rows.
-	c2, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer c2.Close()
-
-	// The legacy row survived with its counters and empty (never-observed)
-	// timestamps, readable through the normal reader (COALESCE'd from NULL).
-	s, ok := c2.FunctionStats("alpha")
-	if !ok || s.EventsProcessedTotal != 7 {
-		t.Fatalf("alpha after migration = %+v, ok=%v; want events 7", s, ok)
-	}
-	if s.LastExecutionAt != "" || s.LastSuccessAt != "" || s.LastFailureAt != "" || s.LastDLQAt != "" {
-		t.Fatalf("legacy row must have no timestamps: %+v", s)
-	}
-
-	// The migrated table is fully functional: record timestamps on it.
-	migrated := time.Now().Add(-time.Minute).UTC()
-	c2.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 3, LastExecutionAt: migrated.Format(time.RFC3339)})
-	b, ok := c2.FunctionStats("beta")
-	if !ok || b.LastExecutionAt != migrated.Format(time.RFC3339) {
-		t.Fatalf("beta after migration = %+v, ok=%v", b, ok)
-	}
-	// Reopen AGAIN: the migration must be idempotent (no duplicate-column error).
-	c3, err := Open(path)
-	if err != nil {
-		t.Fatalf("idempotent reopen: %v", err)
-	}
-	defer c3.Close()
 }
 
 // TestAllFunctionStatsTimestamps verifies AllFunctionStats reads the timestamp
