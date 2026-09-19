@@ -1135,6 +1135,59 @@ Secrets:
   DATABASE_URL=database-url
 ```
 
+`relay function inspect <name>` appends a compact **Runtime pool** section for
+the function. The cumulative acquire/discard counters always come from the
+persisted per-function stats row, so the standalone CLI renders them without
+access to the worker. When inspect runs inside the live worker process and has
+access to the pool snapshot provider, it additionally shows the authoritative
+live gauges:
+
+```
+Runtime pool:
+  Capacity:        4
+  Containers:      2
+  Busy:            1
+  Idle:            1
+  Starting:        1
+  Warm acquires:   7
+  Cold starts:     3
+  Discarded:       2
+```
+
+`Capacity` is the function's resolved concurrency limit.
+
+`Containers` is the number of currently running execution containers owned by
+the function pool, while `Busy` and `Idle` describe their current lease state.
+`Starting` is shown only while a lazy container start is in progress.
+
+During image transitions, `Busy` may temporarily include retiring containers
+from an older image generation, so the live container count can briefly exceed
+the active generation's capacity.
+
+`Warm acquires`, `Cold starts`, and `Discarded` mirror the corresponding
+cumulative Prometheus counters, persisted in the per-function stats snapshot and
+restored on worker restart so they stay monotonic.
+
+The standalone `relay function inspect` process has no access to the worker's
+in-memory pool, so it renders the cumulative counters from the persisted stats
+snapshot while marking the live gauges explicitly unavailable — never a stale
+number:
+
+```
+Runtime pool:
+  Capacity:        unknown
+  Containers:      unknown
+  Busy:            unknown
+  Idle:            unknown
+  Warm acquires:   7
+  Cold starts:     3
+  Discarded:       2
+```
+
+The live gauges are deliberately not persisted to SQLite (a persisted live
+gauge would go stale between flushes); only the cumulative counters are.
+`Starting` is transient and is usually absent.
+
 ## Secrets
 
 Relay stores secrets as files on disk, one per secret, under a fixed directory.
@@ -1354,10 +1407,44 @@ remains the health check.
   counts converge across workers toward one published entry per logical
   occurrence, while failures flag workers that cannot reach Redis. These are
   Prometheus-only and not part of the SQLite snapshot. Labels are bounded to
-  `function`/`handler`/`outcome`; IDs (message, event, container, fingerprint)
-  are never labels. The metrics server is operationally isolated: bind failures
+  `function`/`handler`/`outcome` plus the small closed runtime-pool value sets
+  below; IDs (message, event, container, fingerprint) are never labels. The
+  metrics server is operationally isolated: bind failures
   are logged and retried, scrape errors never stop event consumption, and
   shutdown is graceful. Prometheus is the source for time-series metrics.
+- **Warm-container pool metrics**: the per-function warm container pool
+  (see _Execution container lifecycle_) publishes its own series, all
+  function-scoped and low-cardinality:
+  `runtime_pool_capacity{function}` (the function's resolved concurrency, the
+  pool's bound), `runtime_containers{function,state}` (a gauge of currently
+  pooled containers split by `state=idle|busy|starting`),
+  `runtime_container_acquires_total{function,outcome=warm|cold}` (`warm` = an
+  existing idle container was leased, including after a capacity wait; `cold` =
+  a fresh container was started),
+  `runtime_container_discards_total{function,reason}` where `reason` is one of
+  the finite teardown causes (`timeout`, `process_exit`, `protocol_error`,
+  `image_changed`, `idle_timeout`, `shutdown`; removal-time discards are
+  tombstoned, see below) — the reason label is strictly causal, never a
+  synthetic value,
+  `runtime_container_acquire_duration_seconds{function}` (a histogram observed
+  for **successful** acquires only, end-to-end including any wait), and
+  `runtime_container_waits_total{function}` (acquires that blocked at the pool
+  bound). The gauges are authoritative at the moment they are written: a
+  `starting` reservation is rolled back on start success, failure, or panic.
+  A function's series are deleted when the function is removed, atomically with
+  the removal transition: the pool becomes a metric tombstone under the same lock
+  that deletes the series, so a late release/discard from a busy removed
+  container can never recreate them. The removal-time `function_removed` discard
+  is therefore not counted (it would recreate a deleted series); other functions'
+  series and a genuinely reactivated function's fresh series are unaffected.
+  The CUMULATIVE pool counters (warm acquires, cold starts, discards) are
+  persisted per function so the standalone CLI can render them and so they stay
+  monotonic across restarts; the LIVE pool gauges (capacity and the
+  idle/busy/starting counts) are never persisted to SQLite — a persisted live
+  gauge would go stale between flushes. Restored discards are an a-causal
+  aggregate, so at startup they are held in an internal per-function baseline
+  and folded into the cumulative discard total read by the CLI rather than
+  emitted as a synthetic `reason` series; the per-reason series stay causal.
 - **SQLite operational snapshots**: the local state database also keeps the
   **current** operational counters (`stats`) and per-function counters
   (`function_stats`) — latest totals only, never history or per-event rows. The
