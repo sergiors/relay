@@ -879,3 +879,153 @@ export async function sleep(event) {
 		}
 	}
 }
+
+// TestIntegrationPrepareResizesLivePool drives the full Prepare -> pool-resize
+// path end to end against Docker: a function prepared at concurrency 1 warms a
+// pool bounded by 1, then a hot-swapped template raising concurrency propagates
+// the new bound to the ALREADY-CREATED pool through Manager.Prepare (no restart
+// and no new Manager). The capacity gauge, live snapshot, and acquisition bound
+// must all reflect the new value.
+func TestIntegrationPrepareResizesLivePool(t *testing.T) {
+	requireDocker(t)
+	m, reg := newMetricsManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 1
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	fn := function.Function{Name: "prepare-resize-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 1}}
+	p1, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare concurrency 1: %v", err)
+	}
+	if p1.Concurrency != 1 {
+		t.Fatalf("prepared concurrency = %d, want 1", p1.Concurrency)
+	}
+	// Warm the pool at 1.
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "prepare-resize-e2e", Image: p1.Image})
+	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute at concurrency 1: %v", err)
+	}
+	if s, ok := m.PoolSnapshot("prepare-resize-e2e"); !ok || s.Capacity != 1 {
+		t.Fatalf("snapshot after concurrency 1 = %+v, ok=%v; want capacity 1", s, ok)
+	}
+
+	// Hot-swap template.yaml to concurrency 3 (changing the function content, so
+	// the reconciler rebuilds) and re-Prepare.
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 3
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	fn.Template = &function.Template{Runtime: "node24", Concurrency: 3}
+	p2, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare concurrency 3: %v", err)
+	}
+	if p2.Concurrency != 3 {
+		t.Fatalf("re-prepared concurrency = %d, want 3", p2.Concurrency)
+	}
+
+	// The already-created pool's bound follows the successful Prepare.
+	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
+		[]metrics.Label{{Name: "function", Value: "prepare-resize-e2e"}}); got != 3 {
+		t.Fatalf("capacity gauge after re-prepare = %v, want 3", got)
+	}
+	s, ok := m.PoolSnapshot("prepare-resize-e2e")
+	if !ok || s.Capacity != 3 {
+		t.Fatalf("snapshot after re-prepare = %+v, ok=%v; want capacity 3", s, ok)
+	}
+
+	// Admission opened: the new image's containers now fit up to 3 concurrently.
+	execCtx2 := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "prepare-resize-e2e", Image: p2.Image})
+	if err := m.Execute(execCtx2, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute after re-prepare: %v", err)
+	}
+}
+
+// TestIntegrationPrepareClipsConcurrencyToGlobal drives the MAX_CONCURRENCY clip
+// end to end against Docker: a function whose template asks for concurrency 15
+// under the default worker-global cap of 8 is prepared with an EFFECTIVE bound
+// of 8, and its warm pool's capacity gauge and live snapshot report 8 (not 15).
+// A later hot-swap to concurrency 4 re-clips to 4. This proves the effective
+// min(function concurrency, MAX_CONCURRENCY) — not the raw template value —
+// drives runtime pool capacity.
+func TestIntegrationPrepareClipsConcurrencyToGlobal(t *testing.T) {
+	requireDocker(t)
+	// newMetricsManager builds via NewManager with no WithMaxConcurrency, so the
+	// worker-global cap is the package default (8), mirroring config's default.
+	m, reg := newMetricsManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dir := t.TempDir()
+	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 15
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	fn := function.Function{Name: "clip-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 15}}
+	p1, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare concurrency 15: %v", err)
+	}
+	if p1.Concurrency != 8 {
+		t.Fatalf("prepared concurrency = %d, want 8 (clipped to MAX_CONCURRENCY)", p1.Concurrency)
+	}
+	// Warm the pool and verify the clipped bound, not 15.
+	execCtx := context.WithValue(context.Background(), runMetaKey{},
+		RunMeta{Hostname: "test-host", Function: "clip-e2e", Image: p1.Image})
+	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
+		t.Fatalf("execute at clipped concurrency 8: %v", err)
+	}
+	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
+		[]metrics.Label{{Name: "function", Value: "clip-e2e"}}); got != 8 {
+		t.Fatalf("capacity gauge = %v, want 8 (clipped)", got)
+	}
+	if s, ok := m.PoolSnapshot("clip-e2e"); !ok || s.Capacity != 8 {
+		t.Fatalf("snapshot = %+v, ok=%v; want capacity 8", s, ok)
+	}
+
+	// Hot-swap to concurrency 4 (below the cap): the live pool follows to 4.
+	writeFile(t, dir, "template.yaml", `
+runtime: node24
+concurrency: 4
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`)
+	fn.Template = &function.Template{Runtime: "node24", Concurrency: 4}
+	p2, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare concurrency 4: %v", err)
+	}
+	if p2.Concurrency != 4 {
+		t.Fatalf("re-prepared concurrency = %d, want 4 (below cap, untouched)", p2.Concurrency)
+	}
+	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
+		[]metrics.Label{{Name: "function", Value: "clip-e2e"}}); got != 4 {
+		t.Fatalf("capacity gauge after re-prepare = %v, want 4", got)
+	}
+	if s, ok := m.PoolSnapshot("clip-e2e"); !ok || s.Capacity != 4 {
+		t.Fatalf("snapshot after re-prepare = %+v, ok=%v; want capacity 4", s, ok)
+	}
+}

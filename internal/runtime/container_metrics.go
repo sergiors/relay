@@ -161,12 +161,23 @@ func (p *functionPool) publishPoolGaugesLocked() {
 		[]metrics.Label{fn, {Name: "state", Value: metrics.RuntimeStateStarting}}, float64(starting))
 }
 
-// publishPoolCapacity sets the function's pool-capacity gauge. It is called once
-// when a pool is registered in the cache (capacity is first-wins and never
-// changes for the pool's lifetime) and does not require the pool lock. A pool
-// created after the cache was closed, or one already marked removing (a
-// detached pool is never registered), publishes nothing.
+// publishPoolCapacity sets the function's pool-capacity gauge. It takes the pool
+// lock so it is safe to call once the pool is shared through the cache map (a
+// concurrent setFunctionConcurrency may be mutating p.max); it is used at
+// registration. A pool created after the cache was closed, or one already marked
+// removing (a detached pool is never registered), publishes nothing.
 func (p *functionPool) publishPoolCapacity() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.publishPoolCapacityLocked()
+}
+
+// publishPoolCapacityLocked sets the function's pool-capacity gauge to the
+// pool's CURRENT max. It must be called with p.mu held, so a resize and its
+// gauge write are atomic with respect to the pool's other transitions and the
+// gauge always reflects the authoritative bound (the same p.max acquisition,
+// PoolSnapshot, and the socket read).
+func (p *functionPool) publishPoolCapacityLocked() {
 	if p.cache == nil || p.cache.metrics == nil || p.closed || p.removing {
 		return
 	}
@@ -178,7 +189,8 @@ func (p *functionPool) publishPoolCapacity() {
 // the container's own recorded reason when it tore itself down
 // (timeout/process_exit/protocol_error via executionContainer, or the poison
 // path's protocol_error), falling back to the pool-supplied reason for
-// pool-initiated teardown (image_changed/shutdown/function_removed/idle_timeout).
+// pool-initiated teardown (image_changed/shutdown/function_removed/idle_timeout/
+// concurrency_shrink).
 // sync.Once on the pooled wrapper guarantees a container is counted once even
 // when several teardown paths race.
 //

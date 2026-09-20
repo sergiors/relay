@@ -49,6 +49,14 @@ func engineFor(spec plan.Spec) (interface {
 // config); the worker always passes config's resolved value explicitly.
 const DefaultWarmContainerIdleTimeout = 5 * time.Minute
 
+// DefaultMaxConcurrency is the worker-global concurrency cap applied by
+// NewManager when no WithMaxConcurrency option is given. It mirrors
+// config.DefaultMaxConcurrency and runner.DefaultMaxConcurrency (this leaf
+// package cannot import either); the worker always passes config's resolved
+// value explicitly, and a Manager constructed directly by tests leaves
+// maxConcurrency zero (treated as this default, never "uncapped").
+const DefaultMaxConcurrency = 8
+
 // Manager prepares function images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation, and a
 // per-function warm container pool: each function keeps up to its resolved
@@ -68,6 +76,19 @@ type Manager struct {
 	// same. The startup orphan sweep uses it to distinguish this worker's
 	// stalled containers from those of every other worker sharing the daemon.
 	hostname string
+	// maxConcurrency is the worker-global concurrency cap (MAX_CONCURRENCY): the
+	// SAME value the runner uses for its global semaphore. It clips every
+	// function's effective per-function concurrency to
+	// min(template concurrency, maxConcurrency) in Prepare/Execute, so the warm
+	// pool, its capacity gauge, PoolSnapshot/the CLI, and the runner's
+	// per-function semaphore all agree on one effective bound. It is set once at
+	// construction (WithMaxConcurrency; the worker wires config's resolved
+	// value) and read without the lock: MAX_CONCURRENCY is startup
+	// configuration and is NOT hot-reloadable, so a global change requires a
+	// worker restart. A zero value falls back to DefaultMaxConcurrency, never
+	// "uncapped" (a Manager constructed directly by tests behaves like the
+	// default runner).
+	maxConcurrency int
 	// containers caches the per-function reusable execution containers.
 	containers *containerCache
 
@@ -94,6 +115,10 @@ type managerOptions struct {
 	// idleTimeout is the warm-container idle-eviction window. Zero means the
 	// package default (DefaultWarmContainerIdleTimeout).
 	idleTimeout time.Duration
+	// maxConcurrency is the worker-global concurrency cap. Zero means the
+	// package default (DefaultMaxConcurrency), matching the runner's
+	// normalization.
+	maxConcurrency int
 	// now is the injectable clock seam for deterministic tests. Nil means the
 	// wall clock.
 	now func() time.Time
@@ -105,6 +130,18 @@ type managerOptions struct {
 // eviction; config.Load rejects non-positive values before they reach here.
 func WithWarmContainerIdleTimeout(d time.Duration) ManagerOption {
 	return func(o *managerOptions) { o.idleTimeout = d }
+}
+
+// WithMaxConcurrency sets the worker-global concurrency cap (MAX_CONCURRENCY).
+// It is the SAME value the worker passes to runner.SetMaxConcurrency, so the
+// warm pool's effective bound and the runner's per-function semaphore agree.
+// A non-positive value is treated as DefaultMaxConcurrency (never "uncapped"),
+// matching the runner's normalization. It is startup configuration: changing it
+// requires a worker restart (there is no live setter; the runner's global
+// semaphore is likewise built once at startup). The worker wires it from
+// config; a direct NewManager caller that omits it gets DefaultMaxConcurrency.
+func WithMaxConcurrency(n int) ManagerOption {
+	return func(o *managerOptions) { o.maxConcurrency = n }
 }
 
 // withClock injects a deterministic clock for tests. It is unexported because
@@ -141,12 +178,13 @@ func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string, opts 
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
 	mgr := &Manager{
-		log:       logger,
-		cli:       cli,
-		metrics:   m,
-		hostname:  hostname,
-		done:      make(chan struct{}),
-		maintDone: make(chan struct{}),
+		log:            logger,
+		cli:            cli,
+		metrics:        m,
+		hostname:       hostname,
+		maxConcurrency: resolved.maxConcurrency,
+		done:           make(chan struct{}),
+		maintDone:      make(chan struct{}),
 	}
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
@@ -169,6 +207,9 @@ func resolveManagerOptions(opts []ManagerOption) managerOptions {
 	}
 	if resolved.idleTimeout <= 0 {
 		resolved.idleTimeout = DefaultWarmContainerIdleTimeout
+	}
+	if resolved.maxConcurrency < 1 {
+		resolved.maxConcurrency = DefaultMaxConcurrency
 	}
 	return resolved
 }
@@ -270,12 +311,16 @@ type Prepared struct {
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
 	// execution container for this function, after the base RELAY_HANDLER var.
 	Env []string
-	// Concurrency is the function's RESOLVED per-function concurrency (the
-	// template's `concurrency`, defaulted at template parse). It is the bound on
-	// the function's warm container pool: at most this many containers are kept
-	// and leased concurrently. It intentionally matches the runner's
-	// per-function semaphore so the pool is not a second limiter in the runner
-	// path; direct Execute callers that bypass the runner are bounded by it.
+	// Concurrency is the function's EFFECTIVE per-function concurrency: the
+	// template's resolved `concurrency` clipped to the worker-global
+	// MAX_CONCURRENCY (see Manager.effectiveConcurrency). It is the bound on the
+	// function's warm container pool: at most this many containers are kept and
+	// leased concurrently. It intentionally matches the runner's per-function
+	// semaphore (also clipped to the global cap) so the pool is not a second
+	// limiter in the runner path; direct Execute callers that bypass the runner
+	// are bounded by it. Because MAX_CONCURRENCY is startup configuration, a
+	// global change requires a worker restart; a hot-swapped template
+	// `concurrency` is re-clipped live on each successful Prepare.
 	Concurrency int
 	// Dependency is the full "relay-dep-*" reference this function image was
 	// built FROM, or "" when the function declares no dependency layer. It is
@@ -344,7 +389,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		Image:       image,
 		Fingerprint: fp,
 		Env:         p.Env,
-		Concurrency: resolveConcurrency(fn),
+		Concurrency: m.effectiveConcurrency(fn),
 	}
 	if !p.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
@@ -370,6 +415,10 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		// the exact image: a previously removed function warms again, and a
 		// reverted same-source image is no longer treated as retired.
 		m.containers.activateFunction(fn.Name, image)
+		// Propagate the reconciled concurrency to the live pool: the effective
+		// bound must follow a successful Prepare even when the image was reused
+		// (a concurrency-only change rebuilds the same fingerprinted image).
+		m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
 		return funcPrepared, nil
 	}
 
@@ -420,8 +469,11 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		"result", "success",
 	)
 	// The build succeeded: activate the exact image so a removed-then-recreated
-	// function warms again and a same-content rebuild is not left retired.
+	// function warms again and a same-content rebuild is not left retired, then
+	// propagate the reconciled concurrency to the live pool (a hot-swapped
+	// concurrency takes effect without a worker restart).
 	m.containers.activateFunction(fn.Name, image)
+	m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
 	return &Prepared{
 		Name:        fn.Name,
 		Image:       image,
@@ -442,6 +494,38 @@ func resolveConcurrency(fn function.Function) int {
 		return function.DefaultConcurrency
 	}
 	return fn.Template.Concurrency
+}
+
+// effectiveConcurrency returns the function's EFFECTIVE per-function
+// concurrency for the warm container pool: the template's resolved concurrency
+// clipped to the worker-global MAX_CONCURRENCY. When the template asks for more
+// than the global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8), the pool
+// warms, reports, and admits only the cap's worth — the effective intersection
+// of the two limits the README documents, matching the runner's clipped
+// per-function semaphore.
+func (m *Manager) effectiveConcurrency(fn function.Function) int {
+	return m.clipConcurrency(resolveConcurrency(fn))
+}
+
+// clipConcurrency clips an already-resolved per-function concurrency to the
+// worker-global MAX_CONCURRENCY. A value below 1 is treated as
+// function.DefaultConcurrency first, and a zero Manager.maxConcurrency (a
+// Manager constructed directly by tests) is treated as DefaultMaxConcurrency,
+// never "uncapped". It is the single clipping rule applied by Prepare and
+// Execute, so a hand-built Prepared (direct/integration callers) can never
+// warm a pool larger than the worker-global cap.
+func (m *Manager) clipConcurrency(n int) int {
+	if n < 1 {
+		n = function.DefaultConcurrency
+	}
+	limit := m.maxConcurrency
+	if limit < 1 {
+		limit = DefaultMaxConcurrency
+	}
+	if n > limit {
+		return limit
+	}
+	return n
 }
 
 // ensureDependencyImage builds the dependency image for the function's
@@ -520,12 +604,13 @@ func (m *Manager) ensureDependencyImage(
 // invocation protocol until it is discarded (timeout, process exit, protocol
 // error, image change). A handler failure (ok:false) does NOT discard it.
 //
-// The pool's bound is Prepared.Concurrency, the same resolved value the
-// runner's per-function semaphore uses, so in the runner path the pool never
-// blocks (the semaphore already admits at most that many concurrent calls).
-// Direct callers that bypass the runner are bounded by the pool itself; when
-// the pool is at capacity, Execute blocks until a lease is released, ctx is
-// done, or the Manager is closed (errPoolClosed).
+// The pool's bound is Prepared.Concurrency (the effective value, already
+// clipped to MAX_CONCURRENCY by Prepare and re-clipped here), the same value
+// the runner's per-function semaphore uses, so in the runner path the pool
+// never blocks (the semaphore already admits at most that many concurrent
+// calls). Direct callers that bypass the runner are bounded by the pool itself;
+// when the pool is at capacity, Execute blocks until a lease is released, ctx
+// is done, or the Manager is closed (errPoolClosed).
 //
 // The context must carry the per-invocation timeout; a timeout discards the
 // container (kill + remove, reason "timeout") and is treated as an invocation
@@ -579,15 +664,14 @@ func (m *Manager) Execute(
 	start := func() (reusableContainer, error) {
 		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, idMeta)
 	}
-	// Prepared.Concurrency is populated by Prepare from the function's resolved
-	// template; a hand-built Prepared (direct/integration callers) may leave it
-	// zero, so fall back to the function default — the same bound the runner
-	// applies, keeping the pool from ever being a stricter limiter than the
-	// runner's per-function semaphore.
-	max := prepared.Concurrency
-	if max < 1 {
-		max = function.DefaultConcurrency
-	}
+	// Prepared.Concurrency is populated by Prepare as the effective bound
+	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
+	// (direct/integration callers) may carry the raw template value or leave it
+	// zero, so clip it here too: the pool bound can never exceed the
+	// worker-global cap, and the same bound the runner's clipped per-function
+	// semaphore uses is what the pool enforces, keeping the pool from ever being
+	// a stricter limiter than the runner's per-function semaphore.
+	max := m.clipConcurrency(prepared.Concurrency)
 	return m.containers.execute(
 		ctx, prepared.Name, prepared.Image, max, start, handler, eventJSON, envMap(extraEnv),
 	)

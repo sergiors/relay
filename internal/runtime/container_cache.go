@@ -34,13 +34,14 @@ type reusableContainer interface {
 // again. reasonProtocolError (and timeout/process_exit) are recorded by the
 // container itself on self-initiated teardown; the others are pool-initiated.
 const (
-	reasonImageChanged   = "image_changed"
-	reasonShutdown       = "shutdown"
-	reasonFunctionRemove = "function_removed"
-	reasonIdleTimeout    = "idle_timeout"
-	reasonTimeout        = "timeout"
-	reasonProcessExit    = "process_exit"
-	reasonProtocolError  = "protocol_error"
+	reasonImageChanged      = "image_changed"
+	reasonShutdown          = "shutdown"
+	reasonFunctionRemove    = "function_removed"
+	reasonIdleTimeout       = "idle_timeout"
+	reasonConcurrencyShrink = "concurrency_shrink"
+	reasonTimeout           = "timeout"
+	reasonProcessExit       = "process_exit"
+	reasonProtocolError     = "protocol_error"
 )
 
 // errPoolClosed is returned when an acquire is attempted on a cache/pool that
@@ -96,7 +97,14 @@ type containerCache struct {
 	// after a successful prepare, so a removed-then-recreated function warms
 	// again. Guarded by mu.
 	removedFunctions map[string]bool
-	closed           bool
+	// capacity records the last effective per-function concurrency published by
+	// a successful Prepare (see setFunctionConcurrency). poolFor uses it when it
+	// CREATES a pool, so a stale in-flight acquire that races a reconcile cannot
+	// seed a fresh pool with an out-of-date Prepared.Concurrency — the pool is
+	// always created at the current effective bound. It is deleted with the
+	// function on removal. Guarded by mu.
+	capacity map[string]int
+	closed   bool
 
 	// idleTimeout is how long a healthy idle pooled container may stay before
 	// the maintenance sweep evicts it (see evictIdle). Set once at construction;
@@ -227,6 +235,7 @@ func newContainerCache() *containerCache {
 		pools:            map[string]*functionPool{},
 		retiredImages:    map[string]bool{},
 		removedFunctions: map[string]bool{},
+		capacity:         map[string]int{},
 	}
 }
 
@@ -266,12 +275,16 @@ func (cc *containerCache) lazyInit() {
 	if cc.removedFunctions == nil {
 		cc.removedFunctions = map[string]bool{}
 	}
+	if cc.capacity == nil {
+		cc.capacity = map[string]int{}
+	}
 }
 
-// poolFor returns (creating) the pool for fnName. Capacity is first-wins: the
-// first acquire fixes the pool size to the function's resolved concurrency; a
-// later value is ignored, mirroring the runner's per-function semaphore policy
-// (a hot-swapped concurrency change requires a worker restart).
+// poolFor returns (creating) the pool for fnName. max is used only when the pool
+// is CREATED: an existing pool's bound is authoritative and is updated in place
+// by setFunctionConcurrency when Prepare reconciles the function's resolved
+// concurrency, never by a later acquire (a stale Prepared must not resize a live
+// pool backwards).
 //
 // A pool requested after the cache is closed is returned closed so acquire
 // fails immediately. A function whose removal has been requested (and whose
@@ -284,6 +297,14 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	cc.lazyInit()
 	if p, ok := cc.pools[fnName]; ok {
 		return p
+	}
+	// Prefer the last effective capacity published by a successful Prepare over
+	// the caller's max: a stale acquire racing a reconcile must not seed a fresh
+	// pool with an out-of-date Prepared.Concurrency. The caller's max is the
+	// fallback for direct callers (integration tests) that never go through
+	// Prepare.
+	if effective, ok := cc.capacity[fnName]; ok {
+		max = effective
 	}
 	if cc.removedFunctions[fnName] {
 		p := newFunctionPool(fnName, max, cc)
@@ -305,11 +326,100 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 		close(p.notify)
 	}
 	cc.pools[fnName] = p
-	// Publish the pool's bound exactly once, when it is registered: capacity is
-	// first-wins for the pool's lifetime, so a later acquire's max is ignored
-	// (mirroring the runner's per-function semaphore policy).
+	// Publish the pool's bound at registration, before it is shared through the
+	// map. Its bound is later updated in place by setFunctionConcurrency when
+	// Prepare reconciles a changed concurrency.
 	p.publishPoolCapacity()
 	return p
+}
+
+// setFunctionConcurrency updates fnName's live warm pool bound to max. It is how
+// a successful function Prepare propagates a reconciled `concurrency` to an
+// ALREADY-CREATED pool without a restart: the pool bound is not first-wins. A
+// pool that does not exist yet needs no update (the next acquire creates it with
+// the current max, supplied from the current Prepared); a removed or closed pool
+// is left alone. The new bound publishes the capacity gauge and wakes blocked
+// acquires, and on a DECREASE it immediately retires only EXCESS IDLE containers
+// (see setMax and release for the shrink invariant).
+func (cc *containerCache) setFunctionConcurrency(fnName string, max int) {
+	if max < 1 {
+		max = 1
+	}
+	cc.mu.Lock()
+	cc.lazyInit()
+	// Record the effective bound under cc.mu so a pool created later (or a stale
+	// acquire racing this reconcile) is seeded with it by poolFor, never with a
+	// stale Prepared.Concurrency. Recording and pool lookup share one critical
+	// section so a concurrent creation is covered by the record or by the setMax
+	// below, never missed.
+	cc.capacity[fnName] = max
+	p := cc.pools[fnName]
+	cc.mu.Unlock()
+	if p == nil {
+		return
+	}
+	for _, pc := range p.setMax(max) {
+		p.discardContainer(pc, reasonConcurrencyShrink)
+	}
+}
+
+// setMax applies a new bound to this pool and returns the excess IDLE containers
+// to discard (the caller tears them down outside the lock). It is a no-op for an
+// equal bound or a closed/removing pool. It is the single pool-level bound
+// operation, so acquisition, PoolSnapshot/socket/CLI, and the capacity gauge all
+// read the same p.max. It must not be called with p.mu held.
+func (p *functionPool) setMax(max int) []*pooledContainer {
+	p.mu.Lock()
+	if p.closed || p.removing || max == p.max {
+		p.mu.Unlock()
+		return nil
+	}
+	p.max = max
+	p.publishPoolCapacityLocked()
+	// Shrink invariant: a decrease retires only EXCESS IDLE containers. Busy
+	// containers are never killed; a container returned to an over-bound pool is
+	// retired on release instead (see release), so the pool converges as leases
+	// drain. An increase is lazy: nothing is started here, only admission opens.
+	discard := p.takeExcessIdleLocked(p.usedLocked() - p.max)
+	if len(discard) > 0 {
+		// The idle gauges must drop with the containers the shrink retires.
+		p.publishPoolGaugesLocked()
+	}
+	p.signalLocked()
+	p.mu.Unlock()
+	return discard
+}
+
+// takeExcessIdleLocked removes up to n idle containers from the active then
+// draining generations, marking each retired with the shrink reason, so a
+// decreased bound sheds only idle capacity. It must be called with p.mu held; a
+// non-positive n removes nothing.
+func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
+	if n <= 0 {
+		return nil
+	}
+	var discard []*pooledContainer
+	take := func(g *generation) {
+		for n > 0 && len(g.idle) > 0 {
+			pc := g.idle[len(g.idle)-1]
+			g.idle = g.idle[:len(g.idle)-1]
+			pc.retired = true
+			pc.retireReason = reasonConcurrencyShrink
+			discard = append(discard, pc)
+			n--
+		}
+	}
+	if p.active != nil {
+		take(p.active)
+	}
+	for _, g := range p.draining {
+		if n <= 0 {
+			break
+		}
+		take(g)
+	}
+	p.pruneDrainingLocked()
+	return discard
 }
 
 // execute runs one invocation through a leased container for fnName. start
@@ -748,6 +858,7 @@ func (cc *containerCache) removeFunction(fnName string) {
 	cc.mu.Lock()
 	cc.lazyInit()
 	cc.removedFunctions[fnName] = true
+	delete(cc.capacity, fnName)
 	p := cc.pools[fnName]
 	var discard []*pooledContainer
 	if p != nil {
@@ -1171,6 +1282,14 @@ func (p *functionPool) release(pc *pooledContainer) {
 		// its image is no longer active, so it is discarded rather than pooled.
 		drop = true
 		reason = reasonImageChanged
+	case p.usedLocked() >= p.max:
+		// Shrink invariant: the bound was lowered while this container was busy,
+		// so returning it to idle would leave the pool above max. Retire it
+		// instead; the pool converges to max as the remaining busy leases drain
+		// (the decrease itself only retired excess idle containers and never
+		// killed a busy one).
+		drop = true
+		reason = reasonConcurrencyShrink
 	}
 	if !drop {
 		pc.idleSince = p.clock()

@@ -367,6 +367,14 @@ func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Runtime pool:")
 	tw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+
+	totalAcquires := warm + cold
+	warmAcquires := fmt.Sprintf("%d (n/a)", warm)
+	if totalAcquires > 0 {
+		reuseRate := float64(warm) / float64(totalAcquires) * 100
+		warmAcquires = fmt.Sprintf("%d (%.1f%%)", warm, reuseRate)
+	}
+
 	if live != nil {
 		fmt.Fprintf(tw, "  Capacity:\t%d\n", live.Capacity)
 		fmt.Fprintf(tw, "  Containers:\t%d\n", live.Containers)
@@ -375,7 +383,7 @@ func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64
 		if live.Starting > 0 {
 			fmt.Fprintf(tw, "  Starting:\t%d\n", live.Starting)
 		}
-		fmt.Fprintf(tw, "  Warm acquires:\t%d\n", warm)
+		fmt.Fprintf(tw, "  Warm acquires:\t%s\n", warmAcquires)
 		fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
 		fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
 		tw.Flush()
@@ -389,7 +397,7 @@ func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64
 	fmt.Fprintf(tw, "  Containers:\tunknown\n")
 	fmt.Fprintf(tw, "  Busy:\tunknown\n")
 	fmt.Fprintf(tw, "  Idle:\tunknown\n")
-	fmt.Fprintf(tw, "  Warm acquires:\t%d\n", warm)
+	fmt.Fprintf(tw, "  Warm acquires:\t%s\n", warmAcquires)
 	fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
 	fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
 	tw.Flush()

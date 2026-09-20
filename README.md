@@ -217,15 +217,28 @@ concurrency → per-function concurrency → runner/container → completion/ACK
 - `MAX_CONCURRENCY` bounds the total number of function invocations executing
   concurrently in one worker, and the per-function `concurrency` bounds how many
   concurrent invocations a single function's handlers may run in that worker.
-  The effective limit is the intersection of both. If a slot cannot be acquired
+  The effective limit is the intersection of both: a function's per-function
+  limit is `min(concurrency, MAX_CONCURRENCY)`, and that same effective value
+  sizes both its runner semaphore and its warm container pool (so the pool's
+  capacity gauge, `function inspect` snapshot, and admission all agree). A
+  template `concurrency` above `MAX_CONCURRENCY` (e.g. `15` with `MAX_CONCURRENCY=8`)
+  is therefore capped at `8`. `MAX_CONCURRENCY` is startup configuration: a
+  change requires a worker restart, unlike a hot-swapped template `concurrency`,
+  which is re-clipped live. If a slot cannot be acquired
   within a bounded wait (well below the reclaim `MinPendingIdle`), the message is
   left pending and replayed by a later reclaim — so a locally buffered event
   never sits long enough to defeat the reclaim pacing, and no retry/exhaustion
   accounting is charged for a merely-blocked invocation.
-- A hot-swapped template's `concurrency` change requires a **worker restart** to
-  resize: per-function slots are created first-wins by name and never resized
-  mid-flight (a running invocation is never interrupted). Changes take effect for
-  new function names immediately.
+- A hot-swapped template's `concurrency` change is applied live, without a
+  restart: a successful reconcile propagates the resolved bound to the function's
+  runner semaphore (new acquisitions use the resized semaphore; an in-flight
+  invocation releases to the semaphore it started on) and to its warm container
+  pool. An increase admits more concurrent invocations and stays lazy (no
+  container is started eagerly); a decrease immediately retires only excess idle
+  containers and never interrupts a running invocation — containers returned to
+  an over-capacity pool are retired instead of pooled, so the pool converges as
+  the busy leases drain. Changes to a function that has never warmed take effect
+  when its pool is first created.
 
 ### Log levels
 
@@ -389,9 +402,12 @@ only when no managed function image references them. An image with no
 ### Execution container lifecycle
 
 Each function keeps a **bounded warm pool of reused execution containers**, up
-to its resolved `concurrency`, per image version. Containers are created lazily:
-the first invocation starts one, and additional containers are started only when
-concurrent demand requires them, up to the function's concurrency limit.
+to its **effective** concurrency — `min(template concurrency, MAX_CONCURRENCY)` —
+per image version. Containers are created lazily: the first invocation starts
+one, and additional containers are started only when concurrent demand requires
+them, up to that effective limit. A template asking for more than the
+worker-global cap (e.g. `concurrency: 15` with `MAX_CONCURRENCY=8`) therefore
+warms, reports, and admits only the cap's worth.
 
 Subsequent invocations reuse healthy idle containers instead of paying container
 startup on every event. Concurrent invocations of the same function lease
@@ -520,11 +536,14 @@ hour day-of-month month day-of-week`. The exact expression is shown by
   decides).
 - `concurrency` (optional, top-level) bounds how many of this function's handler
   invocations may execute concurrently within a single Relay worker (per
-  function, per worker). It must be a positive integer; a zero, negative, or
-  non-integer value (e.g. `0`, `-1`, `1.5`, `true`) fails the function's
-  template validation (the function is logged and skipped). Omitted templates use
-  a `2` default. A hot-swapped change requires a worker restart to resize (see
-  _Concurrency and backpressure_).
+  function, per worker). It is additionally clipped to the worker-global
+  `MAX_CONCURRENCY`, so the effective limit is `min(concurrency, MAX_CONCURRENCY)`
+  (e.g. `15` with the default `MAX_CONCURRENCY=8` is capped at `8`). It must be a
+  positive integer; a zero, negative, or non-integer value (e.g. `0`, `-1`,
+  `1.5`, `true`) fails the function's template validation (the function is logged
+  and skipped). Omitted templates use a `2` default. A hot-swapped change is
+  applied live, without a restart (see _Concurrency and backpressure_); a
+  `MAX_CONCURRENCY` change requires a worker restart.
 - `timeout` (optional, per rule) is a Go duration string bounding a single
   invocation of that rule's handler (e.g. `20s`, `1m30s`). It must be positive.
   Zero, negative, unparseable, or values above `5m` (`MaxTimeout`) fail the
@@ -1161,7 +1180,8 @@ Runtime pool:
   Discarded:       2
 ```
 
-`Capacity` is the function's resolved concurrency limit.
+`Capacity` is the function's effective concurrency limit:
+`min(template concurrency, MAX_CONCURRENCY)`.
 
 `Containers` is the number of currently running execution containers owned by
 the function pool, while `Busy` and `Idle` describe their current lease state.
@@ -1442,17 +1462,18 @@ remains the health check.
 - **Warm-container pool metrics**: the per-function warm container pool
   (see _Execution container lifecycle_) publishes its own series, all
   function-scoped and low-cardinality:
-  `runtime_pool_capacity{function}` (the function's resolved concurrency, the
-  pool's bound), `runtime_containers{function,state}` (a gauge of currently
+  `runtime_pool_capacity{function}` (the function's effective concurrency — its
+  resolved template `concurrency` clipped to `MAX_CONCURRENCY` — the pool's
+  bound), `runtime_containers{function,state}` (a gauge of currently
   pooled containers split by `state=idle|busy|starting`),
   `runtime_container_acquires_total{function,outcome=warm|cold}` (`warm` = an
   existing idle container was leased, including after a capacity wait; `cold` =
   a fresh container was started),
   `runtime_container_discards_total{function,reason}` where `reason` is one of
   the finite teardown causes (`timeout`, `process_exit`, `protocol_error`,
-  `image_changed`, `idle_timeout`, `shutdown`; removal-time discards are
-  tombstoned, see below) — the reason label is strictly causal, never a
-  synthetic value,
+  `image_changed`, `idle_timeout`, `concurrency_shrink`, `shutdown`;
+  removal-time discards are tombstoned, see below) — the reason label is strictly
+  causal, never a synthetic value,
   `runtime_container_acquire_duration_seconds{function}` (a histogram observed
   for **successful** acquires only, end-to-end including any wait), and
   `runtime_container_waits_total{function}` (acquires that blocked at the pool

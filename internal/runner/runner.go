@@ -211,9 +211,11 @@ type Runner struct {
 	// semaphore, both of which are internally consistent.
 	globalSem atomic.Pointer[semaphore]
 	// fnSems is a mutex-protected map of per-function semaphores, keyed by
-	// function name and created on demand (first-wins capacity), so a hot-swapped
-	// template's concurrency change only takes effect for NEW function names; a
-	// running function's slots are resized only on restart (see the README).
+	// function name and created on demand. A function's semaphore is RESIZED by
+	// replacing its pointer when the function's resolved template concurrency
+	// changes (see concurrencySems), so a hot-swapped concurrency takes effect
+	// without a restart. In-flight acquisitions release to the semaphore pointer
+	// they captured, so replacing the map entry never strands a held slot.
 	fnSemsMu sync.Mutex
 	fnSems   map[string]*semaphore
 	// inFlight is the current number of invocations executing concurrently in
@@ -645,22 +647,29 @@ func (r *Runner) executeWithRefs(
 // semaphore is a channel-based counting semaphore that bounds how many
 // invocations may execute concurrently (globally or per function). acquireReserve
 // blocks up to slotWaitTimeout for a free slot, returning false on timeout (the
-// invocation is left pending and reclaimed later). It is created sized to the
-// concurrency limit and never resized mid-flight: per-function semaphores are
-// created first-wins by name, and the global semaphore is rebuilt by
+// invocation is left pending and reclaimed later). A per-function semaphore is
+// REPLACED (not mutated) when the function's resolved concurrency changes, so an
+// in-flight acquisition still releases to the semaphore pointer it captured
+// while new acquisitions use the resized one; the global semaphore is rebuilt by
 // SetMaxConcurrency.
 //
 // The per-function semaphore is the ONLY per-function invocation limiter: the
-// runtime's warm container pool is sized from the same resolved concurrency, so
-// the semaphore always admits no more concurrent Execute calls than the pool
-// has containers, and the pool never blocks in the runner path. The global
-// semaphore is the broader cap shared across functions.
+// runtime's warm container pool is sized from the same effective concurrency
+// (template concurrency clipped to MAX_CONCURRENCY), so the semaphore always
+// admits no more concurrent Execute calls than the pool has containers, and the
+// pool never blocks in the runner path. The global semaphore is the broader cap
+// shared across functions.
 type semaphore struct {
 	slots chan struct{}
+	// capacity is the limit the channel was created with. It is immutable and
+	// lets concurrencySems detect a reconciled concurrency change by comparing
+	// the desired value against the installed semaphore, so the map entry is
+	// replaced only on a real change (never resized per call).
+	capacity int
 }
 
 func newSemaphore(n int) *semaphore {
-	return &semaphore{slots: make(chan struct{}, n)}
+	return &semaphore{slots: make(chan struct{}, n), capacity: n}
 }
 
 // acquire acquires one slot, blocking up to wait until a slot frees, ctx is
@@ -692,9 +701,22 @@ func (s *semaphore) release() {
 }
 
 // concurrencySems returns the global and per-function semaphores for the given
-// function, creating the function's semaphore on demand (first-wins capacity:
-// only sizes it to the function's template concurrency when none exists). The
+// function. The function's semaphore is created on demand and RESIZED in place
+// (by replacing the map entry with a freshly sized semaphore) whenever the
+// function's resolved concurrency differs from the installed one. Replacement
+// rather than channel mutation is deliberate: an in-flight acquisition holds
+// the OLD pointer and releases to it, so shrinking can never block a release on
+// a full new channel nor lose a slot, and no held slot is ever stranded. The
 // global semaphore is non-nil on the runner (normalized on construction).
+//
+// The resized-to concurrency is resolved from the CURRENT registry entry, not
+// only the caller's snapshot value (see currentConcurrency): an in-flight Handle
+// holding an older snapshot cannot resize the semaphore backwards after a newer
+// snapshot already applied a larger bound. The resolved value is additionally
+// clipped to the worker-global MAX_CONCURRENCY (see effectiveConcurrency), so a
+// function asking for more than the global cap never gets a per-function
+// semaphore larger than the global one — and the runtime's warm-pool bound,
+// also clipped to the cap, agrees with it.
 func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *semaphore, fn *semaphore) {
 	// Global semaphore: normalized on construction / SetMaxConcurrency; it is
 	// always non-nil in practice. Guard nil defensively (a zero-valued Runner
@@ -703,18 +725,76 @@ func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *sema
 	if global == nil {
 		global = newSemaphore(DefaultMaxConcurrency)
 	}
-	// Per-function semaphore: created on demand, first-wins capacity.
-	if fnConcurrency < 1 {
-		fnConcurrency = function.DefaultConcurrency
-	}
+	fnConcurrency = r.effectiveConcurrency(fnName, fnConcurrency)
 	r.fnSemsMu.Lock()
 	defer r.fnSemsMu.Unlock()
 	if s, ok := r.fnSems[fnName]; ok {
+		if s.capacity == fnConcurrency {
+			return global, s
+		}
+		// Resolved concurrency changed: install a freshly sized semaphore so new
+		// acquisitions use the new bound. In-flight holds keep the old pointer
+		// and release to it (see the semaphore doc).
+		s = newSemaphore(fnConcurrency)
+		r.fnSems[fnName] = s
 		return global, s
 	}
 	s := newSemaphore(fnConcurrency)
 	r.fnSems[fnName] = s
 	return global, s
+}
+
+// currentConcurrency returns fnName's current resolved per-function concurrency
+// from the registry, falling back to fallback when the function is absent or has
+// no parsed template. It makes a semaphore resize authoritative to the latest
+// published template rather than a caller's possibly-stale registry snapshot.
+func (r *Runner) currentConcurrency(fnName string, fallback int) int {
+	if r.reg == nil {
+		return fallback
+	}
+	if pf := r.reg.GetByName(fnName); pf != nil && pf.fn.Template != nil {
+		return pf.fn.Template.Concurrency
+	}
+	return fallback
+}
+
+// effectiveConcurrency returns the per-function semaphore capacity for fnName:
+// its current resolved template concurrency clipped to the worker-global
+// MAX_CONCURRENCY. Clipping matters when the template asks for more than the
+// global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8): the per-function
+// semaphore is then sized to the cap, matching the runtime's effective warm-pool
+// bound, so the pool and the semaphore never disagree. A zero/negative template
+// value falls back to function.DefaultConcurrency; a zero maxConcurrency (a
+// zero-valued Runner in tests) falls back to DefaultMaxConcurrency, never
+// "uncapped". The global value is read fresh, so a SetMaxConcurrency call is
+// reflected on the next acquisition (which resizes the function's semaphore).
+func (r *Runner) effectiveConcurrency(fnName string, fallback int) int {
+	n := r.currentConcurrency(fnName, fallback)
+	if n < 1 {
+		n = function.DefaultConcurrency
+	}
+	limit := int(r.maxConcurrency.Load())
+	if limit < 1 {
+		limit = DefaultMaxConcurrency
+	}
+	if n > limit {
+		return limit
+	}
+	return n
+}
+
+// RemoveFunctionSemaphore drops a function's per-function semaphore. It is
+// called when the function is removed from the registry, so a later recreation
+// of the same name starts from a fresh semaphore rather than inheriting a stale
+// bound (and so a removed function's map entry does not linger). In-flight
+// acquisitions still release to the pointer they captured. It is nil-safe.
+func (r *Runner) RemoveFunctionSemaphore(fnName string) {
+	if r == nil {
+		return
+	}
+	r.fnSemsMu.Lock()
+	delete(r.fnSems, fnName)
+	r.fnSemsMu.Unlock()
 }
 
 // reserveSlots acquires both the global and per-function slots for one

@@ -164,6 +164,12 @@ func Run(logger *slog.Logger) {
 		metricsInstance,
 		cfg.ConsumerName,
 		runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
+		// The SAME MAX_CONCURRENCY the runner's global semaphore uses: the
+		// runtime clips each function's effective per-function concurrency to it,
+		// so a template asking for more than the worker-global cap (e.g. 15 with
+		// MAX_CONCURRENCY=8) warms, reports, and admits only the cap's worth. It
+		// is startup configuration; a global change requires a worker restart.
+		runtime.WithMaxConcurrency(cfg.MaxConcurrency),
 	)
 	if err != nil {
 		// Fatal: the runtime manager owns container execution, which the worker
@@ -379,6 +385,7 @@ func Run(logger *slog.Logger) {
 				// version once idle (the runner's reference guard keeps an image
 				// an in-flight execution still needs).
 				manager.RemoveFunction(name)
+				runWorker.RemoveFunctionSemaphore(name)
 				runWorker.RemoveFunctionImages(name)
 				sched.RemoveFunction(name) // a removed function never keeps firing
 			},
