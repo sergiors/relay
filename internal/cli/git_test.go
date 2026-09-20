@@ -1,10 +1,19 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	gogit "github.com/go-git/go-git/v5"
+	gitcfg "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 
 	gitpkg "relay/internal/git"
 )
@@ -404,5 +413,153 @@ func TestGitSetTooManyArgs(t *testing.T) {
 	_, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git", "extra")
 	if err == nil || !strings.Contains(err.Error(), "too many arguments") {
 		t.Fatalf("git set extra err = %v, want too many arguments", err)
+	}
+}
+
+// TestGitCommandsDoNotUseLogger pins that the single-step git commands (keygen,
+// set, status, remove) present their success on the command writer only and
+// never emit process-log output. The commands take no logger at all, so a
+// future change cannot reintroduce CLI debug/progress logging without also
+// changing the signature; this guards the wiring through the command tree.
+func TestGitCommandsDoNotUseLogger(t *testing.T) {
+	_ = redirectGitDirs(t)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// keygen: public key + guidance on the writer.
+	out, _, err := runCLIWithLogger(t, logger, "", "git", "keygen")
+	if err != nil {
+		t.Fatalf("git keygen: %v", err)
+	}
+	if !strings.Contains(out, "ssh-ed25519 ") {
+		t.Fatalf("keygen writer output missing public key:\n%s", out)
+	}
+
+	// set: confirmation on the writer.
+	out, _, err = runCLIWithLogger(t, logger, "", "git", "set", "git@github.com:acme/repo.git")
+	if err != nil {
+		t.Fatalf("git set: %v", err)
+	}
+	if !strings.Contains(out, "Set git source") {
+		t.Fatalf("set writer output missing confirmation:\n%s", out)
+	}
+
+	// status: table on the writer.
+	out, _, err = runCLIWithLogger(t, logger, "", "git", "status")
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if !strings.Contains(out, "Repository:") {
+		t.Fatalf("status writer output missing fields:\n%s", out)
+	}
+
+	// remove: report on the writer (-y skips the prompt).
+	out, _, err = runCLIWithLogger(t, logger, "", "git", "remove", "-y")
+	if err != nil {
+		t.Fatalf("git remove: %v", err)
+	}
+	if !strings.Contains(out, "Removed git source config") {
+		t.Fatalf("remove writer output missing confirmation:\n%s", out)
+	}
+
+	if logs.Len() != 0 {
+		t.Fatalf("git commands wrote to the process log:\n%s", logs.String())
+	}
+}
+
+// seedLocalBareRepo builds a local work repo with one function and a bare remote
+// cloned from it, returning the bare path. It lets a CLI git sync run end to end
+// against a filesystem source (no SSH, no network), with the repository stored
+// as a plain path in the persisted config.
+func seedLocalBareRepo(t *testing.T) string {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "work")
+	r, err := gogit.PlainInit(work, false)
+	if err != nil {
+		t.Fatalf("init work: %v", err)
+	}
+	wt, err := r.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(work, "fn"), 0o755); err != nil {
+		t.Fatalf("mkdir fn: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "fn", "template.yaml"), []byte("runtime: node24\n"), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	if _, err := wt.Add("fn/template.yaml"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	h, err := wt.Commit("initial", &gogit.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()}})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := r.Storer.SetReference(plumbing.NewHashReference(plumbing.ReferenceName("refs/heads/main"), h)); err != nil {
+		t.Fatalf("set ref: %v", err)
+	}
+
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	if _, err := gogit.PlainInit(bare, true); err != nil {
+		t.Fatalf("init bare: %v", err)
+	}
+	b, err := gogit.PlainOpen(bare)
+	if err != nil {
+		t.Fatalf("open bare: %v", err)
+	}
+	orig, err := b.CreateRemote(&gitcfg.RemoteConfig{Name: "origin", URLs: []string{work}})
+	if err != nil {
+		t.Fatalf("create remote: %v", err)
+	}
+	if err := orig.Fetch(&gogit.FetchOptions{RefSpecs: []gitcfg.RefSpec{"+refs/heads/*:refs/heads/*"}}); err != nil {
+		t.Fatalf("seed bare: %v", err)
+	}
+	return bare
+}
+
+// TestGitSyncCLIStepsAreWriterOnlyAtDebug pins that a real `relay git sync` run
+// writes its full user-facing step summary to the command writer and emits NO
+// process-log output, even with a DEBUG-level process logger. The CLI sync does
+// not set SyncOptions.Log, so the git package's structured diagnostics belong
+// exclusively to the background worker/webhook path (covered by the git package
+// tests); a short-lived CLI sync must not trail debug output.
+func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
+	p := redirectGitDirs(t)
+	bare := seedLocalBareRepo(t)
+
+	// Persist a config with a plain local path as the repository (bypasses the
+	// SSH-URL validation the operator-facing `git set` enforces, exactly as the
+	// git package's local test seam does).
+	data, err := json.Marshal(map[string]any{"repository": bare, "ref": "main"})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(p.configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(p.configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	out, _, err := runCLIWithLogger(t, logger, "", "git", "sync")
+	if err != nil {
+		t.Fatalf("git sync: %v", err)
+	}
+	// The user-facing progress is complete on the writer.
+	for _, step := range []string{"Syncing...", "Cloned ", "Resolved", "Materialized 1 function(s): fn", "Sync complete"} {
+		if !strings.Contains(out, step) {
+			t.Fatalf("git sync writer output missing %q:\n%s", step, out)
+		}
+	}
+	// ...and the CLI sync never logged.
+	if logs.Len() != 0 {
+		t.Fatalf("CLI git sync emitted process-log output:\n%s", logs.String())
+	}
+	// The sync actually materialized the function.
+	if _, err := os.Stat(filepath.Join(p.functionsDir, "fn", "template.yaml")); err != nil {
+		t.Fatalf("function not materialized: %v", err)
 	}
 }

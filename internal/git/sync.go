@@ -125,8 +125,8 @@ func (a gitOpsAuth) authFor(sourceURL string) (gitssh.AuthMethod, error) {
 	if a.opts.SSHDir == "" {
 		return nil, fmt.Errorf("git: ssh source requires the SSHDir option (production sets /var/lib/relay/ssh)")
 	}
-	// Thread the parsed endpoint and the two-channel reporting seams (out/log)
-	// down to the TOFU callback so a first-trust surfaces on both.
+	// Thread the parsed endpoint and the two reporting seams (out/log) down to
+	// the TOFU callback so a first-trust surfaces to whichever is set.
 	return sshAuthFor(a.opts.SSHDir, ep, a.opts.Out, a.opts.Log)
 }
 
@@ -139,24 +139,21 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 
 	log := opts.Log
 	out := opts.Out
-	// writeLine reports each sync step on BOTH channels, honoring two rules:
-	//
-	//  1. opts.Log is DI: the caller's logger (the CLI passes the process logger
-	//     from cmd/main.go). nil means silent — this package never constructs a
-	//     fallback logger (that helper was deliberately removed; nil-tolerance
-	//     lives at the single call site instead).
-	//  2. The slog side is deliberately Debug, NOT Info: the process logger
-	//     (cmd/main.go) is a tint handler writing to stdout at the configured
-	//     level, and opts.Out is also stdout for CLI runs — an Info mirror would
-	//     print every sync step line twice on the operator's terminal. Debug
-	//     keeps default (LOG_LEVEL=INFO) output single-channel while
-	//     LOG_LEVEL=DEBUG reveals the full trail.
+	// writeLine reports a user-facing step line on the command writer (the
+	// manual CLI sync). It does not touch Log: the two channels serve different
+	// callers. The CLI sets Out only, so its presentation prints exactly once;
+	// the background worker/webhook sync sets Log only (Out nil), where the
+	// structured Debug records below are the operational trail.
 	writeLine := func(format string, args ...any) {
 		if out != nil {
 			fmt.Fprintf(out, format+"\n", args...)
 		}
+	}
+	// debug is the nil-tolerant structured diagnostic half. Its messages are
+	// distinct from the writer lines and carry internals the presentation omits.
+	debug := func(msg string, args ...any) {
 		if log != nil {
-			log.Debug(fmt.Sprintf(format, args...))
+			log.Debug(msg, args...)
 		}
 	}
 
@@ -199,12 +196,15 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	if err != nil {
 		return err
 	}
-	if log != nil {
-		if fresh {
-			log.Debug("Cloned fresh checkout", "url", cloneURL)
-		} else {
-			log.Debug("Reusing existing checkout", "url", cloneURL)
-		}
+	// User-facing progress names what happened to the checkout (a fresh clone vs
+	// a reuse) and, in both cases, the source URL. The structured Debug record
+	// carries the checkout path the presentation omits.
+	if fresh {
+		writeLine("Cloned %s", cloneURL)
+		debug("Checkout clone completed", "path", opts.CheckoutDir)
+	} else {
+		writeLine("Reusing existing checkout url=%s", cloneURL)
+		debug("Checkout reuse", "path", opts.CheckoutDir)
 	}
 
 	// Fetch remote "origin" so refs (branches, tags) reflect the remote. Force
@@ -213,6 +213,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	if err := repo.fetch(ctx, cloneURL, am); err != nil {
 		return fmt.Errorf("git: fetch: %w", err)
 	}
+	debug("Remote fetch completed", "url", cloneURL)
 
 	// Resolve the configured ref to a commit. A bare branch name resolves
 	// against the freshly fetched refs/remotes/origin/<ref> FIRST — never the
@@ -222,6 +223,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	if err != nil {
 		return fmt.Errorf("git: ref %q not found as branch, tag, or commit: %w", ref, err)
 	}
+	debug("Ref resolution", "ref", ref, "commit", hash.String())
 
 	// Hard checkout (detached HEAD, Force = hard reset). The remote is truth.
 	if err := repo.checkoutForce(hash); err != nil {
@@ -257,6 +259,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	if len(removed) > 0 {
 		writeLine("Removed %d function(s): %s", len(removed), joinNames(removed))
 	}
+	debug("Materialized functions", "source", srcDir, "materialized", len(materialized), "removed", len(removed))
 
 	// Record the sync bookkeeping atomically, only after materialization.
 	cfg.LastSyncedCommit = headHash.String()

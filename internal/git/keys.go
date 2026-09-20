@@ -125,8 +125,9 @@ func keyExists(dir string) bool {
 //     and never modify known_hosts.
 //
 // ep is the already-parsed SSH endpoint (so hostWithPort is consistent with the
-// address go-git dials); out/log are the two-channel reporting seams (see
-// writeLine in sync.go) and are both optional (nil is silent).
+// address go-git dials); out and log are both optional (nil is silent). out is
+// the manual CLI sync's user-facing line; log is the background sync's
+// structured diagnostic (see tofuHostKeyCallback).
 func sshAuthFor(sshDir string, ep *transport.Endpoint, out io.Writer, log *slog.Logger) (gitssh.AuthMethod, error) {
 	data, err := os.ReadFile(filepath.Join(sshDir, PrivateKeyFile))
 	if err != nil {
@@ -237,17 +238,18 @@ func tofuHostKeyCallback(sshDir string, db *knownhosts.HostKeyDB, ep *transport.
 			if werr := appendKnownHost(knownHostsPath(sshDir), hostname, remote, key); werr != nil {
 				return werr
 			}
-			// Surfacing the first-trust: a sentence-style user line on out plus
-			// a Debug log with attrs (never the raw key bytes). Same
-			// two-channel rule as writeLine in sync.go — Out is user-facing,
-			// slog is Debug (mirroring the no-double-print rationale there).
+			// Surfacing the first-trust: a sentence-style user line on out plus a
+			// distinct structured Debug record (never the raw key bytes). The
+			// writer line serves the manual CLI sync; the Debug record is the
+			// operational diagnostic and the ONLY record on the background
+			// worker/webhook sync, where out is nil.
 			fp := ssh.FingerprintSHA256(key)
 			host := knownhosts.Normalize(hostname)
 			if out != nil {
 				fmt.Fprintf(out, "Trusted new host %s (fingerprint %s)\n", host, fp)
 			}
 			if log != nil {
-				log.Debug("trusted new host", "host", host, "fingerprint", fp)
+				log.Debug("TOFU host key trusted", "host", host, "fingerprint", fp)
 			}
 			return nil
 		default:

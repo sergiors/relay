@@ -72,7 +72,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 			startCommand(logger, deps),
 			functionCommand(deps),
 			secretCommand(),
-			gitCommand(logger),
+			gitCommand(),
 			statsCommand(deps),
 			healthCommand(logger),
 		},

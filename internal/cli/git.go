@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"strings"
 
@@ -32,12 +31,14 @@ var (
 // sync). It is a pure grouping command, so it uses the shared namespaceAction:
 // a bare `relay git` shows the subcommand help (there is nothing else to do with
 // just the command name), and an unknown first token is a friendly Docker-style
-// usage error naming the full path. It receives the process logger (like
-// startCommand and healthCommand) but threads it ONLY into the sync path: sync
-// is the one multi-step operation whose progress is worth a Debug-level trail.
-// set, status, keygen, and remove are single-step commands whose whole outcome
-// already lands on the command writer, so they take no logger at all.
-func gitCommand(logger *slog.Logger) *cli.Command {
+// usage error naming the full path.
+//
+// These are short-lived CLI commands, so they take no process logger: every
+// outcome — keygen guidance, the sync step summary, the status table, the
+// removal report — is presentation and goes to the command writer. Operational
+// diagnostics for background sync (the worker/webhook path) are emitted by the
+// git package through SyncOptions.Log, which this command leaves nil.
+func gitCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "git",
 		Usage: "Manage manual Git synchronization",
@@ -101,7 +102,7 @@ func gitCommand(logger *slog.Logger) *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("git sync: too many arguments", 2)
 					}
-					return gitSync(ctx, cmd.Writer, logger)
+					return gitSync(ctx, cmd.Writer)
 				},
 			},
 			{
@@ -180,16 +181,15 @@ func gitSet(ctx context.Context, w io.Writer, repository, ref, path, webhookSecr
 
 // gitSync runs the manual sync; the process context propagates Ctrl-C. The sync
 // reads the persisted config itself (via opts.ConfigPath), so production simply
-// points at the CLI-level dir defaults. logger is the injected process logger
-// (DI), threaded through to SyncOptions.Log so the sync core can emit its
-// Debug-level step trail on it; user-facing progress still lands on w.
-func gitSync(ctx context.Context, w io.Writer, logger *slog.Logger) error {
+// points at the CLI-level dir defaults. SyncOptions.Log is left nil: this
+// short-lived command's step summary on w is its complete user-facing record,
+// and background operational diagnostics belong to the worker/webhook path.
+func gitSync(ctx context.Context, w io.Writer) error {
 	o := git.NewSyncOptions()
 	o.ConfigPath = gitConfigPath
 	o.CheckoutDir = gitCheckoutDir
 	o.FunctionsDir = gitFunctionsDir
 	o.SSHDir = gitSSHDir
-	o.Log = logger
 	o.Out = w
 	return git.Sync(ctx, o)
 }

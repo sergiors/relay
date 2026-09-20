@@ -384,15 +384,17 @@ func TestSyncBuildsTOFUAuthWithoutSystemKnownHosts(t *testing.T) {
 	// (covered in hostkey_test.go), not an auth-build error.
 }
 
-// TestSyncLogsThroughInjectedLogger pins the DI wiring AND the two-channel
-// report split. A local fixture sync runs with o.Log set to a Debug-level slog
-// logger over one buffer and o.Out set to a separate buffer; the step lines
-// (e.g. "Syncing..." and "Sync complete") must appear on BOTH. It also documents
+// TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged pins the two-channel
+// split and the DI wiring. A sync run with o.Log set to a Debug-level slog logger
+// over one buffer and o.Out set to a separate buffer writes the user-facing step
+// lines (e.g. "Syncing..." and "Sync complete") to the writer ONLY — they are
+// never mirrored into slog — while the structured Debug diagnostics (checkout,
+// fetch, resolution, materialization) still reach the logger. It also documents
 // the nil-contract: every other sync test in this file runs with o.Log unset
 // (nil) — which pins nil-logger safety (no panic, Out is still written) now that
 // the fallback-constructor helper is gone and nil-tolerance lives at this single
 // call site.
-func TestSyncLogsThroughInjectedLogger(t *testing.T) {
+func TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged(t *testing.T) {
 	e := fixture(t, true)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "v1"}
 
@@ -404,13 +406,79 @@ func TestSyncLogsThroughInjectedLogger(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 
-	for _, step := range []string{"Syncing...", "Sync complete"} {
+	// Presentation lives on the writer exactly once.
+	for _, step := range []string{"Syncing...", "Resolved", "Materialized", "Sync complete"} {
 		if !strings.Contains(outBuf.String(), step) {
 			t.Fatalf("out missing %q:\n%s", step, outBuf.String())
 		}
-		if !strings.Contains(logBuf.String(), step) {
-			t.Fatalf("log missing %q:\n%s", step, logBuf.String())
+	}
+	// ...and is NOT mirrored into the log.
+	for _, step := range []string{"Syncing...", "Sync complete", "function(s):", `Resolved "v1"`} {
+		if strings.Contains(logBuf.String(), step) {
+			t.Fatalf("log mirrored writer presentation %q:\n%s", step, logBuf.String())
 		}
+	}
+	// The distinct structured diagnostics are retained (operational records for
+	// the background sync path, not duplicates of the writer wording).
+	for _, diag := range []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"} {
+		if !strings.Contains(logBuf.String(), diag) {
+			t.Fatalf("log missing diagnostic %q:\n%s", diag, logBuf.String())
+		}
+	}
+}
+
+// TestSyncBackgroundLogsDiagnosticsWithoutOut pins the background worker/webhook
+// path: with Out nil (no command writer) and a logger set, a sync emits no panic
+// and records its operational diagnostics on the logger, so a webhook-triggered
+// sync still has a trail. This is the path the CLI deliberately leaves nil.
+func TestSyncBackgroundLogsDiagnosticsWithoutOut(t *testing.T) {
+	e := fixture(t, false)
+	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
+
+	var logBuf bytes.Buffer
+	o := syncOpts(t, e, nil) // Out nil: the background path
+	o.Log = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if err := SyncFromConfig(context.Background(), o, cfg); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	for _, diag := range []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"} {
+		if !strings.Contains(logBuf.String(), diag) {
+			t.Fatalf("background log missing diagnostic %q:\n%s", diag, logBuf.String())
+		}
+	}
+}
+
+// TestSyncReuseLogsReuseLine pins the checkout-reuse reporting: a second sync
+// over an existing checkout writes the concise "Reusing existing checkout
+// url=<cloneURL>" line to the writer and does NOT mirror it (message or URL) into
+// the logger, while still emitting the structured reuse diagnostic with the
+// checkout path.
+func TestSyncReuseLogsReuseLine(t *testing.T) {
+	e := fixture(t, false)
+	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
+	mustSync(t, e, cfg)
+
+	var logBuf bytes.Buffer
+	var outBuf bytes.Buffer
+	o := syncOpts(t, e, &outBuf)
+	o.Log = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if err := SyncFromConfig(context.Background(), o, cfg); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	want := "Reusing existing checkout url=" + e.bare
+	if !strings.Contains(outBuf.String(), want) {
+		t.Fatalf("out missing reuse line %q:\n%s", want, outBuf.String())
+	}
+	if strings.Contains(logBuf.String(), "Reusing existing checkout") {
+		t.Fatalf("log mirrored the reuse presentation line:\n%s", logBuf.String())
+	}
+	// The reuse diagnostic retains the internal path; it must not repeat the
+	// checkout URL the writer line already presents.
+	if !strings.Contains(logBuf.String(), "Checkout reuse") {
+		t.Fatalf("log missing checkout-reuse diagnostic:\n%s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "path="+e.checkout) {
+		t.Fatalf("log missing reuse checkout path:\n%s", logBuf.String())
 	}
 }
 

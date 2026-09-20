@@ -50,8 +50,25 @@ func runCLI(t *testing.T, stdin string, args ...string) (stdout, stderr string, 
 // seed a state DB or hold a lock at paths the command must open.
 func runCLIWithDeps(t *testing.T, deps Dependencies, stdin string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runCLIWithLoggerAndDeps(t, slog.New(slog.NewTextHandler(io.Discard, nil)), deps, stdin, args...)
+}
+
+// runCLIWithLogger runs the command tree with a caller-supplied process logger
+// so tests can assert whether any messages reach slog versus the command writer.
+// The writer/reader/error streams are the usual test buffers.
+func runCLIWithLogger(t *testing.T, logger *slog.Logger, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	return runCLIWithLoggerAndDeps(t, logger, testDeps(t), stdin, args...)
+}
+
+// runCLIWithLoggerAndDeps is the shared implementation behind the runCLI
+// variants: it builds the tree with New (the injected logger, an output buffer,
+// and the supplied deps) and runs it against args. Errors flow into the returned
+// error, never onto the ErrWriter (printing happens in cmd/main.go).
+func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencies, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
-	cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &out, deps)
+	cmd := New(logger, &out, deps)
 	if stdin != "" {
 		cmd.Reader = strings.NewReader(stdin)
 	}
@@ -173,6 +190,37 @@ func TestStartDelegatesToWorker(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("start did not delegate to the worker startup path")
+	}
+}
+
+// TestStartPassesInjectedLoggerToWorker pins that `relay start` threads the
+// process logger into the worker startup path unchanged. Unlike the short-lived
+// administrative commands, start MUST preserve normal worker operational logs,
+// so the logger passed to New is the exact logger handed to startRun (never nil,
+// never a discard).
+func TestStartPassesInjectedLoggerToWorker(t *testing.T) {
+	deps := testDeps(t)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	var got *slog.Logger
+	orig := startRun
+	startRun = func(l *slog.Logger) error {
+		got = l
+		// Emulate a worker operational log; it must land on the injected logger.
+		l.Info("worker operational log")
+		return nil
+	}
+	defer func() { startRun = orig }()
+
+	if _, _, err := runCLIWithLoggerAndDeps(t, logger, deps, "", "start"); err != nil {
+		t.Fatalf("start: err = %v, want nil", err)
+	}
+	if got != logger {
+		t.Fatal("start did not pass the injected process logger to the worker startup path")
+	}
+	if !strings.Contains(logs.String(), "worker operational log") {
+		t.Fatalf("worker operational log did not reach the injected logger:\n%s", logs.String())
 	}
 }
 

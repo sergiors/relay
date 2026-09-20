@@ -242,13 +242,15 @@ type SyncOptions struct {
 	// function.Dir; tests always inject a temp dir. Sync never hardcodes
 	// "/functions" internally.
 	FunctionsDir string
-	// Log is the caller-injected logger (DI): production passes the CLI's process
-	// logger (from cmd/main.go); tests pass a capturing logger or nil. nil means
-	// the package is silent — it never constructs a fallback logger of its own
-	// (the previous constructor fallback was removed). Step summaries still reach
-	// Out independently, so Out alone works without a logger.
+	// Log is the caller-injected logger (DI). nil means the package is silent —
+	// it never constructs a fallback logger of its own (that helper was
+	// deliberately removed). It is populated by the background sync path (the
+	// worker's webhook scheduler), where Out is nil and these structured Debug
+	// records are the sole operational trail. The manual CLI sync leaves it nil:
+	// its short-lived step summary belongs to Out alone.
 	Log *slog.Logger
-	// Out, when non-nil, receives the tidy step summary.
+	// Out, when non-nil, receives the user-facing step summary (the manual CLI
+	// sync). It is presentation only; the worker/webhook path leaves it nil.
 	Out io.Writer
 }
 
@@ -257,8 +259,8 @@ type SyncOptions struct {
 // SSHDir is intentionally left empty here — it is only read when sync targets an
 // SSH host (production sets it); the local-test seam uses CloneURL and Auth
 // instead and never needs it. Log is left nil: the package never constructs a
-// logger, so callers that want logging must inject one (the CLI passes the
-// process logger; tests pass a capturing logger or leave it nil for silence).
+// logger, so the background sync path (the worker's webhook scheduler) injects
+// one explicitly; the manual CLI sync leaves it nil and reports through Out.
 func NewSyncOptions() SyncOptions {
 	return SyncOptions{
 		ConfigPath:  ConfigPath,

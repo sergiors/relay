@@ -242,9 +242,10 @@ func TestTOFUFirstTrustNotifySurfaced(t *testing.T) {
 	if !strings.Contains(outBuf.String(), "SHA256:") {
 		t.Fatalf("out = %q, want SHA256 fingerprint", outBuf.String())
 	}
-	// Debug log carries host + fingerprint attrs.
-	if !strings.Contains(logBuf.String(), "host=gitlab.example.com") || !strings.Contains(logBuf.String(), "fingerprint=") || !strings.Contains(logBuf.String(), "trusted new host") {
-		t.Fatalf("log = %q, want trusted-new-host Debug with host+fingerprint attrs", logBuf.String())
+	// Debug log carries host + fingerprint attrs with its own distinct message
+	// (not the writer sentence).
+	if !strings.Contains(logBuf.String(), "host=gitlab.example.com") || !strings.Contains(logBuf.String(), "fingerprint=") || !strings.Contains(logBuf.String(), "TOFU host key trusted") {
+		t.Fatalf("log = %q, want TOFU-host-key-trusted Debug with host+fingerprint attrs", logBuf.String())
 	}
 	// Neither channel exposes raw key bytes or a private key header.
 	for name, s := range map[string]string{"out": outBuf.String(), "log": logBuf.String()} {
