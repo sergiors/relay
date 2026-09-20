@@ -24,9 +24,6 @@ func testHandler() *GitHubProvider {
 	return &GitHubProvider{}
 }
 
-// testStubProviderName is the route segment registered for a stubProvider.
-const testStubProviderName = "github"
-
 // stubProvider is a minimal Provider harness for dispatch tests: it serves the
 // given status and fixed body at POST /<Name()>, proving the provider seam
 // without exercising any real provider semantics.

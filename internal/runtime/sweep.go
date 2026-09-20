@@ -28,11 +28,11 @@ import (
 // containers as non-Relay and leaves them alone.
 //
 // sweepSkips reports whether a container's label set must be excluded from the
-// orphan sweep, before the ownership predicate is even considered. Three
+// orphan sweep, before the ownership predicate is even considered. Two
 // populations are excluded: service containers (isServiceContainer — persistent
 // and reconciler-owned, never swept) and non-Relay containers that carry no
-// known relay.type (not isManagedContainer). Only invocation containers
-// (isInvocationContainer) pass through to the hostname check.
+// known relay.type (not isManagedContainer). Only invocation containers (an
+// explicit relay.type of event or schedule) pass through to the hostname check.
 func sweepSkips(labels map[string]string) bool {
 	if isServiceContainer(labels) {
 		// Persistent service containers are reconciler-owned and long-lived; the

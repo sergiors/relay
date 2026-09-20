@@ -43,7 +43,6 @@ func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFuncti
 // fixedExecutor succeeds or fails on demand with a configurable duration.
 type fixedExecutor struct {
 	err bool
-	ops int
 }
 
 func (f *fixedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {

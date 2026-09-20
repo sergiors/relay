@@ -66,10 +66,8 @@ type SecretResolver interface {
 	Resolve(ctx context.Context, name string) (string, error)
 }
 
-// EnvResolverFunc builds the env for one service replica from the template, the
-// runtime plan env (preparedEnv), and the desired internal port. It is the env
-// assembly unit so Reconcile and the ServiceReconciler share exactly one
-// definition of ordering.
+// BuildEnv assembles a service replica's environment from the template, the
+// runtime plan env (preparedEnv), and the desired internal port.
 //
 // Order is deliberate and a documented invariant:
 //
@@ -80,11 +78,13 @@ type SecretResolver interface {
 //
 // A template that declares a secret binding while secrets is nil fails with the
 // runner's error style ("no secret provider is configured").
-type EnvResolverFunc func(ctx context.Context, tmpl *function.Template, port int, preparedEnv []string, secrets SecretResolver) ([]string, error)
-
-// BuildEnv assembles a service replica's environment. See EnvResolverFunc for
-// the ordering contract.
-func BuildEnv(ctx context.Context, tmpl *function.Template, port int, preparedEnv []string, secrets SecretResolver) ([]string, error) {
+func BuildEnv(
+	ctx context.Context,
+	tmpl *function.Template,
+	port int,
+	preparedEnv []string,
+	secrets SecretResolver,
+) ([]string, error) {
 	env := make([]string, 0, 4)
 	env = append(env, preparedEnv...)
 	for _, ev := range tmpl.EnvList() {
@@ -266,14 +266,14 @@ func Reconcile(
 		// longest-running lowest-numbered replicas. A candidate already occupies
 		// its own slot (Replica), and we only keep candidates whose slot is a
 		// desired replica slot in [0, desired); any candidate with a slot >=
-		// desired, or a duplicate slot, is excess and becomes stale.
+		// desired, or a duplicate slot, is excess and becomes stale. Kept
+		// candidates are recorded in occupied; the start loop below starts every
+		// desired slot that no candidate holds.
 		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Replica < candidates[j].Replica })
 		occupied := make(map[int]bool, svc.Replicas)
-		var keep []runtime.ServiceContainer
 		for _, c := range candidates {
 			if c.Replica < svc.Replicas && !occupied[c.Replica] {
 				occupied[c.Replica] = true
-				keep = append(keep, c)
 				continue
 			}
 			stale = append(stale, c)
@@ -450,7 +450,12 @@ type ServiceReconciler struct {
 // Traefik routing config (empty = routing not configured; required only for
 // services whose template declares a host). log may be nil (then no messages
 // are emitted).
-func NewServiceReconciler(d Docker, secrets SecretResolver, traefik routing.TraefikConfig, log *slog.Logger) *ServiceReconciler {
+func NewServiceReconciler(
+	d Docker,
+	secrets SecretResolver,
+	traefik routing.TraefikConfig,
+	log *slog.Logger,
+) *ServiceReconciler {
 	return &ServiceReconciler{docker: d, secrets: secrets, traefik: traefik, log: log}
 }
 
@@ -460,7 +465,13 @@ func NewServiceReconciler(d Docker, secrets SecretResolver, traefik routing.Trae
 // service-convergence failure must not fail the function's reconcile. The
 // Info/Debug distinction means an unchanged function (periodic self-healing
 // tick) does not log at Info; only converges that actually changed or failed do.
-func (c *ServiceReconciler) Apply(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string) {
+func (c *ServiceReconciler) Apply(
+	ctx context.Context,
+	fnName string,
+	tmpl *function.Template,
+	image string,
+	preparedEnv []string,
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

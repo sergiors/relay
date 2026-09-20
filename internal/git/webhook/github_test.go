@@ -63,10 +63,9 @@ func pushPayloadBytes(sshURL, ref string) []byte {
 // channel closed on demand, so handler tests assert "sync was (or was not)
 // scheduled" with no real git transport.
 type fakeTrigger struct {
-	mu        sync.Mutex
-	calls     int
-	done      chan struct{}
-	doneClose sync.Once
+	mu    sync.Mutex
+	calls int
+	done  chan struct{}
 }
 
 func newFakeTrigger() *fakeTrigger { return &fakeTrigger{done: make(chan struct{})} }
@@ -79,7 +78,6 @@ func (f *fakeTrigger) Trigger() error {
 }
 
 func (f *fakeTrigger) Done() <-chan struct{} { return f.done }
-func (f *fakeTrigger) close()                { f.doneClose.Do(func() { close(f.done) }) }
 func (f *fakeTrigger) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -119,7 +117,7 @@ func setupHandler(t *testing.T, cfgRef string) (*GitHubProvider, *fakeTrigger, *
 	}
 
 	tr := newFakeTrigger()
-	h := NewGitHubProvider(logger, "gh_secret", prov, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
+	h := NewGitHubProvider(logger, "gh_secret", prov, cfgPath, tr)
 	return h, tr, logBuf
 }
 
@@ -168,8 +166,8 @@ func TestMatchRepository(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := MatchRepository(c.cfg, c.pl); got != c.want {
-				t.Fatalf("MatchRepository(%q) = %v, want %v", c.cfg, got, c.want)
+			if got := matchRepository(c.cfg, c.pl); got != c.want {
+				t.Fatalf("matchRepository(%q) = %v, want %v", c.cfg, got, c.want)
 			}
 		})
 	}
@@ -397,7 +395,7 @@ func setupNilSecretProvider(t *testing.T) (*GitHubProvider, *fakeTrigger, *bytes
 		t.Fatalf("set source: %v", err)
 	}
 	tr := newFakeTrigger()
-	h := NewGitHubProvider(logger, "gh_secret", nil, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
+	h := NewGitHubProvider(logger, "gh_secret", nil, cfgPath, tr)
 	return h, tr, logBuf
 }
 
@@ -428,7 +426,7 @@ func setupUnsignedProvider(t *testing.T, cfgRef string) (*GitHubProvider, *fakeT
 		t.Fatalf("set source: %v", err)
 	}
 	tr := newFakeTrigger()
-	h := NewGitHubProvider(logger, "", nil, cfgPath, filepath.Join(gitDir, "checkout"), t.TempDir(), t.TempDir(), tr)
+	h := NewGitHubProvider(logger, "", nil, cfgPath, tr)
 	return h, tr, logBuf
 }
 

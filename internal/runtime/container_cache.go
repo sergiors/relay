@@ -318,7 +318,15 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 // the invocation poisoned (timeout/process exit/protocol error/panic) is
 // dropped on release so a later call starts fresh; a plain handler error keeps
 // the container.
-func (cc *containerCache) execute(ctx context.Context, fnName, image string, max int, start func() (reusableContainer, error), handler string, eventJSON []byte, env map[string]string) error {
+func (cc *containerCache) execute(
+	ctx context.Context,
+	fnName, image string,
+	max int,
+	start func() (reusableContainer, error),
+	handler string,
+	eventJSON []byte,
+	env map[string]string,
+) error {
 	lease, err := cc.acquire(ctx, fnName, image, max, start)
 	if err != nil {
 		return err
@@ -354,7 +362,12 @@ func (cc *containerCache) execute(ctx context.Context, fnName, image string, max
 // invalidateImage (the runner's image-retirement path) is what retires a
 // known-dead image's busy containers; the forward transition above covers
 // direct callers that switch Prepared without an explicit invalidation.
-func (cc *containerCache) acquire(ctx context.Context, fnName, image string, max int, start func() (reusableContainer, error)) (*containerLease, error) {
+func (cc *containerCache) acquire(
+	ctx context.Context,
+	fnName, image string,
+	max int,
+	start func() (reusableContainer, error),
+) (*containerLease, error) {
 	// acquiredAt bounds the SUCCESSFUL acquire duration recorded below: it
 	// covers the whole call including any capacity wait, but is observed only
 	// when a lease is actually returned. waitRecorded makes the waits counter

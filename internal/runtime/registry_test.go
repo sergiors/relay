@@ -33,8 +33,8 @@ func TestImageRef(t *testing.T) {
 func TestImageRefDeterministic(t *testing.T) {
 	fp1 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	fp2 := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	if ImageRef("fn", fp1) != ImageRef("fn", fp1) {
-		t.Fatal("same fingerprint must yield the same reference")
+	if got, again := ImageRef("fn", fp1), ImageRef("fn", fp1); got != again {
+		t.Fatalf("same fingerprint yielded %q then %q, want identical", got, again)
 	}
 	if ImageRef("fn", fp1) == ImageRef("fn", fp2) {
 		t.Fatal("distinct fingerprints must yield distinct references")

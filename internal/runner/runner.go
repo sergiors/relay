@@ -629,7 +629,13 @@ func toImage(pf *PreparedFunction) string {
 // executor panics; the helper is called per rule so the defer scope is
 // per-invocation rather than accumulating across a long rule loop. extraEnv are
 // the per-invocation env vars (template env values + resolved secrets).
-func (r *Runner) executeWithRefs(pf *PreparedFunction, invokeCtx context.Context, handler string, eventJSON []byte, extraEnv []string) error {
+func (r *Runner) executeWithRefs(
+	pf *PreparedFunction,
+	invokeCtx context.Context,
+	handler string,
+	eventJSON []byte,
+	extraEnv []string,
+) error {
 	image := toImage(pf)
 	r.refs.acquire(image)
 	defer r.refs.release(image)
@@ -787,7 +793,7 @@ func (r *Runner) runInvocation(
 	handler string,
 	eventJSON []byte,
 	extraEnv []string,
-) (err error, panicked bool, panicValue any) {
+) (panicked bool, panicValue any, err error) {
 	defer cancel()
 	defer func() {
 		if pv := recover(); pv != nil {
@@ -796,8 +802,7 @@ func (r *Runner) runInvocation(
 			err = fmt.Errorf("executor panic: %v", pv)
 		}
 	}()
-	err = r.executeWithRefs(pf, invokeCtx, handler, eventJSON, extraEnv)
-	return err, false, nil
+	return false, nil, r.executeWithRefs(pf, invokeCtx, handler, eventJSON, extraEnv)
 }
 
 // Handle evaluates the event against all loaded functions and executes every
@@ -1105,7 +1110,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					Image:     toImage(pf),
 				})
 				start := time.Now()
-				err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
+				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
 				d := time.Since(start)
 				if panicked {
 					// A panicking execution is a misbehaving handler, not a
@@ -1278,6 +1283,17 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	return nil
 }
 
+// obsoleteOccurrence is the terminal error returned when a schedule occurrence
+// names a function or handler that is no longer in the configuration. The stream
+// layer recognizes ErrInvocationObsolete and ACKs the message: an obsolete
+// occurrence is never retried or dead-lettered.
+func obsoleteOccurrence(fnName, handler string) error {
+	return fmt.Errorf(
+		"%w: schedule function %q handler %q no longer in configuration",
+		stream.ErrInvocationObsolete, fnName, handler,
+	)
+}
+
 // InvokeHandler executes a single schedule-occurrence invocation routed through
 // the stream. The handler's timeout is read from the function's current
 // template (single source of truth), capped at the configured maximum exactly
@@ -1321,7 +1337,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 				"function", fnName,
 				"handler", handler,
 			)
-			return fmt.Errorf("%w: schedule function %q handler %q no longer in configuration", stream.ErrInvocationObsolete, fnName, handler)
+			return obsoleteOccurrence(fnName, handler)
 		}
 		r.log.Warn("Schedule: function is not available", "function", fnName)
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
@@ -1359,7 +1375,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 			"function", fnName,
 			"handler", handler,
 		)
-		return fmt.Errorf("%w: schedule function %q handler %q no longer in configuration", stream.ErrInvocationObsolete, fnName, handler)
+		return obsoleteOccurrence(fnName, handler)
 	}
 
 	// Cap the schedule timeout at the configured maximum, exactly like Handle
@@ -1509,7 +1525,7 @@ func (r *Runner) invokeOnce(
 		Image:     toImage(pf),
 	})
 	start := time.Now()
-	err, panicked, panicValue := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv)
+	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv)
 	d := time.Since(start)
 	if panicked {
 		r.log.Error("Function handler: PANICKED for schedule",
@@ -1635,7 +1651,10 @@ func (r *Runner) recordFailure(
 			"handler_attempt", handlerAttempt,
 			"handler_attempts_total", maxAttempts,
 		)
-		return outcomeExhausted, fmt.Errorf("function %q handler %q exhausted after %d handler attempts: %w", fnName, handler, handlerAttempt, origErr)
+		return outcomeExhausted, fmt.Errorf(
+			"function %q handler %q exhausted after %d handler attempts: %w",
+			fnName, handler, handlerAttempt, origErr,
+		)
 	}
 	// Retryable: schedule a retry backoff and count the retry.
 	backoff := retryBackoff(handlerAttempt)
@@ -1651,7 +1670,10 @@ func (r *Runner) recordFailure(
 		"retry_backoff", backoff,
 		"reason", origErr,
 	)
-	return outcomeRetryable, fmt.Errorf("function %q handler %q: handler attempt %d failed: %w", fnName, handler, handlerAttempt, origErr)
+	return outcomeRetryable, fmt.Errorf(
+		"function %q handler %q: handler attempt %d failed: %w",
+		fnName, handler, handlerAttempt, origErr,
+	)
 }
 
 // allMatchedTerminal reports whether every matched invocation is terminal

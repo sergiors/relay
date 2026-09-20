@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -199,7 +200,7 @@ func startExecutionContainer(
 		case res := <-wait.Result:
 			info := exitInfo{code: res.StatusCode}
 			if res.Error != nil {
-				info.err = fmt.Errorf("%s", res.Error.Message)
+				info.err = errors.New(res.Error.Message)
 			}
 			signalExit(c.exitInfo, info)
 		case err := <-wait.Error:

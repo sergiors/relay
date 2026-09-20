@@ -119,9 +119,9 @@ type Reconciler struct {
 	updateServices  func(name string, tmpl *function.Template, image string)
 	removeServices  func(name string)
 
-	mu          sync.Mutex
-	fingerprnts map[string]string // name -> last-reconciled fingerprint
-	timers      map[string]*time.Timer
+	mu           sync.Mutex
+	fingerprints map[string]string // name -> last-reconciled fingerprint
+	timers       map[string]*time.Timer
 
 	incoming chan string   // debounced, per-function trigger queue
 	done     chan struct{} // closed on shutdown to unblock pump/timer sends
@@ -157,7 +157,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		updateSchedules: cfg.UpdateSchedules,
 		updateServices:  cfg.UpdateServices,
 		removeServices:  cfg.RemoveServices,
-		fingerprnts:     map[string]string{},
+		fingerprints:    map[string]string{},
 		timers:          map[string]*time.Timer{},
 		incoming:        make(chan string, DefaultQueueSize),
 		done:            make(chan struct{}),
@@ -171,7 +171,7 @@ func (r *Reconciler) Seed(fn function.Function) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if fp, err := function.Fingerprint(fn.Dir); err == nil {
-		r.fingerprnts[fn.Name] = fp
+		r.fingerprints[fn.Name] = fp
 	}
 }
 
@@ -204,13 +204,6 @@ func (r *Reconciler) Start(ctx context.Context) {
 	}
 	r.mu.Unlock()
 	close(r.done)
-}
-
-// Reconcile triggers the per-function reconcile for name, bypassing the debounce
-// queue. It is exported so tests can drive the logic deterministically and so
-// the periodic pass can call it directly.
-func (r *Reconciler) Reconcile(name string) {
-	r.reconcileFunction(name)
 }
 
 // Enqueue debounces an event for name: only one reconcile fires after the
@@ -339,8 +332,8 @@ func (r *Reconciler) functionForPath(path string) (string, bool) {
 // addWatchRecursive watches root and every subdirectory so events beneath nested
 // dirs are seen. Symlinked directories are deliberately not followed: WalkDir
 // does not follow links (d.IsDir() is false for a symlink entry), so a symlink
-// loop inside the tree cannot make this unbounded — this is the WHY why we use
-// the DirEntry (not os.Stat) form of the walk. A symlinked dir is simply never
+// loop inside the tree cannot make this unbounded — this is why we use the
+// DirEntry (not os.Stat) form of the walk. A symlinked dir is simply never
 // watched, which is acceptable.
 func (r *Reconciler) addWatchRecursive(path string) {
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
@@ -460,7 +453,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	r.mu.Lock()
-	known, hasFingerprint := r.fingerprnts[name]
+	known, hasFingerprint := r.fingerprints[name]
 	r.mu.Unlock()
 
 	cur := r.reg.GetByName(name)
@@ -529,7 +522,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 
 	r.reg.Replace(name, pf)
 	r.mu.Lock()
-	r.fingerprnts[name] = fp
+	r.fingerprints[name] = fp
 	r.mu.Unlock()
 
 	if r.st != nil {
@@ -585,7 +578,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 func (r *Reconciler) remove(name string) {
 	r.reg.Replace(name, nil)
 	r.mu.Lock()
-	delete(r.fingerprnts, name)
+	delete(r.fingerprints, name)
 	r.mu.Unlock()
 	if r.st != nil {
 		r.st.RecordRemoved(name)

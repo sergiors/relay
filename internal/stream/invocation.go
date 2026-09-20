@@ -85,8 +85,17 @@ const (
 type invocationStateStore interface {
 	completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	markComplete(ctx context.Context, stream, group, msgID, invocation string) error
-	tryStart(ctx context.Context, stream, group, msgID, invocation string, now, deadline time.Time) (started bool, attempt int, wait time.Duration, err error)
-	finishFailure(ctx context.Context, stream, group, msgID, invocation string, backoff time.Duration, now time.Time) (time.Time, error)
+	tryStart(
+		ctx context.Context,
+		stream, group, msgID, invocation string,
+		now, deadline time.Time,
+	) (started bool, attempt int, wait time.Duration, err error)
+	finishFailure(
+		ctx context.Context,
+		stream, group, msgID, invocation string,
+		backoff time.Duration,
+		now time.Time,
+	) (time.Time, error)
 	markExhausted(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
 	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	clear(ctx context.Context, stream, group, msgID string) error
@@ -321,30 +330,6 @@ func (p *invocationStore) clear(ctx context.Context, stream, group, msgID string
 	return p.client.Del(ctx, invocationStateKey(stream, group, msgID)).Err()
 }
 
-// completedSet reads the completion state of many invocations in one HMGET,
-// returning a map keyed by invocation. It avoids per-invocation round trips when
-// the caller knows the full set of invocations for a delivery up front.
-func (p *invocationStore) completedSet(
-	ctx context.Context,
-	stream,
-	group,
-	msgID string,
-	invocations []string,
-) (map[string]bool, error) {
-	if len(invocations) == 0 {
-		return map[string]bool{}, nil
-	}
-	vals, err := p.client.HMGet(ctx, invocationStateKey(stream, group, msgID), invocations...).Result()
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]bool, len(invocations))
-	for i, v := range vals {
-		out[invocations[i]] = v == "ok"
-	}
-	return out, nil
-}
-
 // runningValue encodes a protected attempt's absolute deadline and attempt
 // number as the field value "running:<unixnano>#<attempts>". The "running:"
 // prefix distinguishes it from the "ok" completion sentinel; the Unix-nano
@@ -515,9 +500,7 @@ func WithClock(next func() time.Time) Option {
 // NewInvocationState builds the concrete per-message InvocationState handle the
 // stream layer injects. It binds an invocationStateStore to one (stream, group,
 // msgID) and captures the delivery context so the runner's calls hit the right
-// key. Reads are lazy per-invocation (one HGET per call), which is acceptable
-// for v1; the batch completedSet is available for callers that know the full set
-// up front.
+// key. Reads are lazy per-invocation (one HGET per call).
 func NewInvocationState(
 	ctx context.Context,
 	store invocationStateStore,
@@ -623,7 +606,8 @@ func (p *invocationState) TryStart(invocation string, timeout time.Duration) (st
 func (p *invocationState) RecordFailure(invocation string, backoff time.Duration) {
 	next, err := p.store.finishFailure(p.ctx, p.stream, p.group, p.msgID, invocation, backoff, p.now())
 	if err != nil {
-		p.log.Warn("Invocation state: record failure failed; leaving field as-is (eligible immediately)", "invocation", invocation, "error", err)
+		p.log.Warn("Invocation state: record failure failed; leaving field as-is (eligible immediately)",
+			"invocation", invocation, "error", err)
 		return
 	}
 	p.log.Debug("Invocation state: failure recorded; next attempt eligible", "invocation", invocation, "next", next)

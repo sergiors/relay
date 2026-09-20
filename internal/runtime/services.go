@@ -211,14 +211,14 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 }
 
 // ServiceContainerList discovers every service container on the daemon. The
-// filter is isServiceContainer — a strict relay.type=service match via
-// isServiceContainer — deliberately NOT combined with a non-empty
-// relay.function check: stale containers (a function removed while Relay was
-// down) must still be discovered and returned so the reconciler's cross-function
-// orphan sweep can identify and remove them. Hostname is deliberately NOT part
-// of discovery — services must be reconcilable across worker restarts on the
-// same host — but it IS included in the result for logging. Replica is parsed
-// from labelReplica, defaulting to -1 when missing/invalid.
+// filter is a strict relay.type=service match (isServiceContainer) — deliberately
+// NOT combined with a non-empty relay.function check: stale containers (a
+// function removed while Relay was down) must still be discovered and returned so
+// the reconciler's cross-function orphan sweep can identify and remove them.
+// Hostname is deliberately NOT part of discovery — services must be reconcilable
+// across worker restarts on the same host — but it IS included in the result for
+// logging. Replica is parsed from labelReplica, defaulting to -1 when
+// missing/invalid.
 func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer, error) {
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {

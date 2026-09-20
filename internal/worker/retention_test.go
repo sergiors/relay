@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-
 	"sync"
 	"testing"
 	"time"

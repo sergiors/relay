@@ -54,7 +54,7 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: "b"}})
 	m.IncLabels(metrics.MetricFunctionDLQ, []metrics.Label{{Name: "function", Value: "b"}})
 
-	got := funcSnapshotStats(m)
+	got := snapshotFunctionStats(m)
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2: %+v", len(got), got)
 	}
@@ -67,8 +67,8 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 }
 
 func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
-	if got := funcSnapshotStats(nil); got != nil {
-		t.Fatalf("funcSnapshotStats(nil) = %+v, want nil", got)
+	if got := snapshotFunctionStats(nil); got != nil {
+		t.Fatalf("snapshotFunctionStats(nil) = %+v, want nil", got)
 	}
 }
 

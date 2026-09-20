@@ -117,7 +117,7 @@ func TestFuncSnapshotStatsPoolCountersMapping(t *testing.T) {
 	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "a"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}}, 1)
 	m.AddLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "a"}, {Name: "reason", Value: "timeout"}}, 2)
 
-	got := funcSnapshotStats(m)
+	got := snapshotFunctionStats(m)
 	byName := map[string]state.FunctionStats{}
 	for _, fs := range got {
 		byName[fs.Function] = fs
@@ -478,7 +478,7 @@ func TestFuncSnapshotStatsTimestampsMapping(t *testing.T) {
 	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "b"}})
 	m.SetFunctionTimestamp("b", metrics.FunctionTimestampDLQ, ts+60)
 
-	got := funcSnapshotStats(m)
+	got := snapshotFunctionStats(m)
 	byName := map[string]state.FunctionStats{}
 	for _, fs := range got {
 		byName[fs.Function] = fs

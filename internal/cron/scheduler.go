@@ -186,13 +186,29 @@ func (s *Scheduler) fire(ctx context.Context, fnName, handler string) {
 	o := schedule.Occurrence{Function: fnName, Handler: handler, ScheduledAt: due}
 	published, err := s.pub.PublishOccurrence(ctx, o)
 	if err != nil {
-		s.log.Warn("Schedule: publish failed", "function", fnName, "handler", handler, "scheduled_at", due.Format(time.RFC3339), "occurrence_id", o.ID(), "reason", err)
+		s.log.Warn("Schedule: publish failed",
+			"function", fnName,
+			"handler", handler,
+			"scheduled_at", due.Format(time.RFC3339),
+			"occurrence_id", o.ID(),
+			"reason", err,
+		)
 		return
 	}
 	if published {
-		s.log.Info("Schedule: occurrence published", "function", fnName, "handler", handler, "scheduled_at", due.Format(time.RFC3339), "occurrence_id", o.ID())
+		s.log.Info("Schedule: occurrence published",
+			"function", fnName,
+			"handler", handler,
+			"scheduled_at", due.Format(time.RFC3339),
+			"occurrence_id", o.ID(),
+		)
 		return
 	}
 	// Another worker already published this occurrence (clean duplicate no-op).
-	s.log.Debug("Schedule: occurrence already published", "function", fnName, "handler", handler, "scheduled_at", due.Format(time.RFC3339), "occurrence_id", o.ID())
+	s.log.Debug("Schedule: occurrence already published",
+		"function", fnName,
+		"handler", handler,
+		"scheduled_at", due.Format(time.RFC3339),
+		"occurrence_id", o.ID(),
+	)
 }

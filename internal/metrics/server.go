@@ -29,22 +29,6 @@ import (
 	"time"
 )
 
-// prometheusContentType is the Content-Type served by promhttp for the
-// Prometheus text exposition format (version 0.0.4). The header also carries
-// `; charset=utf-8`, but tests assert on this stable prefix.
-const prometheusContentType = "text/plain; version=0.0.4"
-
-// headWriter discards the response body while letting headers and status
-// through. It is currently unused: with the direct mux.Handle registration in
-// NewServer, HEAD /metrics returns promhttp's exposition body (see the
-// NewServer comment). Kept as a known follow-up if HEAD body suppression is
-// wanted again.
-type headWriter struct {
-	http.ResponseWriter
-}
-
-func (h *headWriter) Write(b []byte) (int, error) { return len(b), nil }
-
 // Server owns the dedicated http.Server that exposes the registry on /metrics.
 // It holds the listen address (which comes from application config, never a
 // package-level default), the log sink for bind-failure reporting, and the
@@ -103,13 +87,13 @@ func (s *Server) Start() error {
 		return errors.New("metrics: nil Server")
 	}
 	if !s.started.CompareAndSwap(false, true) {
-		return errors.New("Metrics server already started")
+		return errors.New("metrics server already started")
 	}
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.started.Store(false)
 		if s.logger != nil {
-			s.logger.Error(fmt.Sprintf("Metrics: listen %s failed: %v", s.addr, err))
+			s.logger.Error("Metrics: listen failed", "addr", s.addr, "error", err)
 		}
 		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
 	}

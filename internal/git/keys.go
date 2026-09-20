@@ -47,10 +47,8 @@ func GenerateKey(dir string) (publicAuthorized string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("git: generate ed25519 key: %w", err)
 	}
-	// ed25519.GenerateKey returns (publicKey, privateKey, err); pubKey is the
-	// public half and privKey the private half. The private half implements the
-	// crypto.Signer used to derive the SSH public key, so we pass it to
-	// ssh.NewPublicKey and privKey to ssh.MarshalPrivateKey.
+	// privKey implements crypto.Signer, which ssh.MarshalPrivateKey needs; pubKey
+	// is passed to ssh.NewPublicKey to derive the authorized-keys form.
 	sshPub, err := ssh.NewPublicKey(pubKey)
 	if err != nil {
 		return "", fmt.Errorf("git: serialize public key: %w", err)
@@ -60,8 +58,6 @@ func GenerateKey(dir string) (publicAuthorized string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("git: serialize private key: %w", err)
 	}
-	// MarshalPrivateKey returns a PEM block already carrying the OpenSSH
-	// header; EncodeToMemory renders it as text.
 	pemBytes := pem.EncodeToMemory(block)
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -153,7 +149,7 @@ func sshAuthFor(sshDir string, ep *transport.Endpoint, out io.Writer, log *slog.
 	if err != nil {
 		return nil, fmt.Errorf("git: parse SSH key: %w", err)
 	}
-	auth.HostKeyCallback = tofuHostKeyCallback(sshDir, db, ep, out, log)
+	auth.HostKeyCallback = tofuHostKeyCallback(sshDir, db, out, log)
 	// When the host is already trusted, restrict the algorithms the client will
 	// offer to exactly those in known_hosts for that host. This mirrors what
 	// go-git's own connect() does in its known_hosts branch (ssh/common.go:134),
@@ -216,7 +212,12 @@ func ensureKnownHostsFile(path string) error {
 // touches known_hosts. A HostUnknown error triggers TOFU: the presented key is
 // appended to Relay's known_hosts file and the connection proceeds, with the
 // first-trust event surfaced on out (user line) and log (Debug attrs).
-func tofuHostKeyCallback(sshDir string, db *knownhosts.HostKeyDB, ep *transport.Endpoint, out io.Writer, log *slog.Logger) ssh.HostKeyCallback {
+func tofuHostKeyCallback(
+	sshDir string,
+	db *knownhosts.HostKeyDB,
+	out io.Writer,
+	log *slog.Logger,
+) ssh.HostKeyCallback {
 	inner := db.HostKeyCallback()
 	return ssh.HostKeyCallback(func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		err := inner(hostname, remote, key)
@@ -229,7 +230,11 @@ func tofuHostKeyCallback(sshDir string, db *knownhosts.HostKeyDB, ep *transport.
 			// loudly and NEVER auto-update known_hosts: silently replacing the
 			// key would let an attacker pin their own key. The operator resolves
 			// a genuinely expected rotation by editing the file manually.
-			return fmt.Errorf("git: host key for %s has changed! This may indicate a man-in-the-middle attack. If the change is expected, remove the host's line(s) from %s and sync again", hostname, knownHostsPath(sshDir))
+			return fmt.Errorf(
+				"git: host key for %s has changed! This may indicate a man-in-the-middle attack. "+
+					"If the change is expected, remove the host's line(s) from %s and sync again",
+				hostname, knownHostsPath(sshDir),
+			)
 		case knownhosts.IsHostUnknown(err):
 			// First use of this host: TOFU — persist the key and continue. The
 			// append is done with the file left O_APPEND (see the comment below),

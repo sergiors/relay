@@ -149,15 +149,6 @@ func isServiceContainer(labels map[string]string) bool {
 	return labels[labelType] == ContainerTypeService
 }
 
-// isInvocationContainer reports whether labels classify a container as a
-// one-shot Relay invocation container (event or schedule). It is strict: an
-// unknown or missing relay.type is NOT an invocation container, so the sweep can
-// only ever remove containers that carry an explicit, known type.
-func isInvocationContainer(labels map[string]string) bool {
-	t := labels[labelType]
-	return t == ContainerTypeEvent || t == ContainerTypeSchedule
-}
-
 // isManagedContainer reports whether labels classify a container as Relay-owned:
 // its relay.type is one of the three known values. It is the "touch only
 // Relay-owned" guard. Note isManagedContainer does not by itself make a container

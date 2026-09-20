@@ -215,8 +215,10 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 }
 
 // Healthy reports whether the consumer's last observed Redis operation
-// succeeded. It is the readiness signal for the `relay health` command: true
-// while Redis is reachable, false during an outage.
+// succeeded: true while Redis is reachable, false during an outage. It is an
+// in-process readiness accessor for embedders and orchestrators that run the
+// consumer themselves; the `relay health` command does not use it (that command
+// probes Redis with a direct PING from a separate process).
 func (c *Consumer) Healthy() bool {
 	return c.healthy.Load()
 }
@@ -660,7 +662,8 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
 				}).Result()
 				if err != nil || len(entries) == 0 {
-					c.log.Debug("Message: beyond reclaim window and pending lookup failed; skipping this tick", "message_id", msg.ID, "error", err)
+					c.log.Debug("Message: beyond reclaim window and pending lookup failed; skipping this tick",
+						"message_id", msg.ID, "error", err)
 					continue
 				}
 				pe = entries[0]
@@ -969,7 +972,8 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	}
 }
 
-// routeToDLQ writes the message to the DLQ and only then acks the original. The// XADD-before-XACK ordering matters: if the DLQ write fails the original stays
+// routeToDLQ writes the message to the DLQ and only then acks the original. The
+// XADD-before-XACK ordering matters: if the DLQ write fails the original stays
 // pending so the next recovery cycle retries the DLQ write rather than losing
 // the message.
 func (c *Consumer) routeToDLQ(

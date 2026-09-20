@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
@@ -87,10 +86,10 @@ func retentionTick(
 	cutoffID := retentionCutoffID(now().Add(-retention))
 	n, err := trimStream(ctx, client, stream, cutoffID)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("Retention: trim %q: %v (will retry next tick)", stream, err))
+		logger.Warn("Retention: trim failed; will retry next tick", "stream", stream, "error", err)
 		return
 	}
-	logger.Debug(fmt.Sprintf("Retention: trimmed %q at cutoff %s (removed %d)", stream, cutoffID, n))
+	logger.Debug("Retention: trimmed stream", "stream", stream, "cutoff", cutoffID, "removed", n)
 }
 
 // retentionLoop is the periodic stream-retention loop. It runs in its own
@@ -112,7 +111,7 @@ func retentionLoop(
 	logger *slog.Logger,
 ) {
 	interval := retentionTickInterval(retention)
-	logger.Info(fmt.Sprintf("Retention: enabled for stream %q (window %s, tick %s)", stream, retention, interval))
+	logger.Info("Retention: enabled", "stream", stream, "window", retention, "tick", interval)
 
 	// Initial trim immediately (bounded) so an already-large stream is trimmed
 	// without waiting a full interval. A failure here is logged and the loop

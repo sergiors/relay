@@ -41,7 +41,10 @@ func ValidateRepositoryURL(repository string) error {
 		return fmt.Errorf("git: invalid repository URL: %w", err)
 	}
 	if ep.Protocol != "ssh" {
-		return fmt.Errorf("git: repository must use SSH (url %q resolves to protocol %q); only SSH URLs are supported", repository, ep.Protocol)
+		return fmt.Errorf(
+			"git: repository must use SSH (url %q resolves to protocol %q); only SSH URLs are supported",
+			repository, ep.Protocol,
+		)
 	}
 	if ep.Host == "" {
 		return fmt.Errorf("git: repository %q has no host", repository)

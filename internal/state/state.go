@@ -485,7 +485,10 @@ func (c *State) RebuildFromFS(dir string) error {
 		for _, p := range prepared {
 			ts := now()
 			env, secrets := serializeMappings(p.fn.Template)
-			if err := insertStmt(tx)(p.fn.Name, p.fn.Template.Runtime, StatusPending, "", p.fp, "", "", "", "", ts, env, secrets); err != nil {
+			if err := insertStmt(tx)(
+				p.fn.Name, p.fn.Template.Runtime, StatusPending, "", p.fp,
+				"", "", "", "", ts, env, secrets,
+			); err != nil {
 				return err
 			}
 			if err := replaceHandlers(tx, p.fn.Name, p.fn.Template); err != nil {
@@ -547,7 +550,10 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		env, secrets := serializeMappings(fn.Template)
-		if err := insertStmt(tx)(name, fn.Template.Runtime, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "", ts, env, secrets); err != nil {
+		if err := insertStmt(tx)(
+			name, fn.Template.Runtime, StatusReady, image, fingerprint,
+			prepared, ts, ReconcileSuccess, "", ts, env, secrets,
+		); err != nil {
 			return err
 		}
 		if err := replaceHandlers(tx, name, fn.Template); err != nil {
@@ -717,7 +723,11 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	err := c.db.QueryRowContext(ctx,
 		`SELECT name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets
 		 FROM functions WHERE name = ?`, name,
-	).Scan(&d.Name, &d.Runtime, &d.Status, &d.Image, &d.Fingerprint, &d.PreparedAt, &d.LastReconcileAt, &d.LastReconcileStatus, &d.LastError, &d.UpdatedAt, &envJSON, &secretsJSON)
+	).Scan(
+		&d.Name, &d.Runtime, &d.Status, &d.Image, &d.Fingerprint, &d.PreparedAt,
+		&d.LastReconcileAt, &d.LastReconcileStatus, &d.LastError, &d.UpdatedAt,
+		&envJSON, &secretsJSON,
+	)
 	if err == sql.ErrNoRows {
 		return Detail{}, false
 	}
@@ -803,10 +813,18 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 // (image/fingerprint/prepared_at — and status on the failure path) are guarded.
 // env and secrets are the serialized env/secret MAPPINGS (JSON objects), never
 // secret values.
-type insertFn func(name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets string) error
+type insertFn func(
+	name, runtime, status, image, fingerprint, prepared string,
+	reconcileAt, reconcileStatus, lastError, updated string,
+	env, secrets string,
+) error
 
 func insertStmt(tx *sql.Tx) insertFn {
-	return func(name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets string) error {
+	return func(
+		name, runtime, status, image, fingerprint, prepared string,
+		reconcileAt, reconcileStatus, lastError, updated string,
+		env, secrets string,
+	) error {
 		_, err := tx.Exec(
 			`INSERT INTO functions (name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)

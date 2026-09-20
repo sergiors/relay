@@ -508,7 +508,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			}
 			l, err := time.LoadLocation(s.Timezone)
 			if err != nil {
-				return nil, fmt.Errorf("schedule %q: invalid timezone %q: %v", s.Handler, s.Timezone, err)
+				return nil, fmt.Errorf("schedule %q: invalid timezone %q: %w", s.Handler, s.Timezone, err)
 			}
 			loc = l
 		}
@@ -523,7 +523,13 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err := validateCron(s.Cron, loc); err != nil {
 			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Handler, s.Cron, err)
 		}
-		t.Schedules = append(t.Schedules, Schedule{Handler: s.Handler, Cron: s.Cron, Location: loc, Timeout: timeout, Retries: retries})
+		t.Schedules = append(t.Schedules, Schedule{
+			Handler:  s.Handler,
+			Cron:     s.Cron,
+			Location: loc,
+			Timeout:  timeout,
+			Retries:  retries,
+		})
 	}
 
 	// Parse and validate the optional persistent services. Each entry requires an
@@ -947,7 +953,7 @@ func buildComparison(key string, op comparisonOp, raw any, path string, now func
 			// only the relative offset and never consults a clock.
 			_, temporal, err := parseNowOperand(bound)
 			if err != nil {
-				return nil, fmt.Errorf("%s: %s: %v", path, key, err)
+				return nil, fmt.Errorf("%s: %s: %w", path, key, err)
 			}
 			if !temporal {
 				return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %q`,
@@ -1065,7 +1071,7 @@ func parseNowOperand(value string) (time.Duration, bool, error) {
 	}
 	d, err := time.ParseDuration(value[5:])
 	if err != nil {
-		return 0, true, fmt.Errorf("invalid now() expression %q: %v", value, err)
+		return 0, true, fmt.Errorf("invalid now() expression %q: %w", value, err)
 	}
 	return d, true, nil
 }

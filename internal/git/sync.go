@@ -247,11 +247,9 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 	if len(materialized) == 0 {
-		// Allowable ONLY when the source dir genuinely existed and simply had no
-		// valid function directories (a missing source dir is a hard error thrown
-		// earlier by materialize, before any config bookkeeping is touched). The
-		// deterministic-removal pass still ran and cleared stale dirs; /functions
-		// ends up empty by design.
+		// materialize already hard-errors on a missing source dir, so an empty
+		// result here means the source existed but held no function dirs. The
+		// deterministic-removal pass still ran and cleared stale dirs.
 		writeLine("Source contained no function directories; /functions is now empty")
 	} else {
 		writeLine("Materialized %d function(s): %s", len(materialized), joinNames(materialized))
@@ -286,7 +284,9 @@ type builder interface {
 // existing checkout. A fresh clone uses the default branch (ReferenceName empty)
 // and SingleBranch=false so all remote branches/tags come down for ref
 // resolution. It returns the repository view and whether it was freshly cloned.
-func ensureCheckout(ctx context.Context, ops gitOps, checkoutDir, url string, am gitssh.AuthMethod) (gitRepo, bool, error) {
+func ensureCheckout(
+	ctx context.Context, ops gitOps, checkoutDir, url string, am gitssh.AuthMethod,
+) (gitRepo, bool, error) {
 	// Origin URL drift => re-clone to avoid stale remote state.
 	if _, err := os.Stat(filepath.Join(checkoutDir, ".git")); err == nil {
 		repo, oerr := ops.open(checkoutDir)

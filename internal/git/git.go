@@ -36,7 +36,7 @@ const (
 	// PrivateKeyFile is the deploy key filename written under SSHDir.
 	PrivateKeyFile = "id_ed25519"
 	// KnownHostsFile is Relay's own OpenSSH known_hosts file under SSHDir,
-	// maintained by the TOFU host-key callback (see hostkey.go). It is
+	// maintained by the TOFU host-key callback (see keys.go). It is
 	// deliberately NOT the operator's ~/.ssh/known_hosts: Relay trusts on first
 	// use and records the fingerprint itself, so no ssh-keyscan step is needed.
 	KnownHostsFile = "known_hosts"

@@ -348,10 +348,10 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	}
 
 	// Per-function stats match the registry snapshot.
-	want := funcSnapshotStats(m)
+	want := snapshotFunctionStats(m)
 	// Only alpha has activity.
 	if len(want) != 1 || want[0].Function != "alpha" {
-		t.Fatalf("funcSnapshotStats = %+v, want only alpha", want)
+		t.Fatalf("snapshotFunctionStats = %+v, want only alpha", want)
 	}
 	fa, ok := st.FunctionStats("alpha")
 	if !ok {

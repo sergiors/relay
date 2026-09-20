@@ -252,7 +252,12 @@ func (m *Manager) Close() error {
 // container create) and meta is the creation-time identity RunMeta stamped as
 // labels (per-invocation fields left empty — labels are immutable while the
 // container outlives invocations).
-func (m *Manager) startContainer(ctx context.Context, fnName, image string, env []string, meta RunMeta) (reusableContainer, error) {
+func (m *Manager) startContainer(
+	ctx context.Context,
+	fnName, image string,
+	env []string,
+	meta RunMeta,
+) (reusableContainer, error) {
 	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, meta)
 }
 
@@ -452,7 +457,13 @@ func resolveConcurrency(fn function.Function) int {
 // fingerprint (so a build failure is attributable, and the caller has it in hand
 // even for the reuse case). It must be the reference for depFingerprint; the
 // two travel together to keep "which dependency was this built for" exact.
-func (m *Manager) ensureDependencyImage(ctx context.Context, fn function.Function, spec plan.Spec, deps plan.Deps, depRef string) (string, error) {
+func (m *Manager) ensureDependencyImage(
+	ctx context.Context,
+	fn function.Function,
+	spec plan.Spec,
+	deps plan.Deps,
+	depRef string,
+) (string, error) {
 	// Derive the dependency fingerprint so the built image is stamped with the
 	// exact content address it encodes (see dependencyImageLabels). The
 	// fingerprint has already been computed by Prepare's split above, but

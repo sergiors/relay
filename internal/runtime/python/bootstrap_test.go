@@ -63,8 +63,6 @@ type invokeResult struct {
 	Frame string
 }
 
-func (r invokeResult) hasErrorText(frag string) bool { return strings.Contains(r.Err, frag) }
-
 // startPython runs the real embedded bootstrap under python3 with PYTHONPATH
 // pointing at dir (which holds the handler modules).
 func startPython(t *testing.T, dir string) *pyProc {

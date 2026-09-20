@@ -152,21 +152,6 @@ func (p *nodeProc) stderrString() string {
 	return p.stderr.String()
 }
 
-func runNode(t *testing.T, root, handler, stdin string) (string, bool) {
-	t.Helper()
-	// One-shot runner kept for the malformed-frame test.
-	bs := bootstrapFor(root)
-	bsPath := filepath.Join(root, "relay", "bootstrap.mjs")
-	if err := os.WriteFile(bsPath, []byte(bs), 0o644); err != nil {
-		t.Fatalf("write bootstrap: %v", err)
-	}
-	cmd := exec.Command("node", bsPath)
-	cmd.Env = os.Environ()
-	cmd.Stdin = strings.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
-	return string(out), err != nil
-}
-
 type reqFrame struct {
 	ID      string            `json:"id"`
 	Handler string            `json:"handler"`

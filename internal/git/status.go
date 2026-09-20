@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"text/tabwriter"
 
 	git "github.com/go-git/go-git/v5"
@@ -32,7 +31,7 @@ type StatusConfig struct {
 // Status builds a StatusConfig from the given dirs. It never fails on a missing
 // checkout or key (those are just false fields); it only returns an error when
 // the config file exists but is unreadable/corrupt.
-func Status(cfgPath, ssdDir, checkoutDir string) (StatusConfig, error) {
+func Status(cfgPath, sshDir, checkoutDir string) (StatusConfig, error) {
 	s := StatusConfig{}
 	cfg, err := LoadConfig(cfgPath)
 	switch {
@@ -49,7 +48,7 @@ func Status(cfgPath, ssdDir, checkoutDir string) (StatusConfig, error) {
 		return s, err
 	}
 
-	s.KeyExists = keyExists(ssdDir)
+	s.KeyExists = keyExists(sshDir)
 	if _, err := os.Stat(filepath.Join(checkoutDir, ".git")); err == nil {
 		s.Checkout = true
 		if r, oerr := git.PlainOpen(checkoutDir); oerr == nil {
@@ -102,24 +101,4 @@ func syncedStr(s StatusConfig) string {
 		return "never"
 	}
 	return s.LastSynced
-}
-
-// Names returns the sorted function dirs currently present in the /functions
-// target dir. It is used by the CLI's sync summary to show what is live now.
-func Names(functionsDir string) ([]string, error) {
-	entries, err := os.ReadDir(functionsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("git: list functions dir: %w", err)
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-	return names, nil
 }

@@ -811,13 +811,13 @@ func snapshotStats(metricsInstance *metrics.Registry) state.Stats {
 	}
 }
 
-// funcSnapshotStats maps the registry's per-function counters AND latest
+// snapshotFunctionStats maps the registry's per-function counters AND latest
 // execution-history timestamps into the state layer's FunctionStats rows. The
 // registry stores unix seconds; the state layer stores RFC3339 strings in the
 // updated_at convention (empty = never observed), so zero timestamps map to "".
 // It is nil-safe: a nil registry yields an empty slice so the snapshot path can
 // never panic or block processing.
-func funcSnapshotStats(metricsInstance *metrics.Registry) []state.FunctionStats {
+func snapshotFunctionStats(metricsInstance *metrics.Registry) []state.FunctionStats {
 	if metricsInstance == nil {
 		return nil
 	}
@@ -926,6 +926,6 @@ func recordSnapshots(ctx context.Context, st *state.State, metricsInstance *metr
 	_ = st.RecordStatsSnapshot(
 		ctx,
 		snapshotStats(metricsInstance),
-		funcSnapshotStats(metricsInstance),
+		snapshotFunctionStats(metricsInstance),
 	)
 }

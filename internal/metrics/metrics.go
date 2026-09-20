@@ -1231,7 +1231,8 @@ func (r *Registry) Snapshot() string {
 				if h.GetSampleCount() == 0 {
 					continue
 				}
-				lines = append(lines, fmt.Sprintf("%s count=%d sum=%.3f", sampleName(f.GetName(), m), int64(h.GetSampleCount()), h.GetSampleSum()))
+				lines = append(lines, fmt.Sprintf("%s count=%d sum=%.3f",
+					sampleName(f.GetName(), m), int64(h.GetSampleCount()), h.GetSampleSum()))
 			}
 		}
 	}

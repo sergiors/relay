@@ -50,7 +50,7 @@ func classifyMessage(msg redis.XMessage) (map[string]any, error) {
 	// which is the desired non-retryable classification.
 	var event map[string]any
 	if err := json.Unmarshal([]byte(rawStr), &event); err != nil {
-		return nil, fmt.Errorf("decode event: %v", err)
+		return nil, fmt.Errorf("decode event: %w", err)
 	}
 	if event == nil {
 		// "null" decodes into a nil map without error; it is not a usable object.

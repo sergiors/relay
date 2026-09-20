@@ -128,7 +128,7 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 			logger.Warn("Git webhook: no git source configured; webhook disabled")
 			return nil
 		}
-		logger.Warn(fmt.Sprintf("Git webhook: read git config: %v (continuing without webhook)", err))
+		logger.Warn("Git webhook: read git config; continuing without webhook", "error", err)
 		return nil
 	}
 	if gitCfg.WebhookSecretRef != "" && cfg.Secrets == nil {
@@ -155,9 +155,6 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 		gitCfg.WebhookSecretRef,
 		cfg.Secrets,
 		configPath,
-		opts.CheckoutDir,
-		opts.FunctionsDir,
-		opts.SSHDir,
 		scheduler,
 	)
 	srv := newServer(addr, logger, provider)
@@ -208,18 +205,18 @@ func newServer(addr string, logger *slog.Logger, providers ...Provider) *Server 
 func readBody(logger *slog.Logger, w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		logf(logger, r.Context(), slog.LevelWarn, "webhook: read request body: %v", err)
+		logAt(logger, r.Context(), slog.LevelWarn, "webhook: read request body", "error", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return nil, false
 	}
 	return body, true
 }
 
-// logf routes a structured log line through the injected logger at the given
+// logAt routes a structured log line through the injected logger at the given
 // level using the request context. Nil logger is tolerated (logs dropped). It
 // is shared provider plumbing: providers pass their injected logger. The
 // webhook secret value and signature header are never passed as attrs.
-func logf(logger *slog.Logger, ctx context.Context, lvl slog.Level, msg string, args ...any) {
+func logAt(logger *slog.Logger, ctx context.Context, lvl slog.Level, msg string, args ...any) {
 	if logger == nil {
 		return
 	}
@@ -258,7 +255,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		s.started.Store(false)
 		if s.logger != nil {
-			s.logger.Error(fmt.Sprintf("Webhook: listen %s failed: %v", s.addr, err))
+			s.logger.Error("Webhook: listen failed", "addr", s.addr, "error", err)
 		}
 		return fmt.Errorf("webhook: listen %s: %w", s.addr, err)
 	}
@@ -316,7 +313,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		// an in-flight sync aborts at its next transport step, bounded by ctx.
 		if s.scheduler != nil {
 			if serr := s.scheduler.Stop(ctx); serr != nil && s.logger != nil {
-				s.logger.Warn(fmt.Sprintf("Git webhook scheduler: graceful shutdown: %v", serr))
+				s.logger.Warn("Git webhook scheduler: graceful shutdown failed", "error", serr)
 			}
 		}
 	})

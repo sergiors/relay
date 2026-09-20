@@ -115,16 +115,24 @@ const (
 // matching the loadLogLevel style.
 func Load(logger *slog.Logger) Config {
 	return Config{
-		RedisURI:            requiredEnv(logger, "REDIS_URI"),
-		RedisStream:         requiredEnv(logger, "REDIS_STREAM"),
-		RedisGroup:          requiredEnv(logger, "REDIS_GROUP"),
-		ConsumerName:        consumerNameFromHost(logger),
-		StreamRetention:     parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
-		MetricsAddr:         getEnv("METRICS_ADDR", ""),
-		GitWebhookAddr:      getEnv("GIT_WEBHOOK_ADDR", ""),
-		LogLevel:            loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
-		MaxConcurrency:      loadPositiveInt(logger, "MAX_CONCURRENCY", getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency))),
-		MaxBufferedEvents:   loadPositiveInt(logger, "MAX_BUFFERED_EVENTS", getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents))),
+		RedisURI:        requiredEnv(logger, "REDIS_URI"),
+		RedisStream:     requiredEnv(logger, "REDIS_STREAM"),
+		RedisGroup:      requiredEnv(logger, "REDIS_GROUP"),
+		ConsumerName:    consumerNameFromHost(logger),
+		StreamRetention: parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
+		MetricsAddr:     getEnv("METRICS_ADDR", ""),
+		GitWebhookAddr:  getEnv("GIT_WEBHOOK_ADDR", ""),
+		LogLevel:        loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
+		MaxConcurrency: loadPositiveInt(
+			logger,
+			"MAX_CONCURRENCY",
+			getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency)),
+		),
+		MaxBufferedEvents: loadPositiveInt(
+			logger,
+			"MAX_BUFFERED_EVENTS",
+			getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents)),
+		),
 		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
 		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
@@ -298,11 +306,11 @@ func parseRetention(logger *slog.Logger, value string) time.Duration {
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("Redis: invalid REDIS_STREAM_RETENTION %q: %v", value, err))
+		logger.Warn("Redis: invalid REDIS_STREAM_RETENTION; retention disabled", "value", value, "error", err)
 		return 0
 	}
 	if d <= 0 {
-		logger.Warn(fmt.Sprintf("Redis: REDIS_STREAM_RETENTION must be positive, got %q", value))
+		logger.Warn("Redis: REDIS_STREAM_RETENTION must be positive; retention disabled", "value", value)
 		return 0
 	}
 	return d
@@ -318,7 +326,7 @@ func parseRetention(logger *slog.Logger, value string) time.Duration {
 func consumerNameFromHost(logger *slog.Logger) string {
 	host, err := os.Hostname()
 	if err != nil {
-		logger.Error(fmt.Sprintf("Resolve consumer name: hostname unavailable: %v", err))
+		logger.Error("Resolve consumer name: hostname unavailable", "error", err)
 		os.Exit(1)
 		return ""
 	}
@@ -332,19 +340,14 @@ func consumerNameFromHost(logger *slog.Logger) string {
 
 // requiredEnv returns the value of the environment variable key, or logs a
 // clear configuration error and exits the process (os.Exit(1)) if it is empty.
-//
-// NOTE: this is PRE-EXISTING behavior (missing required variable = fatal)
-// preserved through the slog migration: requiredEnv logs at Error and calls
-// os.Exit(1) on a missing required environment variable. It is only ever
-// reached from the executable boundary (the Relay CLI commands call Load), so
-// the fatal exit is intentional and must not be converted to a returned error.
-// The injected logger is non-nil at this entry point (the CLI owns logger
-// creation).
+// It is only ever reached from the executable boundary (the Relay CLI commands
+// call Load), so the fatal exit is intentional and must not be converted to a
+// returned error.
 func requiredEnv(logger *slog.Logger, key string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
-	logger.Error(fmt.Sprintf("Required environment variable %s is not set", key))
+	logger.Error("Required environment variable is not set", "variable", key)
 	os.Exit(1)
 	return ""
 }

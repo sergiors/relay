@@ -187,7 +187,14 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 // isolated temp contexts (per-call), run the exact same manifest + base + install
 // command, and tag the same reference; Docker lets the tag land on the identical
 // content either way (last tag wins, content-equal), so no lockfile is needed.
-func buildDependencyImage(ctx context.Context, cli *client.Client, spec plan.Spec, fnDir string, deps plan.Deps, depRef, depFingerprint string) error {
+func buildDependencyImage(
+	ctx context.Context,
+	cli *client.Client,
+	spec plan.Spec,
+	fnDir string,
+	deps plan.Deps,
+	depRef, depFingerprint string,
+) error {
 	ctxDir, err := os.MkdirTemp("", "relay-dep-build-*")
 	if err != nil {
 		return fmt.Errorf("dependency %s: create build context: %w", depRef, err)

@@ -148,15 +148,6 @@ func (f *fakeDocker) setState(id string, st container.ContainerState) {
 	}
 }
 
-// setImage mutates a container's image (for rebuild tests via the fake).
-func (f *fakeDocker) setImage(id, image string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if c, ok := f.ctrs[id]; ok {
-		c.image = image
-	}
-}
-
 // runningCount returns how many of fn/service's containers are running.
 func (f *fakeDocker) runningCount(fn, service string) int {
 	f.mu.Lock()
@@ -543,10 +534,6 @@ func TestReconcileStopFailureDoesNotAbort(t *testing.T) {
 	if got := f.runningCount("fn", "service.js"); got != 1 {
 		t.Fatalf("service.js running = %d, want 1 (convergence proceeds despite stop failure)", got)
 	}
-}
-
-func containsErr(err error, substr string) bool {
-	return err != nil && len(err.Error()) >= len(substr) && err.Error()[:len(substr)] == substr
 }
 
 func TestRemoveAll(t *testing.T) {
