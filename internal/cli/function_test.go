@@ -44,7 +44,9 @@ func seedTestState(t *testing.T) (*state.State, Dependencies) {
 	return st, deps
 }
 
-// ls prints the header plus both rows with correct status/handlers, sorted.
+// ls prints the concise header plus both rows with correct status, sorted. The
+// inventory carries exactly NAME, RUNTIME, STATUS, UPDATED — the old HANDLERS
+// column (and any workload-count replacement) is deliberately gone.
 func TestFunctionListColumns(t *testing.T) {
 	st, _ := seedTestState(t)
 	var w bytes.Buffer
@@ -53,10 +55,13 @@ func TestFunctionListColumns(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSpace(w.String()), "\n")
 	hdr := lines[0]
-	for _, col := range []string{"NAME", "RUNTIME", "STATUS", "HANDLERS", "UPDATED"} {
+	for _, col := range []string{"NAME", "RUNTIME", "STATUS", "UPDATED"} {
 		if !strings.Contains(hdr, col) {
 			t.Fatalf("header missing %q: %q", col, hdr)
 		}
+	}
+	if strings.Contains(hdr, "HANDLERS") {
+		t.Fatalf("header must not carry HANDLERS: %q", hdr)
 	}
 	var userRow, nodeRow string
 	for _, l := range lines[1:] {
@@ -67,10 +72,10 @@ func TestFunctionListColumns(t *testing.T) {
 			nodeRow = l
 		}
 	}
-	if !strings.Contains(userRow, "python3.14") || !strings.Contains(userRow, "ready") || !strings.Contains(userRow, "2") {
+	if !strings.Contains(userRow, "python3.14") || !strings.Contains(userRow, "ready") {
 		t.Fatalf("user row wrong: %q", userRow)
 	}
-	if !strings.Contains(nodeRow, "pending") || !strings.Contains(nodeRow, "1") {
+	if !strings.Contains(nodeRow, "node24") || !strings.Contains(nodeRow, "pending") {
 		t.Fatalf("node row wrong: %q", nodeRow)
 	}
 }

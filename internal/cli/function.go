@@ -136,10 +136,10 @@ func printList(w io.Writer, st *state.State) error {
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tRUNTIME\tSTATUS\tHANDLERS\tUPDATED")
+	fmt.Fprintln(tw, "NAME\tRUNTIME\tSTATUS\tUPDATED")
 	for _, r := range rows {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
-			r.Name, r.Runtime, r.Status, r.HandlerCount, displayTime(r))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			r.Name, r.Runtime, r.Status, displayTime(r))
 	}
 	return tw.Flush()
 }

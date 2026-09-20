@@ -1070,15 +1070,16 @@ relay function ls
 ```
 
 ```
-NAME                  RUNTIME      STATUS    HANDLERS   UPDATED
-user-events-python    python3.14   ready     3          12s ago
-welcome-email-node    node24       ready     1          12s ago
+NAME                  RUNTIME      STATUS    UPDATED
+user-events-python    python3.14   ready     12s ago
+welcome-email-node    node24       ready     12s ago
 ```
 
 The `UPDATED` column is `prepared_at` (else `updated_at`) as a relative age
 (`12s ago`, `3m ago`, `2h ago`, `5d ago`), falling back to an absolute date
-beyond ~30 days. Rows are sorted by name; fingerprints, images, and errors are
-deliberately omitted from `ls`.
+beyond ~30 days. Rows are sorted by name; fingerprints, images, errors, and
+per-function workload counts are deliberately omitted from `ls` — detailed
+workloads live in `relay function inspect`.
 
 ```sh
 relay function inspect user-events-python
