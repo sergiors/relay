@@ -920,7 +920,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if !pf.available {
 			continue
 		}
-		eventID, eventName := eventFields(event)
 		rules := pf.fn.Template.MatchingRules(event)
 		// A function is "involved" in an event when at least one of its rules
 		// matches, regardless of whether the execution later fails. This is the
@@ -945,8 +944,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
-					"event_id", eventID,
-					"event_name", eventName,
 					"delivery_attempt", deliveryAttempt,
 				)
 				continue
@@ -992,8 +989,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"function", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
 						"delivery_attempt", int(deliveryAttempt),
 					)
 					return outcomePendingSkip, nil
@@ -1003,8 +998,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"function", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
 						"delivery_attempt", int(deliveryAttempt),
 					)
 				}
@@ -1034,8 +1027,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 								"function", pf.fn.Name,
 								"handler", rule.Handler,
 								"message_id", msgID,
-								"event_id", eventID,
-								"event_name", eventName,
 								"handler_attempt", n,
 								"next_attempt_in", wait,
 							)
@@ -1050,8 +1041,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							"function", pf.fn.Name,
 							"handler", rule.Handler,
 							"message_id", msgID,
-							"event_id", eventID,
-							"event_name", eventName,
 							"handler_attempt", n,
 						)
 						return outcomeTerminalSkip, nil
@@ -1069,8 +1058,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
-					"event_id", eventID,
-					"event_name", eventName,
 					"handler_attempt", handlerAttempt,
 				)
 				eventJSON, err := json.Marshal(event)
@@ -1081,7 +1068,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// next matching rule so each independent invocation gets its own
 					// failed attempt.
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -1098,7 +1085,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -1106,6 +1093,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// Stamp the invocation's diagnostic metadata into the context so
 				// the executor can attach it as container labels. This keeps the
 				// Executor interface (and every test fake) unchanged.
+				eventID, eventName := eventFields(event)
 				invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 					Type:      runtime.ContainerTypeEvent,
 					Function:  pf.fn.Name,
@@ -1129,8 +1117,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"function", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
 						"handler_attempt", handlerAttempt,
 						"panic_value", fmt.Sprintf("%v", panicValue),
 						"stack", string(debug.Stack()),
@@ -1162,8 +1148,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						"function", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
-						"event_id", eventID,
-						"event_name", eventName,
 						"handler_attempt", handlerAttempt,
 						"duration", d,
 						"reason", err,
@@ -1177,7 +1161,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// end-of-loop aggregate, so an invocation may exhaust while
 					// others still run.
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, eventID, eventName, err)
+						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -1219,8 +1203,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					"function", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
-					"event_id", eventID,
-					"event_name", eventName,
 					"handler_attempt", handlerAttempt,
 					"duration", d,
 				)
@@ -1457,7 +1439,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 			// attempt marks the invocation terminal and, because a schedule has
 			// exactly ONE invocation (this one), the message is terminal — wrap
 			// stream.ErrInvocationExhausted so the stream routes it to the DLQ.
-			outcome, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, msgID, "", "", err)
+			outcome, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, msgID, err)
 			if outcome == outcomeExhausted {
 				return fmt.Errorf("%w: %w", stream.ErrInvocationExhausted, retErr)
 			}
@@ -1632,7 +1614,7 @@ func (r *Runner) recordFailure(
 	invocation string,
 	handlerAttempt int,
 	retries int,
-	fnName, handler, msgID, eventID, eventName string,
+	fnName, handler, msgID string,
 	origErr error,
 ) (invocationOutcome, error) {
 	maxAttempts := 1 + retries
@@ -1650,8 +1632,6 @@ func (r *Runner) recordFailure(
 			"function", fnName,
 			"handler", handler,
 			"message_id", msgID,
-			"event_id", eventID,
-			"event_name", eventName,
 			"handler_attempt", handlerAttempt,
 			"handler_attempts_total", maxAttempts,
 		)
@@ -1666,8 +1646,6 @@ func (r *Runner) recordFailure(
 		"function", fnName,
 		"handler", handler,
 		"message_id", msgID,
-		"event_id", eventID,
-		"event_name", eventName,
 		"handler_attempt", handlerAttempt,
 		"handler_attempts_total", maxAttempts,
 		"retry_backoff", backoff,
@@ -1708,7 +1686,9 @@ func retryBackoff(completedAttempts int) time.Duration {
 }
 
 // eventFields extracts the low-cardinality, label-safe event_id and event_name
-// for structured logging. These are never used as metric labels.
+// from the event for the invocation's runtime RunMeta (container labels and the
+// stream output prefix). These are never used as metric labels or structured
+// log fields.
 func eventFields(event map[string]any) (eventID, eventName string) {
 	if v, ok := event["event_id"]; ok {
 		eventID = stringify(v)

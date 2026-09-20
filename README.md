@@ -1407,8 +1407,8 @@ remains the health check.
 
 - **Structured logs**: execution, retry, failure, DLQ,
   reconciliation, and build lines carry structured `slog` attributes —
-  `function`, `handler`, `message_id`, `event_id`, `event_name`, `attempt`,
-  `duration`, and container `exit_code` where available. Handler stdout/stderr
+  `function`, `handler`, `message_id`, `attempt`, `duration`, and container
+  `exit_code` where available. Handler stdout/stderr
   is forwarded unconditionally as a raw transport: it is not routed through
   slog, so it is unaffected by `LOG_LEVEL`, and only Relay's own operational
   logs are governed by the level.

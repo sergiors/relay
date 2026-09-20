@@ -16,8 +16,8 @@ import "context"
 // uses as log fields or identities elsewhere — never raw payload content:
 //   - Function/Handler are configuration (function name, rule handler).
 //   - MessageID is the stream message ID (bounded by upstream event data).
-//   - EventID/EventName are low-cardinality event fields already used as log
-//     fields by the runner.
+//   - EventID/EventName are low-cardinality event fields carried for the
+//     diagnostic container labels and the invocation output prefix.
 //   - Hostname is the worker identity (the same value as the Redis consumer
 //     identity).
 //   - Image is the exact pinned build reference the container runs.
