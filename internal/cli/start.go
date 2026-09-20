@@ -5,19 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/processlock"
 	"relay/internal/worker"
 )
-
-// startLockPath is the process-level lock file `relay start` holds for its
-// lifetime. It defaults to the fixed internal path (/var/lib/relay/relay.lock);
-// tests replace it with a temp path so they never touch /var/lib/relay. It is a
-// package-level variable purely for dependency injection, mirroring statePath,
-// gitConfigPath, and the other CLI path seams.
-var startLockPath = processlock.DefaultPath
 
 // errStartAlreadyRunning is the concise operator-facing error returned when
 // another process already holds the start lock. It carries no stack trace; the
@@ -37,12 +32,12 @@ var startRun = func(l *slog.Logger) error {
 // the foreground. The process never daemonizes or writes a PID file; Docker,
 // systemd, Kubernetes, or a terminal owns process supervision.
 //
-// Before entering the runtime it takes a process-level flock on startLockPath
-// and holds it for the whole run (released by the deferred Close, or by the
-// kernel if the process dies), so a second `relay start` against the same state
-// directory fails fast instead of racing the first. No other subcommand
-// acquires this lock.
-func startCommand(logger *slog.Logger) *cli.Command {
+// Before entering the runtime it creates deps.LockPath's parent directory and
+// takes a process-level flock on deps.LockPath and holds it for the whole run
+// (released by the deferred Close, or by the kernel if the process dies), so a
+// second `relay start` against the same state directory fails fast instead of
+// racing the first. No other subcommand acquires this lock.
+func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "start",
 		Usage: "Start the runtime",
@@ -51,10 +46,19 @@ func startCommand(logger *slog.Logger) *cli.Command {
 				return cli.Exit("start: too many arguments", 2)
 			}
 
+			// Create the ephemeral runtime directory (/run/relay in production)
+			// BEFORE taking the lock, so both the lock file and the worker's later
+			// socket bind have their parent. It is deliberately outside the
+			// persistent /var/lib/relay state volume; the injected lock's
+			// directory is the single source for it.
+			if err := os.MkdirAll(filepath.Dir(deps.LockPath), 0o755); err != nil {
+				return fmt.Errorf("relay start: cannot create runtime dir: %w", err)
+			}
+
 			// Process boundary: acquire the single-instance lock before the
 			// worker touches Redis, Docker, or /functions. The lock is held for
 			// the whole runtime lifetime via the deferred Close.
-			lock, err := processlock.Acquire(startLockPath)
+			lock, err := processlock.Acquire(deps.LockPath)
 			if err != nil {
 				if errors.Is(err, processlock.ErrAlreadyLocked) {
 					return errStartAlreadyRunning

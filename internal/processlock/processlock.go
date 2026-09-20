@@ -18,13 +18,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// DefaultDir is the fixed application-convention directory for Relay's
+// EPHEMERAL runtime files. It is deliberately separate from the PERSISTENT
+// /var/lib/relay state volume (the SQLite database, secrets store, and git
+// material): /run/relay is tmpfs-backed process state that must not survive a
+// reboot. It holds the process lock below and the worker's live query socket
+// (worker.SocketPath), which is derived from this directory so the two
+// ephemeral runtime paths stay centralized without a separate path package.
+const DefaultDir = "/run/relay"
+
 // DefaultPath is the fixed application-convention lock file for the long-running
-// Relay process. It lives in the same /var/lib/relay directory as the state
-// database and secrets store, so the compose volume mount persists it across
-// container restarts. Persistence is harmless: flock is released by the kernel
-// when the process exits, and Acquire happily takes a lock on a pre-existing
-// file.
-const DefaultPath = "/var/lib/relay/relay.lock"
+// Relay process. It lives under the ephemeral DefaultDir: the kernel releases
+// flock when the process exits, so a leftover lock file on tmpfs is inert, and
+// ephemeral process coordination is kept out of the PERSISTENT /var/lib/relay
+// volume. Acquire happily takes a lock on a pre-existing file.
+const DefaultPath = DefaultDir + "/relay.lock"
 
 // ErrAlreadyLocked reports that the lock is held by another open file
 // description — another process, or another Acquire within this process.

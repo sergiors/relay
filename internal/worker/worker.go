@@ -173,6 +173,22 @@ func Run(logger *slog.Logger) {
 	}
 	defer manager.Close()
 
+	// The live runtime-pool query socket (see internal/worker/socket.go). It is
+	// started now that the manager exists: the CLI's `function inspect` dials it
+	// for the LIVE gauges, which are worker-local and never persisted; the
+	// cumulative counters stay in /var/lib/relay. The
+	// process lock acquired by `relay start` is already held, so removing a stale
+	// socket here can never delete an active worker's socket. A bind failure is
+	// fatal, matching the metrics and webhook servers: a local bind error is a
+	// host/config problem that must surface at startup, not heal invisibly.
+	rtSocket, err := NewSocketServer(SocketPath, manager, logger)
+	if err != nil {
+		logger.Error("Runtime state socket: start failed", "error", err)
+		os.Exit(1)
+	}
+	defer rtSocket.Close()
+	logger.Info("Runtime state socket listening", "path", SocketPath)
+
 	// The service controller converges each function's persistent service
 	// containers to its template (manager is the Docker seam; secretProvider is
 	// the shared secrets resolver). Service containers now stop on graceful
@@ -427,6 +443,16 @@ func Run(logger *slog.Logger) {
 		// with nothing running. (Shutdown via a cancelled ctx returns nil, so a
 		// non-nil error here is a genuine failure.)
 		os.Exit(1)
+	}
+
+	// Stop the live runtime-pool query socket first: the worker has stopped
+	// consuming, so there is no new live state to serve, and removing the socket
+	// prevents `relay function inspect` from resolving a dead endpoint while the
+	// rest of shutdown drains. Close stops accepting, closes in-flight
+	// connections, joins their bounded handlers, and unlinks the socket file.
+	// Non-fatal: a unlink failure must never fail process shutdown.
+	if err := rtSocket.Close(); err != nil {
+		logger.Warn("Runtime state socket: shutdown failed", "error", err)
 	}
 
 	// Bounded graceful shutdown of the cron scheduler, so an in-flight

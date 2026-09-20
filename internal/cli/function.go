@@ -13,30 +13,27 @@ import (
 
 	"relay/internal/runtime"
 	"relay/internal/state"
+	"relay/internal/worker"
 )
 
-// statePath is the local state database location the CLI reads. It defaults to
-// the fixed internal path; tests replace it with a temp file so they never
-// touch /var/lib/relay.
-var statePath = state.DBPath
-
-// poolSnapshotProvider is the optional seam for the live warm-container pool
-// view rendered by `relay function inspect`. It defaults to nil: the standalone
-// inspect process is a SEPARATE process from the worker and has no access to the
-// worker's in-memory pool, so the LIVE gauges render as explicitly unavailable
-// rather than from stale persisted state (a persisted live gauge would be
-// misleading). The cumulative acquire/discard counters are persisted per
-// function, so the standalone section still shows those. An in-process host
-// (embedding the worker, an admin path, or a test) wires the provider via
-// SetPoolSnapshotProvider; it deliberately returns the runtime's own snapshot
-// value, so no copy of the live state model exists here.
+// poolSnapshotProvider is the optional IN-PROCESS seam for the live warm-
+// container pool view rendered by `relay function inspect`. It defaults to nil.
+// An in-process host (embedding the worker, an admin path, or a test) wires the
+// provider via SetPoolSnapshotProvider and avoids a socket round trip. The
+// standalone inspect process leaves it nil and falls back to the worker query
+// socket (Dependencies.SocketPath); when neither resolves a live pool, the live
+// gauges render as explicitly unavailable rather than from stale persisted
+// state. The provider supplies ONLY the live gauges; the cumulative
+// acquire/discard counters always come from the persisted per-function stats
+// row, so the section is useful without the worker.
 var poolSnapshotProvider func(name string) (runtime.PoolSnapshot, bool)
 
 // SetPoolSnapshotProvider installs the live warm-container pool provider used by
-// `relay function inspect`. Passing nil (the default) leaves the Runtime pool
-// section rendering persisted cumulative counters with the live gauges marked
-// unavailable. It is safe to call before any command runs; the worker does not
-// call it today (inspect is a distinct process), but an embedding host may.
+// `relay function inspect`. Passing nil (the default) leaves inspect to consult
+// the worker query socket, then to render persisted cumulative counters with the
+// live gauges marked unavailable. It is safe to call before any command runs;
+// the worker does not call it today (inspect is a distinct process), but an
+// embedding host may.
 func SetPoolSnapshotProvider(fn func(name string) (runtime.PoolSnapshot, bool)) {
 	poolSnapshotProvider = fn
 }
@@ -44,10 +41,12 @@ func SetPoolSnapshotProvider(fn func(name string) (runtime.PoolSnapshot, bool)) 
 // functionCommand builds the read-only `relay function ...` subcommand family.
 // It touches the local state database only — never Redis, Docker, or the
 // /functions loader — so it works with no REDIS_URI and no worker reachable.
-// It is a pure grouping command, so it uses the shared namespaceAction: a bare
-// `relay function` shows the subcommand help, and an unknown first token is a
-// friendly Docker-style usage error naming the full path.
-func functionCommand() *cli.Command {
+// deps supplies the state database it opens and the worker socket inspect dials
+// for the live gauges. It is a pure grouping command, so it uses the shared
+// namespaceAction: a bare `relay function` shows the subcommand help, and an
+// unknown first token is a friendly Docker-style usage error naming the full
+// path.
+func functionCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "function",
 		Usage: "Manage functions",
@@ -63,7 +62,7 @@ func functionCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("function ls: too many arguments", 2)
 					}
-					return functionList(ctx, cmd.Writer)
+					return functionList(ctx, cmd.Writer, deps.StatePath)
 				},
 			},
 			{
@@ -80,18 +79,18 @@ func functionCommand() *cli.Command {
 					if cmd.Args().Present() {
 						return cli.Exit("function inspect: too many arguments", 2)
 					}
-					return functionInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0])
+					return functionInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0], deps)
 				},
 			},
 		},
 	}
 }
 
-// openState opens the local state DB (creating it if absent) and returns it
-// with a cleanup func. Any failure is returned as an error for the root
-// ExitErrHandler to print once.
-func openState() (*state.State, func(), error) {
-	st, err := state.Open(statePath)
+// openState opens the local state DB at path (creating it if absent) and
+// returns it with a cleanup func. Any failure is returned as an error for the
+// root ExitErrHandler to print once.
+func openState(path string) (*state.State, func(), error) {
+	st, err := state.Open(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open state: %w", err)
 	}
@@ -99,9 +98,10 @@ func openState() (*state.State, func(), error) {
 	return st, func() { _ = st.Close() }, nil
 }
 
-// functionList prints a Docker-like table of functions sorted by name.
-func functionList(ctx context.Context, w io.Writer) error {
-	st, cleanup, err := openState()
+// functionList prints a Docker-like table of functions sorted by name from the
+// state database at statePath.
+func functionList(ctx context.Context, w io.Writer, statePath string) error {
+	st, cleanup, err := openState(statePath)
 	if err != nil {
 		return err
 	}
@@ -109,10 +109,12 @@ func functionList(ctx context.Context, w io.Writer) error {
 	return printList(w, st)
 }
 
-// functionInspect prints the full detail for one function. An unknown name
-// returns a runtime error (exit 1 via main).
-func functionInspect(ctx context.Context, w io.Writer, name string) error {
-	st, cleanup, err := openState()
+// functionInspect prints the full detail for one function, reading the state
+// database at deps.StatePath and resolving the live pool gauges (when the
+// in-process provider is absent) from the worker socket at deps.SocketPath. An
+// unknown name returns a runtime error (exit 1 via main).
+func functionInspect(ctx context.Context, w io.Writer, name string, deps Dependencies) error {
+	st, cleanup, err := openState(deps.StatePath)
 	if err != nil {
 		return err
 	}
@@ -123,7 +125,7 @@ func functionInspect(ctx context.Context, w io.Writer, name string) error {
 		return fmt.Errorf("unknown function %q", name)
 	}
 	fs := printInspect(w, st, d)
-	appendRuntimePool(w, name, fs)
+	appendRuntimePool(w, name, fs, deps.SocketPath)
 	return nil
 }
 
@@ -261,21 +263,61 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// poolGauges is the live runtime-pool gauge view rendered by inspect, resolved
+// from either the in-process provider (runtime.PoolSnapshot) or the worker query
+// socket (worker.RuntimeState). Keeping a CLI-local shape lets both sources
+// render identically without importing the worker's wire type into the renderer.
+// It carries ONLY the live gauges: the cumulative counters are not a gauge and
+// always come from the persisted stats row.
+type poolGauges struct {
+	Capacity   int
+	Containers int
+	Busy       int
+	Idle       int
+	Starting   int
+}
+
 // appendRuntimePool appends the Runtime pool section to an inspect output for
-// name. The cumulative counters always come from the persisted function_stats
-// row (fs.WarmAcquiresTotal/ColdStartsTotal/DiscardedTotal), so the standalone
-// process renders them with no worker access. The LIVE gauges (capacity,
-// container counts by lease state) are rendered only when an in-process provider
-// reports the function's live pool; otherwise they are explicitly marked
-// unavailable rather than invented from stale persisted state. name is passed
-// separately because fs is the zero value when no stats row exists yet (a
-// function with no pool activity still has a name to look up).
-func appendRuntimePool(w io.Writer, name string, fs state.FunctionStats) {
-	if snap, ok := livePoolSnapshot(name); ok {
-		printRuntimePool(w, &snap, fs)
+// name. The cumulative acquire/discard counters (warm acquires, cold starts,
+// discarded) ALWAYS come from the persisted function_stats row (fs) — never from
+// a live provider or the socket, so the operator-facing history is the same in
+// every process and survives a worker restart. Only the LIVE gauges (capacity,
+// container counts by lease state) are resolved from a live source, in
+// preference order:
+//
+//  1. an in-process provider, when wired (an embedding host or test);
+//  2. the worker query socket at socketPath (the standalone CLI);
+//  3. otherwise explicitly unavailable ("unknown").
+//
+// The live gauges are NEVER rendered from persisted state: a persisted live
+// gauge would go stale between flushes, so "unknown" is always the honest
+// fallback. name is passed separately because fs is the zero value when no stats
+// row exists yet.
+func appendRuntimePool(w io.Writer, name string, fs state.FunctionStats, socketPath string) {
+	gauges, ok := livePoolGauges(name, socketPath)
+	if !ok {
+		printRuntimePool(w, nil, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
 		return
 	}
-	printRuntimePool(w, nil, fs)
+	printRuntimePool(w, &gauges, fs.WarmAcquiresTotal, fs.ColdStartsTotal, fs.DiscardedTotal)
+}
+
+// livePoolGauges resolves name's live pool gauges from the in-process provider
+// first, then the worker query socket at socketPath. It reports (zero, false)
+// when neither source resolves a live pool, so the caller renders the gauges
+// unknown. The cumulative counters are deliberately NOT read here: they always
+// come from the persisted stats row.
+func livePoolGauges(name, socketPath string) (poolGauges, bool) {
+	if snap, ok := livePoolSnapshot(name); ok {
+		return poolGauges{
+			Capacity:   snap.Capacity,
+			Containers: snap.Containers,
+			Busy:       snap.Busy,
+			Idle:       snap.Idle,
+			Starting:   snap.Starting,
+		}, true
+	}
+	return socketPoolGauges(name, socketPath)
 }
 
 // livePoolSnapshot consults the optional in-process provider. It returns
@@ -288,22 +330,40 @@ func livePoolSnapshot(name string) (runtime.PoolSnapshot, bool) {
 	return poolSnapshotProvider(name)
 }
 
+// socketPoolGauges queries the live worker socket at socketPath for name's pool
+// gauges. Any failure — no worker running, a stale/unreachable socket, or the
+// worker having no pool for the function — reports (zero, false) so the caller
+// renders the live gauges unknown. It never fails the command: live
+// observability is best-effort, and the persisted counters remain authoritative
+// cumulative history.
+func socketPoolGauges(name, socketPath string) (poolGauges, bool) {
+	st, err := worker.QueryRuntimeState(socketPath, name)
+	if err != nil {
+		return poolGauges{}, false
+	}
+	return poolGauges{
+		Capacity:   st.Capacity,
+		Containers: st.Containers,
+		Busy:       st.Busy,
+		Idle:       st.Idle,
+		Starting:   st.Starting,
+	}, true
+}
+
 // printRuntimePool renders the compact Runtime pool section for one function.
-// It has two shapes:
+// warm/cold/discarded are the cumulative counters to render; live carries the
+// live gauges when they are known. It has two shapes:
 //
-//   - live != nil: an in-process provider reported the live pool, so the
-//     authoritative gauges (capacity, container counts by lease state, and the
-//     transient starting reservation) are shown alongside the cumulative
-//     counters read from the live snapshot.
-//   - live == nil: the standalone inspect process, which has no access to the
-//     worker's in-memory pool. The live gauges are rendered as unavailable
-//     ("unknown") and the cumulative acquire/discard counters come from the
-//     persisted per-function stats snapshot (fs).
+//   - live != nil: the authoritative gauges (capacity, container counts by
+//     lease state, and the transient starting reservation) are shown. Known
+//     zero values print as 0 (a valid live reading), and Starting is shown only
+//     when non-zero (it is transient and usually zero).
+//   - live == nil: no live pool is reachable from this process, so the live
+//     gauges render as explicitly unavailable ("unknown") — never a guessed or
+//     stale number.
 //
-// Starting is shown only when non-zero (an in-flight lazy start is transient
-// and usually zero). The layout matches the wider padding of the Services
-// section.
-func printRuntimePool(w io.Writer, live *runtime.PoolSnapshot, fs state.FunctionStats) {
+// The layout matches the wider padding of the Services section.
+func printRuntimePool(w io.Writer, live *poolGauges, warm, cold, discarded int64) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Runtime pool:")
 	tw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
@@ -315,9 +375,9 @@ func printRuntimePool(w io.Writer, live *runtime.PoolSnapshot, fs state.Function
 		if live.Starting > 0 {
 			fmt.Fprintf(tw, "  Starting:\t%d\n", live.Starting)
 		}
-		fmt.Fprintf(tw, "  Warm acquires:\t%d\n", live.WarmAcquires)
-		fmt.Fprintf(tw, "  Cold starts:\t%d\n", live.ColdStarts)
-		fmt.Fprintf(tw, "  Discarded:\t%d\n", live.Discarded)
+		fmt.Fprintf(tw, "  Warm acquires:\t%d\n", warm)
+		fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
+		fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
 		tw.Flush()
 		return
 	}
@@ -329,9 +389,9 @@ func printRuntimePool(w io.Writer, live *runtime.PoolSnapshot, fs state.Function
 	fmt.Fprintf(tw, "  Containers:\tunknown\n")
 	fmt.Fprintf(tw, "  Busy:\tunknown\n")
 	fmt.Fprintf(tw, "  Idle:\tunknown\n")
-	fmt.Fprintf(tw, "  Warm acquires:\t%d\n", fs.WarmAcquiresTotal)
-	fmt.Fprintf(tw, "  Cold starts:\t%d\n", fs.ColdStartsTotal)
-	fmt.Fprintf(tw, "  Discarded:\t%d\n", fs.DiscardedTotal)
+	fmt.Fprintf(tw, "  Warm acquires:\t%d\n", warm)
+	fmt.Fprintf(tw, "  Cold starts:\t%d\n", cold)
+	fmt.Fprintf(tw, "  Discarded:\t%d\n", discarded)
 	tw.Flush()
 }
 

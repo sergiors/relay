@@ -13,12 +13,12 @@ import (
 )
 
 // statsCommand builds the read-only `relay stats` subcommand. It reads the
-// operational snapshot from the local state database and renders it to stdout.
-// The command touches only the state database — never Redis, Docker, or the
-// worker — so it works with no REDIS_URI set. A missing or unreadable stats
-// row renders a zero snapshot rather than failing, so an empty state database
-// always produces sensible output with exit 0.
-func statsCommand() *cli.Command {
+// operational snapshot from the local state database at deps.StatePath and
+// renders it to stdout. The command touches only the state database — never
+// Redis, Docker, or the worker — so it works with no REDIS_URI set. A missing
+// or unreadable stats row renders a zero snapshot rather than failing, so an
+// empty state database always produces sensible output with exit 0.
+func statsCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:        "stats",
 		Usage:       "Show current operational statistics",
@@ -27,7 +27,7 @@ func statsCommand() *cli.Command {
 			if cmd.Args().Present() {
 				return cli.Exit("stats: too many arguments", 2)
 			}
-			st, cleanup, err := openState()
+			st, cleanup, err := openState(deps.StatePath)
 			if err != nil {
 				return err
 			}

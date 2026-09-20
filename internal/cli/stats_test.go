@@ -2,24 +2,19 @@ package cli
 
 import (
 	"bytes"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"relay/internal/state"
 )
 
-// seedStatsState creates a temp state DB, redirects the package CLI path
-// (statePath) to it, and records a known global stats snapshot. It returns the
-// opened state DB; later command calls read the same path.
-func seedStatsState(t *testing.T) *state.State {
+// seedStatsState creates a temp state DB under test dependencies and records a
+// known global stats snapshot. It returns the opened state DB and the deps
+// whose StatePath points at it, so command tests run with runCLIWithDeps read
+// exactly what the test seeded.
+func seedStatsState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, deps := openTempState(t)
 
 	st.RecordStats(state.Stats{
 		EventsProcessedTotal:    152934,
@@ -30,13 +25,13 @@ func seedStatsState(t *testing.T) *state.State {
 		PendingEntries:          17,
 		OldestPendingAgeSeconds: 134,
 	})
-	return st
+	return st, deps
 }
 
 // printStats renders the recorded snapshot with tab-aligned labels, Go-duration
 // age formatting, and a relative Updated timestamp.
 func TestPrintStats(t *testing.T) {
-	st := seedStatsState(t)
+	st, _ := seedStatsState(t)
 	var w bytes.Buffer
 	printStats(&w, st)
 	out := w.String()
@@ -87,12 +82,7 @@ func TestHumanAge(t *testing.T) {
 // A fresh state DB has no stats row; printStats renders all zeros, "0s" age,
 // and "never" for Updated, and the command exits 0.
 func TestPrintStatsEmptyDB(t *testing.T) {
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, deps := openTempState(t)
 
 	var w bytes.Buffer
 	printStats(&w, st)
@@ -112,7 +102,7 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 		}
 	}
 
-	if _, _, err := runCLI(t, "", "stats"); err != nil {
+	if _, _, err := runCLIWithDeps(t, deps, "", "stats"); err != nil {
 		t.Fatalf("stats on empty DB: err = %v, want nil", err)
 	}
 }
@@ -120,12 +110,12 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 // `relay stats` reads the seeded snapshot and exits 0; `relay stats extra` is a
 // usage error exiting 2; `relay stats --help` prints usage to stdout and exits 0.
 func TestStatsCommand(t *testing.T) {
-	seedStatsState(t)
-	if _, _, err := runCLI(t, "", "stats"); err != nil {
+	_, deps := seedStatsState(t)
+	if _, _, err := runCLIWithDeps(t, deps, "", "stats"); err != nil {
 		t.Fatalf("stats: err = %v, want nil", err)
 	}
 
-	if _, _, err := runCLI(t, "", "stats", "extra"); err == nil || !strings.Contains(err.Error(), "stats: too many arguments") {
+	if _, _, err := runCLIWithDeps(t, deps, "", "stats", "extra"); err == nil || !strings.Contains(err.Error(), "stats: too many arguments") {
 		t.Fatalf("stats extra: missing rejection error: %v", err)
 	}
 

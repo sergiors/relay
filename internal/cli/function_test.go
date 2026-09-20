@@ -11,17 +11,28 @@ import (
 	"relay/internal/state"
 )
 
-// seedTestState creates a temp state DB, redirects the package CLI path
-// (statePath) to it, and populates a ready function and a pending one. It
-// returns the opened state DB; later command/handler calls read the same path.
-func seedTestState(t *testing.T) *state.State {
+// openTempState opens a fresh temp state DB under per-test dependencies and
+// returns it with those deps. It replaces the former package-level statePath
+// global: each test owns its explicit temp locations, so no shared filesystem
+// state is mutated or restored.
+func openTempState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
+	deps := testDeps(t)
+	st, err := state.Open(deps.StatePath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	return st, deps
+}
+
+// seedTestState creates a temp state DB under test dependencies and populates a
+// ready function and a pending one. It returns the opened state DB and the deps
+// whose StatePath points at it, so command tests run with runCLIWithDeps read
+// exactly what the test seeded.
+func seedTestState(t *testing.T) (*state.State, Dependencies) {
+	t.Helper()
+	st, deps := openTempState(t)
 
 	tmpl, _ := function.ParseTemplate([]byte("runtime: python3.14\nevents:\n  - handler: events.created.handler\n    pattern:\n      event_name: [INSERT]\n    timeout: 6s\n  - handler: events.updated.handler\n    pattern:\n      event_name: [MODIFY]\n    timeout: 20s\n"))
 	readyFn := function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl}
@@ -30,25 +41,14 @@ func seedTestState(t *testing.T) *state.State {
 	nodeTmpl, _ := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
 	st.RecordDiscovered(function.Function{Name: "welcome-email-node", Dir: filepath.Join(t.TempDir(), "y"), Template: nodeTmpl})
 
-	return st
-}
-
-// openForTest opens the state DB the test just seeded at statePath.
-func openForTest(t *testing.T) *state.State {
-	t.Helper()
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st
+	return st, deps
 }
 
 // ls prints the header plus both rows with correct status/handlers, sorted.
 func TestFunctionListColumns(t *testing.T) {
-	seedTestState(t)
+	st, _ := seedTestState(t)
 	var w bytes.Buffer
-	if err := printList(&w, openForTest(t)); err != nil {
+	if err := printList(&w, st); err != nil {
 		t.Fatalf("printList: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(w.String()), "\n")
@@ -77,7 +77,7 @@ func TestFunctionListColumns(t *testing.T) {
 
 // inspect returns full detail including handlers and timeouts.
 func TestFunctionInspectDetail(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
@@ -107,7 +107,7 @@ func TestFunctionInspectDetail(t *testing.T) {
 
 // A pending function omits Image/Fingerprint/Prepared.
 func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	d, ok := st.GetFunction("welcome-email-node")
 	if !ok {
 		t.Fatal("expected pending function")
@@ -124,7 +124,7 @@ func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
 // and the Handlers section, using the same wider padding as Handlers for visual
 // grouping. The long label "Handler successes:" drives the value column.
 func TestFunctionInspectStatsSection(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	st.RecordFunctionStats(state.FunctionStats{
 		Function:             "user-events-python",
 		EventsProcessedTotal: 12493,
@@ -163,7 +163,7 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 // A function with no recorded stats still renders a predictable zero Stats
 // section rather than omitting it.
 func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
@@ -189,12 +189,7 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 // env/secret MAPPINGS (literal env values and secret references) but never a
 // secret VALUE.
 func TestFunctionInspectShowsEnvSecretsMappings(t *testing.T) {
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, _ := openTempState(t)
 
 	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
 env:
@@ -235,12 +230,7 @@ events:
 // A function with schedules renders a Schedules section after Events, showing
 // the verbatim cron expression, effective timezone, and resolved timeout.
 func TestFunctionInspectSchedulesSection(t *testing.T) {
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, _ := openTempState(t)
 
 	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
 events:
@@ -286,12 +276,7 @@ schedules:
 // inspect Schedules output.
 func inspectSchedules(t *testing.T, scheds string) string {
 	t.Helper()
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, _ := openTempState(t)
 
 	tmpl, err := function.ParseTemplate([]byte(`runtime: python3.14
 events:
@@ -384,7 +369,7 @@ func TestFunctionInspectSchedulesDescriptionFallback(t *testing.T) {
 
 // A template without schedules renders no Schedules: header.
 func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
@@ -431,12 +416,7 @@ func TestFunctionInspectServicesExplicit(t *testing.T) {
 
 // Services render after Schedules when both are present.
 func TestFunctionInspectServicesAfterSchedules(t *testing.T) {
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, _ := openTempState(t)
 
 	tmpl, err := function.ParseTemplate([]byte(`runtime: python3.14
 events:
@@ -470,7 +450,7 @@ services:
 
 // A template without services renders no Services: header.
 func TestFunctionInspectNoServicesHeader(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
@@ -493,12 +473,7 @@ func inspectServices(t *testing.T, svcs string) string {
 
 func inspectServicesWithEnv(t *testing.T, svcs string, withEnv bool) string {
 	t.Helper()
-	statePath = filepath.Join(t.TempDir(), "db.sqlite3")
-	st, err := state.Open(statePath)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st, _ := openTempState(t)
 
 	tmplBody := `runtime: python3.14
 events:
@@ -530,7 +505,7 @@ events:
 // longer errors — it shows help (see TestFunctionBareShowsHelp). An unknown
 // token and missing/extra arguments still return errors with messages.
 func TestFunctionCommandErrors(t *testing.T) {
-	_ = seedTestState(t)
+	_, deps := seedTestState(t)
 
 	for _, args := range [][]string{
 		{"function", "bogus"},
@@ -538,7 +513,7 @@ func TestFunctionCommandErrors(t *testing.T) {
 		{"function", "inspect"},
 		{"function", "inspect", "ghost"},
 	} {
-		_, _, err := runCLI(t, "", args...)
+		_, _, err := runCLIWithDeps(t, deps, "", args...)
 		if err == nil || err.Error() == "" {
 			t.Fatalf("args %v: missing returned error message", args)
 		}
@@ -580,8 +555,8 @@ func TestFunctionUnknownCommandFriendly(t *testing.T) {
 // returned error (the ExitErrHandler is a silent no-op); cmd/main.go prints it
 // and exits 1.
 func TestFunctionInspectUnknownMessage(t *testing.T) {
-	_ = seedTestState(t)
-	_, _, err := runCLI(t, "", "function", "inspect", "no-such-fn")
+	_, deps := seedTestState(t)
+	_, _, err := runCLIWithDeps(t, deps, "", "function", "inspect", "no-such-fn")
 	if err == nil || !strings.Contains(err.Error(), `unknown function "no-such-fn"`) {
 		t.Fatalf("returned error missing unknown-function message: %v", err)
 	}
@@ -605,8 +580,8 @@ func TestFunctionHelp(t *testing.T) {
 
 // `relay function ls` renders the table via the command path and exits 0.
 func TestFunctionLsCommand(t *testing.T) {
-	_ = seedTestState(t)
-	out, _, err := runCLI(t, "", "function", "ls")
+	_, deps := seedTestState(t)
+	out, _, err := runCLIWithDeps(t, deps, "", "function", "ls")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -617,8 +592,8 @@ func TestFunctionLsCommand(t *testing.T) {
 
 // `relay function inspect NAME` renders the detail via the command path.
 func TestFunctionInspectCommand(t *testing.T) {
-	_ = seedTestState(t)
-	out, _, err := runCLI(t, "", "function", "inspect", "user-events-python")
+	_, deps := seedTestState(t)
+	out, _, err := runCLIWithDeps(t, deps, "", "function", "inspect", "user-events-python")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -629,8 +604,8 @@ func TestFunctionInspectCommand(t *testing.T) {
 
 // `relay function inspect name extra` is a usage error (exit 2).
 func TestFunctionInspectTooManyArgs(t *testing.T) {
-	_ = seedTestState(t)
-	_, _, err := runCLI(t, "", "function", "inspect", "user-events-python", "extra")
+	_, deps := seedTestState(t)
+	_, _, err := runCLIWithDeps(t, deps, "", "function", "inspect", "user-events-python", "extra")
 	if err == nil || !strings.Contains(err.Error(), "function inspect: too many arguments") {
 		t.Fatalf("returned error missing usage error: %v", err)
 	}
@@ -659,7 +634,7 @@ func TestFunctionCommandHelp(t *testing.T) {
 // The Stats section renders the four per-function execution-history timestamps
 // as relative ages ("2s ago"-style rows) after the DLQ entries line.
 func TestFunctionInspectStatsTimestamps(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	exec := time.Now().Add(-2 * time.Second).UTC()
 	failure := time.Now().Add(-90 * time.Second).UTC()
 	dlq := time.Now().Add(-48 * time.Hour).UTC()
@@ -705,7 +680,7 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 // A function whose timestamps were never observed renders "never" instead of
 // an empty relative age.
 func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
-	st := seedTestState(t)
+	st, _ := seedTestState(t)
 	st.RecordFunctionStats(state.FunctionStats{Function: "user-events-python", EventsProcessedTotal: 3})
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {

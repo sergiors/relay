@@ -1140,10 +1140,13 @@ Secrets:
 
 `relay function inspect <name>` appends a compact **Runtime pool** section for
 the function. The cumulative acquire/discard counters always come from the
-persisted per-function stats row, so the standalone CLI renders them without
-access to the worker. When inspect runs inside the live worker process and has
-access to the pool snapshot provider, it additionally shows the authoritative
-live gauges:
+persisted per-function stats row under `/var/lib/relay` — never from a live
+provider or the socket — so the CLI renders them identically whether or not a
+worker is running. The authoritative **live** gauges are worker-local and are
+fetched over a Unix socket (`/run/relay/relay.sock`) that the running worker
+serves; when inspect runs in-process with a pool snapshot provider, it uses that
+for the live gauges directly instead of a socket round trip. With a worker
+reachable, inspect shows the live gauges:
 
 ```
 Runtime pool:
@@ -1171,10 +1174,9 @@ the active generation's capacity.
 cumulative Prometheus counters, persisted in the per-function stats snapshot and
 restored on worker restart so they stay monotonic.
 
-The standalone `relay function inspect` process has no access to the worker's
-in-memory pool, so it renders the cumulative counters from the persisted stats
-snapshot while marking the live gauges explicitly unavailable — never a stale
-number:
+When no worker is reachable (no socket, or the function has no live pool), the
+live gauges are rendered explicitly unavailable while the cumulative counters
+still come from the persisted stats snapshot — never a stale number:
 
 ```
 Runtime pool:
@@ -1187,9 +1189,30 @@ Runtime pool:
   Discarded:       2
 ```
 
-The live gauges are deliberately not persisted to SQLite (a persisted live
-gauge would go stale between flushes); only the cumulative counters are.
+Known live zero values render as `0`; only an unavailable worker renders
+`unknown`. The live gauges are deliberately not persisted to SQLite (a persisted
+live gauge would go stale between flushes); only the cumulative counters are.
 `Starting` is transient and is usually absent.
+
+### Runtime paths
+
+Relay separates **persistent** state from **ephemeral** runtime state:
+
+- `/var/lib/relay` — the volume-mounted persistent state: the SQLite database,
+  the secrets store, and the git material. It survives container restarts.
+- `/run/relay` — tmpfs-backed ephemeral process state that must not survive a
+  reboot:
+  - `/run/relay/relay.lock` — the process-level `flock` held by `relay start`
+    for the runtime lifetime. The kernel releases it on process exit, so a
+    leftover file is inert; keeping it on tmpfs keeps ephemeral coordination out
+    of the persistent volume.
+  - `/run/relay/relay.sock` — the live worker query socket. It serves only the
+    live runtime-pool gauges to `relay function inspect` (see above); it is
+    removed on graceful shutdown and replaced at the next start. `relay start`
+    creates `/run/relay` and takes the lock before the worker binds the socket,
+    so a second process fails the lock and never reaches (or removes) an active
+    worker's socket; a socket left by a `SIGKILL`ed worker is stale and is
+    safely replaced.
 
 ## Secrets
 
