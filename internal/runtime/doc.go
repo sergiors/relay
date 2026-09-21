@@ -24,6 +24,10 @@
 // in the state database. template.yaml is excluded from the build context so env
 // values and secret references are never baked into image layers.
 //
+// The build context stages exactly the function's selected source via the shared
+// internal/source policy (the function's .gitignore rules), the same selection
+// the fingerprint uses: an ignored file is neither hashed nor baked into a layer.
+//
 // Key Features:
 //   - A single reused Docker Engine client for every build and invocation
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;

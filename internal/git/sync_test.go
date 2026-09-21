@@ -318,6 +318,64 @@ func TestMonorepoSync(t *testing.T) {
 	}
 }
 
+// TestSyncHonorsGitignore pins end-to-end ignore handling: a function source
+// file excluded by .gitignore is NOT materialized, while the function's own
+// .gitignore is. The excluded file IS committed (go-git does not filter ignored
+// files from the index — verified by the fixture's explicit Add), so it truly
+// exists in the checkout: the exclusion is the shared source-selection policy,
+// not the file's absence from git.
+func TestSyncHonorsGitignore(t *testing.T) {
+	e := fixture(t, false)
+
+	r, err := git.PlainOpen(e.work)
+	if err != nil {
+		t.Fatalf("open work: %v", err)
+	}
+	wt, err := r.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	writeFile(t, filepath.Join(e.work, ".gitignore"), "*.log\n")
+	writeFile(t, filepath.Join(e.work, "fn", ".gitignore"), "*.tmp\n")
+	writeFile(t, filepath.Join(e.work, "fn", "debug.log"), "noise\n")
+	writeFile(t, filepath.Join(e.work, "fn", "scratch.tmp"), "noise\n")
+	writeFile(t, filepath.Join(e.work, "fn", "handler.js"), "export function h(){}\n")
+	for _, p := range []string{".gitignore", "fn/.gitignore", "fn/debug.log", "fn/scratch.tmp", "fn/handler.js"} {
+		if _, err := wt.Add(p); err != nil {
+			t.Fatalf("add %s: %v", p, err)
+		}
+	}
+	commit(t, wt, "add ignore rules")
+	h, _ := r.Head()
+	mustSetRef(t, r, "refs/heads/main", h.Hash())
+	seedBare(t, e)
+
+	mustSync(t, e, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
+
+	if _, err := os.Stat(filepath.Join(e.functions, "fn", "template.yaml")); err != nil {
+		t.Fatalf("function not materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.functions, "fn", "handler.js")); err != nil {
+		t.Fatalf("included source not materialized: %v", err)
+	}
+	// The root rule excludes debug.log; the function rule excludes scratch.tmp.
+	if _, err := os.Stat(filepath.Join(e.functions, "fn", "debug.log")); !os.IsNotExist(err) {
+		t.Fatalf("root .gitignore rule not applied during materialization; stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.functions, "fn", "scratch.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("function .gitignore rule not applied during materialization; stat err = %v", err)
+	}
+	// The function's own policy travels with it so later builds/fingerprints
+	// apply the same rules.
+	if _, err := os.Stat(filepath.Join(e.functions, "fn", ".gitignore")); err != nil {
+		t.Fatalf("function .gitignore not materialized with the function: %v", err)
+	}
+	// The root .gitignore lives outside the function dir and is not copied.
+	if _, err := os.Stat(filepath.Join(e.functions, ".gitignore")); err == nil {
+		t.Fatal("root .gitignore must not be copied into the materialized function")
+	}
+}
+
 // TestSyncLoadsFunctionLoader verifies the materialized output loads cleanly
 // with the real function loader, proving format compatibility without
 // duplicating loader logic.

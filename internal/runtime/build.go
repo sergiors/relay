@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 
 	"relay/internal/function"
 	"relay/internal/runtime/plan"
+	"relay/internal/source"
 )
 
 // renderDockerfile is the ONLY Dockerfile renderer, shared by every engine; an
@@ -95,6 +97,7 @@ func buildImage(
 	p plan.BuildPlan,
 	image string,
 	labels map[string]string,
+	sel *source.Selection,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
@@ -102,14 +105,21 @@ func buildImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	// Copy the function directory into the context, EXCLUDING template.yaml.
-	// The template is Relay configuration (runtime, rules, env values, secret
-	// references), not function source: baking it into the image would embed env
-	// values and secret references in the image layers. The fingerprint still
-	// covers template.yaml (its content gates rebuilds), but the image never
-	// contains it. Generated plan files are written separately, so the user's
-	// function directory is never modified.
-	if err := copyDir(fn.Dir, ctxDir, map[string]bool{"template.yaml": true}); err != nil {
+	// sel is the SAME source-selection policy the caller fingerprinted, so the
+	// image contains exactly the selected source: files excluded by the
+	// function's .gitignore rules are never baked into the image and the
+	// applicable ignore files are. Resolving it once in the caller keeps the
+	// fingerprint and the context from racing a concurrent rule edit. Staging is
+	// read-only; the user's function directory is never modified.
+	//
+	// Copy the selected function sources into the context, EXCLUDING
+	// template.yaml. The template is Relay configuration (runtime, rules, env
+	// values, secret references), not function source: baking it into the image
+	// would embed env values and secret references in the image layers. The
+	// fingerprint still covers template.yaml (its content gates rebuilds), but the
+	// image never contains it. Generated plan files are written separately, so the
+	// user's function directory is never modified.
+	if err := copySourceDir(sel, ctxDir); err != nil {
 		return fmt.Errorf("function %q: copy sources: %w", name, err)
 	}
 
@@ -349,34 +359,41 @@ func tarContext(ctxDir string) (io.Reader, error) {
 	return &buf, nil
 }
 
-// copyDir copies src into dst, skipping any file whose slash-separated relative
-// path is in skip AND any file named template.yaml anywhere in the tree (the
-// exclusion is by base name so a nested template.yaml can never leak Relay
-// configuration — including env values and secret references — into an image;
-// the loader only ever reads the top-level one, so nested copies are dead
-// weight at best). It is used to stage a function directory into a build
-// context.
-func copyDir(src, dst string, skip map[string]bool) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+// copySourceDir stages the SELECTED function source into the build context. It
+// walks the shared selection (so files excluded by the function's .gitignore
+// rules are never copied and the applicable ignore files are) and additionally
+// skips any file named template.yaml anywhere in the tree. That exclusion is by
+// base name so a nested template.yaml can never leak Relay configuration —
+// including env values and secret references — into an image; the loader only
+// ever reads the top-level one, so nested copies are dead weight at best.
+func copySourceDir(sel *source.Selection, dst string) error {
+	return sel.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(sel.Dir(), path)
 		if err != nil {
 			return err
 		}
 		if rel == "." {
 			return nil
 		}
-		if skip[filepath.ToSlash(rel)] || filepath.Base(rel) == "template.yaml" {
-			if info.IsDir() {
+		if filepath.Base(rel) == "template.yaml" {
+			if d.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
+		}
 		target := filepath.Join(dst, rel)
-		if info.IsDir() {
+		if d.IsDir() {
 			return os.MkdirAll(target, info.Mode())
+		}
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		return copyFile(path, target, info.Mode())
 	})

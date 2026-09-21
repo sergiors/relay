@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"relay/internal/source"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -167,5 +169,103 @@ func TestFingerprintUnreadableFileErrors(t *testing.T) {
 	}
 	if _, err := Fingerprint(dir); err == nil {
 		t.Fatal("expected error for unreadable file")
+	}
+}
+
+// TestFingerprintIgnoresIgnoredSource pins the core selection guarantee: bytes
+// of a file excluded by the function's .gitignore are NOT hashed, so editing or
+// removing it cannot force a rebuild.
+func TestFingerprintIgnoresIgnoredSource(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	writeFile(t, filepath.Join(dir, "debug.log"), "noise v1\n")
+	base := fp(t, dir)
+
+	// Editing an ignored file must not change the digest.
+	writeFile(t, filepath.Join(dir, "debug.log"), "noise v2\n")
+	if got := fp(t, dir); got != base {
+		t.Fatal("editing an ignored file must not change the fingerprint")
+	}
+
+	// Adding and removing an ignored file must not change the digest.
+	writeFile(t, filepath.Join(dir, "sub", "trace.log"), "more noise\n")
+	if got := fp(t, dir); got != base {
+		t.Fatal("adding an ignored file must not change the fingerprint")
+	}
+	if err := os.Remove(filepath.Join(dir, "sub", "trace.log")); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if got := fp(t, dir); got != base {
+		t.Fatal("removing an ignored file must not change the fingerprint")
+	}
+}
+
+// TestFingerprintTracksIgnoreRuleContent pins the change-detection half of the
+// contract: the applicable .gitignore files ARE hashed, so editing a rule changes
+// the digest even when no included file changes. Without this, a rule-only edit
+// (which can change which files are source) would be invisible to the
+// reconciler.
+func TestFingerprintTracksIgnoreRuleContent(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
+	writeFile(t, filepath.Join(dir, "handler.py"), "def handler(e): return 1\n")
+	base := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n*.tmp\n")
+	if got := fp(t, dir); got == base {
+		t.Fatal("editing an applicable .gitignore must change the fingerprint")
+	}
+}
+
+func TestFingerprintTracksAncestorIgnoreAfterSubselection(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "services", "fn")
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "handler.js"), "export const x = 1\n")
+
+	sel, err := source.New(root, dir)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	before, err := FingerprintSelection(sel)
+	if err != nil {
+		t.Fatalf("before: %v", err)
+	}
+	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nchanged-policy\n")
+	after, err := FingerprintSelection(sel)
+	if err != nil {
+		t.Fatalf("after: %v", err)
+	}
+	if before == after {
+		t.Fatal("ancestor ignore content must affect a subtree fingerprint")
+	}
+}
+
+// TestFingerprintNestedIgnoreRuleChangeDetected proves a nested .gitignore's
+// content is also policy: it changes the digest, and it correctly controls which
+// files under its directory are hashed.
+func TestFingerprintNestedIgnoreRuleChangeDetected(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
+	writeFile(t, filepath.Join(dir, "pkg", ".gitignore"), "*.tmp\n")
+	writeFile(t, filepath.Join(dir, "pkg", "handler.py"), "x=1\n")
+	writeFile(t, filepath.Join(dir, "pkg", "scratch.tmp"), "noise\n")
+	base := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "pkg", ".gitignore"), "*.tmp\n*.bak\n")
+	if got := fp(t, dir); got == base {
+		t.Fatal("editing a nested .gitignore must change the fingerprint")
+	}
+
+	// The nested rule excludes the file under it: editing that file does not
+	// change the digest (compare against a fresh baseline with the new rule).
+	withNewRule := fp(t, dir)
+	writeFile(t, filepath.Join(dir, "pkg", "scratch.tmp"), "different noise\n")
+	if got := fp(t, dir); got != withNewRule {
+		t.Fatal("editing a file ignored by a nested rule must not change the fingerprint")
 	}
 }

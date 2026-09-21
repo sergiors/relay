@@ -5,8 +5,10 @@
 //   - Validation: templates are parsed and validated, including per-rule
 //     timeout resolution and handler form
 //   - Matching: rules pair handlers with patterns evaluated against events
-//   - Fingerprinting: a deterministic hash of a function's contents gates
-//     reconciler rebuilds
+//   - Fingerprinting: a deterministic hash of a function's SELECTED source
+//     (internal/source: files included after applying the function's .gitignore
+//     rules) gates reconciler rebuilds; applicable ignore files are hashed too,
+//     so a rule edit is a source change
 //
 // Key Features:
 //   - A rule that omits a timeout resolves to DefaultTimeout; zero, negative,

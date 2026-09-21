@@ -18,8 +18,12 @@
 // Only `relay git sync` ever modifies /functions. When a git source is
 // configured and a sync has run, /functions is treated as fully managed by git:
 // a sync rewrites it to reflect exactly the configured repository/path, removing
-// any directory it does not contain (the "deterministic replace" rule). See
-// Sync's documentation and README.md "Git" for the precise contract.
+// any directory it does not contain (the "deterministic replace" rule). Source
+// selection honors .gitignore rules via the shared internal/source policy: an
+// ignored function directory is not materialized and an ignored file inside a
+// function is not copied, while the applicable .gitignore files themselves are
+// copied (they are the policy). See Sync's documentation and README.md "Git" for
+// the precise contract.
 //
 // Transport model: production sync authenticates over SSH only, using a local
 // ed25519 deploy key whose host verification uses Trust On First Use (TOFU)

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"relay/internal/runtime/plan"
+	"relay/internal/source"
 )
 
 // TestBuildImageOptionsRemoveIntermediateContainers verifies that Relay's build
@@ -286,9 +287,13 @@ func TestCopyDirSkipsTemplateYaml(t *testing.T) {
 		t.Fatalf("write nested template: %v", err)
 	}
 
+	sel, err := source.ForDir(src)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
 	dst := t.TempDir()
-	if err := copyDir(src, dst, map[string]bool{"template.yaml": true}); err != nil {
-		t.Fatalf("copyDir: %v", err)
+	if err := copySourceDir(sel, dst); err != nil {
+		t.Fatalf("copySourceDir: %v", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(dst, "template.yaml")); !os.IsNotExist(err) {
@@ -301,5 +306,45 @@ func TestCopyDirSkipsTemplateYaml(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dst, want)); err != nil {
 			t.Errorf("expected %s copied, got: %v", want, err)
 		}
+	}
+}
+
+// TestCopySourceDirHonorsSelection verifies the build context stages exactly the
+// selected source: files excluded by the function's .gitignore never reach the
+// image, the applicable .gitignore itself does, and template.yaml is still
+// excluded (Relay configuration must not leak into a layer).
+func TestCopySourceDirHonorsSelection(t *testing.T) {
+	src := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(src, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write(".gitignore", "*.log\ntemplate.yaml-ignored\n")
+	write("template.yaml", "runtime: node24\n")
+	write("index.js", "export function h(){}\n")
+	write("debug.log", "noise\n")
+
+	sel, err := source.ForDir(src)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	dst := t.TempDir()
+	if err := copySourceDir(sel, dst); err != nil {
+		t.Fatalf("copySourceDir: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dst, "template.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("template.yaml must be excluded from the build context, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "debug.log")); !os.IsNotExist(err) {
+		t.Fatalf("ignored file must be excluded from the build context, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "index.js")); err != nil {
+		t.Errorf("included source missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".gitignore")); err != nil {
+		t.Errorf("applicable .gitignore must be staged so the policy travels: %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
+
+	"relay/internal/source"
 )
 
 // gitOps is the seam isolating the transport operations sync drives (clone,
@@ -57,9 +60,12 @@ type gitRepo interface {
 //     fetches origin with Force+Prune+AllTags so removed branches/tags drop.
 //  4. Resolves the configured ref to a commit and hard-checks-out it (detached
 //     HEAD, Force). NEVER pulls — a pull could produce merge state.
-//  5. Locates the functions source (repo root or validated monorepo Path).
+//  5. Locates the functions source (repo root or validated monorepo Path) and
+//     resolves the shared source-selection policy (.gitignore rules anchored at
+//     the checkout root; see internal/source).
 //  6. Materializes /functions deterministically: copy/refresh each function
-//     directory, remove any directory not in the source (see materialize).
+//     directory, skipping files excluded by the selection policy, and remove any
+//     directory not in the source (see materialize).
 //  7. Records LastSyncedCommit/LastSyncedAt/Synced in the persisted config,
 //     atomically, after materialization succeeds.
 //
@@ -241,8 +247,21 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
+	// Resolve the source-selection policy once and share it with
+	// materialization: the checkout root anchors ancestor .gitignore rules (so a
+	// root-level rule governs a monorepo subtree exactly as git would), and the
+	// selected dir scopes the walk. A missing source dir is the hard missing-source
+	// failure materialize reports; a missing .gitignore is not an error.
+	sel, err := source.New(opts.CheckoutDir, srcDir)
+	if err != nil {
+		if errors.Is(err, source.ErrNotExist) {
+			return fmt.Errorf("git: source dir %q does not exist in the checkout", srcDir)
+		}
+		return err
+	}
+
 	// Materialize /functions deterministically.
-	materialized, removed, err := materialize(srcDir, opts.FunctionsDir)
+	materialized, removed, err := materialize(sel, opts.FunctionsDir)
 	if err != nil {
 		return err
 	}

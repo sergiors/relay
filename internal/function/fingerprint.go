@@ -7,52 +7,95 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
+
+	"relay/internal/source"
 )
 
 // Fingerprint returns a deterministic SHA-256 over the complete contents of the
-// function directory: every file's slash-separated relative path plus its bytes,
-// sorted by path. Renames (path change), adds, removes, and content edits all
+// function's SELECTED source: every included file's slash-separated relative path
+// plus its bytes, sorted by path.
+//
+// Selection is the shared source policy (internal/source): the function's own
+// .gitignore rules decide which files under dir are source. A file the rules
+// ignore is not source, so its bytes never enter the digest — editing or removing
+// it cannot force a rebuild. The applicable .gitignore files themselves ARE source
+// (the policy is an input to selection), so their content is hashed: editing a
+// rule changes the digest, which is exactly the change-detection guarantee a
+// rule-only edit needs (a rule edit can alter the source set without any included
+// file changing).
+//
+// Renames (path change), adds, removes, and content edits to included files all
 // change the digest. File permissions are intentionally excluded: mode changes
 // are rare and do not alter the image inputs (the build copies dirs wholesale).
-// An unreadable file is surfaced as an error so the reconciler can retain the
-// previous version rather than guessing.
+// An unreadable included file — or an unreadable .gitignore — is surfaced as an
+// error so the reconciler can retain the previous version rather than guessing.
 func Fingerprint(dir string) (string, error) {
-	var paths []string
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	sel, err := source.ForDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("select %q: %w", dir, err)
+	}
+	return FingerprintSelection(sel)
+}
+
+// FingerprintSelection fingerprints an already-resolved source selection. It is
+// the seam the manager uses when it has already selected a function's source (so
+// the policy is not re-derived), and it keeps the hashing logic in one place.
+func FingerprintSelection(sel *source.Selection) (string, error) {
+	// Collect the included files as (hash path, filesystem path) pairs. The hash
+	// path is root-relative and slash-separated so the serialization is canonical
+	// and independent of how the walk produced absolute paths.
+	type entry struct{ rel, path string }
+	var entries []entry
+	err := sel.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
-		rel, err := filepath.Rel(dir, path)
+		rel, err := sel.Rel(path)
 		if err != nil {
 			return err
 		}
-		paths = append(paths, filepath.ToSlash(rel))
+		entries = append(entries, entry{rel: rel, path: path})
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("walk %q: %w", dir, err)
+		return "", fmt.Errorf("walk %q: %w", sel.Dir(), err)
 	}
-	sort.Strings(paths)
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		seen[e.rel] = true
+	}
+	// A subtree walk cannot visit policy files above the selected directory,
+	// but those files still affect the selected source and must be versioned.
+	for _, path := range sel.ApplicableIgnoreFiles() {
+		rel, err := sel.Rel(path)
+		if err != nil {
+			continue
+		}
+		if seen[rel] {
+			continue
+		}
+		entries = append(entries, entry{rel: rel, path: path})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 
 	h := sha256.New()
-	for _, rel := range paths {
-		io.WriteString(h, rel)
+	for _, e := range entries {
+		io.WriteString(h, e.rel)
 		h.Write([]byte{0})
-		f, err := os.Open(filepath.Join(dir, filepath.FromSlash(rel)))
+		f, err := os.Open(e.path)
 		if err != nil {
-			return "", fmt.Errorf("read %q: %w", rel, err)
+			return "", fmt.Errorf("read %q: %w", e.rel, err)
 		}
 		if _, err := io.Copy(h, f); err != nil {
 			_ = f.Close()
-			return "", fmt.Errorf("read %q: %w", rel, err)
+			return "", fmt.Errorf("read %q: %w", e.rel, err)
 		}
 		if err := f.Close(); err != nil {
-			return "", fmt.Errorf("close %q: %w", rel, err)
+			return "", fmt.Errorf("close %q: %w", e.rel, err)
 		}
 		h.Write([]byte{0})
 	}

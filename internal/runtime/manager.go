@@ -17,6 +17,7 @@ import (
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
+	"relay/internal/source"
 )
 
 // arch and platform are the build-host architecture keys for the dependency
@@ -349,7 +350,15 @@ type Prepared struct {
 // done up front: a failed prepare must not lift a removal, or a stale acquire
 // could warm a function the reconciler has not actually reconciled.
 func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared, error) {
-	fp, err := function.Fingerprint(fn.Dir)
+	// Resolve the source-selection policy ONCE and share it with the
+	// fingerprint and the build context: both must select exactly the same files
+	// (the function's .gitignore rules), and resolving a single Selection keeps
+	// them from disagreeing if a rule file is edited concurrently.
+	sel, err := source.ForDir(fn.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
+	}
+	fp, err := function.FingerprintSelection(sel)
 	if err != nil {
 		return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
 	}
@@ -443,7 +452,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	}
 
 	start := time.Now()
-	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash)); err != nil {
+	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash), sel); err != nil {
 		d := time.Since(start)
 		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
