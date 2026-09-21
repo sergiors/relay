@@ -411,3 +411,150 @@ func TestRoutingLabelsMatch(t *testing.T) {
 		t.Error("routed desired vs unlabeled container must not match")
 	}
 }
+
+// A routed service with a path reaches the started container with the exact
+// PathPrefix rule and the StripPrefix middleware referenced by the router.
+func TestReconcileRoutedPathLabels(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "service.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no started container")
+	}
+	id := "relay-fn-service-js"
+	mw := "relay-fn-service-js-path"
+	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`service.test`) && PathPrefix(`/v2`)" {
+		t.Fatalf("rule = %q", got)
+	}
+	if got := c.labels[routingRouterPrefix+id+".middlewares"]; got != mw {
+		t.Fatalf("middlewares = %q, want %q", got, mw)
+	}
+	if got := c.labels["traefik.http.middlewares."+mw+".stripprefix.prefixes"]; got != "/v2" {
+		t.Fatalf("stripprefix.prefixes = %q, want /v2", got)
+	}
+}
+
+// Two services on the same host with different paths start with distinct router
+// and middleware labels (no collision).
+func TestReconcileSameHostDifferentPathsDistinct(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24",
+		function.Service{Entrypoint: "v1.js", Port: 3000, Replicas: 1, Host: "same.test", Path: "/v1"},
+		function.Service{Entrypoint: "v2.js", Port: 3000, Replicas: 1, Host: "same.test", Path: "/v2"},
+	)
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	v1 := f.lastStartedFor("fn", "v1.js")
+	v2 := f.lastStartedFor("fn", "v2.js")
+	if v1 == nil || v2 == nil {
+		t.Fatal("expected both containers started")
+	}
+	if v1.labels[routingRouterPrefix+"relay-fn-v1-js.rule"] != "Host(`same.test`) && PathPrefix(`/v1`)" {
+		t.Fatalf("v1 rule = %q", v1.labels[routingRouterPrefix+"relay-fn-v1-js.rule"])
+	}
+	if v2.labels[routingRouterPrefix+"relay-fn-v2-js.rule"] != "Host(`same.test`) && PathPrefix(`/v2`)" {
+		t.Fatalf("v2 rule = %q", v2.labels[routingRouterPrefix+"relay-fn-v2-js.rule"])
+	}
+	v1mw := v1.labels[routingRouterPrefix+"relay-fn-v1-js.middlewares"]
+	v2mw := v2.labels[routingRouterPrefix+"relay-fn-v2-js.middlewares"]
+	if v1mw == "" || v1mw == v2mw {
+		t.Fatalf("same-host services must not share a middleware name: %q vs %q", v1mw, v2mw)
+	}
+}
+
+// Changing a service path makes the running container stale: it is stopped and
+// replaced with one carrying the new PathPrefix rule and middleware.
+func TestReconcilePathChangeReplaces(t *testing.T) {
+	f := newFakeDocker()
+	start := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v1",
+	})
+	if _, err := reconcile(t, f, "fn", start, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile v1: %v", err)
+	}
+
+	changed := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", changed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile v2: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want one replaced container", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	id := "relay-fn-service-js"
+	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`) && PathPrefix(`/v2`)" {
+		t.Fatalf("replacement rule = %q", got)
+	}
+	if got := c.labels["traefik.http.middlewares."+id+"-path.stripprefix.prefixes"]; got != "/v2" {
+		t.Fatalf("replacement stripprefix = %q", got)
+	}
+}
+
+// Removing a path (back to host-only) makes the path-routed container stale: it
+// is replaced with the legacy host-only label set and no middleware labels.
+func TestReconcilePathRemovedReplacesWithoutMiddleware(t *testing.T) {
+	f := newFakeDocker()
+	routed := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", routed, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile path: %v", err)
+	}
+
+	hostOnly := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test",
+	})
+	if _, err := reconcile(t, f, "fn", hostOnly, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile host-only: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the path-routed container replaced", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil {
+		t.Fatal("no replacement container")
+	}
+	id := "relay-fn-service-js"
+	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`)" {
+		t.Fatalf("replacement host-only rule = %q", got)
+	}
+	for k := range c.labels {
+		if strings.Contains(k, "middlewares") || strings.Contains(k, "stripprefix") {
+			t.Fatalf("host-only replacement must carry no middleware labels: %v", c.labels)
+		}
+	}
+}
+
+// A converged path-routed state is a no-op: identical path labels keep the
+// container (no churn).
+func TestReconcilePathConvergedNoOp(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{
+		Entrypoint: "service.js", Port: 3000, Replicas: 1, Host: "a.test", Path: "/v2",
+	})
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stopsSoFar := len(f.stops)
+	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{Network: "proxy"})
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if changed {
+		t.Fatal("converged path-routed state must be a no-op (changed = false)")
+	}
+	if len(f.stops) != stopsSoFar {
+		t.Fatalf("stops grew from %d to %d on a converged pass", stopsSoFar, len(f.stops))
+	}
+}

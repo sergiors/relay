@@ -214,12 +214,15 @@ func Reconcile(
 				}
 				continue
 			}
-			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Port, traefik)
+			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Path, svc.Port, traefik)
 			routeNetwork = traefik.Network
 			if log != nil {
 				// Optional routing values log only when set, omitting empty
 				// ones; the generated labels themselves are never logged.
 				var attrs []any
+				if svc.Path != "" {
+					attrs = append(attrs, "path", svc.Path)
+				}
 				if traefik.EntryPoints != "" {
 					attrs = append(attrs, "entrypoints", traefik.EntryPoints)
 				}
@@ -245,8 +248,8 @@ func Reconcile(
 		// removing, a changed image (rebuild), a changed port, or an unlabeled
 		// legacy container (Replica == -1) — is stale and must be replaced. In
 		// addition, the container's labels must match the desired routing label
-		// set exactly: a changed host/port/network leaves stale Traefik labels
-		// pointing traffic at whatever the old container served, so the
+		// set exactly: a changed host/path/port/network leaves stale Traefik
+		// labels pointing traffic at whatever the old container served, so the
 		// container is replaced.
 		var candidates []runtime.ServiceContainer
 		var stale []runtime.ServiceContainer

@@ -85,10 +85,11 @@ type Schedule struct {
 }
 
 // Service is one persistent service's effective configuration as persisted
-// from the template: the application entrypoint file, its internal TCP port,
-// and the desired replica count.
+// from the template: the application entrypoint file, the optional routing path
+// prefix, its internal TCP port, and the desired replica count.
 type Service struct {
 	Entrypoint string
+	Path       string
 	Port       int
 	Replicas   int
 }
@@ -183,8 +184,9 @@ func (c *State) SetLogger(l *slog.Logger) {
 // Close releases the underlying connection pool. It is non-fatal on error.
 func (c *State) Close() error { return c.db.Close() }
 
-// initSchema creates the tables idempotently. Plain SQL, no migration
-// framework: these tables are internal local state and are safe to recreate.
+// initSchema creates the current tables if they do not already exist, so a
+// fresh database is initialized with the current schema. Plain SQL: these
+// tables are internal local state and are (re)created on first open.
 func (c *State) initSchema(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS functions (
@@ -204,8 +206,8 @@ func (c *State) initSchema(ctx context.Context) error {
 		// handlers is keyed by function_name but carries no foreign key: cleanup
 		// is explicit (removeTx), not relational. A relational ON DELETE CASCADE
 		// was considered but rejected: it would require PRAGMA foreign_keys=ON on
-		// every pooled connection (modernc applies DSN pragmas per connection) and
-		// migrating existing databases, and — decisively — the data model lets
+		// every pooled connection (modernc applies DSN pragmas per connection),
+		// and — decisively — the data model lets
 		// function_stats rows exist for a name without a functions row
 		// (RecordFunctionStats is a standalone upsert used by the CLI/tests and by
 		// callers that snapshot per-function counters directly), which FK
@@ -236,6 +238,7 @@ func (c *State) initSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS services (
 			function_name TEXT,
 			entrypoint TEXT,
+			path TEXT,
 			port INTEGER,
 			replicas INTEGER,
 			PRIMARY KEY (function_name, entrypoint)
@@ -247,8 +250,8 @@ func (c *State) initSchema(ctx context.Context) error {
 		// fixed single-row id and the write timestamp updated_at — while the
 		// evolving counter/gauge payload is the JSON object in data (see Stats
 		// and stats_json.go). JSON, not a column per field: the payload grows
-		// as instrumentation is added, and an ALTER-free schema keeps old rows
-		// readable (absent fields decode to zero).
+		// as instrumentation is added without changing the schema, and absent
+		// fields decode to zero.
 		`CREATE TABLE IF NOT EXISTS stats (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			data TEXT,
@@ -276,150 +279,7 @@ func (c *State) initSchema(ctx context.Context) error {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
-	// Idempotent migration for databases created before the env/secrets columns
-	// existed: CREATE TABLE IF NOT EXISTS does not add columns to an existing
-	// table, so check PRAGMA table_info and ALTER TABLE ADD COLUMN when missing.
-	// Plain SQL, consistent with the "no migration framework" comment above.
-	if err := c.migrateFunctionsColumns(ctx); err != nil {
-		return err
-	}
-	// Idempotent migration for the services-handler -> services-entrypoint
-	// rename (see migrateServicesHandlerToEntrypoint).
-	if err := c.migrateServicesHandlerToEntrypoint(ctx); err != nil {
-		return err
-	}
 	return nil
-}
-
-// migrateFunctionsColumns adds the env and secrets columns to an existing
-// functions table that predates them. It is idempotent: each column is added
-// only when PRAGMA table_info reports it missing (see addColumnIfMissing, which
-// also tolerates a concurrent Open winning the same ALTER).
-func (c *State) migrateFunctionsColumns(ctx context.Context) error {
-	for _, col := range []string{"env", "secrets"} {
-		if err := c.addColumnIfMissing(ctx, "functions", col, "TEXT"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// tableColumns returns the set of column names on table via PRAGMA table_info.
-// Plain SQL, consistent with the "no migration framework" comment above.
-func (c *State) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
-	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
-	if err != nil {
-		return nil, fmt.Errorf("migrate: read %s columns: %w", table, err)
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull int
-		var dflt any
-		var pk int
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("migrate: scan %s column: %w", table, err)
-		}
-		have[name] = true
-	}
-	_ = rows.Close()
-	return have, nil
-}
-
-// addColumnIfMissing adds col (decl is the full column declaration, e.g.
-// "INTEGER NOT NULL DEFAULT 0") to table when PRAGMA table_info does not
-// already report it.
-func (c *State) addColumnIfMissing(ctx context.Context, table, col, decl string) error {
-	have, err := c.tableColumns(ctx, table)
-	if err != nil {
-		return err
-	}
-	if have[col] {
-		return nil
-	}
-	return c.execAddColumn(ctx, table, col, decl)
-}
-
-// execAddColumn runs the ADD COLUMN, tolerating the concurrent-Open race: two
-// Open calls (in-process or a CLI alongside the worker) can both observe the
-// column missing and both attempt the ALTER, and SQLite rejects the loser with a
-// duplicate-column error. Rather than parse that error string, on failure PRAGMA
-// is re-read: a column that now exists is a concurrent migrator's win and is
-// treated as success, while any genuine failure (still missing) is returned.
-// This keeps the existing PRAGMA-then-ALTER style without a lock or migration
-// framework.
-func (c *State) execAddColumn(ctx context.Context, table, col, decl string) error {
-	if _, err := c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+col+` `+decl); err != nil {
-		// Lost a concurrent ALTER: a column that now exists means the schema is
-		// already correct despite our duplicate-column error.
-		if have, rerr := c.tableColumns(ctx, table); rerr == nil && have[col] {
-			return nil
-		}
-		return fmt.Errorf("migrate: add column %s.%s: %w", table, col, err)
-	}
-	return nil
-}
-
-// migrateServicesHandlerToEntrypoint renames the services table's handler column
-// to entrypoint for databases that predate the rename. Renaming a PRIMARY KEY
-// column in SQLite requires a table rebuild (ALTER TABLE RENAME COLUMN cannot
-// rename a column that is part of an index, including a primary key), so it
-// creates a new services table with the entrypoint column, copies every row
-// (handler AS entrypoint), drops the old table, and renames the new one. It is
-// idempotent: it runs only when PRAGMA table_info(services) reports the
-// entrypoint column is missing (an already-migrated table has it). It runs in a
-// transaction so a partial failure never leaves a half-migrated database.
-func (c *State) migrateServicesHandlerToEntrypoint(ctx context.Context) error {
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("migrate: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var haveEntrypoint bool
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(services)`)
-	if err != nil {
-		return fmt.Errorf("migrate: read services columns: %w", err)
-	}
-	for rows.Next() {
-		var name, ctype string
-		var cid, notnull, pk int
-		var dflt any
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("migrate: scan service column: %w", err)
-		}
-		if name == "entrypoint" {
-			haveEntrypoint = true
-		}
-	}
-	_ = rows.Close()
-	if haveEntrypoint {
-		// Already migrated; nothing to do.
-		return nil
-	}
-
-	for _, stmt := range []string{
-		`DROP TABLE IF EXISTS services_new`,
-		`CREATE TABLE services_new (
-			function_name TEXT,
-			entrypoint TEXT,
-			port INTEGER,
-			replicas INTEGER,
-			PRIMARY KEY (function_name, entrypoint)
-		)`,
-		`INSERT INTO services_new (function_name, entrypoint, port, replicas)
-		 SELECT function_name, handler AS entrypoint, port, replicas FROM services`,
-		`DROP TABLE services`,
-		`ALTER TABLE services_new RENAME TO services`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migrate: rename services handler->entrypoint: %w", err)
-		}
-	}
-	return tx.Commit()
 }
 
 // now returns the current UTC time in RFC3339. It is the package-level default
@@ -803,7 +663,7 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	}
 
 	srows2, err := c.db.QueryContext(ctx,
-		`SELECT entrypoint, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, port`, name)
+		`SELECT entrypoint, path, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, port`, name)
 	if err != nil {
 		c.log.Warn("State: services read failed", "function", name, "error", err)
 		return d, true
@@ -811,12 +671,13 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	defer srows2.Close()
 	for srows2.Next() {
 		var se string
+		var sePath sql.NullString
 		var sp, sr int
-		if err := srows2.Scan(&se, &sp, &sr); err != nil {
+		if err := srows2.Scan(&se, &sePath, &sp, &sr); err != nil {
 			c.log.Warn("State: scan service failed", "function", name, "error", err)
 			continue
 		}
-		d.Services = append(d.Services, Service{Entrypoint: se, Port: sp, Replicas: sr})
+		d.Services = append(d.Services, Service{Entrypoint: se, Path: sePath.String, Port: sp, Replicas: sr})
 	}
 	return d, true
 }
@@ -898,16 +759,17 @@ func replaceSchedules(tx *sql.Tx, name string, tmpl *function.Template) error {
 }
 
 // replaceServices deletes a function's services and re-inserts them from the
-// template, so the service list always mirrors the latest parsed template. Port
-// and replicas are stored as their effective integer values (defaults included).
+// template, so the service list always mirrors the latest parsed template. Path
+// is stored as its canonical string (empty = host-only routing); port and
+// replicas as their effective integer values (defaults included).
 func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
 	if _, err := tx.Exec(`DELETE FROM services WHERE function_name = ?`, name); err != nil {
 		return err
 	}
 	for _, s := range tmpl.Services {
 		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO services (function_name, entrypoint, port, replicas) VALUES (?,?,?,?)`,
-			name, s.Entrypoint, s.Port, s.Replicas); err != nil {
+			`INSERT OR REPLACE INTO services (function_name, entrypoint, path, port, replicas) VALUES (?,?,?,?,?)`,
+			name, s.Entrypoint, s.Path, s.Port, s.Replicas); err != nil {
 			return err
 		}
 	}

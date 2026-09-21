@@ -445,6 +445,27 @@ func TestFunctionInspectServicesExplicit(t *testing.T) {
 	}
 }
 
+// A configured path renders alongside port/replicas; a host-only service keeps
+// the pre-path rendering with no path token.
+func TestFunctionInspectServicesPath(t *testing.T) {
+	out := inspectServices(t, `  - entrypoint: v2.js
+    host: api.example.com
+    path: /v2
+    port: 3000
+  - entrypoint: plain.js
+    port: 80
+`)
+	if !strings.Contains(out, "path=/v2") {
+		t.Errorf("inspect output missing path=/v2\n%s", out)
+	}
+	if !strings.Contains(out, "plain.js") {
+		t.Errorf("inspect output missing plain.js\n%s", out)
+	}
+	if strings.Contains(out, "plain.js\tport=80 replicas=1 path=") {
+		t.Errorf("host-only service must not render a path token\n%s", out)
+	}
+}
+
 // Services render after Schedules when both are present.
 func TestFunctionInspectServicesAfterSchedules(t *testing.T) {
 	st, _ := openTempState(t)

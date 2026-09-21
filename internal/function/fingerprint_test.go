@@ -90,6 +90,33 @@ func TestFingerprintTemplateChangeDetected(t *testing.T) {
 	}
 }
 
+// A service path change alone (same runtime, same handler) changes the
+// fingerprint, because the fingerprint covers template.yaml contents verbatim.
+// This is the regression guard for "path participates in fingerprinting": the
+// reconciler decides staleness from the fingerprint, so a path-only edit must
+// be visible without a second fingerprint mechanism.
+func TestFingerprintServicePathChangeDetected(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
+services:
+  - entrypoint: service.js
+    host: api.example.com
+    path: /v1
+`)
+	before := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
+services:
+  - entrypoint: service.js
+    host: api.example.com
+    path: /v2
+`)
+	after := fp(t, dir)
+	if after == before {
+		t.Fatal("service path change should change fingerprint")
+	}
+}
+
 // Covers file add, remove, and rename paths.
 func TestFingerprintAddRemoveDetected(t *testing.T) {
 	dir := t.TempDir()

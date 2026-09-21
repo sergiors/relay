@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -505,43 +504,13 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	}
 }
 
-// TestExecAddColumnToleratesDuplicateColumn pins the tolerance branch of the
-// migration helper deterministically: execAddColumn is invoked for a column that
-// ALREADY exists (the state a concurrent migrator leaves behind), so its ALTER
-// fails with a duplicate-column error and the re-read must turn that into
-// success. A still-missing column is returned as a genuine error.
-//
-// The exercised column (functions.env) belongs to the preserved
-// functions-column migration; the removed stats migrations used to cover this
-// branch, so the helper is pinned through an unrelated surviving column.
-func TestExecAddColumnToleratesDuplicateColumn(t *testing.T) {
-	c := openTestState(t)
-	ctx := context.Background()
-
-	// functions.env already exists (initSchema created it): a duplicate-column
-	// ALTER must be tolerated.
-	if err := c.execAddColumn(ctx, "functions", "env", "TEXT"); err != nil {
-		t.Fatalf("execAddColumn on an existing column = %v; want nil (concurrent-win tolerance)", err)
-	}
-
-	// A genuine failure (a non-existent table) must still be returned: the
-	// re-read cannot find the column, so the error is real, not a lost race.
-	if err := c.execAddColumn(ctx, "no_such_table", "c", "TEXT"); err == nil {
-		t.Fatal("execAddColumn on a missing table must return an error")
-	}
-}
-
 // TestStatsRelationalMetadataColumns pins the schema shape: only the stable
 // metadata columns exist on stats/function_stats (plus data), so no counter is
 // duplicated as a column.
 func TestStatsRelationalMetadataColumns(t *testing.T) {
 	c := openTestState(t)
-	ctx := context.Background()
 
-	statsCols, err := c.tableColumns(ctx, "stats")
-	if err != nil {
-		t.Fatalf("stats columns: %v", err)
-	}
+	statsCols := tableColumnSet(t, c, "stats")
 	for _, want := range []string{"id", "data", "updated_at"} {
 		if !statsCols[want] {
 			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
@@ -551,10 +520,7 @@ func TestStatsRelationalMetadataColumns(t *testing.T) {
 		t.Errorf("stats must have exactly id/data/updated_at, got %v", statsCols)
 	}
 
-	fnCols, err := c.tableColumns(ctx, "function_stats")
-	if err != nil {
-		t.Fatalf("function_stats columns: %v", err)
-	}
+	fnCols := tableColumnSet(t, c, "function_stats")
 	for _, want := range []string{"function_name", "data", "updated_at"} {
 		if !fnCols[want] {
 			t.Errorf("function_stats missing metadata column %q: %v", want, fnCols)
@@ -565,86 +531,44 @@ func TestStatsRelationalMetadataColumns(t *testing.T) {
 	}
 }
 
-// TestOldSchemaStatsTablesAreNotMigrated documents the intentional removal of
-// the stats migration helpers: CREATE TABLE IF NOT EXISTS leaves an old
-// explicit-column stats table alone, so a legacy database does not silently gain
-// the data column. This pins the "no stats backcompat" decision.
-func TestOldSchemaStatsTablesAreNotMigrated(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	db, err := sql.Open("sqlite", path)
+// tableColumnSet returns the set of column names of table using a zero-row
+// SELECT, so tests can pin the current schema shape without a production
+// schema-introspection helper.
+func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
+	t.Helper()
+	rows, err := c.db.QueryContext(context.Background(), "SELECT * FROM "+table+" LIMIT 0")
 	if err != nil {
-		t.Fatalf("legacy open: %v", err)
+		t.Fatalf("read %s columns: %v", table, err)
 	}
-	if _, err := db.ExecContext(context.Background(), `
-		CREATE TABLE stats (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			events_processed_total INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT
-		)`); err != nil {
-		t.Fatalf("legacy schema: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("legacy close: %v", err)
-	}
-
-	c, err := Open(path)
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
 	if err != nil {
-		t.Fatalf("reopen: %v", err)
+		t.Fatalf("columns of %s: %v", table, err)
 	}
-	defer c.Close()
-	have, err := c.tableColumns(context.Background(), "stats")
-	if err != nil {
-		t.Fatalf("columns: %v", err)
+	set := make(map[string]bool, len(cols))
+	for _, col := range cols {
+		set[col] = true
 	}
-	if have["data"] {
-		t.Fatalf("old stats table must NOT be migrated to add data: %v", have)
-	}
+	return set
 }
 
-// TestEnvSecretsMigrationAddsColumns verifies a database created before the
-// env/secrets columns existed is migrated idempotently: the columns are added
-// and existing rows read back with nil maps.
-func TestEnvSecretsMigrationAddsColumns(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db.sqlite3")
-	// Create a DB with the OLD schema (no env/secrets columns).
-	old, err := Open(path)
-	if err != nil {
-		t.Fatalf("open old: %v", err)
-	}
-	// Drop the columns to simulate a pre-migration database.
-	if _, err := old.db.ExecContext(context.Background(), `ALTER TABLE functions DROP COLUMN env`); err != nil {
-		t.Fatalf("drop env: %v", err)
-	}
-	if _, err := old.db.ExecContext(context.Background(), `ALTER TABLE functions DROP COLUMN secrets`); err != nil {
-		t.Fatalf("drop secrets: %v", err)
-	}
-	_ = old.Close()
+// TestFreshSchemaHasCurrentColumns checks the current schema columns directly:
+// initSchema must create the functions env/secrets columns and the services
+// entrypoint/path columns.
+func TestFreshSchemaHasCurrentColumns(t *testing.T) {
+	c := openTestState(t)
 
-	// Reopen: the migration must re-add the columns.
-	c, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
+	fnCols := tableColumnSet(t, c, "functions")
+	for _, want := range []string{"env", "secrets"} {
+		if !fnCols[want] {
+			t.Errorf("functions missing current column %q: %v", want, fnCols)
+		}
 	}
-	defer c.Close()
-	tmpl := mustTemplate(t, `runtime: python3.14
-env:
-  API_URL: https://api.example.com
-secrets:
-  DATABASE_URL: database-url
-events:
-  - handler: events.created.handler
-    pattern:
-      event_name: [INSERT]
-`)
-	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
-	d, ok := c.GetFunction("fn")
-	if !ok {
-		t.Fatal("expected row after migration")
-	}
-	if d.Env["API_URL"] != "https://api.example.com" {
-		t.Errorf("env API_URL = %q after migration, want https://api.example.com", d.Env["API_URL"])
-	}
-	if d.Secrets["DATABASE_URL"] != "database-url" {
-		t.Errorf("secrets DATABASE_URL = %q after migration, want database-url", d.Secrets["DATABASE_URL"])
+
+	svcCols := tableColumnSet(t, c, "services")
+	for _, want := range []string{"function_name", "entrypoint", "path", "port", "replicas"} {
+		if !svcCols[want] {
+			t.Errorf("services missing current column %q: %v", want, svcCols)
+		}
 	}
 }

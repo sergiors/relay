@@ -815,7 +815,17 @@ services:
 Traefik routing is configured`, and if the configured network does not exist
   on the daemon it reports `service "app/main.py": Traefik network "proxy"
 does not exist` — Relay never creates the network. Changing `host` (or the
-  port, or `TRAEFIK_NETWORK`) reconciles: the running container is replaced.
+  port or `TRAEFIK_NETWORK`) reconciles: the running container is replaced.
+- `path` (optional) is a URL path prefix (e.g. `/v2`) under which this service
+  is exposed on its `host`. It requires a `host`; a `path` without one is
+  rejected at parse time (`service "service.js": path requires host`), because
+  `PathPrefix` alone is not an externally addressable route. Empty or omitted
+  preserves the exact host-only behavior. A configured path must start with
+  `/`; whitespace, a query (`?`), a fragment (`#`), a backslash, or an empty
+  (`//`) segment is rejected. It is **canonicalized** at parse time: trailing
+  slashes are removed from non-root paths (`/v2/` → `/v2`), while `/` stays
+  exactly `/`. Changing `path` reconciles: the running container is replaced
+  with updated routing labels.
 - `replicas` (optional) is the desired replica count Relay maintains. It
   defaults to `1` and must be a positive integer. No autoscaling — the count
   is always exactly what the template declares.
@@ -917,13 +927,30 @@ So a routed service with
 `TRAEFIK_NETWORK=proxy TRAEFIK_ENTRYPOINTS=websecure TRAEFIK_CERTRESOLVER=letsencrypt TRAEFIK_PRIORITY=100`
 gets all eight labels; with network-only config it gets exactly the four above.
 
+When the service also declares a `path`, the router rule is constrained to that
+prefix and a StripPrefix middleware is attached to the router, so the upstream
+service receives the request as if the prefix were not part of it:
+
+```
+traefik.http.routers.<id>.rule                              = Host(`api.example.com`) && PathPrefix(`/v2`)
+traefik.http.routers.<id>.middlewares                       = <middleware>
+traefik.http.middlewares.<middleware>.stripprefix.prefixes  = /v2
+```
+
+`<middleware>` is the deterministic `<id>-path` (Traefik-safe, capped at 100
+characters). It is distinct from `<id>`, so adding a path never overwrites the
+router/service slices, and it is per-service (the id already encodes function +
+entrypoint), so two services on the same host with different paths get distinct
+router and middleware names. An empty/omitted path adds **nothing** — the label
+set is byte-for-byte the host-only one.
+
 - `<id>` is a single deterministic Traefik-safe router/service id shared by the
   router and service slices: it is derived from the service identity (the
-  function name + entrypoint, never the host) as `relay-<function>-<entrypoint>`,
-  lowercased, with every character outside `[a-z0-9-]` sanitized to `-`
-  (entrypoints like `app/main.py` contain `/` and `.`), consecutive `-`
-  collapsed, and trimmed/capped at 100 characters. Because the id is
-  deterministic, reconciliation produces stable labels.
+  function name + entrypoint, never the host or path) as
+  `relay-<function>-<entrypoint>`, lowercased, with every character outside
+  `[a-z0-9-]` sanitized to `-` (entrypoints like `app/main.py` contain `/` and
+  `.`), consecutive `-` collapsed, and trimmed/capped at 100 characters.
+  Because the id is deterministic, reconciliation produces stable labels.
 - `traefik.docker.network` tells Traefik which network the container routes on
   (the `TRAEFIK_NETWORK` Docker network). The container is **created attached
   to that network**. The network itself is owned outside Relay: Relay never
@@ -934,13 +961,13 @@ gets all eight labels; with network-only config it gets exactly the four above.
   network: it stays internal. `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`, and
   `TRAEFIK_PRIORITY` only affect routed services and always appear on the same
   `<id>` as the router/service slices.
-- Reconciliation is label-aware: changing `host`, `port`, or any routing value
-  (`TRAEFIK_NETWORK`, `TRAEFIK_ENTRYPOINTS`, `TRAEFIK_CERTRESOLVER`,
-  `TRAEFIK_PRIORITY`) makes the running container stale and it is **replaced**
-  with one carrying the updated routing labels. Removing `host` replaces the
-  routed container with an internal (unlabeled) one; clearing an optional value
-  (e.g. unsetting `TRAEFIK_CERTRESOLVER`) converges its labels away the same
-  way.
+- Reconciliation is label-aware: changing `host`, `path`, `port`, or any
+  routing value (`TRAEFIK_NETWORK`, `TRAEFIK_ENTRYPOINTS`,
+  `TRAEFIK_CERTRESOLVER`, `TRAEFIK_PRIORITY`) makes the running container
+  stale and it is **replaced** with one carrying the updated routing labels.
+  Removing `host` replaces the routed container with an internal (unlabeled)
+  one; clearing an optional value (e.g. unsetting `TRAEFIK_CERTRESOLVER`)
+  converges its labels away the same way.
 
 ## Supported runtimes
 

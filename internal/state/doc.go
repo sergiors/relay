@@ -24,9 +24,8 @@
 // from each function's template (env-var name → literal value, and env-var name
 // → secret reference) as JSON object strings. These are configuration metadata
 // like the handler timeouts — never secret VALUES. A secret's value is never
-// stored in SQLite; only the reference name is. The columns are added
-// idempotently to pre-existing databases by a small PRAGMA table_info migration
-// in initSchema.
+// stored in SQLite; only the reference name is. The env and secrets columns are
+// part of the current schema created by initSchema on a fresh database.
 //
 // Schedules: a `schedules` table (function_name, handler, cron, timezone,
 // timeout) mirrors the template's cron schedules — the handler, its verbatim

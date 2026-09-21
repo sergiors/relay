@@ -24,7 +24,7 @@ func TestTraefikLabelsUnroutedNil(t *testing.T) {
 		{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)},
 	}
 	for _, cfg := range configs {
-		labels := TraefikLabels("fn", "app/main.py", "", 8000, cfg)
+		labels := TraefikLabels("fn", "app/main.py", "", "", 8000, cfg)
 		if labels != nil {
 			t.Fatalf("unrouted service labels = %v, want nil", labels)
 		}
@@ -36,7 +36,7 @@ func ptr(i int) *int { return &i }
 // A routed service gets exactly the four expected keys with the expected
 // values, with router id == service id.
 func TestTraefikLabelsRouted(t *testing.T) {
-	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, TraefikConfig{Network: "proxy"})
+	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, TraefikConfig{Network: "proxy"})
 	want := []string{
 		enableKey,
 		"traefik.http.routers.relay-fastapi-service-app-main-py.rule",
@@ -97,7 +97,7 @@ func TestTraefikLabelsRouted(t *testing.T) {
 
 // Without a network the docker.network label is omitted (three labels total).
 func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
-	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{})
+	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{})
 	if _, ok := labels[networkKey]; ok {
 		t.Fatalf("docker.network label present without a configured network: %v", labels)
 	}
@@ -110,7 +110,7 @@ func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
 func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 	id := "relay-fn-svc-js"
 	t.Run("entrypoint", func(t *testing.T) {
-		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", EntryPoints: "websecure"})
+		labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{Network: "proxy", EntryPoints: "websecure"})
 		if got := labels[routerPrefix+id+".entrypoints"]; got != "websecure" {
 			t.Fatalf("entrypoints = %q, want websecure; labels = %v", got, labels)
 		}
@@ -122,7 +122,8 @@ func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 		}
 	})
 	t.Run("certresolver", func(t *testing.T) {
-		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", CertResolver: "letsencrypt"})
+		labels := TraefikLabels("fn", "svc.js", "a.test", "", 80,
+			TraefikConfig{Network: "proxy", CertResolver: "letsencrypt"})
 		if got := labels[routerPrefix+id+tlsSuffix]; got != "true" {
 			t.Fatalf("tls = %q, want true; labels = %v", got, labels)
 		}
@@ -137,7 +138,7 @@ func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 		}
 	})
 	t.Run("priority", func(t *testing.T) {
-		labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", Priority: ptr(50)})
+		labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{Network: "proxy", Priority: ptr(50)})
 		if got := labels[routerPrefix+id+".priority"]; got != "50" {
 			t.Fatalf("priority = %q, want 50; labels = %v", got, labels)
 		}
@@ -152,7 +153,8 @@ func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 // comma-separated string in its label grammar).
 func TestTraefikLabelsEntryPointsCommaSeparatedVerbatim(t *testing.T) {
 	id := "relay-fn-svc-js"
-	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{Network: "proxy", EntryPoints: "web,websecure"})
+	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80,
+		TraefikConfig{Network: "proxy", EntryPoints: "web,websecure"})
 	if got := labels[routerPrefix+id+".entrypoints"]; got != "web,websecure" {
 		t.Fatalf("entrypoints = %q, want web,websecure verbatim; labels = %v", got, labels)
 	}
@@ -163,7 +165,7 @@ func TestTraefikLabelsEntryPointsCommaSeparatedVerbatim(t *testing.T) {
 
 // All three optional values set together: the full 8-label set on the same id.
 func TestTraefikLabelsFullHTTPS(t *testing.T) {
-	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, TraefikConfig{
+	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, TraefikConfig{
 		Network:      "proxy",
 		EntryPoints:  "websecure",
 		CertResolver: "letsencrypt",
@@ -192,7 +194,7 @@ func TestTraefikLabelsFullHTTPS(t *testing.T) {
 
 // Empty-string optional values are treated exactly as unset (nil priority).
 func TestTraefikLabelsEmptyOptionalsUnset(t *testing.T) {
-	labels := TraefikLabels("fn", "svc.js", "a.test", 80, TraefikConfig{
+	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{
 		Network:      "proxy",
 		EntryPoints:  "",
 		CertResolver: "",
@@ -207,8 +209,8 @@ func TestTraefikLabelsEmptyOptionalsUnset(t *testing.T) {
 // relay-fastapi-service-app-main-py over the safe charset.
 func TestServiceProviderIDDeterministicAndSafe(t *testing.T) {
 	cfg := TraefikConfig{Network: "proxy"}
-	a := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, cfg)
-	b := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", 8000, cfg)
+	a := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, cfg)
+	b := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, cfg)
 	if len(a) != len(b) {
 		t.Fatalf("label counts differ: %v vs %v", a, b)
 	}
@@ -318,5 +320,157 @@ func TestMissingNetworkMessage(t *testing.T) {
 	err := MissingNetwork("proxy")
 	if err == nil || err.Error() != `Traefik network "proxy" does not exist` {
 		t.Fatalf("MissingNetwork = %v, want the exact message", err)
+	}
+}
+
+// Host-only routing (empty path) is byte-for-byte the legacy label set: the rule
+// has no PathPrefix and there are no middleware labels at all.
+func TestTraefikLabelsHostOnlyNoMiddleware(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{Network: "proxy"})
+	id := "relay-fn-svc-js"
+	want := map[string]string{
+		enableKey:                       "true",
+		networkKey:                      "proxy",
+		routerPrefix + id + ruleSuffix:  "Host(`a.test`)",
+		servicePrefix + id + portSuffix: "80",
+	}
+	if len(labels) != len(want) {
+		t.Fatalf("host-only labels = %v (%d), want %d legacy keys", labels, len(labels), len(want))
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			t.Fatalf("label %q = %q, want %q (all: %v)", k, labels[k], v, labels)
+		}
+	}
+	for k := range labels {
+		if strings.Contains(k, "middlewares") || strings.Contains(k, "stripprefix") {
+			t.Fatalf("host-only routing must carry no middleware labels: %v", labels)
+		}
+	}
+}
+
+// A configured path yields the exact PathPrefix rule and the StripPrefix
+// middleware, with the router referencing that middleware by the deterministic
+// name (service id + "-path").
+func TestTraefikLabelsPathAddsRuleAndMiddleware(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "a.test", "/v2", 80, TraefikConfig{Network: "proxy"})
+	id := "relay-fn-svc-js"
+	mw := "relay-fn-svc-js-path"
+	want := map[string]string{
+		enableKey:                          "true",
+		networkKey:                         "proxy",
+		routerPrefix + id + ruleSuffix:     "Host(`a.test`) && PathPrefix(`/v2`)",
+		servicePrefix + id + portSuffix:    "80",
+		routerPrefix + id + ".middlewares": mw,
+		"traefik.http.middlewares." + mw + ".stripprefix.prefixes": "/v2",
+	}
+	if len(labels) != len(want) {
+		t.Fatalf("path labels = %v (%d), want %d keys", labels, len(labels), len(want))
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			t.Fatalf("label %q = %q, want %q (all: %v)", k, labels[k], v, labels)
+		}
+	}
+}
+
+// The root path is a configured path: it gets PathPrefix(`/`) and a StripPrefix
+// middleware, distinct from host-only routing.
+func TestTraefikLabelsRootPath(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "a.test", "/", 80, TraefikConfig{Network: "proxy"})
+	id := "relay-fn-svc-js"
+	mw := "relay-fn-svc-js-path"
+	if got := labels[routerPrefix+id+ruleSuffix]; got != "Host(`a.test`) && PathPrefix(`/`)" {
+		t.Fatalf("root rule = %q", got)
+	}
+	if labels[routerPrefix+id+".middlewares"] != mw {
+		t.Fatalf("root middlewares = %q, want %q", labels[routerPrefix+id+".middlewares"], mw)
+	}
+	if labels["traefik.http.middlewares."+mw+".stripprefix.prefixes"] != "/" {
+		t.Fatalf("root stripprefix = %q, want /", labels["traefik.http.middlewares."+mw+".stripprefix.prefixes"])
+	}
+}
+
+// The middleware name is deterministic across calls and distinct from the
+// router/service id.
+func TestPathMiddlewareIDDeterministicDistinct(t *testing.T) {
+	id := ServiceProviderID("fn", "svc.js")
+	mw := PathMiddlewareID("fn", "svc.js")
+	if mw != id+"-path" {
+		t.Fatalf("middleware id = %q, want %q", mw, id+"-path")
+	}
+	if mw == id {
+		t.Fatal("middleware id must differ from the provider id")
+	}
+	if a, b := PathMiddlewareID("fn", "svc.js"), mw; a != b {
+		t.Fatalf("middleware id not deterministic: %q vs %q", a, b)
+	}
+	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(mw) {
+		t.Fatalf("middleware id %q contains unsafe characters", mw)
+	}
+}
+
+// Two services on the SAME host but different paths get distinct router and
+// middleware names, so they do not collide in Traefik.
+func TestTraefikLabelsSameHostDifferentPathsDistinct(t *testing.T) {
+	cfg := TraefikConfig{Network: "proxy"}
+	a := TraefikLabels("fn", "a.js", "same.test", "/v1", 80, cfg)
+	b := TraefikLabels("fn", "b.js", "same.test", "/v2", 80, cfg)
+	idA, idB := "relay-fn-a-js", "relay-fn-b-js"
+	mwA, mwB := "relay-fn-a-js-path", "relay-fn-b-js-path"
+	if !strings.Contains(a[routerPrefix+idA+ruleSuffix], "PathPrefix(`/v1`)") {
+		t.Fatalf("service a rule = %q", a[routerPrefix+idA+ruleSuffix])
+	}
+	if !strings.Contains(b[routerPrefix+idB+ruleSuffix], "PathPrefix(`/v2`)") {
+		t.Fatalf("service b rule = %q", b[routerPrefix+idB+ruleSuffix])
+	}
+	if mwA == mwB {
+		t.Fatalf("same-host services share middleware name %q", mwA)
+	}
+	if a[routerPrefix+idA+".middlewares"] != mwA || b[routerPrefix+idB+".middlewares"] != mwB {
+		t.Fatalf("router middleware references mismatch: %v vs %v", a, b)
+	}
+}
+
+// A path coexists with every optional router value: all labels land on the same
+// id, and the middleware stays on its own deterministic name.
+func TestTraefikLabelsPathWithFullHTTPS(t *testing.T) {
+	labels := TraefikLabels("fn", "svc.js", "a.test", "/v2", 80, TraefikConfig{
+		Network:      "proxy",
+		EntryPoints:  "websecure",
+		CertResolver: "letsencrypt",
+		Priority:     ptr(100),
+	})
+	id := "relay-fn-svc-js"
+	want := map[string]string{
+		routerPrefix + id + ruleSuffix:                                       "Host(`a.test`) && PathPrefix(`/v2`)",
+		routerPrefix + id + ".middlewares":                                   "relay-fn-svc-js-path",
+		routerPrefix + id + ".entrypoints":                                   "websecure",
+		routerPrefix + id + tlsSuffix:                                        "true",
+		routerPrefix + id + ".tls.certresolver":                              "letsencrypt",
+		routerPrefix + id + ".priority":                                      "100",
+		"traefik.http.middlewares.relay-fn-svc-js-path.stripprefix.prefixes": "/v2",
+	}
+	for k, v := range want {
+		if labels[k] != v {
+			t.Fatalf("label %q = %q, want %q (all: %v)", k, labels[k], v, labels)
+		}
+	}
+}
+
+// A very long service id still yields a middleware name that keeps the "-path"
+// suffix and stays within the 100-char cap and the safe charset.
+func TestPathMiddlewareIDOverlongKeepsSuffix(t *testing.T) {
+	longName := strings.Repeat("verylongfunction", 5)
+	longEntry := strings.Repeat("deep/nested/path", 5) + ".py"
+	mw := PathMiddlewareID(longName, longEntry)
+	if len(mw) > 100 {
+		t.Fatalf("middleware id length = %d, want <= 100", len(mw))
+	}
+	if !strings.HasSuffix(mw, "-path") {
+		t.Fatalf("middleware id %q lost the -path suffix", mw)
+	}
+	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(mw) {
+		t.Fatalf("middleware id %q is not Traefik-safe", mw)
 	}
 }

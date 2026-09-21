@@ -505,3 +505,134 @@ services:
 		t.Fatalf("boundary hosts = %v", tmpl.Services)
 	}
 }
+
+// A declared `path` parses into Service.Path; an omitted path and an explicit
+// empty path both parse to "" (host-only routing, exactly as before paths).
+func TestParseServicePath(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - entrypoint: routed.js
+    host: api.example.com
+    path: /v2
+  - entrypoint: blank.js
+    host: api.example.com
+    path: ""
+  - entrypoint: plain.js
+    host: api.example.com
+`)
+	if len(tmpl.Services) != 3 {
+		t.Fatalf("services = %d, want 3", len(tmpl.Services))
+	}
+	if tmpl.Services[0].Path != "/v2" {
+		t.Fatalf("path = %q, want /v2", tmpl.Services[0].Path)
+	}
+	if tmpl.Services[1].Path != "" {
+		t.Fatalf("empty path = %q, want \"\" (host-only)", tmpl.Services[1].Path)
+	}
+	if tmpl.Services[2].Path != "" {
+		t.Fatalf("omitted path = %q, want \"\" (host-only)", tmpl.Services[2].Path)
+	}
+}
+
+// Canonicalization: a non-root path drops trailing slashes; the root path stays
+// exactly "/".
+func TestParseServicePathCanonicalization(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/v2", "/v2"},
+		{"/v2/", "/v2"},
+		{"/v2///", "/v2"},
+		{"/", "/"},
+		{"/a/b", "/a/b"},
+		{"/a/b/", "/a/b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			tmpl := mustParse(t, `
+runtime: node24
+services:
+  - entrypoint: service.js
+    host: api.example.com
+    path: "`+tc.in+`"
+`)
+			if got := tmpl.Services[0].Path; got != tc.want {
+				t.Fatalf("path %q canonicalized to %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// Invalid paths are rejected, with the error naming the service and the path.
+func TestParseServicePathRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"relative", "v2"},
+		{"whitespace", "/has space"},
+		{"query", "/v2?x=1"},
+		{"fragment", "/v2#frag"},
+		{"backslash", `\v2`},
+		{"double slash", "/v2//x"},
+		{"double slash leading", "//v2"},
+		{"triple slash", "///"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - entrypoint: service.js
+    host: api.example.com
+    path: "` + tc.path + `"
+`))
+			if err == nil {
+				t.Fatalf("expected error for path %q", tc.path)
+			}
+			if !strings.Contains(err.Error(), "service.js") {
+				t.Errorf("expected error to name the service, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "path") {
+				t.Errorf("expected error to mention path, got: %v", err)
+			}
+		})
+	}
+}
+
+// A path without a host is rejected: PathPrefix alone is not an externally
+// addressable route and the no-host service must remain unrouted.
+func TestParseServicePathWithoutHostRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - entrypoint: service.js
+    path: /v2
+`))
+	if err == nil {
+		t.Fatal("expected error for a path without a host")
+	}
+	if !strings.Contains(err.Error(), "path requires host") {
+		t.Fatalf("err = %v, want the path-requires-host error", err)
+	}
+}
+
+// A service with a path but no host, and a service with neither, coexist: only
+// the path-without-host entry fails validation.
+func TestParseServicePathWithoutHostAfterHostedService(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - entrypoint: routed.js
+    host: api.example.com
+    path: /v1
+  - entrypoint: bad.js
+    path: /v2
+`))
+	if err == nil || !strings.Contains(err.Error(), "service \"bad.js\": path requires host") {
+		t.Fatalf("err = %v, want service \"bad.js\": path requires host", err)
+	}
+}

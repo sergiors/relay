@@ -112,7 +112,8 @@ type Template struct {
 	Schedules []Schedule
 	// Services lists the function's persistent long-running services. It is nil
 	// when the template defines no `services` key. Port and Replicas carry their
-	// resolved defaults (never zero) after ParseTemplate.
+	// resolved defaults (never zero) after ParseTemplate, and Path is
+	// canonicalized (see Service.Path).
 	Services []Service
 }
 
@@ -148,7 +149,17 @@ type Service struct {
 	// means an internal unrouted service with no routing labels. It is generic
 	// template config (a plain hostname), never a Traefik-specific term. It
 	// must be a valid hostname and is validated at parse time.
-	Host     string
+	Host string
+	// Path is the optional URL path prefix this service is exposed under on its
+	// Host (e.g. "/v2"). It is generic template config (a URL path), never a
+	// Traefik-specific term. Empty (omitted or explicitly "") means the service
+	// is routed by host alone, exactly as before paths existed. When set, the
+	// routing layer adds a PathPrefix rule and a StripPrefix middleware. A
+	// configured path requires a host: path without host is rejected at parse
+	// time. After ParseTemplate the value is canonicalized: it starts with "/",
+	// has no trailing slash except for the root "/", and contains no empty
+	// ("//") segments — a non-root value therefore never has a trailing slash.
+	Path     string
 	Port     int
 	Replicas int
 }
@@ -407,6 +418,10 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		Services []struct {
 			Entrypoint string `yaml:"entrypoint"`
 			Host       string `yaml:"host"`
+			// Path is optional; empty (omitted or "") means host-only routing.
+			// It is decoded as a plain string so an omitted and an explicit ""
+			// are indistinguishable, matching the "empty = omitted" rule.
+			Path string `yaml:"path"`
 			// Port and Replicas are decoded as `any` so a non-integer value
 			// (e.g. "abc", "1.5", true) is distinguishable from an omitted one
 			// and rejected with a clear message (see resolveServicePort /
@@ -539,8 +554,10 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	// NOT applied. The entrypoint string is the service's identity: duplicates
 	// would be ambiguous for reconciliation, so they are rejected. Port and
 	// replicas are optional with defaults (DefaultServicePort /
-	// DefaultServiceReplicas). Services are optional — a template without the
-	// `services` key parses exactly as before.
+	// DefaultServiceReplicas). Host and path are optional and independently
+	// omitted-preserving: an omitted/empty path leaves the service routed by
+	// host alone, and a path without a host is rejected. Services are optional —
+	// a template without the `services` key parses exactly as before.
 	seen := make(map[string]bool, len(raw.Services))
 	for _, s := range raw.Services {
 		if s.Entrypoint == "" {
@@ -564,7 +581,24 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err := validateServiceHost(s.Host); err != nil {
 			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
 		}
-		t.Services = append(t.Services, Service{Entrypoint: s.Entrypoint, Host: s.Host, Port: port, Replicas: replicas})
+		// A configured path only makes sense with a host: PathPrefix alone is
+		// not an externally addressable route, and preserving the existing
+		// no-host behavior (an unrouted, label-free service) requires rejecting
+		// the combination rather than silently ignoring the path.
+		if s.Path != "" && s.Host == "" {
+			return nil, fmt.Errorf("service %q: path requires host", s.Entrypoint)
+		}
+		path, err := canonicalizeServicePath(s.Path)
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+		}
+		t.Services = append(t.Services, Service{
+			Entrypoint: s.Entrypoint,
+			Host:       s.Host,
+			Path:       path,
+			Port:       port,
+			Replicas:   replicas,
+		})
 	}
 	return t, nil
 }
@@ -810,6 +844,46 @@ func validateServiceHost(host string) error {
 		return fmt.Errorf("host %q is not a valid hostname", host)
 	}
 	return nil
+}
+
+// canonicalizeServicePath validates the optional service `path` and returns its
+// canonical form. Empty is valid (host-only routing, exactly as before).
+//
+// A configured value must be an absolute URL path: a leading "/" is REQUIRED.
+// Whitespace, a query ("?"), a fragment ("#"), and a backslash are rejected —
+// each would make the PathPrefix rule ambiguous or unparseable. Empty ("//")
+// segments are rejected too, so a canonical value never contains "//" (the root
+// "/" is the one value that starts and ends with "/").
+//
+// Canonicalization is deliberately minimal and stable: a non-root value loses
+// its trailing slashes ("/v2/" -> "/v2", "/v2///" -> "/v2"), while the root
+// stays exactly "/". This makes "/v2" and "/v2/" the SAME configured path, so
+// reconciliation does not churn containers over a cosmetic trailing slash.
+func canonicalizeServicePath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("path %q must start with %q", path, "/")
+	}
+	if strings.ContainsAny(path, " \t\r\n") {
+		return "", fmt.Errorf("path %q contains whitespace", path)
+	}
+	if strings.ContainsAny(path, "?#\\") {
+		return "", fmt.Errorf("path %q must not contain a query, fragment, or backslash", path)
+	}
+	canonical := strings.TrimRight(path, "/")
+	if canonical == "" {
+		// The input was all slashes ("/", "//", "///"): only the root is valid.
+		if path != "/" {
+			return "", fmt.Errorf("path %q contains an empty path segment", path)
+		}
+		return "/", nil
+	}
+	if strings.Contains(canonical, "//") {
+		return "", fmt.Errorf("path %q contains an empty path segment", path)
+	}
+	return canonical, nil
 }
 
 // validateHandler requires the form module.function (splitting at the last dot)

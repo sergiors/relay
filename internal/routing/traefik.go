@@ -83,6 +83,21 @@ func MissingNetwork(network string) error {
 //	traefik.http.routers.<id>.rule                              = Host(`<host>`)
 //	traefik.http.services.<id>.loadbalancer.server.port         = <port>
 //
+// When path is non-empty the rule ALSO constrains the request path and a
+// StripPrefix middleware is attached to the router, so the upstream service
+// sees the request as if the prefix were not part of it:
+//
+//	traefik.http.routers.<id>.rule                              = Host(`<host>`) && PathPrefix(`<path>`)
+//	traefik.http.routers.<id>.middlewares                       = <middleware>
+//	traefik.http.middlewares.<middleware>.stripprefix.prefixes  = <path>
+//
+// <middleware> is PathMiddlewareID(functionName, entrypoint): the deterministic
+// service id plus the "-path" suffix. It is distinct from <id>, so adding a path
+// can never overwrite the router/service slices, and it is per-service (the id
+// already encodes function + entrypoint), so two services on the same host with
+// different paths get distinct middleware names. An empty path adds NOTHING —
+// the host-only label set is byte-for-byte the pre-path behavior.
+//
 // The docker.network label pins which network Traefik resolves the container
 // on; it is omitted without a configured network so the container's
 // membership alone decides.
@@ -96,15 +111,28 @@ func MissingNetwork(network string) error {
 //	cfg.CertResolver != ""  → traefik.http.routers.<id>.tls                = true
 //	                            traefik.http.routers.<id>.tls.certresolver = <cfg.CertResolver>
 //	cfg.Priority     != nil → traefik.http.routers.<id>.priority           = <cfg.Priority>
-func TraefikLabels(functionName, entrypoint, host string, port int, cfg TraefikConfig) map[string]string {
+//
+// The path argument is expected to be canonical (see function.Template parsing):
+// leading "/", no trailing slash except root, no "//". TraefikLabels treats it
+// as opaque and does not re-validate it.
+func TraefikLabels(functionName, entrypoint, host, path string, port int, cfg TraefikConfig) map[string]string {
 	if host == "" {
 		return nil
 	}
 	id := ServiceProviderID(functionName, entrypoint)
+	rule := fmt.Sprintf("Host(`%s`)", host)
+	if path != "" {
+		rule = fmt.Sprintf("%s && PathPrefix(`%s`)", rule, path)
+	}
 	labels := map[string]string{
 		"traefik.enable": "true",
-		fmt.Sprintf("traefik.http.routers.%s.rule", id):                      fmt.Sprintf("Host(`%s`)", host),
+		fmt.Sprintf("traefik.http.routers.%s.rule", id):                      rule,
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", id): strconv.Itoa(port),
+	}
+	if path != "" {
+		middleware := PathMiddlewareID(functionName, entrypoint)
+		labels[fmt.Sprintf("traefik.http.routers.%s.middlewares", id)] = middleware
+		labels[fmt.Sprintf("traefik.http.middlewares.%s.stripprefix.prefixes", middleware)] = path
 	}
 	if cfg.Network != "" {
 		labels["traefik.docker.network"] = cfg.Network
@@ -120,6 +148,28 @@ func TraefikLabels(functionName, entrypoint, host string, port int, cfg TraefikC
 		labels[fmt.Sprintf("traefik.http.routers.%s.priority", id)] = strconv.Itoa(*cfg.Priority)
 	}
 	return labels
+}
+
+// PathMiddlewareID derives the deterministic, Traefik-safe StripPrefix
+// middleware name for a routed service with a path: the service's provider id
+// plus the stable "-path" suffix. The suffix keeps the middleware name in a
+// distinct namespace from the router/service slices on the same service (so
+// adding a path never clobbers them) and makes the name self-describing.
+//
+// The id is capped at 100 characters like ServiceProviderID, but the suffix is
+// preserved by trimming the base id first: a >100-char service id would
+// otherwise absorb the suffix at the cap and make the middleware name
+// indistinguishable from the provider id (harmless, but no longer
+// self-describing). Because the base id is already collision-safe and the
+// suffix is constant, the result is collision-safe too. Only [a-z0-9-]
+// characters result, so the name is safe in Traefik's label grammar.
+func PathMiddlewareID(functionName, entrypoint string) string {
+	const suffix = "-path"
+	id := ServiceProviderID(functionName, entrypoint)
+	if len(id)+len(suffix) > 100 {
+		id = id[:100-len(suffix)]
+	}
+	return id + suffix
 }
 
 // ServiceProviderID derives the deterministic, Traefik-safe router/service id
