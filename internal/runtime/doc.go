@@ -33,10 +33,12 @@
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;
 //     this package answers "how do I build it?" and knows nothing about Python
 //     imports or Node module resolution. Engines declare a function's reusable
-//     dependency layer (manifest files + install command) via plan.Deps; the
-//     dependency images and their content-addressed `relay-dep-*` references
-//     live entirely here. The dependency fingerprint keys on the base image
-//     TAG, not its digest (a documented limitation).
+//     dependency layer (manifest files + install command) via plan.Deps and any
+//     external tool they need via plan.Spec.ToolCopies (the pinned uv binary for
+//     Python); the renderer emits the COPY --from and the dependency image
+//     inherits the tool. The dependency images and their content-addressed
+//     `relay-dep-*` references live entirely here. The dependency fingerprint
+//     keys on the base image TAG, not its digest (a documented limitation).
 //   - The package knows nothing about matching or Redis
 //
 // Security baseline: every execution container is hardened. It runs as a

@@ -12,15 +12,22 @@ import (
 
 // pythonSpec is the production python3.14 spec shared by the fingerprint tests.
 func pythonSpec() plan.Spec {
-	return plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
+	return plan.Spec{
+		Name:      "python3.14",
+		Engine:    plan.EnginePython,
+		BaseImage: "python:3.14-slim",
+		ToolCopies: []plan.ImageCopy{{
+			From: UvImageTag, Source: "/uv", Dest: "/usr/local/bin/uv",
+		}},
+	}
 }
 
 // pythonRequirementsDeps is the conventional python dependency layer used by
-// the fingerprint tests (a single requirements.txt installed into /app).
+// the fingerprint tests (a single requirements.txt installed into /app with uv).
 func pythonRequirementsDeps() plan.Deps {
 	return plan.Deps{
 		Files:   []string{"requirements.txt"},
-		Install: "pip install --no-cache-dir -r requirements.txt",
+		Install: "uv pip install --system --no-cache -r requirements.txt",
 		Dir:     "/app",
 	}
 }
@@ -101,6 +108,16 @@ func TestDependencyFingerprintSensitivity(t *testing.T) {
 	}
 	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) { s.BaseImage = "python:3.15-slim" }); fp == orig {
 		t.Error("changing the base image must change the fingerprint")
+	}
+	// The pinned external install tool (uv) shapes the installed payload: a
+	// version bump must yield a new layer.
+	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) {
+		s.ToolCopies = []plan.ImageCopy{{From: "ghcr.io/astral-sh/uv:0.12.18", Source: "/uv", Dest: "/usr/local/bin/uv"}}
+	}); fp == orig {
+		t.Error("changing the pinned install tool version must change the fingerprint")
+	}
+	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) { s.ToolCopies = nil }); fp == orig {
+		t.Error("removing the install tool must change the fingerprint")
 	}
 	// Install command and directory.
 	if fp := mutate(func(_ *plan.Spec, d *plan.Deps) { d.Install = "pip install -r requirements.txt" }); fp == orig {
@@ -185,6 +202,60 @@ func TestDependencyFingerprintRuntimeVersionDifferent(t *testing.T) {
 	}
 	if depImageRef(fpA) == depImageRef(fpB) {
 		t.Error("different runtime versions must map to different dependency images")
+	}
+}
+
+// TestDependencyFingerprintNativePair pins the native uv dependency identity:
+// both manifest files participate, so changing either the declared deps
+// (pyproject.toml) or the resolved lock (uv.lock) yields a different layer, while
+// an unchanged pair is stable.
+func TestDependencyFingerprintNativePair(t *testing.T) {
+	dir := t.TempDir()
+	pyproject := "[project]\nname = \"x\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n"
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o644); err != nil {
+		t.Fatalf("write pyproject: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "uv.lock"), []byte("version = 1\n"), 0o644); err != nil {
+		t.Fatalf("write uv.lock: %v", err)
+	}
+	spec := pythonSpec()
+	deps := plan.Deps{
+		Files:   []string{"pyproject.toml", "uv.lock"},
+		Install: "uv export --locked --no-dev --no-emit-project && uv pip install --system",
+		Dir:     "/app",
+	}
+
+	base, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+
+	// pyproject change (declared deps).
+	changedPyproject := "[project]\nname = \"x\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.17.0\"]\n"
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(changedPyproject), 0o644); err != nil {
+		t.Fatalf("rewrite pyproject: %v", err)
+	}
+	pf, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if pf == base {
+		t.Error("changing pyproject.toml must change the dependency fingerprint")
+	}
+
+	// uv.lock change (resolved set) after restoring pyproject.
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o644); err != nil {
+		t.Fatalf("restore pyproject: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "uv.lock"), []byte("version = 1\n# changed\n"), 0o644); err != nil {
+		t.Fatalf("rewrite uv.lock: %v", err)
+	}
+	lf, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if lf == base {
+		t.Error("changing uv.lock must change the dependency fingerprint")
 	}
 }
 

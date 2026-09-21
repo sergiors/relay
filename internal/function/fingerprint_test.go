@@ -79,6 +79,29 @@ func TestFingerprintDependencyFileChangeDetected(t *testing.T) {
 	}
 }
 
+// TestFingerprintNativeUvPairDetected pins that the native uv project files are
+// selected source: editing either pyproject.toml or uv.lock changes the function
+// fingerprint (so the reconciler forces a rebuild), and each is individually
+// observable.
+func TestFingerprintNativeUvPairDetected(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")
+	writeFile(t, filepath.Join(dir, "pyproject.toml"), "[project]\nname = \"x\"\ndependencies = [\"six==1.16.0\"]\n")
+	writeFile(t, filepath.Join(dir, "uv.lock"), "version = 1\n")
+	base := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "pyproject.toml"), "[project]\nname = \"x\"\ndependencies = [\"six==1.17.0\"]\n")
+	if got := fp(t, dir); got == base {
+		t.Fatal("editing pyproject.toml must change the fingerprint")
+	}
+	pyprojectChanged := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "uv.lock"), "version = 1\n# changed\n")
+	if got := fp(t, dir); got == pyprojectChanged {
+		t.Fatal("editing uv.lock must change the fingerprint")
+	}
+}
+
 func TestFingerprintTemplateChangeDetected(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")

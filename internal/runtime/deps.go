@@ -39,6 +39,9 @@ import (
 //   - the Install command. A changed install procedure (dependency set, flags,
 //     install method) means a different installed payload even with identical
 //     manifest bytes.
+//   - the runtime's external tool copies (spec.ToolCopies): the install runs the
+//     copied tool (e.g. uv), so its pinned version is an input to the installed
+//     payload even when the manifests are unchanged.
 //
 // Field boundaries are length-prefixed so two distinct concatenations (e.g.
 // "ab"+"c" vs "a"+"bc") can never collide under the flat hash.
@@ -61,6 +64,15 @@ func DependencyFingerprint(arch, platform string, spec plan.Spec, fnDir string, 
 	// Build-host architecture.
 	hashField(h, arch)
 	hashField(h, platform)
+
+	// External build tools the install depends on (e.g. the pinned uv binary).
+	// Hashed in plan order: ToolCopies is a fixed registry-declared list, and
+	// the field boundaries keep distinct copy sets from colliding.
+	for _, tc := range spec.ToolCopies {
+		hashField(h, tc.From)
+		hashField(h, tc.Source)
+		hashField(h, tc.Dest)
+	}
 
 	// Install procedure.
 	hashField(h, deps.Install)

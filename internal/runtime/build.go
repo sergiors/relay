@@ -52,6 +52,13 @@ func renderDockerfile(p plan.BuildPlan) string {
 		b.WriteString("COPY " + rel + " " + dir + "/\n")
 	}
 
+	// External tool copies pull a pinned binary out of another image (e.g. the
+	// uv distroless image). They are emitted BEFORE the install RUN so the
+	// dependency install can already use the tool.
+	for _, tc := range p.ToolCopies {
+		b.WriteString("COPY --from=" + tc.From + " " + tc.Source + " " + tc.Dest + "\n")
+	}
+
 	for _, cmd := range p.Install {
 		if cmd != "" {
 			b.WriteString("RUN " + cmd + "\n")
@@ -234,11 +241,17 @@ func buildDependencyImage(
 	// Render via the single generic renderer with a synthetic plan: the runtime
 	// base, WORKDIR = the install dir, the manifests already staged at their
 	// relative context paths (so the generic `COPY . <workdir>` copies exactly
-	// them), and the install command. No User/UserSetup/Env/Entrypoint — it is a
-	// base image.
+	// them), the runtime's external tool copies (the install may need the tool,
+	// e.g. uv), and the install command. No User/UserSetup/Env/Entrypoint — it is
+	// a base image.
 	depPlan := plan.BuildPlan{
 		BaseImage: spec.BaseImage,
 		WorkDir:   deps.Dir,
+		// The dependency base image is built FROM the raw runtime base (not the
+		// function image), so it must copy the runtime's external tools itself:
+		// the function image inherits them through FROM, but the dependency
+		// build cannot.
+		ToolCopies: spec.ToolCopies,
 		// Note: plan.Deps is intentionally left zero here so the renderer emits
 		// the plain `COPY . <workdir>` path, not a nested dependency base.
 		Install: []string{deps.Install},

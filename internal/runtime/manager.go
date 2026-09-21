@@ -447,8 +447,11 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		// its Dockerfile's FROM is the dependency reference rather than the raw
 		// base image. The engine moved the install into Deps, so the function
 		// image carries no install RUN of its own — only UserSetup/User/Env/
-		// Entrypoint on top of the dependency layer.
+		// Entrypoint on top of the dependency layer. The dependency image was
+		// built with the runtime's external tools (e.g. uv), so the function
+		// image inherits them via FROM and does not need to copy them again.
 		p.BaseImage = depRef
+		p.ToolCopies = nil
 	}
 
 	start := time.Now()

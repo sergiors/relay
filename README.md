@@ -384,19 +384,23 @@ the fingerprint, so all three always agree on which files are source.
 - Relay manages **only its own `relay-fn-*` images** — it never prunes globally
   or touches other apps' images or layers.
 
-Dependency layers (`requirements.txt` / `package-lock.json` / `package.json`)
-are installed once into reusable `relay-dep-*` images, fingerprinted by runtime
+Dependency layers (`requirements.txt` / `pyproject.toml` + `uv.lock` /
+`package-lock.json` / `package.json`) are installed once into reusable
+`relay-dep-*` images, fingerprinted by:
 
-- architecture + manifest contents. Function images build `FROM` them, so only
-  dependency or source changes rebuild the top layers; a changed manifest yields a
-  new `relay-dep-*` tag, an unchanged one is reused across every version of a
-  function (and across functions with identical dependency sets). Dependency
-  images are content-addressed and, being shared bases, are **not** auto-pruned
-  by the startup sweep — a removed function image never removes a layer another
-  function may still need. The fingerprint keys on the base image **tag** (e.g.
-  `python:3.14-slim`), not its digest, so a newer pull of the same tag reuses the
-  cached `relay-dep-*` image — operators wanting a refresh must remove those images
-  (a future digest-pinning feature is the proper fix).
+- runtime + architecture + manifest contents, plus the runtime's pinned external
+  install tool (e.g. uv), whose version shapes the installed payload.
+
+Function images build `FROM` those layers, so only dependency or source changes
+rebuild the top layers; a changed manifest yields a new `relay-dep-*` tag, an
+unchanged one is reused across every version of a function (and across functions
+with identical dependency sets). Dependency images are content-addressed and,
+being shared bases, are **not** auto-pruned by the startup sweep — a removed
+function image never removes a layer another function may still need. The
+fingerprint keys on the base image **tag** (e.g. `python:3.14-slim`), not its
+digest, so a newer pull of the same tag reuses the cached `relay-dep-*` image —
+operators wanting a refresh must remove those images (a future digest-pinning
+feature is the proper fix).
 
 Managed images carry Relay-ownership labels: `relay.type=function|dependency`
 (classifies a function vs a dependency image), `relay.function`,
@@ -990,11 +994,37 @@ set is byte-for-byte the host-only one.
 
 | Runtime      | Base image         | Dependency handling                                                                                  |
 | ------------ | ------------------ | ---------------------------------------------------------------------------------------------------- |
-| `python3.14` | `python:3.14-slim` | `requirements.txt` → `pip install --no-cache-dir -r requirements.txt`                                |
+| `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` → native uv project; else `requirements.txt` → `uv pip install --system` |
 | `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none |
 
 Base images are fixed; arbitrary base images are not allowed. Dependencies are
 installed **inside** the image at build time, never on the host.
+
+Python dependencies are installed with **uv**, never pip. The pinned uv binary
+(`ghcr.io/astral-sh/uv:0.12.17`) is copied into every Python runtime image (even
+one with no dependencies) by the generic Dockerfile renderer, and the dependency
+image inherits it, so installs are fast and reproducible. Python has two
+dependency manifests, resolved deterministically:
+
+- **Native uv project (`uv.lock` + `pyproject.toml`)**: when a committed
+  `uv.lock` is present it is authoritative and `requirements.txt` is ignored. The
+  locked set is installed **without re-resolving** —
+  `uv export --locked --no-dev --no-emit-project` then
+  `uv pip install --system` — so the image matches the lock exactly and the
+  build fails if the lock is out of date. Always commit `uv.lock` (run
+  `uv lock`); Relay never generates or updates it.
+- **`requirements.txt`**: the classic manifest remains fully supported and is
+  installed with `uv pip install --system --no-cache -r requirements.txt`. It is
+  still valid alongside an unrelated `pyproject.toml` (e.g. tool configuration).
+- **Incomplete native project**: a `uv.lock` without `pyproject.toml`, or a
+  `pyproject.toml` without `uv.lock`, is an error (the function is skipped and
+  logged) rather than a guess — Relay installs only from a committed lock or a
+  `requirements.txt`.
+
+Both paths install into the **system** site-packages (`--system`), not a
+project-local `.venv`, so the existing `python -u /relay/bootstrap.py` entrypoint
+sees the packages and the dependency image stays a reusable, source-independent
+base.
 
 For Node functions, if no `package.json` exists a minimal `{"type":"module"}`
 package.json is injected so `.js` files are treated as ESM; if a user
@@ -1762,7 +1792,7 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 
 ## Out of scope
 
-Custom images/Dockerfiles, other runtimes, pyproject/uv/poetry/pnpm/yarn/bun,
+Custom images/Dockerfiles, other runtimes, poetry/pipenv/pnpm/yarn/bun,
 build caching, source hashing,
 registries, k8s, configurable retry _policies per rule_ (delays/attempt counts
 are fixed internals — a rule's `retries` count is configurable, the backoff

@@ -123,7 +123,7 @@ func TestRenderDockerfileHardening(t *testing.T) {
 		Files: []plan.File{
 			{Path: "/relay/bootstrap.py", Content: []byte("x"), Mode: fs.FileMode(0o644)},
 		},
-		Install:    []string{"pip install --no-cache-dir -r requirements.txt"},
+		Install:    []string{"uv pip install --system --no-cache -r requirements.txt"},
 		UserSetup:  pythonUserSetup,
 		User:       "10001:10001",
 		Entrypoint: []string{"python", "/relay/bootstrap.py"},
@@ -136,7 +136,7 @@ func TestRenderDockerfileHardening(t *testing.T) {
 WORKDIR /app
 COPY . /app
 COPY relay/bootstrap.py /relay/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt
 RUN ` + pythonUserSetup + `
 USER 10001:10001
 ENTRYPOINT ["python", "/relay/bootstrap.py"]
@@ -148,13 +148,43 @@ ENTRYPOINT ["python", "/relay/bootstrap.py"]
 	// The USER line must come after the user-setup RUN and after the install RUN.
 	userIdx := strings.Index(df, "USER 10001:10001")
 	setupIdx := strings.Index(df, "RUN groupadd")
-	installIdx := strings.Index(df, "RUN pip install")
+	installIdx := strings.Index(df, "RUN uv pip install")
 	if userIdx < 0 || setupIdx < 0 || installIdx < 0 {
 		t.Fatalf("expected USER, user-setup RUN, and install RUN lines, got:\n%s", df)
 	}
 	if !(installIdx < setupIdx && setupIdx < userIdx) {
 		t.Errorf("expected order install RUN < user-setup RUN < USER, got install=%d setup=%d user=%d",
 			installIdx, setupIdx, userIdx)
+	}
+}
+
+// TestRenderDockerfileToolCopies verifies external tool copies (the uv binary)
+// are emitted as `COPY --from=<image> <src> <dest>` BEFORE the install RUN, so
+// the install can use the tool. The order is the whole point: a copy after the
+// install would make uv unavailable at install time.
+func TestRenderDockerfileToolCopies(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage: "python:3.14-slim",
+		WorkDir:   "/app",
+		ToolCopies: []plan.ImageCopy{{
+			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv",
+		}},
+		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
+	}
+
+	df := renderDockerfile(p)
+	wantLine := "COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv"
+	if !strings.Contains(df, wantLine) {
+		t.Fatalf("expected tool copy line %q, got:\n%s", wantLine, df)
+	}
+	copyIdx := strings.Index(df, wantLine)
+	installIdx := strings.Index(df, "RUN uv pip install")
+	if copyIdx < 0 || installIdx < 0 || copyIdx > installIdx {
+		t.Errorf("tool copy must precede the install RUN (copy=%d install=%d):\n%s", copyIdx, installIdx, df)
+	}
+	// Never a floating tag: the renderer copies the pinned reference verbatim.
+	if strings.Contains(df, "uv:latest") {
+		t.Errorf("tool copy must not use a floating latest tag:\n%s", df)
 	}
 }
 
@@ -182,11 +212,17 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 // image, not a runnable function.
 func TestRenderDockerfileDependencyBase(t *testing.T) {
 	// buildDependencyImage builds this plan (note Deps is intentionally zero so
-	// the renderer emits the plain COPY . path, not a nested dep base).
+	// the renderer emits the plain COPY . path, not a nested dep base). The
+	// dependency base image is built FROM the raw runtime base, so it must copy
+	// the runtime's tool (uv) itself — this is how the dependency install gets
+	// uv even though it does not inherit it from a function image.
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
-		Install:   []string{"pip install --no-cache-dir -r requirements.txt"},
+		ToolCopies: []plan.ImageCopy{{
+			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv",
+		}},
+		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
 	}
 	df := renderDockerfile(p)
 
@@ -201,7 +237,10 @@ func TestRenderDockerfileDependencyBase(t *testing.T) {
 	if !strings.Contains(df, "COPY . /app") {
 		t.Errorf("expected COPY manifests line, got:\n%s", df)
 	}
-	if !strings.Contains(df, "RUN pip install --no-cache-dir -r requirements.txt") {
+	if !strings.Contains(df, "COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv") {
+		t.Errorf("expected uv tool copy line in the dependency base, got:\n%s", df)
+	}
+	if !strings.Contains(df, "RUN uv pip install --system --no-cache -r requirements.txt") {
 		t.Errorf("expected RUN install line, got:\n%s", df)
 	}
 	// A base image must not get runtime concerns baked in.
@@ -232,7 +271,7 @@ func TestRenderDockerfileFunctionFromDependency(t *testing.T) {
 	}
 	// The install is in the dependency layer; the function image has no install
 	// RUN of its own.
-	if strings.Contains(df, "RUN pip install") {
+	if strings.Contains(df, "RUN uv pip install") {
 		t.Errorf("function image built FROM the dep layer must not re-run install, got:\n%s", df)
 	}
 	// The user setup is still needed (the dep layer's /app contents are owned by

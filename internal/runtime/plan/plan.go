@@ -18,6 +18,12 @@ type Spec struct {
 	Name      string
 	Engine    Engine
 	BaseImage string
+	// ToolCopies are external-image COPY --from directives every image for this
+	// runtime needs (e.g. a pinned tool binary). They are applied to BOTH the
+	// function image and its dependency base image, because the dependency image
+	// is built FROM BaseImage (not from the function image) and still needs the
+	// tool to run its install. Empty when the runtime needs no external tool.
+	ToolCopies []ImageCopy
 }
 
 // File is a file the builder mirrors into the build context: Path is the
@@ -27,6 +33,22 @@ type File struct {
 	Path    string
 	Content []byte
 	Mode    fs.FileMode
+}
+
+// ImageCopy is a build-time COPY --from directive that pulls a file out of an
+// EXTERNAL image into the image being built (e.g. the pinned uv binary). It is
+// how a runtime acquires a versioned external tool without changing its base
+// image; the single generic Dockerfile renderer emits it, so engines express
+// the copy as plan data rather than a Dockerfile.
+type ImageCopy struct {
+	// From is the source image reference. Callers should pin it (tag or
+	// digest); a moving tag would make otherwise identical builds differ.
+	From string
+	// Source is the path copied out of From (e.g. "/uv").
+	Source string
+	// Dest is the destination path in the image being built (e.g.
+	// "/usr/local/bin/uv").
+	Dest string
 }
 
 // BuildPlan is how a function directory becomes an image. Engines answer "what
@@ -99,6 +121,11 @@ type BuildPlan struct {
 	// runtime (not build time). They are merged after the base RELAY_HANDLER
 	// variable. Empty when the runtime needs no extra environment.
 	Env []string
+	// ToolCopies are build-time COPY --from directives pulling external tool
+	// binaries into this image (see Spec.ToolCopies). The builder applies them
+	// before the dependency install so the install can use the tool. Empty when
+	// the image needs no external tool.
+	ToolCopies []ImageCopy
 	// Entrypoint is the container entrypoint as a JSON-array ENTRYPOINT.
 	Entrypoint []string
 }

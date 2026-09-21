@@ -40,6 +40,49 @@ func TestLookupResolvesRuntimeSpecAndRejectsUnknown(t *testing.T) {
 	}
 }
 
+// TestPythonSpecPinsUvImage verifies the Python runtime declares the pinned uv
+// tool copy (source ghcr.io/astral-sh/uv:<pinned>) so every Python image has the
+// uv binary. It also guards against a floating "latest" tag: the version must
+// be an explicit semver so builds are reproducible.
+func TestPythonSpecPinsUvImage(t *testing.T) {
+	spec, err := lookup("python3.14")
+	if err != nil {
+		t.Fatalf("lookup python3.14: %v", err)
+	}
+	if len(spec.ToolCopies) != 1 {
+		t.Fatalf("python3.14 tool copies = %+v, want exactly the uv copy", spec.ToolCopies)
+	}
+	tc := spec.ToolCopies[0]
+	if tc.From != UvImageTag {
+		t.Errorf("uv image = %q, want %q", tc.From, UvImageTag)
+	}
+	if tc.Source != "/uv" || tc.Dest != "/usr/local/bin/uv" {
+		t.Errorf("uv copy = %+v, want /uv -> /usr/local/bin/uv", tc)
+	}
+	if !strings.HasPrefix(tc.From, "ghcr.io/astral-sh/uv:") {
+		t.Errorf("uv image = %q, want the official ghcr.io/astral-sh/uv source", tc.From)
+	}
+	version := strings.TrimPrefix(tc.From, "ghcr.io/astral-sh/uv:")
+	if version == "latest" || version == "" {
+		t.Errorf("uv image version = %q, must be a pinned version, never latest", version)
+	}
+	if strings.Count(version, ".") != 2 {
+		t.Errorf("uv image version = %q, want a full pinned major.minor.patch version", version)
+	}
+}
+
+// TestNodeSpecHasNoToolCopies verifies the tool-copy mechanism is opt-in per
+// runtime: node does not copy the uv binary.
+func TestNodeSpecHasNoToolCopies(t *testing.T) {
+	spec, err := lookup("node24")
+	if err != nil {
+		t.Fatalf("lookup node24: %v", err)
+	}
+	if len(spec.ToolCopies) != 0 {
+		t.Errorf("node24 tool copies = %+v, want none", spec.ToolCopies)
+	}
+}
+
 // testSpecTable returns a COPY of the production registry with the two
 // test-only multi-version specs added, so the shared-engine tests exercise the
 // real resolution/dispatch path without mutating the global specs map (which

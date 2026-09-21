@@ -111,6 +111,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
 		WorkDir:    workDir,
 		Files:      files,
 		Deps:       deps,
+		ToolCopies: spec.ToolCopies,
 		UserSetup:  userSetup,
 		User:       userID,
 		Entrypoint: entrypoint,
