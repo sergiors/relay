@@ -210,6 +210,7 @@ func Run(logger *slog.Logger) {
 		EntryPoints:  cfg.TraefikEntryPoints,
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
+		HostOverride: cfg.TraefikHostOverride,
 	}, logger)
 
 	// Conservative startup orphan sweep: before any function is prepared or any

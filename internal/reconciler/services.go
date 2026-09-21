@@ -24,9 +24,10 @@
 //     reference those images.
 //   - Routing (Traefik) for routed services (a service declaring a host) is
 //     validated before any container action for that service: the routing
-//     config must be present and the routing network must exist (Relay never
-//     creates it); a routed service failing routing validation is reported and
-//     skipped, not half-reconciled.
+//     config must be present, the per-service effective host (including any
+//     TRAEFIK_HOST_OVERRIDE mapping) must be a valid hostname, and the routing
+//     network must exist (Relay never creates it); a routed service failing
+//     routing validation is reported and skipped, not half-reconciled.
 package reconciler
 
 import (
@@ -194,6 +195,20 @@ func Reconcile(
 				}
 				continue
 			}
+			// The per-service effective host (declared host, or the override
+			// mapping) is validated next: the combined length is only knowable
+			// with the template host in hand, and an overlong host would
+			// silently never match. This runs before network/container work,
+			// preserving the routing-first ordering; with no override it is a
+			// no-op on an already-validated template host.
+			if err := traefik.ValidateHost(svc.Host); err != nil {
+				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
+				fail(err)
+				if log != nil {
+					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				}
+				continue
+			}
 			// The routing network (e.g. the Traefik network) is infrastructure
 			// owned outside Relay; Relay verifies it exists and refuses to
 			// start routed containers otherwise — it never creates it.
@@ -231,6 +246,9 @@ func Reconcile(
 				}
 				if traefik.Priority != nil {
 					attrs = append(attrs, "priority", *traefik.Priority)
+				}
+				if traefik.HostOverride != "" {
+					attrs = append(attrs, "host_override", traefik.HostOverride)
 				}
 				log.Debug("Service: routing configured",
 					append([]any{

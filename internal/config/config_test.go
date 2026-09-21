@@ -391,6 +391,25 @@ func TestLoadTraefikOptionalValues(t *testing.T) {
 	}
 }
 
+// TestLoadTraefikHostOverride pins the optional TRAEFIK_HOST_OVERRIDE value:
+// empty when unset (no override, prior behavior) and passed through verbatim
+// when set. Validation is the routing layer's concern, so config does not
+// reject a non-hostname here — it is hostname-dumb passthrough like the other
+// TRAEFIK_* fields.
+func TestLoadTraefikHostOverride(t *testing.T) {
+	setRequiredEnv(t)
+	cfg := Load(discardLogger())
+	if cfg.TraefikHostOverride != "" {
+		t.Fatalf("TraefikHostOverride = %q, want empty when unset", cfg.TraefikHostOverride)
+	}
+
+	t.Setenv("TRAEFIK_HOST_OVERRIDE", "localhost")
+	cfg = Load(discardLogger())
+	if cfg.TraefikHostOverride != "localhost" {
+		t.Fatalf("TraefikHostOverride = %q, want localhost", cfg.TraefikHostOverride)
+	}
+}
+
 // TestParseOptionalPositiveInt pins the ParseOptionalPositiveInt contract:
 // unset/empty/whitespace → (nil, nil) — the "not configured" pointer-nil state;
 // positive ints parse to a pointer; zero, negative, non-numeric, and float

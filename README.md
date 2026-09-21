@@ -158,22 +158,23 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                       | Required | Description                                                                                                                                           |
-| ----------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REDIS_URI`                   | yes      | Redis address or DSN (see below).                                                                                                                     |
-| `REDIS_STREAM`                | yes      | Redis stream to consume.                                                                                                                              |
-| `REDIS_GROUP`                 | yes      | Consumer group name.                                                                                                                                  |
-| `REDIS_STREAM_RETENTION`      | no       | Stream retention window; unset disables trimming.                                                                                                     |
-| `METRICS_ADDR`                | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                               |
-| `GIT_WEBHOOK_ADDR`            | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).                                                                         |
-| `LOG_LEVEL`                   | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                |
-| `MAX_CONCURRENCY`             | no       | Max concurrent function invocations per worker; default `8`.                                                                                          |
-| `MAX_BUFFERED_EVENTS`         | no       | Max events read from Redis and held locally before completion; default `16`.                                                                          |
-| `WARM_CONTAINER_IDLE_TIMEOUT` | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                  |
-| `TRAEFIK_NETWORK`             | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                  |
-| `TRAEFIK_ENTRYPOINTS`         | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted. |
-| `TRAEFIK_CERTRESOLVER`        | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.                                                                   |
-| `TRAEFIK_PRIORITY`            | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer.                                                                |
+| Env var                       | Required | Description                                                                                                                                                                              |
+| ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_URI`                   | yes      | Redis address or DSN (see below).                                                                                                                                                        |
+| `REDIS_STREAM`                | yes      | Redis stream to consume.                                                                                                                                                                 |
+| `REDIS_GROUP`                 | yes      | Consumer group name.                                                                                                                                                                     |
+| `REDIS_STREAM_RETENTION`      | no       | Stream retention window; unset disables trimming.                                                                                                                                        |
+| `METRICS_ADDR`                | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                                                                  |
+| `GIT_WEBHOOK_ADDR`            | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).                                                                                                            |
+| `LOG_LEVEL`                   | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                                                   |
+| `MAX_CONCURRENCY`             | no       | Max concurrent function invocations per worker; default `8`.                                                                                                                             |
+| `MAX_BUFFERED_EVENTS`         | no       | Max events read from Redis and held locally before completion; default `16`.                                                                                                             |
+| `WARM_CONTAINER_IDLE_TIMEOUT` | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                                                     |
+| `TRAEFIK_NETWORK`             | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                                                     |
+| `TRAEFIK_ENTRYPOINTS`         | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted.                                    |
+| `TRAEFIK_CERTRESOLVER`        | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.                                                                                                      |
+| `TRAEFIK_PRIORITY`            | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer.                                                                                                   |
+| `TRAEFIK_HOST_OVERRIDE`       | no       | Replaces the declared host's domain for local/development routing while preserving its left-most label; e.g. `issuer.example.com` → `issuer.localhost`. Unset = declared host unchanged. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -358,10 +359,19 @@ which runtime to use and which events it handles.
 
 ### Image lifecycle
 
-Function images are **versioned by source fingerprint**. Each function's content
-is hashed (SHA-256 over file paths + bytes) and the image is tagged
-`relay-fn-<name>:<first-16-hex-of-fingerprint>`; the full 64-hex fingerprint
-stays authoritative in the local state database and on the prepared function.
+Function images are **versioned by source fingerprint**. Each function's
+**selected source** is hashed (SHA-256 over file paths + bytes) and the image is
+tagged `relay-fn-<name>:<first-16-hex-of-fingerprint>`; the full 64-hex
+fingerprint stays authoritative in the local state database and on the prepared
+function.
+
+Selection is governed by `.gitignore` rules (the same policy git uses): a source
+file matched by an applicable rule is not source, so its bytes never enter the
+fingerprint and never enter the image. The applicable `.gitignore` files
+themselves **are** hashed, so editing a rule changes the fingerprint even when no
+included file changed — a rule edit can change the source set, and must therefore
+gate a rebuild. The same selection drives materialization, the build context, and
+the fingerprint, so all three always agree on which files are source.
 
 - A rebuild produces a **new immutable image version**; an existing image for
   the exact fingerprint is reused without rebuilding.
@@ -926,6 +936,13 @@ traefik.http.routers.<id>.priority                      = <TRAEFIK_PRIORITY>    
 So a routed service with
 `TRAEFIK_NETWORK=proxy TRAEFIK_ENTRYPOINTS=websecure TRAEFIK_CERTRESOLVER=letsencrypt TRAEFIK_PRIORITY=100`
 gets all eight labels; with network-only config it gets exactly the four above.
+
+For local or development environments, `TRAEFIK_HOST_OVERRIDE` changes only the
+effective host in the Traefik routing rule. For example, with
+`TRAEFIK_HOST_OVERRIDE=localhost`, `issuer.example.com` routes as
+`issuer.localhost` while `api.example.com` routes as
+`api.localhost`. The template host is not modified. If a service declares a
+path, the existing `PathPrefix` and StripPrefix behavior is unchanged.
 
 When the service also declares a `path`, the router rule is constrained to that
 prefix and a StripPrefix middleware is attached to the router, so the upstream

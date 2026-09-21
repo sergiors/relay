@@ -71,6 +71,15 @@ type Config struct {
 	// it must be a positive integer — an invalid value is a fatal
 	// configuration error — so &0 is never produced.
 	TraefikPriority *int
+	// TraefikHostOverride is the optional TRAEFIK_HOST_OVERRIDE value: the
+	// domain suffix substituted for the domain of every routed service's
+	// declared host, keeping the host's left-most label (so
+	// "issuer.example.com" routes as "issuer.localhost" when set to
+	// "localhost"). Empty (unset) means no override: hosts are used verbatim,
+	// preserving prior behavior. The value is passed through as-is here and
+	// validated by the routing layer (a routing concern); it is hostname-dumb
+	// config, like the other TRAEFIK_* fields.
+	TraefikHostOverride string
 	// WarmContainerIdleTimeout is the WARM_CONTAINER_IDLE_TIMEOUT value: how
 	// long a healthy idle warm execution container is kept before the runtime
 	// evicts it. Unset/empty defaults to DefaultWarmContainerIdleTimeout (5m);
@@ -137,6 +146,7 @@ func Load(logger *slog.Logger) Config {
 		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
 		TraefikPriority:     loadOptionalPositiveInt(logger, "TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", "")),
+		TraefikHostOverride: getEnv("TRAEFIK_HOST_OVERRIDE", ""),
 		WarmContainerIdleTimeout: loadPositiveDuration(
 			logger,
 			"WARM_CONTAINER_IDLE_TIMEOUT",
