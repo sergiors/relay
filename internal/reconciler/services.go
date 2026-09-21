@@ -190,9 +190,7 @@ func Reconcile(
 			if err := traefik.Validate(); err != nil {
 				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
 				fail(err)
-				if log != nil {
-					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
-				}
+				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
 				continue
 			}
 			// The per-service effective host (declared host, or the override
@@ -204,9 +202,7 @@ func Reconcile(
 			if err := traefik.ValidateHost(svc.Host); err != nil {
 				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
 				fail(err)
-				if log != nil {
-					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
-				}
+				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
 				continue
 			}
 			// The routing network (e.g. the Traefik network) is infrastructure
@@ -216,48 +212,42 @@ func Reconcile(
 			if err != nil {
 				err := fmt.Errorf("service %q: check routing network: %w", svc.Entrypoint, err)
 				fail(err)
-				if log != nil {
-					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
-				}
+				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
 				continue
 			}
 			if !ok {
 				err := fmt.Errorf("service %q: %w", svc.Entrypoint, routing.MissingNetwork(traefik.Network))
 				fail(err)
-				if log != nil {
-					log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
-				}
+				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
 				continue
 			}
 			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Path, svc.Port, traefik)
 			routeNetwork = traefik.Network
-			if log != nil {
-				// Optional routing values log only when set, omitting empty
-				// ones; the generated labels themselves are never logged.
-				var attrs []any
-				if svc.Path != "" {
-					attrs = append(attrs, "path", svc.Path)
-				}
-				if traefik.EntryPoints != "" {
-					attrs = append(attrs, "entrypoints", traefik.EntryPoints)
-				}
-				if traefik.CertResolver != "" {
-					attrs = append(attrs, "certresolver", traefik.CertResolver)
-				}
-				if traefik.Priority != nil {
-					attrs = append(attrs, "priority", *traefik.Priority)
-				}
-				if traefik.HostOverride != "" {
-					attrs = append(attrs, "host_override", traefik.HostOverride)
-				}
-				log.Debug("Service: routing configured",
-					append([]any{
-						"function", fnName,
-						"service", svc.Entrypoint,
-						"host", svc.Host,
-						"network", routeNetwork,
-					}, attrs...)...)
+			// Optional routing values log only when set, omitting empty
+			// ones; the generated labels themselves are never logged.
+			var attrs []any
+			if svc.Path != "" {
+				attrs = append(attrs, "path", svc.Path)
 			}
+			if traefik.EntryPoints != "" {
+				attrs = append(attrs, "entrypoints", traefik.EntryPoints)
+			}
+			if traefik.CertResolver != "" {
+				attrs = append(attrs, "certresolver", traefik.CertResolver)
+			}
+			if traefik.Priority != nil {
+				attrs = append(attrs, "priority", *traefik.Priority)
+			}
+			if traefik.HostOverride != "" {
+				attrs = append(attrs, "host_override", traefik.HostOverride)
+			}
+			log.Debug("Service: routing configured",
+				append([]any{
+					"function", fnName,
+					"service", svc.Entrypoint,
+					"host", svc.Host,
+					"network", routeNetwork,
+				}, attrs...)...)
 		}
 
 		// A container is a keep candidate only when it is both healthy (running)
@@ -315,17 +305,13 @@ func Reconcile(
 		entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
-			if log != nil {
-				log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
-			}
+			log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
 			continue
 		}
 		env, err := BuildEnv(ctx, tmpl, svc.Port, preparedEnv, secrets)
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
-			if log != nil {
-				log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
-			}
+			log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
 			continue
 		}
 
@@ -387,12 +373,10 @@ func routingLabelsMatch(desired, actual map[string]string) bool {
 func RemoveAll(ctx context.Context, d Docker, fnName string, log *slog.Logger) {
 	n, err := d.RemoveFunctionServiceContainers(ctx, fnName)
 	if err != nil {
-		if log != nil {
-			log.Warn("Service: remove function containers failed", "function", fnName, "error", err)
-		}
+		log.Warn("Service: remove function containers failed", "function", fnName, "error", err)
 		return
 	}
-	if log != nil && n > 0 {
+	if n > 0 {
 		log.Info("Service: removed function containers", "function", fnName, "count", n)
 	}
 }
@@ -420,9 +404,7 @@ func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string
 	containers, err := c.docker.ServiceContainerList(ctx)
 	if err != nil {
 		logErr := fmt.Errorf("service: list containers: %w", err)
-		if c.log != nil {
-			c.log.Warn("Service: shutdown cleanup failed", "error", logErr)
-		}
+		c.log.Warn("Service: shutdown cleanup failed", "error", logErr)
 		return 0, logErr
 	}
 	var own []runtime.ServiceContainer
@@ -435,21 +417,17 @@ func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string
 		}
 	}
 	if len(own) == 0 {
-		if c.log != nil {
-			c.log.Debug("Service: shutdown cleanup: nothing to clean", "hostname", hostname)
-		}
+		c.log.Debug("Service: shutdown cleanup: nothing to clean", "hostname", hostname)
 		return 0, nil
 	}
 	err = c.docker.StopServiceContainers(ctx, own)
-	if c.log != nil {
-		if err != nil {
-			// StopServiceContainers keeps the partial progress (everything it
-			// could stop/remove is gone); the error is still returned to the
-			// caller — cleanup is never fatal to shutdown itself.
-			c.log.Warn("Service: shutdown cleanup failed", "error", err)
-		} else {
-			c.log.Info("Service: shutdown cleanup complete", "containers", len(own))
-		}
+	if err != nil {
+		// StopServiceContainers keeps the partial progress (everything it
+		// could stop/remove is gone); the error is still returned to the
+		// caller — cleanup is never fatal to shutdown itself.
+		c.log.Warn("Service: shutdown cleanup failed", "error", err)
+	} else {
+		c.log.Info("Service: shutdown cleanup complete", "containers", len(own))
 	}
 	return len(own), err
 }
@@ -469,8 +447,7 @@ type ServiceReconciler struct {
 
 // NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
 // Traefik routing config (empty = routing not configured; required only for
-// services whose template declares a host). log may be nil (then no messages
-// are emitted).
+// services whose template declares a host).
 func NewServiceReconciler(
 	d Docker,
 	secrets SecretResolver,
@@ -503,16 +480,11 @@ func (c *ServiceReconciler) Apply(
 
 	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log)
 	if err != nil {
-		if c.log != nil {
-			c.log.Warn("Service: reconciled with errors",
-				"function", fnName,
-				"replicas", replicas,
-				"error", err,
-			)
-		}
-		return
-	}
-	if c.log == nil {
+		c.log.Warn("Service: reconciled with errors",
+			"function", fnName,
+			"replicas", replicas,
+			"error", err,
+		)
 		return
 	}
 	if changed {
@@ -550,9 +522,7 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[
 
 	containers, err := c.docker.ServiceContainerList(ctx)
 	if err != nil {
-		if c.log != nil {
-			c.log.Warn("Service: orphan sweep list failed", "error", err)
-		}
+		c.log.Warn("Service: orphan sweep list failed", "error", err)
 		return
 	}
 	var stale []runtime.ServiceContainer
@@ -565,14 +535,10 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[
 		return
 	}
 	if err := c.docker.StopServiceContainers(ctx, stale); err != nil {
-		if c.log != nil {
-			c.log.Warn("Service: orphan sweep stop failed", "count", len(stale), "error", err)
-		}
+		c.log.Warn("Service: orphan sweep stop failed", "count", len(stale), "error", err)
 		return
 	}
-	if c.log != nil {
-		c.log.Info("Service: swept orphan containers",
-			"count", len(stale),
-		)
-	}
+	c.log.Info("Service: swept orphan containers",
+		"count", len(stale),
+	)
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -33,12 +32,8 @@ type Scheduler struct {
 
 // New constructs a Scheduler over the given publisher. The gocron scheduler is
 // pinned to UTC (per-job timezones are encoded as CRON_TZ prefixes) and its
-// shutdown is bounded by WithStopTimeout. A nil logger falls back to a
-// discarding slog logger like the runner does.
+// shutdown is bounded by WithStopTimeout.
 func New(pub Publisher, logger *slog.Logger) *Scheduler {
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
 	g, err := gocron.NewScheduler(
 		gocron.WithLocation(time.UTC),
 		gocron.WithStopTimeout(5*time.Second),

@@ -28,6 +28,7 @@ func TestNewConsumerDefaults(t *testing.T) {
 		return ConsumerConfig{
 			Client: redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
 			Stream: "events",
+			Log:    slog.New(slog.DiscardHandler),
 		}
 	}
 

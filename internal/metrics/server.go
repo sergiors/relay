@@ -92,9 +92,7 @@ func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.started.Store(false)
-		if s.logger != nil {
-			s.logger.Error("Metrics: listen failed", "addr", s.addr, "error", err)
-		}
+		s.logger.Error("Metrics: listen failed", "addr", s.addr, "error", err)
 		return fmt.Errorf("metrics: listen %s: %w", s.addr, err)
 	}
 	s.srv = &http.Server{

@@ -84,7 +84,7 @@ func newUniqueOccurrence(prefix string) Occurrence {
 func TestIntegrationPublishIfNewWritesEntryAndTTLedDedupKey(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
-	p := NewPublisher(cli, e.stream, nil, nil)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	ctx := context.Background()
 	o := newUniqueOccurrence(e.prefix)
@@ -118,7 +118,7 @@ func TestIntegrationPublishIfNewWritesEntryAndTTLedDedupKey(t *testing.T) {
 func TestIntegrationDuplicateIsNoOp(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
-	p := NewPublisher(cli, e.stream, nil, nil)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	ctx := context.Background()
 	o := newUniqueOccurrence(e.prefix)
@@ -141,7 +141,7 @@ func TestIntegrationDuplicateIsNoOp(t *testing.T) {
 func TestIntegrationDifferentOccurrencesPublishIndependently(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
-	p := NewPublisher(cli, e.stream, nil, nil)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	o1 := newUniqueOccurrence(e.prefix)
 	o2 := Occurrence{Function: e.prefix, Handler: "jobs.cleanup.handler", ScheduledAt: o1.ScheduledAt.Add(time.Minute)}
@@ -176,7 +176,7 @@ func TestIntegrationDifferentOccurrencesPublishIndependently(t *testing.T) {
 func TestIntegrationPublishFailureLeavesNoKey(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
-	p := NewPublisher(cli, e.stream, nil, nil)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	ctx := context.Background()
 	// Make the stream name a wrong-type key so the script's XADD errors.

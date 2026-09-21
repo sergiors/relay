@@ -21,7 +21,7 @@ import (
 // tests without any auth logic (a nil secret provider makes requests 500, but
 // here we only care that POST /github reaches SOMETHING).
 func testHandler() *GitHubProvider {
-	return &GitHubProvider{}
+	return &GitHubProvider{logger: testutil.DiscardLogger()}
 }
 
 // stubProvider is a minimal Provider harness for dispatch tests: it serves the
@@ -43,7 +43,7 @@ func (p *stubProvider) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 // TestMuxRoutesGitHub only registers POST /github: a GET on /github is a 405,
 // and a POST to any other path is a 404.
 func TestMuxRoutesGitHub(t *testing.T) {
-	srv := newServer("127.0.0.1:0", nil, testHandler())
+	srv := newServer("127.0.0.1:0", testutil.DiscardLogger(), testHandler())
 	mux := srv.handler.(*http.ServeMux)
 
 	// GET /github -> 405 (method pattern only allows POST).
@@ -116,7 +116,7 @@ func TestMultiProviderDispatch(t *testing.T) {
 func TestNewServerRoutesSkipsNilProvider(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/github", nil)
-	srv := newServer("", nil, nil) // a single nil provider, plus the nil logger
+	srv := newServer("", testutil.DiscardLogger(), nil) // zero providers
 	srv.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("nil-provider route status = %d, want 404 (no route registered)", rec.Code)
@@ -134,12 +134,12 @@ func TestNewServerRejectsInvalidProviderName(t *testing.T) {
 					t.Fatalf("newServer did not panic for name %q", name)
 				}
 			}()
-			newServer("", nil, &stubProvider{name: name, code: http.StatusOK, body: "x"})
+			newServer("", testutil.DiscardLogger(), &stubProvider{name: name, code: http.StatusOK, body: "x"})
 		})
 	}
 
 	// A valid single-segment name registers without panicking.
-	srv := newServer("", nil, &stubProvider{name: "valid", code: http.StatusOK, body: "x"})
+	srv := newServer("", testutil.DiscardLogger(), &stubProvider{name: "valid", code: http.StatusOK, body: "x"})
 	srv.handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/valid", nil))
 }
 
@@ -181,7 +181,7 @@ func TestServerLifecycleStartServeStop(t *testing.T) {
 
 // TestServerStartTwiceFails verifies Start may be called exactly once.
 func TestServerStartTwiceFails(t *testing.T) {
-	srv := newServer(testutil.FreeAddr(t), nil, testHandler())
+	srv := newServer(testutil.FreeAddr(t), testutil.DiscardLogger(), testHandler())
 	if err := srv.Start(); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestServerStartFailsFastOnBadAddr(t *testing.T) {
 func TestServerStopNeverStartedAndNil(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := newServer("", nil, testHandler()).Stop(ctx); err != nil {
+	if err := newServer("", testutil.DiscardLogger(), testHandler()).Stop(ctx); err != nil {
 		t.Fatalf("Stop on never-started server: %v", err)
 	}
 	var nilSrv *Server
@@ -242,7 +242,7 @@ func TestReadBodyAtSizeBoundary(t *testing.T) {
 		body := bytes.Repeat([]byte("x"), maxBodyBytes)
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/github", bytes.NewReader(body))
-		got, ok := readBody(nil, rec, req)
+		got, ok := readBody(testutil.DiscardLogger(), rec, req)
 		if !ok {
 			t.Fatalf("readBody at exactly maxBodyBytes returned ok=false (status %d)", rec.Code)
 		}
@@ -254,7 +254,7 @@ func TestReadBodyAtSizeBoundary(t *testing.T) {
 		body := bytes.Repeat([]byte("x"), maxBodyBytes+1)
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/github", bytes.NewReader(body))
-		if _, ok := readBody(nil, rec, req); ok {
+		if _, ok := readBody(testutil.DiscardLogger(), rec, req); ok {
 			t.Fatal("readBody over maxBodyBytes returned ok=true, want rejection")
 		}
 		if rec.Code != http.StatusBadRequest {
@@ -492,7 +492,7 @@ func TestServerStopNilSafe(t *testing.T) {
 
 	// A never-started server built via newServer has a nil scheduler; Stop must
 	// still return nil without touching it.
-	s := newServer("", nil, testHandler())
+	s := newServer("", testutil.DiscardLogger(), testHandler())
 	if err := s.Stop(ctx); err != nil {
 		t.Fatalf("Stop on never-started newServer: %v", err)
 	}

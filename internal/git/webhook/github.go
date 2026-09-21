@@ -89,8 +89,8 @@ type SyncTrigger interface {
 	Done() <-chan struct{}
 }
 
-// NewGitHubProvider builds a GitHubProvider. logger is DI (nil tolerated: logs are
-// skipped); secretRef is the name of the webhook secret in Relay's store — empty
+// NewGitHubProvider builds a GitHubProvider. secretRef is the name of the
+// webhook secret in Relay's store — empty
 // means signature verification is disabled and deliveries are accepted
 // unauthenticated (a GitHub webhook configured without a secret sends no
 // signature header); secrets resolves secretRef to the value (when non-empty,
@@ -350,9 +350,8 @@ type SyncScheduler struct {
 }
 
 // NewSyncScheduler builds a coalescing sync scheduler that runs git.Sync with
-// the given opts (dirs pre-populated by the worker). logger is DI (nil
-// tolerated). It owns a cancellable context so Stop can abort an in-flight sync
-// at its next transport step.
+// the given opts (dirs pre-populated by the worker). It owns a cancellable
+// context so Stop can abort an in-flight sync at its next transport step.
 func NewSyncScheduler(opts git.SyncOptions, logger *slog.Logger) *SyncScheduler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SyncScheduler{
@@ -428,16 +427,12 @@ func (s *SyncScheduler) run() {
 			s.closeIdle()
 			return
 		}
-		if s.logger != nil {
-			s.logger.Info("Git sync triggered")
-		}
+		s.logger.Info("Git sync triggered")
 		err := s.syncFn(s.ctx, s.opts)
-		if s.logger != nil {
-			if err != nil {
-				s.logger.Error("Webhook: Git sync failed", "error", err)
-			} else {
-				s.logger.Info("Git sync completed")
-			}
+		if err != nil {
+			s.logger.Error("Webhook: Git sync failed", "error", err)
+		} else {
+			s.logger.Info("Git sync completed")
 		}
 		s.mu.Lock()
 		if !s.pending {

@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -71,9 +70,9 @@ func newEnv(t *testing.T, cfg ConsumerConfig) *testEnv {
 	}
 	cfg.Client = cli
 	// Respect a caller-provided logger (e.g. a testutil.SyncBuffer-backed one) so a test
-	// can assert on consumer logs; otherwise default to stderr.
+	// can assert on consumer logs; otherwise discard them.
 	if cfg.Log == nil {
-		cfg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		cfg.Log = testutil.DiscardLogger()
 	}
 	// Fast recovery defaults for deterministic tests. A small Block keeps shutdown
 	// prompt: go-redis XReadGroup BLOCK is not interrupted by ctx cancellation and

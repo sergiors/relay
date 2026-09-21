@@ -135,9 +135,6 @@ type Reconciler struct {
 // startup-loaded functions (available or not) so reconciliation can compare
 // against and swap them.
 func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger) *Reconciler {
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
 	if cfg.Debounce == 0 {
 		cfg.Debounce = DefaultDebounce
 	}

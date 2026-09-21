@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -140,12 +139,15 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.Block == 0 {
 		cfg.Block = DefaultBlock
 	}
+
 	if cfg.Count == 0 {
 		cfg.Count = DefaultCount
 	}
+
 	if cfg.ReclaimInterval == 0 {
 		cfg.ReclaimInterval = DefaultReclaimInterval
 	}
+
 	// MinPendingIdle defaults to DefaultReclaimInterval (1m): it is a
 	// message-level recovery-pacing backstop that only delays MESSAGE
 	// re-delivery. Per-invocation execution eligibility (including retry
@@ -155,12 +157,11 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.MinPendingIdle == 0 {
 		cfg.MinPendingIdle = DefaultReclaimInterval
 	}
-	if cfg.Log == nil {
-		cfg.Log = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
+
 	if cfg.MetricsInterval == 0 {
 		cfg.MetricsInterval = DefaultMetricsInterval
 	}
+
 	// The bounded local-event buffer defaults to DefaultMaxBufferedEvents (16)
 	// and falls back to it on a zero or negative value (a value of 0 must not
 	// mean "unbounded").

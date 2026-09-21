@@ -213,13 +213,10 @@ func readBody(logger *slog.Logger, w http.ResponseWriter, r *http.Request) ([]by
 }
 
 // logAt routes a structured log line through the injected logger at the given
-// level using the request context. Nil logger is tolerated (logs dropped). It
-// is shared provider plumbing: providers pass their injected logger. The
-// webhook secret value and signature header are never passed as attrs.
+// level using the request context. It is shared provider plumbing: providers
+// pass their injected logger. The webhook secret value and signature header are
+// never passed as attrs.
 func logAt(logger *slog.Logger, ctx context.Context, lvl slog.Level, msg string, args ...any) {
-	if logger == nil {
-		return
-	}
 	switch lvl {
 	case slog.LevelDebug:
 		logger.DebugContext(ctx, msg, args...)
@@ -254,9 +251,7 @@ func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.started.Store(false)
-		if s.logger != nil {
-			s.logger.Error("Webhook: listen failed", "addr", s.addr, "error", err)
-		}
+		s.logger.Error("Webhook: listen failed", "addr", s.addr, "error", err)
 		return fmt.Errorf("webhook: listen %s: %w", s.addr, err)
 	}
 	s.srv = &http.Server{
@@ -275,9 +270,7 @@ func (s *Server) Start() error {
 	go func() {
 		s.serveErr <- s.srv.Serve(ln)
 	}()
-	if s.logger != nil {
-		s.logger.Info("Webhook server started")
-	}
+	s.logger.Info("Webhook server started")
 	return nil
 }
 
@@ -312,12 +305,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		// scheduler the providers trigger — it cancels its internal context so
 		// an in-flight sync aborts at its next transport step, bounded by ctx.
 		if s.scheduler != nil {
-			if serr := s.scheduler.Stop(ctx); serr != nil && s.logger != nil {
+			if serr := s.scheduler.Stop(ctx); serr != nil {
 				s.logger.Warn("Git webhook scheduler: graceful shutdown failed", "error", serr)
 			}
 		}
 	})
-	if err == nil && s.logger != nil {
+	if err == nil {
 		s.logger.Info("Webhook server stopped")
 	}
 	return err

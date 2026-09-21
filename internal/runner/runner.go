@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -340,9 +339,6 @@ func New(prepared []*PreparedFunction, logger *slog.Logger) *Runner {
 // NewWithMetrics is like New but wires an optional metrics registry. A nil
 // registry is safe: every metric call is a no-op.
 func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, m *metrics.Registry) *Runner {
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
 	r := &Runner{
 		reg:                     &Registry{},
 		log:                     logger,
@@ -376,55 +372,41 @@ func (r *Runner) imageRemovedIdle(image string) {
 func (r *Runner) Registry() *Registry { return r.reg }
 
 // SetHostname sets this worker's container-ownership hostname, stamped as the
-// relay.hostname label on every execution container. It is nil-safe (a nil
-// Runner is a no-op) and must be called before Consume begins processing; it
-// takes effect on the next Handle, so setting it right after construction (as
-// internal/worker does) labels every invocation.
+// relay.hostname label on every execution container. It must be called before
+// Consume begins processing; it takes effect on the next Handle, so setting it
+// right after construction (as internal/worker does) labels every invocation.
+// The constructor guarantees a non-nil Runner.
 func (r *Runner) SetHostname(h string) {
-	if r == nil {
-		return
-	}
 	r.hostname = h
 }
 
 // SetMaxHandlerTimeout caps every rule's handler timeout to at most d. A value
-// of 0 (the default) leaves rule timeouts uncapped. It is nil-safe (a nil
-// Runner is a no-op) and takes effect on the next Handle. It is defense in
-// depth: template validation enforces the cap at load, and this runtime cap
-// guarantees a misconfigured or hot-swapped template can never run a handler
-// longer than the stream layer's MaxRuleTimeout. The capped value is also what
-// TryStart persists as the invocation's running deadline, so the persisted
-// deadline matches the local timer by construction.
+// of 0 (the default) leaves rule timeouts uncapped. It takes effect on the next
+// Handle. It is defense in depth: template validation enforces the cap at load,
+// and this runtime cap guarantees a misconfigured or hot-swapped template can
+// never run a handler longer than the stream layer's MaxRuleTimeout. The capped
+// value is also what TryStart persists as the invocation's running deadline, so
+// the persisted deadline matches the local timer by construction.
 func (r *Runner) SetMaxHandlerTimeout(d time.Duration) {
-	if r == nil {
-		return
-	}
 	r.maxHandlerTimeout.Store(int64(d))
 }
 
 // SetSecretProvider wires the provider that resolves secret references to
-// values at execution time. It is nil-safe (a nil Runner is a no-op) and takes
-// effect on the next Handle. A nil provider means no secrets are available: a
-// template that references a secret then fails the invocation with a clear
-// error. The worker wires the production local provider after construction.
+// values at execution time. It takes effect on the next Handle. A nil provider
+// means no secrets are available: a template that references a secret then fails
+// the invocation with a clear error. The worker wires the production local
+// provider after construction.
 func (r *Runner) SetSecretProvider(p secrets.Provider) {
-	if r == nil {
-		return
-	}
 	r.secrets = p
 }
 
 // SetMaxConcurrency sets the worker-global cap on concurrently executing
 // invocations. A value of 0 or negative (the zero value) falls back to
-// DefaultMaxConcurrency (8); a value of 0 must not mean "unbounded". It is
-// nil-safe (a nil Runner is a no-op) and takes effect on the next Handle. It
-// is wired by the worker right next to SetHostname/SetSecretProvider/
-// SetMaxHandlerTimeout. The global semaphore is (re)built on the next acquisition,
-// so a call after construction resizes it.
+// DefaultMaxConcurrency (8); a value of 0 must not mean "unbounded". It takes
+// effect on the next Handle. It is wired by the worker right next to
+// SetHostname/SetSecretProvider/SetMaxHandlerTimeout. The global semaphore is
+// (re)built on the next acquisition, so a call after construction resizes it.
 func (r *Runner) SetMaxConcurrency(n int) {
-	if r == nil {
-		return
-	}
 	if n < 1 {
 		n = DefaultMaxConcurrency
 	}
@@ -573,6 +555,7 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 			r.skipAndRetryImageCleanup(image, delays, "relay-owned container references it", attempt)
 			return
 		}
+
 		if err := cleaner.RemoveImage(ctx, image); err != nil {
 			// A removal that fails while a container references the image is a
 			// guard-skip (the daemon refused, or the reference appeared mid-call),
@@ -794,11 +777,9 @@ func (r *Runner) effectiveConcurrency(fnName string, fallback int) int {
 // called when the function is removed from the registry, so a later recreation
 // of the same name starts from a fresh semaphore rather than inheriting a stale
 // bound (and so a removed function's map entry does not linger). In-flight
-// acquisitions still release to the pointer they captured. It is nil-safe.
+// acquisitions still release to the pointer they captured. The constructor
+// guarantees a non-nil Runner.
 func (r *Runner) RemoveFunctionSemaphore(fnName string) {
-	if r == nil {
-		return
-	}
 	r.fnSemsMu.Lock()
 	delete(r.fnSems, fnName)
 	r.fnSemsMu.Unlock()

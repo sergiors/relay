@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -77,13 +76,14 @@ type SchedulePublisher struct {
 }
 
 // NewPublisher constructs a SchedulePublisher over the given client and stream.
-// A nil logger falls back to a discarding slog logger; a nil metrics registry is
-// nil-safe (every metric call is a no-op). It does not own the client's
-// lifecycle: the caller (the worker) closes it.
-func NewPublisher(client *redis.Client, stream string, logger *slog.Logger, metrics *metrics.Registry) *SchedulePublisher {
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
+// A nil metrics registry is nil-safe (every metric call is a no-op). It does not
+// own the client's lifecycle: the caller (the worker) closes it.
+func NewPublisher(
+	client *redis.Client,
+	stream string,
+	logger *slog.Logger,
+	metrics *metrics.Registry,
+) *SchedulePublisher {
 	return &SchedulePublisher{
 		client:     client,
 		stream:     stream,

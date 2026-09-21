@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"relay/internal/runner"
+	"relay/internal/testutil"
 )
 
 // assertNoSpurious holds the observed prepare count at want across a bounded
@@ -93,7 +94,7 @@ func TestFunctionForPath(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	r := New(Config{Root: root}, nil, nil, nil)
+	r := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
 
 	cases := []struct {
 		path string

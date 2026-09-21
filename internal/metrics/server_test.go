@@ -25,7 +25,7 @@ func TestMuxServesMetrics(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, req)
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -48,7 +48,7 @@ func TestMuxRootNotFound(t *testing.T) {
 	r := New()
 	r.SetGauge(MetricPendingEntries, 1)
 	rec := httptest.NewRecorder()
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -59,7 +59,7 @@ func TestMuxRootNotFound(t *testing.T) {
 func TestMuxNotFound(t *testing.T) {
 	r := New()
 	rec := httptest.NewRecorder()
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/other", nil))
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/other", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -71,7 +71,7 @@ func TestMuxMethodNotAllowed(t *testing.T) {
 	r := New()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/metrics", nil)
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, req)
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
@@ -91,7 +91,7 @@ func TestMuxHead(t *testing.T) {
 	r.SetGauge(MetricPendingEntries, 1)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodHead, "/metrics", nil)
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, req)
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -110,7 +110,7 @@ func TestMuxNilHandlerPanics(t *testing.T) {
 			t.Fatal("NewServer with a nil handler did not panic; want a fail-fast registration panic")
 		}
 	}()
-	NewServer("127.0.0.1:0", nil, nil)
+	NewServer("127.0.0.1:0", nil, testutil.DiscardLogger())
 }
 
 // TestServerStartServesInBackground verifies Start binds synchronously and then
@@ -121,7 +121,7 @@ func TestServerStartServesInBackground(t *testing.T) {
 	r.SetGauge(MetricPendingEntries, 1)
 
 	addr := testutil.FreeAddr(t)
-	srv := NewServer(addr, r.Handler(), nil)
+	srv := NewServer(addr, r.Handler(), testutil.DiscardLogger())
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -169,11 +169,11 @@ func TestServerStopIdempotentAndNeverStarted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	if err := NewServer("", New().Handler(), nil).Stop(ctx); err != nil {
+	if err := NewServer("", New().Handler(), testutil.DiscardLogger()).Stop(ctx); err != nil {
 		t.Fatalf("Stop on never-started server: %v", err)
 	}
 
-	srv := NewServer("", New().Handler(), nil)
+	srv := NewServer("", New().Handler(), testutil.DiscardLogger())
 	if err := srv.Stop(ctx); err != nil {
 		t.Fatalf("Stop on never-started server: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestServerStopIdempotentAndNeverStarted(t *testing.T) {
 // returns an error — Start may be called exactly once.
 func TestServerStartTwiceFails(t *testing.T) {
 	addr := testutil.FreeAddr(t)
-	srv := NewServer(addr, New().Handler(), nil)
+	srv := NewServer(addr, New().Handler(), testutil.DiscardLogger())
 	if err := srv.Start(); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -167,10 +166,12 @@ func withClock(now func() time.Time) ManagerOption {
 // worker passes WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout).
 // NewManager starts the single warm-container maintenance loop, stopped by
 // Close.
-func NewManager(logger *slog.Logger, m *metrics.Registry, hostname string, opts ...ManagerOption) (*Manager, error) {
-	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
+func NewManager(
+	logger *slog.Logger,
+	m *metrics.Registry,
+	hostname string,
+	opts ...ManagerOption,
+) (*Manager, error) {
 	resolved := resolveManagerOptions(opts)
 
 	cli, err := client.New(client.FromEnv)

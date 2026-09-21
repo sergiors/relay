@@ -9,6 +9,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/metrics"
+	"relay/internal/testutil"
 )
 
 // newUnitPublisher builds a Publisher with the unexported test seams set: no
@@ -19,7 +20,7 @@ func newUnitPublisher(t *testing.T, m *metrics.Registry, res int, scriptErr erro
 	t.Helper()
 	cli := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	t.Cleanup(func() { _ = cli.Close() })
-	p := NewPublisher(cli, "unit-stream", nil, m)
+	p := NewPublisher(cli, "unit-stream", testutil.DiscardLogger(), m)
 	p.runScript = func(context.Context, redis.Scripter, []string, ...any) (int, error) {
 		return res, scriptErr
 	}

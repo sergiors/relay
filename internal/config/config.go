@@ -163,8 +163,7 @@ func Load(logger *slog.Logger) Config {
 // loadPositiveInt parses a positive-integer environment value. Defaults are
 // resolved at the getEnv call site (the env value is already non-empty), so an
 // unparseable, zero, or negative value is a configuration error: it logs and
-// aborts startup, matching loadLogLevel. The injected logger is non-nil at this
-// entry point (the CLI owns logger creation).
+// aborts startup, matching loadLogLevel.
 func loadPositiveInt(logger *slog.Logger, name, value string) int {
 	n, err := ParsePositiveInt(name, value)
 	if err != nil {
@@ -177,8 +176,7 @@ func loadPositiveInt(logger *slog.Logger, name, value string) int {
 // loadPositiveDuration wraps ParsePositiveDuration with the fatal style: an
 // invalid (malformed or non-positive) value logs a clear configuration error
 // and aborts startup, matching loadPositiveInt. Defaults are resolved at the
-// getEnv call site. The injected logger is non-nil at this entry point (the CLI
-// owns logger creation).
+// getEnv call site.
 func loadPositiveDuration(logger *slog.Logger, name, value string) time.Duration {
 	d, err := ParsePositiveDuration(name, value)
 	if err != nil {
@@ -246,8 +244,7 @@ func ParseOptionalPositiveInt(name, value string) (*int, error) {
 // loadOptionalPositiveInt wraps ParseOptionalPositiveInt with the fatal style:
 // an invalid value logs a clear configuration error and aborts startup,
 // matching loadPositiveInt. It returns nil for an unset value (see the parse
-// helper for the nil-vs-provided contract). The injected logger is non-nil at
-// this entry point (the CLI owns logger creation).
+// helper for the nil-vs-provided contract).
 func loadOptionalPositiveInt(logger *slog.Logger, name, value string) *int {
 	n, err := ParseOptionalPositiveInt(name, value)
 	if err != nil {
@@ -294,8 +291,7 @@ func ParseLogLevel(value string) (slog.Level, error) {
 // (loadDuration falls back), an invalid log level is a configuration error:
 // silently running at an unintended level would obscure precisely the
 // operational feedback the operator asked for. The valid value set is small and
-// enumerated, so there is no ambiguity worth falling back on. The injected
-// logger is non-nil at this entry point (the CLI owns logger creation).
+// enumerated, so there is no ambiguity worth falling back on.
 func loadLogLevel(logger *slog.Logger, value string) slog.Level {
 	level, err := ParseLogLevel(value)
 	if err != nil {
