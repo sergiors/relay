@@ -43,6 +43,7 @@ they read from.
 relay start                # start Relay in the foreground
 relay health               # check Relay dependencies (Redis, Docker)
 relay stats                # show current operational statistics
+relay stats reset          # reset persisted cumulative statistics
 relay function ls          # list functions
 relay function inspect <name>
 relay secret ls|set|rm     # manage local secrets
@@ -1648,6 +1649,18 @@ Updated:             10s ago
 zeroes with `Updated: never`. Backlog gauges (`pending_entries`,
 `oldest_pending_age_seconds`) are global — the consumer-group backlog is not
 attributed to individual functions.
+
+`relay stats reset` rewrites the persisted totals transactionally: the global
+cumulative counters are zeroed and the per-function `function_stats` rows —
+including the four per-function `Last*` execution timestamps — are cleared. The
+backlog gauges are **not** reset: they are point-in-time snapshots of the live
+Redis backlog, and the next worker flush refreshes them. It does not touch Redis
+or pending events, containers/runtime pools, schedules/services, or a running
+worker's Prometheus counters (those are monotonic for the process lifetime;
+restarting the worker resets them). A running worker re-writes its in-memory
+totals on its next ~5s flush, so a clean slate for a live worker requires a
+restart; for a stopped worker the reset is immediate and complete. After a reset,
+stats accumulate normally again.
 
 ## Acknowledgment semantics
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"relay/internal/state"
 )
@@ -126,5 +127,94 @@ func TestStatsCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "stats") {
 		t.Fatalf("stats --help: stdout missing stats usage:\n%s", out)
+	}
+}
+
+// `relay stats reset` prints the exact confirmation line, clears the global
+// cumulative counters and every function_stats row, but PRESERVES the live
+// backlog gauges. A following bare `relay stats` renders zeros for the counters
+// and the preserved gauge value.
+func TestStatsResetCommand(t *testing.T) {
+	st, deps := seedStatsState(t)
+	st.RecordFunctionStats(state.FunctionStats{
+		Function:             "alpha",
+		EventsProcessedTotal: 9,
+		WarmAcquiresTotal:    3,
+		LastExecutionAt:      time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	})
+
+	out, _, err := runCLIWithDeps(t, deps, "", "stats", "reset")
+	if err != nil {
+		t.Fatalf("stats reset: err = %v, want nil", err)
+	}
+	if out != "Stats reset\n" {
+		t.Fatalf("stats reset stdout = %q, want %q", out, "Stats reset\n")
+	}
+
+	// Persisted state: global counters zeroed, gauges preserved, function rows
+	// deleted.
+	s, ok := st.Stats()
+	if !ok {
+		t.Fatal("stats row must survive the reset")
+	}
+	if s.EventsProcessedTotal != 0 || s.HandlerSuccessTotal != 0 ||
+		s.HandlerFailureTotal != 0 || s.RetryTotal != 0 || s.DLQTotal != 0 {
+		t.Fatalf("cumulative counters must be zeroed: %+v", s)
+	}
+	if s.PendingEntries != 17 || s.OldestPendingAgeSeconds != 134 {
+		t.Fatalf("backlog gauges must be preserved: %+v", s)
+	}
+	if all := st.AllFunctionStats(); len(all) != 0 {
+		t.Fatalf("function_stats must be cleared: %+v", all)
+	}
+
+	// A follow-up bare `relay stats` still renders the table (the parent Action
+	// with no subcommand token), now with zero counters and the preserved gauge.
+	rendered, _, err := runCLIWithDeps(t, deps, "", "stats")
+	if err != nil {
+		t.Fatalf("stats after reset: err = %v, want nil", err)
+	}
+	for _, want := range []string{
+		"Events processed:    0",
+		"Handler successes:   0",
+		"Handler failures:    0",
+		"Retries:             0",
+		"DLQ entries:         0",
+		"Pending entries:     17",
+		"Oldest pending age:  2m14s",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("post-reset stats output missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "COMMANDS:") {
+		t.Errorf("bare stats must render the table, not help:\n%s", rendered)
+	}
+}
+
+// `relay stats reset extra` is a usage error exiting 2, and the rejection
+// happens before any state write.
+func TestStatsResetTooManyArgs(t *testing.T) {
+	st, deps := seedStatsState(t)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "stats", "reset", "extra")
+	if err == nil || !strings.Contains(err.Error(), "stats reset: too many arguments") {
+		t.Fatalf("stats reset extra: missing rejection error: %v", err)
+	}
+	s, ok := st.Stats()
+	if !ok || s.EventsProcessedTotal != 152934 {
+		t.Fatalf("rejected reset must not write: %+v, ok=%v", s, ok)
+	}
+}
+
+// A junk token under `stats` is NOT swallowed by the new subcommand list: with
+// no matching subcommand, urfave runs the parent Action, whose too-many-
+// arguments guard preserves the previous `stats: too many arguments` semantics.
+func TestStatsUnknownTokenFallsThroughToParentGuard(t *testing.T) {
+	_, deps := seedStatsState(t)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "stats", "asdsa")
+	if err == nil || !strings.Contains(err.Error(), "stats: too many arguments") {
+		t.Fatalf("stats asdsa: err = %v, want parent guard", err)
 	}
 }

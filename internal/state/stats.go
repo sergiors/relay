@@ -195,6 +195,86 @@ func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name stri
 	return fs
 }
 
+// ResetStats returns the persisted cumulative statistics to their
+// fresh-install state in ONE transaction: the per-function function_stats rows
+// (pure aggregate payloads: the five event/handler counters, the cumulative
+// warm-acquire/cold-start/discarded pool counters, and the four Last*At
+// timestamps) are deleted outright — they are pure stats and are re-created by
+// the next flush with zero counters — and the global stats row's payload is
+// rewritten with its cumulative counters zeroed. The backlog gauges
+// (pending_entries / oldest_pending_age_seconds) are POINT-IN-TIME snapshots of
+// the live Redis backlog, deliberately NOT reset: deleting or zeroing them
+// would misreport a backlog that still exists — the next worker flush replaces
+// them with fresh values anyway. updated_at is refreshed to now() on the
+// rewritten row (it is generic last-write metadata, same semantics as
+// RecordStats). Everything else in the database (functions, handlers,
+// schedules, services, git state, secrets, invocation state) is untouched; no
+// Prometheus counter, Redis state, worker, or container is involved.
+//
+// Concurrency: one transaction (rebuildTx), so a partial reset never lands. A
+// RUNNING worker that flushes after this reset will re-write its in-memory
+// registry's pre-reset cumulative totals (flushes are absolute snapshots, and
+// the fresh process registry is only seeded from these rows at startup) — so a
+// clean persisted slate for a live worker requires restarting it; the reset is
+// immediate and complete for a stopped worker. After any concurrent or later
+// flush, ordinary accumulation continues normally.
+//
+// Returns the error so the CLI can surface it; the package's Warn log also
+// records the failure, matching RecordStats.
+func (c *State) ResetStats() error {
+	ctx := context.Background()
+	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+		// Rewrite the global payload only when a non-empty row exists. An
+		// absent row has nothing cumulative to zero (and creating one would
+		// falsely claim stats were recorded); a NULL/empty payload already
+		// decodes to the zero Stats, so both are left untouched.
+		var data sql.NullString
+		err := tx.QueryRowContext(ctx,
+			`SELECT data FROM stats WHERE id = 1`).Scan(&data)
+		switch {
+		case err == sql.ErrNoRows:
+			// No row exists yet: there is nothing cumulative to zero, and
+			// creating one would falsely claim stats were recorded. Skip.
+		case err != nil:
+			return err
+		case !data.Valid || data.String == "":
+			// A NULL/empty payload already decodes to the zero Stats; there is
+			// nothing to zero, so leave the row (and its updated_at) untouched.
+		default:
+			s, err := unmarshalStats(data)
+			if err != nil {
+				return err
+			}
+			// Zero ONLY the five cumulative counters; the two gauges are live
+			// backlog snapshots and are preserved (the next flush refreshes them).
+			s.EventsProcessedTotal = 0
+			s.HandlerSuccessTotal = 0
+			s.HandlerFailureTotal = 0
+			s.RetryTotal = 0
+			s.DLQTotal = 0
+			payload, err := marshalStats(s)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)
+				 ON CONFLICT(id) DO UPDATE SET
+				   data       = excluded.data,
+				   updated_at = excluded.updated_at`,
+				payload, c.nowString()); err != nil {
+				return err
+			}
+		}
+		// function_stats rows have no gauges: deletion IS their fresh state.
+		_, err = tx.ExecContext(ctx, `DELETE FROM function_stats`)
+		return err
+	})
+	if err != nil {
+		c.log.Warn("State: reset stats failed", "error", err)
+	}
+	return err
+}
+
 // Stats returns the current operational snapshot, or (zero, false) when no row
 // has been recorded yet or the read/decoding fails (which is logged). An empty
 // or NULL payload decodes to the zero Stats; a non-empty invalid payload is

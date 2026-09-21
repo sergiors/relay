@@ -12,17 +12,24 @@ import (
 	"relay/internal/state"
 )
 
-// statsCommand builds the read-only `relay stats` subcommand. It reads the
-// operational snapshot from the local state database at deps.StatePath and
-// renders it to stdout. The command touches only the state database — never
-// Redis, Docker, or the worker — so it works with no REDIS_URI set. A missing
-// or unreadable stats row renders a zero snapshot rather than failing, so an
-// empty state database always produces sensible output with exit 0.
+// statsCommand builds the `relay stats ...` subcommand family. It reads and
+// resets the operational snapshot in the local state database at
+// deps.StatePath; it touches only the state database — never Redis, Docker, or
+// the worker — so it works with no REDIS_URI set. A missing or unreadable stats
+// row renders a zero snapshot rather than failing, so an empty state database
+// always produces sensible output with exit 0.
+//
+// It is a hybrid grouping command: bare `relay stats` keeps rendering the table
+// through the parent Action (urfave runs it when no subcommand token resolves),
+// and an unknown first token still fails through that Action's too-many-
+// arguments guard, matching the previous leaf command. `reset` is the only
+// subcommand.
 func statsCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:        "stats",
-		Usage:       "Show current operational statistics",
-		Description: "Show the current operational snapshot from the local state database.",
+		Name:  "stats",
+		Usage: "Show current operational statistics",
+		Description: "Show or reset the persisted operational statistics in the local " +
+			"state database.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats: too many arguments", 2)
@@ -33,6 +40,44 @@ func statsCommand(deps Dependencies) *cli.Command {
 			}
 			defer cleanup()
 			printStats(cmd.Writer, st)
+			return nil
+		},
+		Commands: []*cli.Command{statsResetCommand(deps)},
+	}
+}
+
+// statsResetCommand builds `relay stats reset`: it rewrites the persisted
+// global cumulative counters to zero and clears the per-function stats rows in
+// one transaction (see state.ResetStats). It deliberately does not touch
+// pending events/backlog, Redis, containers/runtime pools/schedules/services,
+// or a running worker's Prometheus counters (monotonic for the process
+// lifetime; restarting does that). A running worker's next 5s flush re-writes
+// its in-memory totals, so a truly clean slate for a live worker means
+// restarting it.
+func statsResetCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:      "reset",
+		Usage:     "Reset persisted cumulative statistics",
+		UsageText: "relay stats reset",
+		Description: "Reset the global and per-function cumulative statistics (including " +
+			"the Last* execution timestamps) in one transaction. Pending events/backlog, " +
+			"Redis, containers/pools, schedules and services are untouched, and a running " +
+			"worker's Prometheus counters keep their process-lifetime values (restart to " +
+			"reset those). A running worker re-writes its in-memory totals on its next 5s " +
+			"flush, so a clean slate for a live worker requires a restart.",
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if cmd.Args().Present() {
+				return cli.Exit("stats reset: too many arguments", 2)
+			}
+			st, cleanup, err := openState(deps.StatePath)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			if err := st.ResetStats(); err != nil {
+				return fmt.Errorf("stats reset: %w", err)
+			}
+			fmt.Fprintln(cmd.Writer, "Stats reset")
 			return nil
 		},
 	}
