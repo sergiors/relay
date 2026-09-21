@@ -46,7 +46,7 @@ const (
 	// exportedRequirements is the transient path the native workflow exports
 	// the locked requirements to before installing them. Relay owns the name;
 	// the install command removes it again.
-	exportedRequirements = "/tmp/relay-uv-requirements.txt"
+	exportedRequirements = "/tmp/uv-requirements.txt"
 )
 
 // install commands (run inside the dependency image, after uv has been copied
