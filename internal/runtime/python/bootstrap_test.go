@@ -18,27 +18,19 @@ import (
 // than imported) to avoid an import cycle with the Go runtime package.
 const relaySentinel = "@@RELAY@@"
 
-// TestBootstrapContent is a static check that the embedded bootstrap implements
-// the persistent invocation protocol the engine and the Go side rely on.
-func TestBootstrapContent(t *testing.T) {
-	bs := string(Bootstrap)
-	for _, want := range []struct {
-		frag string
-		why  string
-	}{
-		{"@@RELAY@@", "must write the @@RELAY@@ sentinel protocol prefix"},
-		{"sys.path.insert(0, \"/app\")", "must put function sources on sys.path"},
-		{"readline()", "must read line-delimited requests from stdin"},
-		{"importlib.import_module", "must import per-request handlers with module caching"},
-		{"rpartition", "must split the handler at the last dot"},
-		{"inspect.isawaitable", "must support async handlers via inspect.isawaitable"},
-		{"asyncio.run", "must run async handlers via asyncio.run"},
-		{"RELAY_HANDLER", "must keep setting RELAY_HANDLER for backward compatibility"},
-		{"os.environ", "must apply per-request env to os.environ"},
-	} {
-		if !strings.Contains(bs, want.frag) {
-			t.Errorf("python bootstrap must contain %q (%s)", want.frag, want.why)
-		}
+// TestBootstrapIsEmbeddedAndAddsAppToSysPath asserts the two things static
+// source inspection is actually needed for. The process-behavior tests below
+// cover the rest of the invocation protocol (sentinel framing, module import,
+// async handlers, env rotation, error handling), so they are no longer
+// duplicated as brittle substring checks. The sys.path assertion is kept because
+// it pins the specific import contract: function sources are importable by
+// module name (the package-relative service entrypoint depends on it).
+func TestBootstrapIsEmbeddedAndAddsAppToSysPath(t *testing.T) {
+	if len(Bootstrap) == 0 {
+		t.Fatal("embedded python bootstrap is empty")
+	}
+	if !strings.Contains(string(Bootstrap), `sys.path.insert(0, "/app")`) {
+		t.Error(`python bootstrap must put function sources on sys.path via sys.path.insert(0, "/app")`)
 	}
 }
 

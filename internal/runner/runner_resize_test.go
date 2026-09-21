@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"relay/internal/function"
+	"relay/internal/testutil"
 )
 
 // TestRunnerPerFunctionSemaphoreResizedLive proves a function's per-function
@@ -16,7 +17,7 @@ import (
 // per-function bound is the binding one.
 func TestRunnerPerFunctionSemaphoreResizedLive(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	// Warm the per-function semaphore at capacity 4.
@@ -55,8 +56,8 @@ func TestRunnerPerFunctionSemaphoreResizedLive(t *testing.T) {
 // flight; both the original holder and later invocations must complete.
 func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 	release := make(chan struct{})
-	holding := newHoldingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, silentLogger(), nil)
+	holding := newBlockingExecutor(release)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	firstDone := make(chan struct{})
@@ -98,7 +99,7 @@ func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 // inheriting a stale one.
 func TestRunnerRemoveFunctionSemaphore(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 20 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 5, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 5, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	// Warm the semaphore at 5.
@@ -127,7 +128,7 @@ func TestRunnerRemoveFunctionSemaphore(t *testing.T) {
 // to its captured pointer.
 func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 2, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 2, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	var wg sync.WaitGroup
@@ -146,6 +147,9 @@ func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
 		}
 	}()
 
+	// Bounded iteration count instead of a fixed soak: each of the 4 Handle
+	// goroutines runs a fixed number of iterations, so total work is
+	// time-independent while the swapper still interleaves under -race.
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -156,7 +160,13 @@ func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
 		}()
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Let the swapper run a bounded number of rounds alongside the Handles.
+	waitFor(t, func() bool {
+		r.fnSemsMu.Lock()
+		n := len(r.fnSems)
+		r.fnSemsMu.Unlock()
+		return n > 0
+	})
 	close(stop)
 	wg.Wait()
 }
@@ -167,7 +177,7 @@ func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
 // registry entry already raised.
 func TestRunnerSemaphoreResizeIsRegistryAuthoritative(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
 
 	// Install a semaphore at the current bound.
 	_, s := r.concurrencySems("f", 4)
@@ -191,7 +201,7 @@ func TestRunnerSemaphoreResizeIsRegistryAuthoritative(t *testing.T) {
 // => effective live capacity 8".
 func TestRunnerPerFunctionSemaphoreClipsToGlobal(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 15, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 15, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	// The installed semaphore capacity is the effective bound, not the raw 15.
@@ -224,7 +234,7 @@ func TestRunnerPerFunctionSemaphoreClipsToGlobal(t *testing.T) {
 // zero/negative template value falls back to the function default, and a
 // zero-valued Runner's global falls back to DefaultMaxConcurrency.
 func TestRunnerEffectiveConcurrencyClipsAndDefaults(t *testing.T) {
-	r := NewWithMetrics(nil, silentLogger(), nil)
+	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	if got := r.effectiveConcurrency("abs", 15); got != 8 {

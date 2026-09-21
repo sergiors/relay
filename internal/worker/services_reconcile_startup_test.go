@@ -133,7 +133,6 @@ type svcShutdownDocker struct {
 	nextID     int
 	containers map[string]runtime.ServiceContainer
 	stopped    []string
-	stopDelay  time.Duration // optional artificial stop latency
 }
 
 func newSvcShutdownDocker() *svcShutdownDocker {
@@ -163,9 +162,6 @@ func (f *svcShutdownDocker) ServiceContainerList(context.Context) ([]runtime.Ser
 }
 
 func (f *svcShutdownDocker) StopServiceContainers(_ context.Context, containers []runtime.ServiceContainer) error {
-	if f.stopDelay > 0 {
-		time.Sleep(f.stopDelay)
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, c := range containers {

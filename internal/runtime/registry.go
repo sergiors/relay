@@ -22,7 +22,14 @@ var specs = map[string]plan.Spec{
 }
 
 func lookup(name string) (plan.Spec, error) {
-	spec, ok := specs[name]
+	return lookupIn(specs, name)
+}
+
+// lookupIn resolves name against an explicit spec table. It exists so tests can
+// exercise multi-version resolution on a copied table without mutating the
+// global production registry.
+func lookupIn(table map[string]plan.Spec, name string) (plan.Spec, error) {
+	spec, ok := table[name]
 	if !ok {
 		return plan.Spec{}, fmt.Errorf("unsupported runtime %q", name)
 	}

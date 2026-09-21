@@ -10,6 +10,21 @@ import (
 	"relay/internal/runtime/plan"
 )
 
+// pythonSpec is the production python3.14 spec shared by the fingerprint tests.
+func pythonSpec() plan.Spec {
+	return plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
+}
+
+// pythonRequirementsDeps is the conventional python dependency layer used by
+// the fingerprint tests (a single requirements.txt installed into /app).
+func pythonRequirementsDeps() plan.Deps {
+	return plan.Deps{
+		Files:   []string{"requirements.txt"},
+		Install: "pip install --no-cache-dir -r requirements.txt",
+		Dir:     "/app",
+	}
+}
+
 // TestDependencyFingerprintDeterminism verifies the fingerprint is stable: the
 // same inputs always yield the same digest, so a dependency image tagged by the
 // fingerprint is safely reuseable across builds and processes.
@@ -18,8 +33,8 @@ func TestDependencyFingerprintDeterminism(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
 		t.Fatalf("write requirements: %v", err)
 	}
-	spec := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
-	deps := plan.Deps{Files: []string{"requirements.txt"}, Install: "pip install --no-cache-dir -r requirements.txt", Dir: "/app"}
+	spec := pythonSpec()
+	deps := pythonRequirementsDeps()
 
 	a, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
 	if err != nil {
@@ -45,8 +60,8 @@ func TestDependencyFingerprintSensitivity(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
 		t.Fatalf("write requirements: %v", err)
 	}
-	base := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
-	deps := plan.Deps{Files: []string{"requirements.txt"}, Install: "pip install --no-cache-dir -r requirements.txt", Dir: "/app"}
+	base := pythonSpec()
+	deps := pythonRequirementsDeps()
 
 	mutate := func(mk func(*plan.Spec, *plan.Deps)) string {
 		s := base
@@ -143,22 +158,52 @@ func TestDependencyFingerprintCanonicalFileOrder(t *testing.T) {
 	}
 }
 
+// TestDependencyFingerprintRuntimeVersionDifferent verifies that the dependency
+// fingerprint differs across runtime versions even with identical manifest
+// content: different spec.Name / BaseImage must not share a layer, and must map
+// to different dependency images. Pure fingerprint logic, no daemon needed.
+func TestDependencyFingerprintRuntimeVersionDifferent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
+		t.Fatalf("write requirements: %v", err)
+	}
+	deps := pythonRequirementsDeps()
+
+	specA := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
+	specB := plan.Spec{Name: "python3.15", Engine: plan.EnginePython, BaseImage: "python:3.15-slim"}
+
+	fpA, err := DependencyFingerprint("arm64", "linux", specA, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint A: %v", err)
+	}
+	fpB, err := DependencyFingerprint("arm64", "linux", specB, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint B: %v", err)
+	}
+	if fpA == fpB {
+		t.Error("different runtime versions must not share a dependency layer fingerprint")
+	}
+	if depImageRef(fpA) == depImageRef(fpB) {
+		t.Error("different runtime versions must map to different dependency images")
+	}
+}
+
 // TestDependencyFingerprintMissingManifest verifies that a manifest file the
 // engine declared but that is absent on disk is an error (a race / mid-reconcile
 // state), not silently hashed as empty — an empty hash would poison the shared
 // layer cache.
 func TestDependencyFingerprintMissingManifest(t *testing.T) {
 	dir := t.TempDir() // empty: no requirements.txt
-	spec := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
-	deps := plan.Deps{Files: []string{"requirements.txt"}, Install: "pip install --no-cache-dir -r requirements.txt", Dir: "/app"}
+	spec := pythonSpec()
+	deps := pythonRequirementsDeps()
 	if _, err := DependencyFingerprint("arm64", "linux", spec, dir, deps); err == nil {
 		t.Error("expected an error for a missing manifest file")
 	}
 }
 
-// TestDepImageRef verifies the dependency image reference format and defensive
-// truncation (mirroring ImageRef).
-func TestDepImageRef(t *testing.T) {
+// TestDepImageRefTruncatesFingerprintToTag verifies the dependency image
+// reference format and defensive truncation (mirroring ImageRef).
+func TestDepImageRefTruncatesFingerprintToTag(t *testing.T) {
 	fp := strings.Repeat("a", 16) + "bcdef"
 	if got := depImageRef(fp); got != "relay-dep-"+strings.Repeat("a", 16) {
 		t.Errorf("depImageRef = %q, want the first 16 hex chars", got)
@@ -172,8 +217,9 @@ func TestDepImageRef(t *testing.T) {
 	}
 }
 
-// TestIsDepRepo verifies the relay-dep- prefix discriminates dependency repos.
-func TestIsDepRepo(t *testing.T) {
+// TestIsDepRepoMatchesRelayDepPrefix verifies the relay-dep- prefix
+// discriminates dependency repos.
+func TestIsDepRepoMatchesRelayDepPrefix(t *testing.T) {
 	if !isDepRepo("relay-dep-abcdef1234567890") {
 		t.Error("expected a relay-dep repo to be detected")
 	}
@@ -192,8 +238,8 @@ func TestDependencyFingerprintConcurrent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
 		t.Fatalf("write requirements: %v", err)
 	}
-	spec := plan.Spec{Name: "python3.14", Engine: plan.EnginePython, BaseImage: "python:3.14-slim"}
-	deps := plan.Deps{Files: []string{"requirements.txt"}, Install: "pip install --no-cache-dir -r requirements.txt", Dir: "/app"}
+	spec := pythonSpec()
+	deps := pythonRequirementsDeps()
 
 	const n = 64
 	results := make([]string, n)

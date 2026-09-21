@@ -30,7 +30,9 @@ func testLogger() (*slog.Logger, *bytes.Buffer) {
 }
 
 // discardLogger returns a logger writing to io.Discard, for Load calls where
-// the specific log output is irrelevant.
+// the specific log output is irrelevant. It stays local (rather than using
+// testutil.DiscardLogger) because testutil imports config, so a config test
+// importing testutil would be an import cycle.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -136,7 +138,8 @@ func TestStreamRetention(t *testing.T) {
 			}
 			gotLogged := strings.Contains(buf.String(), "REDIS_STREAM_RETENTION")
 			if gotLogged != tt.wantLogged {
-				t.Fatalf("parseRetention(%q) logged REDIS_STREAM_RETENTION = %v, want %v; log: %q", tt.value, gotLogged, tt.wantLogged, buf.String())
+				t.Fatalf("parseRetention(%q) logged REDIS_STREAM_RETENTION = %v, want %v; log: %q",
+					tt.value, gotLogged, tt.wantLogged, buf.String())
 			}
 		})
 	}
@@ -588,7 +591,8 @@ func TestLoadWarmContainerIdleTimeoutDefault(t *testing.T) {
 	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", "")
 	cfg := Load(discardLogger())
 	if cfg.WarmContainerIdleTimeout != DefaultWarmContainerIdleTimeout {
-		t.Fatalf("WarmContainerIdleTimeout = %v, want default %v", cfg.WarmContainerIdleTimeout, DefaultWarmContainerIdleTimeout)
+		t.Fatalf("WarmContainerIdleTimeout = %v, want default %v",
+			cfg.WarmContainerIdleTimeout, DefaultWarmContainerIdleTimeout)
 	}
 	if DefaultWarmContainerIdleTimeout != 5*time.Minute {
 		t.Fatalf("DefaultWarmContainerIdleTimeout = %v, want 5m", DefaultWarmContainerIdleTimeout)

@@ -96,7 +96,7 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 			 ON CONFLICT(function_name) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
-			s.Function, payload, now())
+			s.Function, payload, c.nowString())
 		return err
 	})
 	if err != nil {

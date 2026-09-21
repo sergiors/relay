@@ -3,8 +3,6 @@ package runner
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -12,40 +10,8 @@ import (
 	"relay/internal/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
-
-// scriptedExecutor records how many times it was invoked and can be told to
-// fail on demand. It is the per-function executor used by the redelivery tests:
-// each function gets its own instance so call counts and failure behavior are
-// independent.
-type scriptedExecutor struct {
-	mu    sync.Mutex
-	calls int
-	fail  bool
-}
-
-func (s *scriptedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
-	s.mu.Lock()
-	s.calls++
-	fail := s.fail
-	s.mu.Unlock()
-	if fail {
-		return fmt.Errorf("boom")
-	}
-	return nil
-}
-
-func (s *scriptedExecutor) count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
-func (s *scriptedExecutor) setFail(f bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fail = f
-}
 
 // TestHandleSkipsCompletedInvocationsOnRedelivery is the core redelivery
 // scenario: a message matching two functions is delivered, one invocation
@@ -54,12 +20,12 @@ func (s *scriptedExecutor) setFail(f bool) {
 // succeeds, a third delivery skips both and Handle returns nil (so the stream
 // layer would ACK).
 func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
-	alpha := &scriptedExecutor{}
-	beta := &scriptedExecutor{fail: true}
+	alpha := &countingExecutor{}
+	beta := &countingExecutor{fail: true}
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -112,12 +78,12 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 // delivery A is retried (B skipped, not re-run) and, once A succeeds, a further
 // delivery skips both and returns nil (the stream would ACK).
 func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
-	a := &scriptedExecutor{fail: true} // sorts first, fails delivery 1
-	b := &scriptedExecutor{}           // sorts second, succeeds always
+	a := &countingExecutor{fail: true} // sorts first, fails delivery 1
+	b := &countingExecutor{}           // sorts second, succeeds always
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", a), // sorts before "beta"
 		alwaysMatchFn(t, "beta", b),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -175,12 +141,12 @@ func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
 // as engaged on every match (attribution, not execution).
 func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	m := metrics.New()
-	alpha := &scriptedExecutor{}
-	beta := &scriptedExecutor{fail: true}
+	alpha := &countingExecutor{}
+	beta := &countingExecutor{fail: true}
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
-	}, silentLogger(), m)
+	}, testutil.DiscardLogger(), m)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -226,8 +192,8 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 // TestHandleMarksStateOnlyAfterSuccess verifies that a failing invocation is
 // never marked, and a later success marks it.
 func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
-	exec := &scriptedExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -253,16 +219,16 @@ func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 	}
 }
 
-// TestHandleWithoutStateUnchanged verifies that with no invocation state in
-// ctx, every matching handler runs on every Handle call, nothing is marked,
-// and there is no panic.
-func TestHandleWithoutStateUnchanged(t *testing.T) {
-	a := &scriptedExecutor{}
-	b := &scriptedExecutor{}
+// TestHandleWithoutStateStillExecutesOnEveryDelivery verifies that with no
+// invocation state in ctx, every matching handler runs on every Handle call,
+// nothing is marked, and there is no panic.
+func TestHandleWithoutStateStillExecutesOnEveryDelivery(t *testing.T) {
+	a := &countingExecutor{}
+	b := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 
 	for i := 0; i < 2; i++ {
 		if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
@@ -281,14 +247,14 @@ func TestHandleWithoutStateUnchanged(t *testing.T) {
 // a failure in one handler no longer prevents the later, sorted ones from
 // running.
 func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
-	a := &scriptedExecutor{}           // A: always succeeds
-	c := &scriptedExecutor{fail: true} // C: fails delivery 1, succeeds delivery 2
-	z := &scriptedExecutor{fail: true} // Z: always fails
+	a := &countingExecutor{}           // A: always succeeds
+	c := &countingExecutor{fail: true} // C: fails delivery 1, succeeds delivery 2
+	z := &countingExecutor{fail: true} // Z: always fails
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "A", a),
 		alwaysMatchFn(t, "C", c),
 		alwaysMatchFn(t, "Z", z),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -372,30 +338,13 @@ func TestRetryBackoffSchedule(t *testing.T) {
 	}
 }
 
-// fnWithRetries builds a prepared function whose single rule matches any event
-// and carries the given retry count (additional attempts after the first).
-func fnWithRetries(t *testing.T, name string, retries int, executor Executor) *PreparedFunction {
-	t.Helper()
-	return NewPrepared(
-		function.Function{
-			Name: name,
-			Template: &function.Template{
-				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: retries}},
-			},
-		},
-		&runtime.Prepared{Name: name, Image: "x"},
-		executor,
-	)
-}
-
 // TestHandleRetriesZeroExhaustsAfterOneAttempt verifies that a rule with
 // retries:0 (only the initial attempt) exhausts after a single failure: the
 // invocation is marked exhausted and Handle returns ErrInvocationExhausted (the
 // sole invocation is terminal).
 func TestHandleRetriesZeroExhaustsAfterOneAttempt(t *testing.T) {
-	exec := &scriptedExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, silentLogger(), nil)
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -418,8 +367,8 @@ func TestHandleRetriesZeroExhaustsAfterOneAttempt(t *testing.T) {
 // retry count (4) allows 5 total attempts before exhaustion, with the backoff
 // schedule 1m/2m/5m/10m applied after attempts 1..4.
 func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
-	exec := &scriptedExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, silentLogger(), nil)
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -465,12 +414,12 @@ func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
 // returns ErrInvocationExhausted and the stream layer routes the message to the
 // DLQ. Note both run in one delivery (no fail-fast).
 func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
-	alpha := &scriptedExecutor{fail: true} // exhausts
-	beta := &scriptedExecutor{}            // succeeds
+	alpha := &countingExecutor{fail: true} // exhausts
+	beta := &countingExecutor{}            // succeeds
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -496,12 +445,12 @@ func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
 // executed, protected skip) and the message stays pending rather than being
 // routed to the DLQ or ACKed.
 func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
-	alpha := &scriptedExecutor{fail: true} // exhausts
-	beta := &scriptedExecutor{}            // protected (never executed)
+	alpha := &countingExecutor{fail: true} // exhausts
+	beta := &countingExecutor{}            // protected (never executed)
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -533,12 +482,12 @@ func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
 // hazard: a succeeded invocation does not let the message ACK while a sibling
 // invocation is unresolved — the stream keeps it pending and reclaim replays it.
 func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
-	alpha := &scriptedExecutor{} // executes and succeeds this delivery
-	beta := &scriptedExecutor{}  // protected, never executes
+	alpha := &countingExecutor{} // executes and succeeds this delivery
+	beta := &countingExecutor{}  // protected, never executes
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	now := time.Now()
@@ -574,7 +523,7 @@ func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
 // the message pending.
 func TestHandleNotEligibleWhenProtected(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -595,8 +544,8 @@ func TestHandleNotEligibleWhenProtected(t *testing.T) {
 // increments only on retryable failures, not on the exhausting failure.
 func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	m := metrics.New()
-	exec := &scriptedExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 1, exec)}, silentLogger(), m)
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 1, exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -637,7 +586,7 @@ func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 // the removed invocation's backoff no longer blocks.
 func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -666,7 +615,7 @@ func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
 // nothing → nil (ACK); the stale invocation-state field is not consulted.
 func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -707,7 +656,7 @@ func TestHandleRemovedAndCompleteMatchesAck(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	// B already completed on a previous delivery.
 	prog.done["beta/index.run"] = true
@@ -736,7 +685,7 @@ func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -767,7 +716,7 @@ func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
 func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })

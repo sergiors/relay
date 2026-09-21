@@ -1,13 +1,11 @@
 package reconciler
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"relay/internal/function"
 	"relay/internal/runner"
@@ -50,32 +48,14 @@ func (s *servicesRecorder) all() []string {
 	return append([]string(nil), s.events...)
 }
 
-// newTestReconcilerServices builds a reconciler wired with UpdateServices,
-// RemoveServices, and RemoveFunction to the given recorder, over the given
-// initial prepared functions.
-func newTestReconcilerServices(
-	t *testing.T,
-	root string,
-	builder Builder,
-	initial []*runner.PreparedFunction,
-	rec *servicesRecorder,
-) (*Reconciler, *runner.Registry) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	cfg := Config{
-		Root:           root,
-		Debounce:       10 * time.Millisecond,
-		Interval:       time.Hour,
-		UpdateServices: rec.update,
-		RemoveServices: rec.remove,
-		RemoveFunction: rec.removeFn,
+// withServiceHooks wires UpdateServices, RemoveServices, and RemoveFunction to
+// the given recorder.
+func withServiceHooks(rec *servicesRecorder) func(*Config) {
+	return func(cfg *Config) {
+		cfg.UpdateServices = rec.update
+		cfg.RemoveServices = rec.remove
+		cfg.RemoveFunction = rec.removeFn
 	}
-	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-	}
-	return r, reg
 }
 
 const servicesTemplate = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: service.js\n    port: 3000\n"
@@ -108,7 +88,7 @@ func TestReconcileUpdateServicesFiresOnDiscoveryAndUpdate(t *testing.T) {
 
 	// Discovery: brand-new function with services declared.
 	writeServicesDir(t, root, "svc-new")
-	r, _ := newTestReconcilerServices(t, root, &versionedBuilder{version: 0}, nil, rec)
+	r, _ := newTestReconciler(t, root, &versionedBuilder{version: 0}, nil, withServiceHooks(rec))
 	r.reconcileFunction("svc-new")
 	got := rec.all()
 	if len(got) != 1 || got[0] != "update svc-new=1@img-svc-new-v1" {
@@ -119,7 +99,7 @@ func TestReconcileUpdateServicesFiresOnDiscoveryAndUpdate(t *testing.T) {
 	dir := writeServicesDir(t, root, "svc-upd")
 	b := &versionedBuilder{version: 1}
 	fn := initialServicesFn("svc-upd", dir, "img-svc-upd-v1", b)
-	r2, _ := newTestReconcilerServices(t, root, b, []*runner.PreparedFunction{fn}, rec)
+	r2, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, withServiceHooks(rec))
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
@@ -151,7 +131,7 @@ func TestReconcileUpdateServicesFiresOnSkipPathWhenServicesDefined(t *testing.T)
 	// (a) No services: skip path must NOT call UpdateServices.
 	dirNo := writeFnDir(t, root, "plain")
 	fnNo := initialFn("plain", dirNo)
-	rd, _ := newTestReconcilerServices(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fnNo}, rec)
+	rd, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fnNo}, withServiceHooks(rec))
 	rd.reconcileFunction("plain") // skip (unchanged, no services)
 	if got := rec.all(); len(got) != 0 {
 		t.Fatalf("UpdateServices fired on skip path for a function WITHOUT services: %v", got)
@@ -160,7 +140,7 @@ func TestReconcileUpdateServicesFiresOnSkipPathWhenServicesDefined(t *testing.T)
 	// (b) With services: skip path MUST call UpdateServices (crash recovery).
 	dirSvc := writeServicesDir(t, root, "svc-stable")
 	svcFn := initialServicesFn("svc-stable", dirSvc, "img-svc-stable-v1", &fakeBuilder{})
-	rs, _ := newTestReconcilerServices(t, root, &fakeBuilder{}, []*runner.PreparedFunction{svcFn}, rec)
+	rs, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{svcFn}, withServiceHooks(rec))
 	rs.reconcileFunction("svc-stable") // skip (unchanged but services declared)
 	got := rec.all()
 	if len(got) != 1 || got[0] != "update svc-stable=1@img-svc-stable-v1" {
@@ -176,7 +156,7 @@ func TestReconcileRemoveServicesFiresBeforeRemoveFunction(t *testing.T) {
 
 	svcFn := initialServicesFn("svc-gone", dir, "img-svc-gone-v1", &fakeBuilder{})
 	rec := &servicesRecorder{}
-	r, _ := newTestReconcilerServices(t, root, &fakeBuilder{}, []*runner.PreparedFunction{svcFn}, rec)
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{svcFn}, withServiceHooks(rec))
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove dir: %v", err)

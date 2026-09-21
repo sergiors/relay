@@ -9,13 +9,7 @@ import (
 
 func writeTemplate(t *testing.T, dir, name, content string) {
 	t.Helper()
-	path := filepath.Join(dir, name, "template.yaml")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
+	writeFile(t, filepath.Join(dir, name, "template.yaml"), content)
 }
 
 func TestLoadValidFunction(t *testing.T) {

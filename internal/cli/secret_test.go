@@ -11,11 +11,13 @@ import (
 	"relay/internal/secrets"
 )
 
-// seedSecretStore redirects the package secrets path to a temp dir and returns
-// a store over it.
+// seedSecretStore redirects the package secrets path to a temp dir, restoring
+// the previous value on cleanup, and returns a store over it.
 func seedSecretStore(t *testing.T) *secrets.LocalStore {
 	t.Helper()
+	prev := secretsPath
 	secretsPath = filepath.Join(t.TempDir(), "secrets")
+	t.Cleanup(func() { secretsPath = prev })
 	store, err := secrets.NewLocal(secretsPath)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
@@ -85,8 +87,8 @@ func TestSecretSetAtomicUpdate(t *testing.T) {
 func TestSecretRmMissingError(t *testing.T) {
 	_ = seedSecretStore(t)
 	_, _, err := runCLI(t, "", "secret", "rm", "ghost")
-	if err == nil || err.Error() == "" {
-		t.Fatalf("returned error missing message: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("returned error missing the missing-secret name: %v", err)
 	}
 }
 
@@ -128,21 +130,24 @@ func TestSecretSetViaCommandPipe(t *testing.T) {
 	}
 }
 
-// TestSecretCommandErrors verifies arg handling: an unknown subcommand,
-// missing name, and an extra value are all returned as errors. `secret` alone
-// no longer errors — it shows help (see TestSecretBareShowsHelp). The extra
-// value case is the critical safety regression (a value passed as a positional
-// argument is never accepted).
+// TestSecretCommandErrors verifies arg handling: an unknown subcommand, a
+// missing name, and an extra value are all returned as errors carrying the
+// expected message. `secret` alone no longer errors — it shows help (see
+// TestSecretBareShowsHelp). The extra value case is the critical safety
+// regression (a value passed as a positional argument is never accepted).
 func TestSecretCommandErrors(t *testing.T) {
 	_ = seedSecretStore(t)
-	for _, args := range [][]string{
-		{"secret", "bogus"},
-		{"secret", "set"},
-		{"secret", "rm"},
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"secret", "bogus"}, "unknown command: relay secret bogus"},
+		{[]string{"secret", "set"}, "not provided"},
+		{[]string{"secret", "rm"}, "not provided"},
 	} {
-		_, _, err := runCLI(t, "", args...)
-		if err == nil || err.Error() == "" {
-			t.Fatalf("args %v: missing returned error message", args)
+		_, _, err := runCLI(t, "", tc.args...)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("args %v: err = %v, want message containing %q", tc.args, err, tc.want)
 		}
 	}
 
@@ -207,8 +212,8 @@ func TestSecretHelp(t *testing.T) {
 func TestSecretSetInvalidName(t *testing.T) {
 	_ = seedSecretStore(t)
 	_, _, err := runCLI(t, "", "secret", "set", "../etc")
-	if err == nil || err.Error() == "" {
-		t.Fatalf("returned error missing message: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "invalid secret name") {
+		t.Fatalf("returned error missing invalid-name message: %v", err)
 	}
 }
 

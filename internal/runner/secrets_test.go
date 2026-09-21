@@ -8,29 +8,9 @@ import (
 	"testing"
 
 	"relay/internal/function"
-	"relay/internal/runtime"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
-
-// envCaptureExecutor records the extraEnv it receives, so tests can assert the
-// runner resolved template env values and secrets into the per-invocation env.
-type envCaptureExecutor struct {
-	mu       sync.Mutex
-	extraEnv []string
-}
-
-func (e *envCaptureExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte, extraEnv []string) error {
-	e.mu.Lock()
-	e.extraEnv = append([]string(nil), extraEnv...)
-	e.mu.Unlock()
-	return nil
-}
-
-func (e *envCaptureExecutor) got() []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return append([]string(nil), e.extraEnv...)
-}
 
 // fakeProvider resolves a fixed set of names to values.
 type fakeProvider struct {
@@ -60,41 +40,23 @@ func (p *fakeProvider) count() int {
 	return p.calls
 }
 
-// fnWithEnv builds a prepared function whose template carries env and secrets.
-func fnWithEnv(t *testing.T, name string, executor Executor, env map[string]string, secrets map[string]function.SecretRef) *PreparedFunction {
-	t.Helper()
-	return NewPrepared(
-		function.Function{
-			Name: name,
-			Template: &function.Template{
-				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: 0, Retries: function.DefaultRetries}},
-				Env:     env,
-				Secrets: secrets,
-			},
-		},
-		&runtime.Prepared{Name: name, Image: "x"},
-		executor,
-	)
-}
-
 // TestHandleInjectsEnvAndResolvedSecrets verifies the runner resolves template
 // env values and secret references into the per-invocation extra env, in
 // name-ordered form, and passes them to the executor.
 func TestHandleInjectsEnvAndResolvedSecrets(t *testing.T) {
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec,
 			map[string]string{"API_URL": "https://api.example.com"},
 			map[string]function.SecretRef{"DATABASE_URL": "db-url"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
-	got := exec.got()
+	got := exec.gotEnv()
 	want := []string{"API_URL=https://api.example.com", "DATABASE_URL=postgres://secret"}
 	if len(got) != len(want) {
 		t.Fatalf("extraEnv = %v, want %v", got, want)
@@ -114,7 +76,7 @@ func TestHandleSecretResolutionFailureSchedulesRetry(t *testing.T) {
 	prov := &fakeProvider{err: errors.New("secret \"db-url\" not found")}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"DATABASE_URL": "db-url"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
 	prog := newFakeInvocationState()
@@ -142,7 +104,7 @@ func TestHandleSecretNoProviderFails(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	// SetSecretProvider deliberately NOT called.
 
 	err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"})
@@ -165,17 +127,17 @@ func TestHandleSecretNoProviderFails(t *testing.T) {
 // so rotating the underlying value between calls takes effect without a
 // rebuild.
 func TestHandleResolvesSecretsPerInvocation(t *testing.T) {
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"tok": "v1"}}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle 1: %v", err)
 	}
-	if got := exec.got(); len(got) != 1 || got[0] != "TOKEN=v1" {
+	if got := exec.gotEnv(); len(got) != 1 || got[0] != "TOKEN=v1" {
 		t.Fatalf("extraEnv after v1 = %v, want [TOKEN=v1]", got)
 	}
 
@@ -186,7 +148,7 @@ func TestHandleResolvesSecretsPerInvocation(t *testing.T) {
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle 2: %v", err)
 	}
-	if got := exec.got(); len(got) != 1 || got[0] != "TOKEN=v2" {
+	if got := exec.gotEnv(); len(got) != 1 || got[0] != "TOKEN=v2" {
 		t.Fatalf("extraEnv after v2 = %v, want [TOKEN=v2]", got)
 	}
 	if prov.count() != 2 {
@@ -198,7 +160,7 @@ func TestHandleResolvesSecretsPerInvocation(t *testing.T) {
 // appears in the runner's log output.
 func TestHandleSecretValueNeverLogged(t *testing.T) {
 	logger, buf := bufferLogger()
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"tok": "SUPERSECRETVALUE"}}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
@@ -226,18 +188,18 @@ const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n
 // byte-for-byte: the executor receives exactly `NAME=<fixture>` with no
 // trimming, no escaping, and no transformation of internal newlines.
 func TestHandleInjectsMultilineSecret(t *testing.T) {
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	want := []string{"PRIVATE_KEY=" + pemValue}
-	got := exec.got()
+	got := exec.gotEnv()
 	if len(got) != 1 {
 		t.Fatalf("extraEnv = %v, want single entry of length %d", got, len(want[0]))
 	}
@@ -252,7 +214,7 @@ func TestHandleInjectsMultilineSecret(t *testing.T) {
 // leak guard must not come at the cost of a false failure).
 func TestHandleMultilineSecretValueNeverLogged(t *testing.T) {
 	logger, buf := bufferLogger()
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
@@ -282,7 +244,7 @@ func TestHandleMultilineSecretResolutionFailureDoesNotLeak(t *testing.T) {
 	prov := &fakeProvider{err: errors.New("secret \"rsa-private-key\" not found")}
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithEnv(t, "user-events", &countingExecutor{}, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
 	err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"})

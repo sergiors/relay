@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"relay/internal/testutil"
 )
 
 // TestIntegrationBufferFullPausesReading verifies the core backpressure
@@ -25,7 +27,7 @@ import (
 // handlers unblock, reading resumes and every message is eventually ACKed (the
 // PEL empties and the whole stream is consumed).
 func TestIntegrationBufferFullPausesReading(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{MaxBufferedEvents: 2, Count: 10})
 	const n = 5
 
@@ -74,7 +76,7 @@ func TestIntegrationBufferFullPausesReading(t *testing.T) {
 	}
 
 	// Wait until the buffer has saturated: 2 (the capacity) handlers in flight.
-	WaitFor(t, 8*time.Second, "buffer full: 2 handlers in flight", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "buffer full: 2 handlers in flight", func() bool {
 		occMu.Lock()
 		cur := occupied
 		occMu.Unlock()
@@ -84,7 +86,7 @@ func TestIntegrationBufferFullPausesReading(t *testing.T) {
 	// While the buffer is full, the consumer must NOT read further: at most 2
 	// messages are in the PEL (held locally, in flight) and the rest stay
 	// unread in the stream. The in-flight occupancy never exceeds capacity.
-	WaitFor(t, 8*time.Second, "reading paused: unread backlog stays in stream", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "reading paused: unread backlog stays in stream", func() bool {
 		return unread() >= int64(n-2) && len(e.pending()) <= 2
 	})
 	// Sustained, so a transient over-read cannot pass: the paused state holds.
@@ -97,10 +99,10 @@ func TestIntegrationBufferFullPausesReading(t *testing.T) {
 	// Unblock the handlers; reading resumes and every message is consumed and
 	// ACKed: the PEL empties and all n handlers completed.
 	close(release)
-	WaitFor(t, 8*time.Second, "all messages acked (PEL empty)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "all messages acked (PEL empty)", func() bool {
 		return len(e.pending()) == 0
 	})
-	WaitFor(t, 8*time.Second, "all 5 messages completed", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "all 5 messages completed", func() bool {
 		return completed.Load() >= n
 	})
 	e.stop(t)
@@ -115,7 +117,7 @@ func TestIntegrationBufferFullPausesReading(t *testing.T) {
 // messages are left pending and replayed on a later tick once capacity frees,
 // instead of growing local work beyond the buffer limit.
 func TestIntegrationReclaimSkipsWhenBufferFull(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	// Fast reclaim cadence, tiny idle threshold: reclaimed quickly while the
 	// buffer is saturated.
 	e := newEnv(t, ConsumerConfig{MaxBufferedEvents: 1})
@@ -150,7 +152,7 @@ func TestIntegrationReclaimSkipsWhenBufferFull(t *testing.T) {
 	// is then free to continue (no message was lost or double-run beyond the
 	// buffer's bound). The PEL drains.
 	close(release)
-	WaitFor(t, 8*time.Second, "message acked after release", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "message acked after release", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})

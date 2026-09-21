@@ -50,7 +50,7 @@ func poolMax(cc *containerCache, fnName string) int {
 // by it, and its snapshot and capacity gauge agree.
 func TestPoolResizeInitialBound(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 3, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 3, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if got := poolMax(cc, "fn-a"); got != 3 {
@@ -70,7 +70,7 @@ func TestPoolResizeInitialBound(t *testing.T) {
 func TestPoolResizeIncreaseUpdatesAdmissionLazily(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	// Seed one idle container at max 1.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	before := ff.count()
@@ -107,8 +107,8 @@ func TestPoolResizeIncreaseUpdatesAdmissionLazily(t *testing.T) {
 // TestPoolResizeIncreaseWakesWaiter proves a blocked acquire at the old bound is
 // woken by an increase and then acquires a container.
 func TestPoolResizeIncreaseWakesWaiter(t *testing.T) {
-	cc, ff := mkCache()
-	blocking := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	cc, ff := newTestCache()
+	blocking := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return blocking }
 
 	firstDone := make(chan error, 1)
@@ -227,7 +227,7 @@ func TestPoolResizeDecreaseNeverKillsBusyAndConvergesOnRelease(t *testing.T) {
 // acquisition enforces: after a shrink, an acquire beyond the bound blocks until
 // context cancellation.
 func TestPoolResizeDecreaseBoundsAcquisition(t *testing.T) {
-	cc, ff := mkCache()
+	cc, ff := newTestCache()
 	lease := acquireN(t, cc, ff, "fn-a", "img-1", 1, 1)
 	lease[0].release() // one idle
 	cc.setFunctionConcurrency("fn-a", 1)
@@ -244,11 +244,11 @@ func TestPoolResizeDecreaseBoundsAcquisition(t *testing.T) {
 	busy[0].release()
 }
 
-// TestPoolResizeNoOp proves resizing to the same bound discards nothing and
-// leaves the pool unchanged.
-func TestPoolResizeNoOp(t *testing.T) {
-	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+// TestPoolResizeNoOpKeepsPoolUnchanged proves resizing to the same bound
+// discards nothing and leaves the pool unchanged.
+func TestPoolResizeNoOpKeepsPoolUnchanged(t *testing.T) {
+	cc, ff := newTestCache()
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	cc.setFunctionConcurrency("fn-a", 2)
@@ -266,11 +266,11 @@ func TestPoolResizeNoOp(t *testing.T) {
 // retires the busy one (drained on release), and the new image serves at the new
 // bound.
 func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
-	cc, ff := mkCache()
+	cc, ff := newTestCache()
 
 	// busy is a blocking img-1 container; two more img-1 containers are returned
 	// to idle. max 3 so all three exist (busy + 2 idle = 3).
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	idle1 := &fakeContainer{}
 	idle2 := &fakeContainer{}
 	built := 0
@@ -313,7 +313,7 @@ func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
 	// retired (not killed) and drains on release. With one draining busy
 	// container (used=1 < max=2) the new image is served immediately.
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
-	if err := run(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
 		t.Fatalf("img-2 execute: %v", err)
 	}
 	if got := busy.reasons(); len(got) != 0 {
@@ -331,7 +331,7 @@ func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
 	}
 	// The new image's idle container is reused at the new bound.
 	before := ff.count()
-	if err := run(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
 		t.Fatalf("reuse img-2: %v", err)
 	}
 	if ff.count() != before {
@@ -344,7 +344,7 @@ func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
 // stale caller's max. This is the race where a stale in-flight acquire (still
 // holding an old Prepared.Concurrency) creates the pool after Prepare ran.
 func TestPoolResizeFreshPoolUsesEffectiveCapacity(t *testing.T) {
-	cc, _ := mkCache()
+	cc, _ := newTestCache()
 	// Prepare reconciled the function to 5; no pool exists yet.
 	cc.setFunctionConcurrency("fn-a", 5)
 
@@ -377,7 +377,7 @@ func TestPoolResizeManagerSnapshotReflectsNewBound(t *testing.T) {
 	m.containers = newContainerCache()
 	m.containers.metrics = reg
 	ff := &fakeFactory{}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -397,13 +397,13 @@ func TestPoolResizeManagerSnapshotReflectsNewBound(t *testing.T) {
 // TestPoolResizeRemovedFunctionIgnores proves a resize of a removed/detached
 // pool is a safe no-op and does not resurrect it.
 func TestPoolResizeRemovedFunctionIgnores(t *testing.T) {
-	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	cc, ff := newTestCache()
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	cc.removeFunction("fn-a")
 	cc.setFunctionConcurrency("fn-a", 5)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal+resize = %v, want errPoolClosed", err)
 	}
 }
@@ -416,18 +416,18 @@ func TestPoolResizeRaceSafety(t *testing.T) {
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
 
 	var wg sync.WaitGroup
-	stop := make(chan struct{})
+
+	// All loops run a fixed, generous iteration count; the whole test is
+	// iteration-bounded (no wall-clock soak), so it cannot flake slow or fast.
+	const resizeIters = 400
+	const acquireIters = 80
+	const snapshotIters = 400
 
 	// Resize loop: alternate small and large bounds.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		for i := 0; i < resizeIters; i++ {
 			cc.setFunctionConcurrency("fn-race", 1+(i%4))
 		}
 	}()
@@ -437,7 +437,7 @@ func TestPoolResizeRaceSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 80; j++ {
+			for j := 0; j < acquireIters; j++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 				l, err := cc.acquire(ctx, "fn-race", "img-1", 2, ff.start())
 				cancel()
@@ -454,17 +454,10 @@ func TestPoolResizeRaceSafety(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		for i := 0; i < snapshotIters; i++ {
 			_, _ = cc.snapshot("fn-race", reg)
 		}
 	}()
 
-	time.Sleep(150 * time.Millisecond)
-	close(stop)
 	wg.Wait()
 }

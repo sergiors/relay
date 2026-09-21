@@ -36,44 +36,55 @@ func timestamp(t *testing.T, s string) string {
 }
 
 // TestParseNowOperand pins the exact now() syntax rules. It is pure syntax —
-// it returns only the signed relative offset and never consults a clock.
+// it returns only the signed relative offset and never consults a clock. It
+// covers the valid offset matrix (including sub-second, large, and zero
+// offsets), the non-temporal strings that are simply "not a temporal operand",
+// and the malformed forms that are errors.
 func TestParseNowOperand(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
+	valid := []struct {
 		name string
 		in   string
 		want time.Duration // signed offset (baked-in sign); zero => clock() itself
-		temp bool
 	}{
-		{"plain now()", "now()", 0, true},
-		{"now() minus 5m", "now()-5m", -5 * time.Minute, true},
-		{"now() plus 5m", "now()+5m", 5 * time.Minute, true},
-		{"now() plus 1h", "now()+1h", time.Hour, true},
-		{"compound duration", "now()-1h30m", -90 * time.Minute, true},
-		{"compound mixed", "now()-2h45m30s", -(2*time.Hour + 45*time.Minute + 30*time.Second), true},
-		{"zero duration", "now()+0s", 0, true},
+		{"plain now()", "now()", 0},
+		{"now() minus 5m", "now()-5m", -5 * time.Minute},
+		{"now() plus 5m", "now()+5m", 5 * time.Minute},
+		{"now() plus 1h", "now()+1h", time.Hour},
+		{"compound duration", "now()-1h30m", -90 * time.Minute},
+		{"compound mixed", "now()-2h45m30s", -(2*time.Hour + 45*time.Minute + 30*time.Second)},
+		{"zero duration", "now()+0s", 0},
+		{"sub-second ms", "now()-500ms", -500 * time.Millisecond},
+		{"sub-second us", "now()+250us", 250 * time.Microsecond},
+		{"sub-second ns", "now()-1ns", -1 * time.Nanosecond},
+		{"large offset 24h", "now()+24h", 24 * time.Hour},
+		{"large offset 72h30m", "now()-72h30m", -(72*time.Hour + 30*time.Minute)},
+		{"large offset 168h", "now()+168h", 168 * time.Hour},
+		{"zero offset minutes", "now()-0m", 0},
+		{"zero offset hours", "now()+0h", 0},
 	}
-	for _, tc := range cases {
+	for _, tc := range valid {
 		t.Run(tc.name, func(t *testing.T) {
 			got, temp, err := parseNowOperand(tc.in)
 			if err != nil {
 				t.Fatalf("parseNowOperand(%q) error: %v", tc.in, err)
 			}
 			if !temp {
-				t.Errorf("parseNowOperand(%q) = temporal=%v, want %v", tc.in, temp, tc.temp)
+				t.Errorf("parseNowOperand(%q) = temporal=false, want true", tc.in)
 			}
-			if temp && got != tc.want {
+			if got != tc.want {
 				t.Errorf("parseNowOperand(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}
 
 	// Non-now() strings (including the removed bare `now`/`now±duration`
-	// syntax and uppercase variants) are simply "not a temporal operand"
-	// (zero, false, nil) — they are rejected by the caller, not as a now()
-	// syntax error.
+	// syntax, uppercase variants, and empty input) are simply "not a temporal
+	// operand" (zero, false, nil) — they are rejected by the caller, not as a
+	// now() syntax error.
 	for _, in := range []string{
+		"",
 		"hello",
 		"2026-09-12T10:00:00Z",
 		"utc_now()",
@@ -84,6 +95,9 @@ func TestParseNowOperand(t *testing.T) {
 		"now+1h",
 		"NOW()",
 		"Now()",
+		"NOW()-5m",
+		"Now",
+		"NOW",
 	} {
 		got, temp, err := parseNowOperand(in)
 		if err != nil {
@@ -94,15 +108,23 @@ func TestParseNowOperand(t *testing.T) {
 		}
 	}
 
-	// Malformed now() expressions are errors.
+	// Malformed now() expressions are errors (whitespace anywhere, a missing or
+	// negative duration, or trailing garbage after the parentheses).
 	for _, in := range []string{
 		"now()-",
 		"now()+",
 		"now()-foo",
 		"now() - 5m",
+		"now() -5m",
+		"now() +5m",
+		"now()\t-5m",
+		"now()+ 5m",
+		"now()- 5m",
 		"now()--5m",
 		"now()+-5m",
 		"now()5m",
+		"now()now",
+		"now()x",
 		"now() ",
 		"now()  ",
 	} {
@@ -323,10 +345,14 @@ events:
           updated_at:
             gt: "now()-1h"
 `, func() time.Time { return fixedNow })
-	if !matches(t, tmpl, map[string]any{"metadata": map[string]any{"timestamps": map[string]any{"updated_at": "2026-09-12T10:00:00Z"}}}) {
+	if !matches(t, tmpl, map[string]any{
+		"metadata": map[string]any{"timestamps": map[string]any{"updated_at": "2026-09-12T10:00:00Z"}},
+	}) {
 		t.Error("expected nested match")
 	}
-	if matches(t, tmpl, map[string]any{"metadata": map[string]any{"timestamps": map[string]any{"updated_at": "2026-09-12T08:00:00Z"}}}) {
+	if matches(t, tmpl, map[string]any{
+		"metadata": map[string]any{"timestamps": map[string]any{"updated_at": "2026-09-12T08:00:00Z"}},
+	}) {
 		t.Error("expected nested no match (before one-hour cutoff)")
 	}
 }
@@ -507,7 +533,9 @@ func TestGteLtORSemantics(t *testing.T) {
 	// As OR, an instant in neither bucket ([08:00, 09:00)) matches neither. This
 	// is NOT a range constraint (that would be AND); it is two independent
 	// alternatives.
-	tmpl := mustParseWithClock(t, templateYAML("gte: \"now()-1h\"\n        lt: \"now()-2h\""), func() time.Time { return fixedNow })
+	tmpl := mustParseWithClock(t,
+		templateYAML("gte: \"now()-1h\"\n        lt: \"now()-2h\""),
+		func() time.Time { return fixedNow })
 	// 09:30 satisfies gte -> match.
 	if !matches(t, tmpl, map[string]any{"created_at": "2026-09-12T09:30:00Z"}) {
 		t.Error("expected match via gte now()-1h")
@@ -519,138 +547,6 @@ func TestGteLtORSemantics(t *testing.T) {
 	// 08:30 is in the gap [08:00, 09:00) -> satisfies neither.
 	if matches(t, tmpl, map[string]any{"created_at": "2026-09-12T08:30:00Z"}) {
 		t.Error("expected no match: 08:30 satisfies neither gte-now()-1h nor lt-now()-2h")
-	}
-}
-
-// TestTemporalProductionPath verifies ParseTemplate (the production entry point)
-// evaluates temporal rules against the real wall clock. Instants are chosen far
-// enough from any plausible "now" that the result is stable regardless of when
-// the test runs: a 26-year-old instant is certainly before now, and a 900-year
-// future instant is certainly after.
-func TestTemporalProductionPath(t *testing.T) {
-	tmpl := mustParse(t, templateYAML("gt: \"now()\""))
-	if matches(t, tmpl, map[string]any{"created_at": "2000-01-01T00:00:00Z"}) {
-		t.Error("expected no match: a past instant is not gt now()")
-	}
-	if !matches(t, tmpl, map[string]any{"created_at": "3000-01-01T00:00:00Z"}) {
-		t.Error("expected match: a far-future instant is gt now")
-	}
-}
-
-// TestParseNowOperandExtra extends TestParseNowOperand with additional pure
-// syntax coverage: case sensitivity, whitespace variants, empty input, missing
-// sign, sub-second units, large offsets, and zero offsets. It is pure syntax and
-// never consults a clock.
-func TestParseNowOperandExtra(t *testing.T) {
-	t.Parallel()
-
-	// Uppercase "NOW()" and other "NOW(...)" prefixed variants are NOT temporal
-	// (case-sensitive), returning (0, false, nil) with no error.
-	for _, in := range []string{"NOW()", "Now()", "NOW()-5m", "Now", "NOW"} {
-		got, temp, err := parseNowOperand(in)
-		if err != nil {
-			t.Errorf("parseNowOperand(%q) unexpected error: %v", in, err)
-		}
-		if temp || got != 0 {
-			t.Errorf("parseNowOperand(%q) = (%v, %v), want (0, false)", in, got, temp)
-		}
-	}
-
-	// Whitespace anywhere in the expression is malformed -> error.
-	for _, in := range []string{
-		"now() -5m", "now() +5m", "now()\t-5m", "now()+ 5m", "now()- 5m",
-		"now() - 5m", "now() +5m", "now()",
-	} {
-		wantErr := in != "now()"
-		_, temp, err := parseNowOperand(in)
-		if wantErr && err == nil {
-			t.Errorf("parseNowOperand(%q) expected an error, got nil", in)
-		}
-		if !wantErr && err != nil {
-			t.Errorf("parseNowOperand(%q) unexpected error: %v", in, err)
-		}
-		if !wantErr && !temp {
-			t.Errorf("parseNowOperand(%q) = temporal=%v, want true", in, temp)
-		}
-	}
-
-	// Empty string is not temporal.
-	got, temp, err := parseNowOperand("")
-	if err != nil {
-		t.Errorf("parseNowOperand(\"\") unexpected error: %v", err)
-	}
-	if temp || got != 0 {
-		t.Errorf("parseNowOperand(\"\") = (%v, %v), want (0, false)", got, temp)
-	}
-
-	// "now()now", "now()5m", "now()" followed by anything other than a sign is
-	// malformed -> error.
-	for _, in := range []string{"now()now", "now()5m", "now()x"} {
-		if _, _, err := parseNowOperand(in); err == nil {
-			t.Errorf("parseNowOperand(%q) expected an error, got nil", in)
-		}
-	}
-
-	// The removed bare `now`/`now±duration` syntax is NOT temporal (parses as
-	// a plain non-temporal string, not an error) — rejections happen in the
-	// caller.
-	for _, in := range []string{"now", "now-5m", "now+1h"} {
-		got, temp, err := parseNowOperand(in)
-		if err != nil {
-			t.Errorf("parseNowOperand(%q) unexpected error: %v", in, err)
-		}
-		if temp || got != 0 {
-			t.Errorf("parseNowOperand(%q) = (%v, %v), want (0, false)", in, got, temp)
-		}
-	}
-
-	// Sub-second units are valid (ParseDuration supports ms/us/ns).
-	sub := []struct {
-		in   string
-		want time.Duration
-	}{
-		{"now()-500ms", -500 * time.Millisecond},
-		{"now()+250us", 250 * time.Microsecond},
-		{"now()-1ns", -1 * time.Nanosecond},
-	}
-	for _, tc := range sub {
-		got, temp, err := parseNowOperand(tc.in)
-		if err != nil {
-			t.Fatalf("parseNowOperand(%q) error: %v", tc.in, err)
-		}
-		if !temp || got != tc.want {
-			t.Errorf("parseNowOperand(%q) = (%v, %v), want (%v, true)", tc.in, got, temp, tc.want)
-		}
-	}
-
-	// Large offsets parse without overflow concerns.
-	big := []struct {
-		in   string
-		want time.Duration
-	}{
-		{"now()+24h", 24 * time.Hour},
-		{"now()-72h30m", -(72*time.Hour + 30*time.Minute)},
-		{"now()+168h", 168 * time.Hour},
-	}
-	for _, tc := range big {
-		got, temp, err := parseNowOperand(tc.in)
-		if err != nil {
-			t.Fatalf("parseNowOperand(%q) error: %v", tc.in, err)
-		}
-		if !temp || got != tc.want {
-			t.Errorf("parseNowOperand(%q) = (%v, %v), want (%v, true)", tc.in, got, temp, tc.want)
-		}
-	}
-
-	// Zero offsets remain valid temporal operands (cutoff == clock()).
-	for _, in := range []string{"now()-0m", "now()+0h"} {
-		got, temp, err := parseNowOperand(in)
-		if err != nil {
-			t.Fatalf("parseNowOperand(%q) error: %v", in, err)
-		}
-		if !temp || got != 0 {
-			t.Errorf("parseNowOperand(%q) = (%v, %v), want (0, true)", in, got, temp)
-		}
 	}
 }
 

@@ -23,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,7 +30,6 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 
-	"relay/internal/config"
 	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/reconciler"
@@ -39,100 +37,8 @@ import (
 	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
-
-// syncBuffer is a bytes.Buffer safe for concurrent writes and reads. The worker
-// wiring logs from several goroutines (MetricsLogger, metrics Server, statsLoop, the
-// reconciler, the consumer), so the test's log buffer must tolerate concurrent
-// access when asserted under -race.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf strings.Builder
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// envOr returns the value of the environment variable key, or fallback when it
-// is empty or unset. It replaces the deleted config.Env helper for integration
-// tests that want a configurable REDIS_TEST_ADDR override (config.getEnv is
-// unexported, so it cannot be used from this package).
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// requireRedis fails the test when the test Redis (REDIS_TEST_ADDR, default
-// localhost:6379) is not reachable, instead of skipping: the graceful-shutdown
-// wiring is meaningless without real Redis state.
-func requireRedis(t *testing.T) *redis.Client {
-	t.Helper()
-	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
-	opts, _ := config.RedisOptions(addr)
-	cli := redis.NewClient(opts)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := cli.Ping(ctx).Err(); err != nil {
-		_ = cli.Close()
-		t.Fatalf(
-			"redis integration test requires a reachable Redis at %s (ping: %v); start one with `docker compose -f compose.dev.yaml up -d`",
-			addr,
-			err,
-		)
-	}
-	t.Cleanup(func() { cli.Close() })
-	return cli
-}
-
-// requireDocker fails the test immediately when the Docker Engine API daemon
-// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
-// all respected). The graceful-shutdown path runs a real in-flight handler
-// container; missing infrastructure fails rather than skips.
-func requireDocker(t *testing.T) *client.Client {
-	t.Helper()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
-		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
-	}
-	t.Cleanup(func() { cli.Close() })
-	return cli
-}
-
-// WaitFor polls pred until it returns true or the deadline passes. It is a
-// bounded poll: a generous budget avoids spurious CI flakes while the loop
-// never spins forever. On timeout it fails the test with what as context.
-func WaitFor(t *testing.T, timeout time.Duration, what string, pred func() bool) {
-	t.Helper()
-	deadline := time.After(timeout)
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if pred() {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", what)
-		case <-tick.C:
-		}
-	}
-}
 
 // workerConfig carries the test-controlled constants that replace the package
 // CONSTANTS (function.Dir, state.DBPath) and the env-derived values in Run().
@@ -157,7 +63,7 @@ type workerEnv struct {
 	ctx          context.Context
 	cancel       func()
 	consumeDone  chan error
-	buf          *syncBuffer
+	buf          *testutil.SyncBuffer
 	m            *metrics.Registry
 	st           *state.State
 	client       *redis.Client
@@ -178,7 +84,7 @@ type workerEnv struct {
 // on SIGTERM.
 func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Helper()
-	buf := &syncBuffer{}
+	buf := &testutil.SyncBuffer{}
 	// DEBUG level: the mid-handler shutdown path logs its cancellation line at
 	// Debug (expected shutdown coordination detail), and the assertions below
 	// match it.
@@ -426,10 +332,10 @@ func writeTestFile(t *testing.T, dir, name, content string) {
 // the final SQLite flush runs within its bound, and the message is recoverable
 // through the normal reclaim path by a second consumer.
 func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
-	requireRedis(t)
-	dcli := requireDocker(t)
+	testutil.RequireRedis(t)
+	dcli := testutil.RequireDocker(t)
 
-	redisURI := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	redisURI := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
 	prefix := fmt.Sprintf("shutdown-itest-%d", time.Now().UnixNano())
 	streamName := prefix + "-stream"
 	groupName := prefix + "-group"
@@ -448,10 +354,17 @@ func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 	fnRoot := t.TempDir()
 	statePath := filepath.Join(t.TempDir(), "db.sqlite3")
 
+	// Derive a unique, length-capped function name from the test name + a
+	// nanosecond stamp so concurrent runs on one daemon cannot collide on the
+	// execution container labels or the function directory. testutil.UniqueName
+	// guarantees the name stays within function.ValidName's 63-char cap even for
+	// a long test name.
+	fnName := testutil.UniqueName(t, "shutdown")
+
 	// Write the function. The handler sleeps 30s while the rule timeout is 25s,
 	// so TryStart persists a running deadline (now+25s) that comfortably exceeds
 	// the shutdown point — the handler is genuinely mid-execution when we cancel.
-	fnDir := filepath.Join(fnRoot, "shutdowntest")
+	fnDir := filepath.Join(fnRoot, fnName)
 	if err := os.MkdirAll(fnDir, 0o755); err != nil {
 		t.Fatalf("mkdir fn: %v", err)
 	}
@@ -486,13 +399,13 @@ export async function slow(event) {
 	// lives in the request frame and the output prefix — so the identity label
 	// set is the stable wait predicate.)
 	containerID := waitForContainer(t, dcli, map[string]string{
-		"relay.function": "shutdowntest",
+		"relay.function": fnName,
 		"relay.hostname": consumerName,
 	})
 	t.Logf("in-flight container %s observed", containerID)
 
 	// The message is in the PEL (delivered to consumer A) with retry count 1.
-	WaitFor(t, 8*time.Second, "message in PEL", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "message in PEL", func() bool {
 		_, ok := pendingEntry(env.client, streamName, groupName, msgID)
 		return ok
 	})
@@ -555,7 +468,7 @@ export async function slow(event) {
 	// Docker cleanup completed: the in-flight container is gone (AutoRemove after
 	// the kill, plus the deferred best-effort remove).
 	if !waitForContainerGone(t, dcli, map[string]string{
-		"relay.function": "shutdowntest",
+		"relay.function": fnName,
 		"relay.hostname": consumerName,
 	}) {
 		t.Error("in-flight container should have been removed after shutdown")
@@ -571,7 +484,7 @@ export async function slow(event) {
 	// HDELs the running marker, so the field is typically absent; a hard crash
 	// would leave it as "running:<deadline>". Either way it must not be "ok".
 	invKey := "relay:invocation:" + streamName + ":" + groupName + ":" + msgID
-	if v, err := env.client.HGet(context.Background(), invKey, "shutdowntest/index.slow").Result(); err == nil && v == "ok" {
+	if v, err := env.client.HGet(context.Background(), invKey, fnName+"/index.slow").Result(); err == nil && v == "ok" {
 		t.Fatal("invocation state should NOT be 'ok' after mid-handler shutdown")
 	}
 
@@ -624,7 +537,7 @@ export async function slow(event) {
 	}()
 
 	// Wait for the message to be reclaimed and acked (gone from the PEL).
-	WaitFor(t, 8*time.Second, "message reclaimed and acked by consumer B", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "message reclaimed and acked by consumer B", func() bool {
 		_, ok := pendingEntry(env.client, streamName, groupName, msgID)
 		return !ok
 	})

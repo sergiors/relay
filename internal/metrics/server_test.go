@@ -4,13 +4,14 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"relay/internal/testutil"
 )
 
 const handlerContentType = "text/plain; version=0.0.4"
@@ -69,7 +70,8 @@ func TestMuxNotFound(t *testing.T) {
 func TestMuxMethodNotAllowed(t *testing.T) {
 	r := New()
 	rec := httptest.NewRecorder()
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/metrics", nil))
+	req := httptest.NewRequest(http.MethodPost, "/metrics", nil)
+	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
@@ -88,7 +90,8 @@ func TestMuxHead(t *testing.T) {
 	r := New()
 	r.SetGauge(MetricPendingEntries, 1)
 	rec := httptest.NewRecorder()
-	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	req := httptest.NewRequest(http.MethodHead, "/metrics", nil)
+	NewServer("127.0.0.1:0", r.Handler(), nil).handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -117,19 +120,14 @@ func TestServerStartServesInBackground(t *testing.T) {
 	r := New()
 	r.SetGauge(MetricPendingEntries, 1)
 
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
+	addr := testutil.FreeAddr(t)
 	srv := NewServer(addr, r.Handler(), nil)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// The server is serving in the background; scrape-retry until reachable.
+	// Start binds synchronously, so the port is listening before it returns; a
+	// bounded retry tolerates the serving goroutine not yet having accepted.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		resp, err := http.Get("http://" + addr + "/metrics")
@@ -192,13 +190,7 @@ func TestServerStopIdempotentAndNeverStarted(t *testing.T) {
 // TestServerStartTwiceFails verifies a second Start (even after a prior Stop)
 // returns an error — Start may be called exactly once.
 func TestServerStartTwiceFails(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
+	addr := testutil.FreeAddr(t)
 	srv := NewServer(addr, New().Handler(), nil)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("first Start: %v", err)
@@ -225,14 +217,7 @@ func TestServerStartBadAddrThenGoodAddr(t *testing.T) {
 		t.Fatal("Start on bad addr returned nil, want error")
 	}
 
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
-	srv.addr = addr
+	srv.addr = testutil.FreeAddr(t)
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start on corrected addr: %v", err)
 	}
@@ -243,38 +228,41 @@ func TestServerStartBadAddrThenGoodAddr(t *testing.T) {
 	}
 }
 
+// TestConcurrentIncrementAndRender exercises the Registry's locking under
+// concurrent Inc/Snapshot without a fixed wall-clock sleep: every writer runs a
+// fixed iteration count and the reader loops until they finish, so the test is
+// deterministic and race-detector-friendly.
 func TestConcurrentIncrementAndRender(t *testing.T) {
 	r := New()
 
+	const (
+		writers = 4
+		iters   = 2000
+	)
 	var wg sync.WaitGroup
-	stop := make(chan struct{})
 
-	// Writers.
-	for i := 0; i < 4; i++ {
+	// Writers each perform a fixed number of mixed mutations.
+	for i := 0; i < writers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					r.Inc(MetricEventsReceived)
-					r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
-					r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
-					r.SetGauge(MetricPendingEntries, 1)
-				}
+			for j := 0; j < iters; j++ {
+				r.Inc(MetricEventsReceived)
+				r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
+				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
+				r.SetGauge(MetricPendingEntries, 1)
 			}
 		}()
 	}
 
-	// Reader.
-	wg.Add(1)
+	// Reader snapshots concurrently until the writers finish.
+	writersDone := make(chan struct{})
+	readerDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(readerDone)
 		for {
 			select {
-			case <-stop:
+			case <-writersDone:
 				return
 			default:
 				_ = r.Snapshot()
@@ -282,7 +270,7 @@ func TestConcurrentIncrementAndRender(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	close(stop)
 	wg.Wait()
+	close(writersDone)
+	<-readerDone
 }

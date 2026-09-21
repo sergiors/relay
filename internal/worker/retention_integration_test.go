@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/testutil"
 )
 
 // TestIntegrationRetentionTrimsOldEntries verifies the retention trim against a
@@ -21,7 +23,7 @@ import (
 // the affected tests rather than skipping them. Start the documented dev
 // dependencies with `docker compose -f compose.dev.yaml up -d`.
 func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
-	cli := requireRedis(t)
+	cli := testutil.RequireRedis(t)
 	t.Cleanup(func() { _ = cli.Close() })
 
 	stream := fmt.Sprintf("relay:retention-test:%d", time.Now().UnixNano())
@@ -59,7 +61,7 @@ func TestIntegrationRetentionTrimsOldEntries(t *testing.T) {
 
 	// Trim with a 1h window: the full leading node of old entries (2h old) must
 	// be removed, the recent entry (1s old) must remain.
-	retentionTick(context.Background(), cli, stream, time.Hour, time.Now, discardLogger())
+	retentionTick(context.Background(), cli, stream, time.Hour, time.Now, testutil.DiscardLogger())
 
 	msgs, err := cli.XRange(context.Background(), stream, "-", "+").Result()
 	if err != nil {

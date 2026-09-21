@@ -1,15 +1,3 @@
-//go:build integration
-
-// This file exercises the metrics HTTP endpoint against a real Redis: it boots
-// the worker-style metrics wiring (a metrics server on a free port fed from a
-// real Redis) and scrapes /metrics to assert the Prometheus text exposition
-// works end to end.
-//
-// This file is excluded from the default suite by the integration build tag.
-// Running it (`go test -tags=integration ./...`) REQUIRES Redis at REDIS_TEST_ADDR
-// (default localhost:6379, matching compose.dev.yaml); a missing dependency fails
-// the affected tests rather than skipping them. Start the documented dev
-// dependencies with `docker compose -f compose.dev.yaml up -d`.
 package worker
 
 import (
@@ -27,13 +15,11 @@ import (
 	"relay/internal/metrics"
 )
 
-// TestIntegrationMetricsEndpoint boots the worker wiring (excluding the real
-// Consume loop, which needs /functions + Docker) with a free metrics port and a
-// real Redis, then scrapes /metrics and asserts the Prometheus exposition works
-// end-to-end.
-func TestIntegrationMetricsEndpoint(t *testing.T) {
-	requireRedis(t)
-
+// TestMetricsEndpointScrapeExposesFunctionSeries boots a metrics server on a
+// free port fed from an in-memory registry, then scrapes /metrics and asserts
+// the Prometheus text exposition carries the function-scoped and warm-pool
+// series end to end. It needs no Redis or Docker: the registry is in-memory.
+func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
 	// Free port for the metrics server.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

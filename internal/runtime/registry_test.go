@@ -7,50 +7,10 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// TestImageRef verifies the fingerprint-versioned format
-// "relay-fn-<name>:<16hex>" and that it is deterministic.
-func TestImageRef(t *testing.T) {
-	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	cases := []struct {
-		name, fp, want string
-	}{
-		{"user-events", fp, "relay-fn-user-events:0123456789abcdef"},
-		{"welcome_email", fp, "relay-fn-welcome_email:0123456789abcdef"},
-		{"jobs.v2", fp, "relay-fn-jobs.v2:0123456789abcdef"},
-		// The tag is only the first 16 hex chars; the rest is dropped.
-		{"a", "abcdef1234567890xyz", "relay-fn-a:abcdef1234567890"},
-	}
-	for _, tc := range cases {
-		if got := ImageRef(tc.name, tc.fp); got != tc.want {
-			t.Errorf("ImageRef(%q) = %q, want %q", tc.name, got, tc.want)
-		}
-	}
-}
-
-// TestImageRefDeterministic asserts the same (name, fingerprint) always maps to
-// the same reference, and distinct fingerprints map to distinct references (so
-// two source versions can never collide on one image tag).
-func TestImageRefDeterministic(t *testing.T) {
-	fp1 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	fp2 := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	if got, again := ImageRef("fn", fp1), ImageRef("fn", fp1); got != again {
-		t.Fatalf("same fingerprint yielded %q then %q, want identical", got, again)
-	}
-	if ImageRef("fn", fp1) == ImageRef("fn", fp2) {
-		t.Fatal("distinct fingerprints must yield distinct references")
-	}
-}
-
-// TestImageRefShortFingerprint verifies no panic and a sensible prefix when the
-// fingerprint is shorter than 16 chars (defensive; production fingerprints are
-// always 64 hex chars).
-func TestImageRefShortFingerprint(t *testing.T) {
-	if got, want := ImageRef("fn", "abc"), "relay-fn-fn:abc"; got != want {
-		t.Errorf("ImageRef(fn, abc) = %q, want %q", got, want)
-	}
-}
-
-func TestLookup(t *testing.T) {
+// TestLookupResolvesRuntimeSpecAndRejectsUnknown verifies the runtime registry
+// resolves each supported runtime to its engine + base image and rejects an
+// unknown runtime with an "unsupported runtime" error.
+func TestLookupResolvesRuntimeSpecAndRejectsUnknown(t *testing.T) {
 	spec, err := lookup("python3.14")
 	if err != nil {
 		t.Fatalf("lookup python3.14: %v", err)
@@ -80,20 +40,31 @@ func TestLookup(t *testing.T) {
 	}
 }
 
-// A test-only spec can be registered temporarily through the same mechanism
-// (the specs map) and share an engine with an existing runtime, without enabling
-// a real new runtime. It validates that a single engine serves more than one
-// version, in both directions.
-func TestLookupSharedEngine(t *testing.T) {
+// testSpecTable returns a COPY of the production registry with the two
+// test-only multi-version specs added, so the shared-engine tests exercise the
+// real resolution/dispatch path without mutating the global specs map (which
+// races any other test that reads it).
+func testSpecTable() (map[string]plan.Spec, string, string) {
 	const tempPython = "python3.15-test-only"
 	const tempNode = "node26-test-only"
-	defer delete(specs, tempPython)
-	defer delete(specs, tempNode)
-	specs[tempPython] = plan.Spec{Name: tempPython, Engine: plan.EnginePython, BaseImage: "python:3.15-slim"}
-	specs[tempNode] = plan.Spec{Name: tempNode, Engine: plan.EngineNode, BaseImage: "node:26-alpine"}
+	table := make(map[string]plan.Spec, len(specs)+2)
+	for k, v := range specs {
+		table[k] = v
+	}
+	table[tempPython] = plan.Spec{Name: tempPython, Engine: plan.EnginePython, BaseImage: "python:3.15-slim"}
+	table[tempNode] = plan.Spec{Name: tempNode, Engine: plan.EngineNode, BaseImage: "node:26-alpine"}
+	return table, tempPython, tempNode
+}
+
+// A test-only spec can be resolved through the same mechanism (lookupIn on a
+// copied table) and share an engine with an existing runtime, without enabling a
+// real new runtime. It validates that a single engine serves more than one
+// version, in both directions.
+func TestEngineForRuntimeResolvesSharedEngine(t *testing.T) {
+	table, tempPython, tempNode := testSpecTable()
 
 	// A second Python version shares EnginePython with the production spec.
-	py, err := lookup(tempPython)
+	py, err := lookupIn(table, tempPython)
 	if err != nil {
 		t.Fatalf("lookup(%s): %v", tempPython, err)
 	}
@@ -105,7 +76,7 @@ func TestLookupSharedEngine(t *testing.T) {
 	}
 
 	// A second Node version shares EngineNode with the production spec.
-	nd, err := lookup(tempNode)
+	nd, err := lookupIn(table, tempNode)
 	if err != nil {
 		t.Fatalf("lookup(%s): %v", tempNode, err)
 	}
@@ -117,21 +88,16 @@ func TestLookupSharedEngine(t *testing.T) {
 	}
 }
 
-// engineFor dispatches both the production and the test-only specs to the same
-// engine type, so the shared engine property holds through the actual dispatch
-// path, not just the registry.
-func TestEngineForSharedEngine(t *testing.T) {
-	const tempPython = "python3.15-test-only"
-	const tempNode = "node26-test-only"
-	defer delete(specs, tempPython)
-	defer delete(specs, tempNode)
-	specs[tempPython] = plan.Spec{Name: tempPython, Engine: plan.EnginePython, BaseImage: "python:3.15-slim"}
-	specs[tempNode] = plan.Spec{Name: tempNode, Engine: plan.EngineNode, BaseImage: "node:26-alpine"}
+// TestEngineForSharedEngineDispatch dispatches both the production and the
+// test-only specs to the same engine type, so the shared engine property holds
+// through the actual dispatch path, not just the registry.
+func TestEngineForSharedEngineDispatch(t *testing.T) {
+	table, tempPython, tempNode := testSpecTable()
 
 	// Both python specs must produce a plan with the python entrypoint and the
 	// spec's own base image; both node specs likewise for node.
 	for _, name := range []string{"python3.14", tempPython} {
-		spec, err := lookup(name)
+		spec, err := lookupIn(table, name)
 		if err != nil {
 			t.Fatalf("lookup(%s): %v", name, err)
 		}
@@ -152,7 +118,7 @@ func TestEngineForSharedEngine(t *testing.T) {
 	}
 
 	for _, name := range []string{"node24", tempNode} {
-		spec, err := lookup(name)
+		spec, err := lookupIn(table, name)
 		if err != nil {
 			t.Fatalf("lookup(%s): %v", name, err)
 		}

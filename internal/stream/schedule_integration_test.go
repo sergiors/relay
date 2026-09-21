@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"relay/internal/schedule"
+	"relay/internal/testutil"
 )
 
 // schOcc returns a schedule occurrence used by the schedule integration tests.
@@ -83,21 +84,24 @@ func (r *scriptedRunner) last() scheduleOccCall {
 	return r.calls[len(r.calls)-1]
 }
 
-// A schedule message routed through a ScheduleRunner is executed directly with the
-// exact function/handler and payload, then ACKed (gone from the PEL). It does NOT
-// flow through a normal-event handler.
+// TestIntegrationScheduleRoutedToRunnerAndAcked verifies a schedule message
+// routed through a ScheduleRunner is executed directly with the exact
+// function/handler and payload, then ACKed (gone from the PEL), while the
+// normal-event handler is never invoked for it (bypass confirmed).
 func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	rr := &scriptedRunner{}
 	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	o := schOcc()
 
 	id := e.xadd(t, schEnvelope(t, o))
+	normalCalls := &atomic.Int64{}
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
-		return fmt.Errorf("normal handler invoked for a schedule message")
+		normalCalls.Add(1)
+		return nil
 	})
 
-	WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
 		return rr.count() >= 1
 	})
 	call := rr.last()
@@ -117,32 +121,7 @@ func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 		t.Fatalf("unexpected schedule payload: %v", p)
 	}
 
-	WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
-		_, ok := e.pending()[id]
-		return !ok
-	})
-	e.stop(t)
-}
-
-// A schedule message routed through a ScheduleRunner is delivered and acked, and
-// the normal-event handler is never invoked for it (bypass confirmed).
-func TestIntegrationScheduleBypassesNormalHandler(t *testing.T) {
-	requireRedis(t)
-	rr := &scriptedRunner{}
-	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
-	o := schOcc()
-
-	id := e.xadd(t, schEnvelope(t, o))
-	normalCalls := &atomic.Int64{}
-	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
-		normalCalls.Add(1)
-		return nil
-	})
-
-	WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
-		return rr.count() >= 1
-	})
-	WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -155,7 +134,7 @@ func TestIntegrationScheduleBypassesNormalHandler(t *testing.T) {
 // After a ScheduleRunner is wired, a normal (non-schedule) event still flows
 // through the matcher handler and never touches the schedule runner.
 func TestIntegrationNormalEventUnchangedWithScheduleRunner(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	rr := &scriptedRunner{}
 	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	id := e.xadd(t, `{"a":1}`)
@@ -168,7 +147,7 @@ func TestIntegrationNormalEventUnchangedWithScheduleRunner(t *testing.T) {
 		return nil
 	})
 	<-acked
-	WaitFor(t, 8*time.Second, "normal event acked (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "normal event acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -182,7 +161,7 @@ func TestIntegrationNormalEventUnchangedWithScheduleRunner(t *testing.T) {
 // redelivers it with a higher attempt count, and the second attempt succeeds and
 // is acked. Invocation-state protection still applies to schedule messages.
 func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	rr := &scriptedRunner{failErr: fmt.Errorf("boom")}
 	// The runner fails only its first invocation.
 	var attempts atomic.Int64
@@ -202,7 +181,7 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 
 	// First delivery: the runner fails (attempt 1), leaving the message pending.
-	WaitFor(t, 8*time.Second, "schedule runner invoked (attempt 1 fails)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule runner invoked (attempt 1 fails)", func() bool {
 		return rr.count() >= 1
 	})
 	// Flip the runner to success so a reclaim retry succeeds.
@@ -210,7 +189,7 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 	rr.failErr = nil
 	rr.mu.Unlock()
 
-	WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -223,7 +202,7 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 // A schedule message whose ScheduleRunner reports exhaustion routes to the DLQ and
 // is acked, exactly like a normal exhausted event.
 func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	rr := &scriptedRunner{exhaust: true}
 	e := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
 	o := schOcc()
@@ -232,15 +211,15 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		return nil
 	})
-	WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule runner invoked", func() bool {
 		return rr.count() >= 1
 	})
 	// The invocation is exhausted, so the message routes to the DLQ (and is acked).
-	WaitFor(t, 8*time.Second, "schedule message routed to DLQ", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule message routed to DLQ", func() bool {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "schedule message acked (gone from PEL)", func() bool {
 		_, ok := e.pending()[id]
 		return !ok
 	})
@@ -260,7 +239,7 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 // invocation, e.g. running on another replica or waiting out a retry backoff) is
 // left pending, never acked and never DLQ'd.
 func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	neo := schOcc()
 	env := newEnv(t, ConsumerConfig{
 		ScheduleRunner: func(ctx context.Context, msgID, fn, handler string, payload []byte) error {
@@ -275,7 +254,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 	// The message must stay pending across the reclaim grace window (never acked,
 	// never DLQ'd): the runner reports the invocation not eligible, so the message
 	// is left pending for a later delivery.
-	WaitFor(t, 8*time.Second, "not-eligible schedule message delivered into PEL", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "not-eligible schedule message delivered into PEL", func() bool {
 		_, ok := env.pending()[id]
 		return ok
 	})
@@ -292,7 +271,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 // the DLQ. This is the intentional-removal case: retrying or dead-lettering an
 // obsolete occurrence would be wrong, so the stream acknowledges it instead.
 func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
-	requireRedis(t)
+	testutil.RequireRedis(t)
 	env := newEnv(t, ConsumerConfig{
 		ScheduleRunner: func(ctx context.Context, msgID, fn, handler string, payload []byte) error {
 			return fmt.Errorf("%w: removed", ErrInvocationObsolete)
@@ -304,7 +283,7 @@ func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 	env.start(func(ctx context.Context, msgID string, ev map[string]any) error { return nil })
 
 	// The obsolete occurrence is acknowledged: it disappears from the PEL.
-	WaitFor(t, 8*time.Second, "obsolete schedule message acked (gone from PEL)", func() bool {
+	testutil.WaitFor(t, 8*time.Second, "obsolete schedule message acked (gone from PEL)", func() bool {
 		_, ok := env.pending()[id]
 		return !ok
 	})

@@ -33,13 +33,13 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	writeFnDir(t, root, "coalesced")
 
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, nil)
+	r, _ := newTestReconciler(t, root, b, nil, nil)
 
 	// Seed a fingerprint so the very first reconcile for the pre-written dir
 	// would be skipped (it was never built though). Instead we drive reconcile
 	// through Enqueue only and count Prepare calls: a single successful prepare
 	// per burst proves coalescing.
-	r.startDebounceForTest()
+	go r.pump()
 
 	// A burst of rapid events for the same function.
 	for i := 0; i < 20; i++ {
@@ -68,8 +68,8 @@ func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
 	writeFnDir(t, root, "b")
 
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, nil)
-	r.startDebounceForTest()
+	r, _ := newTestReconciler(t, root, b, nil, nil)
+	go r.pump()
 
 	r.Enqueue("a")
 	r.Enqueue("b")
@@ -124,13 +124,14 @@ func TestWatcherAddsNestedDirWatch(t *testing.T) {
 	// Register base as a healthy, seeded function so an unchanged base would not
 	// rebuild; only the nested change forces a rebuild, proving the watcher saw it.
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{initialFn("base", dir)})
+	r, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{initialFn("base", dir)}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go r.Start(ctx)
-	// Give the watcher a moment to set up the root watch.
-	time.Sleep(100 * time.Millisecond)
+	// Wait until the watcher has installed the root watch rather than sleeping
+	// a fixed amount, so the nested create below is guaranteed to be observed.
+	waitAllWatched(t, r, []string{root})
 
 	// Create a new nested subdirectory under a function.
 	nested := filepath.Join(root, "base", "deep")

@@ -3,18 +3,43 @@ package git
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
-// readSource returns the source file at relPath relative to the module root
-// (../../ from this package). These are ARCHITECTURAL GUARDRAIL tests (not style
-// checks): they pin that the automatic runtime never references git sync and
-// that the git package keeps no background timers. They read source text, not
-// runtime state, so they are cheap and deterministic.
+// moduleRoot locates the module root by walking up from this test file's own
+// directory until it finds go.mod. Resolving from runtime.Caller makes the
+// guardrail source scans independent of the test's working directory, so a scan
+// of another package cannot silently miss its target if the relative depth ever
+// changes.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller could not locate the git guardrail test")
+	}
+	dir := filepath.Dir(thisFile)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("walked to filesystem root from %s without finding go.mod", filepath.Dir(thisFile))
+		}
+		dir = parent
+	}
+}
+
+// readSource returns the source file at relPath relative to the module root.
+// These are ARCHITECTURAL GUARDRAIL tests (not style checks): they pin that the
+// automatic runtime never references git sync and that the git package keeps no
+// background timers. They read source text, not runtime state, so they are cheap
+// and deterministic.
 func readSource(t *testing.T, relPath string) string {
 	t.Helper()
-	abs := filepath.Join("..", "..", relPath)
+	abs := filepath.Join(moduleRoot(t), relPath)
 	data, err := os.ReadFile(abs)
 	if err != nil {
 		t.Fatalf("read %s: %v", relPath, err)
@@ -43,9 +68,21 @@ func TestWorkerNeverSyncsGitDirectly(t *testing.T) {
 	worker := readSource(t, "internal/worker/worker.go")
 	for _, forbid := range []string{"git.Sync(", "git.SyncFromConfig(", "git sync", "git\\.Sync", "internal/git.GitDir"} {
 		if strings.Contains(worker, forbid) {
-			t.Fatalf("worker.go calls git sync directly (%q); Relay's runtime must sync only through the webhook package", forbid)
+			t.Fatalf("worker.go calls git sync directly (%q); "+
+				"Relay's runtime must sync only through the webhook package", forbid)
 		}
 	}
+}
+
+// pkgDir returns this package's source directory, derived from the test file,
+// so the in-package scans below do not depend on the test working directory.
+func pkgDir(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller could not locate the git guardrail test")
+	}
+	return filepath.Dir(thisFile)
 }
 
 // TestGitPackageHasNoTimers pins that the git package performs NO background
@@ -58,8 +95,8 @@ func TestWorkerNeverSyncsGitDirectly(t *testing.T) {
 func TestGitPackageHasNoTimers(t *testing.T) {
 	// The git package source lives in the current directory (internal/git). Scan
 	// every non-test .go file here.
-	pkgDir := "."
-	entries, err := os.ReadDir(pkgDir)
+	pkg := pkgDir(t)
+	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		t.Fatalf("read git dir: %v", err)
 	}
@@ -67,7 +104,7 @@ func TestGitPackageHasNoTimers(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(pkgDir, e.Name()))
+		data, err := os.ReadFile(filepath.Join(pkg, e.Name()))
 		if err != nil {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
@@ -88,8 +125,8 @@ func TestGitPackageHasNoTimers(t *testing.T) {
 // loggers. Source-scan, same style as TestGitPackageHasNoTimers — cheap,
 // deterministic, no runtime.
 func TestGitPackageNeverConstructsLoggers(t *testing.T) {
-	pkgDir := "."
-	entries, err := os.ReadDir(pkgDir)
+	pkg := pkgDir(t)
+	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		t.Fatalf("read git dir: %v", err)
 	}
@@ -97,12 +134,13 @@ func TestGitPackageNeverConstructsLoggers(t *testing.T) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(pkgDir, e.Name()))
+		data, err := os.ReadFile(filepath.Join(pkg, e.Name()))
 		if err != nil {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
 		if strings.Contains(string(data), "slog.New(") {
-			t.Fatalf("git package file %s must not construct its own logger (slog.New) — loggers are caller-injected (DI)", e.Name())
+			t.Fatalf("git package file %s must not construct its own logger (slog.New) — "+
+				"loggers are caller-injected (DI)", e.Name())
 		}
 	}
 }

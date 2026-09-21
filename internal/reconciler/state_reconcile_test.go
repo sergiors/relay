@@ -1,7 +1,6 @@
 package reconciler
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,39 +12,13 @@ import (
 	"relay/internal/state"
 )
 
-// newStateReconciler builds a reconciler wired to a temp state DB, like the
-// production path (Config.State set).
-func newStateReconciler(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction) (*Reconciler, *runner.Registry, *state.State) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
-	if err != nil {
-		t.Fatalf("open state: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	r := New(Config{
-		Root:     root,
-		Debounce: 10 * time.Millisecond,
-		Interval: time.Hour,
-		State:    st,
-	}, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-		// Mirror production wiring: startup records each loaded function before
-		// reconciliation, so reconcile hooks always find an existing row.
-		st.RecordDiscovered(pf.Function())
-	}
-	return r, reg, st
-}
-
 // discovered -> the state DB records a ready row with handlers.
 func TestReconcileStateDiscoverSuccess(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "brand-new")
 
 	b := &fakeBuilder{}
-	r, reg, st := newStateReconciler(t, root, b, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, nil, nil)
 
 	r.reconcileFunction("brand-new")
 
@@ -74,7 +47,7 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 
 	fn := initialFn("flaky", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change so a rebuild is attempted, then make it fail.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -119,7 +92,7 @@ func TestReconcileStateUnchangedDoesNotRecordOutcome(t *testing.T) {
 
 	fn := initialFn("stable", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	r.reconcileFunction("stable") // unchanged -> skip
 
@@ -142,7 +115,7 @@ func TestReconcileStateRemoved(t *testing.T) {
 
 	fn := initialFn("tobe-removed", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("removeall: %v", err)
@@ -186,19 +159,11 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 	// Build the reconciler with the production-style RemoveFunction hook: delete
 	// the function's metrics series, then retire its images (a no-op with the
 	// fake builder). The runner registry and state wiring mirror production.
-	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{victim, bystander})
-	r := New(Config{
-		Root:     root,
-		Debounce: 10 * time.Millisecond,
-		Interval: time.Hour,
-		RemoveFunction: func(name string) {
+	r, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{victim, bystander}, func(cfg *Config) {
+		cfg.RemoveFunction = func(name string) {
 			m.RemoveFunction(name)
-		},
-	}, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range []*runner.PreparedFunction{victim, bystander} {
-		r.Seed(pf.Function())
-	}
+		}
+	})
 
 	if err := os.RemoveAll(victimDir); err != nil {
 		t.Fatalf("remove victim: %v", err)
@@ -247,7 +212,7 @@ func TestReconcileStateNoWriteOnInvalidTemplate(t *testing.T) {
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
@@ -275,7 +240,7 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 	victim := initialFn("victim", victimDir)
 	bystander := initialFn("bystander", bystanderDir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{victim, bystander})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{victim, bystander}, nil)
 
 	// Simulate prior activity: per-function counters for both and a cumulative
 	// global row.
@@ -352,7 +317,7 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 
 	fn := initialFn("flaky", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change content so a rebuild is attempted, then seed an active version and
 	// per-function stats, as production would after activity.
@@ -406,7 +371,7 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, _, st := newStateReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change content so a rebuild is attempted, then seed an active version and
 	// per-function stats.

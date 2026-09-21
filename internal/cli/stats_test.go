@@ -63,7 +63,7 @@ func TestPrintStats(t *testing.T) {
 	}
 }
 
-// humanAge formats integer seconds as Go durations, with zero rendered as "0s".
+// TestHumanAge pins Go-duration formatting, including zero rendered as "0s".
 func TestHumanAge(t *testing.T) {
 	for _, tc := range []struct {
 		in   int64
@@ -115,7 +115,8 @@ func TestStatsCommand(t *testing.T) {
 		t.Fatalf("stats: err = %v, want nil", err)
 	}
 
-	if _, _, err := runCLIWithDeps(t, deps, "", "stats", "extra"); err == nil || !strings.Contains(err.Error(), "stats: too many arguments") {
+	if _, _, err := runCLIWithDeps(t, deps, "", "stats", "extra"); err == nil ||
+		!strings.Contains(err.Error(), "stats: too many arguments") {
 		t.Fatalf("stats extra: missing rejection error: %v", err)
 	}
 

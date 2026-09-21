@@ -1,7 +1,6 @@
 package state
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -88,16 +87,7 @@ func TestStatsOnEmptyDB(t *testing.T) {
 // functions/handlers tables.
 func TestRebuildFromFSKeepsStats(t *testing.T) {
 	root := t.TempDir()
-	dir := filepath.Join(root, "demo")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return e\n"), 0o644); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
+	writeFunctionsDir(t, root)
 
 	c := openTestState(t)
 	c.RecordStats(Stats{EventsProcessedTotal: 55, PendingEntries: 3})

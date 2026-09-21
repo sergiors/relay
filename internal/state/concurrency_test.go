@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"path/filepath"
@@ -11,28 +10,29 @@ import (
 	"time"
 
 	"relay/internal/function"
+	"relay/internal/testutil"
 )
 
-// captureLogger returns a *State whose logger writes into a bytes.Buffer, so a
-// test can assert that no SQLITE_BUSY / "database is locked" error surfaced
-// during concurrent access. With SetMaxOpenConns(1) the pool serializes all
-// in-process access, so these errors must never appear.
-func captureLogger(t *testing.T) (*State, *bytes.Buffer) {
+// captureLogger returns a *State whose logger writes into a mutex-protected
+// buffer, so a test can assert that no SQLITE_BUSY / "database is locked" error
+// surfaced during concurrent access. With SetMaxOpenConns(1) the pool serializes
+// all in-process access, so these errors must never appear.
+func captureLogger(t *testing.T) (*State, *testutil.SyncBuffer) {
 	t.Helper()
 	c, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
-	var buf bytes.Buffer
-	c.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
-	return c, &buf
+	buf := &testutil.SyncBuffer{}
+	c.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
+	return c, buf
 }
 
 // assertNoBusy fails the test if the captured log contains any SQLite lock/busy
 // error. The driver's error string is typically "database is locked (5)
 // (SQLITE_BUSY)"; we check for both "locked" and "SQLITE_BUSY".
-func assertNoBusy(t *testing.T, buf *bytes.Buffer) {
+func assertNoBusy(t *testing.T, buf *testutil.SyncBuffer) {
 	t.Helper()
 	s := buf.String()
 	if strings.Contains(s, "locked") || strings.Contains(s, "SQLITE_BUSY") {
@@ -207,7 +207,9 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 				return
 			default:
 			}
-			_ = c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 1}, []FunctionStats{{Function: "alpha", EventsProcessedTotal: 1}})
+			_ = c.RecordStatsSnapshot(context.Background(),
+				Stats{EventsProcessedTotal: 1},
+				[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 1}})
 		}
 	}()
 
@@ -243,8 +245,8 @@ func TestReopenUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	var buf bytes.Buffer
-	c1.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	buf := &testutil.SyncBuffer{}
+	c1.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 
 	const n = 40
 	var wg sync.WaitGroup
@@ -272,7 +274,7 @@ func TestReopenUnderConcurrency(t *testing.T) {
 	if s.EventsProcessedTotal < 1 || s.EventsProcessedTotal > n {
 		t.Fatalf("events = %d, want one of the written values 1..%d", s.EventsProcessedTotal, n)
 	}
-	assertNoBusy(t, &buf)
+	assertNoBusy(t, buf)
 }
 
 // TestPersistenceAfterConcurrency is a deterministic correctness check: distinct
@@ -284,8 +286,8 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	var buf bytes.Buffer
-	c1.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	buf := &testutil.SyncBuffer{}
+	c1.SetLogger(slog.New(slog.NewTextHandler(buf, nil)))
 
 	const k = 20
 	var wg sync.WaitGroup
@@ -328,5 +330,5 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 	if !ok || gs.EventsProcessedTotal != 999 {
 		t.Fatalf("global stats = %+v, ok=%v; want events 999", gs, ok)
 	}
-	assertNoBusy(t, &buf)
+	assertNoBusy(t, buf)
 }

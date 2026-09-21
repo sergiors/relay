@@ -54,7 +54,7 @@ func discardCount(reg *metrics.Registry, fn, reason string) int64 {
 // successful acquire duration, and publishes capacity plus the idle gauge.
 func TestPoolMetricsFirstAcquireIsCold(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if got := acquireCount(reg, "fn-a", metrics.RuntimeOutcomeCold); got != 1 {
@@ -82,7 +82,7 @@ func TestPoolMetricsFirstAcquireIsCold(t *testing.T) {
 func TestPoolMetricsReuseIsWarm(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	for i := 0; i < 2; i++ {
-		if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 			t.Fatalf("execute %d: %v", i, err)
 		}
 	}
@@ -106,7 +106,7 @@ func TestPoolMetricsConcurrentCold(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	ff.created = make(chan *fakeContainer, 2)
 	ff.build = func() *fakeContainer {
-		return &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 2)}
+		return newBlockingContainer(2)
 	}
 
 	const max = 2
@@ -143,7 +143,7 @@ func TestPoolMetricsConcurrentCold(t *testing.T) {
 // the wait itself.
 func TestPoolMetricsWaitThenReuseIsWarm(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	c1 := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return c1 }
 
 	firstDone := make(chan error, 1)
@@ -157,13 +157,10 @@ func TestPoolMetricsWaitThenReuseIsWarm(t *testing.T) {
 		secondDone <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
 	}()
 
-	// Give the waiter a moment to reach the capacity wait.
-	deadline := time.Now().Add(time.Second)
-	for reg.CounterLabels(metrics.MetricRuntimeContainerWaits, fnLabels("fn-a")) == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := reg.CounterLabels(metrics.MetricRuntimeContainerWaits, fnLabels("fn-a")); got != 1 {
-		t.Fatalf("waits = %d, want 1", got)
+	// Wait for the waiter to reach the capacity wait (bounded, no fixed soak).
+	waits := func() int64 { return reg.CounterLabels(metrics.MetricRuntimeContainerWaits, fnLabels("fn-a")) }
+	if !pollUntil(nil, time.Second, func() bool { return waits() == 1 }) {
+		t.Fatalf("waits = %d, want 1", waits())
 	}
 
 	close(c1.release)
@@ -203,12 +200,11 @@ func TestPoolMetricsBusyAndStartingGauges(t *testing.T) {
 		t.Fatalf("starting gauge during start = %d, want 1", got)
 	}
 	close(unblock)
-	deadline := time.Now().Add(time.Second)
-	for gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateBusy)) != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	busy := func() int64 {
+		return gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateBusy))
 	}
-	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateBusy)); got != 1 {
-		t.Fatalf("busy gauge after acquire = %d, want 1", got)
+	if !pollUntil(nil, time.Second, func() bool { return busy() == 1 }) {
+		t.Fatalf("busy gauge after acquire = %d, want 1", busy())
 	}
 	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateStarting)); got != 0 {
 		t.Fatalf("starting gauge after acquire = %d, want 0", got)
@@ -221,11 +217,13 @@ func TestPoolMetricsBusyAndStartingGauges(t *testing.T) {
 func TestPoolMetricsStartFailureRollsBackStarting(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	ff.startErr = errors.New("start boom")
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err == nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err == nil {
 		t.Fatal("expected the failed start to surface")
 	}
-	if got := acquireCount(reg, "fn-a", metrics.RuntimeOutcomeCold) + acquireCount(reg, "fn-a", metrics.RuntimeOutcomeWarm); got != 0 {
-		t.Fatalf("acquires after failed start = %d, want 0", got)
+	acquires := acquireCount(reg, "fn-a", metrics.RuntimeOutcomeCold) +
+		acquireCount(reg, "fn-a", metrics.RuntimeOutcomeWarm)
+	if acquires != 0 {
+		t.Fatalf("acquires after failed start = %d, want 0", acquires)
 	}
 	if c, _ := reg.HistogramLabels(metrics.MetricRuntimeContainerAcquireDuration, fnLabels("fn-a")); c != 0 {
 		t.Fatalf("acquire duration observations = %d, want 0", c)
@@ -267,7 +265,7 @@ func TestPoolMetricsPanicRollsBackStarting(t *testing.T) {
 // wait records the wait (contention happened) but no acquire and no duration.
 func TestPoolMetricsCancellationRecordsNoAcquire(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	c1 := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	c1 := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return c1 }
 	firstDone := make(chan struct{})
 	go func() {
@@ -278,7 +276,8 @@ func TestPoolMetricsCancellationRecordsNoAcquire(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
-	if err := cc.execute(ctx, "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil); !errors.Is(err, context.DeadlineExceeded) {
+	err := cc.execute(ctx, "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waiter error = %v, want deadline exceeded", err)
 	}
 	if got := reg.CounterLabels(metrics.MetricRuntimeContainerWaits, fnLabels("fn-a")); got != 1 {
@@ -320,7 +319,7 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 
 	t.Run("image_changed", func(t *testing.T) {
 		cc, ff, reg := newMetricsCache()
-		if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 		cc.invalidateImage("img-1")
@@ -334,7 +333,7 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 		cc, ff, reg := newMetricsCache()
 		cc.idleTimeout = time.Minute
 		cc.now = clk.Now
-		if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 		clk.Advance(2 * time.Minute)
@@ -346,7 +345,7 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 
 	t.Run("shutdown", func(t *testing.T) {
 		cc, ff, reg := newMetricsCache()
-		if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 		cc.close()
@@ -362,7 +361,7 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 
 	t.Run("function_removed", func(t *testing.T) {
 		cc, ff, reg := newMetricsCache()
-		if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
 		cc.removeFunction("fn-a")
@@ -383,7 +382,7 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 // (release after close, remove while idle) increments the counter exactly once.
 func TestPoolMetricsDiscardCountedOnce(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -407,10 +406,10 @@ func TestPoolMetricsDiscardCountedOnce(t *testing.T) {
 // discards never leak into another function's series.
 func TestPoolMetricsIndependentFunctions(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("A: %v", err)
 	}
-	if err := run(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
 		t.Fatalf("B: %v", err)
 	}
 	if got := acquireCount(reg, "fn-a", metrics.RuntimeOutcomeCold); got != 1 {
@@ -437,8 +436,8 @@ func TestPoolMetricsIndependentFunctions(t *testing.T) {
 // TestPoolMetricsNilRegistry pins that a cache with no registry (metrics
 // disabled) works and never panics.
 func TestPoolMetricsNilRegistry(t *testing.T) {
-	cc, ff := mkCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	cc, ff := newTestCache()
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	cc.removeFunction("fn-a")
@@ -462,10 +461,10 @@ func TestPoolMetricsSnapshot(t *testing.T) {
 	m.containers = newContainerCache()
 	m.containers.metrics = reg
 	ff := &fakeFactory{}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("reuse: %v", err)
 	}
 	s, ok := m.PoolSnapshot("fn-a")
@@ -511,7 +510,7 @@ func TestPoolMetricsSelfTerminatedReleaseAttribution(t *testing.T) {
 // idle is counted when acquire reaps it, and not again by a later path.
 func TestPoolMetricsDeadIdleReapCountsOnce(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -523,14 +522,14 @@ func TestPoolMetricsDeadIdleReapCountsOnce(t *testing.T) {
 	c1.mu.Unlock()
 
 	// A later acquire reaps the dead idle container and starts a fresh one.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after death: %v", err)
 	}
 	if got := discardCount(reg, "fn-a", reasonProcessExit); got != 1 {
 		t.Fatalf("process_exit discards = %d, want 1", got)
 	}
 	// A subsequent acquire reuses the fresh container; no further discards.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute reuse: %v", err)
 	}
 	if got := discardCount(reg, "fn-a", reasonProcessExit); got != 1 {
@@ -548,7 +547,7 @@ func TestPoolMetricsDeadIdleReapedByMaintenanceEvenWithoutTimeout(t *testing.T) 
 	cc, ff, reg := newMetricsCache()
 	cc.idleTimeout = 0 // age eviction disabled; dead-idle reaping must still run
 	cc.now = clk.Now
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateIdle)); got != 1 {
@@ -571,7 +570,7 @@ func TestPoolMetricsDeadIdleReapedByMaintenanceEvenWithoutTimeout(t *testing.T) 
 		t.Fatalf("process_exit discards = %d, want 1 (reaped by maintenance)", got)
 	}
 	// The dead container lost its slot: the next acquire starts fresh.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after reap: %v", err)
 	}
 	if got := discardCount(reg, "fn-a", reasonProcessExit); got != 1 {
@@ -588,10 +587,10 @@ func TestPoolMetricsManagerRemoveDeletesSeries(t *testing.T) {
 	m.containers = newContainerCache()
 	m.containers.metrics = reg
 	ff := &fakeFactory{}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed fn-a: %v", err)
 	}
-	if err := run(t, m.containers, ff, "fn-b", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-b", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed fn-b: %v", err)
 	}
 
@@ -634,7 +633,7 @@ func TestPoolMetricsLateReleaseAfterRemovalDoesNotRecreateSeries(t *testing.T) {
 	m.containers.metrics = reg
 	ff := &fakeFactory{}
 
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -687,7 +686,7 @@ func TestPoolMetricsRemoveThenReactivateKeepsFreshSeries(t *testing.T) {
 	ff := &fakeFactory{}
 
 	// Seed a warm fn-a and immediately remove it: its series are deleted.
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	m.RemoveFunction("fn-a")
@@ -698,7 +697,7 @@ func TestPoolMetricsRemoveThenReactivateKeepsFreshSeries(t *testing.T) {
 	// Reactivate and warm again: a fresh pool publishes fresh series.
 	m.containers.activateFunction("fn-a", "img-1")
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 3, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 3, "h"); err != nil {
 		t.Fatalf("reactivated acquire: %v", err)
 	}
 	if got := gauge(reg, metrics.MetricRuntimePoolCapacity, fnLabels("fn-a")); got != 3 {
@@ -720,7 +719,7 @@ func TestPoolMetricsRemoveThenReactivateKeepsFreshSeries(t *testing.T) {
 func TestPoolMetricsSnapshotCountsTransientAsBusy(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	// Seed and invalidate an image so a later request for it is a transient.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	cc.invalidateImage("img-1")
@@ -741,11 +740,13 @@ func TestPoolMetricsSnapshotCountsTransientAsBusy(t *testing.T) {
 		t.Fatalf("snapshot = %+v, want Busy=1 Idle=0 Containers=1 (transient is real+busy)", s)
 	}
 	// The gauges agree with the snapshot's counts: single source, no contradiction.
-	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateBusy)); got != int64(s.Busy) {
-		t.Fatalf("busy gauge = %d, snapshot Busy = %d (must agree)", got, s.Busy)
+	busyGauge := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateBusy))
+	if busyGauge != int64(s.Busy) {
+		t.Fatalf("busy gauge = %d, snapshot Busy = %d (must agree)", busyGauge, s.Busy)
 	}
-	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateIdle)); got != int64(s.Idle) {
-		t.Fatalf("idle gauge = %d, snapshot Idle = %d (must agree)", got, s.Idle)
+	idleGauge := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-a", metrics.RuntimeStateIdle))
+	if idleGauge != int64(s.Idle) {
+		t.Fatalf("idle gauge = %d, snapshot Idle = %d (must agree)", idleGauge, s.Idle)
 	}
 
 	l.release()
@@ -822,7 +823,7 @@ func TestPoolMetricsRaceSafety(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 4; i++ {
-		if err := run(t, cc, ff, "fn-race-a", "img-1", 2, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-race-a", "img-1", 2, "h"); err != nil {
 			t.Fatalf("serial execute: %v", err)
 		}
 	}

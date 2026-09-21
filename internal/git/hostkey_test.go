@@ -21,7 +21,9 @@ import (
 // state). It also returns a synthesized server host key (a distinct ed25519
 // public key) and a TCP remote address so tests can invoke the TOFU callback
 // directly, exactly as the transport would.
-func hostKeyFixture(t *testing.T) (sshDir, khPath string, serverKey ssh.PublicKey, remote net.Addr, cb ssh.HostKeyCallback) {
+func hostKeyFixture(t *testing.T) (
+	sshDir, khPath string, serverKey ssh.PublicKey, remote net.Addr, cb ssh.HostKeyCallback,
+) {
 	t.Helper()
 	sshDir = filepath.Join(t.TempDir(), "ssh")
 	if _, err := GenerateKey(sshDir); err != nil {
@@ -244,7 +246,9 @@ func TestTOFUFirstTrustNotifySurfaced(t *testing.T) {
 	}
 	// Debug log carries host + fingerprint attrs with its own distinct message
 	// (not the writer sentence).
-	if !strings.Contains(logBuf.String(), "host=gitlab.example.com") || !strings.Contains(logBuf.String(), "fingerprint=") || !strings.Contains(logBuf.String(), "TOFU host key trusted") {
+	if !strings.Contains(logBuf.String(), "host=gitlab.example.com") ||
+		!strings.Contains(logBuf.String(), "fingerprint=") ||
+		!strings.Contains(logBuf.String(), "TOFU host key trusted") {
 		t.Fatalf("log = %q, want TOFU-host-key-trusted Debug with host+fingerprint attrs", logBuf.String())
 	}
 	// Neither channel exposes raw key bytes or a private key header.

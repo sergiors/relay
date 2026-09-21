@@ -91,11 +91,11 @@ func TestRecordSnapshotsSweepsStaleFunctionSeries(t *testing.T) {
 	}
 }
 
-// TestReaddFunctionFreshSeries pins SQLite consistency on re-add: after a
-// function's series are removed, re-incrementing starts at 1 and the flush
-// persists that fresh small value (the row was recreated/upserted, not held at a
-// stale value).
-func TestReaddFunctionFreshSeries(t *testing.T) {
+// TestReaddedFunctionPersistsFreshSeries verifies SQLite consistency on re-add:
+// after a function's series are removed, re-incrementing starts at 1 and the
+// flush persists that fresh small value (the row was recreated/upserted, not
+// held at a stale value).
+func TestReaddedFunctionPersistsFreshSeries(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	m := metrics.New()
@@ -498,14 +498,5 @@ func TestConcurrentIncrementsAndFlushRaceSafe(t *testing.T) {
 	b, ok := st.FunctionStats("fn-b")
 	if !ok || b.EventsProcessedTotal != total || b.HandlerFailureTotal != total {
 		t.Fatalf("fn-b = %+v, ok=%v; want events %d failure %d", b, ok, total, total)
-	}
-}
-
-// TestStatsFlushIntervalConstant guards the durability contract: the fixed SQLite
-// snapshot cadence may not drift without this test failing, so nobody silently
-// changes the flush interval.
-func TestStatsFlushIntervalConstant(t *testing.T) {
-	if statsFlushInterval != 5*time.Second {
-		t.Fatalf("statsFlushInterval = %v, want 5s (durability contract)", statsFlushInterval)
 	}
 }

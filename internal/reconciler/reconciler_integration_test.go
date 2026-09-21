@@ -28,30 +28,12 @@ import (
 	"relay/internal/function"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/testutil"
 )
 
 // dockerManagerAdapter wraps a runtime.Manager to satisfy the reconciler's
 // Builder interface (the Manager already has both methods).
 type dockerManagerAdapter struct{ m *runtime.Manager }
-
-// requireDocker fails the test immediately when the Docker Engine API daemon
-// cannot be reached via client.FromEnv (DOCKER_HOST, socket, socket proxy are
-// all respected). Integration tests fundamentally require Docker; missing
-// infrastructure fails rather than skips.
-func requireDocker(t *testing.T) *client.Client {
-	t.Helper()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		t.Fatalf("docker integration test requires a Docker daemon (client: %v)", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := cli.Ping(ctx, client.PingOptions{}); err != nil {
-		t.Fatalf("docker integration test requires a reachable Docker daemon (ping: %v); start one or run `docker compose -f compose.dev.yaml up -d`", err)
-	}
-	t.Cleanup(func() { cli.Close() })
-	return cli
-}
 
 func (a dockerManagerAdapter) Prepare(
 	ctx context.Context,
@@ -90,7 +72,7 @@ func writeNodeFn(t *testing.T, root, name, output string) {
 func runHandlerWith(
 	t *testing.T,
 	m *runtime.Manager,
-	out *bytes.Buffer,
+	out *testutil.SyncBuffer,
 	fn function.Function,
 	hndlr,
 	eventJSON string,
@@ -109,12 +91,18 @@ func runHandlerWith(
 // Docker daemon: discover -> change & rebuild -> broken template retained ->
 // fix -> remove. It mirrors the compose verification from the task.
 func TestReconcilerReloadIntegration(t *testing.T) {
-	requireDocker(t)
+	testutil.RequireDocker(t)
 
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("mkdir root: %v", err)
 	}
+
+	// Derive a unique function name from the test name and a nanosecond stamp so
+	// concurrent runs against one daemon cannot collide on the image repo or the
+	// function directory, and scope cleanup to that prefix; testutil.UniqueName
+	// keeps it within function.ValidName's 63-char cap even for a long test name.
+	name := testutil.UniqueName(t, "recon")
 
 	var buf bytes.Buffer
 	// Relay-operational logger. Container stdout/stderr is NO LONGER routed
@@ -130,15 +118,17 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	defer m.Close()
 
 	// Function-output sink: handler stdout is transport-forwarded here (not to
-	// the logger), so handler-output assertions read from this buffer.
-	outBuf := &bytes.Buffer{}
+	// the logger), so handler-output assertions read from this buffer. It is
+	// written by SetFunctionOutput goroutines, so a mutex-guarded buffer is used
+	// under -race.
+	outBuf := &testutil.SyncBuffer{}
 	outPrev := runtime.SetFunctionOutput(outBuf)
 	defer runtime.SetFunctionOutput(outPrev)
 
-	// Track the relay-fn-example:* images this test builds (v1/v2/v3 via
+	// Track the relay-fn-<name>:* images this test builds (v1/v2/v3 via
 	// fingerprint-tagged refs) so t.Cleanup removes them; the reconciler's
 	// rebuilds leave superseded versions behind. Removal is scoped strictly to
-	// the function name this test creates ("example"), never unrelated images.
+	// the derived name, never unrelated images.
 	cleanupCli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		t.Fatalf("docker client for cleanup: %v", err)
@@ -154,7 +144,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-example:") {
+				if strings.HasPrefix(tag, "relay-fn-"+name+":") {
 					if _, err := cleanupCli.ImageRemove(cleanupCtx, tag, client.ImageRemoveOptions{Force: true}); err != nil {
 						t.Logf("cleanup: remove %s: %v", tag, err)
 					}
@@ -167,7 +157,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	adapter := dockerManagerAdapter{m}
 
 	// a) Discover a brand-new function via reconcile.
-	writeNodeFn(t, root, "example", "hello-v1")
+	writeNodeFn(t, root, name, "hello-v1")
 	reg := &runner.Registry{}
 	reg.Set(nil)
 	r := New(
@@ -180,13 +170,13 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		adapter,
 		logger,
 	)
-	r.reconcileFunction("example")
+	r.reconcileFunction(name)
 
-	if pf := reg.GetByName("example"); pf == nil || pf.Prepared() == nil {
-		t.Fatal("example should be discovered and prepared")
+	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
+		t.Fatal("function should be discovered and prepared")
 	}
 	// Execute the freshly built image for v1.
-	fn := function.Function{Name: "example", Dir: filepath.Join(root, "example"), Template: mustParse(templateWithInsert())}
+	fn := function.Function{Name: name, Dir: filepath.Join(root, name), Template: mustParse(templateWithInsert())}
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v1")) {
 		t.Fatalf("expected v1 output, got: %s", outBuf.String())
@@ -194,24 +184,24 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 
 	// b) Change source; unchanged template. Fingerprint changes -> rebuild.
 	outBuf.Reset()
-	writeNodeFn(t, root, "example", "hello-v2")
-	r.reconcileFunction("example")
+	writeNodeFn(t, root, name, "hello-v2")
+	r.reconcileFunction(name)
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
 		t.Fatalf("expected v2 output after reload, got: %s", outBuf.String())
 	}
-	if pf := reg.GetByName("example"); pf == nil || pf.Prepared() == nil {
-		t.Fatal("example must stay prepared after reload")
+	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
+		t.Fatal("function must stay prepared after reload")
 	}
 
 	// c) Break template -> old version retained, not removed.
 	outBuf.Reset()
-	tmplPath := filepath.Join(root, "example", "template.yaml")
+	tmplPath := filepath.Join(root, name, "template.yaml")
 	if err := os.WriteFile(tmplPath, []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
-	r.reconcileFunction("example")
-	if pf := reg.GetByName("example"); pf == nil || pf.Prepared() == nil {
+	r.reconcileFunction(name)
+	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
 		t.Fatal("broken template must not drop the active version")
 	}
 	// Old image still runs (v2) because the running snapshot is unchanged.
@@ -222,20 +212,20 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 
 	// d) Fix template -> rebuild succeeds.
 	outBuf.Reset()
-	writeNodeFn(t, root, "example", "hello-v3")
-	r.reconcileFunction("example")
+	writeNodeFn(t, root, name, "hello-v3")
+	r.reconcileFunction(name)
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v3")) {
 		t.Fatalf("expected v3 output after fix, got: %s", outBuf.String())
 	}
 
 	// e) Remove dir -> function dropped.
-	if err := os.RemoveAll(filepath.Join(root, "example")); err != nil {
-		t.Fatalf("remove example: %v", err)
+	if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
+		t.Fatalf("remove function dir: %v", err)
 	}
-	r.reconcileFunction("example")
-	if reg.GetByName("example") != nil {
-		t.Fatal("example should be removed from the registry when its dir vanishes")
+	r.reconcileFunction(name)
+	if reg.GetByName(name) != nil {
+		t.Fatal("function should be removed from the registry when its dir vanishes")
 	}
 }
 

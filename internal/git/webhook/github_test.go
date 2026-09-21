@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,13 +18,9 @@ import (
 	"testing"
 	"time"
 
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
-
 	git "relay/internal/git"
 	"relay/internal/secrets"
+	"relay/internal/testutil"
 )
 
 // testSig computes a GitHub X-Hub-Signature-256 value for body under secret.
@@ -498,55 +493,11 @@ func TestBodyOverLimit400(t *testing.T) {
 // --- Concurrency / coalescing tests using the REAL scheduler with an
 // injectable syncFn seam. ---
 
-// makeBareRepo builds a work repo + bare remote (Copied from the git package's
-// fixture pattern; the git test helpers are not exported, so this test keeps its
-// own small copy). It returns the bare clone path.
+// makeBareRepo builds a work repo + bare remote via the shared testutil fixture.
+// It returns the bare clone path.
 func makeBareRepo(t *testing.T) string {
 	t.Helper()
-	work := filepath.Join(t.TempDir(), "work")
-	bare := filepath.Join(t.TempDir(), "remote.git")
-	r, err := gogit.PlainInit(work, false)
-	if err != nil {
-		t.Fatalf("init work: %v", err)
-	}
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(work, "fn"), 0o755); err != nil {
-		t.Fatalf("mkdir fn: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "fn", "template.yaml"), []byte("runtime: node24\n"), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	if _, err := wt.Add("fn/template.yaml"); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	h, err := wt.Commit("initial", &gogit.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()}})
-	if err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	if err := r.Storer.SetReference(plumbing.NewHashReference(plumbing.ReferenceName("refs/heads/main"), h)); err != nil {
-		t.Fatalf("set ref: %v", err)
-	}
-	if _, err := gogit.PlainInit(bare, true); err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
-	b, err := gogit.PlainOpen(bare)
-	if err != nil {
-		t.Fatalf("open bare: %v", err)
-	}
-	orig, err := b.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{work}})
-	if err != nil {
-		orig, err = b.Remote("origin")
-		if err != nil {
-			t.Fatalf("get origin: %v", err)
-		}
-	}
-	if err := orig.Fetch(&gogit.FetchOptions{RefSpecs: []config.RefSpec{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}}); err != nil {
-		t.Fatalf("seed bare: %v", err)
-	}
-	return bare
+	return testutil.NewBareRepo(t)
 }
 
 // makeScheduler builds a real SyncScheduler whose syncFn is injectable,
@@ -567,7 +518,9 @@ func makeScheduler(t *testing.T, syncFn func(context.Context, git.SyncOptions) e
 
 // blockingSync returns a syncFn that blocks on start; the caller closes start to
 // release it. It tracks concurrent entries.
-func blockingSync(t *testing.T, start chan struct{}, concurrent *atomic.Int32, entered chan struct{}) func(context.Context, git.SyncOptions) error {
+func blockingSync(
+	t *testing.T, start chan struct{}, concurrent *atomic.Int32, entered chan struct{},
+) func(context.Context, git.SyncOptions) error {
 	t.Helper()
 	return func(_ context.Context, _ git.SyncOptions) error {
 		c := concurrent.Add(1)

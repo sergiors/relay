@@ -17,8 +17,10 @@ import (
 // lock all live under fresh per-test temp locations. The socket lives under
 // /tmp (not t.TempDir's /var/folders on macOS) to stay inside the ~104-byte
 // Unix socket sun_path limit. It replaces the former package-level path globals
-// (statePath, runtimeSocketPath, startLockPath): no test mutates shared state,
-// so tests are safe under -race and never touch /var/lib/relay or /run/relay.
+// (statePath, runtimeSocketPath, startLockPath) with per-test values, so tests
+// never touch /var/lib/relay or /run/relay. A few unrelated seams (the CLI git
+// dir globals and secretsPath) remain package vars; tests that mutate them
+// restore the previous value via t.Cleanup.
 func testDeps(t *testing.T) Dependencies {
 	t.Helper()
 	dir := t.TempDir()
@@ -56,7 +58,8 @@ func runCLIWithDeps(t *testing.T, deps Dependencies, stdin string, args ...strin
 // runCLIWithLogger runs the command tree with a caller-supplied process logger
 // so tests can assert whether any messages reach slog versus the command writer.
 // The writer/reader/error streams are the usual test buffers.
-func runCLIWithLogger(t *testing.T, logger *slog.Logger, stdin string, args ...string) (stdout, stderr string, err error) {
+func runCLIWithLogger(t *testing.T, logger *slog.Logger, stdin string, args ...string) (
+	stdout, stderr string, err error) {
 	t.Helper()
 	return runCLIWithLoggerAndDeps(t, logger, testDeps(t), stdin, args...)
 }
@@ -65,7 +68,8 @@ func runCLIWithLogger(t *testing.T, logger *slog.Logger, stdin string, args ...s
 // variants: it builds the tree with New (the injected logger, an output buffer,
 // and the supplied deps) and runs it against args. Errors flow into the returned
 // error, never onto the ErrWriter (printing happens in cmd/main.go).
-func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencies, stdin string, args ...string) (stdout, stderr string, err error) {
+func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencies, stdin string, args ...string) (
+	stdout, stderr string, err error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	cmd := New(logger, &out, deps)
@@ -77,12 +81,13 @@ func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencie
 	return out.String(), errOut.String(), err
 }
 
-// Root --help/-h prints the root help to stdout and exits 0, listing every
-// command. This literally follows the user-required pattern: build the tree
-// with New (an injected buffer writer and deps), then call cmd.Run directly with
-// a ctx and the args including the program name — no global stdout swapping or
-// subprocess.
+// Root --help/-h renders the COMMANDS block listing every documented command
+// and the global help option, to stdout, exiting 0. This follows the
+// user-required pattern: build the tree with New (an injected buffer writer and
+// deps), then call cmd.Run directly with a ctx and args including the program
+// name — no global stdout swapping or subprocess.
 func TestRootHelp(t *testing.T) {
+	commands := []string{"start", "function", "secret", "git", "stats", "health"}
 	for _, flag := range []string{"--help", "-h"} {
 		var output bytes.Buffer
 		cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &output, testDeps(t))
@@ -90,17 +95,21 @@ func TestRootHelp(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: err = %v, want nil", flag, err)
 		}
-		for _, want := range []string{
-			"start",
-			"function",
-			"health",
-			"stats",
-			"secret",
-			"git",
-		} {
-			if !strings.Contains(output.String(), want) {
-				t.Fatalf("%s: stdout missing %q:\n%s", flag, want, output.String())
+		out := output.String()
+		// Scope to the COMMANDS block: the root Usage line also contains words
+		// like "function", so an unanchored search would not prove listing.
+		idx := strings.Index(out, "COMMANDS:")
+		if idx < 0 {
+			t.Fatalf("%s: help has no COMMANDS section:\n%s", flag, out)
+		}
+		block := out[idx:]
+		for _, name := range commands {
+			if !strings.Contains(block, name) {
+				t.Fatalf("%s: COMMANDS block missing %q:\n%s", flag, name, out)
 			}
+		}
+		if !strings.Contains(out, "--help, -h") {
+			t.Fatalf("%s: help missing the global --help option:\n%s", flag, out)
 		}
 	}
 }
@@ -265,6 +274,31 @@ func TestStartAlreadyRunning(t *testing.T) {
 	}
 }
 
+// TestStartRuntimeDirCreationFailure verifies a failure to create the runtime
+// directory (its parent is a regular file) surfaces a clear error before the
+// worker startup path runs.
+func TestStartRuntimeDirCreationFailure(t *testing.T) {
+	deps := testDeps(t)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatalf("seed blocker: %v", err)
+	}
+	deps.LockPath = filepath.Join(blocker, "relay.lock")
+
+	called := false
+	orig := startRun
+	startRun = func(l *slog.Logger) error { called = true; return nil }
+	defer func() { startRun = orig }()
+
+	_, _, err := runCLIWithDeps(t, deps, "", "start")
+	if err == nil || !strings.Contains(err.Error(), "cannot create runtime dir") {
+		t.Fatalf("err = %v, want 'cannot create runtime dir'", err)
+	}
+	if called {
+		t.Fatal("start must not delegate to the worker when the runtime dir cannot be created")
+	}
+}
+
 // TestStartReleasesLockAfterRun verifies the deferred release: once a start run
 // returns, the lock is free again for a subsequent run.
 func TestStartReleasesLockAfterRun(t *testing.T) {
@@ -281,7 +315,8 @@ func TestStartReleasesLockAfterRun(t *testing.T) {
 }
 
 // TestNonStartCommandsDoNotAcquireLock pins that administrative commands never
-// touch the start lock: a lock held elsewhere must not affect them.
+// touch the start lock: with the lock held elsewhere, they still succeed and the
+// lock file is not created or modified by them.
 func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 	deps := testDeps(t)
 	held, err := processlock.Acquire(deps.LockPath)
@@ -290,6 +325,13 @@ func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 	}
 	defer held.Close()
 
+	// The lock file exists (created by Acquire) and is held; capture its
+	// identity so the administrative commands can be proven not to recreate it.
+	before, err := os.Stat(deps.LockPath)
+	if err != nil {
+		t.Fatalf("stat held lock: %v", err)
+	}
+
 	// deps.StatePath is a fresh temp DB, so `function ls` never touches
 	// /var/lib/relay (the lock is the only path under test here).
 	if _, _, err := runCLIWithDeps(t, deps, "", "function", "ls"); err != nil {
@@ -297,5 +339,16 @@ func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 	}
 	if _, _, err := runCLI(t, "", "--help"); err != nil {
 		t.Fatalf("--help err = %v, want nil", err)
+	}
+
+	after, err := os.Stat(deps.LockPath)
+	if err != nil {
+		t.Fatalf("stat lock after admin commands: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("administrative commands replaced the lock file; they must not touch it")
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("administrative commands modified the lock file; they must not touch it")
 	}
 }

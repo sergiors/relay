@@ -66,7 +66,9 @@ func TestResolveRefPrefersRemoteBranchOverStaleLocal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worktree: %v", err)
 	}
-	if err := wt.Checkout(&git.CheckoutOptions{Branch: plumbing.ReferenceName("refs/heads/main"), Force: true}); err != nil {
+	if err := wt.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.ReferenceName("refs/heads/main"), Force: true,
+	}); err != nil {
 		t.Fatalf("checkout main: %v", err)
 	}
 	oldHead, _ := r.Head()
@@ -156,7 +158,9 @@ func TestSyncResolvesFreshRemoteBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worktree: %v", err)
 	}
-	if err := wt.Checkout(&git.CheckoutOptions{Branch: plumbing.ReferenceName("refs/heads/main"), Force: true}); err != nil {
+	if err := wt.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.ReferenceName("refs/heads/main"), Force: true,
+	}); err != nil {
 		t.Fatalf("checkout main: %v", err)
 	}
 	writeFile(t, filepath.Join(e.work, "fn", "template.yaml"), "# NEW\nruntime: node24\n")

@@ -2,8 +2,8 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
-
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,15 +155,19 @@ func (*boomErr) Error() string { return "boom" }
 // TestRecordReconcileSuccessAdvancesLastReconcileAt is the regression for the
 // upsert that omitted last_reconcile_at: a success on an EXISTING row (one
 // already seeded by RecordDiscovered) must persist its reconcile timestamp and
-// status. A second, later success must advance the timestamp.
+// status. A second, later success must advance the timestamp. Time is driven by
+// the injected State clock, so no sleep is needed: the first write is stamped at
+// t1 and the second at t1+2s (RFC3339 has 1s resolution).
 func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	c := openTestState(t)
+	clock := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c.nowFn = func() time.Time { return clock }
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 	c.RecordDiscovered(fn) // existing row, empty reconcile fields
 
 	img1, fp1 := "img-v1", "fp-v1"
-	t1 := time.Now()
+	t1 := clock
 	c.RecordReconcileSuccess("fn", img1, fp1, t1, fn)
 
 	d1, ok := c.GetFunction("fn")
@@ -178,10 +182,10 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 		t.Fatalf("first last_reconcile_at not a valid RFC3339 timestamp %q: %v", d1.LastReconcileAt, err)
 	}
 
-	// A second success shortly later (RFC3339 has 1s resolution, so sleep just
-	// over 1s for a deterministic strict increase) must advance the timestamp.
-	time.Sleep(1100 * time.Millisecond)
-	t2 := time.Now()
+	// Advance the injected clock past the RFC3339 second resolution and record a
+	// second success; the persisted timestamp must advance.
+	clock = clock.Add(2 * time.Second)
+	t2 := clock
 	c.RecordReconcileSuccess("fn", img1, fp1, t2, fn)
 
 	d2, ok := c.GetFunction("fn")
@@ -292,16 +296,7 @@ func TestGetFunctionUnknownReturnsFalse(t *testing.T) {
 // loader + fingerprint. A non-empty DB is left untouched.
 func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	root := t.TempDir()
-	dir := filepath.Join(root, "demo")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(twoHandlerTmpl), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return e\n"), 0o644); err != nil {
-		t.Fatalf("write source: %v", err)
-	}
+	writeFunctionsDir(t, root)
 
 	c := openTestState(t)
 	if err := c.RebuildFromFS(root); err != nil {
@@ -507,6 +502,102 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	}
 	if d.Secrets != nil {
 		t.Errorf("secrets = %v, want nil when absent", d.Secrets)
+	}
+}
+
+// TestExecAddColumnToleratesDuplicateColumn pins the tolerance branch of the
+// migration helper deterministically: execAddColumn is invoked for a column that
+// ALREADY exists (the state a concurrent migrator leaves behind), so its ALTER
+// fails with a duplicate-column error and the re-read must turn that into
+// success. A still-missing column is returned as a genuine error.
+//
+// The exercised column (functions.env) belongs to the preserved
+// functions-column migration; the removed stats migrations used to cover this
+// branch, so the helper is pinned through an unrelated surviving column.
+func TestExecAddColumnToleratesDuplicateColumn(t *testing.T) {
+	c := openTestState(t)
+	ctx := context.Background()
+
+	// functions.env already exists (initSchema created it): a duplicate-column
+	// ALTER must be tolerated.
+	if err := c.execAddColumn(ctx, "functions", "env", "TEXT"); err != nil {
+		t.Fatalf("execAddColumn on an existing column = %v; want nil (concurrent-win tolerance)", err)
+	}
+
+	// A genuine failure (a non-existent table) must still be returned: the
+	// re-read cannot find the column, so the error is real, not a lost race.
+	if err := c.execAddColumn(ctx, "no_such_table", "c", "TEXT"); err == nil {
+		t.Fatal("execAddColumn on a missing table must return an error")
+	}
+}
+
+// TestStatsRelationalMetadataColumns pins the schema shape: only the stable
+// metadata columns exist on stats/function_stats (plus data), so no counter is
+// duplicated as a column.
+func TestStatsRelationalMetadataColumns(t *testing.T) {
+	c := openTestState(t)
+	ctx := context.Background()
+
+	statsCols, err := c.tableColumns(ctx, "stats")
+	if err != nil {
+		t.Fatalf("stats columns: %v", err)
+	}
+	for _, want := range []string{"id", "data", "updated_at"} {
+		if !statsCols[want] {
+			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
+		}
+	}
+	if len(statsCols) != 3 {
+		t.Errorf("stats must have exactly id/data/updated_at, got %v", statsCols)
+	}
+
+	fnCols, err := c.tableColumns(ctx, "function_stats")
+	if err != nil {
+		t.Fatalf("function_stats columns: %v", err)
+	}
+	for _, want := range []string{"function_name", "data", "updated_at"} {
+		if !fnCols[want] {
+			t.Errorf("function_stats missing metadata column %q: %v", want, fnCols)
+		}
+	}
+	if len(fnCols) != 3 {
+		t.Errorf("function_stats must have exactly function_name/data/updated_at, got %v", fnCols)
+	}
+}
+
+// TestOldSchemaStatsTablesAreNotMigrated documents the intentional removal of
+// the stats migration helpers: CREATE TABLE IF NOT EXISTS leaves an old
+// explicit-column stats table alone, so a legacy database does not silently gain
+// the data column. This pins the "no stats backcompat" decision.
+func TestOldSchemaStatsTablesAreNotMigrated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("legacy open: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+		CREATE TABLE stats (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			events_processed_total INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT
+		)`); err != nil {
+		t.Fatalf("legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("legacy close: %v", err)
+	}
+
+	c, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c.Close()
+	have, err := c.tableColumns(context.Background(), "stats")
+	if err != nil {
+		t.Fatalf("columns: %v", err)
+	}
+	if have["data"] {
+		t.Fatalf("old stats table must NOT be migrated to add data: %v", have)
 	}
 }
 

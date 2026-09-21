@@ -12,7 +12,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +24,7 @@ import (
 	"relay/internal/runtime"
 	"relay/internal/schedule"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
 
 const scheduleFnName = "courses"
@@ -95,7 +95,7 @@ type scheduleEnv struct {
 // ScheduleRunner.
 func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 	t.Helper()
-	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
 	redisOpts, err := config.RedisOptions(addr)
 	if err != nil {
 		t.Fatalf("redis options: %v", err)
@@ -109,7 +109,7 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 		Stream:          streamName,
 		Group:           prefix + "-group",
 		Consumer:        prefix + "-consumer",
-		Log:             silentLogger(),
+		Log:             testutil.DiscardLogger(),
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 200 * time.Millisecond,
 		Block:           300 * time.Millisecond,
@@ -259,20 +259,13 @@ func (e *scheduleEnv) hasStateKey(msgID string) bool {
 	return err == nil && n == 1
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
 // registerScheduleFn builds a runner with a single schedule function whose
 // handler is scheduleHandler carrying the given retry count.
 func registerScheduleFn(t *testing.T, exec Executor, retries int) *Runner {
 	t.Helper()
 	return NewWithMetrics(
 		[]*PreparedFunction{scheduleFnForHandler(t, scheduleHandler, exec, time.Second, retries)},
-		silentLogger(), nil)
+		testutil.DiscardLogger(), nil)
 }
 
 // scheduleFnForHandler builds a prepared function with a single schedule entry
@@ -316,7 +309,7 @@ func (e *scheduleEnv) eventually(what string, pred func() bool) {
 // redisAvailable returns a live client or skips the test when Redis is down.
 func redisAvailable(t *testing.T) *redis.Client {
 	t.Helper()
-	addr := envOr("REDIS_TEST_ADDR", "localhost:6379")
+	addr := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
 	opts, err := config.RedisOptions(addr)
 	if err != nil {
 		t.Fatalf("redis options: %v", err)
@@ -657,7 +650,7 @@ func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
 	_ = redisAvailable(t)
 	r := NewWithMetrics(
 		[]*PreparedFunction{NewUnavailable(function.Function{Name: scheduleFnName, Template: &function.Template{Runtime: "node24"}})},
-		silentLogger(), nil)
+		testutil.DiscardLogger(), nil)
 	e := newScheduleEnv(t, r)
 	o := scheduleOcc(time.Date(2026, 8, 3, 14, 0, 0, 0, time.UTC))
 	id := e.xadd(o)

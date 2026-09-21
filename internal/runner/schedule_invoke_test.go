@@ -3,68 +3,20 @@ package runner
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"relay/internal/function"
 	"relay/internal/metrics"
-	"relay/internal/runtime"
+	"relay/internal/testutil"
 )
-
-// payloadCaptureExecutor records the handler and event JSON it was invoked
-// with, so a test can assert the schedule payload reached the executor.
-type payloadCaptureExecutor struct {
-	mu      sync.Mutex
-	handler string
-	payload []byte
-}
-
-func (e *payloadCaptureExecutor) Execute(_ context.Context, _ *runtime.Prepared, handler string, eventJSON []byte, _ []string) error {
-	e.mu.Lock()
-	e.handler = handler
-	e.payload = append([]byte(nil), eventJSON...)
-	e.mu.Unlock()
-	return nil
-}
-
-func (e *payloadCaptureExecutor) got() (string, []byte) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.handler, append([]byte(nil), e.payload...)
-}
-
-// schedFn returns a prepared function with an empty rule set but that still
-// carries the runtime/template the InvokeHandler path reads (env/secrets). Its
-// schedule entry carries the given timeout, which is what InvokeHandler now
-// resolves (the template's schedule entry being the single source of truth).
-func schedFn(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration) *PreparedFunction {
-	t.Helper()
-	return NewPrepared(
-		function.Function{
-			Name: name,
-			Template: &function.Template{
-				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: scheduleTimeout, Retries: function.DefaultRetries}},
-				Schedules: []function.Schedule{{
-					Handler:  "index.run",
-					Cron:     "0 3 * * *",
-					Location: time.UTC,
-					Timeout:  scheduleTimeout,
-				}},
-			},
-		},
-		&runtime.Prepared{Name: name, Image: "x"},
-		executor,
-	)
-}
 
 // InvokeHandler executes the handler with the schedule payload on the executor
 // and no invocation state; a successful run records success metrics.
 func TestInvokeHandlerSuccess(t *testing.T) {
-	exec := &payloadCaptureExecutor{}
+	exec := &captureExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", exec, function.DefaultTimeout)}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", exec, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{"source":"relay.schedule"}`))
 	if err != nil {
@@ -104,7 +56,7 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 // A failing invocation records failure metrics and returns the error.
 func TestInvokeHandlerFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", &fixedExecutor{err: true}, function.DefaultTimeout)}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", &countingExecutor{fail: true}, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{}`))
 	if err == nil {
@@ -128,8 +80,8 @@ func TestInvokeHandlerFailure(t *testing.T) {
 
 // Missing or unavailable functions return an error without executing.
 func TestInvokeHandlerMissingFunction(t *testing.T) {
-	exec := &payloadCaptureExecutor{}
-	r := New([]*PreparedFunction{schedFn(t, "present", exec, function.DefaultTimeout)}, silentLogger())
+	exec := &captureExecutor{}
+	r := New([]*PreparedFunction{schedFn(t, "present", exec, function.DefaultTimeout)}, testutil.DiscardLogger())
 
 	err := r.InvokeHandler(context.Background(), "1-0", "ghost", "index.run", []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), `function "ghost" is not available`) {
@@ -140,7 +92,7 @@ func TestInvokeHandlerMissingFunction(t *testing.T) {
 	}
 
 	// Unavailable (nil prepared) function.
-	r = New([]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})}, silentLogger())
+	r = New([]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})}, testutil.DiscardLogger())
 	err = r.InvokeHandler(context.Background(), "1-0", "broken", "index.run", []byte(`{}`))
 	if err == nil || !strings.Contains(err.Error(), `function "broken" is not available`) {
 		t.Fatalf("err = %v, want not-available error for unavailable function", err)
@@ -150,7 +102,7 @@ func TestInvokeHandlerMissingFunction(t *testing.T) {
 // SetMaxHandlerTimeout caps the schedule timeout exactly like a rule timeout:
 // the executor observes a deadline at the cap, not the larger schedule timeout.
 func TestInvokeHandlerTimeoutCap(t *testing.T) {
-	r := New([]*PreparedFunction{schedFn(t, "fn", ctxAwareExecutor{}, time.Hour)}, silentLogger())
+	r := New([]*PreparedFunction{schedFn(t, "fn", ctxAwareExecutor{}, time.Hour)}, testutil.DiscardLogger())
 	r.SetMaxHandlerTimeout(50 * time.Millisecond)
 
 	start := time.Now()
@@ -170,19 +122,19 @@ func TestInvokeHandlerTimeoutCap(t *testing.T) {
 // InvokeHandler resolves template env values and secret references into the
 // per-invocation extra env, like Handle.
 func TestInvokeHandlerSecretResolution(t *testing.T) {
-	exec := &envCaptureExecutor{}
+	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}}
 	pf := fnWithEnv(t, "fn", exec,
 		map[string]string{"API_URL": "https://api.example.com"},
 		map[string]function.SecretRef{"DATABASE_URL": "db-url"})
-	r := New([]*PreparedFunction{pf}, silentLogger())
+	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
 	r.SetSecretProvider(prov)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "index.run", []byte(`{}`))
 	if err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}
-	extra := exec.got()
+	extra := exec.gotEnv()
 	joined := strings.Join(extra, " ")
 	for _, want := range []string{"API_URL=https://api.example.com", "DATABASE_URL=postgres://secret"} {
 		if !strings.Contains(joined, want) {

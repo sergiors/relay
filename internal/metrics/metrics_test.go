@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestNamespacePrefixOnAllMetrics verifies that every metric registered by
@@ -71,12 +69,21 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 			t.Errorf("display/display-name roundtrip broken for %q", name)
 		}
 	}
-	if len(seen) != len(functionMetrics)+14 {
-		t.Errorf("gathered %d families, want %d (14 static + %d function-carrying vecs seeded)", len(seen), len(functionMetrics)+14, len(functionMetrics))
+	// The expected family count is derived from the registry's own registration
+	// tables rather than a hard-coded constant, so adding a collector updates the
+	// expectation automatically. Every static (non-function) collector is one
+	// family; each function-carrying vec contributes one family once seeded.
+	wantFamilies := len(r.counters) + len(r.gauges) + len(functionMetrics)
+	if len(seen) != wantFamilies {
+		t.Errorf("gathered %d families, want %d (%d static counters + %d static gauges + %d function vecs)",
+			len(seen), wantFamilies, len(r.counters), len(r.gauges), len(functionMetrics))
 	}
 }
 
-func TestCounterAccumulation(t *testing.T) {
+// TestCounterAddsAccumulateAcrossIncAndAdd verifies Inc and Add accumulate on the
+// same counter while a distinct counter stays independent, and that the
+// pre-registered zero gauges are still present in the rendered snapshot.
+func TestCounterAddsAccumulateAcrossIncAndAdd(t *testing.T) {
 	r := New()
 	r.Inc(MetricEventsProcessed)
 	r.Inc(MetricEventsProcessed)
@@ -128,7 +135,8 @@ func TestDurationCountSum(t *testing.T) {
 	obs(2 * time.Second)
 	got := r.Snapshot()
 	if !strings.Contains(got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000") {
-		t.Fatalf("snapshot = %q, want it to contain %q", got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000")
+		t.Fatalf("snapshot = %q, want it to contain %q", got,
+			"handler_duration_seconds{function=a,handler=x} count=3 sum=6.000")
 	}
 }
 
@@ -307,7 +315,8 @@ func TestSeedFunctionStatPoolCounters(t *testing.T) {
 	}
 	// A zero-valued pool seed writes no pool counters (the pre-existing
 	// operational counter series are still created by SeedFunctionStat).
-	if b := byFn(r.FunctionStatsSnapshot(), "beta"); b.WarmAcquiresTotal != 0 || b.ColdStartsTotal != 0 || b.DiscardedTotal != 0 {
+	if b := byFn(r.FunctionStatsSnapshot(), "beta"); b.WarmAcquiresTotal != 0 ||
+		b.ColdStartsTotal != 0 || b.DiscardedTotal != 0 {
 		t.Fatalf("zero-valued pool seed must not create pool counters: %+v", b)
 	}
 
@@ -398,18 +407,6 @@ func TestFunctionStatsSnapshotEmptyAndNil(t *testing.T) {
 	var nilR *Registry
 	if got := nilR.FunctionStatsSnapshot(); got != nil {
 		t.Fatalf("nil snapshot = %+v, want nil", got)
-	}
-}
-
-func TestTestutilBacking(t *testing.T) {
-	r := New()
-	r.Inc(MetricEventsReceived)
-	c := testutil.ToFloat64(r.counters[MetricEventsReceived])
-	if c != 1 {
-		t.Fatalf("testutil.ToFloat64 = %v, want 1", c)
-	}
-	if n := testutil.CollectAndCount(r.reg, MetricEventsReceived); n != 1 {
-		t.Fatalf("CollectAndCount = %d, want 1", n)
 	}
 }
 

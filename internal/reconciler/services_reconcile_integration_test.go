@@ -9,6 +9,7 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,11 +25,12 @@ import (
 	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/testutil"
 )
 
 // TestServicesReconcileIntegration reconciles a function's services end to end.
 func TestServicesReconcileIntegration(t *testing.T) {
-	requireDocker(t)
+	testutil.RequireDocker(t)
 
 	root := t.TempDir()
 	var buf strings.Builder
@@ -42,8 +44,12 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// Manager is both the reconcile Builder and the services Docker seam.
 	adapter := dockerManagerAdapter{m}
 
-	// Write a node function dir that declares one service (port 3000).
-	name := "svc-reconcile"
+	// Write a node function dir that declares one service (port 3000). The name
+	// is derived from the test name + a nanosecond stamp so concurrent runs on
+	// one daemon do not collide on function, container, or image names;
+	// testutil.UniqueName keeps it within function.ValidName's 63-char cap even
+	// for a long test name.
+	name := testutil.UniqueName(t, "svc-rec")
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -62,7 +68,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	}
 
 	// Cleanup: stop every service container belonging to this function and remove
-	// every relay-fn-svc-reconcile:* image this test builds.
+	// every relay-fn-<name>:* image this test builds.
 	cleanupCli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		t.Fatalf("cleanup client: %v", err)
@@ -189,11 +195,14 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 // structurally contains ONLY relay service containers, so no unrelated
 // container could ever be touched by this path).
 func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
-	requireDocker(t)
+	testutil.RequireDocker(t)
 
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	w1host, w2host := "relay-it-w1", "relay-it-w2"
+	// Derive per-run worker identities and function names so concurrent runs on
+	// one daemon cannot collide on the hostname-scoped container set.
+	stamp := time.Now().UnixNano()
+	w1host, w2host := fmt.Sprintf("relay-it-w1-%d", stamp), fmt.Sprintf("relay-it-w2-%d", stamp)
 	m1, err := runtime.NewManager(logger, nil, w1host)
 	if err != nil {
 		t.Fatalf("new manager w1: %v", err)
@@ -211,7 +220,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// (the strict relay.type=service filter), so hostname preservation is the
 	// complete scoping assertion; a plain no-label container sub-assertion is
 	// omitted because no relay-labeled start path exists for one.
-	fn1, fn2 := "int-sc-a", "int-sc-b"
+	fn1, fn2 := fmt.Sprintf("int-sc-a-%d", stamp), fmt.Sprintf("int-sc-b-%d", stamp)
 	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
 		Function:   fn1,
 		Entrypoint: "svc.js",
@@ -233,13 +242,20 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		t.Fatalf("start w2 service: %v", err)
 	}
 
-	// Cleanup: stop whatever this test left running on either manager.
+	// Cleanup: stop whatever this test left running on either manager, scoped to
+	// this run's derived function names.
 	t.Cleanup(func() {
 		cc, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		for _, m := range []*runtime.Manager{m1, m2} {
 			if list, err := m.ServiceContainerList(cc); err == nil {
-				_ = m.StopServiceContainers(cc, list)
+				keep := list[:0]
+				for _, c := range list {
+					if c.Function == fn1 || c.Function == fn2 {
+						keep = append(keep, c)
+					}
+				}
+				_ = m.StopServiceContainers(cc, keep)
 			}
 		}
 	})

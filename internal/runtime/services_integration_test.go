@@ -22,6 +22,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
+	"relay/internal/testutil"
 )
 
 // buildServiceHost builds a tiny node24 function directory containing a
@@ -66,7 +67,7 @@ setInterval(() => {}, 1 << 30);
 // point of module (not script) execution. No requirements.txt keeps the build to
 // just the base image.
 func TestIntegrationPythonServiceModuleExecution(t *testing.T) {
-	cli := requireDocker(t)
+	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -139,14 +140,7 @@ keep_alive()
 	}
 
 	// Wait for the container to be running, then assert its entrypoint.
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	waitForContainerRunning(t, ctx, cli, id)
 	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -166,9 +160,9 @@ keep_alive()
 	// fetched log was empty while the container was healthy), so fetch on a
 	// short deadline and require the proof to appear, not merely the container
 	// to be running.
-	deadlineLogs := time.Now().Add(30 * time.Second)
+	const proof = "module-entrypoint-started from-relative-import-ok"
 	var logs string
-	for {
+	if !pollUntil(ctx, 30*time.Second, func() bool {
 		rc, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 		if err != nil {
 			t.Fatalf("logs: %v", err)
@@ -177,18 +171,14 @@ keep_alive()
 		_, _ = io.Copy(&buf, rc)
 		rc.Close()
 		logs = buf.String()
-		if strings.Contains(logs, "module-entrypoint-started from-relative-import-ok") {
-			break
-		}
-		if !time.Now().Before(deadlineLogs) {
-			t.Fatalf("container logs do not show the module-entrypoint + relative-import proof within 30s, got:\n%s", logs)
-		}
-		time.Sleep(200 * time.Millisecond)
+		return strings.Contains(logs, proof)
+	}) {
+		t.Fatalf("container logs do not show the module-entrypoint + relative-import proof within 30s, got:\n%s", logs)
 	}
 }
 
-func TestServiceStartListStop(t *testing.T) {
-	cli := requireDocker(t)
+func TestIntegrationServiceStartListStop(t *testing.T) {
+	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -221,14 +211,13 @@ func TestServiceStartListStop(t *testing.T) {
 	}
 
 	// Both replicas listed and running.
-	deadline := time.Now().Add(15 * time.Second)
 	var ids []string
-	for time.Now().Before(deadline) {
+	if !pollUntil(ctx, 15*time.Second, func() bool {
 		list, err := m.ServiceContainerList(ctx)
 		if err != nil {
 			t.Fatalf("list: %v", err)
 		}
-		ids = nil
+		ids = ids[:0]
 		allRunning := true
 		for _, c := range list {
 			if c.Function == "svc-lifecycle" {
@@ -238,12 +227,8 @@ func TestServiceStartListStop(t *testing.T) {
 				}
 			}
 		}
-		if len(ids) == 2 && allRunning {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if len(ids) != 2 {
+		return len(ids) == 2 && allRunning
+	}) {
 		t.Fatalf("expected 2 running service containers, got %d", len(ids))
 	}
 
@@ -278,29 +263,8 @@ func TestServiceStartListStop(t *testing.T) {
 			t.Errorf("container %s must NOT carry relay.service, got %v", id, insp.Container.Config.Labels)
 		}
 		// Hardening assertions.
-		hc := insp.Container.HostConfig
-		if hc == nil {
-			t.Fatal("nil HostConfig")
-		}
-		if hc.Memory != 128<<20 {
-			t.Errorf("memory = %d, want 128MiB", hc.Memory)
-		}
-		if hc.NanoCPUs != 1_000_000_000 {
-			t.Errorf("nanocpus = %d, want 1", hc.NanoCPUs)
-		}
-		if hc.PidsLimit == nil || *hc.PidsLimit != 128 {
-			t.Errorf("pids limit = %v, want 128", hc.PidsLimit)
-		}
-		if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" {
-			t.Errorf("capdrop = %v, want [ALL]", hc.CapDrop)
-		}
-		if !hc.ReadonlyRootfs {
-			t.Error("expected read-only rootfs")
-		}
-		if len(hc.PortBindings) != 0 {
-			t.Errorf("expected no host port bindings, got %v", hc.PortBindings)
-		}
-		if hc.AutoRemove {
+		assertHardenedHostConfig(t, insp.Container.HostConfig)
+		if insp.Container.HostConfig.AutoRemove {
 			t.Error("service container must NOT be AutoRemove (persistent, reconciler-owned)")
 		}
 		if insp.Container.Config.User != "10001:10001" {
@@ -337,27 +301,16 @@ func TestServiceStartListStop(t *testing.T) {
 	if err := m.StopServiceContainers(ctx, svcList); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	deadline2 := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline2) {
-		l2, _ := m.ServiceContainerList(ctx)
-		remaining := 0
-		for _, c := range l2 {
-			if c.Function == "svc-lifecycle" {
-				remaining++
-			}
-		}
-		if remaining == 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	pollUntil(ctx, 15*time.Second, func() bool {
+		return countServiceContainers(t, ctx, m, "svc-lifecycle") == 0
+	})
 	if remaining := countServiceContainers(t, ctx, m, "svc-lifecycle"); remaining != 0 {
 		t.Errorf("expected 0 service containers after stop, got %d", remaining)
 	}
 }
 
-func TestServiceImageRetirement(t *testing.T) {
-	cli := requireDocker(t)
+func TestIntegrationServiceImageRetirement(t *testing.T) {
+	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -401,14 +354,7 @@ events:
 		t.Fatalf("start v1 replica: %v", err)
 	}
 	// Wait for it to be running.
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		insp, err := cli.ContainerInspect(ctx, svc1, client.ContainerInspectOptions{})
-		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	waitForContainerRunning(t, ctx, cli, svc1)
 
 	// Now create a SECOND fingerprint v2 (touch a file) and build it -> new image.
 	writeFile(t, dir1, "index.js", "export function hi(e){ console.log('v2'); }\n")
@@ -438,14 +384,7 @@ events:
 	if err != nil {
 		t.Fatalf("start v2 replica: %v", err)
 	}
-	deadline2 := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline2) {
-		insp, err := cli.ContainerInspect(ctx, svc2, client.ContainerInspectOptions{})
-		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	waitForContainerRunning(t, ctx, cli, svc2)
 
 	// Retire svc-retire's images. v2 is referenced by the running container -> kept.
 	removed, err := m.RetireServiceImages(ctx, "svc-retire")
@@ -498,7 +437,7 @@ events:
 // A forced remove would have succeeded while the container was up, so this test
 // proves the removal is force-free by construction.
 func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
-	cli := requireDocker(t)
+	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -524,7 +463,7 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	}, 0); err != nil {
 		t.Fatalf("start v1 replica: %v", err)
 	}
-	waitForServiceRunning(t, ctx, m, cli, "svc-wait")
+	waitForServiceRunning(t, ctx, m, "svc-wait")
 
 	// The new method reports the image referenced; RemoveImage refuses.
 	referenced, err := m.ImageReferencedByManagedContainer(ctx, v1Ref)
@@ -545,14 +484,10 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	if c, err := m.ServiceContainerList(ctx); err == nil {
 		_ = m.StopServiceContainers(ctx, c)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
+	pollUntil(ctx, 30*time.Second, func() bool {
 		l, _ := m.ServiceContainerList(ctx)
-		if len(l) == 0 {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+		return len(l) == 0
+	})
 
 	// Now the image is removable and gone.
 	if err := m.RemoveImage(ctx, v1Ref); err != nil {
@@ -565,21 +500,22 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 
 // waitForServiceRunning polls until at least one of fn's service containers is
 // running.
-func waitForServiceRunning(t *testing.T, ctx context.Context, m *Manager, cli *client.Client, fn string) {
+func waitForServiceRunning(t *testing.T, ctx context.Context, m *Manager, fn string) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
+	if !pollUntil(ctx, 30*time.Second, func() bool {
 		list, err := m.ServiceContainerList(ctx)
-		if err == nil {
-			for _, c := range list {
-				if c.Function == fn && c.State == container.StateRunning {
-					return
-				}
+		if err != nil {
+			return false
+		}
+		for _, c := range list {
+			if c.Function == fn && c.State == container.StateRunning {
+				return true
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		return false
+	}) {
+		t.Fatalf("no running service container for %s", fn)
 	}
-	t.Fatalf("no running service container for %s", fn)
 }
 
 // countServiceContainers returns how many service containers belong to fn.
@@ -606,7 +542,7 @@ func countServiceContainers(t *testing.T, ctx context.Context, m *Manager, fn st
 // negative case: starting a service against a NONEXISTENT network fails and
 // leaves no container behind.
 func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
-	cli := requireDocker(t)
+	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -645,14 +581,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		t.Fatalf("start service: %v", err)
 	}
 
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-		if err == nil && insp.Container.State != nil && insp.Container.State.Running {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	waitForContainerRunning(t, ctx, cli, id)
 	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
 	if err != nil {
 		t.Fatalf("inspect: %v", err)
@@ -675,7 +604,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		t.Fatal("inspect: nil NetworkSettings")
 	}
 	if _, ok := insp.Container.NetworkSettings.Networks[networkName]; !ok {
-		t.Fatalf("container is not attached to network %q; networks = %v", networkName, insp.Container.NetworkSettings.Networks)
+		t.Fatalf("container is not attached to network %q; networks = %v",
+			networkName, insp.Container.NetworkSettings.Networks)
 	}
 
 	// Negative: a nonexistent network fails and leaves NO container behind.
@@ -691,12 +621,11 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error starting a service on a nonexistent network")
 	}
-	deadlineNoLeftover := time.Now().Add(15 * time.Second)
 	remaining := countServiceContainers(t, ctx, m, "svc-network")
-	for remaining > 1 && time.Now().Before(deadlineNoLeftover) {
-		time.Sleep(200 * time.Millisecond)
+	pollUntil(ctx, 15*time.Second, func() bool {
 		remaining = countServiceContainers(t, ctx, m, "svc-network")
-	}
+		return remaining <= 1
+	})
 	// The extra replica must not exist: exactly the one happy-path container.
 	if remaining != 1 {
 		t.Fatalf("after a failed create left %d containers for the function; want 1 (the routed one only)", remaining)

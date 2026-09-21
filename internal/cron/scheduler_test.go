@@ -1,10 +1,12 @@
 package cron
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,6 +148,36 @@ func TestReplaceFunctionRegistersJobs(t *testing.T) {
 	s.ReplaceFunction("fn", &function.Template{Runtime: "node24"})
 	if n := s.JobCount(); n != 0 {
 		t.Fatalf("jobs = %d, want 0 (empty template replaces)", n)
+	}
+}
+
+// A malformed cron expression in one schedule logs a Warn and is skipped, while
+// the valid schedules still register. (Templates are validated at parse time, so
+// this is the defensive path.)
+func TestReplaceFunctionSkipsUnregisterableSchedule(t *testing.T) {
+	fp := newFakePublisher(1)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := New(fp, logger)
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Handler: "jobs.good", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Handler: "jobs.bad", Cron: "not a cron", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs = %d, want 1 (invalid schedule skipped, valid one registered)", n)
+	}
+	names := map[string]bool{}
+	for _, j := range s.g.Jobs() {
+		names[j.Name()] = true
+	}
+	if !names["fn/jobs.good#0"] || names["fn/jobs.bad#1"] {
+		t.Fatalf("registered jobs = %v, want only fn/jobs.good#0", names)
+	}
+	if !strings.Contains(logBuf.String(), "register schedule failed") {
+		t.Fatalf("expected a Warn about the unregisterable schedule:\n%s", logBuf.String())
 	}
 }
 

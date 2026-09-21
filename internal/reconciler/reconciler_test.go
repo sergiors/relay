@@ -83,23 +83,6 @@ func mustParse(s string) *function.Template {
 	return t
 }
 
-func newTestReconciler(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction) (*Reconciler, *runner.Registry) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	r := New(Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-	}
-	return r, reg
-}
-
-// Launches just the debounce pump (the consumer of the incoming queue) without
-// the fsnotify watcher, so debounce semantics can be tested deterministically.
-func (r *Reconciler) startDebounceForTest() {
-	go r.pump()
-}
-
 // A dir present on disk but not in the registry is built (Prepare called) and
 // added.
 func TestReconcileNewFunctionDiscovered(t *testing.T) {
@@ -107,7 +90,7 @@ func TestReconcileNewFunctionDiscovered(t *testing.T) {
 	writeFnDir(t, root, "brand-new")
 
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, nil)
+	r, reg := newTestReconciler(t, root, b, nil, nil)
 
 	r.reconcileFunction("brand-new")
 
@@ -126,7 +109,7 @@ func TestReconcileUnchangedFingerprintSkipped(t *testing.T) {
 
 	fn := initialFn("stable", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	r.reconcileFunction("stable")
 
@@ -145,7 +128,7 @@ func TestReconcileChangedFunctionRebuilt(t *testing.T) {
 
 	fn := initialFn("changing", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change source content.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -169,7 +152,7 @@ func TestReconcileInvalidTemplateKeepsOld(t *testing.T) {
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Break the template.
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
@@ -194,7 +177,7 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 
 	fn := initialFn("tobe-removed", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Remove the whole directory -> function dropped.
 	if err := os.RemoveAll(dir); err != nil {
@@ -232,7 +215,7 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 
 	fn := initialFn("flaky", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn})
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change content so a rebuild is warranted, then make it fail.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -289,4 +272,96 @@ func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
 	if pf := reg.GetByName("recover"); pf == nil || pf.Prepared() == nil {
 		t.Fatal("recover should be prepared after successful reconcile")
 	}
+}
+
+// TestReconcileAllDiscoversAndRemoves verifies the periodic backstop:
+// reconcileAll reconciles every on-disk function AND every registered function
+// whose directory vanished (removal). It drives the real single pump so the
+// semantics match production.
+func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
+	root := t.TempDir()
+	// One live dir on disk + one registered function whose dir is gone.
+	liveDir := writeFnDir(t, root, "live")
+	goneDir := writeFnDir(t, root, "gone")
+
+	live := initialFn("live", liveDir)
+	gone := initialFn("gone", goneDir)
+	b := &fakeBuilder{}
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{live, gone}, nil)
+
+	// Remove "gone" only from disk; the registry still knows it.
+	if err := os.RemoveAll(goneDir); err != nil {
+		t.Fatalf("removeall gone: %v", err)
+	}
+	// Delete "live" content so the fingerprint changes and it must be rebuilt.
+	if err := os.WriteFile(filepath.Join(liveDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+
+	go r.pump()
+	r.reconcileAll()
+
+	waitForPrepare(t, b, 1)
+	if pf := reg.GetByName("live"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("live should remain registered and prepared")
+	}
+	if reg.GetByName("gone") != nil {
+		t.Fatal("gone (dir vanished) should have been removed by reconcileAll")
+	}
+}
+
+// waitForPrepare polls until the builder has recorded want prepare calls.
+func waitForPrepare(t *testing.T, b *fakeBuilder, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.prepares() >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("prepare calls = %d, want >= %d", b.prepares(), want)
+}
+
+// TestReconcileSameImageRetireSkipped verifies the Retire hook does not fire
+// when the rebuilt image reference equals the old one (a same-image
+// re-prepare, or an unavailable->available retry with a stable fingerprint):
+// there is nothing superseded to retire.
+func TestReconcileSameImageRetireSkipped(t *testing.T) {
+	root := t.TempDir()
+	dir := writeFnDir(t, root, "same")
+
+	fn := runner.NewPrepared(
+		function.Function{Name: "same", Dir: dir, Template: mustParse(template)},
+		&runtime.Prepared{Name: "same", Image: "img-same"},
+		&fixedImageBuilder{image: "img-same"},
+	)
+	var retires int
+	r, reg := newTestReconciler(t, root, &fixedImageBuilder{image: "img-same"}, []*runner.PreparedFunction{fn},
+		func(cfg *Config) { cfg.Retire = func(string, string) { retires++ } })
+
+	// Change content so a rebuild is warranted; the builder returns the SAME
+	// image, so the retire must be skipped.
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	r.reconcileFunction("same")
+
+	if retires != 0 {
+		t.Fatalf("retire calls = %d, want 0 (same image is never retired)", retires)
+	}
+	if pf := reg.GetByName("same"); pf == nil || pf.Prepared() == nil || pf.Prepared().Image != "img-same" {
+		t.Fatalf("registry should serve the same image, got %+v", reg.GetByName("same"))
+	}
+}
+
+// fixedImageBuilder always returns the same image reference.
+type fixedImageBuilder struct{ image string }
+
+func (b *fixedImageBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
+	return &runtime.Prepared{Name: fn.Name, Image: b.image}, nil
+}
+
+func (b *fixedImageBuilder) Execute(context.Context, *runtime.Prepared, string, []byte, []string) error {
+	return nil
 }

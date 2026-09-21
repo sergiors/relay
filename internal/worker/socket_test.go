@@ -8,7 +8,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"relay/internal/processlock"
 	"relay/internal/runtime"
@@ -155,6 +157,63 @@ func TestRuntimeSocketMalformedRequest(t *testing.T) {
 		if resp.RuntimeState != nil {
 			t.Fatalf("line %q: malformed request must not carry state", line)
 		}
+	}
+}
+
+// TestRuntimeSocketSilentClientHitsDeadline verifies a client that connects but
+// never sends a request cannot hold a handler open: the server's connection
+// deadline expires, the handler returns without answering, and the connection is
+// closed (the client's read sees EOF).
+func TestRuntimeSocketSilentClientHitsDeadline(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send nothing. The server should close the connection on its request
+	// deadline; a read must then fail/EOF rather than block forever.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * runtimeStateRequestTimeout))
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("silent client read %d bytes (%q), want the server to close without answering", n, buf[:n])
+	}
+}
+
+// TestRuntimeSocketOversizeRequestRejected verifies a request larger than the
+// 64KiB cap is rejected as malformed rather than buffered unboundedly: the
+// server reads exactly the cap, finds no complete valid frame, and answers with
+// a malformed_request error.
+func TestRuntimeSocketOversizeRequestRejected(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * runtimeStateRequestTimeout))
+
+	// Write from a goroutine and ignore write errors: the server may close the
+	// connection after answering the truncated frame while we are still writing.
+	go func() {
+		_, _ = io.WriteString(conn, strings.Repeat("x", runtimeStateMaxRequest+4096))
+	}()
+
+	var resp socketResponse
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Error != errCodeMalformedRequest {
+		t.Fatalf("oversize request error = %q, want %q", resp.Error, errCodeMalformedRequest)
+	}
+	if resp.RuntimeState != nil {
+		t.Fatalf("oversize request must not carry state")
 	}
 }
 

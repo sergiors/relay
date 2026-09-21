@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 
 	git "relay/internal/git"
 	"relay/internal/secrets"
+	"relay/internal/testutil"
 )
 
 // testHandler is a trivial GitHubProvider that responds to routing/lifecycle
@@ -146,13 +146,7 @@ func TestNewServerRejectsInvalidProviderName(t *testing.T) {
 // TestServerLifecycleStartServeStop verifies Start binds synchronously, serves
 // the handler in the background, and Stop drains it gracefully.
 func TestServerLifecycleStartServeStop(t *testing.T) {
-	// Free-port probe-listen pattern (mirrors the metrics server tests).
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
+	addr := testutil.FreeAddr(t)
 
 	h := testHandler()
 	srv := newServer(addr, slog.New(slog.NewTextHandler(io.Discard, nil)), h)
@@ -187,14 +181,7 @@ func TestServerLifecycleStartServeStop(t *testing.T) {
 
 // TestServerStartTwiceFails verifies Start may be called exactly once.
 func TestServerStartTwiceFails(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
-	srv := newServer(addr, nil, testHandler())
+	srv := newServer(testutil.FreeAddr(t), nil, testHandler())
 	if err := srv.Start(); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
@@ -247,17 +234,33 @@ func testLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})), buf
 }
 
-// freeAddr probe-listens for a free port and returns the address after closing
-// the listener (mirrors the metrics server test pattern).
-func freeAddr(t *testing.T) string {
-	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("probe listen: %v", err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-	return addr
+// TestReadBodyAtSizeBoundary pins the exact maxBodyBytes boundary: a body of
+// exactly maxBodyBytes reads successfully, while one byte more is rejected with
+// 400 (http.MaxBytesReader's limit is inclusive of the cap).
+func TestReadBodyAtSizeBoundary(t *testing.T) {
+	t.Run("exactly maxBodyBytes allowed", func(t *testing.T) {
+		body := bytes.Repeat([]byte("x"), maxBodyBytes)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/github", bytes.NewReader(body))
+		got, ok := readBody(nil, rec, req)
+		if !ok {
+			t.Fatalf("readBody at exactly maxBodyBytes returned ok=false (status %d)", rec.Code)
+		}
+		if len(got) != maxBodyBytes {
+			t.Fatalf("readBody returned %d bytes, want %d", len(got), maxBodyBytes)
+		}
+	})
+	t.Run("one byte over rejected", func(t *testing.T) {
+		body := bytes.Repeat([]byte("x"), maxBodyBytes+1)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/github", bytes.NewReader(body))
+		if _, ok := readBody(nil, rec, req); ok {
+			t.Fatal("readBody over maxBodyBytes returned ok=true, want rejection")
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("over-limit readBody status = %d, want 400", rec.Code)
+		}
+	})
 }
 
 // subsystemConfig builds a Config with temp dirs and a real LocalProvider holding
@@ -367,7 +370,7 @@ func TestNewDisabledWithoutWebhookSecret(t *testing.T) {
 // without signature verification.
 func TestServerAssemblesAndServesUnsignedGitHub(t *testing.T) {
 	logger, _ := testLogger()
-	s := NewServer(freeAddr(t), logger, subsystemConfigNoSecret(t))
+	s := NewServer(testutil.FreeAddr(t), logger, subsystemConfigNoSecret(t))
 	if s == nil {
 		t.Fatal("NewServer returned nil for an enabled server")
 	}
@@ -424,7 +427,7 @@ func TestNewDisabledWithoutSecretResolver(t *testing.T) {
 // value.
 func TestServerAssemblesAndServesGitHub(t *testing.T) {
 	logger, logBuf := testLogger()
-	s := NewServer(freeAddr(t), logger, subsystemConfig(t))
+	s := NewServer(testutil.FreeAddr(t), logger, subsystemConfig(t))
 	if s == nil {
 		t.Fatal("NewServer returned nil for an enabled server")
 	}

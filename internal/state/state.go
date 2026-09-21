@@ -99,6 +99,12 @@ type Service struct {
 type State struct {
 	db  *sql.DB
 	log *slog.Logger
+	// nowFn is an injectable clock used to stamp updated_at/reconcile
+	// timestamps. Production leaves it nil and falls back to the package now()
+	// (time.Now UTC RFC3339), preserving behavior exactly; tests inject a fake
+	// to advance time deterministically without sleeping. Tests must set it
+	// before any writes, so every stamped row uses the fake clock.
+	nowFn func() time.Time
 }
 
 // fallbackLogger is the package-level default logger used when a State is
@@ -416,8 +422,20 @@ func (c *State) migrateServicesHandlerToEntrypoint(ctx context.Context) error {
 	return tx.Commit()
 }
 
-// now returns the current UTC time in RFC3339.
+// now returns the current UTC time in RFC3339. It is the package-level default
+// clock; State.nowString prefers the injectable clock when one is set.
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// nowString returns the current time as an RFC3339 UTC string, using the
+// injectable clock when set and the package default otherwise. It is the single
+// timestamp source for every State write, so an injected clock (tests) governs
+// every updated_at/last_reconcile_at consistently.
+func (c *State) nowString() string {
+	if c.nowFn != nil {
+		return c.nowFn().UTC().Format(time.RFC3339)
+	}
+	return now()
+}
 
 // rebuildTx runs fn inside a transaction, which the rebuild path uses so a
 // partial scan never leaves a half-populated state database.
@@ -483,7 +501,7 @@ func (c *State) RebuildFromFS(dir string) error {
 
 	return c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, p := range prepared {
-			ts := now()
+			ts := c.nowString()
 			env, secrets := serializeMappings(p.fn.Template)
 			if err := insertStmt(tx)(
 				p.fn.Name, p.fn.Template.Runtime, StatusPending, "", p.fp,
@@ -511,7 +529,7 @@ func (c *State) RebuildFromFS(dir string) error {
 // upsert keyed by name.
 func (c *State) RecordDiscovered(fn function.Function) {
 	ctx := context.Background()
-	ts := now()
+	ts := c.nowString()
 	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
 	// external I/O (filesystem reads), so the closure only writes. Fingerprint
 	// errors are logged and fall back to fp="" exactly as before.
@@ -546,7 +564,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 // a previously-discovered row records its own outcome and timestamp.
 func (c *State) RecordReconcileSuccess(name, image, fingerprint string, preparedAt time.Time, fn function.Function) {
 	ctx := context.Background()
-	ts := now()
+	ts := c.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		env, secrets := serializeMappings(fn.Template)
@@ -578,7 +596,7 @@ func (c *State) RecordReconcileSuccess(name, image, fingerprint string, prepared
 // marked unavailable because of a failed rebuild.
 func (c *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
-	ts := now()
+	ts := c.nowString()
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`UPDATE functions

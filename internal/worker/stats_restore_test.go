@@ -2,15 +2,158 @@ package worker
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/state"
 )
+
+// seedCorruptRow writes a syntactically invalid JSON payload directly into a
+// state DB column, bypassing the state package's marshalling. It is used to pin
+// the startup restore path's tolerance of a corrupt persisted payload. The DB
+// is first created through state.Open so the schema exists; the raw connection
+// then overwrites the target row and closes.
+func seedCorruptRow(t *testing.T, path, table, keyCol, key, data string) {
+	t.Helper()
+	st, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("prime state: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("prime close: %v", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO `+table+` (`+keyCol+`, data, updated_at) VALUES (?, ?, ?)`,
+		key, data, "2020-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("seed corrupt %s row: %v", table, err)
+	}
+}
+
+// TestRestoreToleratesCorruptGlobalJSON verifies the startup restore path does
+// not panic or seed garbage when the persisted global payload is invalid: the
+// fresh registry simply stays at zero (the state reader logs the decode error
+// and reports the row unreadable).
+func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	seedCorruptRow(t, path, "stats", "id", "1", `{not-json`)
+
+	st, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	m := metrics.New()
+	restorePersistedStats(m, st) // must not panic
+
+	if got := m.Counter(metrics.MetricEventsProcessed); got != 0 {
+		t.Fatalf("events seeded from corrupt payload = %d, want 0", got)
+	}
+}
+
+// TestRestoreToleratesCorruptFunctionJSON verifies the per-function counterpart:
+// a corrupt function_stats payload is skipped by the restore sweep without
+// panicking, and it seeds no series.
+func TestRestoreToleratesCorruptFunctionJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	// Seed a functional row through the public API first, then corrupt it.
+	seed, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	seed.RecordDiscovered(stateFunction("broken", t.TempDir()))
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	seedCorruptRow(t, path, "function_stats", "function_name", "broken", `{not-json`)
+
+	st, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	m := metrics.New()
+	restorePersistedStats(m, st) // must not panic
+
+	// The corrupt row surfaces no series.
+	if fs := m.FunctionStatsSnapshot(); len(fs) != 0 {
+		t.Fatalf("corrupt function payload must seed no series: %+v", fs)
+	}
+}
+
+// TestWorkerFlushReopenRestoreRoundTrip is the worker-path end-to-end for the
+// JSON storage format: flush a registry snapshot into a DB, close it, reopen and
+// restore into a fresh registry, then flush again — the totals must be
+// preserved (never reset) and the pool counters/timestamps must round-trip.
+func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+
+	c1, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	c1.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+
+	exec := time.Now().Add(-time.Minute).UTC()
+	m1 := metrics.New()
+	m1.Add(metrics.MetricEventsProcessed, 100)
+	m1.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m1.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
+	m1.SetFunctionTimestamp("alpha", metrics.FunctionTimestampExecution, exec.Unix())
+	recordSnapshots(context.Background(), c1, m1)
+	if err := c1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopen (restart) and restore into a fresh registry.
+	c2, err := state.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.Close()
+
+	m2 := metrics.New()
+	restorePersistedStats(m2, c2)
+	if got := m2.Counter(metrics.MetricEventsProcessed); got != 100 {
+		t.Fatalf("restored global events = %d, want 100", got)
+	}
+	a := byFunction(m2.FunctionStatsSnapshot(), "alpha")
+	if a.Events != 1 || a.WarmAcquiresTotal != 7 {
+		t.Fatalf("restored alpha = %+v, want events 1 warm 7", a)
+	}
+	if a.LastExecution != exec.Unix() {
+		t.Fatalf("restored execution = %d, want %d", a.LastExecution, exec.Unix())
+	}
+
+	// The first post-restart flush must write the same totals back.
+	recordSnapshots(context.Background(), c2, m2)
+	gs, ok := c2.Stats()
+	if !ok || gs.EventsProcessedTotal != 100 {
+		t.Fatalf("global after restart flush = %+v, ok=%v; want events 100", gs, ok)
+	}
+	fa, ok := c2.FunctionStats("alpha")
+	if !ok || fa.EventsProcessedTotal != 1 || fa.WarmAcquiresTotal != 7 {
+		t.Fatalf("alpha after restart flush = %+v, ok=%v", fa, ok)
+	}
+	if fa.LastExecutionAt != exec.Format(time.RFC3339) {
+		t.Fatalf("alpha execution after restart flush = %q, want %q", fa.LastExecutionAt, exec.Format(time.RFC3339))
+	}
+}
 
 // openTempState opens a state DB at a fresh temp-dir path and registers a
 // cleanup that closes it. It mirrors openTestState in internal/state but lives
@@ -23,6 +166,91 @@ func openTempState(t *testing.T) *state.State {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// TestSnapshotStatsMapping pins the registry-to-state row mapping: counter names
+// feed the columns directly (retries_total → RetryTotal) and the float gauges
+// are truncated to int64.
+func TestSnapshotStatsMapping(t *testing.T) {
+	m := metrics.New()
+	m.Add(metrics.MetricEventsProcessed, 10)
+	m.Add(metrics.MetricHandlerSuccess, 7)
+	m.Add(metrics.MetricHandlerFailure, 3)
+	m.Add(metrics.MetricRetries, 2)
+	m.Add(metrics.MetricDLQEntries, 1)
+	m.SetGauge(metrics.MetricPendingEntries, 4.9)
+	m.SetGauge(metrics.MetricPendingOldestAge, 12.7)
+
+	got := snapshotStats(m)
+	want := state.Stats{
+		EventsProcessedTotal:    10,
+		HandlerSuccessTotal:     7,
+		HandlerFailureTotal:     3,
+		RetryTotal:              2, // registry retries_total → stats RetryTotal
+		DLQTotal:                1,
+		PendingEntries:          4, // float gauge truncated to int64
+		OldestPendingAgeSeconds: 12,
+	}
+	if got != want {
+		t.Fatalf("snapshotStats = %+v, want %+v", got, want)
+	}
+}
+
+// TestSnapshotStatsNilRegistry pins the nil-safety contract of the global mapper.
+func TestSnapshotStatsNilRegistry(t *testing.T) {
+	got := snapshotStats(nil)
+	if got != (state.Stats{}) {
+		t.Fatalf("snapshotStats(nil) = %+v, want zero Stats", got)
+	}
+}
+
+// TestFuncSnapshotStatsMapping pins the per-function registry-to-state row
+// mapping, indexed by function name.
+func TestFuncSnapshotStatsMapping(t *testing.T) {
+	m := metrics.New()
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionDLQ, []metrics.Label{{Name: "function", Value: "b"}})
+
+	got := snapshotFunctionStats(m)
+	byName := map[string]state.FunctionStats{}
+	for _, fs := range got {
+		byName[fs.Function] = fs
+	}
+	if len(byName) != 2 {
+		t.Fatalf("len = %d, want 2: %+v", len(byName), got)
+	}
+	if a := byName["a"]; a.EventsProcessedTotal != 2 || a.HandlerSuccessTotal != 1 {
+		t.Fatalf("function a = %+v", a)
+	}
+	if b := byName["b"]; b.HandlerFailureTotal != 1 || b.RetryTotal != 1 || b.DLQTotal != 1 {
+		t.Fatalf("function b = %+v", b)
+	}
+}
+
+// TestFuncSnapshotStatsNilRegistry pins the nil-safety contract of the
+// per-function mapper.
+func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
+	if got := snapshotFunctionStats(nil); got != nil {
+		t.Fatalf("snapshotFunctionStats(nil) = %+v, want nil", got)
+	}
+}
+
+// TestSnapshotStatsIgnoresLabeledCounters guards against the unlabeled getters
+// accidentally reading labeled-only metrics (which would double-count).
+func TestSnapshotStatsIgnoresLabeledCounters(t *testing.T) {
+	m := metrics.New()
+	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "a"}, {Name: "handler", Value: "x"}})
+	got := snapshotStats(m)
+	if got.HandlerSuccessTotal != 0 {
+		t.Fatalf("HandlerSuccessTotal = %d, want 0 (labeled only)", got.HandlerSuccessTotal)
+	}
+	if !strings.Contains(m.Snapshot(), "handler_invocations_total{function=a,handler=x,outcome=success} count=1") {
+		t.Fatalf("labeled counter missing from snapshot:\n%s", m.Snapshot())
+	}
 }
 
 // TestRestorePersistedStatsSeedsRegistry verifies that restorePersistedStats
@@ -64,11 +292,13 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 	if len(fs) != 2 {
 		t.Fatalf("FunctionStatsSnapshot len = %d, want 2: %+v", len(fs), fs)
 	}
-	if fs[0].Function != "alpha" || fs[0].Events != 10 || fs[0].HandlerSuccessTotal != 8 {
-		t.Fatalf("alpha = %+v", fs[0])
+	alpha := byFunction(fs, "alpha")
+	if alpha.Events != 10 || alpha.HandlerSuccessTotal != 8 {
+		t.Fatalf("alpha = %+v", alpha)
 	}
-	if fs[1].Function != "beta" || fs[1].Events != 20 || fs[1].RetriesTotal != 3 {
-		t.Fatalf("beta = %+v", fs[1])
+	beta := byFunction(fs, "beta")
+	if beta.Events != 20 || beta.RetriesTotal != 3 {
+		t.Fatalf("beta = %+v", beta)
 	}
 }
 
@@ -131,6 +361,48 @@ func TestFuncSnapshotStatsPoolCountersMapping(t *testing.T) {
 	}
 }
 
+// TestFlushPersistsCountersNotLiveGauges pins the no-live-gauge contract through
+// the worker flush path: live pool gauges set on the registry are never carried
+// into the persisted per-function snapshot, while the cumulative acquire/cold/
+// discard counters are. The typed state.FunctionStats has no gauge fields, so
+// the assertion is that the counters round-trip and the gauges leave no trace in
+// the decoded row.
+func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
+	st := openTempState(t)
+	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+
+	m := metrics.New()
+	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
+	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}}, 3)
+	m.AddLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "reason", Value: "idle_timeout"}}, 2)
+	// Live gauges that must NOT be persisted.
+	m.SetGaugeLabels(metrics.MetricRuntimeContainers, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 4)
+	m.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "function", Value: "alpha"}}, 5)
+
+	recordSnapshots(context.Background(), st, m)
+
+	got, ok := st.FunctionStats("alpha")
+	if !ok {
+		t.Fatal("expected alpha after flush")
+	}
+	if got.WarmAcquiresTotal != 7 || got.ColdStartsTotal != 3 || got.DiscardedTotal != 2 {
+		t.Fatalf("persisted counters = %+v, want warm 7 cold 3 discarded 2", got)
+	}
+	// The decoded row is exactly the typed value: there is no field for a live
+	// gauge, so the gauges cannot have leaked into the persisted payload.
+	if got != (state.FunctionStats{Function: "alpha", WarmAcquiresTotal: 7, ColdStartsTotal: 3, DiscardedTotal: 2, UpdatedAt: got.UpdatedAt}) {
+		t.Fatalf("persisted row carries unexpected fields: %+v", got)
+	}
+
+	// A reopen/restore still sees only the counters.
+	restored := metrics.New()
+	restorePersistedStats(restored, st)
+	a := byFunction(restored.FunctionStatsSnapshot(), "alpha")
+	if a.WarmAcquiresTotal != 7 || a.ColdStartsTotal != 3 || a.DiscardedTotal != 2 {
+		t.Fatalf("restored counters = %+v, want warm 7 cold 3 discarded 2", a)
+	}
+}
+
 // byFunction finds the FunctionStat for name in a snapshot, or a zero value.
 func byFunction(fs []metrics.FunctionStat, name string) metrics.FunctionStat {
 	for _, f := range fs {
@@ -148,86 +420,6 @@ func TestRestorePersistedStatsNilSafe(t *testing.T) {
 	restorePersistedStats(nil, st)            // nil registry
 	restorePersistedStats(metrics.New(), nil) // nil state
 	restorePersistedStats(nil, nil)           // both nil
-}
-
-// TestFirstSnapshotAfterRestorePreservesCounters is the end-to-end regression
-// for the restart bug: a fresh registry seeded from persisted values, then an
-// immediate snapshot, must not zero the persisted counters. This test FAILS on
-// the pre-fix code if restorePersistedStats were removed, because the fresh
-// registry (all zeros) would be snapshotted immediately, wiping the persisted
-// totals.
-func TestFirstSnapshotAfterRestorePreservesCounters(t *testing.T) {
-	st := openTempState(t)
-	// alpha needs a functions row so its function_stats survives the flush's
-	// orphan pruning (a function_stats row with no functions row is pruned).
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
-	st.RecordStats(state.Stats{
-		EventsProcessedTotal: 100,
-		RetryTotal:           5,
-		PendingEntries:       3,
-	})
-	st.RecordFunctionStats(state.FunctionStats{Function: "alpha", EventsProcessedTotal: 10})
-
-	// Simulate a restart: a fresh process-lifetime registry seeded from the
-	// persisted values.
-	m := metrics.New()
-	restorePersistedStats(m, st)
-
-	// Simulate ONE new event after restart.
-	m.Inc(metrics.MetricEventsProcessed)
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
-
-	// The worker's statsLoop snapshots immediately on start.
-	recordSnapshots(context.Background(), st, m)
-
-	gs, ok := st.Stats()
-	if !ok {
-		t.Fatal("expected stats row after snapshot")
-	}
-	if gs.EventsProcessedTotal != 101 {
-		t.Fatalf("events = %d, want 101 (100 persisted + 1 new)", gs.EventsProcessedTotal)
-	}
-	if gs.RetryTotal != 5 {
-		t.Fatalf("retries = %d, want 5 (persisted, unchanged)", gs.RetryTotal)
-	}
-	if gs.HandlerSuccessTotal != 0 || gs.HandlerFailureTotal != 0 || gs.DLQTotal != 0 {
-		t.Fatalf("other counters changed: %+v", gs)
-	}
-
-	fa, ok := st.FunctionStats("alpha")
-	if !ok {
-		t.Fatal("expected alpha function stats after snapshot")
-	}
-	if fa.EventsProcessedTotal != 11 {
-		t.Fatalf("alpha events = %d, want 11 (10 persisted + 1 new)", fa.EventsProcessedTotal)
-	}
-
-	// A second snapshot with no further activity must be idempotent: counters
-	// stay put while the gauge is refreshed.
-	m.SetGauge(metrics.MetricPendingEntries, 9)
-	recordSnapshots(context.Background(), st, m)
-
-	gs, ok = st.Stats()
-	if !ok {
-		t.Fatal("expected stats row after second snapshot")
-	}
-	if gs.EventsProcessedTotal != 101 {
-		t.Fatalf("events after second snapshot = %d, want 101", gs.EventsProcessedTotal)
-	}
-	if gs.RetryTotal != 5 {
-		t.Fatalf("retries after second snapshot = %d, want 5", gs.RetryTotal)
-	}
-	if gs.PendingEntries != 9 {
-		t.Fatalf("pending = %d, want 9 (gauge refreshed)", gs.PendingEntries)
-	}
-
-	fa, ok = st.FunctionStats("alpha")
-	if !ok {
-		t.Fatal("expected alpha function stats after second snapshot")
-	}
-	if fa.EventsProcessedTotal != 11 {
-		t.Fatalf("alpha events after second snapshot = %d, want 11", fa.EventsProcessedTotal)
-	}
 }
 
 // TestStatsLoopFirstSnapshotPreservesPersistedCounters is the true worker-path

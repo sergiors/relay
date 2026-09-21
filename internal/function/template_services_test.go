@@ -93,7 +93,8 @@ services:
 	if len(tmpl.Services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(tmpl.Services))
 	}
-	if tmpl.Services[0].Entrypoint != "api.js" || tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != DefaultServiceReplicas {
+	if tmpl.Services[0].Entrypoint != "api.js" || tmpl.Services[0].Port != 3000 ||
+		tmpl.Services[0].Replicas != DefaultServiceReplicas {
 		t.Fatalf("service 0 = %+v", tmpl.Services[0])
 	}
 	if tmpl.Services[1].Entrypoint != "worker.js" || tmpl.Services[1].Port != 4000 || tmpl.Services[1].Replicas != 3 {

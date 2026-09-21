@@ -5,11 +5,12 @@ import (
 	"testing"
 )
 
-// TestRunLabels verifies that runLabels maps every RunMeta field to the exact
-// diagnostic label keys, that empty values are preserved as empty labels
-// (total, greppable set), and that no unexpected keys are introduced. The label
-// set deliberately contains only bounded identifiers — never payload content.
-func TestRunLabels(t *testing.T) {
+// TestRunMetadataCarriesFunctionImageAndHost verifies that runLabels maps every
+// RunMeta field to the exact diagnostic label keys, that empty values are
+// preserved as empty labels (total, greppable set), and that no unexpected keys
+// are introduced. The label set deliberately contains only bounded identifiers —
+// never payload content.
+func TestRunMetadataCarriesFunctionImageAndHost(t *testing.T) {
 	meta := RunMeta{
 		Type:      ContainerTypeEvent,
 		Function:  "user-events",

@@ -53,7 +53,8 @@ func TestResolveManagerOptionsMaxConcurrency(t *testing.T) {
 		t.Fatalf("explicit maxConcurrency = %d, want 4", got)
 	}
 	for _, bad := range []int{0, -1} {
-		if got := resolveManagerOptions([]ManagerOption{WithMaxConcurrency(bad)}).maxConcurrency; got != DefaultMaxConcurrency {
+		optsBad := []ManagerOption{WithMaxConcurrency(bad)}
+		if got := resolveManagerOptions(optsBad).maxConcurrency; got != DefaultMaxConcurrency {
 			t.Errorf("non-positive maxConcurrency %d resolved to %d, want default %d", bad, got, DefaultMaxConcurrency)
 		}
 	}
@@ -78,7 +79,7 @@ func TestManagerClampedConcurrencyDrivesPoolAndSnapshot(t *testing.T) {
 	if max != 8 {
 		t.Fatalf("effective max = %d, want 8", max)
 	}
-	if err := run(t, m.containers, ff, "fn-cap", "img-1", max, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-cap", "img-1", max, "h"); err != nil {
 		t.Fatalf("execute at capped bound: %v", err)
 	}
 

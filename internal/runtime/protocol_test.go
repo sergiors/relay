@@ -247,3 +247,26 @@ func TestDemuxerStderrForwarding(t *testing.T) {
 		t.Errorf("stderr forwarded = %q, want %q", got, want)
 	}
 }
+
+// TestClampResponseErrorKeepsFramesUnderDemuxerLineCap pins the protocol
+// invariant the clamp exists for: a response frame (sentinel + JSON envelope +
+// error) built from a clamped error always fits under the demuxer's maxPending
+// line cap, so it can never be split as user output mid-frame. It also verifies
+// a short error is passed through unchanged.
+func TestClampResponseErrorKeepsFramesUnderDemuxerLineCap(t *testing.T) {
+	if short := "boom"; clampResponseError(short) != short {
+		t.Errorf("clampResponseError(%q) = %q, want unchanged", short, clampResponseError(short))
+	}
+
+	// A pathological multi-megabyte handler error must be clamped.
+	clamped := clampResponseError(strings.Repeat("x", 1<<20))
+	if len(clamped) != maxResponseError {
+		t.Fatalf("clamped length = %d, want maxResponseError (%d)", len(clamped), maxResponseError)
+	}
+
+	// The whole wire frame built from the clamped error stays under the cap.
+	frame := testResponse("id", false, clamped)
+	if len(frame) >= maxPending {
+		t.Errorf("response frame length %d must stay below maxPending %d", len(frame), maxPending)
+	}
+}

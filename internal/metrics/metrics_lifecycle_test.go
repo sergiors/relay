@@ -188,7 +188,12 @@ func TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries(t *testing.T) {
 	r.RemoveFunction("foo")
 
 	s := r.Snapshot()
-	for _, m := range []string{MetricRuntimeContainers, MetricRuntimeContainerAcquires, MetricRuntimeContainerDiscards, MetricRuntimeContainerWaits} {
+	for _, m := range []string{
+		MetricRuntimeContainers,
+		MetricRuntimeContainerAcquires,
+		MetricRuntimeContainerDiscards,
+		MetricRuntimeContainerWaits,
+	} {
 		if seriesPresent(t, s, m, "foo") {
 			t.Fatalf("foo %s series must be removed:\n%s", m, s)
 		}
@@ -346,7 +351,7 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		r.SweepFunctionMetrics(map[string]bool{"bar": true})
-		if !anyFunctionStat(r, "foo") {
+		if byFn(r.FunctionStatsSnapshot(), "foo").Function == "" {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -354,7 +359,7 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 	// One final sweep removes everything remaining.
 	r.SweepFunctionMetrics(map[string]bool{"bar": true})
 
-	if anyFunctionStat(r, "foo") {
+	if byFn(r.FunctionStatsSnapshot(), "foo").Function != "" {
 		t.Fatalf("foo must be absent from FunctionStatsSnapshot after convergence:\n%+v", r.FunctionStatsSnapshot())
 	}
 	assertNoFunctionSeries(t, r, "foo")
@@ -363,14 +368,4 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 	}
 	// Globals equal their exact seeded totals.
 	assertGlobalTotals(t, r, globals)
-}
-
-// anyFunctionStat reports whether snapshot has a FunctionStat for name.
-func anyFunctionStat(r *Registry, name string) bool {
-	for _, fs := range r.FunctionStatsSnapshot() {
-		if fs.Function == name {
-			return true
-		}
-	}
-	return false
 }

@@ -34,27 +34,6 @@ func (r *retireRecorder) all() []string {
 	return append([]string(nil), r.args...)
 }
 
-// newTestReconcilerRetire is like newTestReconciler but wires the image-lifecycle
-// hooks so reconcile drives retirement.
-func newTestReconcilerRetire(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction, rec *retireRecorder) (*Reconciler, *runner.Registry) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	cfg := Config{
-		Root:     root,
-		Debounce: 10 * time.Millisecond,
-		Interval: time.Hour,
-	}
-	if rec != nil {
-		cfg.Retire = rec.add
-	}
-	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-	}
-	return r, reg
-}
-
 // versionedBuilder returns a distinct image reference for each Prepare call, so
 // a content change produces a genuinely different image to swap and retire.
 type versionedBuilder struct {
@@ -93,7 +72,9 @@ func TestReconcileRetiresOldImageOnSwap(t *testing.T) {
 	)
 
 	rec := &retireRecorder{}
-	r, reg := newTestReconcilerRetire(t, root, b, []*runner.PreparedFunction{fn}, rec)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, func(cfg *Config) {
+		cfg.Retire = rec.add
+	})
 
 	// Change source so the fingerprint changes and a rebuild is warranted.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -130,7 +111,9 @@ func TestReconcileNoRetireOnFailedBuild(t *testing.T) {
 	failb := &fakeBuilder{fail: true}
 
 	rec := &retireRecorder{}
-	r, _ := newTestReconcilerRetire(t, root, failb, []*runner.PreparedFunction{fn}, rec)
+	r, _ := newTestReconciler(t, root, failb, []*runner.PreparedFunction{fn}, func(cfg *Config) {
+		cfg.Retire = rec.add
+	})
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
@@ -200,7 +183,9 @@ func TestReconcileNoRetireOnSkipPath(t *testing.T) {
 		&fakeBuilder{},
 	)
 	rec := &retireRecorder{}
-	r, _ := newTestReconcilerRetire(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, rec)
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, func(cfg *Config) {
+		cfg.Retire = rec.add
+	})
 
 	r.reconcileFunction("stable")
 	if got := rec.all(); len(got) != 0 {
@@ -219,8 +204,8 @@ func TestReconcileRemovalInvokesRemoveFunctionHook(t *testing.T) {
 		&fakeBuilder{},
 	)
 	var calls int
-	r, reg := newTestReconcilerRemoval(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, func(string) {
-		calls++
+	r, reg := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, func(cfg *Config) {
+		cfg.RemoveFunction = func(string) { calls++ }
 	})
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove dir: %v", err)
@@ -232,19 +217,6 @@ func TestReconcileRemovalInvokesRemoveFunctionHook(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("RemoveFunction hook calls = %d, want 1", calls)
 	}
-}
-
-// newTestReconcilerRemoval wires the RemoveFunction hook.
-func newTestReconcilerRemoval(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction, removeFn func(string)) (*Reconciler, *runner.Registry) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, RemoveFunction: removeFn}
-	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-	}
-	return r, reg
 }
 
 // scheduleRecorder records the (name, template-handler-count) pairs a hook is
@@ -266,32 +238,16 @@ func (s *scheduleRecorder) all() []string {
 	return append([]string(nil), s.args...)
 }
 
-// newTestReconcilerSched is like newTestReconciler but wires the
-// UpdateSchedules hook.
-func newTestReconcilerSched(t *testing.T, root string, builder Builder, initial []*runner.PreparedFunction, rec *scheduleRecorder) (*Reconciler, *runner.Registry) {
-	t.Helper()
-	reg := &runner.Registry{}
-	reg.Set(initial)
-	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}
-	if rec != nil {
-		cfg.UpdateSchedules = rec.add
-	}
-	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	for _, pf := range initial {
-		r.Seed(pf.Function())
-	}
-	return r, reg
-}
-
 // On discovery and on update after a swap, the UpdateSchedules hook fires with
 // the function name and its template. It does not fire on the skip path.
 func TestReconcileUpdateSchedulesHookFires(t *testing.T) {
 	root := t.TempDir()
 	rec := &scheduleRecorder{}
+	withSchedules := func(cfg *Config) { cfg.UpdateSchedules = rec.add }
 
 	// Discovery of a brand-new function (not yet in the registry) fires the hook.
 	writeFnDir(t, root, "brand-new")
-	r, _ := newTestReconcilerSched(t, root, &fakeBuilder{}, nil, rec)
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, nil, withSchedules)
 	r.reconcileFunction("brand-new")
 	if got := rec.all(); len(got) != 1 || got[0] != "brand-new=0" {
 		t.Fatalf("UpdateSchedules after discovery = %v, want [brand-new=0]", got)
@@ -315,7 +271,7 @@ func TestReconcileUpdateSchedulesHookFires(t *testing.T) {
 		&runtime.Prepared{Name: "changing", Image: "img-changing-v1"},
 		b,
 	)
-	r2, _ := newTestReconcilerSched(t, root, b, []*runner.PreparedFunction{chgFn}, rec)
+	r2, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{chgFn}, withSchedules)
 	// Change source so an update warrants a rebuild.
 	if err := os.WriteFile(filepath.Join(updateDir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -345,7 +301,9 @@ func TestReconcileUpdateSchedulesHookNotFiredOnRemoval(t *testing.T) {
 		&fakeBuilder{},
 	)
 	rec := &scheduleRecorder{}
-	r, _ := newTestReconcilerSched(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, rec)
+	r, _ := newTestReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{fn}, func(cfg *Config) {
+		cfg.UpdateSchedules = rec.add
+	})
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove dir: %v", err)

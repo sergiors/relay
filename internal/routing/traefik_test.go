@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// traefikKeyPrefixes used in tests.
 const (
 	enableKey     = "traefik.enable"
 	networkKey    = "traefik.docker.network"
@@ -19,7 +18,12 @@ const (
 
 // An unrouted service (empty host) gets NO Traefik labels at all.
 func TestTraefikLabelsUnroutedNil(t *testing.T) {
-	for _, cfg := range []TraefikConfig{{}, {Network: "proxy"}, {Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}} {
+	configs := []TraefikConfig{
+		{},
+		{Network: "proxy"},
+		{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)},
+	}
+	for _, cfg := range configs {
 		labels := TraefikLabels("fn", "app/main.py", "", 8000, cfg)
 		if labels != nil {
 			t.Fatalf("unrouted service labels = %v, want nil", labels)
@@ -227,6 +231,24 @@ func TestServiceProviderIDDeterministicAndSafe(t *testing.T) {
 	}
 	if len(id) > 100 {
 		t.Fatalf("id length %d exceeds the 100-char cap", len(id))
+	}
+}
+
+// TestServiceProviderIDTruncatesOverlong pins the >100-char truncation branch: a
+// long function name plus a long entrypoint produces an id capped at exactly 100
+// characters, and the truncation still yields a Traefik-safe identifier.
+func TestServiceProviderIDTruncatesOverlong(t *testing.T) {
+	longName := strings.Repeat("verylongfunction", 5) // 80 chars
+	longEntry := strings.Repeat("deep/nested/path", 5) + ".py"
+	id := ServiceProviderID(longName, longEntry)
+	if len(id) != 100 {
+		t.Fatalf("overlong id length = %d, want exactly 100 (truncated)", len(id))
+	}
+	if !strings.HasPrefix(id, "relay-") {
+		t.Fatalf("truncated id %q lost the relay- prefix", id)
+	}
+	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(id) {
+		t.Fatalf("truncated id %q is not Traefik-safe", id)
 	}
 }
 

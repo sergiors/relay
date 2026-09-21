@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
 	"relay/internal/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
 
 // concurrencyTrackingExecutor records the peak concurrent executions, so a test
@@ -55,24 +55,6 @@ func (f *concurrencyTrackingExecutor) callCount() int {
 	return f.calls
 }
 
-// fnWithConcurrency builds an always-matching function with the given template
-// concurrency (0 = unparsed/default in the runner).
-func fnWithConcurrency(t *testing.T, name string, concurrency int, executor Executor) *PreparedFunction {
-	t.Helper()
-	return NewPrepared(
-		function.Function{
-			Name: name,
-			Template: &function.Template{
-				Runtime:     "node24",
-				Concurrency: concurrency,
-				Rules:       []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: 0}},
-			},
-		},
-		&runtime.Prepared{Name: name, Image: "x"},
-		executor,
-	)
-}
-
 // runConcurrent fires n concurrent Handles against the runner and waits.
 func runConcurrent(t *testing.T, r *Runner, n int) {
 	t.Helper()
@@ -111,7 +93,7 @@ func runTwo(t *testing.T, r *Runner, n int) {
 // concurrent executions, and all complete.
 func TestRunnerGlobalConcurrencyDefault(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 
 	runConcurrent(t, r, 12)
 
@@ -131,7 +113,7 @@ func TestRunnerGlobalConcurrencyDefault(t *testing.T) {
 // concurrency.
 func TestRunnerGlobalConcurrencyExplicit(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(2)
 
 	runConcurrent(t, r, 12)
@@ -149,7 +131,7 @@ func TestRunnerGlobalConcurrencyExplicit(t *testing.T) {
 // single function never exceed 2 concurrent executions per function.
 func TestRunnerPerFunctionDefault(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 	// Raise the global cap so the per-function limit is the binding one.
 	r.SetMaxConcurrency(16)
 
@@ -167,7 +149,7 @@ func TestRunnerPerFunctionDefault(t *testing.T) {
 // 1 strictly serializes the function's executions.
 func TestRunnerPerFunctionExplicit1(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 30 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	runConcurrent(t, r, 8)
@@ -189,7 +171,7 @@ func TestRunnerGlobalSharedAcrossFunctions(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithConcurrency(t, "a", 8, shared),
 		fnWithConcurrency(t, "b", 8, shared),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(2)
 
 	runTwo(t, r, 12)
@@ -214,7 +196,7 @@ func TestRunnerPerFunctionIndependent(t *testing.T) {
 	r := NewWithMetrics([]*PreparedFunction{
 		fnWithConcurrency(t, "a", 2, shared),
 		fnWithConcurrency(t, "b", 2, shared),
-	}, silentLogger(), nil)
+	}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	runTwo(t, r, 8)
@@ -235,8 +217,8 @@ func TestRunnerPerFunctionIndependent(t *testing.T) {
 // stream layer) and the executor is NOT called for the timed-out invocation.
 func TestRunnerSlotTimeoutLeavesPending(t *testing.T) {
 	release := make(chan struct{})
-	holding := newHoldingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, silentLogger(), nil)
+	holding := newBlockingExecutor(release)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(1)
 	// Test override (package-internal field): keep the wait short so the timeout
 	// path is exercised quickly without a 30s wait.
@@ -279,8 +261,8 @@ func TestRunnerSlotTimeoutLeavesPending(t *testing.T) {
 func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	m := metrics.New()
 	release := make(chan struct{})
-	exec := newHoldingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, silentLogger(), m)
+	exec := newBlockingExecutor(release)
+	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), m)
 	r.SetMaxConcurrency(1)
 	r.slotWait = 50 * time.Millisecond
 
@@ -306,44 +288,4 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	if got := m.Gauge(metrics.MetricInFlightInvocations); got != 0 {
 		t.Fatalf("in_flight_invocations = %g, want 0 after drain", got)
 	}
-}
-
-// holdingExecutor blocks in Execute until release closes, and records how many
-// times it was entered.
-type holdingExecutor struct {
-	release     chan struct{}
-	entered     chan struct{}
-	enteredOnce sync.Once
-	callsMu     sync.Mutex
-	calls       int
-}
-
-// newHoldingExecutor builds a holdingExecutor whose entered channel is created
-// up front (no race between waitEntered and the goroutine's Execute).
-func newHoldingExecutor(release chan struct{}) *holdingExecutor {
-	return &holdingExecutor{release: release, entered: make(chan struct{})}
-}
-
-func (f *holdingExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ string, _ []byte, _ []string) error {
-	f.callsMu.Lock()
-	f.calls++
-	f.callsMu.Unlock()
-	f.enteredOnce.Do(func() { close(f.entered) })
-	select {
-	case <-f.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// waitEntered blocks until the first Execute has been entered.
-func (f *holdingExecutor) waitEntered() {
-	<-f.entered
-}
-
-func (f *holdingExecutor) callCount() int {
-	f.callsMu.Lock()
-	defer f.callsMu.Unlock()
-	return f.calls
 }

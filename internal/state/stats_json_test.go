@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -94,6 +93,23 @@ func assertJSONKeys(t *testing.T, data string, required, allowed []string) {
 	}
 }
 
+// assertJSONKeysAbsent fails unless none of keys appear as top-level keys in the
+// JSON payload. It is the key-set counterpart of assertJSONKeys for
+// must-not-be-persisted fields (relations and live gauges), avoiding a bare
+// substring match that a value could accidentally satisfy.
+func assertJSONKeysAbsent(t *testing.T, data string, keys ...string) {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		t.Fatalf("payload is not JSON: %q: %v", data, err)
+	}
+	for _, k := range keys {
+		if _, ok := m[k]; ok {
+			t.Errorf("payload must not carry key %q: %s", k, data)
+		}
+	}
+}
+
 // TestStatsPayloadIsCentralizedJSON pins the storage contract: the global stats
 // row keeps only id/updated_at as columns, stores the whole counter/gauge
 // payload as a JSON object with exactly the expected keys, and round-trips.
@@ -113,9 +129,7 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	data, updatedAt := rawStatsData(t, c)
 	assertJSONKeysExactly(t, data, statsJSONKeys)
 	// updated_at is relational, not in the payload.
-	if strings.Contains(data, "updated_at") {
-		t.Fatalf("payload must not carry updated_at: %s", data)
-	}
+	assertJSONKeysAbsent(t, data, "updated_at")
 	if updatedAt == "" {
 		t.Fatal("stats.updated_at column must be set")
 	}
@@ -157,7 +171,8 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 	data, updatedAt := rawFunctionStatsData(t, c, "alpha")
 	// last_execution_at is present (it was set); the other three timestamps are
 	// empty and intentionally omitted.
-	assertJSONKeys(t, data, functionStatsJSONRequiredKeys, []string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"})
+	assertJSONKeys(t, data, functionStatsJSONRequiredKeys,
+		[]string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"})
 	if !strings.Contains(data, `"last_execution_at"`) {
 		t.Fatalf("expected the populated timestamp in the payload: %s", data)
 	}
@@ -166,18 +181,12 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 			t.Fatalf("empty timestamp %s must be omitted: %s", absent, data)
 		}
 	}
-	// Relational metadata must not be duplicated in the payload.
-	for _, forbidden := range []string{"function", "updated_at"} {
-		if strings.Contains(data, `"`+forbidden+`"`) {
-			t.Fatalf("payload must not carry relational %q: %s", forbidden, data)
-		}
-	}
+	// Relational metadata must not be duplicated in the payload. Use a key-set
+	// check (not a bare substring) so a counter value that merely contains the
+	// word cannot false-positive.
+	assertJSONKeysAbsent(t, data, "function", "updated_at", "function_name")
 	// The live pool gauges are never persisted.
-	for _, gauge := range []string{"capacity", "containers", "busy", "idle", "starting"} {
-		if strings.Contains(data, gauge) {
-			t.Fatalf("payload must not carry live pool gauge %q: %s", gauge, data)
-		}
-	}
+	assertJSONKeysAbsent(t, data, "capacity", "containers", "busy", "idle", "starting")
 	if updatedAt == "" {
 		t.Fatal("function_stats.updated_at column must be set")
 	}
@@ -460,75 +469,5 @@ func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	}
 	if logs := buf.String(); !strings.Contains(logs, "read function stats failed") {
 		t.Fatalf("expected a decode warning for the corrupt row, got:\n%s", logs)
-	}
-}
-
-// TestStatsRelationalMetadataColumns pins the schema shape: only the stable
-// metadata columns exist on stats/function_stats (plus data), so no counter is
-// duplicated as a column.
-func TestStatsRelationalMetadataColumns(t *testing.T) {
-	c := openTestState(t)
-	ctx := context.Background()
-
-	statsCols, err := c.tableColumns(ctx, "stats")
-	if err != nil {
-		t.Fatalf("stats columns: %v", err)
-	}
-	for _, want := range []string{"id", "data", "updated_at"} {
-		if !statsCols[want] {
-			t.Errorf("stats missing metadata column %q: %v", want, statsCols)
-		}
-	}
-	if len(statsCols) != 3 {
-		t.Errorf("stats must have exactly id/data/updated_at, got %v", statsCols)
-	}
-
-	fnCols, err := c.tableColumns(ctx, "function_stats")
-	if err != nil {
-		t.Fatalf("function_stats columns: %v", err)
-	}
-	for _, want := range []string{"function_name", "data", "updated_at"} {
-		if !fnCols[want] {
-			t.Errorf("function_stats missing metadata column %q: %v", want, fnCols)
-		}
-	}
-	if len(fnCols) != 3 {
-		t.Errorf("function_stats must have exactly function_name/data/updated_at, got %v", fnCols)
-	}
-}
-
-// TestOldSchemaStatsTablesAreNotMigrated documents the intentional removal of
-// the stats migration helpers: CREATE TABLE IF NOT EXISTS leaves an old
-// explicit-column stats table alone, so a legacy database does not silently gain
-// the data column. This pins the "no stats backcompat" decision.
-func TestOldSchemaStatsTablesAreNotMigrated(t *testing.T) {
-	path := t.TempDir() + "/db.sqlite3"
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("legacy open: %v", err)
-	}
-	if _, err := db.ExecContext(context.Background(), `
-		CREATE TABLE stats (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			events_processed_total INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT
-		)`); err != nil {
-		t.Fatalf("legacy schema: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("legacy close: %v", err)
-	}
-
-	c, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer c.Close()
-	have, err := c.tableColumns(context.Background(), "stats")
-	if err != nil {
-		t.Fatalf("columns: %v", err)
-	}
-	if have["data"] {
-		t.Fatalf("old stats table must NOT be migrated to add data: %v", have)
 	}
 }

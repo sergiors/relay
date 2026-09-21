@@ -1,15 +1,8 @@
 package stream
 
 import (
-	"bytes"
-	"context"
-	"errors"
-	"log/slog"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func TestBackoffProgressionAndCap(t *testing.T) {
@@ -33,9 +26,10 @@ func TestBackoffReset(t *testing.T) {
 	}
 }
 
-func TestBackoffJitterBounds(t *testing.T) {
-	// A jitter that always returns the max factor (1.2) must stay within bounds
-	// and scale the base value exactly.
+// TestBackoffJitterScalesExactFactor pins that next applies the injected jitter
+// function to the base delay exactly (here the max 1.2x and min 0.8x factors),
+// so the bounds test below can trust the scaling arithmetic.
+func TestBackoffJitterScalesExactFactor(t *testing.T) {
 	b := newBackoff(nil, func(f float64) float64 { return f * 1.2 })
 	if got := b.next(); got != 1200*time.Millisecond {
 		t.Fatalf("max jitter: got %s, want 1.2s", got)
@@ -60,94 +54,22 @@ func TestBackoffJitterNeverOutOfBounds(t *testing.T) {
 	}
 }
 
-// newTestConsumer returns a Consumer with a buffer logger and a fast,
-// deterministic backoff for health-transition tests.
-func newTestConsumer(t *testing.T) (*Consumer, *bytes.Buffer) {
-	t.Helper()
-	var buf bytes.Buffer
-	c := NewConsumer(ConsumerConfig{
-		Log:           slog.New(slog.NewTextHandler(&buf, nil)),
-		backoffTable:  []time.Duration{time.Second},
-		backoffJitter: func(f float64) float64 { return f },
-	})
-	return c, &buf
-}
-
-func TestNoteOutcomeFailureMarksUnhealthyAndLogsOnce(t *testing.T) {
-	c, buf := newTestConsumer(t)
-	if !c.Healthy() {
-		t.Fatalf("consumer should start healthy")
+// TestBackoffPeekDoesNotAdvance pins peek: it returns the current table value
+// without advancing the step, so the recovery loop's ticker-paced peek never
+// consumes the main read loop's backoff progression.
+func TestBackoffPeekDoesNotAdvance(t *testing.T) {
+	b := newBackoff([]time.Duration{1 * time.Second, 2 * time.Second}, func(f float64) float64 { return f })
+	if got := b.peek(); got != time.Second {
+		t.Fatalf("initial peek = %s, want 1s", got)
 	}
-	c.noteOutcome(errors.New("boom"), time.Second)
-	if c.Healthy() {
-		t.Fatalf("consumer should be unhealthy after failure")
+	if got := b.peek(); got != time.Second {
+		t.Fatalf("repeated peek = %s, want 1s (must not advance)", got)
 	}
-	if got := buf.String(); !strings.Contains(got, "Redis: read failed; retrying") {
-		t.Fatalf("expected one failure log, got: %q", got)
+	// peek never advances, so next still starts at the first entry.
+	if got := b.next(); got != time.Second {
+		t.Fatalf("next after peek = %s, want 1s", got)
 	}
-}
-
-func TestNoteOutcomeSuccessRecoversAndLogsOnce(t *testing.T) {
-	c, buf := newTestConsumer(t)
-	// Enter outage.
-	c.noteOutcome(errors.New("boom"), time.Second)
-	buf.Reset()
-	// Many successes must log exactly one recovery line.
-	for i := 0; i < 5; i++ {
-		c.noteOutcome(nil, 0)
-	}
-	if !c.Healthy() {
-		t.Fatalf("consumer should be healthy after success")
-	}
-	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 1 {
-		t.Fatalf("expected exactly one recovery line, got %d: %q", got, buf.String())
-	}
-}
-
-func TestNoteOutcomeNoRecoverySpamDuringOutage(t *testing.T) {
-	c, buf := newTestConsumer(t)
-	c.noteOutcome(errors.New("boom"), time.Second)
-	buf.Reset()
-	// Repeated failures during an ongoing outage must not log recovery lines.
-	for i := 0; i < 5; i++ {
-		c.noteOutcome(errors.New("boom"), time.Second)
-	}
-	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 0 {
-		t.Fatalf("no recovery line expected during outage, got %d", got)
-	}
-}
-
-func TestNoteOutcomeRedisNilCountsAsSuccess(t *testing.T) {
-	c, buf := newTestConsumer(t)
-	c.noteOutcome(errors.New("boom"), time.Second)
-	buf.Reset()
-	c.noteOutcome(redis.Nil, 0)
-	if !c.Healthy() {
-		t.Fatalf("redis.Nil should count as healthy")
-	}
-	if got := strings.Count(buf.String(), "Redis connection recovered"); got != 1 {
-		t.Fatalf("expected one recovery line, got %d", got)
-	}
-}
-
-func TestConsumeWaitInterruptedByCancel(t *testing.T) {
-	c, _ := newTestConsumer(t)
-	// A long backoff so the wait would otherwise block; cancellation must
-	// interrupt it promptly.
-	c.backoff = newBackoff([]time.Duration{10 * time.Second}, func(f float64) float64 { return f })
-	ctx, cancel := context.WithCancel(context.Background())
-	start := time.Now()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-	// Simulate the wait loop's select: on ctx.Done we return immediately.
-	select {
-	case <-ctx.Done():
-	case <-time.After(10 * time.Second):
-		t.Fatalf("wait was not interrupted by cancellation")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("cancellation took too long: %s", elapsed)
+	if got := b.peek(); got != 2*time.Second {
+		t.Fatalf("peek after next = %s, want 2s", got)
 	}
 }

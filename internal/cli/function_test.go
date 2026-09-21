@@ -11,6 +11,15 @@ import (
 	"relay/internal/state"
 )
 
+// normWS collapses runs of whitespace (including newlines) in s to single
+// spaces, so tabwriter column padding changes from label-length edits do not
+// break assertions that care about label/value content rather than alignment.
+// Exact-alignment contract anchors are kept in the dedicated render tests
+// (e.g. TestPrintStats).
+func normWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // openTempState opens a fresh temp state DB under per-test dependencies and
 // returns it with those deps. It replaces the former package-level statePath
 // global: each test owns its explicit temp locations, so no shared filesystem
@@ -34,12 +43,28 @@ func seedTestState(t *testing.T) (*state.State, Dependencies) {
 	t.Helper()
 	st, deps := openTempState(t)
 
-	tmpl, _ := function.ParseTemplate([]byte("runtime: python3.14\nevents:\n  - handler: events.created.handler\n    pattern:\n      event_name: [INSERT]\n    timeout: 6s\n  - handler: events.updated.handler\n    pattern:\n      event_name: [MODIFY]\n    timeout: 20s\n"))
+	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+    timeout: 6s
+  - handler: events.updated.handler
+    pattern:
+      event_name: [MODIFY]
+    timeout: 20s
+`))
 	readyFn := function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl}
 	st.RecordReconcileSuccess("user-events-python", "relay-fn-user-events-python", "abc123hash", time.Now(), readyFn)
 
-	nodeTmpl, _ := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
-	st.RecordDiscovered(function.Function{Name: "welcome-email-node", Dir: filepath.Join(t.TempDir(), "y"), Template: nodeTmpl})
+	nodeTmpl, _ := function.ParseTemplate([]byte(`runtime: node24
+events:
+  - handler: index.hi
+    pattern:
+      event_name: [INSERT]
+`))
+	nodeFn := function.Function{Name: "welcome-email-node", Dir: filepath.Join(t.TempDir(), "y"), Template: nodeTmpl}
+	st.RecordDiscovered(nodeFn)
 
 	return st, deps
 }
@@ -89,14 +114,15 @@ func TestFunctionInspectDetail(t *testing.T) {
 	}
 	var w bytes.Buffer
 	printInspect(&w, st, d)
-	out := w.String()
-	// tabwriter pads to the longest label ("Last reconcile:") + minwidth
+	out := normWS(w.String())
+	// Whitespace is normalized: this test pins which detail rows render, not
+	// their tabwriter column alignment (that is anchored in TestPrintStats).
 	for _, want := range []string{
-		"Name:            user-events-python",
-		"Runtime:         python3.14",
-		"Status:          ready",
-		"Image:           relay-fn-user-events-python",
-		"Fingerprint:     abc123hash",
+		"Name: user-events-python",
+		"Runtime: python3.14",
+		"Status: ready",
+		"Image: relay-fn-user-events-python",
+		"Fingerprint: abc123hash",
 		"Prepared:",
 		"Last reconcile:",
 		"events.created.handler",
@@ -144,14 +170,14 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 	}
 	var w bytes.Buffer
 	printInspect(&w, st, d)
-	out := w.String()
+	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
-		"  Events processed:    12493",
-		"  Handler successes:   12470",
-		"  Handler failures:    23",
-		"  Retries:             17",
-		"  DLQ entries:         2",
+		"Events processed: 12493",
+		"Handler successes: 12470",
+		"Handler failures: 23",
+		"Retries: 17",
+		"DLQ entries: 2",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -175,14 +201,14 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	}
 	var w bytes.Buffer
 	printInspect(&w, st, d)
-	out := w.String()
+	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
-		"  Events processed:    0",
-		"  Handler successes:   0",
-		"  Handler failures:    0",
-		"  Retries:             0",
-		"  DLQ entries:         0",
+		"Events processed: 0",
+		"Handler successes: 0",
+		"Handler failures: 0",
+		"Retries: 0",
+		"DLQ entries: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -508,19 +534,23 @@ events:
 // Arg handling: usage errors and the unknown-function error are returned with
 // their messages (cmd/main.go prints them and exits 1). `function` alone no
 // longer errors — it shows help (see TestFunctionBareShowsHelp). An unknown
-// token and missing/extra arguments still return errors with messages.
+// token and missing/extra arguments still return errors carrying the expected
+// message.
 func TestFunctionCommandErrors(t *testing.T) {
 	_, deps := seedTestState(t)
 
-	for _, args := range [][]string{
-		{"function", "bogus"},
-		{"function", "ls", "extra"},
-		{"function", "inspect"},
-		{"function", "inspect", "ghost"},
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"function", "bogus"}, "unknown command: relay function bogus"},
+		{[]string{"function", "ls", "extra"}, "function ls: too many arguments"},
+		{[]string{"function", "inspect"}, "not provided"},
+		{[]string{"function", "inspect", "ghost"}, `unknown function "ghost"`},
 	} {
-		_, _, err := runCLIWithDeps(t, deps, "", args...)
-		if err == nil || err.Error() == "" {
-			t.Fatalf("args %v: missing returned error message", args)
+		_, _, err := runCLIWithDeps(t, deps, "", tc.args...)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("args %v: err = %v, want message containing %q", tc.args, err, tc.want)
 		}
 	}
 }
@@ -602,7 +632,7 @@ func TestFunctionInspectCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	if !strings.Contains(out, "Name:            user-events-python") {
+	if !strings.Contains(normWS(out), "Name: user-events-python") {
 		t.Fatalf("inspect missing detail:\n%s", out)
 	}
 }
@@ -661,12 +691,12 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 	}
 	var w bytes.Buffer
 	printInspect(&w, st, d)
-	out := w.String()
+	out := normWS(w.String())
 	for _, want := range []string{
-		"Last execution:      2s ago",
-		"Last success:        2s ago",
-		"Last failure:        1m ago",
-		"Last DLQ:            2d ago",
+		"Last execution: 2s ago",
+		"Last success: 2s ago",
+		"Last failure: 1m ago",
+		"Last DLQ: 2d ago",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -693,12 +723,12 @@ func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 	}
 	var w bytes.Buffer
 	printInspect(&w, st, d)
-	out := w.String()
+	out := normWS(w.String())
 	for _, want := range []string{
-		"Last execution:      never",
-		"Last success:        never",
-		"Last failure:        never",
-		"Last DLQ:            never",
+		"Last execution: never",
+		"Last success: never",
+		"Last failure: never",
+		"Last DLQ: never",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)

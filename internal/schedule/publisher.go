@@ -67,6 +67,13 @@ type SchedulePublisher struct {
 	stream  string
 	log     *slog.Logger
 	metrics *metrics.Registry
+	// envelopeFn and runScript are unexported test seams mirrored on
+	// ConsumerConfig's backoff hooks: production leaves them at the real
+	// implementations (Occurrence.Envelope and publishScript.Run); unit tests
+	// substitute fakes to drive the branch/metric matrix without Redis. They are
+	// never configurable from outside the package.
+	envelopeFn func(Occurrence) ([]byte, error)
+	runScript  func(ctx context.Context, c redis.Scripter, keys []string, args ...any) (int, error)
 }
 
 // NewPublisher constructs a SchedulePublisher over the given client and stream.
@@ -77,7 +84,16 @@ func NewPublisher(client *redis.Client, stream string, logger *slog.Logger, metr
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	return &SchedulePublisher{client: client, stream: stream, log: logger, metrics: metrics}
+	return &SchedulePublisher{
+		client:     client,
+		stream:     stream,
+		log:        logger,
+		metrics:    metrics,
+		envelopeFn: Occurrence.Envelope,
+		runScript: func(ctx context.Context, c redis.Scripter, keys []string, args ...any) (int, error) {
+			return publishScript.Run(ctx, c, keys, args...).Int()
+		},
+	}
 }
 
 // PublishOccurrence atomically publishes one schedule occurrence to the Relay
@@ -89,7 +105,7 @@ func NewPublisher(client *redis.Client, stream string, logger *slog.Logger, metr
 // is history and expires by TTL only; it is never deleted on completion.
 func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence) (published bool, err error) {
 	id := o.ID()
-	envelope, err := o.Envelope()
+	envelope, err := p.envelopeFn(o)
 	if err != nil {
 		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed",
@@ -101,7 +117,7 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 		return false, fmt.Errorf("schedule publish: marshal envelope: %w", err)
 	}
 	key := dedupKey(o)
-	res, err := publishScript.Run(ctx, p.client, []string{key, p.stream}, id, occurrenceTTL.Milliseconds(), string(envelope)).Int()
+	res, err := p.runScript(ctx, p.client, []string{key, p.stream}, id, occurrenceTTL.Milliseconds(), string(envelope))
 	if err != nil {
 		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed",

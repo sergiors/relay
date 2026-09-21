@@ -93,7 +93,7 @@ func TestFunctionInspectRuntimePoolSection(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
+	out := normWS(w.String())
 	for _, want := range []string{
 		"Runtime pool:",
 		"Capacity:",
@@ -111,13 +111,13 @@ func TestFunctionInspectRuntimePoolSection(t *testing.T) {
 	// Live gauges come from the provider; cumulative counters come from the
 	// persisted stats row.
 	for _, row := range []string{
-		"Capacity:        4",
-		"Containers:      2",
-		"Busy:            1",
-		"Idle:            1",
-		"Warm acquires:   7",
-		"Cold starts:     3",
-		"Discarded:       2",
+		"Capacity: 4",
+		"Containers: 2",
+		"Busy: 1",
+		"Idle: 1",
+		"Warm acquires: 7",
+		"Cold starts: 3",
+		"Discarded: 2",
 	} {
 		if !strings.Contains(out, row) {
 			t.Errorf("inspect output missing value row %q\n%s", row, out)
@@ -134,8 +134,8 @@ func TestFunctionInspectRuntimePoolSection(t *testing.T) {
 func TestFunctionInspectRuntimePoolStartingRow(t *testing.T) {
 	var w bytes.Buffer
 	printRuntimePool(&w, &poolGauges{Capacity: 2, Starting: 1}, 0, 0, 0)
-	out := w.String()
-	if !strings.Contains(out, "Starting:") || !strings.Contains(out, "1") {
+	out := normWS(w.String())
+	if !strings.Contains(out, "Starting: 1") {
 		t.Errorf("starting row missing:\n%s", out)
 	}
 }
@@ -162,15 +162,15 @@ func TestFunctionInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
+	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") {
 		t.Fatalf("standalone inspect must render the Runtime pool section from persisted counters:\n%s", out)
 	}
 	// The persisted cumulative counters are rendered exactly.
 	for _, row := range []string{
-		"Warm acquires:   7",
-		"Cold starts:     3",
-		"Discarded:       2",
+		"Warm acquires: 7",
+		"Cold starts: 3",
+		"Discarded: 2",
 	} {
 		if !strings.Contains(out, row) {
 			t.Errorf("inspect output missing persisted counter row %q\n%s", row, out)
@@ -178,10 +178,10 @@ func TestFunctionInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T
 	}
 	// The live gauges are explicitly unavailable, never a guessed/stale number.
 	for _, row := range []string{
-		"Capacity:        unknown",
-		"Containers:      unknown",
-		"Busy:            unknown",
-		"Idle:            unknown",
+		"Capacity: unknown",
+		"Containers: unknown",
+		"Busy: unknown",
+		"Idle: unknown",
 	} {
 		if !strings.Contains(out, row) {
 			t.Errorf("inspect output missing unavailable gauge row %q\n%s", row, out)
@@ -210,11 +210,11 @@ func TestFunctionInspectRuntimePoolProviderUnknownFunction(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
-	if !strings.Contains(out, "Runtime pool:") || !strings.Contains(out, "Warm acquires:   4") {
+	out := normWS(w.String())
+	if !strings.Contains(out, "Runtime pool:") || !strings.Contains(out, "Warm acquires: 4") {
 		t.Fatalf("not-found provider must still render persisted counters:\n%s", out)
 	}
-	if !strings.Contains(out, "Capacity:        unknown") {
+	if !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("not-found provider must mark live gauges unavailable:\n%s", out)
 	}
 }
@@ -231,10 +231,11 @@ func TestFunctionInspectCommandRendersPersistedPoolCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
+	out = normWS(out)
 	if !strings.Contains(out, "Runtime pool:") {
 		t.Fatalf("standalone inspect must render a Runtime pool section:\n%s", out)
 	}
-	if !strings.Contains(out, "Warm acquires:   0") || !strings.Contains(out, "Capacity:        unknown") {
+	if !strings.Contains(out, "Warm acquires: 0") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("standalone inspect must render zero persisted counters and unknown gauges:\n%s", out)
 	}
 }
@@ -263,16 +264,16 @@ func TestFunctionInspectSocketLiveGauges(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
+	out := normWS(w.String())
 	for _, row := range []string{
-		"Capacity:        4",
-		"Containers:      2",
-		"Busy:            1",
-		"Idle:            1",
+		"Capacity: 4",
+		"Containers: 2",
+		"Busy: 1",
+		"Idle: 1",
 		// Cumulative counters remain the persisted values, not the socket's.
-		"Warm acquires:   11",
-		"Cold starts:     4",
-		"Discarded:       1",
+		"Warm acquires: 11",
+		"Cold starts: 4",
+		"Discarded: 1",
 	} {
 		if !strings.Contains(out, row) {
 			t.Errorf("socket-backed inspect missing %q\n%s", row, out)
@@ -305,12 +306,12 @@ func TestFunctionInspectSocketKnownZeros(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
+	out := normWS(w.String())
 	for _, row := range []string{
-		"Capacity:        0",
-		"Containers:      0",
-		"Busy:            0",
-		"Idle:            0",
+		"Capacity: 0",
+		"Containers: 0",
+		"Busy: 0",
+		"Idle: 0",
 	} {
 		if !strings.Contains(out, row) {
 			t.Errorf("known-zero inspect missing %q\n%s", row, out)
@@ -344,8 +345,8 @@ func TestFunctionInspectSocketUnknownFunction(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
-	if !strings.Contains(out, "Warm acquires:   5") || !strings.Contains(out, "Capacity:        unknown") {
+	out := normWS(w.String())
+	if !strings.Contains(out, "Warm acquires: 5") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unknown-function answer must render persisted counters and unknown gauges:\n%s", out)
 	}
 }
@@ -369,8 +370,8 @@ func TestFunctionInspectSocketUnavailable(t *testing.T) {
 	var w bytes.Buffer
 	fs := printInspect(&w, st, d)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
-	out := w.String()
-	if !strings.Contains(out, "Warm acquires:   6") || !strings.Contains(out, "Capacity:        unknown") {
+	out := normWS(w.String())
+	if !strings.Contains(out, "Warm acquires: 6") || !strings.Contains(out, "Capacity: unknown") {
 		t.Fatalf("unavailable socket must render persisted counters and unknown gauges:\n%s", out)
 	}
 }

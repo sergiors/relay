@@ -12,16 +12,19 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	git "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"relay/internal/testutil"
 )
+
+// fixtureTemplate is the function committed by fixture: one handler with an
+// INSERT pattern, distinct from testutil.DefaultTemplate so git package tests can
+// assert on the handler.
+const fixtureTemplate = "runtime: node24\nevents:\n  - handler: foo.handler\n    pattern:\n      event_name: [INSERT]\n"
 
 // testEnv bundles the temp dirs and a local fixture repo for a sync test.
 type testEnv struct {
@@ -30,8 +33,8 @@ type testEnv struct {
 
 // fixture builds a local working repo and a bare "remote" origin. The working
 // repo starts with one function "fn" committed to branch "main" and a second
-// branch "other" at the same commit, and (optionally) an annotated tag. It
-// returns the paths; e.bare is the CloneURL for sync tests.
+// branch "other" at the same commit, and (optionally) a tag. It returns the
+// paths; e.bare is the CloneURL for sync tests.
 func fixture(t *testing.T, withTag bool) testEnv {
 	t.Helper()
 	e := testEnv{
@@ -42,85 +45,40 @@ func fixture(t *testing.T, withTag bool) testEnv {
 		gitDir:    filepath.Join(t.TempDir(), "git"),
 		sshDir:    filepath.Join(t.TempDir(), "ssh"),
 	}
-
-	r, err := git.PlainInit(e.work, false)
-	if err != nil {
-		t.Fatalf("init work: %v", err)
+	opts := testutil.Options{
+		Work:          e.work,
+		Bare:          e.bare,
+		Template:      fixtureTemplate,
+		ExtraBranches: []string{"other"},
 	}
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-	writeFile(t, filepath.Join(e.work, "fn", "template.yaml"), "runtime: node24\nevents:\n  - handler: foo.handler\n    pattern:\n      event_name: [INSERT]\n")
-	if _, err := wt.Add("fn/template.yaml"); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	commit(t, wt, "initial")
-	h, _ := r.Head()
-	mustSetRef(t, r, "refs/heads/main", h.Hash())
-	mustSetRef(t, r, "refs/heads/other", h.Hash())
 	if withTag {
-		if _, err := r.CreateTag("v1", h.Hash(), nil); err != nil {
-			t.Fatalf("tag: %v", err)
-		}
+		opts.Tag = "v1"
 	}
-	seedBare(t, e)
+	testutil.New(t, opts)
 	return e
 }
 
+// mustSetRef points ref at h directly in the store.
 func mustSetRef(t *testing.T, r *git.Repository, name string, h plumbing.Hash) {
 	t.Helper()
-	if err := r.Storer.SetReference(plumbing.NewHashReference(plumbing.ReferenceName(name), h)); err != nil {
-		t.Fatalf("set ref %s: %v", name, err)
-	}
+	testutil.SetRef(t, r, name, h)
 }
 
-// seedBare creates (or re-seeds) the bare remote from the work repo, fetching
-// every branch and tag.
+// seedBare re-seeds the test env's bare remote from its work repo.
 func seedBare(t *testing.T, e testEnv) {
 	t.Helper()
-	if _, err := os.Stat(e.bare); os.IsNotExist(err) {
-		if _, err := git.PlainInit(e.bare, true); err != nil {
-			t.Fatalf("init bare: %v", err)
-		}
-	}
-	b, err := git.PlainOpen(e.bare)
-	if err != nil {
-		t.Fatalf("open bare: %v", err)
-	}
-	orig, err := b.CreateRemote(&config.RemoteConfig{Name: "origin", URLs: []string{e.work}})
-	if err != nil {
-		orig, err = b.Remote("origin")
-		if err != nil {
-			t.Fatalf("get origin: %v", err)
-		}
-	}
-	if err := orig.Fetch(&git.FetchOptions{
-		RefSpecs: []config.RefSpec{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"},
-	}); err != nil {
-		t.Fatalf("seed bare: %v", err)
-	}
+	testutil.SeedBare(t, e.bare, e.work)
 }
 
 func commit(t *testing.T, wt *git.Worktree, msg string) plumbing.Hash {
 	t.Helper()
-	h, err := wt.Commit(msg, &git.CommitOptions{
-		Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()},
-	})
-	if err != nil {
-		t.Fatalf("commit %q: %v", msg, err)
-	}
-	return h
+	return testutil.Commit(t, wt, msg)
 }
 
+// writeFile writes content at path, creating parent dirs.
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
+	testutil.WriteFile(t, path, content)
 }
 
 // syncOpts returns a SyncOptions bound to the test env, with the bare repo as

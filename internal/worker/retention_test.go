@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"relay/internal/testutil"
 )
 
 // stubTrimmer is a test double for streamTrimmer. It records every
@@ -61,8 +61,6 @@ func (s *stubTrimmer) lastCutoffID() string {
 	return s.cutoffID[len(s.cutoffID)-1]
 }
 
-func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
-
 // TestRetentionTickInterval pins the pure interval derivation: 6h → 15m, small
 // values clamp to the 1m floor, huge values clamp to the 1h ceiling.
 func TestRetentionTickInterval(t *testing.T) {
@@ -105,7 +103,7 @@ func TestRetentionTickTrimsConfiguredStream(t *testing.T) {
 	stub := &stubTrimmer{val: 3}
 	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 	retention := 6 * time.Hour // cutoff = now - 6h
-	retentionTick(context.Background(), stub, "relay:events", retention, func() time.Time { return now }, discardLogger())
+	retentionTick(context.Background(), stub, "relay:events", retention, func() time.Time { return now }, testutil.DiscardLogger())
 
 	if got := stub.calls(); got != 1 {
 		t.Fatalf("trim calls = %d, want 1", got)
@@ -135,8 +133,8 @@ func TestRetentionTickErrorLoggedAndRetried(t *testing.T) {
 	now := func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) }
 
 	// Two ticks, both failing: the loop must survive and retry.
-	retentionTick(context.Background(), stub, "relay:events", time.Hour, now, discardLogger())
-	retentionTick(context.Background(), stub, "relay:events", time.Hour, now, discardLogger())
+	retentionTick(context.Background(), stub, "relay:events", time.Hour, now, testutil.DiscardLogger())
+	retentionTick(context.Background(), stub, "relay:events", time.Hour, now, testutil.DiscardLogger())
 
 	if got := stub.calls(); got != 2 {
 		t.Fatalf("trim calls = %d, want 2 (retried on next tick)", got)
@@ -152,7 +150,7 @@ func TestRetentionLoopStopsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		retentionLoop(ctx, stub, "relay:events", time.Hour, discardLogger())
+		retentionLoop(ctx, stub, "relay:events", time.Hour, testutil.DiscardLogger())
 	}()
 	cancel()
 	select {

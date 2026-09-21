@@ -670,12 +670,6 @@ func sweepStartupImages(
 	st *state.State,
 	logger *slog.Logger,
 ) {
-	keep := make(map[string]bool)
-	for _, fn := range functions {
-		if fp, err := function.Fingerprint(fn.Dir); err == nil {
-			keep[runtime.ImageRef(fn.Name, fp)] = true
-		}
-	}
 	// Images referenced by any Relay-owned service container are kept too: a
 	// container kept by the Applys above (unchanged image) or left over from a
 	// previous boot that this boot has not yet replaced references its image by
@@ -685,26 +679,60 @@ func sweepStartupImages(
 	svcCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 	svcContainers, err := manager.ServiceContainerList(svcCtx)
 	cancel()
+	var serviceImages []string
 	if err == nil {
+		serviceImages = make([]string, 0, len(svcContainers))
 		for _, c := range svcContainers {
-			if c.Image != "" {
-				keep[c.Image] = true
-			}
+			serviceImages = append(serviceImages, c.Image)
 		}
 	} else {
 		logger.Warn("Service: keep-set list failed; continuing without", "error", err)
 	}
-	// The state keep-set is only armed when the DB was available.
+	// The state keep-set is only armed when the DB was available. When st is
+	// nil recordedImages stays empty, so the keep-set falls back to the function
+	// and service images alone (and the sweep below is skipped entirely).
+	var recordedImages []string
 	if st != nil {
 		for _, fn := range functions {
 			if d, ok := st.GetFunction(fn.Name); ok && d.Image != "" {
-				keep[d.Image] = true
+				recordedImages = append(recordedImages, d.Image)
 			}
 		}
+	}
+
+	keep := startupImageKeepSet(functions, serviceImages, recordedImages)
+	if st != nil {
 		if _, err := manager.RemoveImagesExcept(context.Background(), keep); err != nil {
 			logger.Warn("Image cleanup: startup sweep failed", "error", err)
 		}
 	}
+}
+
+// startupImageKeepSet computes the set of image references the startup sweep
+// must keep: (a) each function's expected fingerprinted image, (b) every image a
+// running service container references, and (c) every last-active image recorded
+// for a function still on disk — the crash guard for a swap that started but
+// whose RecordReconcileSuccess never landed, where the recorded image may still
+// be the one serving. It is a pure function so the keep-set policy is unit
+// testable without Docker or a state DB; blank image entries are ignored.
+func startupImageKeepSet(functions []function.Function, serviceImages, recordedImages []string) map[string]bool {
+	keep := make(map[string]bool)
+	for _, fn := range functions {
+		if fp, err := function.Fingerprint(fn.Dir); err == nil {
+			keep[runtime.ImageRef(fn.Name, fp)] = true
+		}
+	}
+	for _, img := range serviceImages {
+		if img != "" {
+			keep[img] = true
+		}
+	}
+	for _, img := range recordedImages {
+		if img != "" {
+			keep[img] = true
+		}
+	}
+	return keep
 }
 
 // cleanupStartupDependencies runs dependency GC at startup. The startup image

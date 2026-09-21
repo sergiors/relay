@@ -72,29 +72,3 @@ func TestRecordStatsSnapshotPersistsPoolCounters(t *testing.T) {
 		t.Fatalf("AllFunctionStats = %+v", all)
 	}
 }
-
-// TestExecAddColumnToleratesDuplicateColumn pins the tolerance branch of the
-// migration helper deterministically: execAddColumn is invoked for a column that
-// ALREADY exists (the state a concurrent migrator leaves behind), so its ALTER
-// fails with a duplicate-column error and the re-read must turn that into
-// success. A still-missing column is returned as a genuine error.
-//
-// The exercised column (functions.env) belongs to the preserved
-// functions-column migration; the removed stats migrations used to cover this
-// branch, so the helper is pinned through an unrelated surviving column.
-func TestExecAddColumnToleratesDuplicateColumn(t *testing.T) {
-	c := openTestState(t)
-	ctx := context.Background()
-
-	// functions.env already exists (initSchema created it): a duplicate-column
-	// ALTER must be tolerated.
-	if err := c.execAddColumn(ctx, "functions", "env", "TEXT"); err != nil {
-		t.Fatalf("execAddColumn on an existing column = %v; want nil (concurrent-win tolerance)", err)
-	}
-
-	// A genuine failure (a non-existent table) must still be returned: the
-	// re-read cannot find the column, so the error is real, not a lost race.
-	if err := c.execAddColumn(ctx, "no_such_table", "c", "TEXT"); err == nil {
-		t.Fatal("execAddColumn on a missing table must return an error")
-	}
-}

@@ -8,14 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	gogit "github.com/go-git/go-git/v5"
-	gitcfg "github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
 
 	gitpkg "relay/internal/git"
+	"relay/internal/testutil"
 )
 
 // cliGitPaths carries the redirected dirs the CLI git tests use for assertions.
@@ -94,7 +89,8 @@ func TestGitSetPersistsAndDefaultsRef(t *testing.T) {
 // TestGitSetExplicitRefAndPath verifies --ref and --path are persisted.
 func TestGitSetExplicitRefAndPath(t *testing.T) {
 	p := redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "--ref", "v1.2.3", "--path", "pkg/fn", "git@github.com:acme/repo.git"); err != nil {
+	_, _, err := runCLI(t, "", "git", "set", "--ref", "v1.2.3", "--path", "pkg/fn", "git@github.com:acme/repo.git")
+	if err != nil {
 		t.Fatalf("git set: %v", err)
 	}
 	cfg, _ := gitpkg.LoadConfig(p.configPath)
@@ -262,41 +258,26 @@ func TestGitBareShowsHelp(t *testing.T) {
 	}
 }
 
-// TestGitRemoveConfirmed drives `git remove` with an affirmative `y\n` answer:
-// it removes the config and reports success.
+// TestGitRemoveConfirmed drives `git remove` with each affirmative answer (short
+// and long form): removal happens, the config is gone, and success is reported.
 func TestGitRemoveConfirmed(t *testing.T) {
-	p := redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-	out, _, err := runCLI(t, "y\n", "git", "remove")
-	if err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if !strings.Contains(out, "Removed git source config") {
-		t.Fatalf("remove output missing confirmation:\n%s", out)
-	}
-	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
-		t.Fatal("config not removed after confirming")
-	}
-}
-
-// TestGitRemoveConfirmedYes drives `git remove` with the long affirmative form
-// `yes\n`, verifying both accepted spellings.
-func TestGitRemoveConfirmedYes(t *testing.T) {
-	p := redirectGitDirs(t)
-	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-	out, _, err := runCLI(t, "yes\n", "git", "remove")
-	if err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if !strings.Contains(out, "Removed git source config") {
-		t.Fatalf("remove output missing confirmation:\n%s", out)
-	}
-	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
-		t.Fatal("config not removed after confirming")
+	for _, answer := range []string{"y\n", "yes\n"} {
+		t.Run("answer="+strings.TrimSpace(answer), func(t *testing.T) {
+			p := redirectGitDirs(t)
+			if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+			out, _, err := runCLI(t, answer, "git", "remove")
+			if err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+			if !strings.Contains(out, "Removed git source config") {
+				t.Fatalf("remove output missing confirmation:\n%s", out)
+			}
+			if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+				t.Fatal("config not removed after confirming")
+			}
+		})
 	}
 }
 
@@ -468,53 +449,12 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 }
 
 // seedLocalBareRepo builds a local work repo with one function and a bare remote
-// cloned from it, returning the bare path. It lets a CLI git sync run end to end
-// against a filesystem source (no SSH, no network), with the repository stored
-// as a plain path in the persisted config.
+// cloned from it via the shared testutil fixture, returning the bare path. It lets
+// a CLI git sync run end to end against a filesystem source (no SSH, no network),
+// with the repository stored as a plain path in the persisted config.
 func seedLocalBareRepo(t *testing.T) string {
 	t.Helper()
-	work := filepath.Join(t.TempDir(), "work")
-	r, err := gogit.PlainInit(work, false)
-	if err != nil {
-		t.Fatalf("init work: %v", err)
-	}
-	wt, err := r.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(work, "fn"), 0o755); err != nil {
-		t.Fatalf("mkdir fn: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(work, "fn", "template.yaml"), []byte("runtime: node24\n"), 0o644); err != nil {
-		t.Fatalf("write template: %v", err)
-	}
-	if _, err := wt.Add("fn/template.yaml"); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	h, err := wt.Commit("initial", &gogit.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()}})
-	if err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	if err := r.Storer.SetReference(plumbing.NewHashReference(plumbing.ReferenceName("refs/heads/main"), h)); err != nil {
-		t.Fatalf("set ref: %v", err)
-	}
-
-	bare := filepath.Join(t.TempDir(), "remote.git")
-	if _, err := gogit.PlainInit(bare, true); err != nil {
-		t.Fatalf("init bare: %v", err)
-	}
-	b, err := gogit.PlainOpen(bare)
-	if err != nil {
-		t.Fatalf("open bare: %v", err)
-	}
-	orig, err := b.CreateRemote(&gitcfg.RemoteConfig{Name: "origin", URLs: []string{work}})
-	if err != nil {
-		t.Fatalf("create remote: %v", err)
-	}
-	if err := orig.Fetch(&gogit.FetchOptions{RefSpecs: []gitcfg.RefSpec{"+refs/heads/*:refs/heads/*"}}); err != nil {
-		t.Fatalf("seed bare: %v", err)
-	}
-	return bare
+	return testutil.NewBareRepo(t)
 }
 
 // TestGitSyncCLIStepsAreWriterOnlyAtDebug pins that a real `relay git sync` run

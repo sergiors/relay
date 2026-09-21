@@ -20,7 +20,8 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 	opts := buildImageOptions("relay-fn-test:abc123", nil)
 
 	if !opts.Remove {
-		t.Error("expected Remove=true so the daemon removes intermediate containers after a successful build (moby client v0.6.0 emits rm=0 when Remove is false)")
+		t.Error("expected Remove=true so the daemon removes intermediate containers after a " +
+			"successful build (moby client v0.6.0 emits rm=0 when Remove is false)")
 	}
 	if opts.ForceRemove {
 		t.Error("expected ForceRemove=false: failed builds must keep their intermediates for debugging")
@@ -55,7 +56,7 @@ func TestBuildImageOptionsCarriesManagedLabels(t *testing.T) {
 	}
 }
 
-func TestRenderDockerfile(t *testing.T) {
+func TestDockerfileTemplateEmbedsFunctionSource(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "node:24-alpine",
 		WorkDir:   "/app",
@@ -109,6 +110,11 @@ func TestRenderDockerfileNoInstallNoEntrypoint(t *testing.T) {
 // in the correct order: FROM → WORKDIR → COPY → RUN install → RUN user setup →
 // USER → ENTRYPOINT. The user setup must run as root AFTER install (so
 // dependency installation is unaffected) and before the USER switch.
+// pythonUserSetup is the runtime-user provisioning command the python plans
+// emit; kept as a fixture so the long line does not repeat inline.
+const pythonUserSetup = "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app " +
+	"-s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay"
+
 func TestRenderDockerfileHardening(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
@@ -117,7 +123,7 @@ func TestRenderDockerfileHardening(t *testing.T) {
 			{Path: "/relay/bootstrap.py", Content: []byte("x"), Mode: fs.FileMode(0o644)},
 		},
 		Install:    []string{"pip install --no-cache-dir -r requirements.txt"},
-		UserSetup:  "groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app -s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay",
+		UserSetup:  pythonUserSetup,
 		User:       "10001:10001",
 		Entrypoint: []string{"python", "/relay/bootstrap.py"},
 	}
@@ -130,7 +136,7 @@ WORKDIR /app
 COPY . /app
 COPY relay/bootstrap.py /relay/
 RUN pip install --no-cache-dir -r requirements.txt
-RUN groupadd -g 10001 app && useradd -u 10001 -g 10001 -m -d /home/app -s /usr/sbin/nologin app && chown -R 10001:10001 /app /relay
+RUN ` + pythonUserSetup + `
 USER 10001:10001
 ENTRYPOINT ["python", "/relay/bootstrap.py"]
 `
@@ -146,7 +152,8 @@ ENTRYPOINT ["python", "/relay/bootstrap.py"]
 		t.Fatalf("expected USER, user-setup RUN, and install RUN lines, got:\n%s", df)
 	}
 	if !(installIdx < setupIdx && setupIdx < userIdx) {
-		t.Errorf("expected order install RUN < user-setup RUN < USER, got install=%d setup=%d user=%d", installIdx, setupIdx, userIdx)
+		t.Errorf("expected order install RUN < user-setup RUN < USER, got install=%d setup=%d user=%d",
+			installIdx, setupIdx, userIdx)
 	}
 }
 

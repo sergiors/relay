@@ -71,7 +71,7 @@ func newTestManager(t *testing.T, clk *fakeClock, timeout, interval time.Duratio
 func TestIdleEvictionAfterTimeout(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, 5*time.Minute)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -91,7 +91,7 @@ func TestIdleEvictionAfterTimeout(t *testing.T) {
 	}
 
 	// The next acquire starts a fresh container (the evicted one is not reused).
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after eviction: %v", err)
 	}
 	if ff.count() != 2 {
@@ -108,7 +108,7 @@ func TestIdleEvictionOnlyHealthyIdle(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	idle := &fakeContainer{}
 	built := 0
 	ff.build = func() *fakeContainer {
@@ -123,7 +123,7 @@ func TestIdleEvictionOnlyHealthyIdle(t *testing.T) {
 		busyDone <- cc.execute(context.Background(), "fn-a", "img-1", 2, ff.start(), "h", []byte(`{}`), nil)
 	}()
 	<-busy.entered
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed idle: %v", err)
 	}
 
@@ -152,7 +152,7 @@ func TestIdleEvictionOnlyHealthyIdle(t *testing.T) {
 func TestIdleEvictionCleanupFailureNeverReinserts(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -174,7 +174,7 @@ func TestIdleEvictionCleanupFailureNeverReinserts(t *testing.T) {
 	c1.discardFails = false
 	c1.mu.Unlock()
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute after failed eviction: %v", err)
 	}
 	if got := c1.calls(); got != 1 {
@@ -198,7 +198,7 @@ func TestIdleEvictionCleanupFailureNeverReinserts(t *testing.T) {
 func TestIdleEvictionDisabledForNonPositiveTimeout(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, 0)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	c1 := ff.lastContainer()
@@ -216,17 +216,13 @@ func TestManagerMaintenanceLoopEvicts(t *testing.T) {
 	clk := newFakeClock()
 	m := newTestManager(t, clk, 50*time.Millisecond, 5*time.Millisecond)
 	ff := &fakeFactory{}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	c1 := ff.lastContainer()
 
 	clk.Advance(100 * time.Millisecond)
-	deadline := time.Now().Add(2 * time.Second)
-	for !c1.dead() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !c1.dead() {
+	if !pollUntil(nil, 2*time.Second, c1.dead) {
 		t.Fatal("maintenance loop did not evict the idle container")
 	}
 	if got := c1.reasons(); len(got) != 1 || got[0] != reasonIdleTimeout {
@@ -277,11 +273,13 @@ func TestResolveManagerOptions(t *testing.T) {
 	if got := resolveManagerOptions(nil).idleTimeout; got != DefaultWarmContainerIdleTimeout {
 		t.Fatalf("default idleTimeout = %v, want %v", got, DefaultWarmContainerIdleTimeout)
 	}
-	if got := resolveManagerOptions([]ManagerOption{WithWarmContainerIdleTimeout(90 * time.Second)}).idleTimeout; got != 90*time.Second {
+	opts90 := []ManagerOption{WithWarmContainerIdleTimeout(90 * time.Second)}
+	if got := resolveManagerOptions(opts90).idleTimeout; got != 90*time.Second {
 		t.Fatalf("explicit idleTimeout = %v, want 90s", got)
 	}
 	for _, bad := range []time.Duration{0, -time.Second} {
-		if got := resolveManagerOptions([]ManagerOption{WithWarmContainerIdleTimeout(bad)}).idleTimeout; got != DefaultWarmContainerIdleTimeout {
+		optsBad := []ManagerOption{WithWarmContainerIdleTimeout(bad)}
+		if got := resolveManagerOptions(optsBad).idleTimeout; got != DefaultWarmContainerIdleTimeout {
 			t.Errorf("non-positive timeout %v resolved to %v, want default %v", bad, got, DefaultWarmContainerIdleTimeout)
 		}
 	}
@@ -308,7 +306,7 @@ func TestGenerationDrainingRemovedWhenEmpty(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
-	oldC := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	oldC := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return oldC }
 	done := make(chan error, 1)
 	go func() {
@@ -318,7 +316,7 @@ func TestGenerationDrainingRemovedWhenEmpty(t *testing.T) {
 
 	// Transition to img-2 while oldC is busy: old generation drains.
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
-	if err := run(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-2", 2, "h"); err != nil {
 		t.Fatalf("execute img-2: %v", err)
 	}
 	p := cc.poolFor("fn-a", 2)
@@ -354,14 +352,14 @@ func TestGenerationDrainingRemovedWhenEmpty(t *testing.T) {
 func TestGenerationNoNewOldGeneration(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("v1: %v", err)
 	}
-	if err := run(t, cc, ff, "fn-a", "img-2", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-2", 1, "h"); err != nil {
 		t.Fatalf("v2: %v", err)
 	}
 	// Stale img-1 acquire: transient, never pooled.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("stale v1: %v", err)
 	}
 	c := ff.lastContainer()
@@ -390,7 +388,7 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 
 	// fn-a: one busy container (created first, so the pool is empty and the
 	// acquire lazily starts it), then one idle container.
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -400,14 +398,14 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 
 	idle := &fakeContainer{}
 	ff.build = func() *fakeContainer { return idle }
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("idle seed: %v", err)
 	}
 
 	// fn-b must be untouched by fn-a's removal. Reset the factory so fn-b gets
 	// its own container rather than the shared idle pointer above.
 	ff.build = nil
-	if err := run(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
 		t.Fatalf("fn-b seed: %v", err)
 	}
 
@@ -420,7 +418,7 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 	}
 
 	// A new acquire for the removed function fails immediately.
-	if err := run(t, cc, ff, "fn-a", "img-1", 2, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 
@@ -439,7 +437,7 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 	if aExists {
 		t.Fatal("removed function's empty pool must be deleted from the cache")
 	}
-	if err := run(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
 		t.Fatalf("fn-b execute after fn-a removal: %v", err)
 	}
 }
@@ -449,7 +447,7 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -473,7 +471,7 @@ func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 	if !removed {
 		t.Fatal("removed function must stay marked removed after its pool drains")
 	}
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after late release = %v, want errPoolClosed", err)
 	}
 }
@@ -483,16 +481,16 @@ func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 func TestFunctionReactivateAfterRemoval(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	cc.removeFunction("fn-a")
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 
 	cc.activateFunction("fn-a", "img-1")
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after reactivation: %v", err)
 	}
 }
@@ -513,14 +511,14 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 	const image = "relay-fn-fn-a:abc123"
 	// Seed a warm container for fn-a, then remove the function and retire its
 	// image exactly as the worker's removal hook does (manager then runner).
-	if err := run(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	cc.removeFunction("fn-a")
 	cc.invalidateImage(image)
 
 	// A stale acquire during removal must fail, never warm.
-	if err := run(t, cc, ff, "fn-a", image, 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire while removed = %v, want errPoolClosed", err)
 	}
 
@@ -529,7 +527,7 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 	cc.activateFunction("fn-a", image)
 
 	before := ff.count()
-	if err := run(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
 		t.Fatalf("first acquire after recreation: %v", err)
 	}
 	c := ff.lastContainer()
@@ -539,7 +537,7 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 
 	// The recreated function must be WARM: a second invocation reuses the
 	// container rather than starting a fresh throwaway.
-	if err := run(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
 		t.Fatalf("second acquire after recreation: %v", err)
 	}
 	if ff.count() != before+1 {
@@ -560,7 +558,7 @@ func TestFunctionRecreationOnlyUnretiresOwnImage(t *testing.T) {
 
 	const foreignImage = "relay-fn-fn-b:abc123"
 	// fn-b is warm on its image, which is then invalidated (retired).
-	if err := run(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
 		t.Fatalf("fn-b seed: %v", err)
 	}
 	cc.invalidateImage(foreignImage)
@@ -569,7 +567,7 @@ func TestFunctionRecreationOnlyUnretiresOwnImage(t *testing.T) {
 	// name encoded in the reference is fn-b, not fn-a.
 	cc.activateFunction("fn-a", foreignImage)
 
-	if err := run(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
 		t.Fatalf("fn-b acquire: %v", err)
 	}
 	if got := ff.lastContainer().reasons(); len(got) != 1 || got[0] != reasonImageChanged {
@@ -632,7 +630,7 @@ func TestFunctionRemovalDuringInFlightStart(t *testing.T) {
 	}
 
 	// A later acquire still fails (removal not lifted).
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 }
@@ -686,7 +684,7 @@ func TestFunctionRemovalDuringInFlightStartFailureDeletesPool(t *testing.T) {
 	}
 
 	// A later acquire still fails (removal not lifted).
-	if err := run(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 }
@@ -724,7 +722,7 @@ func TestFunctionRemovalDuringInFlightStartPanicDeletesPool(t *testing.T) {
 		t.Fatal("removed function's empty pool must be deleted after a panicking in-flight start")
 	}
 
-	if err := run(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 }
@@ -769,7 +767,7 @@ func TestFunctionRemovalDuringInFlightTransientStartFailureDeletesPool(t *testin
 		t.Fatal("removed function's empty pool must be deleted after a failed in-flight transient start")
 	}
 
-	if err := run(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 }
@@ -809,7 +807,7 @@ func TestFunctionRemovalDuringInFlightTransientStartPanicDeletesPool(t *testing.
 		t.Fatal("removed function's empty pool must be deleted after a panicking in-flight transient start")
 	}
 
-	if err := run(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, &fakeFactory{}, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 }
@@ -824,13 +822,13 @@ func TestFunctionRemovalRequestAfterReactivationWins(t *testing.T) {
 
 	cc.removeFunction("fn-a")
 	cc.activateFunction("fn-a", "")
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after remove-then-activate: %v", err)
 	}
 
 	// A subsequent removal is later and must win.
 	cc.removeFunction("fn-a")
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after later removal = %v, want errPoolClosed", err)
 	}
 }
@@ -844,7 +842,7 @@ func TestFunctionRemovalRequestAfterReactivationWins(t *testing.T) {
 func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -866,12 +864,12 @@ func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
 	if got := busy.reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
 		t.Fatalf("removal-retired busy discards = %v, want [%s]", got, reasonFunctionRemove)
 	}
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after late release: %v", err)
 	}
 	// Warm again: a second acquire reuses the fresh container.
 	before := ff.count()
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("second acquire after late release: %v", err)
 	}
 	if ff.count() != before {
@@ -917,7 +915,7 @@ func TestPrepareFailureDoesNotReactivateRemovedFunction(t *testing.T) {
 	}
 
 	ff := &fakeFactory{}
-	if err := run(t, m.containers, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after failed Prepare = %v, want errPoolClosed", err)
 	}
 }
@@ -927,7 +925,7 @@ func TestPrepareFailureDoesNotReactivateRemovedFunction(t *testing.T) {
 func TestFunctionRemovalWakesWaiter(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
-	busy := &fakeContainer{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	busy := newBlockingContainer(1)
 	ff.build = func() *fakeContainer { return busy }
 	done := make(chan error, 1)
 	go func() {
@@ -959,7 +957,7 @@ func TestIndependentPoolsEvictionAndRemoval(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 	for _, name := range []string{"fn-a", "fn-b"} {
-		if err := run(t, cc, ff, name, "img-1", 1, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, name, "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed %s: %v", name, err)
 		}
 	}
@@ -978,10 +976,10 @@ func TestIndependentPoolsEvictionAndRemoval(t *testing.T) {
 	}
 
 	// Re-seed, then remove only fn-a.
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("reseed fn-a: %v", err)
 	}
-	if err := run(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
+	if err := runInvoke(t, cc, ff, "fn-b", "img-1", 1, "h"); err != nil {
 		t.Fatalf("reseed fn-b: %v", err)
 	}
 	last := ff.lastContainer()
@@ -1052,7 +1050,7 @@ func TestEvictionRaceSafety(t *testing.T) {
 	// Serial executes while the sweep runs: they may race eviction but must
 	// never fail or hang.
 	for i := 0; i < 4; i++ {
-		if err := run(t, cc, ff, "fn-race-a", "img-1", 2, "h"); err != nil {
+		if err := runInvoke(t, cc, ff, "fn-race-a", "img-1", 2, "h"); err != nil {
 			t.Fatalf("serial execute: %v", err)
 		}
 	}
@@ -1064,9 +1062,9 @@ func TestEvictionRaceSafety(t *testing.T) {
 // TestAcquireAfterCloseStillFails pins that the generation refactor preserves
 // errPoolClosed behavior on a closed pool.
 func TestAcquireAfterCloseStillFails(t *testing.T) {
-	cc, ff := mkCache()
+	cc, ff := newTestCache()
 	cc.close()
-	if err := run(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
+	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after close = %v, want errPoolClosed", err)
 	}
 }

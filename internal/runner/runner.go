@@ -227,6 +227,26 @@ type Runner struct {
 	// defaults to slotWaitTimeout and is overridable by tests (package-internal
 	// tests set r.slotWait directly to keep the slot-timeout tests fast).
 	slotWait time.Duration
+	// imageCleanupRetryDelays is the bounded backoff between retries of an image
+	// removal that was skipped because a relay-owned container still references
+	// it. It defaults to the production ~60s horizon (2+4+8+16+30s across 5
+	// attempts) before the image is deferred to a later natural cleanup pass.
+	// It is a field (not a package var) so package-internal tests can shrink it
+	// directly to milliseconds without mutating shared state. It is read-only
+	// after New/NewWithMetrics: tests must set it before use and never mutate it
+	// while the runner is running.
+	imageCleanupRetryDelays []time.Duration
+}
+
+// defaultImageCleanupRetryDelays is the production backoff schedule for image
+// removal retries: a ~60s horizon across 5 attempts before deferring to a later
+// natural cleanup pass.
+var defaultImageCleanupRetryDelays = []time.Duration{
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	30 * time.Second,
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
@@ -324,12 +344,13 @@ func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, m *metric
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	r := &Runner{
-		reg:      &Registry{},
-		log:      logger,
-		metrics:  m,
-		refs:     newImageRefCounter(),
-		fnSems:   map[string]*semaphore{},
-		slotWait: slotWaitTimeout,
+		reg:                     &Registry{},
+		log:                     logger,
+		metrics:                 m,
+		refs:                    newImageRefCounter(),
+		fnSems:                  map[string]*semaphore{},
+		slotWait:                slotWaitTimeout,
+		imageCleanupRetryDelays: defaultImageCleanupRetryDelays,
 	}
 	// maxConcurrency defaults to DefaultMaxConcurrency so an uncalled
 	// SetMaxConcurrency (a runner constructed directly, as in tests) still has a
@@ -500,28 +521,14 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	}
 }
 
-// imageCleanupRetryDelays is the bounded backoff between retries of an image
-// removal that was skipped because a relay-owned container still references it.
-// Production uses a ~60s horizon (2+4+8+16+30s across 5 attempts) before the
-// image is deferred to a later natural cleanup pass. Tests may override this
-// var (package-internal) to shrink it to milliseconds so the retry lifecycle is
-// exercised quickly.
-var imageCleanupRetryDelays = []time.Duration{
-	2 * time.Second,
-	4 * time.Second,
-	8 * time.Second,
-	16 * time.Second,
-	30 * time.Second,
-}
-
 // removeImageAsync removes a retired image off the event path so a docker round
 // trip can never add latency (or failure) to Handle. Removal is gated by two
 // independent guards: the in-flight refcount (an execution may have (re)claimed
 // the image after it was retired) and the relay-owned container reference check
 // (a persistent service container may still reference it). When either guard
 // holds, removal is skipped and retried with a bounded backoff
-// (imageCleanupRetryDelays); when the attempts exhaust, the image is deferred to
-// a later natural cleanup pass rather than force-removed. A nil cleaner is a
+// (r.imageCleanupRetryDelays); when the attempts exhaust, the image is deferred
+// to a later natural cleanup pass rather than force-removed. A nil cleaner is a
 // no-op.
 func (r *Runner) removeImageAsync(image string) {
 	cleaner := r.resolver()
@@ -529,12 +536,12 @@ func (r *Runner) removeImageAsync(image string) {
 		return
 	}
 	// Snapshot the retry backoff once so a goroutine that outlives a test
-	// (which may override imageCleanupRetryDelays) never races the shared
-	// package var. attempt is the retry counter shared across a single
-	// guard-skip chain; a later retire of the same image that reaches removal
-	// does not cancel it — the guards make duplicate attempts benign, so a
-	// bounded per-image cleanup is safe and keeps goroutine count bounded.
-	delays := append([]time.Duration(nil), imageCleanupRetryDelays...)
+	// (which may set r.imageCleanupRetryDelays) never races a later field write.
+	// attempt is the retry counter shared across a single guard-skip chain; a
+	// later retire of the same image that reaches removal does not cancel it —
+	// the guards make duplicate attempts benign, so a bounded per-image cleanup
+	// is safe and keeps goroutine count bounded.
+	delays := append([]time.Duration(nil), r.imageCleanupRetryDelays...)
 	attempt := 0
 	r.retryImageCleanupAttempt(image, cleaner, delays, &attempt)
 }

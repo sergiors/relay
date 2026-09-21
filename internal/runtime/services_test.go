@@ -1,12 +1,16 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
+
+	"relay/internal/testutil"
 )
 
-func TestServiceLabels(t *testing.T) {
+func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	got := serviceLabels(ServiceSpec{
 		Function:   "user-events",
 		Entrypoint: "service.js",
@@ -46,7 +50,7 @@ func TestServiceLabels(t *testing.T) {
 	}
 }
 
-func TestServiceContainerName(t *testing.T) {
+func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		function   string
@@ -116,7 +120,7 @@ func TestValidateServiceEntrypoint(t *testing.T) {
 	}
 }
 
-func TestServiceEntry(t *testing.T) {
+func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 	for _, tc := range []struct {
 		runtime    string
 		entrypoint string
@@ -194,9 +198,66 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 	}
 }
 
-// serviceLabels merges the spec's extra labels onto the relay ownership set,
-// and Relay ownership ALWAYS wins: a spec label colliding with a relay.* key
-// is overwritten by the authoritative relay value.
+// TestServiceContainerListParsing verifies the discovery mapping over a scripted
+// daemon: only relay.type=service containers are returned, replica and port are
+// parsed from their labels, a missing/non-numeric replica defaults to -1, and a
+// non-service container (including one with no labels at all) is excluded safely.
+// The client-call path is exercised without a real Docker daemon.
+func TestServiceContainerListParsing(t *testing.T) {
+	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.entrypoint":"svc.js",` +
+		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2"}`
+	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.entrypoint":"svc.js",` +
+		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
+	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
+		`{"Id":"c2","Labels":` + c2Labels + `},` +
+		`{"Id":"c3","Labels":{"relay.type":"event","relay.function":"fn-a"}},` +
+		`{"Id":"c4"}]`
+	cli := newScriptedDockerClient(t, dockerRoute{method: http.MethodGet, path: "/containers/json", body: body})
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+
+	list, err := m.ServiceContainerList(context.Background())
+	if err != nil {
+		t.Fatalf("ServiceContainerList: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("list = %+v, want the two service containers (event excluded)", list)
+	}
+	byID := map[string]ServiceContainer{}
+	for _, c := range list {
+		byID[c.ID] = c
+	}
+
+	c1 := byID["c1"]
+	if c1.Function != "fn-a" || c1.Entrypoint != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
+		t.Errorf("c1 identity = %+v, want the label-derived identity", c1)
+	}
+	if c1.Replica != 2 {
+		t.Errorf("c1 replica = %d, want the parsed 2", c1.Replica)
+	}
+	if c1.Port != 3000 {
+		t.Errorf("c1 port = %d, want the parsed 3000", c1.Port)
+	}
+
+	// c2 has no relay.replica and a non-numeric relay.port: replica defaults to
+	// -1 (always-stale to Reconcile) and port to 0.
+	c2 := byID["c2"]
+	if c2.Replica != -1 {
+		t.Errorf("c2 replica = %d, want -1 default for a missing label", c2.Replica)
+	}
+	if c2.Port != 0 {
+		t.Errorf("c2 port = %d, want 0 default for a non-numeric label", c2.Port)
+	}
+
+	// The full label set is copied, so the reconciler can compare foreign labels.
+	if c1.Labels["relay.port"] != "3000" {
+		t.Errorf("c1 labels copy = %v, want the full label set", c1.Labels)
+	}
+}
+
+// TestServiceLabelsSpecMergedOwnershipWins pins that serviceLabels merges the
+// spec's extra labels onto the relay ownership set, and that Relay ownership
+// ALWAYS wins: a spec label colliding with a relay.* key is overwritten by the
+// authoritative relay value.
 func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	spec := ServiceSpec{
 		Function:   "user-events",

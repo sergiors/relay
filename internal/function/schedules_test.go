@@ -141,7 +141,8 @@ schedules:
   - handler: jobs.cleanup.handler
     cron: "` + cron + `"
 `))
-		if err == nil || !strings.Contains(err.Error(), "jobs.cleanup.handler") || !strings.Contains(err.Error(), "invalid cron expression") {
+		if err == nil || !strings.Contains(err.Error(), "jobs.cleanup.handler") ||
+			!strings.Contains(err.Error(), "invalid cron expression") {
 			t.Fatalf("cron %q: err = %v, want handler-naming invalid-cron error", cron, err)
 		}
 	}

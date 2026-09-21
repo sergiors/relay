@@ -17,27 +17,19 @@ import (
 // than imported) to avoid an import cycle with the Go runtime package.
 const relaySentinel = "@@RELAY@@"
 
-// TestBootstrapContent is a static check that the embedded bootstrap implements
-// the persistent invocation protocol the engine and the Go side rely on.
-func TestBootstrapContent(t *testing.T) {
-	bs := string(Bootstrap)
-	for _, want := range []struct {
-		frag string
-		why  string
-	}{
-		{"@@RELAY@@", "must write the @@RELAY@@ sentinel protocol prefix"},
-		{"lastIndexOf", "must split the handler at the last dot"},
-		{"statSync", "must resolve modules via the filesystem, not import attempts"},
-		{"module not found", "must report a clear module-not-found error"},
-		{`import(modPath)`, "must import the resolved module"},
-		{"moduleCache", "must cache import promises so module state persists"},
-		{"process.stdin", "must read request lines from stdin"},
-		{"process.exit(0)", "must exit cleanly on stdin EOF"},
-		{"process.env", "must apply per-request env to process.env"},
-	} {
-		if !strings.Contains(bs, want.frag) {
-			t.Errorf("node bootstrap must contain %q (%s)", want.frag, want.why)
-		}
+// TestBootstrapIsEmbeddedAndResolvesModulesByStat asserts the two things static
+// source inspection is actually needed for. The process-behavior tests below
+// cover the rest of the invocation protocol (sentinel framing, module caching,
+// env rotation, error handling), so they are no longer duplicated as brittle
+// substring checks. The stat-sync assertion is kept because it pins the specific
+// module-resolution contract: modules are resolved via the filesystem (statSync),
+// never by attempting an import of a path that may not exist.
+func TestBootstrapIsEmbeddedAndResolvesModulesByStat(t *testing.T) {
+	if len(Bootstrap) == 0 {
+		t.Fatal("embedded node bootstrap is empty")
+	}
+	if !strings.Contains(string(Bootstrap), "statSync") {
+		t.Error("node bootstrap must resolve modules via filesystem stat (statSync), not import attempts")
 	}
 }
 

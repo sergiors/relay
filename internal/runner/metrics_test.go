@@ -2,59 +2,19 @@ package runner
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
-	"time"
 
-	"relay/internal/function"
 	"relay/internal/metrics"
-	"relay/internal/runtime"
 	"relay/internal/stream"
+	"relay/internal/testutil"
 )
 
-// silentLogger returns a leveled logger that discards output at the most
-// verbose (DEBUG) level, so nothing is filtered.
-func silentLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-// alwaysMatch returns a prepared function whose single rule matches any event
-// (empty pattern). Its handler invocations record a short, observable duration.
-// The rule carries the default retry count so failing invocations are retried
-// (matching production template defaults).
-func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFunction {
-	t.Helper()
-	return NewPrepared(
-		function.Function{
-			Name: name,
-			Template: &function.Template{
-				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: function.DefaultRetries}},
-			},
-		},
-		&runtime.Prepared{Name: name, Image: "x"},
-		executor,
-	)
-}
-
-// fixedExecutor succeeds or fails on demand with a configurable duration.
-type fixedExecutor struct {
-	err bool
-}
-
-func (f *fixedExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, _ []byte, _ []string) error {
-	if f.err {
-		return fmt.Errorf("boom")
-	}
-	return nil
-}
+// alwaysMatchFn lives in helpers_test.go.
 
 func TestHandleRecordsSuccessMetrics(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{})}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
@@ -84,7 +44,7 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 
 func TestHandleRecordsFailureMetrics(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{err: true})}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
@@ -116,11 +76,11 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 	// again) share the same registry, so one function accumulates both outcomes
 	// and another is isolated.
 	success := NewWithMetrics(
-		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{}), alwaysMatchFn(t, "other", &fixedExecutor{})},
-		silentLogger(), m)
+		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{}), alwaysMatchFn(t, "other", &countingExecutor{})},
+		testutil.DiscardLogger(), m)
 	failure := NewWithMetrics(
-		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{err: true})},
-		silentLogger(), m)
+		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})},
+		testutil.DiscardLogger(), m)
 	if err := success.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle success: %v", err)
 	}
@@ -212,9 +172,9 @@ func TestHandleFunctionLevelCounters(t *testing.T) {
 	m := metrics.New()
 	// Two functions, each with a single always-matching rule.
 	r := NewWithMetrics([]*PreparedFunction{
-		alwaysMatchFn(t, "a", &fixedExecutor{}),
-		alwaysMatchFn(t, "b", &fixedExecutor{}),
-	}, silentLogger(), m)
+		alwaysMatchFn(t, "a", &countingExecutor{}),
+		alwaysMatchFn(t, "b", &countingExecutor{}),
+	}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
@@ -246,7 +206,7 @@ func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
 	// Without invocation state, a failure counts a retry but never a DLQ: the
 	// DLQ decision needs a Redis-backed attempt count to know exhaustion.
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &fixedExecutor{err: true})}, silentLogger(), m)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 	ctx := stream.WithDeliveryAttempt(context.Background(), 2)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
@@ -266,14 +226,14 @@ func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
 	}
 }
 
-func TestHandleNilMetricsSafe(t *testing.T) {
+func TestHandleWithNilMetricsDoesNotPanic(t *testing.T) {
 	// NewWithMetrics(nil registry) must not panic when handling succeeds/fails.
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{})}, silentLogger(), nil)
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), nil)
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
-	rf := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &fixedExecutor{err: true})}, silentLogger(), nil)
+	rf := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), nil)
 	if err := rf.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
 	}

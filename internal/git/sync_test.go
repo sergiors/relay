@@ -97,7 +97,9 @@ func updateFnAndAdd(t *testing.T, e testEnv, branch, fnName, content, extraName 
 	t.Helper()
 	r, _ := git.PlainOpen(e.work)
 	wt, _ := r.Worktree()
-	if err := wt.Checkout(&git.CheckoutOptions{Branch: plumbing.ReferenceName("refs/heads/" + branch), Force: true}); err != nil {
+	if err := wt.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.ReferenceName("refs/heads/" + branch), Force: true,
+	}); err != nil {
 		t.Fatalf("checkout %s: %v", branch, err)
 	}
 	writeFile(t, filepath.Join(e.work, fnName, "template.yaml"), content)
@@ -119,7 +121,9 @@ func removeFnFromRepo(t *testing.T, e testEnv, branch, fnName string) {
 	t.Helper()
 	r, _ := git.PlainOpen(e.work)
 	wt, _ := r.Worktree()
-	if err := wt.Checkout(&git.CheckoutOptions{Branch: plumbing.ReferenceName("refs/heads/" + branch), Force: true}); err != nil {
+	if err := wt.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.ReferenceName("refs/heads/" + branch), Force: true,
+	}); err != nil {
 		t.Fatalf("checkout %s: %v", branch, err)
 	}
 	// Remove every tracked file under the function dir first (git rm), then the
@@ -236,8 +240,10 @@ func TestMonorepoSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("worktree: %v", err)
 	}
-	writeFile(t, filepath.Join(e.work, "services", "funa", "template.yaml"), "runtime: node24\nevents:\n  - handler: a.handler\n")
-	writeFile(t, filepath.Join(e.work, "services", "funb", "template.yaml"), "runtime: node24\nevents:\n  - handler: b.handler\n")
+	writeFile(t, filepath.Join(e.work, "services", "funa", "template.yaml"),
+		"runtime: node24\nevents:\n  - handler: a.handler\n")
+	writeFile(t, filepath.Join(e.work, "services", "funb", "template.yaml"),
+		"runtime: node24\nevents:\n  - handler: b.handler\n")
 	writeFile(t, filepath.Join(e.work, "services", "README.md"), "# services\n")
 	writeFile(t, filepath.Join(e.work, "services", "vendor", "lib.go"), "package vendor\n")
 	for _, p := range []string{
@@ -250,7 +256,8 @@ func TestMonorepoSync(t *testing.T) {
 			t.Fatalf("add %s: %v", p, err)
 		}
 	}
-	if _, err := wt.Commit("monorepo layout", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()}}); err != nil {
+	if _, err := wt.Commit("monorepo layout",
+		&git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@e", When: time.Now()}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	h, _ := r.Head()
@@ -420,7 +427,8 @@ func TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged(t *testing.T) {
 	}
 	// The distinct structured diagnostics are retained (operational records for
 	// the background sync path, not duplicates of the writer wording).
-	for _, diag := range []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"} {
+	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"}
+	for _, diag := range diags {
 		if !strings.Contains(logBuf.String(), diag) {
 			t.Fatalf("log missing diagnostic %q:\n%s", diag, logBuf.String())
 		}
@@ -441,7 +449,8 @@ func TestSyncBackgroundLogsDiagnosticsWithoutOut(t *testing.T) {
 	if err := SyncFromConfig(context.Background(), o, cfg); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	for _, diag := range []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"} {
+	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"}
+	for _, diag := range diags {
 		if !strings.Contains(logBuf.String(), diag) {
 			t.Fatalf("background log missing diagnostic %q:\n%s", diag, logBuf.String())
 		}

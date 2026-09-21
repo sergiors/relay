@@ -74,8 +74,9 @@ func gitCommand() *cli.Command {
 					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit to sync (default " + git.DefaultRef + ")"},
 					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repo"},
 					&cli.StringFlag{
-						Name:  "webhook-secret",
-						Usage: "name of the secret holding the GitHub webhook secret (optional; when set, webhook deliveries must be signed with this secret)",
+						Name: "webhook-secret",
+						Usage: "name of the secret holding the GitHub webhook secret " +
+							"(optional; when set, webhook deliveries must be signed with this secret)",
 					},
 				},
 				Arguments: []cli.Argument{

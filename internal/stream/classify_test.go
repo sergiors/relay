@@ -11,17 +11,18 @@ import (
 func TestClassifyMessage(t *testing.T) {
 	validEvent := `{"event_id":"1","status":"COMPLETED"}`
 	tests := []struct {
-		name    string
-		values  map[string]any
-		wantErr bool
+		name       string
+		values     map[string]any
+		wantErr    bool
+		wantReason string // required when wantErr; a stable fragment of the error text
 	}{
-		{"missing event field", map[string]any{}, true},
-		{"event not a string", map[string]any{"event": 42}, true},
-		{"event invalid JSON", map[string]any{"event": `{oops`}, true},
-		{"event array JSON", map[string]any{"event": `[1,2,3]`}, true},
-		{"event scalar JSON", map[string]any{"event": `"hello"`}, true},
-		{"event null JSON", map[string]any{"event": `null`}, true},
-		{"event valid object", map[string]any{"event": validEvent}, false},
+		{"missing event field", map[string]any{}, true, "missing 'event' field"},
+		{"event not a string", map[string]any{"event": 42}, true, "'event' field is not a string"},
+		{"event invalid JSON", map[string]any{"event": `{oops`}, true, "decode event:"},
+		{"event array JSON", map[string]any{"event": `[1,2,3]`}, true, "decode event:"},
+		{"event scalar JSON", map[string]any{"event": `"hello"`}, true, "decode event:"},
+		{"event null JSON", map[string]any{"event": `null`}, true, "'event' decodes to null"},
+		{"event valid object", map[string]any{"event": validEvent}, false, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -29,6 +30,9 @@ func TestClassifyMessage(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.wantReason) {
+					t.Fatalf("error = %q, want it to contain %q", err.Error(), tt.wantReason)
 				}
 				return
 			}
@@ -49,8 +53,19 @@ func TestDLQPayload(t *testing.T) {
 		p["event"] != `{"a":1}` || p["reason"] != "boom" || p["attempts"] != int64(3) {
 		t.Fatalf("unexpected payload: %v", p)
 	}
-	if ts, ok := p["timestamp"].(string); !ok || ts != time.Now().UTC().Format(time.RFC3339) {
-		t.Fatalf("timestamp field invalid: %v", p["timestamp"])
+	// The timestamp is generated inside dlqPayload, so parse it and compare the
+	// instant within a small tolerance rather than re-deriving it (a second
+	// boundary between the two time.Now calls would fail spuriously).
+	ts, ok := p["timestamp"].(string)
+	if !ok {
+		t.Fatalf("timestamp field is not a string: %v", p["timestamp"])
+	}
+	parsed, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		t.Fatalf("timestamp %q is not RFC3339: %v", ts, err)
+	}
+	if delta := time.Since(parsed); delta < -5*time.Second || delta > 5*time.Second {
+		t.Fatalf("timestamp %q is not near now (delta %s)", ts, delta)
 	}
 }
 
@@ -65,32 +80,5 @@ func TestEventStringFallback(t *testing.T) {
 	}
 	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{"event": 7}}); got != "-" {
 		t.Fatalf("expected fallback '-' for non-string, got %q", got)
-	}
-}
-
-func TestNewConsumerDefaults(t *testing.T) {
-	c := NewConsumer(ConsumerConfig{Client: redis.NewClient(&redis.Options{}), Stream: "events"})
-	if c.dlqStream != "relay:events:dlq" {
-		t.Errorf("dlqStream = %q, want relay:events:dlq", c.dlqStream)
-	}
-	if c.minPendingIdle != DefaultReclaimInterval {
-		t.Errorf("minPendingIdle default = %s, want DefaultReclaimInterval = %s", c.minPendingIdle, DefaultReclaimInterval)
-	}
-	if c.reclaimInterval != time.Minute {
-		t.Errorf("reclaimInterval default = %s, want 1m", c.reclaimInterval)
-	}
-	// Invariant: the consumer is always constructed with a functional
-	// invocation-state store (the production path supplies a Redis-backed one).
-	if c.invStateStore == nil {
-		t.Error("invStateStore is nil, want non-nil (consumer must always carry an invocation-state store)")
-	}
-}
-
-func TestConsumerNameInDLQPayload(t *testing.T) {
-	// Sanity: the consumer name flows into the DLQ entry, which matters for
-	// attribution during a restart scenario.
-	p := dlqPayload("events", "1-0", "relay", "consumer-b", "", "err", 1)
-	if got := p["consumer"].(string); strings.Contains(got, "consumer-b") == false {
-		t.Fatalf("expected consumer name in payload, got %q", got)
 	}
 }

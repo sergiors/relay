@@ -22,7 +22,7 @@ func TestShutdownNoSendOnClosedChannel(t *testing.T) {
 	writeFnDir(t, root, "race-me")
 
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, nil)
+	r, _ := newTestReconciler(t, root, b, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.Start(ctx)
@@ -53,7 +53,7 @@ func TestWatchCleanupOnRenameRemovesDescendants(t *testing.T) {
 	}
 
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, nil)
+	r, _ := newTestReconciler(t, root, b, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -93,7 +93,7 @@ func TestWatchRecleanupOnRecreate(t *testing.T) {
 	old := filepath.Join(root, "a", "b")
 
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, nil)
+	r, _ := newTestReconciler(t, root, b, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

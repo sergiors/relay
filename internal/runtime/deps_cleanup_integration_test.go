@@ -11,6 +11,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
+	"relay/internal/testutil"
 )
 
 // TestIntegrationDependencyImageLabels verifies that a function built with a
@@ -21,7 +22,7 @@ import (
 // on the resulting image config (the build backend applies them as LABEL
 // equivalents), the mechanism the dependency GC reads for ownership.
 func TestIntegrationDependencyImageLabels(t *testing.T) {
-	cli := requireDocker(t)
+	cli := testutil.RequireDocker(t)
 	mgr, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -47,12 +48,17 @@ events:
 		t.Fatalf("prepare: %v", err)
 	}
 
-	// Exactly one NEW dependency image built.
-	newDeps := newDepTagsSince(ctx, cli, depBefore)
-	if len(newDeps) != 1 {
-		t.Fatalf("expected exactly one new dependency image, got %v", newDeps)
+	// Name the dependency image deterministically with the production helpers
+	// rather than inferring it from a before/after tag delta: the relay-dep-*
+	// namespace is content-addressed and shared daemon-wide, so a delta count
+	// races any other test/worker building the same manifest.
+	depRef := expectedDependencyRef(t, fn)
+	if p1.Dependency != depRef {
+		t.Fatalf("prepare dependency = %q, want %q", p1.Dependency, depRef)
 	}
-	depRef := newDeps[0]
+	if !imageExistsInDaemon(cli, ctx, depRef) {
+		t.Fatalf("dependency image %s must exist after prepare", depRef)
+	}
 	// The daemon normalizes a plain repo reference to a :latest tag; the
 	// function image's relay.dependency label carries the untagged repo (what
 	// depImageRef produces), so normalize the candidate before comparing.
@@ -68,7 +74,8 @@ events:
 		t.Fatalf("inspect dep image: %v", err)
 	}
 	if depInsp.Config == nil || depInsp.Config.Labels == nil {
-		t.Fatal("managed dependency image must carry config labels (ImageBuildOptions.Labels did not land on the image config)")
+		t.Fatal("managed dependency image must carry config labels " +
+			"(ImageBuildOptions.Labels did not land on the image config)")
 	}
 	dlbls := depInsp.Config.Labels
 	if dlbls[labelType] != ImageTypeDependency {
@@ -81,7 +88,8 @@ events:
 	// truncates the full fingerprint to the first 16 hex; depFP strips the
 	// daemon's normalized :latest suffix).
 	if !strings.HasPrefix(dlbls[labelFingerprint], depFP) {
-		t.Errorf("dep relay.fingerprint %q must be consistent with dep ref %q (prefix %q)", dlbls[labelFingerprint], depRef, depFP)
+		t.Errorf("dep relay.fingerprint %q must be consistent with dep ref %q (prefix %q)",
+			dlbls[labelFingerprint], depRef, depFP)
 	}
 
 	// The function image carries its own labels and references the dependency.
@@ -117,7 +125,8 @@ events:
 		t.Fatalf("re-inspect dep after reuse: %v", err)
 	}
 	if depIDAfter.ID != depIDBefore {
-		t.Errorf("dependency layer was rebuilt across a reuse Prepare (before %s after %s), want reuse", depIDBefore, depIDAfter.ID)
+		t.Errorf("dependency layer was rebuilt across a reuse Prepare (before %s after %s), want reuse",
+			depIDBefore, depIDAfter.ID)
 	}
 }
 
@@ -127,7 +136,7 @@ events:
 // removed the dependency layer is pruned. It also proves unmanaged images (a
 // relay-dep-* image with no relay.type label) are never touched.
 func TestIntegrationSharedDependencyGC(t *testing.T) {
-	cli := requireDocker(t)
+	cli := testutil.RequireDocker(t)
 	mgr, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()

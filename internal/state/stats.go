@@ -56,7 +56,7 @@ func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
 		 ON CONFLICT(id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
-		payload, now())
+		payload, c.nowString())
 	if err != nil {
 		c.log.Warn("State: record stats failed", "error", err)
 	}
@@ -101,7 +101,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 		// One timestamp for the whole snapshot, so the global row and every
 		// per-function row share the same updated_at (the previous explicit-
 		// column flush computed ts once too).
-		ts := now()
+		ts := c.nowString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)
 			 ON CONFLICT(id) DO UPDATE SET
