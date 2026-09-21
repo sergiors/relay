@@ -19,8 +19,8 @@ events:
 	if tmpl.Services != nil {
 		t.Fatalf("expected nil Services, got %#v", tmpl.Services)
 	}
-	if len(tmpl.Rules) != 1 {
-		t.Fatalf("expected 1 rule, got %d", len(tmpl.Rules))
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
 	}
 }
 
@@ -245,8 +245,8 @@ services:
     port: 3000
     replicas: 2
 `)
-	if len(tmpl.Rules) != 2 {
-		t.Fatalf("rules = %d, want 2", len(tmpl.Rules))
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("rules = %d, want 2", len(tmpl.Events))
 	}
 	if len(tmpl.Services) != 1 {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
@@ -272,8 +272,8 @@ services:
   - entrypoint: service.js
     port: 8080
 `)
-	if len(tmpl.Rules) != 1 {
-		t.Fatalf("rules = %d, want 1", len(tmpl.Rules))
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("rules = %d, want 1", len(tmpl.Events))
 	}
 	if len(tmpl.Schedules) != 1 || tmpl.Schedules[0].Handler != "jobs.cleanup.handler" {
 		t.Fatalf("schedules = %+v", tmpl.Schedules)
@@ -315,8 +315,8 @@ services:
 	if err != nil {
 		t.Fatalf("services-only template must parse: %v", err)
 	}
-	if len(tmpl.Rules) != 0 {
-		t.Fatalf("rules = %d, want 0", len(tmpl.Rules))
+	if len(tmpl.Events) != 0 {
+		t.Fatalf("rules = %d, want 0", len(tmpl.Events))
 	}
 	if len(tmpl.Services) != 1 || tmpl.Services[0].Entrypoint != "service.js" ||
 		tmpl.Services[0].Port != 3000 || tmpl.Services[0].Replicas != 2 {

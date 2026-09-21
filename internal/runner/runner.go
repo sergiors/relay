@@ -1003,7 +1003,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if !pf.available {
 			continue
 		}
-		for _, rule := range pf.fn.Template.MatchingRules(event) {
+		for _, rule := range pf.fn.Template.MatchingEventRules(event) {
 			matched = append(matched, pf.fn.Name+"/"+rule.Handler)
 		}
 	}
@@ -1012,7 +1012,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if !pf.available {
 			continue
 		}
-		rules := pf.fn.Template.MatchingRules(event)
+		rules := pf.fn.Template.MatchingEventRules(event)
 		// A function is "involved" in an event when at least one of its rules
 		// matches, regardless of whether the execution later fails. This is the
 		// functions-engaged counter: an event matching two functions counts once

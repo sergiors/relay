@@ -267,7 +267,7 @@ func TestInvokeHandlerObsoleteScheduleHandlerRemoved(t *testing.T) {
 			Name: "fn",
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}}},
+				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}}},
 			},
 		},
 		&runtime.Prepared{Name: "fn", Image: "x"},

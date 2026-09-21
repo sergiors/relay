@@ -17,7 +17,7 @@ func mustParse(t *testing.T, yaml string) *Template {
 
 func matches(t *testing.T, tmpl *Template, event map[string]any) bool {
 	t.Helper()
-	return len(tmpl.MatchingRules(event)) > 0
+	return len(tmpl.MatchingEventRules(event)) > 0
 }
 
 func TestImplicitEquality(t *testing.T) {

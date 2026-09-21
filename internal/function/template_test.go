@@ -57,7 +57,7 @@ events:
 	}
 }
 
-func TestParseRuleMissingHandler(t *testing.T) {
+func TestParseEventRuleMissingHandler(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: python3.14
 events:
@@ -69,7 +69,7 @@ events:
 	}
 }
 
-func TestParseRuleMissingPattern(t *testing.T) {
+func TestParseEventRuleMissingPattern(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: python3.14
 events:
@@ -98,11 +98,11 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	if len(tmpl.Rules) != 1 {
-		t.Fatalf("expected 1 rule, got %d", len(tmpl.Rules))
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
 	}
-	if tmpl.Rules[0].Handler != "handler.main" {
-		t.Errorf("expected handler.main, got %q", tmpl.Rules[0].Handler)
+	if tmpl.Events[0].Handler != "handler.main" {
+		t.Errorf("expected handler.main, got %q", tmpl.Events[0].Handler)
 	}
 }
 
@@ -114,11 +114,11 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	if len(tmpl.Rules) != 1 {
-		t.Fatalf("expected 1 rule, got %d", len(tmpl.Rules))
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
 	}
-	if tmpl.Rules[0].Handler != "src.email.send" {
-		t.Errorf("expected src.email.send, got %q", tmpl.Rules[0].Handler)
+	if tmpl.Events[0].Handler != "src.email.send" {
+		t.Errorf("expected src.email.send, got %q", tmpl.Events[0].Handler)
 	}
 }
 
@@ -148,7 +148,7 @@ events:
 	}
 }
 
-func TestMatchingRulesExactlyOne(t *testing.T) {
+func TestMatchingEventRulesExactlyOne(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -159,7 +159,7 @@ events:
     pattern:
       status: [FAILED]
 `)
-	rules := tmpl.MatchingRules(map[string]any{"status": "COMPLETED"})
+	rules := tmpl.MatchingEventRules(map[string]any{"status": "COMPLETED"})
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 matching rule, got %d", len(rules))
 	}
@@ -168,7 +168,7 @@ events:
 	}
 }
 
-func TestMatchingRulesMultiple(t *testing.T) {
+func TestMatchingEventRulesMultiple(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -179,7 +179,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	rules := tmpl.MatchingRules(map[string]any{"status": "COMPLETED"})
+	rules := tmpl.MatchingEventRules(map[string]any{"status": "COMPLETED"})
 	if len(rules) != 2 {
 		t.Fatalf("expected 2 matching rules, got %d", len(rules))
 	}
@@ -188,7 +188,7 @@ events:
 	}
 }
 
-func TestMatchingRulesDifferentHandlers(t *testing.T) {
+func TestMatchingEventRulesDifferentHandlers(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -199,7 +199,7 @@ events:
     pattern:
       status: [FAILED]
 `)
-	rules := tmpl.MatchingRules(map[string]any{"status": "FAILED"})
+	rules := tmpl.MatchingEventRules(map[string]any{"status": "FAILED"})
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 matching rule, got %d", len(rules))
 	}
@@ -208,7 +208,7 @@ events:
 	}
 }
 
-func TestMatchingRulesSameHandler(t *testing.T) {
+func TestMatchingEventRulesSameHandler(t *testing.T) {
 	// Two matching rules referencing the same handler: both are returned.
 	tmpl := mustParse(t, `
 runtime: python3.14
@@ -220,7 +220,7 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	rules := tmpl.MatchingRules(map[string]any{"status": "COMPLETED"})
+	rules := tmpl.MatchingEventRules(map[string]any{"status": "COMPLETED"})
 	if len(rules) != 2 {
 		t.Fatalf("expected 2 matching rules, got %d", len(rules))
 	}
@@ -229,7 +229,7 @@ events:
 	}
 }
 
-func TestMatchingRulesNone(t *testing.T) {
+func TestMatchingEventRulesNone(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -237,13 +237,13 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	rules := tmpl.MatchingRules(map[string]any{"status": "FAILED"})
+	rules := tmpl.MatchingEventRules(map[string]any{"status": "FAILED"})
 	if len(rules) != 0 {
 		t.Fatalf("expected 0 matching rules, got %d", len(rules))
 	}
 }
 
-func TestParseRuleMissingTimeoutDefaults(t *testing.T) {
+func TestParseEventRuleMissingTimeoutDefaults(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -251,14 +251,14 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	if got := tmpl.Rules[0].Timeout; got != DefaultTimeout {
+	if got := tmpl.Events[0].Timeout; got != DefaultTimeout {
 		t.Errorf("missing timeout rule = %s, want default %s", got, DefaultTimeout)
 	}
 }
 
-// TestParseRuleMissingRetriesDefaults pins the default retry count for a rule
+// TestParseEventRuleMissingRetriesDefaults pins the default retry count for a rule
 // that omits `retries`.
-func TestParseRuleMissingRetriesDefaults(t *testing.T) {
+func TestParseEventRuleMissingRetriesDefaults(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -266,14 +266,14 @@ events:
     pattern:
       status: [COMPLETED]
 `)
-	if got := tmpl.Rules[0].Retries; got != DefaultRetries {
+	if got := tmpl.Events[0].Retries; got != DefaultRetries {
 		t.Errorf("missing retries rule = %d, want default %d", got, DefaultRetries)
 	}
 }
 
-// TestParseRuleExplicitRetries verifies an explicit non-negative `retries` is
+// TestParseEventRuleExplicitRetries verifies an explicit non-negative `retries` is
 // honored, including zero (only the initial attempt).
-func TestParseRuleExplicitRetries(t *testing.T) {
+func TestParseEventRuleExplicitRetries(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -282,7 +282,7 @@ events:
       status: [COMPLETED]
     retries: 2
 `)
-	if got := tmpl.Rules[0].Retries; got != 2 {
+	if got := tmpl.Events[0].Retries; got != 2 {
 		t.Errorf("explicit retries = %d, want 2", got)
 	}
 
@@ -294,16 +294,16 @@ events:
       status: [COMPLETED]
     retries: 0
 `)
-	if got := zero.Rules[0].Retries; got != 0 {
+	if got := zero.Events[0].Retries; got != 0 {
 		t.Errorf("retries: 0 = %d, want 0", got)
 	}
 }
 
-// TestParseRuleRetriesRejected verifies that a negative or non-integer `retries`
+// TestParseEventRuleRetriesRejected verifies that a negative or non-integer `retries`
 // fails template validation with a clear message. yaml.v3 decodes "1.5" as a
 // float and "abc"/"true" as non-integers, so they must be rejected rather than
 // silently truncated or coerced.
-func TestParseRuleRetriesRejected(t *testing.T) {
+func TestParseEventRuleRetriesRejected(t *testing.T) {
 	cases := []struct {
 		name    string
 		retries string
@@ -333,7 +333,7 @@ events:
 	}
 }
 
-func TestParseRuleExplicitTimeout(t *testing.T) {
+func TestParseEventRuleExplicitTimeout(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -342,13 +342,13 @@ events:
       status: [COMPLETED]
     timeout: 20s
 `)
-	got := tmpl.Rules[0].Timeout
+	got := tmpl.Events[0].Timeout
 	if want := 20 * time.Second; got != want {
 		t.Errorf("explicit timeout rule = %s, want %s", got, want)
 	}
 }
 
-func TestParseRuleTimeoutRejected(t *testing.T) {
+func TestParseEventRuleTimeoutRejected(t *testing.T) {
 	cases := []struct {
 		name    string
 		timeout string
@@ -375,9 +375,9 @@ events:
 	}
 }
 
-// TestParseRuleTimeoutMaxBoundary verifies the MaxTimeout cap: exactly MaxTimeout
+// TestParseEventRuleTimeoutMaxBoundary verifies the MaxTimeout cap: exactly MaxTimeout
 // parses, while anything above it is rejected with an error mentioning the max.
-func TestParseRuleTimeoutMaxBoundary(t *testing.T) {
+func TestParseEventRuleTimeoutMaxBoundary(t *testing.T) {
 	// Exactly MaxTimeout is accepted.
 	tmpl := mustParse(t, `
 runtime: python3.14
@@ -387,7 +387,7 @@ events:
       status: [COMPLETED]
     timeout: 5m
 `)
-	if got := tmpl.Rules[0].Timeout; got != MaxTimeout {
+	if got := tmpl.Events[0].Timeout; got != MaxTimeout {
 		t.Errorf("timeout = %s, want MaxTimeout %s", got, MaxTimeout)
 	}
 
@@ -671,7 +671,7 @@ events:
 	}
 }
 
-func TestMatchingRulesANDSemantics(t *testing.T) {
+func TestMatchingEventRulesANDSemantics(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -680,15 +680,15 @@ events:
       event_name: [MODIFY]
       table_name: [enrollments]
 `)
-	if len(tmpl.MatchingRules(map[string]any{"event_name": "MODIFY", "table_name": "enrollments"})) != 1 {
+	if len(tmpl.MatchingEventRules(map[string]any{"event_name": "MODIFY", "table_name": "enrollments"})) != 1 {
 		t.Error("expected match when both AND fields present")
 	}
-	if len(tmpl.MatchingRules(map[string]any{"event_name": "MODIFY", "table_name": "users"})) != 0 {
+	if len(tmpl.MatchingEventRules(map[string]any{"event_name": "MODIFY", "table_name": "users"})) != 0 {
 		t.Error("expected no match when one AND field differs")
 	}
 }
 
-func TestMatchingRulesORSemantics(t *testing.T) {
+func TestMatchingEventRulesORSemantics(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -696,13 +696,13 @@ events:
     pattern:
       status: [COMPLETED, FAILED]
 `)
-	if len(tmpl.MatchingRules(map[string]any{"status": "COMPLETED"})) != 1 {
+	if len(tmpl.MatchingEventRules(map[string]any{"status": "COMPLETED"})) != 1 {
 		t.Error("expected match for COMPLETED via OR")
 	}
-	if len(tmpl.MatchingRules(map[string]any{"status": "FAILED"})) != 1 {
+	if len(tmpl.MatchingEventRules(map[string]any{"status": "FAILED"})) != 1 {
 		t.Error("expected match for FAILED via OR")
 	}
-	if len(tmpl.MatchingRules(map[string]any{"status": "PENDING"})) != 0 {
+	if len(tmpl.MatchingEventRules(map[string]any{"status": "PENDING"})) != 0 {
 		t.Error("expected no match for PENDING")
 	}
 }

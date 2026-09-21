@@ -304,7 +304,7 @@ type fnSpec struct {
 	name        string
 	image       string
 	runtime     string
-	rules       []function.Rule
+	rules       []function.EventRule
 	schedules   []function.Schedule
 	concurrency int
 	env         map[string]string
@@ -326,7 +326,7 @@ func buildFn(spec fnSpec, exec Executor) *PreparedFunction {
 			Template: &function.Template{
 				Runtime:     spec.runtime,
 				Concurrency: spec.concurrency,
-				Rules:       spec.rules,
+				Events:      spec.rules,
 				Schedules:   spec.schedules,
 				Env:         spec.env,
 				Secrets:     spec.secrets,
@@ -338,8 +338,8 @@ func buildFn(spec fnSpec, exec Executor) *PreparedFunction {
 }
 
 // alwaysMatchRule is a single any-event rule with the default retry count.
-func alwaysMatchRule(timeout time.Duration) function.Rule {
-	return function.Rule{Handler: "index.run", Pattern: function.Pattern{}, Timeout: timeout, Retries: function.DefaultRetries}
+func alwaysMatchRule(timeout time.Duration) function.EventRule {
+	return function.EventRule{Handler: "index.run", Pattern: function.Pattern{}, Timeout: timeout, Retries: function.DefaultRetries}
 }
 
 // newFn builds a prepared function with no rules, used by registry-only tests.
@@ -352,21 +352,21 @@ func newFn(t *testing.T, name string) *PreparedFunction {
 // carries the default retry count.
 func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFunction {
 	t.Helper()
-	return buildFn(fnSpec{name: name, rules: []function.Rule{alwaysMatchRule(time.Second)}}, executor)
+	return buildFn(fnSpec{name: name, rules: []function.EventRule{alwaysMatchRule(time.Second)}}, executor)
 }
 
 // fp is a valid, always-matching prepared function whose executor doubles as an
 // ImageCleaner so the runner's resolver finds it.
 func fpClean(t *testing.T, name, image string, exec Executor) *PreparedFunction {
 	t.Helper()
-	return buildFn(fnSpec{name: name, image: image, rules: []function.Rule{alwaysMatchRule(time.Second)}}, exec)
+	return buildFn(fnSpec{name: name, image: image, rules: []function.EventRule{alwaysMatchRule(time.Second)}}, exec)
 }
 
 // fnWithTimeout builds a prepared function whose single rule matches any event
 // and carries the given handler timeout and the default retry count.
 func fnWithTimeout(t *testing.T, name string, timeout time.Duration, executor Executor) *PreparedFunction {
 	t.Helper()
-	return buildFn(fnSpec{name: name, rules: []function.Rule{alwaysMatchRule(timeout)}}, executor)
+	return buildFn(fnSpec{name: name, rules: []function.EventRule{alwaysMatchRule(timeout)}}, executor)
 }
 
 // fnWithRetries builds a prepared function whose single rule matches any event
@@ -375,7 +375,7 @@ func fnWithRetries(t *testing.T, name string, retries int, executor Executor) *P
 	t.Helper()
 	rule := alwaysMatchRule(time.Second)
 	rule.Retries = retries
-	return buildFn(fnSpec{name: name, rules: []function.Rule{rule}}, executor)
+	return buildFn(fnSpec{name: name, rules: []function.EventRule{rule}}, executor)
 }
 
 // fnWithConcurrency builds an always-matching function with the given template
@@ -384,14 +384,14 @@ func fnWithConcurrency(t *testing.T, name string, concurrency int, executor Exec
 	t.Helper()
 	rule := alwaysMatchRule(time.Second)
 	rule.Retries = 0
-	return buildFn(fnSpec{name: name, concurrency: concurrency, rules: []function.Rule{rule}}, executor)
+	return buildFn(fnSpec{name: name, concurrency: concurrency, rules: []function.EventRule{rule}}, executor)
 }
 
 // fnWithEnv builds a prepared function whose template carries env and secrets.
 func fnWithEnv(t *testing.T, name string, executor Executor, env map[string]string, secrets map[string]function.SecretRef) *PreparedFunction {
 	t.Helper()
 	rule := alwaysMatchRule(0)
-	return buildFn(fnSpec{name: name, rules: []function.Rule{rule}, env: env, secrets: secrets}, executor)
+	return buildFn(fnSpec{name: name, rules: []function.EventRule{rule}, env: env, secrets: secrets}, executor)
 }
 
 // schedFn returns a prepared function with an empty schedule-entry rule set but
@@ -410,7 +410,7 @@ func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeou
 	rule := alwaysMatchRule(scheduleTimeout)
 	return buildFn(fnSpec{
 		name:  name,
-		rules: []function.Rule{rule},
+		rules: []function.EventRule{rule},
 		schedules: []function.Schedule{{
 			Handler:  "index.run",
 			Cron:     "0 3 * * *",

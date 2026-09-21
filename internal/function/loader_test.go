@@ -39,8 +39,8 @@ events:
 	if fns[0].Template.Runtime != "python3.14" {
 		t.Errorf("expected runtime python3.14, got %q", fns[0].Template.Runtime)
 	}
-	if len(fns[0].Template.Rules) != 1 {
-		t.Errorf("expected 1 rule, got %d", len(fns[0].Template.Rules))
+	if len(fns[0].Template.Events) != 1 {
+		t.Errorf("expected 1 rule, got %d", len(fns[0].Template.Events))
 	}
 	if fns[0].Dir != filepath.Join(dir, "enrollment-events") {
 		t.Errorf("expected Dir %q, got %q", filepath.Join(dir, "enrollment-events"), fns[0].Dir)

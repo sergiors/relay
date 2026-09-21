@@ -611,8 +611,9 @@ func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
 }
 
 // regression #5: the function stays registered but its handler is removed from
-// the template rules, so MatchingRules no longer matches H. Redelivery matches
-// nothing → nil (ACK); the stale invocation-state field is not consulted.
+// the template event rules, so MatchingEventRules no longer matches H. Redelivery
+// matches nothing → nil (ACK); the stale invocation-state field is not
+// consulted.
 func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 	exec := &countingExecutor{}
 	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
@@ -628,7 +629,7 @@ func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 			Name: "alpha",
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{},
+				Events:  []function.EventRule{},
 			},
 		},
 		&runtime.Prepared{Name: "alpha", Image: "x"},

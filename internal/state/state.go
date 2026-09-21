@@ -730,7 +730,7 @@ func replaceHandlers(tx *sql.Tx, name string, tmpl *function.Template) error {
 	if _, err := tx.Exec(`DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
 		return err
 	}
-	for _, rule := range tmpl.Rules {
+	for _, rule := range tmpl.Events {
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO handlers (function_name, handler, timeout) VALUES (?,?,?)`,
 			name, rule.Handler, rule.Timeout.String()); err != nil {

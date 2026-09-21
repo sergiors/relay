@@ -278,7 +278,7 @@ func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleT
 			Name: scheduleFnName,
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: scheduleTimeout, Retries: function.DefaultRetries}},
+				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: scheduleTimeout, Retries: function.DefaultRetries}},
 				Schedules: []function.Schedule{{
 					Handler:  handler,
 					Cron:     "0 3 * * *",
@@ -615,7 +615,7 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 			Name: scheduleFnName,
 			Template: &function.Template{
 				Runtime: "node24",
-				Rules:   []function.Rule{{Handler: "index.run", Pattern: function.Pattern{}}},
+				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}}},
 				// No Schedules: the handler is removed.
 			},
 		},

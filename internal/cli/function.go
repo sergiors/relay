@@ -187,13 +187,15 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 	fmt.Fprintf(sw, "  Last DLQ:\t%s\n", lastAgo(fs.LastDLQAt))
 	sw.Flush()
 
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Events:")
-	hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-	for _, h := range d.Handlers {
-		fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
+	if len(d.Handlers) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Events:")
+		hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+		for _, h := range d.Handlers {
+			fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
+		}
+		hw.Flush()
 	}
-	hw.Flush()
 
 	// The Schedules section renders the template's cron schedules (handler,
 	// verbatim cron expression, effective timezone, resolved timeout). It is

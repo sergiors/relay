@@ -86,12 +86,12 @@ type SecretBinding struct {
 	Ref  SecretRef
 }
 
-// Template is a parsed template.yaml file: the runtime plus a list of rules,
-// each pairing a handler with a pattern invoked when the pattern matches, and
-// an optional list of cron schedules.
+// Template is a parsed template.yaml file: the runtime plus a list of event
+// rules, each pairing a handler with a pattern invoked when the pattern
+// matches, and an optional list of cron schedules.
 type Template struct {
 	Runtime string
-	Rules   []Rule
+	Events  []EventRule
 	// Concurrency bounds how many of this function's handler invocations may
 	// execute concurrently within a single Relay worker (per-function, per
 	// worker). It is always >= 1 after ParseTemplate; a Template constructed
@@ -129,7 +129,7 @@ type Schedule struct {
 	Timeout  time.Duration
 	// Retries is the number of additional executions attempted after the
 	// initial one (0 = only the initial attempt). Schedule entries carry the
-	// same semantics as Rule.Retries: it is always non-negative after
+	// same semantics as EventRule.Retries: it is always non-negative after
 	// ParseTemplate; omitted schedules default to DefaultRetries. The total
 	// number of attempts for a failing invocation is 1 + Retries.
 	Retries int
@@ -164,19 +164,19 @@ type Service struct {
 	Replicas int
 }
 
-// Rule pairs a handler (module.function) with a matching pattern and a resolved
-// invocation timeout. Timeout is always non-zero after ParseTemplate; omitted
-// rules default to DefaultTimeout.
-type Rule struct {
+// EventRule pairs a handler (module.function) with a matching pattern and a
+// resolved invocation timeout. Timeout is always non-zero after ParseTemplate;
+// omitted event rules default to DefaultTimeout.
+type EventRule struct {
 	Handler string
 	Pattern Pattern
-	// Timeout bounds a single invocation of this rule's handler. It is always
-	// positive and never exceeds MaxTimeout after ParseTemplate.
+	// Timeout bounds a single invocation of this event rule's handler. It is
+	// always positive and never exceeds MaxTimeout after ParseTemplate.
 	Timeout time.Duration
 	// Retries is the number of additional executions attempted after the
 	// initial one (0 = only the initial attempt). It is always non-negative
-	// after ParseTemplate; omitted rules default to DefaultRetries. The total
-	// number of attempts for a failing invocation is 1 + Retries.
+	// after ParseTemplate; omitted event rules default to DefaultRetries. The
+	// total number of attempts for a failing invocation is 1 + Retries.
 	Retries int
 }
 
@@ -493,7 +493,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			}
 			pattern[field] = parsed
 		}
-		t.Rules = append(t.Rules, Rule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
+		t.Events = append(t.Events, EventRule{Handler: ev.Handler, Pattern: pattern, Timeout: timeout, Retries: retries})
 	}
 
 	// Parse and validate the optional cron schedules. Each entry requires a

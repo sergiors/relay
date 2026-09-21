@@ -915,7 +915,7 @@ events:
 	}
 }
 
-// TestTemporalMultipleRules exercises MatchingRules with temporal rules: two
+// TestTemporalMultipleRules exercises MatchingEventRules with temporal rules: two
 // rules, one temporal and one numeric, asserting exactly which rule handlers are
 // returned when one, both, or neither pattern matches.
 func TestTemporalMultipleRules(t *testing.T) {
@@ -934,30 +934,30 @@ events:
 `, func() time.Time { return fixedNow })
 
 	// Only rule A (created_at fresh, score low).
-	onlyA := tmpl.MatchingRules(map[string]any{"created_at": "2026-09-12T10:00:00Z", "score": 50})
+	onlyA := tmpl.MatchingEventRules(map[string]any{"created_at": "2026-09-12T10:00:00Z", "score": 50})
 	if len(onlyA) != 1 || onlyA[0].Handler != "handler.aging" {
-		t.Errorf("MatchingRules single temporal rule = %v, want only handler.aging", ruleHandlers(onlyA))
+		t.Errorf("MatchingEventRules single temporal rule = %v, want only handler.aging", ruleHandlers(onlyA))
 	}
 
 	// Both rules.
-	both := tmpl.MatchingRules(map[string]any{"created_at": "2026-09-12T10:00:00Z", "score": 95})
+	both := tmpl.MatchingEventRules(map[string]any{"created_at": "2026-09-12T10:00:00Z", "score": 95})
 	if len(both) != 2 {
-		t.Fatalf("MatchingRules both = %d rules, want 2", len(both))
+		t.Fatalf("MatchingEventRules both = %d rules, want 2", len(both))
 	}
 	if both[0].Handler != "handler.aging" || both[1].Handler != "handler.score" {
-		t.Errorf("MatchingRules both = %v, want handler.aging then handler.score", ruleHandlers(both))
+		t.Errorf("MatchingEventRules both = %v, want handler.aging then handler.score", ruleHandlers(both))
 	}
 
 	// Neither rule.
-	none := tmpl.MatchingRules(map[string]any{"created_at": "2026-09-12T08:00:00Z", "score": 50})
+	none := tmpl.MatchingEventRules(map[string]any{"created_at": "2026-09-12T08:00:00Z", "score": 50})
 	if len(none) != 0 {
-		t.Errorf("MatchingRules neither = %d rules, want 0", len(none))
+		t.Errorf("MatchingEventRules neither = %d rules, want 0", len(none))
 	}
 }
 
 // ruleHandlers returns the handler names of a slice of rules, for readably
 // reporting mismatches in error messages.
-func ruleHandlers(rules []Rule) []string {
+func ruleHandlers(rules []EventRule) []string {
 	names := make([]string, len(rules))
 	for i, r := range rules {
 		names[i] = r.Handler

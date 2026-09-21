@@ -19,8 +19,8 @@ events:
 	if len(tmpl.Schedules) != 0 {
 		t.Fatalf("expected 0 schedules, got %d", len(tmpl.Schedules))
 	}
-	if len(tmpl.Rules) != 1 {
-		t.Fatalf("expected 1 rule, got %d", len(tmpl.Rules))
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
 	}
 }
 
@@ -299,7 +299,7 @@ schedules:
 	}
 }
 
-// A template with both events and schedules still yields correct Rules and
+// A template with both events and schedules still yields correct Events and
 // Schedules.
 func TestParseEventsAndSchedules(t *testing.T) {
 	tmpl := mustParse(t, `
@@ -316,11 +316,11 @@ schedules:
   - handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 `)
-	if len(tmpl.Rules) != 2 {
-		t.Fatalf("rules = %d, want 2", len(tmpl.Rules))
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("rules = %d, want 2", len(tmpl.Events))
 	}
-	if tmpl.Rules[1].Timeout != 20*time.Second {
-		t.Fatalf("rule 1 timeout = %s, want 20s", tmpl.Rules[1].Timeout)
+	if tmpl.Events[1].Timeout != 20*time.Second {
+		t.Fatalf("rule 1 timeout = %s, want 20s", tmpl.Events[1].Timeout)
 	}
 	if len(tmpl.Schedules) != 1 || tmpl.Schedules[0].Handler != "jobs.cleanup.handler" {
 		t.Fatalf("schedules = %+v", tmpl.Schedules)

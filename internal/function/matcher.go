@@ -4,12 +4,12 @@ import (
 	"reflect"
 )
 
-// MatchingRules returns every rule whose pattern matches the event, in
-// declaration order. Multiple rules may match; no deduplication is performed,
+// MatchingEventRules returns every event rule whose pattern matches the event,
+// in declaration order. Multiple rules may match; no deduplication is performed,
 // so two matching rules referencing the same handler are both returned.
-func (t *Template) MatchingRules(event map[string]any) []Rule {
-	var matched []Rule
-	for _, r := range t.Rules {
+func (t *Template) MatchingEventRules(event map[string]any) []EventRule {
+	var matched []EventRule
+	for _, r := range t.Events {
 		if r.Pattern.match(event) {
 			matched = append(matched, r)
 		}
