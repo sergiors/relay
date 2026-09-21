@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -30,9 +31,11 @@ var (
 )
 
 // engineFor returns the engine that prepares a spec. A single engine serves
-// every version registered for its language.
+// every version registered for its language. The handler-module list is passed
+// to Plan so the Node engine can transpile TypeScript handlers at build time;
+// the Python engine ignores it.
 func engineFor(spec plan.Spec) (interface {
-	Plan(plan.Spec, string) (plan.BuildPlan, error)
+	Plan(plan.Spec, string, []string) (plan.BuildPlan, error)
 }, error) {
 	switch spec.Engine {
 	case plan.EnginePython:
@@ -373,7 +376,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 	}
 
-	p, err := eng.Plan(spec, fn.Dir)
+	p, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
 	if err != nil {
 		return nil, fmt.Errorf("function %q: plan: %w", fn.Name, err)
 	}
@@ -494,6 +497,42 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		Concurrency: funcPrepared.Concurrency,
 		Dependency:  funcPrepared.Dependency,
 	}, nil
+}
+
+// templateHandlers returns the function's handler MODULE parts (the portion of
+// each `module.function` handler before the LAST dot), collected from the
+// template's event rules and cron schedules, sorted and deduped. Only the module
+// part is needed: it identifies the source file the engine must resolve (and, for
+// the Node engine, transpile when it is TypeScript). A nil template, a malformed
+// handler without a dot, and an empty module are skipped: template validation
+// already rejects them on the parse path, and this keeps Prepare total for
+// hand-built templates used by tests and direct callers.
+func templateHandlers(fn function.Function) []string {
+	if fn.Template == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	add := func(handler string) {
+		idx := strings.LastIndex(handler, ".")
+		if idx <= 0 {
+			return
+		}
+		module := handler[:idx]
+		if module == "" || seen[module] {
+			return
+		}
+		seen[module] = true
+		out = append(out, module)
+	}
+	for _, ev := range fn.Template.Events {
+		add(ev.Handler)
+	}
+	for _, s := range fn.Template.Schedules {
+		add(s.Handler)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resolveConcurrency returns the function's resolved per-function concurrency

@@ -145,7 +145,11 @@ func Load(logger *slog.Logger) Config {
 		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
 		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
-		TraefikPriority:     loadOptionalPositiveInt(logger, "TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", "")),
+		TraefikPriority: loadOptionalPositiveInt(
+			logger,
+			"TRAEFIK_PRIORITY",
+			getEnv("TRAEFIK_PRIORITY", ""),
+		),
 		TraefikHostOverride: getEnv("TRAEFIK_HOST_OVERRIDE", ""),
 		WarmContainerIdleTimeout: loadPositiveDuration(
 			logger,

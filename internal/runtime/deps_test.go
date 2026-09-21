@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"relay/internal/function"
 	"relay/internal/runtime/plan"
 )
 
@@ -333,4 +334,120 @@ func TestDependencyFingerprintConcurrent(t *testing.T) {
 			t.Fatalf("concurrent fingerprints diverged: %s vs %s", results[i], results[0])
 		}
 	}
+}
+
+// TestTypeScriptEditsInvalidateFunctionNotDependency pins the artifact split for
+// TypeScript handlers: a .ts source edit (or a tsconfig.json edit) changes the
+// function fingerprint — the transpiled output is baked into the function image —
+// while the dependency fingerprint is unchanged (it hashes the dependency
+// manifests only). A TS change therefore rebuilds the function image but reuses
+// the shared relay-dep-* layer.
+func TestTypeScriptEditsInvalidateFunctionNotDependency(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tsconfig.json"), []byte(`{"compilerOptions":{"strict":true}}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write tsconfig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	handlerPath := filepath.Join(dir, "src", "handler.ts")
+	if err := os.WriteFile(handlerPath, []byte("export function handler(e) { return 1; }\n"), 0o644); err != nil {
+		t.Fatalf("write handler.ts: %v", err)
+	}
+
+	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
+	deps := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+
+	funcBefore := fpOf(t, dir)
+	depBefore, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint: %v", err)
+	}
+
+	// Edit the TypeScript handler: it is function source, not dependency input.
+	if err := os.WriteFile(handlerPath, []byte("export function handler(e) { return 2; }\n"), 0o644); err != nil {
+		t.Fatalf("rewrite handler.ts: %v", err)
+	}
+	if got := fpOf(t, dir); got == funcBefore {
+		t.Error("editing a .ts handler must change the function fingerprint")
+	}
+	depAfterTS, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint: %v", err)
+	}
+	if depAfterTS != depBefore {
+		t.Error("a .ts source edit must NOT change the dependency fingerprint")
+	}
+
+	// Edit tsconfig.json: also function source (it shapes transpilation).
+	funcAfterTS := fpOf(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, "tsconfig.json"), []byte(`{"compilerOptions":{"strict":false}}`+"\n"), 0o644); err != nil {
+		t.Fatalf("rewrite tsconfig: %v", err)
+	}
+	if got := fpOf(t, dir); got == funcAfterTS {
+		t.Error("editing tsconfig.json must change the function fingerprint")
+	}
+	depAfterTSConfig, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint: %v", err)
+	}
+	if depAfterTSConfig != depBefore {
+		t.Error("a tsconfig.json edit must NOT change the dependency fingerprint")
+	}
+}
+
+// TestTypeScriptIgnoredFileChangesNeitherFingerprint pins the shared selection
+// policy for TypeScript: a .ts file matched by .gitignore is neither function
+// source nor dependency input, so editing it changes neither digest.
+func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.generated.ts\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "handler.ts"), []byte("export function handler(e) {}\n"), 0o644); err != nil {
+		t.Fatalf("write handler.ts: %v", err)
+	}
+	generatedPath := filepath.Join(dir, "scratch.generated.ts")
+	if err := os.WriteFile(generatedPath, []byte("export const a = 1\n"), 0o644); err != nil {
+		t.Fatalf("write generated.ts: %v", err)
+	}
+
+	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
+	deps := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+
+	funcBefore := fpOf(t, dir)
+	depBefore, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint: %v", err)
+	}
+
+	if err := os.WriteFile(generatedPath, []byte("export const a = 2\n"), 0o644); err != nil {
+		t.Fatalf("rewrite generated.ts: %v", err)
+	}
+	if got := fpOf(t, dir); got != funcBefore {
+		t.Error("editing a .gitignored .ts file must not change the function fingerprint")
+	}
+	depAfter, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
+	if err != nil {
+		t.Fatalf("dependency fingerprint: %v", err)
+	}
+	if depAfter != depBefore {
+		t.Error("editing a .gitignored .ts file must not change the dependency fingerprint")
+	}
+}
+
+// fpOf computes the function fingerprint for dir, failing the test on error.
+func fpOf(t *testing.T, dir string) string {
+	t.Helper()
+	f, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("function fingerprint: %v", err)
+	}
+	return f
 }

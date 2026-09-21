@@ -148,7 +148,7 @@ func TestEngineForSharedEngineDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("engineFor(%s): %v", name, err)
 		}
-		p, err := eng.Plan(spec, t.TempDir())
+		p, err := eng.Plan(spec, t.TempDir(), nil)
 		if err != nil {
 			t.Fatalf("plan(%s): %v", name, err)
 		}
@@ -169,7 +169,7 @@ func TestEngineForSharedEngineDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("engineFor(%s): %v", name, err)
 		}
-		p, err := eng.Plan(spec, t.TempDir())
+		p, err := eng.Plan(spec, t.TempDir(), nil)
 		if err != nil {
 			t.Fatalf("plan(%s): %v", name, err)
 		}

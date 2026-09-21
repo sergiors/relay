@@ -52,7 +52,7 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := t.TempDir()
 
-			p, err := Engine{}.Plan(spec, dir)
+			p, err := Engine{}.Plan(spec, dir, nil)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
@@ -119,7 +119,7 @@ func TestPlanWithRequirements(t *testing.T) {
 			dir := t.TempDir()
 			write(t, dir, "requirements.txt", "# comment\n")
 
-			p, err := Engine{}.Plan(spec, dir)
+			p, err := Engine{}.Plan(spec, dir, nil)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
@@ -146,7 +146,7 @@ func TestPlanRequirementsBesideUnrelatedPyproject(t *testing.T) {
 	write(t, dir, "requirements.txt", "six==1.16.0\n")
 	write(t, dir, "pyproject.toml", "[tool.black]\nline-length = 100\n")
 
-	p, err := Engine{}.Plan(testSpecs[0], dir)
+	p, err := Engine{}.Plan(testSpecs[0], dir, nil)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestPlanNativeUvProject(t *testing.T) {
 	// requirements.txt is deliberately also present: the committed lock must win.
 	write(t, dir, "requirements.txt", "six==1.16.0\n")
 
-	p, err := Engine{}.Plan(testSpecs[0], dir)
+	p, err := Engine{}.Plan(testSpecs[0], dir, nil)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestPlanNativeIncompleteErrors(t *testing.T) {
 			for name, content := range tc.files {
 				write(t, dir, name, content)
 			}
-			_, err := Engine{}.Plan(testSpecs[0], dir)
+			_, err := Engine{}.Plan(testSpecs[0], dir, nil)
 			if tc.wantOK && err != nil {
 				t.Fatalf("plan: unexpected error %v", err)
 			}
@@ -265,7 +265,7 @@ func TestPlanRequirementsOnlyInstallUsesUv(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "requirements.txt", "six==1.16.0\n")
 
-	p, err := Engine{}.Plan(testSpecs[0], dir)
+	p, err := Engine{}.Plan(testSpecs[0], dir, nil)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}

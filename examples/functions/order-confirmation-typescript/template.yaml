@@ -1,0 +1,6 @@
+runtime: node24
+
+events:
+  - handler: src.handler.handler
+    pattern:
+      type: [order.created]

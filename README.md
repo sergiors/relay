@@ -527,7 +527,9 @@ services:
 ```
 
 - `runtime` (required) selects the execution runtime. Only `python3.14` and
-  `node24` are supported; any other value fails validation.
+  `node24` are supported; any other value fails validation. On `node24` a
+  handler may be JavaScript **or** TypeScript (see _TypeScript handlers_); the
+  `handler` syntax is identical for both.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
 - `schedules` (optional) is a list of cron-triggered handlers; each entry
@@ -571,7 +573,10 @@ hour day-of-month month day-of-week`. The exact expression is shown by
   considered exhausted and the message is routed to the DLQ.
 - `handler` is split at the **last** dot: `events.created.handler` → module
   `events.created`, function `handler`. Handlers may live in nested modules
-  (for example the `events/` package), not only in top-level files.
+  (for example the `events/` package), not only in top-level files. On the
+  `node24` runtime the module may be a `.js`/`.mjs` file or a `.ts`/`.mts`
+  file (see _TypeScript handlers_); the handler string never carries an
+  extension.
 - `services` (optional) is a list of persistent long-running HTTP services (see
   _Services_ below). Each entry has a required `entrypoint` (an application
   entrypoint **file**, not the `module.function` form) plus optional `port`
@@ -1000,6 +1005,11 @@ set is byte-for-byte the host-only one.
 Base images are fixed; arbitrary base images are not allowed. Dependencies are
 installed **inside** the image at build time, never on the host.
 
+`node24` accepts **both** JavaScript and TypeScript handlers — TypeScript is
+transpiled and bundled by Relay at function **build** time with a pinned esbuild
+into generated `.mjs` JavaScript that the unchanged Node bootstrap executes (see
+_TypeScript handlers_ below).
+
 Python dependencies are installed with **uv**, never pip. The pinned uv binary
 (`ghcr.io/astral-sh/uv:0.12.17`) is copied into every Python runtime image (even
 one with no dependencies) by the generic Dockerfile renderer, and the dependency
@@ -1037,6 +1047,49 @@ attempting an import), imports it, and awaits a returned Promise.
 
 Adding a future runtime (e.g. `python3.15` or `node26`) requires only a new
 entry in the runtime registry map; the engine is reused.
+
+### TypeScript handlers
+
+On `node24`, a handler module may be a TypeScript file instead of a JavaScript
+one; the template syntax is identical and never carries an extension:
+
+```yaml
+runtime: node24
+
+events:
+  - handler: src.handler.handler   # resolves to src/handler.ts
+    pattern:
+      type: [order.created]
+```
+
+A module is resolved the same way the runtime bootstrap resolves it: the
+JavaScript candidates `base.mjs`, `base.js`, `base/index.mjs`, `base/index.js`
+are checked first (in that order). Only when none exists are the TypeScript
+candidates `base.mts`, `base.ts`, `base/index.mts`, `base/index.ts` checked.
+A module that resolves to both a JavaScript and a TypeScript source, or to
+neither, fails the **build** with a clear error instead of failing later per
+invocation.
+
+- TypeScript is transpiled and bundled by Relay at function **build** time, never
+  per invocation. A pinned **esbuild** (`0.28.2`) is installed into an ephemeral
+  layer with the base image's own `npm`, run once for all TypeScript handlers,
+  and removed again in the same image layer — the user's `package.json` never
+  needs esbuild and no build tooling reaches the execution layer.
+- The output is generated `.mjs` JavaScript written beside the source inside the
+  image (e.g. `src/handler.ts` → `src/handler.mjs`), which the existing Node
+  bootstrap resolves first and executes unchanged. Your function directory is
+  never modified (the build stages a temporary context).
+- Local `import`s across `.ts` modules work: the handler and its local module
+  graph are bundled together. Bare package imports stay **external** and resolve
+  at runtime from `/app/node_modules`, so dependencies continue to flow through
+  the normal dependency-image path.
+- A `tsconfig.json` present in the function directory is honored for
+  `compilerOptions` (e.g. `strict`, `experimentalDecorators`). Relay **does not
+  type-check**: esbuild only strips types. Run `tsc --noEmit` yourself in
+  development or CI if you want type checking.
+- This is a handler-level transpile, not a general frontend build pipeline.
+  React/Next/Vite-style builds need the custom build/Dockerfile service work,
+  which is out of scope by design.
 
 ## Handler contract
 
@@ -1737,6 +1790,13 @@ above.
   reads `event.new_image` and logs a welcome email. No `package.json` is
   provided, so Relay injects the ESM `package.json`. It omits `timeout`, so it
   exercises the `6s` default.
+
+- `examples/functions/order-confirmation-typescript/` (node24): a **TypeScript**
+  handler. A single rule `src.handler.handler` on `type: [order.created]`
+  resolves to `src/handler.ts`, which imports a local message module and a shared
+  event-type module (both `.ts`). Relay transpiles the graph to `src/handler.mjs`
+  at build time with the pinned esbuild; `tsconfig.json` and a committed
+  `package-lock.json` are present.
 
 - `examples/functions/users-api-node/` (node24): a persistent **service** — a
   small Fastify HTTP server (`service.js`) exposing `GET /health` and

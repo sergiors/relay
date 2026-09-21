@@ -319,7 +319,7 @@ func expectedDependencyRef(t *testing.T, fn function.Function) string {
 	if err != nil {
 		t.Fatalf("engine for %q: %v", fn.Template.Runtime, err)
 	}
-	p, err := eng.Plan(spec, fn.Dir)
+	p, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
 	if err != nil {
 		t.Fatalf("plan %q: %v", fn.Name, err)
 	}

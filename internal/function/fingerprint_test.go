@@ -292,3 +292,57 @@ func TestFingerprintNestedIgnoreRuleChangeDetected(t *testing.T) {
 		t.Fatal("editing a file ignored by a nested rule must not change the fingerprint")
 	}
 }
+
+// TestFingerprintTracksTypeScriptSources pins that TypeScript handlers are
+// ordinary selected source: editing a .ts file, editing the tsconfig.json, and
+// editing a locally imported .ts module each change the digest, so the function
+// artifact is rebuilt. Relay runs no type-checker, but the transpiled output is
+// baked into the image, so the sources must version it.
+func TestFingerprintTracksTypeScriptSources(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "tsconfig.json"), `{"compilerOptions":{"strict":true}}`+"\n")
+	writeFile(t, filepath.Join(dir, "src", "handler.ts"),
+		"import { msg } from \"./msg\";\nexport function handler(e) { console.log(msg(e)); }\n")
+	writeFile(t, filepath.Join(dir, "src", "msg.ts"), "export function msg(e) { return \"v1\"; }\n")
+	base := fp(t, dir)
+
+	// Editing the handler source.
+	writeFile(t, filepath.Join(dir, "src", "handler.ts"),
+		"import { msg } from \"./msg\";\nexport function handler(e) { console.log(msg(e) + \"!\"); }\n")
+	if got := fp(t, dir); got == base {
+		t.Fatal("editing a .ts handler must change the fingerprint")
+	}
+	handlerEdit := fp(t, dir)
+
+	// Editing a locally imported .ts module.
+	writeFile(t, filepath.Join(dir, "src", "msg.ts"), "export function msg(e) { return \"v2\"; }\n")
+	if got := fp(t, dir); got == handlerEdit {
+		t.Fatal("editing an imported .ts module must change the fingerprint")
+	}
+	msgEdit := fp(t, dir)
+
+	// Editing the tsconfig (it shapes the transpilation).
+	writeFile(t, filepath.Join(dir, "tsconfig.json"), `{"compilerOptions":{"strict":false}}`+"\n")
+	if got := fp(t, dir); got == msgEdit {
+		t.Fatal("editing tsconfig.json must change the fingerprint")
+	}
+}
+
+// TestFingerprintIgnoresIgnoredTypeScript pins that a .ts file excluded by the
+// function's .gitignore is not source: editing it changes neither the function
+// fingerprint nor the build context, reusing the shared selection policy (no
+// TypeScript-specific filtering).
+func TestFingerprintIgnoresIgnoredTypeScript(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, ".gitignore"), "*.generated.ts\n")
+	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
+	writeFile(t, filepath.Join(dir, "handler.ts"), "export function handler(e) {}\n")
+	writeFile(t, filepath.Join(dir, "scratch.generated.ts"), "export const scratch = 1\n")
+	base := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "scratch.generated.ts"), "export const scratch = 2\n")
+	if got := fp(t, dir); got != base {
+		t.Fatal("editing a .ts file ignored by .gitignore must not change the fingerprint")
+	}
+}

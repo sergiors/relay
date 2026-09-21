@@ -11,10 +11,11 @@ import (
 // bootstrapHash returns a short (16 hex char) sha256 over the plan's
 // runtime-injected files (the embedded bootstrap and anything else the engine
 // injects, e.g. a package.json), the externally copied runtime tools (the pinned
-// uv binary), AND the entrypoint. It is the content the relay.bootstrap image
-// label pins: an image whose label differs was built with a different (stale)
-// bootstrap or tool version and must be rebuilt even though its tag is
-// content-current for the function source.
+// uv binary), the build-time Install commands (e.g. the pinned esbuild
+// TypeScript transpilation), AND the entrypoint. It is the content the
+// relay.bootstrap image label pins: an image whose label differs was built with a
+// different (stale) bootstrap, tool version, or compile step and must be rebuilt
+// even though its tag is content-current for the function source.
 func bootstrapHash(p plan.BuildPlan) string {
 	h := sha256.New()
 	for _, f := range p.Files {
@@ -30,6 +31,9 @@ func bootstrapHash(p plan.BuildPlan) string {
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write([]byte(tc.Dest))
 		_, _ = h.Write([]byte{0})
+	}
+	for _, cmd := range p.Install {
+		hashField(h, cmd)
 	}
 	for _, e := range p.Entrypoint {
 		_, _ = h.Write([]byte(e))

@@ -3,6 +3,8 @@ package runtime
 import (
 	"reflect"
 	"testing"
+
+	"relay/internal/function"
 )
 
 // TestEnvMapParsesKeyValueAndLaterWins verifies the per-invocation env parsing:
@@ -40,6 +42,63 @@ func TestEnvMapParsesKeyValueAndLaterWins(t *testing.T) {
 			got := envMap(tc.in)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("envMap(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTemplateHandlersExtraction pins the handler-module extraction: module
+// parts only (everything before the LAST dot), collected from events and
+// schedules, sorted and deduped, with malformed entries skipped and a nil
+// template yielding nil.
+func TestTemplateHandlersExtraction(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   function.Function
+		want []string
+	}{
+		{name: "nil template", fn: function.Function{}},
+		{
+			name: "event modules",
+			fn: function.Function{Template: &function.Template{
+				Events: []function.EventRule{
+					{Handler: "handler.handler"},
+					{Handler: "src.order.handler"},
+				},
+			}},
+			want: []string{"handler", "src.order"},
+		},
+		{
+			name: "schedules deduped and sorted with events",
+			fn: function.Function{Template: &function.Template{
+				Events: []function.EventRule{
+					{Handler: "src.order.handler"},
+					{Handler: "handler.handler"},
+				},
+				Schedules: []function.Schedule{
+					{Handler: "src.order.cleanup"},
+					{Handler: "jobs.report.handler"},
+				},
+			}},
+			want: []string{"handler", "jobs.report", "src.order"},
+		},
+		{
+			name: "malformed handlers skipped",
+			fn: function.Function{Template: &function.Template{
+				Events: []function.EventRule{
+					{Handler: "nodot"},
+					{Handler: ".fn"},
+					{Handler: "ok.handler"},
+				},
+			}},
+			want: []string{"ok"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := templateHandlers(tc.fn)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("templateHandlers() = %v, want %v", got, tc.want)
 			}
 		})
 	}

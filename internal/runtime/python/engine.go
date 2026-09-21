@@ -104,7 +104,12 @@ const (
 //     set, so a native project whose lock is missing cannot be installed
 //     deterministically. Commit the lock (or use requirements.txt).
 //   - none: no dependency layer.
-func (Engine) Plan(spec plan.Spec, fnDir string) (plan.BuildPlan, error) {
+//
+// handlers is the function's handler MODULE parts, an input only the Node engine
+// needs (to transpile TypeScript at build time). Python handlers are resolved by
+// the runtime bootstrap exactly as before, so the list is intentionally unused
+// here; the parameter exists so both engines share one Plan signature.
+func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, error) {
 	files := []plan.File{{
 		Path:    "/relay/bootstrap.py",
 		Content: bootstrap,

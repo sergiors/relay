@@ -69,6 +69,21 @@ func TestBootstrapHashChangesWithInjectedContent(t *testing.T) {
 	if got := bootstrapHash(toolBumped); got == bootstrapHash(toolChanged) {
 		t.Error("changing the pinned tool version must change the bootstrap hash")
 	}
+
+	// Build-time Install commands (e.g. the pinned esbuild TypeScript
+	// transpilation) are image content too: a different compile step or esbuild
+	// version must change the hash so an older image is rebuilt under the same
+	// function fingerprint tag.
+	installAdded := base
+	installAdded.Install = []string{"npm install --prefix /tmp/relay-esbuild --no-save --silent esbuild@0.28.2"}
+	if got := bootstrapHash(installAdded); got == orig {
+		t.Error("adding a build Install command must change the bootstrap hash")
+	}
+	installBumped := installAdded
+	installBumped.Install = []string{"npm install --prefix /tmp/relay-esbuild --no-save --silent esbuild@0.29.0"}
+	if got := bootstrapHash(installBumped); got == bootstrapHash(installAdded) {
+		t.Error("changing the pinned esbuild version must change the bootstrap hash")
+	}
 }
 
 // TestBootstrapHashPinsFileBoundaries verifies the hash length-prefixes/separates
