@@ -879,12 +879,14 @@ func (r *Runner) runInvocation(
 // not acknowledge the message.
 //
 // At-least-once semantics: Handle returns an error after partial successes, so
-// a retried message re-runs the handlers that already succeeded. events_received
-// and events_processed count each delivery attempt that reaches the handler
-// handoff, so retries increment them too — they are delivery-attempt counters,
-// not unique-event counters. Handle does NOT claim exactly-once: redeliveries
-// re-run whatever is not yet recorded as complete, and the handlers must stay
-// idempotent.
+// a retried message re-runs the handlers that already succeeded. The event
+// classification counters (events_received/matched/unmatched_total) are NOT
+// delivery-attempt counters: each logical event is classified exactly once
+// across redeliveries/retries via an atomic claim in the message's
+// invocation-state hash (see stream.InvocationState.ClaimClassification). A
+// handler failure stays in the matched class. Handle does NOT claim
+// exactly-once execution: redeliveries re-run whatever is not yet recorded as
+// complete, and the handlers must stay idempotent.
 //
 // Aggregate, per-invocation semantics: a single Redis message can match multiple
 // "<function>/<handler>" invocations, and each is tracked independently in the
@@ -903,12 +905,12 @@ func (r *Runner) runInvocation(
 // — this or another replica may be executing it, or it is waiting out its
 // backoff), or is exhausted (terminal). Skipped invocations are not executions:
 // they do not touch the handler_* or function_handler_* metrics.
-// function_events_total still counts the function as engaged (it matched), which
-// is attribution, not execution counting. When no invocation state is present
-// (direct Handle callers/tests, or invocation tracking disabled) Handle behaves
-// exactly as before: it runs every matching handler and returns the first
-// failure's plain error immediately, with no invocation wrapping or DLQ
-// attribution.
+// function_events_matched_total still counts the function as engaged (it
+// matched), which is attribution, not execution counting. When no invocation
+// state is present (direct Handle callers/tests, or invocation tracking
+// disabled) Handle behaves exactly as before: it runs every matching handler
+// and returns the first failure's plain error immediately, with no invocation
+// wrapping or DLQ attribution.
 //
 // Return contract (with invocation state, aggregated after the full rule loop):
 //   - a plain (retryable) error when any matched invocation had a retryable
@@ -939,9 +941,6 @@ func (r *Runner) runInvocation(
 // invocation's context cancel is deferred so no timer leaks. Panics elsewhere
 // (startup, reconciler, Redis client) are not recovered here and stay fatal.
 func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any) error {
-	// A message received at the runner is one logical event handled across all
-	// matching rules. This is the message-level counter.
-	r.metrics.Inc(metrics.MetricEventsReceived)
 	// Best-effort delivery attempt, defaulting to 1 when the stream did not set
 	// it (e.g. when the runner is driven directly in tests). It is the delivery
 	// attempt used for logging; without invocation state the handler attempt is
@@ -976,16 +975,65 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 
 	// Pre-pass: collect every matched invocation ID so an exhausted attempt can
 	// decide whether the whole message is terminal (all matched invocations
-	// complete or exhausted). This must be complete before any execution, because
-	// a rule that exhausts early must still see the full set of matched
-	// invocations (including ones that sort later).
+	// complete or exhausted), and collect the engaged function names. The
+	// registry snapshot holds one entry per function, so a function with several
+	// matching rules is appended once here (deduped by construction). This must
+	// be complete before any execution, because a rule that exhausts early must
+	// still see the full set of matched invocations (including ones that sort
+	// later). Matching is pure; a panic here is a programming error that escapes
+	// and no counter has been touched yet.
 	var matched []string
+	var matchedFns []string
 	for _, pf := range snapshot {
 		if !pf.available {
 			continue
 		}
-		for _, rule := range pf.fn.Template.MatchingEventRules(event) {
+		rules := pf.fn.Template.MatchingEventRules(event)
+		if len(rules) == 0 {
+			continue
+		}
+		matchedFns = append(matchedFns, pf.fn.Name)
+		for _, rule := range rules {
 			matched = append(matched, pf.fn.Name+"/"+rule.Handler)
+		}
+	}
+
+	// Classify the logical event exactly once (received == matched +
+	// unmatched), regardless of delivery attempt. With invocation state the
+	// stream-injected handle claims the classification atomically in the
+	// message's invocation-state hash: only the first delivery across
+	// redeliveries, reclaims, and replicas wins, so retries never double-count.
+	// A claim error counts nothing (classification is a partition, so a missed
+	// count is preferable to a double count). Without invocation state (direct
+	// Handle callers/tests) there is no dedup channel, so each call is treated
+	// as a distinct logical event.
+	//
+	// A handler failure does NOT move the event out of the matched class: the
+	// classification is decided from matching alone, before any execution.
+	// Unmatched events are acknowledged and never retried.
+	classify := true
+	if hasState {
+		claimed, err := invState.ClaimClassification()
+		if err != nil {
+			classify = false
+		} else {
+			classify = claimed
+		}
+	}
+	if classify {
+		r.metrics.Inc(metrics.MetricEventsReceived)
+		if len(matchedFns) > 0 {
+			r.metrics.Inc(metrics.MetricEventsMatched)
+			// A function is "engaged" by an event when at least one of its
+			// rules matches, regardless of whether the execution later fails:
+			// an event matching two functions counts once per function here,
+			// while MetricEventsMatched counts it once globally.
+			for _, fnName := range matchedFns {
+				r.metrics.IncLabels(metrics.MetricFunctionEventsMatched,
+					[]metrics.Label{{Name: "function", Value: fnName}})
+			}
+		} else {
+			r.metrics.Inc(metrics.MetricEventsUnmatched)
 		}
 	}
 
@@ -994,15 +1042,6 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			continue
 		}
 		rules := pf.fn.Template.MatchingEventRules(event)
-		// A function is "involved" in an event when at least one of its rules
-		// matches, regardless of whether the execution later fails. This is the
-		// functions-engaged counter: an event matching two functions counts once
-		// per function here, while the message-level events_processed_total
-		// (stream) and events_received_total (above) count it once globally.
-		if len(rules) > 0 {
-			r.metrics.IncLabels(metrics.MetricFunctionEvents,
-				[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-		}
 		for _, rule := range rules {
 			// The invocation identity is stable across restarts and config
 			// reloads as long as the rule still exists: the function name and the
@@ -1675,10 +1714,10 @@ func handlerLogFields(hasState bool, fnName, handler, msgID string, handlerAttem
 // unlabeled total, per-function failure attribution, and the duration
 // histogram. A failed attempt that will retry still counts as a failure here
 // (it sets last_failure_at); only the DLQ-routed exhaustion additionally sets
-// last_dlq_at (see recordFailure). It deliberately does NOT touch
-// events_received/processed or function_events_total — the stream layer counts
-// events_processed_total for a schedule delivery (see stream.processScheduleMessage),
-// so those are not double-counted here.
+// last_dlq_at (see recordFailure). It deliberately does NOT touch the event
+// classification counters or function_events_matched_total — Handle owns those
+// and counts them once per logical event, so a failure must not be
+// double-attributed here.
 func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{

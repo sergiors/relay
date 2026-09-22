@@ -10,10 +10,12 @@ import (
 // keyed by function name (the relational function_stats.function_name column) so
 // each function's payload is attributed independently.
 //
-// Semantics (see runner.Handle): EventsProcessedTotal counts a function once
-// per event for which at least one of its rules matched — a functions-engaged
-// counter, distinct from the message-level global events_processed_total (an
+// Semantics (see runner.Handle): EventsMatchedTotal counts a function once per
+// logical event for which at least one of its rules matched — a
+// functions-engaged counter, distinct from the global events_matched_total (an
 // event matching two functions counts once globally, once per function here).
+// It is classified once per logical event across redeliveries. A handler
+// failure does not move the event out of the matched class.
 // HandlerSuccessTotal/HandlerFailureTotal are per rule execution.
 // RetryTotal counts every failing rule execution (a retry driver);
 // DLQTotal counts a function once when its failing rule execution is the one
@@ -50,19 +52,19 @@ type FunctionStats struct {
 	// legitimate reset is representable. The Last*At fields are omitted when
 	// empty, which is what lets an empty incoming value preserve the persisted
 	// timestamp during the flush merge.
-	EventsProcessedTotal int64  `json:"events_processed_total"`
-	HandlerSuccessTotal  int64  `json:"handler_success_total"`
-	HandlerFailureTotal  int64  `json:"handler_failure_total"`
-	RetryTotal           int64  `json:"retry_total"`
-	DLQTotal             int64  `json:"dlq_total"`
-	WarmAcquiresTotal    int64  `json:"warm_acquires_total"`
-	ColdStartsTotal      int64  `json:"cold_starts_total"`
-	DiscardedTotal       int64  `json:"discarded_total"`
-	LastExecutionAt      string `json:"last_execution_at,omitempty"`
-	LastSuccessAt        string `json:"last_success_at,omitempty"`
-	LastFailureAt        string `json:"last_failure_at,omitempty"`
-	LastDLQAt            string `json:"last_dlq_at,omitempty"`
-	UpdatedAt            string `json:"-"`
+	EventsMatchedTotal  int64  `json:"events_matched_total"`
+	HandlerSuccessTotal int64  `json:"handler_success_total"`
+	HandlerFailureTotal int64  `json:"handler_failure_total"`
+	RetryTotal          int64  `json:"retry_total"`
+	DLQTotal            int64  `json:"dlq_total"`
+	WarmAcquiresTotal   int64  `json:"warm_acquires_total"`
+	ColdStartsTotal     int64  `json:"cold_starts_total"`
+	DiscardedTotal      int64  `json:"discarded_total"`
+	LastExecutionAt     string `json:"last_execution_at,omitempty"`
+	LastSuccessAt       string `json:"last_success_at,omitempty"`
+	LastFailureAt       string `json:"last_failure_at,omitempty"`
+	LastDLQAt           string `json:"last_dlq_at,omitempty"`
+	UpdatedAt           string `json:"-"`
 }
 
 // RecordFunctionStats upserts the function_stats row for s.Function. It is a

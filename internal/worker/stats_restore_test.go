@@ -60,7 +60,7 @@ func TestRestoreToleratesCorruptGlobalJSON(t *testing.T) {
 	m := metrics.New()
 	restorePersistedStats(m, st) // must not panic
 
-	if got := m.Counter(metrics.MetricEventsProcessed); got != 0 {
+	if got := m.Counter(metrics.MetricEventsMatched); got != 0 {
 		t.Fatalf("events seeded from corrupt payload = %d, want 0", got)
 	}
 }
@@ -111,8 +111,8 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 
 	exec := time.Now().Add(-time.Minute).UTC()
 	m1 := metrics.New()
-	m1.Add(metrics.MetricEventsProcessed, 100)
-	m1.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m1.Add(metrics.MetricEventsMatched, 100)
+	m1.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}})
 	m1.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
 	m1.SetFunctionTimestamp("alpha", metrics.FunctionTimestampExecution, exec.Unix())
 	recordSnapshots(context.Background(), c1, m1, nil)
@@ -129,11 +129,11 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 
 	m2 := metrics.New()
 	restorePersistedStats(m2, c2)
-	if got := m2.Counter(metrics.MetricEventsProcessed); got != 100 {
+	if got := m2.Counter(metrics.MetricEventsMatched); got != 100 {
 		t.Fatalf("restored global events = %d, want 100", got)
 	}
 	a := byFunction(m2.FunctionStatsSnapshot(), "alpha")
-	if a.Events != 1 || a.WarmAcquiresTotal != 7 {
+	if a.EventsMatchedTotal != 1 || a.WarmAcquiresTotal != 7 {
 		t.Fatalf("restored alpha = %+v, want events 1 warm 7", a)
 	}
 	if a.LastExecution != exec.Unix() {
@@ -143,11 +143,11 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	// The first post-restart flush must write the same totals back.
 	recordSnapshots(context.Background(), c2, m2, nil)
 	gs, ok := c2.Stats()
-	if !ok || gs.EventsProcessedTotal != 100 {
+	if !ok || gs.EventsMatchedTotal != 100 {
 		t.Fatalf("global after restart flush = %+v, ok=%v; want events 100", gs, ok)
 	}
 	fa, ok := c2.FunctionStats("alpha")
-	if !ok || fa.EventsProcessedTotal != 1 || fa.WarmAcquiresTotal != 7 {
+	if !ok || fa.EventsMatchedTotal != 1 || fa.WarmAcquiresTotal != 7 {
 		t.Fatalf("alpha after restart flush = %+v, ok=%v", fa, ok)
 	}
 	if fa.LastExecutionAt != exec.Format(time.RFC3339) {
@@ -173,7 +173,9 @@ func openTempState(t *testing.T) *state.State {
 // are truncated to int64.
 func TestSnapshotStatsMapping(t *testing.T) {
 	m := metrics.New()
-	m.Add(metrics.MetricEventsProcessed, 10)
+	m.Add(metrics.MetricEventsReceived, 150)
+	m.Add(metrics.MetricEventsMatched, 10)
+	m.Add(metrics.MetricEventsUnmatched, 5)
 	m.Add(metrics.MetricHandlerSuccess, 7)
 	m.Add(metrics.MetricHandlerFailure, 3)
 	m.Add(metrics.MetricRetries, 2)
@@ -183,7 +185,9 @@ func TestSnapshotStatsMapping(t *testing.T) {
 
 	got := snapshotStats(m, nil)
 	want := state.Stats{
-		EventsProcessedTotal:    10,
+		EventsReceivedTotal:     150,
+		EventsMatchedTotal:      10,
+		EventsUnmatchedTotal:    5,
 		HandlerSuccessTotal:     7,
 		HandlerFailureTotal:     3,
 		RetryTotal:              2, // registry retries_total → stats RetryTotal
@@ -208,8 +212,8 @@ func TestSnapshotStatsNilRegistry(t *testing.T) {
 // mapping, indexed by function name.
 func TestFuncSnapshotStatsMapping(t *testing.T) {
 	m := metrics.New()
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "a"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "a"}})
 	m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "b"}})
 	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: "b"}})
@@ -223,7 +227,7 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 	if len(byName) != 2 {
 		t.Fatalf("len = %d, want 2: %+v", len(byName), got)
 	}
-	if a := byName["a"]; a.EventsProcessedTotal != 2 || a.HandlerSuccessTotal != 1 {
+	if a := byName["a"]; a.EventsMatchedTotal != 2 || a.HandlerSuccessTotal != 1 {
 		t.Fatalf("function a = %+v", a)
 	}
 	if b := byName["b"]; b.HandlerFailureTotal != 1 || b.RetryTotal != 1 || b.DLQTotal != 1 {
@@ -261,19 +265,27 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 	st := openTempState(t)
 
 	st.RecordStats(state.Stats{
-		EventsProcessedTotal: 100,
+		EventsReceivedTotal:  105,
+		EventsMatchedTotal:   100,
+		EventsUnmatchedTotal: 5,
 		HandlerSuccessTotal:  70,
 		HandlerFailureTotal:  30,
 		RetryTotal:           5,
 		DLQTotal:             2,
 	})
-	st.RecordFunctionStats(state.FunctionStats{Function: "alpha", EventsProcessedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
-	st.RecordFunctionStats(state.FunctionStats{Function: "beta", EventsProcessedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1})
+	st.RecordFunctionStats(state.FunctionStats{Function: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
+	st.RecordFunctionStats(state.FunctionStats{Function: "beta", EventsMatchedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1})
 
 	restorePersistedStats(m, st)
 
-	if got := m.Counter(metrics.MetricEventsProcessed); got != 100 {
-		t.Fatalf("events_processed_total = %d, want 100", got)
+	if got := m.Counter(metrics.MetricEventsReceived); got != 105 {
+		t.Fatalf("events_received_total = %d, want 105", got)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 100 {
+		t.Fatalf("events_matched_total = %d, want 100", got)
+	}
+	if got := m.Counter(metrics.MetricEventsUnmatched); got != 5 {
+		t.Fatalf("events_unmatched_total = %d, want 5", got)
 	}
 	if got := m.Counter(metrics.MetricHandlerSuccess); got != 70 {
 		t.Fatalf("handler_success_total = %d, want 70", got)
@@ -293,11 +305,11 @@ func TestRestorePersistedStatsSeedsRegistry(t *testing.T) {
 		t.Fatalf("FunctionStatsSnapshot len = %d, want 2: %+v", len(fs), fs)
 	}
 	alpha := byFunction(fs, "alpha")
-	if alpha.Events != 10 || alpha.HandlerSuccessTotal != 8 {
+	if alpha.EventsMatchedTotal != 10 || alpha.HandlerSuccessTotal != 8 {
 		t.Fatalf("alpha = %+v", alpha)
 	}
 	beta := byFunction(fs, "beta")
-	if beta.Events != 20 || beta.RetriesTotal != 3 {
+	if beta.EventsMatchedTotal != 20 || beta.RetriesTotal != 3 {
 		t.Fatalf("beta = %+v", beta)
 	}
 }
@@ -311,11 +323,11 @@ func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 1,
-		WarmAcquiresTotal:    7,
-		ColdStartsTotal:      3,
-		DiscardedTotal:       2,
+		Function:           "alpha",
+		EventsMatchedTotal: 1,
+		WarmAcquiresTotal:  7,
+		ColdStartsTotal:    3,
+		DiscardedTotal:     2,
 	})
 
 	restorePersistedStats(m, st)
@@ -428,11 +440,11 @@ func TestRestorePersistedStatsNilSafe(t *testing.T) {
 func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 	st := openTempState(t)
 	st.RecordStats(state.Stats{
-		EventsProcessedTotal: 100,
-		HandlerSuccessTotal:  70,
-		HandlerFailureTotal:  30,
-		RetryTotal:           5,
-		DLQTotal:             2,
+		EventsMatchedTotal:  100,
+		HandlerSuccessTotal: 70,
+		HandlerFailureTotal: 30,
+		RetryTotal:          5,
+		DLQTotal:            2,
 	})
 
 	// Fresh registry seeded from persisted values, as the worker does at startup.
@@ -465,8 +477,8 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 	if !ok {
 		t.Fatal("expected stats row after statsLoop")
 	}
-	if gs.EventsProcessedTotal != 100 {
-		t.Fatalf("events = %d, want 100 (persisted, not zeroed)", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 100 {
+		t.Fatalf("events = %d, want 100 (persisted, not zeroed)", gs.EventsMatchedTotal)
 	}
 	if gs.HandlerSuccessTotal != 70 {
 		t.Fatalf("success = %d, want 70", gs.HandlerSuccessTotal)
@@ -505,11 +517,11 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	// Seed the DB as if a prior process had run: "stale" succeeded (no dir on
 	// disk now) and both functions have per-function counters.
 	st.RecordReconcileSuccess("stale", "img", "fp", time.Now(), stateFunction("stale", keptDir))
-	st.RecordFunctionStats(state.FunctionStats{Function: "stale", EventsProcessedTotal: 5})
-	st.RecordFunctionStats(state.FunctionStats{Function: "kept", EventsProcessedTotal: 7})
+	st.RecordFunctionStats(state.FunctionStats{Function: "stale", EventsMatchedTotal: 5})
+	st.RecordFunctionStats(state.FunctionStats{Function: "kept", EventsMatchedTotal: 7})
 	// A cumulative global row, so restorePersistedStats seeds the registry's
 	// global counter and the first snapshot writes it back unchanged.
-	st.RecordStats(state.Stats{EventsProcessedTotal: 7})
+	st.RecordStats(state.Stats{EventsMatchedTotal: 7})
 
 	// Simulate the worker startup order: rebuild, prune, then seed the registry.
 	if err := st.RebuildFromFS(root); err != nil {
@@ -528,7 +540,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("AllFunctionStats len = %d, want 1 (only kept): %+v", len(all), all)
 	}
-	if all[0].Function != "kept" || all[0].EventsProcessedTotal != 7 {
+	if all[0].Function != "kept" || all[0].EventsMatchedTotal != 7 {
 		t.Fatalf("AllFunctionStats = %+v, want only kept events 7", all[0])
 	}
 	if _, ok := st.FunctionStats("stale"); ok {
@@ -541,7 +553,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	if len(fs) != 1 {
 		t.Fatalf("FunctionStatsSnapshot len = %d, want 1: %+v", len(fs), fs)
 	}
-	if fs[0].Function != "kept" || fs[0].Events != 7 {
+	if fs[0].Function != "kept" || fs[0].EventsMatchedTotal != 7 {
 		t.Fatalf("seeded registry = %+v, want only kept events 7", fs[0])
 	}
 
@@ -553,15 +565,15 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("AllFunctionStats after snapshot len = %d, want 1: %+v", len(all), all)
 	}
-	if all[0].Function != "kept" || all[0].EventsProcessedTotal != 7 {
+	if all[0].Function != "kept" || all[0].EventsMatchedTotal != 7 {
 		t.Fatalf("function_stats after snapshot = %+v, want only kept events 7", all[0])
 	}
 	gs, ok := st.Stats()
 	if !ok {
 		t.Fatal("expected global stats row after snapshot")
 	}
-	if gs.EventsProcessedTotal != 7 {
-		t.Fatalf("global events = %d, want 7 (from seeded kept registry)", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 7 {
+		t.Fatalf("global events = %d, want 7 (from seeded kept registry)", gs.EventsMatchedTotal)
 	}
 }
 
@@ -587,11 +599,11 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	exec := time.Now().Add(-time.Minute).UTC()
 	dlq := exec.Add(-time.Minute)
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 10,
-		LastExecutionAt:      exec.Format(time.RFC3339),
-		LastSuccessAt:        exec.Format(time.RFC3339),
-		LastDLQAt:            dlq.Format(time.RFC3339),
+		Function:           "alpha",
+		EventsMatchedTotal: 10,
+		LastExecutionAt:    exec.Format(time.RFC3339),
+		LastSuccessAt:      exec.Format(time.RFC3339),
+		LastDLQAt:          dlq.Format(time.RFC3339),
 	})
 
 	// Restore: the registry's unix-seconds timestamps must round-trip.
@@ -608,7 +620,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 
 	// Simulate ONE post-restart activity in the restored registry: the live
 	// (seeded) timestamps are republished untouched.
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
 	recordSnapshots(context.Background(), st, m, nil)
 	got, ok := st.FunctionStats("alpha")
@@ -624,7 +636,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// must keep the persisted timestamps (an empty incoming value never
 	// clobbers them).
 	fresh := metrics.New()
-	fresh.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
+	fresh.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}})
 	recordSnapshots(context.Background(), st, fresh, nil)
 	got, ok = st.FunctionStats("alpha")
 	if !ok {
@@ -646,10 +658,10 @@ func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
 	st := openTempState(t)
 	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 1,
-		LastExecutionAt:      "not-a-timestamp",
-		LastSuccessAt:        "",
+		Function:           "alpha",
+		EventsMatchedTotal: 1,
+		LastExecutionAt:    "not-a-timestamp",
+		LastSuccessAt:      "",
 	})
 
 	m := metrics.New()
@@ -665,9 +677,9 @@ func TestRestoreSkipsInvalidAndEmptyTimestamps(t *testing.T) {
 func TestFuncSnapshotStatsTimestampsMapping(t *testing.T) {
 	m := metrics.New()
 	ts := int64(1700000000)
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "a"}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "a"}})
 	m.SetFunctionTimestamp("a", metrics.FunctionTimestampExecution, ts)
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "b"}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "b"}})
 	m.SetFunctionTimestamp("b", metrics.FunctionTimestampDLQ, ts+60)
 
 	got := snapshotFunctionStats(m, nil)

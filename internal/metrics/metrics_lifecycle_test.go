@@ -15,7 +15,7 @@ func seedFunction(r *Registry, name string) {
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", name}, {"handler", "x"}})
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", name}, {"handler", "x"}})
 	r.IncLabels(MetricBuildFailures, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", name}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", name}})
 	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", name}})
 	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", name}})
 	r.IncLabels(MetricFunctionRetries, []Label{{"function", name}})
@@ -85,8 +85,8 @@ func assertFunctionSeries(t *testing.T, r *Registry, name string) {
 // seedGlobals sets distinctive global counters/gauges and returns their total
 // values so a test can assert they never change under function cleanup.
 func seedGlobals(r *Registry) map[string]int64 {
-	r.Inc(MetricEventsProcessed)
-	r.SeedCounter(MetricEventsProcessed, 4)
+	r.Inc(MetricEventsMatched)
+	r.SeedCounter(MetricEventsMatched, 4)
 	r.Inc(MetricDLQEntries)
 	r.Inc(MetricDLQEntries)
 	r.Inc(MetricRetries)
@@ -96,11 +96,11 @@ func seedGlobals(r *Registry) map[string]int64 {
 	r.Inc(MetricHandlerFailure)
 	r.SetGauge(MetricPendingEntries, 9)
 	return map[string]int64{
-		MetricEventsProcessed: 5, // 1 + 4 via SeedCounter
-		MetricDLQEntries:      2,
-		MetricRetries:         1,
-		MetricHandlerSuccess:  3,
-		MetricHandlerFailure:  1,
+		MetricEventsMatched:  5, // 1 + 4 via SeedCounter
+		MetricDLQEntries:     2,
+		MetricRetries:        1,
+		MetricHandlerSuccess: 3,
+		MetricHandlerFailure: 1,
 	}
 }
 
@@ -253,13 +253,13 @@ func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
 // not the pre-removal one.
 func TestRemoveFunctionReAddStartsFreshCount(t *testing.T) {
 	r := New()
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
 	r.RemoveFunction("foo")
 
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
 	s := r.Snapshot()
-	if !strings.Contains(s, "function_events_total{function=foo} count=1") {
+	if !strings.Contains(s, "function_events_matched_total{function=foo} count=1") {
 		t.Fatalf("re-added foo must count 1, not the stale value; got:\n%s", s)
 	}
 }
@@ -284,7 +284,7 @@ func TestSweepFunctionMetrics(t *testing.T) {
 
 	assertGlobalTotals(t, r, globals)
 	assertNoFunctionSeries(t, r, "remove")
-	if !seriesPresent(t, r.Snapshot(), MetricFunctionEvents, "keep") {
+	if !seriesPresent(t, r.Snapshot(), MetricFunctionEventsMatched, "keep") {
 		t.Fatal("keep's series must survive the sweep")
 	}
 
@@ -314,7 +314,7 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
-				r.IncLabels(MetricFunctionEvents, []Label{{"function", "foo"}})
+				r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
 				r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "foo"}})
 				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
 			}
@@ -363,7 +363,7 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 		t.Fatalf("foo must be absent from FunctionStatsSnapshot after convergence:\n%+v", r.FunctionStatsSnapshot())
 	}
 	assertNoFunctionSeries(t, r, "foo")
-	if !seriesPresent(t, r.Snapshot(), MetricFunctionEvents, "bar") {
+	if !seriesPresent(t, r.Snapshot(), MetricFunctionEventsMatched, "bar") {
 		t.Fatal("bar's series must survive the concurrent cleanup")
 	}
 	// Globals equal their exact seeded totals.

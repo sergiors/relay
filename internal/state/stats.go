@@ -6,17 +6,25 @@ import (
 )
 
 // Stats is the current operational snapshot of Relay's runtime, persisted as the
-// JSON payload of the single-row stats table. The monotonic counters
-// (events_processed, handler success/failure, retries, dlq) survive restarts and
-// always reflect the latest known totals; the gauge fields (pending_entries,
-// oldest_pending_age) are point-in-time snapshots of the backlog and are
-// replaced on every record.
+// JSON payload of the single-row stats table. The monotonic counters (events
+// received/matched/unmatched, handler success/failure, retries, dlq) survive
+// restarts and always reflect the latest known totals; the gauge fields
+// (pending_entries, oldest_pending_age) are point-in-time snapshots of the
+// backlog and are replaced on every record.
+//
+// The three event counters form a closed partition of the logical incoming
+// events the runner handled: EventsReceivedTotal == EventsMatchedTotal +
+// EventsUnmatchedTotal. Each logical event is classified exactly once across
+// redeliveries and retries; schedule occurrences are excluded (they bypass
+// event matching).
 //
 // The struct is the source of truth for the payload: JSON (un)marshalling is
 // centralized in stats_json.go and the stable relational metadata — the row id
 // and updated_at — stays a column (UpdatedAt is excluded from the payload).
 type Stats struct {
-	EventsProcessedTotal    int64  `json:"events_processed_total"`
+	EventsReceivedTotal     int64  `json:"events_received_total"`
+	EventsMatchedTotal      int64  `json:"events_matched_total"`
+	EventsUnmatchedTotal    int64  `json:"events_unmatched_total"`
 	HandlerSuccessTotal     int64  `json:"handler_success_total"`
 	HandlerFailureTotal     int64  `json:"handler_failure_total"`
 	RetryTotal              int64  `json:"retry_total"`
@@ -198,9 +206,10 @@ func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name stri
 // ResetStats returns the persisted cumulative statistics to their
 // fresh-install state in ONE transaction while PRESERVING the shape of the
 // stored rows: the global stats row and every per-function function_stats row
-// survive, decoded from their typed JSON payloads. The global row's five
-// cumulative counters (events/handler success/handler failure/retry/DLQ) are
-// zeroed; each function row's five event/handler counters plus the cumulative
+// survive, decoded from their typed JSON payloads. The global row's seven
+// cumulative counters (events received/matched/unmatched and
+// handler success/handler failure/retry/DLQ) are zeroed; each function row's
+// event-matched/handler counters plus the cumulative
 // warm-acquire/cold-start/discarded pool counters are zeroed, and its four
 // Last*At execution-history timestamps are cleared. The rows themselves are
 // rewritten in place (an UPDATE, never a DELETE), so a running worker's flush
@@ -247,7 +256,7 @@ func (c *State) ResetStats() error {
 	return err
 }
 
-// resetGlobalStatsTx zeroes the global stats row's five cumulative counters in
+// resetGlobalStatsTx zeroes the global stats row's cumulative counters in
 // tx while preserving the live backlog gauges and any other decoded field. An
 // absent, NULL, or empty row has nothing cumulative to zero and is left
 // untouched (creating one would falsely claim stats were recorded). A corrupt
@@ -267,9 +276,11 @@ func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) e
 	if err != nil {
 		return err
 	}
-	// Zero ONLY the five cumulative counters; the two gauges are live backlog
+	// Zero ONLY the cumulative counters; the two gauges are live backlog
 	// snapshots and are preserved (the next flush refreshes them).
-	s.EventsProcessedTotal = 0
+	s.EventsReceivedTotal = 0
+	s.EventsMatchedTotal = 0
+	s.EventsUnmatchedTotal = 0
 	s.HandlerSuccessTotal = 0
 	s.HandlerFailureTotal = 0
 	s.RetryTotal = 0
@@ -288,13 +299,13 @@ func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) e
 }
 
 // resetFunctionStatsTx zeroes every function_stats row's cumulative fields in
-// tx with an UPDATE per row (never a DELETE): the five event/handler counters,
-// the three warm-container pool counters, and the four Last*At timestamps. The
-// typed JSON payloads are read first into a slice (a single-connection SQLite
-// transaction cannot run an UPDATE while a SELECT is still open), then written
-// back. A corrupt payload returns the decode error, rolling the whole reset
-// back. Timestamps are cleared (not merged) because a reset is an explicit
-// erasure of execution history.
+// tx with an UPDATE per row (never a DELETE): the event-matched/handler
+// counters, the three warm-container pool counters, and the four Last*At
+// timestamps. The typed JSON payloads are read first into a slice (a
+// single-connection SQLite transaction cannot run an UPDATE while a SELECT is
+// still open), then written back. A corrupt payload returns the decode error,
+// rolling the whole reset back. Timestamps are cleared (not merged) because a
+// reset is an explicit erasure of execution history.
 func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	type row struct {
 		name string
@@ -324,7 +335,7 @@ func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string)
 		if err != nil {
 			return err
 		}
-		fs.EventsProcessedTotal = 0
+		fs.EventsMatchedTotal = 0
 		fs.HandlerSuccessTotal = 0
 		fs.HandlerFailureTotal = 0
 		fs.RetryTotal = 0

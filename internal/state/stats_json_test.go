@@ -11,7 +11,9 @@ import (
 // statsJSONKeys is the exact set of payload keys expected in stats.data. It
 // deliberately excludes the relational updated_at (and the id).
 var statsJSONKeys = []string{
-	"events_processed_total",
+	"events_received_total",
+	"events_matched_total",
+	"events_unmatched_total",
 	"handler_success_total",
 	"handler_failure_total",
 	"retry_total",
@@ -28,7 +30,7 @@ var statsJSONKeys = []string{
 // deliberately excludes the relational function_name and updated_at, and the
 // live pool gauges.
 var functionStatsJSONRequiredKeys = []string{
-	"events_processed_total",
+	"events_matched_total",
 	"handler_success_total",
 	"handler_failure_total",
 	"retry_total",
@@ -116,7 +118,7 @@ func assertJSONKeysAbsent(t *testing.T, data string, keys ...string) {
 func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	c := openTestState(t)
 	in := Stats{
-		EventsProcessedTotal:    12,
+		EventsMatchedTotal:      12,
 		HandlerSuccessTotal:     9,
 		HandlerFailureTotal:     3,
 		RetryTotal:              2,
@@ -155,16 +157,16 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	in := FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 5,
-		HandlerSuccessTotal:  4,
-		HandlerFailureTotal:  1,
-		RetryTotal:           1,
-		DLQTotal:             0,
-		WarmAcquiresTotal:    7,
-		ColdStartsTotal:      3,
-		DiscardedTotal:       2,
-		LastExecutionAt:      exec,
+		Function:            "alpha",
+		EventsMatchedTotal:  5,
+		HandlerSuccessTotal: 4,
+		HandlerFailureTotal: 1,
+		RetryTotal:          1,
+		DLQTotal:            0,
+		WarmAcquiresTotal:   7,
+		ColdStartsTotal:     3,
+		DiscardedTotal:      2,
+		LastExecutionAt:     exec,
 	}
 	c.RecordFunctionStats(in)
 
@@ -214,7 +216,7 @@ func TestStatsAbsentJSONFieldsZero(t *testing.T) {
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
 		`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)`,
-		`{"events_processed_total":7}`, "2020-01-01T00:00:00Z"); err != nil {
+		`{"events_matched_total":7}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed partial payload: %v", err)
 	}
 
@@ -222,8 +224,8 @@ func TestStatsAbsentJSONFieldsZero(t *testing.T) {
 	if !ok {
 		t.Fatal("expected readable stats row")
 	}
-	if s.EventsProcessedTotal != 7 {
-		t.Fatalf("events = %d, want 7", s.EventsProcessedTotal)
+	if s.EventsMatchedTotal != 7 {
+		t.Fatalf("events = %d, want 7", s.EventsMatchedTotal)
 	}
 	if s.HandlerSuccessTotal != 0 || s.HandlerFailureTotal != 0 || s.RetryTotal != 0 ||
 		s.DLQTotal != 0 || s.PendingEntries != 0 || s.OldestPendingAgeSeconds != 0 {
@@ -242,7 +244,7 @@ func TestFunctionStatsAbsentJSONFieldsZero(t *testing.T) {
 	ctx := context.Background()
 	for _, row := range []struct{ name, data string }{
 		{"empty", `{}`},
-		{"partial", `{"events_processed_total":7,"warm_acquires_total":2}`},
+		{"partial", `{"events_matched_total":7,"warm_acquires_total":2}`},
 	} {
 		if _, err := c.db.ExecContext(ctx,
 			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)`,
@@ -263,7 +265,7 @@ func TestFunctionStatsAbsentJSONFieldsZero(t *testing.T) {
 	if !ok {
 		t.Fatal("expected partial payload row to be readable")
 	}
-	if p.EventsProcessedTotal != 7 || p.WarmAcquiresTotal != 2 {
+	if p.EventsMatchedTotal != 7 || p.WarmAcquiresTotal != 2 {
 		t.Fatalf("partial payload = %+v, want events 7 warm 2", p)
 	}
 	if p.LastExecutionAt != "" || p.LastSuccessAt != "" || p.LastFailureAt != "" || p.LastDLQAt != "" {
@@ -299,7 +301,7 @@ func TestInvalidFunctionStatsJSONSurfacesErrors(t *testing.T) {
 	ctx := context.Background()
 	for _, row := range []struct{ name, data string }{
 		{"broken", `{not-json`},
-		{"good", `{"events_processed_total":3}`},
+		{"good", `{"events_matched_total":3}`},
 	} {
 		if _, err := c.db.ExecContext(ctx,
 			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)`,
@@ -316,7 +318,7 @@ func TestInvalidFunctionStatsJSONSurfacesErrors(t *testing.T) {
 	}
 
 	all := c.AllFunctionStats()
-	if len(all) != 1 || all[0].Function != "good" || all[0].EventsProcessedTotal != 3 {
+	if len(all) != 1 || all[0].Function != "good" || all[0].EventsMatchedTotal != 3 {
 		t.Fatalf("AllFunctionStats = %+v, want only the good row", all)
 	}
 	if logs := buf.String(); !strings.Contains(logs, "read function stats failed") || !strings.Contains(logs, "broken") {
@@ -337,13 +339,13 @@ func TestRecordFunctionStatsSelfHealsInvalidJSON(t *testing.T) {
 	}
 
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 4, LastExecutionAt: exec})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 4, LastExecutionAt: exec})
 
 	got, ok := c.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha to be readable after self-heal")
 	}
-	if got.EventsProcessedTotal != 4 || got.LastExecutionAt != exec {
+	if got.EventsMatchedTotal != 4 || got.LastExecutionAt != exec {
 		t.Fatalf("self-healed row = %+v, want events 4 execution %s", got, exec)
 	}
 }
@@ -357,10 +359,10 @@ func TestRecordStatsContextSelfHealsInvalidJSON(t *testing.T) {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 
-	c.RecordStats(Stats{EventsProcessedTotal: 4})
+	c.RecordStats(Stats{EventsMatchedTotal: 4})
 
 	got, ok := c.Stats()
-	if !ok || got.EventsProcessedTotal != 4 {
+	if !ok || got.EventsMatchedTotal != 4 {
 		t.Fatalf("self-healed stats = %+v, ok=%v; want events 4", got, ok)
 	}
 }
@@ -375,15 +377,15 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	global := Stats{EventsProcessedTotal: 100, PendingEntries: 9, OldestPendingAgeSeconds: 42}
+	global := Stats{EventsMatchedTotal: 100, PendingEntries: 9, OldestPendingAgeSeconds: 42}
 	fn := FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 10,
-		WarmAcquiresTotal:    7,
-		ColdStartsTotal:      3,
-		DiscardedTotal:       2,
-		LastExecutionAt:      exec,
-		LastDLQAt:            exec,
+		Function:           "alpha",
+		EventsMatchedTotal: 10,
+		WarmAcquiresTotal:  7,
+		ColdStartsTotal:    3,
+		DiscardedTotal:     2,
+		LastExecutionAt:    exec,
+		LastDLQAt:          exec,
 	}
 	c1.RecordStats(global)
 	c1.RecordFunctionStats(fn)
@@ -424,13 +426,13 @@ func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	c.RecordFunctionStats(FunctionStats{
-		Function: "alpha", EventsProcessedTotal: 1, WarmAcquiresTotal: 7, LastExecutionAt: exec,
+		Function: "alpha", EventsMatchedTotal: 1, WarmAcquiresTotal: 7, LastExecutionAt: exec,
 	})
 
 	// A flush observing no timestamp must preserve the stored one, while the
 	// absolute counters replace.
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 2},
-		[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 2, WarmAcquiresTotal: 9}}); err != nil {
+	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 2},
+		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 2, WarmAcquiresTotal: 9}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	got, ok := c.FunctionStats("alpha")
@@ -440,7 +442,7 @@ func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 	if got.LastExecutionAt != exec {
 		t.Fatalf("LastExecutionAt = %q, want preserved %q", got.LastExecutionAt, exec)
 	}
-	if got.EventsProcessedTotal != 2 || got.WarmAcquiresTotal != 9 {
+	if got.EventsMatchedTotal != 2 || got.WarmAcquiresTotal != 9 {
 		t.Fatalf("counters = %+v, want events 2 warm 9 (absolute replace)", got)
 	}
 }
@@ -459,12 +461,12 @@ func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	}
 
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsProcessedTotal: 1},
-		[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 3, LastExecutionAt: exec}}); err != nil {
+	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 1},
+		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 3, LastExecutionAt: exec}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 	got, ok := c.FunctionStats("alpha")
-	if !ok || got.EventsProcessedTotal != 3 || got.LastExecutionAt != exec {
+	if !ok || got.EventsMatchedTotal != 3 || got.LastExecutionAt != exec {
 		t.Fatalf("self-healed row = %+v, ok=%v", got, ok)
 	}
 	if logs := buf.String(); !strings.Contains(logs, "read function stats failed") {

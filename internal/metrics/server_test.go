@@ -42,6 +42,29 @@ func TestMuxServesMetrics(t *testing.T) {
 	}
 }
 
+// TestMuxServesEventClassificationHelp verifies the three event-classification
+// counters are exposed with their documented HELP text stating the partition and
+// the once-per-logical-event rule, so a scrape alone conveys the semantics.
+func TestMuxServesEventClassificationHelp(t *testing.T) {
+	r := New()
+	r.Inc(MetricEventsReceived)
+	r.Inc(MetricEventsMatched)
+
+	rec := httptest.NewRecorder()
+	NewServer("127.0.0.1:0", r.Handler(), testutil.DiscardLogger()).handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		"# HELP relay_events_received_total Logical incoming events",
+		"# HELP relay_events_matched_total Logical incoming events",
+		"# HELP relay_events_unmatched_total Logical incoming events",
+		"classified exactly once per logical event",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("exposition missing %q:\n%s", want, body)
+		}
+	}
+}
+
 // TestMuxRootNotFound verifies the root path no longer serves metrics: the mux
 // registers only /metrics, so "/" now 404s (the old "/" alias is gone).
 func TestMuxRootNotFound(t *testing.T) {

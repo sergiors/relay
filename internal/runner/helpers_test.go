@@ -436,7 +436,13 @@ type fakeInvocationState struct {
 	nextAt    map[string]time.Time // invocation -> next-attempt deadline
 	exhausted map[string]int       // invocation -> attempts
 	attempts  map[string]int       // invocation -> highest attempt started
-	now       func() time.Time
+	// classified records whether the one-time logical-event classification has
+	// been claimed (the fake is bound to one message per test).
+	classified bool
+	// classifyErr, when non-nil, is returned by ClaimClassification so the
+	// fail-closed classification path is exercisable.
+	classifyErr error
+	now         func() time.Time
 	// failures records the backoff passed to RecordFailure, for tests to assert
 	// the retry schedule.
 	failures []time.Duration
@@ -533,6 +539,22 @@ func (p *fakeInvocationState) IsTerminal(invocation string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.done[invocation] || p.exhausted[invocation] > 0
+}
+
+// ClaimClassification mirrors the Redis HSETNX claim: the first call claims the
+// logical-event classification, every later call (a redelivery) does not. The
+// fake is bound to one message per test, so a single flag is the faithful model.
+func (p *fakeInvocationState) ClaimClassification() (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.classifyErr != nil {
+		return false, p.classifyErr
+	}
+	if p.classified {
+		return false, nil
+	}
+	p.classified = true
+	return true, nil
 }
 
 // runningDeadline returns the persisted running deadline for an invocation, for

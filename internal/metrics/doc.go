@@ -25,11 +25,13 @@
 // Metric kinds (canonical Prometheus names carry the "relay_" namespace
 // prefix; log snapshots render without it):
 //
-//   - Counters: relay_events_received_total, relay_events_processed_total,
-//     relay_retries_total, relay_dlq_entries_total, relay_handler_success_total,
+//   - Counters: relay_events_received_total, relay_events_matched_total,
+//     relay_events_unmatched_total, relay_retries_total,
+//     relay_dlq_entries_total, relay_handler_success_total,
 //     relay_handler_failure_total, plus CounterVecs
-//     relay_handler_invocations_total{outcome,function,handler} and
-//     relay_build_failures_total{function}.
+//     relay_handler_invocations_total{outcome,function,handler},
+//     relay_build_failures_total{function}, and the per-function
+//     relay_function_events_matched_total{function}.
 //   - Histograms: relay_handler_duration_seconds{function,handler} and
 //     relay_function_build_seconds{function} (prometheus.DefBuckets).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
@@ -41,6 +43,13 @@
 //     relay_runtime_container_discards_total{function,reason} counters,
 //     relay_runtime_container_waits_total{function}, and the successful-acquire
 //     histogram relay_runtime_container_acquire_duration_seconds{function}.
+//
+// Event classification: the three relay_events_* counters form a closed
+// partition of the logical incoming events the runner handled
+// (received == matched + unmatched). Each logical event is classified exactly
+// once across redeliveries and retries, using an atomic per-message claim in
+// the invocation-state hash; a handler failure stays "matched". Schedule
+// occurrences bypass event matching and are not counted here.
 //
 // Cardinality is bounded: labels are limited to function/handler/outcome plus
 // the small closed runtime-pool value sets (state=idle|busy|starting,

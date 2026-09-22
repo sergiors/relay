@@ -774,13 +774,12 @@ func (c *Consumer) processMessage(
 	}
 
 	// The message decoded successfully and is about to be handed to the handler.
-	// This is the single message-level "processed" counter in the stream layer:
-	// an event matching N functions counts once globally here (per-function
-	// attribution lives in function_events_total). It is incremented on EVERY
-	// delivery attempt that reaches the handler handoff, including redeliveries,
-	// so retries increment it too — it is a delivery-attempt counter, not a
-	// unique-event counter.
-	c.metrics.Inc(metrics.MetricEventsProcessed)
+	// Event classification (received/matched/unmatched) is NOT counted here: it
+	// is a property of the logical event, owned by the runner, which claims it
+	// exactly once per message via the invocation-state hash (see
+	// runner.Handle and stream.InvocationState.ClaimClassification). Counting a
+	// delivery attempt here would break the once-per-logical-event invariant on
+	// redeliveries.
 
 	// Inject a per-message invocation-state handle so the runner can skip
 	// invocations that already completed on a previous delivery or are protected
@@ -859,17 +858,17 @@ func (c *Consumer) processMessage(
 // processScheduleMessage routes a schedule-occurrence message directly to the
 // ScheduleRunner (which resolves the function's current timeout from the
 // registry), bypassing event matching entirely. It shares the exact delivery
-// contract of processMessage: events_processed_total counts the delivery
-// attempt, invocation state protects redeliveries (complete/running/backoff/
-// exhausted), and the message is ACKed on success, left pending on a retryable
-// failure or protected skip, and routed to the DLQ on exhaustion.
+// contract of processMessage: invocation state protects redeliveries
+// (complete/running/backoff/exhausted), and the message is ACKed on success,
+// left pending on a retryable failure or protected skip, and routed to the DLQ
+// on exhaustion.
+//
+// Schedule occurrences are deliberately NOT counted in the event-classification
+// counters (received/matched/unmatched): they bypass event matching, so they
+// have no meaningful matched/unmatched class and would otherwise break the
+// partition invariant. Schedule activity is accounted by the schedule
+// publication counters and the per-function handler counters.
 func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) {
-	// Schedules ARE stream deliveries now, so this is the same delivery-attempt
-	// counter as processMessage: it keeps the global events_processed_total
-	// semantics uniform across message kinds (a redelivered schedule increments
-	// it again, like any other delivery attempt).
-	c.metrics.Inc(metrics.MetricEventsProcessed)
-
 	c.log.Debug("Schedule: executing occurrence",
 		"function", occ.Function,
 		"handler", occ.Handler,

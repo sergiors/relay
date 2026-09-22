@@ -53,7 +53,7 @@ func TestConcurrentGlobalStatsWrites(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			c.RecordStats(Stats{EventsProcessedTotal: int64(i + 1)})
+			c.RecordStats(Stats{EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
@@ -64,8 +64,8 @@ func TestConcurrentGlobalStatsWrites(t *testing.T) {
 	}
 	// Absolute semantics: the value must be exactly one writer's value, not a
 	// mixture or a partial write.
-	if s.EventsProcessedTotal < 1 || s.EventsProcessedTotal > n {
-		t.Fatalf("events = %d, want one of the written values 1..%d", s.EventsProcessedTotal, n)
+	if s.EventsMatchedTotal < 1 || s.EventsMatchedTotal > n {
+		t.Fatalf("events = %d, want one of the written values 1..%d", s.EventsMatchedTotal, n)
 	}
 	assertNoBusy(t, buf)
 }
@@ -82,7 +82,7 @@ func TestConcurrentFunctionStatsWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := "fn-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
-			c.RecordFunctionStats(FunctionStats{Function: name, EventsProcessedTotal: int64(i + 1)})
+			c.RecordFunctionStats(FunctionStats{Function: name, EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
@@ -100,8 +100,8 @@ func TestConcurrentFunctionStatsWrites(t *testing.T) {
 				break
 			}
 		}
-		if fs.EventsProcessedTotal != want {
-			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsProcessedTotal, want)
+		if fs.EventsMatchedTotal != want {
+			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsMatchedTotal, want)
 		}
 	}
 	assertNoBusy(t, buf)
@@ -160,9 +160,9 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 			}
 			fns := make([]FunctionStats, 0, m)
 			for i := 0; i < m; i++ {
-				fns = append(fns, FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsProcessedTotal: int64(i + 1)})
+				fns = append(fns, FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
 			}
-			_ = c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 100}, fns)
+			_ = c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 100}, fns)
 		}
 	}()
 
@@ -208,8 +208,8 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 			default:
 			}
 			_ = c.RecordStatsSnapshot(context.Background(),
-				Stats{EventsProcessedTotal: 1},
-				[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 1}})
+				Stats{EventsMatchedTotal: 1},
+				[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 1}})
 		}
 	}()
 
@@ -254,7 +254,7 @@ func TestReopenUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			c1.RecordStats(Stats{EventsProcessedTotal: int64(i + 1)})
+			c1.RecordStats(Stats{EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
@@ -271,8 +271,8 @@ func TestReopenUnderConcurrency(t *testing.T) {
 	if !ok {
 		t.Fatal("expected stats row after reopen")
 	}
-	if s.EventsProcessedTotal < 1 || s.EventsProcessedTotal > n {
-		t.Fatalf("events = %d, want one of the written values 1..%d", s.EventsProcessedTotal, n)
+	if s.EventsMatchedTotal < 1 || s.EventsMatchedTotal > n {
+		t.Fatalf("events = %d, want one of the written values 1..%d", s.EventsMatchedTotal, n)
 	}
 	assertNoBusy(t, buf)
 }
@@ -295,11 +295,11 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			c1.RecordFunctionStats(FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsProcessedTotal: int64(i + 1)})
+			c1.RecordFunctionStats(FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
-	c1.RecordStats(Stats{EventsProcessedTotal: 999})
+	c1.RecordStats(Stats{EventsMatchedTotal: 999})
 	if err := c1.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -322,12 +322,12 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 				break
 			}
 		}
-		if fs.EventsProcessedTotal != want {
-			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsProcessedTotal, want)
+		if fs.EventsMatchedTotal != want {
+			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsMatchedTotal, want)
 		}
 	}
 	gs, ok := c2.Stats()
-	if !ok || gs.EventsProcessedTotal != 999 {
+	if !ok || gs.EventsMatchedTotal != 999 {
 		t.Fatalf("global stats = %+v, ok=%v; want events 999", gs, ok)
 	}
 	assertNoBusy(t, buf)

@@ -63,7 +63,9 @@ func seedStatsState(t *testing.T) (*state.State, Dependencies) {
 	st, deps := openTempState(t)
 
 	st.RecordStats(state.Stats{
-		EventsProcessedTotal:    152934,
+		EventsReceivedTotal:     153000,
+		EventsMatchedTotal:      152934,
+		EventsUnmatchedTotal:    66,
 		HandlerSuccessTotal:     152801,
 		HandlerFailureTotal:     133,
 		RetryTotal:              82,
@@ -83,14 +85,17 @@ func TestPrintStats(t *testing.T) {
 	out := w.String()
 
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 8 {
-		t.Fatalf("expected 8 lines, got %d:\n%s", len(lines), out)
+	if len(lines) != 10 {
+		t.Fatalf("expected 10 lines, got %d:\n%s", len(lines), out)
 	}
 
-	// "Oldest pending age:" and "Pending entries:" are the longest labels, so
-	// tabwriter pads values to a common column; assert the exact aligned rows.
+	// "Oldest pending age:" and "Events unmatched:" are among the longest
+	// labels, so tabwriter pads values to a common column; assert the exact
+	// aligned rows.
 	wants := []string{
-		"Events processed:    152934",
+		"Events received:     153000",
+		"Events matched:      152934",
+		"Events unmatched:    66",
 		"Handler successes:   152801",
 		"Handler failures:    133",
 		"Retries:             82",
@@ -104,8 +109,8 @@ func TestPrintStats(t *testing.T) {
 		}
 	}
 	// Updated is a just-recorded row, so it is "just now".
-	if !strings.Contains(lines[7], "Updated:") || !strings.Contains(lines[7], "ago") {
-		t.Errorf("row 7 want Updated + relative age, got %q", lines[7])
+	if !strings.Contains(lines[9], "Updated:") || !strings.Contains(lines[9], "ago") {
+		t.Errorf("row 9 want Updated + relative age, got %q", lines[9])
 	}
 }
 
@@ -134,7 +139,7 @@ func TestPrintStatsEmptyDB(t *testing.T) {
 	printStats(&w, st)
 	out := w.String()
 	for _, want := range []string{
-		"Events processed:    0",
+		"Events received:     0",
 		"Handler successes:   0",
 		"Handler failures:    0",
 		"Retries:             0",
@@ -183,10 +188,10 @@ func TestStatsCommand(t *testing.T) {
 func TestStatsResetCommand(t *testing.T) {
 	st, deps := seedStatsState(t)
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 9,
-		WarmAcquiresTotal:    3,
-		LastExecutionAt:      time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+		Function:           "alpha",
+		EventsMatchedTotal: 9,
+		WarmAcquiresTotal:  3,
+		LastExecutionAt:    time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
 	})
 
 	out, _, err := runCLIWithDeps(t, deps, "", "stats", "reset")
@@ -203,7 +208,8 @@ func TestStatsResetCommand(t *testing.T) {
 	if !ok {
 		t.Fatal("stats row must survive the reset")
 	}
-	if s.EventsProcessedTotal != 0 || s.HandlerSuccessTotal != 0 ||
+	if s.EventsReceivedTotal != 0 || s.EventsMatchedTotal != 0 || s.EventsUnmatchedTotal != 0 ||
+		s.HandlerSuccessTotal != 0 ||
 		s.HandlerFailureTotal != 0 || s.RetryTotal != 0 || s.DLQTotal != 0 {
 		t.Fatalf("cumulative counters must be zeroed: %+v", s)
 	}
@@ -214,7 +220,7 @@ func TestStatsResetCommand(t *testing.T) {
 	if len(all) != 1 || all[0].Function != "alpha" {
 		t.Fatalf("function_stats rows must be preserved: %+v", all)
 	}
-	if all[0].EventsProcessedTotal != 0 || all[0].WarmAcquiresTotal != 0 || all[0].LastExecutionAt != "" {
+	if all[0].EventsMatchedTotal != 0 || all[0].WarmAcquiresTotal != 0 || all[0].LastExecutionAt != "" {
 		t.Fatalf("function_stats must be zeroed in place: %+v", all[0])
 	}
 
@@ -225,7 +231,7 @@ func TestStatsResetCommand(t *testing.T) {
 		t.Fatalf("stats after reset: err = %v, want nil", err)
 	}
 	for _, want := range []string{
-		"Events processed:    0",
+		"Events received:     0",
 		"Handler successes:   0",
 		"Handler failures:    0",
 		"Retries:             0",
@@ -255,7 +261,7 @@ func TestStatsResetCommandWorkerFailureSurfaces(t *testing.T) {
 	}
 	// The CLI must not have written the state DB as a silent fallback.
 	s, _ := st.Stats()
-	if s.EventsProcessedTotal != 152934 {
+	if s.EventsReceivedTotal != 153000 {
 		t.Fatalf("failed worker reset must not fall back to a state write: %+v", s)
 	}
 }
@@ -283,7 +289,7 @@ func TestStatsResetCommandRunningWorker(t *testing.T) {
 	}
 	// The CLI must not have written the state DB directly.
 	s, _ := st.Stats()
-	if s.EventsProcessedTotal != 152934 {
+	if s.EventsReceivedTotal != 153000 {
 		t.Fatalf("CLI must not reset the state DB when a worker answered: %+v", s)
 	}
 }
@@ -298,7 +304,7 @@ func TestStatsResetTooManyArgs(t *testing.T) {
 		t.Fatalf("stats reset extra: missing rejection error: %v", err)
 	}
 	s, ok := st.Stats()
-	if !ok || s.EventsProcessedTotal != 152934 {
+	if !ok || s.EventsReceivedTotal != 153000 {
 		t.Fatalf("rejected reset must not write: %+v, ok=%v", s, ok)
 	}
 }

@@ -23,12 +23,16 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 	got := m.Snapshot()
 	for _, want := range []string{
 		"events_received_total count=1",
+		"events_matched_total count=1",
 		"handler_invocations_total{function=user-events,handler=index.run,outcome=success} count=1",
 		"handler_success_total count=1",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("snapshot missing %q; got:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "events_unmatched_total count=1") {
+		t.Errorf("a matched event must not count unmatched; got:\n%s", got)
 	}
 	if strings.Contains(got, "outcome=failure") {
 		t.Errorf("unexpected failure metric; got:\n%s", got)
@@ -120,7 +124,7 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 	// All of user-events' function-scoped series are gone — no series at all
 	// carrying the function=user-events label on any of the functionMetrics vecs.
 	for _, mname := range []string{
-		metrics.MetricFunctionEvents,
+		metrics.MetricFunctionEventsMatched,
 		metrics.MetricFunctionHandlerSuccess,
 		metrics.MetricFunctionHandlerFailure,
 		metrics.MetricHandlerInvocations,
@@ -190,8 +194,8 @@ func TestHandleFunctionLevelCounters(t *testing.T) {
 		t.Fatalf("function stats len = %d, want 2: %+v", len(fs), fs)
 	}
 	for _, f := range fs {
-		if f.Events != 1 {
-			t.Fatalf("function %s events = %d, want 1", f.Function, f.Events)
+		if f.EventsMatchedTotal != 1 {
+			t.Fatalf("function %s events matched = %d, want 1", f.Function, f.EventsMatchedTotal)
 		}
 		if f.HandlerSuccessTotal != 1 {
 			t.Fatalf("function %s success = %d, want 1", f.Function, f.HandlerSuccessTotal)

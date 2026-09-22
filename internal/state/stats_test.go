@@ -11,7 +11,9 @@ import (
 func TestStatsRoundTrip(t *testing.T) {
 	c := openTestState(t)
 	in := Stats{
-		EventsProcessedTotal:    12,
+		EventsReceivedTotal:     20,
+		EventsMatchedTotal:      12,
+		EventsUnmatchedTotal:    8,
 		HandlerSuccessTotal:     9,
 		HandlerFailureTotal:     3,
 		RetryTotal:              2,
@@ -45,7 +47,7 @@ func TestRecordStatsReplaces(t *testing.T) {
 
 	c.RecordStats(Stats{PendingEntries: 3})
 	// Counters are replaced too, not accumulated.
-	c.RecordStats(Stats{PendingEntries: 7, EventsProcessedTotal: 100})
+	c.RecordStats(Stats{PendingEntries: 7, EventsMatchedTotal: 100})
 
 	s, ok := c.Stats()
 	if !ok {
@@ -54,11 +56,11 @@ func TestRecordStatsReplaces(t *testing.T) {
 	if s.PendingEntries != 7 {
 		t.Fatalf("pending = %d, want 7", s.PendingEntries)
 	}
-	if s.EventsProcessedTotal != 100 {
-		t.Fatalf("events = %d, want 100", s.EventsProcessedTotal)
+	if s.EventsMatchedTotal != 100 {
+		t.Fatalf("events = %d, want 100", s.EventsMatchedTotal)
 	}
 
-	c.RecordStats(Stats{PendingEntries: 0, EventsProcessedTotal: 100})
+	c.RecordStats(Stats{PendingEntries: 0, EventsMatchedTotal: 100})
 	s, ok = c.Stats()
 	if !ok {
 		t.Fatal("expected stats row")
@@ -66,8 +68,8 @@ func TestRecordStatsReplaces(t *testing.T) {
 	if s.PendingEntries != 0 {
 		t.Fatalf("pending = %d, want 0 after reset", s.PendingEntries)
 	}
-	if s.EventsProcessedTotal != 100 {
-		t.Fatalf("events = %d, want 100 preserved", s.EventsProcessedTotal)
+	if s.EventsMatchedTotal != 100 {
+		t.Fatalf("events = %d, want 100 preserved", s.EventsMatchedTotal)
 	}
 }
 
@@ -90,7 +92,7 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 	writeFunctionsDir(t, root)
 
 	c := openTestState(t)
-	c.RecordStats(Stats{EventsProcessedTotal: 55, PendingEntries: 3})
+	c.RecordStats(Stats{EventsMatchedTotal: 55, PendingEntries: 3})
 
 	if err := c.RebuildFromFS(root); err != nil {
 		t.Fatalf("rebuild: %v", err)
@@ -100,7 +102,7 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 	if !ok {
 		t.Fatal("stats row must survive rebuild")
 	}
-	if s.EventsProcessedTotal != 55 || s.PendingEntries != 3 {
+	if s.EventsMatchedTotal != 55 || s.PendingEntries != 3 {
 		t.Fatalf("stats changed by rebuild: %+v", s)
 	}
 }
@@ -110,12 +112,12 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 func TestFunctionStatsRoundTrip(t *testing.T) {
 	c := openTestState(t)
 	in := FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 5,
-		HandlerSuccessTotal:  4,
-		HandlerFailureTotal:  1,
-		RetryTotal:           1,
-		DLQTotal:             0,
+		Function:            "alpha",
+		EventsMatchedTotal:  5,
+		HandlerSuccessTotal: 4,
+		HandlerFailureTotal: 1,
+		RetryTotal:          1,
+		DLQTotal:            0,
 	}
 	c.RecordFunctionStats(in)
 
@@ -142,15 +144,15 @@ func TestFunctionStatsRoundTrip(t *testing.T) {
 // Two functions keep independent rows: recording one does not affect the other.
 func TestFunctionStatsIndependentRows(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 3})
-	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 7})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsMatchedTotal: 7})
 
 	a, ok := c.FunctionStats("alpha")
-	if !ok || a.EventsProcessedTotal != 3 {
+	if !ok || a.EventsMatchedTotal != 3 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 3", a, ok)
 	}
 	b, ok := c.FunctionStats("beta")
-	if !ok || b.EventsProcessedTotal != 7 {
+	if !ok || b.EventsMatchedTotal != 7 {
 		t.Fatalf("beta = %+v, ok=%v; want events 7", b, ok)
 	}
 }
@@ -159,15 +161,15 @@ func TestFunctionStatsIndependentRows(t *testing.T) {
 // not accumulates.
 func TestFunctionStatsUpdateReplaces(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 3, HandlerSuccessTotal: 2})
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 9, HandlerSuccessTotal: 8})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3, HandlerSuccessTotal: 2})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 9, HandlerSuccessTotal: 8})
 
 	s, ok := c.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("expected function stats row")
 	}
-	if s.EventsProcessedTotal != 9 {
-		t.Fatalf("events = %d, want 9 (replaced, not accumulated)", s.EventsProcessedTotal)
+	if s.EventsMatchedTotal != 9 {
+		t.Fatalf("events = %d, want 9 (replaced, not accumulated)", s.EventsMatchedTotal)
 	}
 	if s.HandlerSuccessTotal != 8 {
 		t.Fatalf("success = %d, want 8", s.HandlerSuccessTotal)
@@ -189,7 +191,7 @@ func TestFunctionStatsAbsent(t *testing.T) {
 // RecordRemoved deletes the function_stats row alongside the function/handlers.
 func TestRemovalDeletesFunctionStats(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3})
 
 	c.RecordRemoved("alpha")
 

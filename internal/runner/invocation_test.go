@@ -138,8 +138,10 @@ func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
 // TestHandleSkippedInvocationsDoNotCountMetrics verifies that a skipped
 // invocation (already completed on a previous delivery) is not counted as an
 // execution: handler_success_total and function_handler_success_total only
-// count real executions, while function_events_total still counts the function
-// as engaged on every match (attribution, not execution).
+// count real executions, while function_events_matched_total counts the function
+// as engaged once for the logical event (attribution, not execution), and the
+// event classification counters are claimed once and not re-counted on the
+// redelivery.
 func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	m := metrics.New()
 	alpha := &countingExecutor{}
@@ -170,8 +172,16 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	if got := m.Counter(metrics.MetricHandlerFailure); got != 1 {
 		t.Errorf("handler_failure_total = %d, want 1", got)
 	}
-	if got := m.Counter(metrics.MetricEventsReceived); got != 2 {
-		t.Errorf("events_received_total = %d, want 2", got)
+	// The event is one logical event delivered twice: the three classification
+	// counters are claimed once, so received=1 and it was matched.
+	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
+		t.Errorf("events_received_total = %d, want 1 (claimed once across redeliveries)", got)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 1 {
+		t.Errorf("events_matched_total = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
+		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
 
 	fs := m.FunctionStatsSnapshot()
@@ -182,11 +192,12 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	if byName["alpha"].HandlerSuccessTotal != 1 {
 		t.Errorf("alpha success = %d, want 1 (not 2; the skip is not an execution)", byName["alpha"].HandlerSuccessTotal)
 	}
-	if byName["alpha"].Events != 2 {
-		t.Errorf("alpha events = %d, want 2 (counted on each match)", byName["alpha"].Events)
+	// Each function is engaged once for the logical event, not once per delivery.
+	if byName["alpha"].EventsMatchedTotal != 1 {
+		t.Errorf("alpha events = %d, want 1 (counted once per logical event)", byName["alpha"].EventsMatchedTotal)
 	}
-	if byName["beta"].Events != 2 {
-		t.Errorf("beta events = %d, want 2 (counted on each match)", byName["beta"].Events)
+	if byName["beta"].EventsMatchedTotal != 1 {
+		t.Errorf("beta events = %d, want 1 (counted once per logical event)", byName["beta"].EventsMatchedTotal)
 	}
 }
 

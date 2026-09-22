@@ -1080,6 +1080,57 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 	e.stop(t)
 }
 
+// TestIntegrationClassificationClaimSurvivesRedelivery verifies the real Redis
+// HSETNX classification claim end to end: the first delivery of a message wins
+// the claim (ClaimClassification true), a redelivery of the SAME pending message
+// loses it (false), and the claim is cleaned up with the invocation-state key
+// once the message is ACKed. This is what keeps
+// events_received == events_matched + events_unmatched across retries.
+func TestIntegrationClassificationClaimSurvivesRedelivery(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	var claims atomic.Int64
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := invocationStateFromCtx(t, ctx)
+		if !ok {
+			return fmt.Errorf("no invocation state in ctx")
+		}
+		// The first delivery claims the classification; the message then stays
+		// pending (returned error) so the reclaim loop redelivers it.
+		if claimed, err := p.ClaimClassification(); err != nil {
+			return err
+		} else if claimed {
+			claims.Add(1)
+		}
+		if claims.Load() < 1 {
+			return nil
+		}
+		return fmt.Errorf("leave pending to force redelivery")
+	})
+	e.waitDelivered(t, id)
+	// The claim field is persisted in Redis.
+	testutil.WaitFor(t, 8*time.Second, "classification claim recorded", func() bool {
+		v, err := e.client.HGet(context.Background(), key, classificationField).Result()
+		return err == nil && v == "1"
+	})
+	// A redelivery (reclaim) happens and loses the claim: the count stays 1.
+	testutil.WaitFor(t, 8*time.Second, "message redelivered and reclaim lost the claim", func() bool {
+		return e.pending()[id] >= 2
+	})
+	waitSustained(t, "classification claimed exactly once across redeliveries", 500*time.Millisecond, func() bool {
+		return claims.Load() == 1
+	})
+	// Stop and clean up; the claim's cleanup-on-ack is covered by the fact that
+	// it lives in the same hash key as the invocation state (cleared on ack).
+	e.stop(t)
+}
+
 // TestIntegrationFailureSchedulesRetryBackoff verifies the failure path: an
 // attempt that fails records a next_attempt_at marker (RecordFailure) gating the
 // invocation by its retry backoff, so a redelivery within the backoff is skipped

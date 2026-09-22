@@ -157,12 +157,12 @@ func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
 func TestFunctionInspectStatsSection(t *testing.T) {
 	st, _ := seedTestState(t)
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "user-events-python",
-		EventsProcessedTotal: 12493,
-		HandlerSuccessTotal:  12470,
-		HandlerFailureTotal:  23,
-		RetryTotal:           17,
-		DLQTotal:             2,
+		Function:            "user-events-python",
+		EventsMatchedTotal:  12493,
+		HandlerSuccessTotal: 12470,
+		HandlerFailureTotal: 23,
+		RetryTotal:          17,
+		DLQTotal:            2,
 	})
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
@@ -173,7 +173,7 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
-		"Events processed: 12493",
+		"Events matched: 12493",
 		"Handler successes: 12470",
 		"Handler failures: 23",
 		"Retries: 17",
@@ -204,7 +204,7 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
-		"Events processed: 0",
+		"Events matched: 0",
 		"Handler successes: 0",
 		"Handler failures: 0",
 		"Retries: 0",
@@ -695,16 +695,16 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 	failure := time.Now().Add(-90 * time.Second).UTC()
 	dlq := time.Now().Add(-48 * time.Hour).UTC()
 	st.RecordFunctionStats(state.FunctionStats{
-		Function:             "user-events-python",
-		EventsProcessedTotal: 10,
-		HandlerSuccessTotal:  8,
-		HandlerFailureTotal:  2,
-		RetryTotal:           4,
-		DLQTotal:             1,
-		LastExecutionAt:      exec.Format(time.RFC3339),
-		LastSuccessAt:        exec.Format(time.RFC3339),
-		LastFailureAt:        failure.Format(time.RFC3339),
-		LastDLQAt:            dlq.Format(time.RFC3339),
+		Function:            "user-events-python",
+		EventsMatchedTotal:  10,
+		HandlerSuccessTotal: 8,
+		HandlerFailureTotal: 2,
+		RetryTotal:          4,
+		DLQTotal:            1,
+		LastExecutionAt:     exec.Format(time.RFC3339),
+		LastSuccessAt:       exec.Format(time.RFC3339),
+		LastFailureAt:       failure.Format(time.RFC3339),
+		LastDLQAt:           dlq.Format(time.RFC3339),
 	})
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
@@ -737,7 +737,7 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 // an empty relative age.
 func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 	st, _ := seedTestState(t)
-	st.RecordFunctionStats(state.FunctionStats{Function: "user-events-python", EventsProcessedTotal: 3})
+	st.RecordFunctionStats(state.FunctionStats{Function: "user-events-python", EventsMatchedTotal: 3})
 	d, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")

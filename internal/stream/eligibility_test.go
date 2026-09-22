@@ -104,6 +104,20 @@ func (f *fakeInvocationStore) markExhausted(_ context.Context, _, _, _, invocati
 	return nil
 }
 
+// claimClassification models the Redis HSETNX claim: the first call sets the
+// reserved field and returns true; every later call returns false. A read error
+// is surfaced so the fail-closed classification path is exercisable.
+func (f *fakeInvocationStore) claimClassification(_ context.Context, _, _, _ string) (bool, error) {
+	if f.readErr != nil {
+		return false, f.readErr
+	}
+	if _, ok := f.fields[classificationField]; ok {
+		return false, nil
+	}
+	f.fields[classificationField] = "1"
+	return true, nil
+}
+
 func (f *fakeInvocationStore) clear(_ context.Context, _, _, _ string) error {
 	f.fields = map[string]string{}
 	return nil
@@ -276,5 +290,53 @@ func TestInvocationStateFailsOpenOnStoreReadError(t *testing.T) {
 	p.RecordFailure("fn/h", time.Second)
 	if store.fields["fn/h"] != "ok" {
 		t.Fatalf("field mutated on RecordFailure read error: %q", store.fields["fn/h"])
+	}
+}
+
+// TestInvocationClaimClassificationOnce pins the once-per-message classification
+// claim through the production seam: the first delivery wins (true), every later
+// delivery of the same message loses (false), and the reserved field is set. It
+// is the invariant that makes events_received == events_matched +
+// events_unmatched hold across redeliveries.
+func TestInvocationClaimClassificationOnce(t *testing.T) {
+	store := newFakeInvocationStore(nil)
+	p := consumerForStore(t, store)
+
+	claimed, err := p.ClaimClassification()
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("first ClaimClassification = false, want true")
+	}
+	if store.fields[classificationField] != "1" {
+		t.Fatalf("claim field = %q, want \"1\"", store.fields[classificationField])
+	}
+
+	for i := 0; i < 3; i++ {
+		claimed, err := p.ClaimClassification()
+		if err != nil {
+			t.Fatalf("later claim %d: %v", i, err)
+		}
+		if claimed {
+			t.Fatalf("later claim %d = true, want false (already claimed)", i)
+		}
+	}
+}
+
+// TestInvocationClaimClassificationFailsClosed pins that a store error is NOT
+// swallowed as a claim: (false, err) is returned so the caller counts nothing,
+// avoiding a double count on redelivery.
+func TestInvocationClaimClassificationFailsClosed(t *testing.T) {
+	boom := errors.New("redis down")
+	store := &fakeInvocationStore{fields: map[string]string{}, readErr: boom}
+	p := consumerForStore(t, store)
+
+	claimed, err := p.ClaimClassification()
+	if err == nil || !errors.Is(err, boom) {
+		t.Fatalf("ClaimClassification error = %v, want the store error", err)
+	}
+	if claimed {
+		t.Fatal("ClaimClassification on store error = true, want false")
 	}
 }

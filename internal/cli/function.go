@@ -176,7 +176,7 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 	fmt.Fprintln(w, "Stats:")
 	sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 	fs, _ := st.FunctionStats(d.Name)
-	fmt.Fprintf(sw, "  Events processed:\t%d\n", fs.EventsProcessedTotal)
+	fmt.Fprintf(sw, "  Events matched:\t%d\n", fs.EventsMatchedTotal)
 	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
 	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
 	fmt.Fprintf(sw, "  Retries:\t%d\n", fs.RetryTotal)

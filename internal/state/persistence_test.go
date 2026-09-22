@@ -35,7 +35,7 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 		t.Fatalf("first open: %v", err)
 	}
 	want := Stats{
-		EventsProcessedTotal:    100,
+		EventsMatchedTotal:      100,
 		HandlerSuccessTotal:     70,
 		HandlerFailureTotal:     30,
 		RetryTotal:              5,
@@ -82,8 +82,8 @@ func TestRestartPreservesFunctionStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	alpha := FunctionStats{Function: "alpha", EventsProcessedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0}
-	beta := FunctionStats{Function: "beta", EventsProcessedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1}
+	alpha := FunctionStats{Function: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0}
+	beta := FunctionStats{Function: "beta", EventsMatchedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1}
 	c1.RecordFunctionStats(alpha)
 	c1.RecordFunctionStats(beta)
 	_ = c1.Close()
@@ -141,7 +141,7 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	c.RecordDiscovered(fnFor(t, "demo", tmpl)) // populate the functions table
-	c.RecordFunctionStats(FunctionStats{Function: "demo", EventsProcessedTotal: 7, HandlerSuccessTotal: 5})
+	c.RecordFunctionStats(FunctionStats{Function: "demo", EventsMatchedTotal: 7, HandlerSuccessTotal: 5})
 
 	root := t.TempDir()
 	writeFunctionsDir(t, root)
@@ -153,7 +153,7 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function stats row after rebuild")
 	}
-	if s.EventsProcessedTotal != 7 || s.HandlerSuccessTotal != 5 {
+	if s.EventsMatchedTotal != 7 || s.HandlerSuccessTotal != 5 {
 		t.Fatalf("function stats changed by rebuild: %+v", s)
 	}
 }
@@ -164,7 +164,7 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 func TestRecordDiscoveredDoesNotResetFunctionStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
 
 	before, ok := c.FunctionStats("alpha")
 	if !ok {

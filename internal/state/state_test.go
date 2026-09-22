@@ -387,11 +387,11 @@ func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
 	// rows (handlers + function_stats) so the sweep must clean them inclusively.
 	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), fnFor(t, "gone", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsProcessedTotal: 5})
+	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsMatchedTotal: 5})
 	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), fnFor(t, "kept", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "kept", EventsProcessedTotal: 9})
+	c.RecordFunctionStats(FunctionStats{Function: "kept", EventsMatchedTotal: 9})
 	// The global stats row must never be touched by pruning.
-	want := Stats{EventsProcessedTotal: 55}
+	want := Stats{EventsMatchedTotal: 55}
 	c.RecordStats(want)
 
 	// Real roots: create "kept", leave "gone" out, plus a stray non-function
@@ -419,7 +419,7 @@ func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 		t.Fatal("kept function row must survive")
 	}
 	ks, ok := c.FunctionStats("kept")
-	if !ok || ks.EventsProcessedTotal != 9 {
+	if !ok || ks.EventsMatchedTotal != 9 {
 		t.Fatalf("kept function_stats = %+v, ok=%v; want events 9", ks, ok)
 	}
 
@@ -428,7 +428,7 @@ func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 	if !ok {
 		t.Fatal("global stats row must survive pruning")
 	}
-	if gs.EventsProcessedTotal != 55 {
+	if gs.EventsMatchedTotal != 55 {
 		t.Fatalf("global stats changed by prune: %+v", gs)
 	}
 }

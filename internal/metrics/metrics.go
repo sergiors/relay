@@ -47,8 +47,20 @@ const metricNamespacePrefix = "relay_"
 // constants, which stay in lockstep with the registrations in New by
 // construction.
 const (
-	MetricEventsReceived               = metricNamespacePrefix + "events_received_total"
-	MetricEventsProcessed              = metricNamespacePrefix + "events_processed_total"
+	// The three canonical event-classification counters form a closed partition
+	// of the logical incoming events the runner handled:
+	// relay_events_received_total == relay_events_matched_total +
+	// relay_events_unmatched_total. Each logical event is classified exactly
+	// once across redeliveries and retries (see
+	// stream.InvocationState.ClaimClassification), so redelivering the same
+	// message does not increment them again. Schedule occurrences bypass event
+	// matching entirely and are deliberately NOT classified here (they have
+	// their own schedule counters); malformed messages never reach the runner
+	// and are not classified either.
+	MetricEventsReceived  = metricNamespacePrefix + "events_received_total"
+	MetricEventsMatched   = metricNamespacePrefix + "events_matched_total"
+	MetricEventsUnmatched = metricNamespacePrefix + "events_unmatched_total"
+
 	MetricRetries                      = metricNamespacePrefix + "retries_total"
 	MetricDLQEntries                   = metricNamespacePrefix + "dlq_entries_total"
 	MetricHandlerSuccess               = metricNamespacePrefix + "handler_success_total"
@@ -59,17 +71,23 @@ const (
 	MetricSchedulePublishFailures      = metricNamespacePrefix + "schedule_publish_failures_total"
 	MetricHandlerInvocations           = metricNamespacePrefix + "handler_invocations_total"
 	MetricBuildFailures                = metricNamespacePrefix + "build_failures_total"
-	MetricFunctionEvents               = metricNamespacePrefix + "function_events_total"
-	MetricFunctionHandlerSuccess       = metricNamespacePrefix + "function_handler_success_total"
-	MetricFunctionHandlerFailure       = metricNamespacePrefix + "function_handler_failure_total"
-	MetricFunctionRetries              = metricNamespacePrefix + "function_retries_total"
-	MetricFunctionDLQ                  = metricNamespacePrefix + "function_dlq_total"
-	MetricHandlerDuration              = metricNamespacePrefix + "handler_duration_seconds"
-	MetricFunctionBuild                = metricNamespacePrefix + "function_build_seconds"
-	MetricPendingEntries               = metricNamespacePrefix + "pending_entries"
-	MetricPendingOldestAge             = metricNamespacePrefix + "pending_oldest_age_seconds"
-	MetricBufferedEvents               = metricNamespacePrefix + "buffered_events"
-	MetricInFlightInvocations          = metricNamespacePrefix + "in_flight_invocations"
+	// MetricFunctionEventsMatched counts a function once per logical event for
+	// which at least one of its rules matched — a functions-engaged counter,
+	// distinct from the message-level MetricEventsMatched (an event matching two
+	// functions counts once globally and once per function here). Like the
+	// global counters it is classified once per logical event across
+	// redeliveries.
+	MetricFunctionEventsMatched  = metricNamespacePrefix + "function_events_matched_total"
+	MetricFunctionHandlerSuccess = metricNamespacePrefix + "function_handler_success_total"
+	MetricFunctionHandlerFailure = metricNamespacePrefix + "function_handler_failure_total"
+	MetricFunctionRetries        = metricNamespacePrefix + "function_retries_total"
+	MetricFunctionDLQ            = metricNamespacePrefix + "function_dlq_total"
+	MetricHandlerDuration        = metricNamespacePrefix + "handler_duration_seconds"
+	MetricFunctionBuild          = metricNamespacePrefix + "function_build_seconds"
+	MetricPendingEntries         = metricNamespacePrefix + "pending_entries"
+	MetricPendingOldestAge       = metricNamespacePrefix + "pending_oldest_age_seconds"
+	MetricBufferedEvents         = metricNamespacePrefix + "buffered_events"
+	MetricInFlightInvocations    = metricNamespacePrefix + "in_flight_invocations"
 
 	// Warm-container pool observability (Phase 4). The state gauge is labeled by
 	// function and by a fixed state set (idle/busy/starting); acquires are split
@@ -85,6 +103,25 @@ const (
 	MetricRuntimeContainerAcquireDuration = metricNamespacePrefix + "runtime_container_acquire_duration_seconds"
 	MetricRuntimeContainerWaits           = metricNamespacePrefix + "runtime_container_waits_total"
 )
+
+// counterHelp carries the Prometheus HELP text for the counters whose semantics
+// are non-obvious. The three event-classification counters in particular must
+// state the exact partition and the once-per-logical-event rule, because their
+// values only make sense together. Names absent from this map are registered
+// with no explicit Help (Prometheus renders its default), preserving the
+// existing exposition for the counters that predate this map.
+var counterHelp = map[string]string{
+	MetricEventsReceived:  "Logical incoming events (messages that decoded to an event object) handled by the runner, classified exactly once per logical event across redeliveries/retries. Schedule occurrences are excluded.",
+	MetricEventsMatched:   "Logical incoming events for which at least one function rule matched, classified exactly once per logical event across redeliveries/retries. A handler failure does not move an event out of this class.",
+	MetricEventsUnmatched: "Logical incoming events for which no function rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
+}
+
+// counterVecHelp is the labeled counterpart of counterHelp: the HELP text for
+// CounterVecs whose semantics need spelling out. Names absent from the map are
+// registered with no explicit Help.
+var counterVecHelp = map[string]string{
+	MetricFunctionEventsMatched: "Logical events for which at least one of this function's rules matched, counted once per logical event per function across redeliveries/retries (deduped across the function's matching rules). A handler failure does not move an event out of this class.",
+}
 
 // Runtime pool gauge label values. They are a closed set so the
 // runtime_containers gauge's cardinality stays bounded by function × 3.
@@ -278,7 +315,8 @@ func New() *Registry {
 	// these via Counter in snapshotStats).
 	for _, name := range []string{
 		MetricEventsReceived,
-		MetricEventsProcessed,
+		MetricEventsMatched,
+		MetricEventsUnmatched,
 		MetricRetries,
 		MetricDLQEntries,
 		MetricHandlerSuccess,
@@ -294,7 +332,7 @@ func New() *Registry {
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
 	} {
-		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name})
+		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: counterHelp[name]})
 		reg.MustRegister(c)
 		r.counters[name] = c
 	}
@@ -329,23 +367,23 @@ func New() *Registry {
 	// multi-label handler_invocations_total vec. The function label is
 	// low-cardinality (bounded by the function count), matching build_failures.
 	//
-	// Semantics (see runner.Handle): RelayFunctionEvents counts a function
-	// once per event for which at least one of its rules matched — a
-	// functions-engaged counter, distinct from the message-level
-	// MetricEventsProcessed. handler success/failure are per rule execution.
+	// Semantics (see runner.Handle): MetricFunctionEventsMatched counts a
+	// function once per logical event for which at least one of its rules
+	// matched — a functions-engaged counter, distinct from the message-level
+	// MetricEventsMatched. handler success/failure are per rule execution.
 	// MetricFunctionRetries counts every failing rule execution that will be
 	// retried (a retry driver); MetricFunctionDLQ counts a function once when
 	// its failing rule execution is the one that exhausts the rule's retry
 	// budget (attempt >= 1+retries, per-invocation) and the message is routed
 	// to the DLQ.
 	for _, name := range []string{
-		MetricFunctionEvents,
+		MetricFunctionEventsMatched,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
 		MetricFunctionDLQ,
 	} {
-		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name}, []string{"function"})
+		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: counterVecHelp[name]}, []string{"function"})
 		reg.MustRegister(vec)
 		r.counterVecs[name] = &labeledCounterVec{order: []string{"function"}, vec: vec}
 	}
@@ -538,7 +576,7 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 		return
 	}
 	labels := []Label{{Name: "function", Value: f.Function}}
-	r.AddLabels(MetricFunctionEvents, labels, f.Events)
+	r.AddLabels(MetricFunctionEventsMatched, labels, f.EventsMatchedTotal)
 	r.AddLabels(MetricFunctionHandlerSuccess, labels, f.HandlerSuccessTotal)
 	r.AddLabels(MetricFunctionHandlerFailure, labels, f.HandlerFailureTotal)
 	r.AddLabels(MetricFunctionRetries, labels, f.RetriesTotal)
@@ -663,7 +701,7 @@ func (r *Registry) Counter(name string) int64 {
 // state layer's function_stats table.
 type FunctionStat struct {
 	Function            string
-	Events              int64
+	EventsMatchedTotal  int64
 	HandlerSuccessTotal int64
 	HandlerFailureTotal int64
 	RetriesTotal        int64
@@ -696,7 +734,8 @@ type FunctionStat struct {
 }
 
 // FunctionStatsSnapshot reads the per-function CounterVecs — the five
-// operational counters plus the warm-container pool acquires/discards counters
+// operational counters (events matched, handler success/failure, retries, DLQ)
+// plus the warm-container pool acquires/discards counters
 // (discards summed across every live reason, plus the internal restored
 // baseline) — and, for every function that has at
 // least one series, fills the four execution-history timestamp fields from the
@@ -749,8 +788,8 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 			}
 			v := int64(m.Counter.GetValue())
 			switch name {
-			case MetricFunctionEvents:
-				fs.Events = v
+			case MetricFunctionEventsMatched:
+				fs.EventsMatchedTotal = v
 			case MetricFunctionHandlerSuccess:
 				fs.HandlerSuccessTotal = v
 			case MetricFunctionHandlerFailure:
@@ -820,7 +859,7 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 // (they are not cumulative per-function snapshots).
 func isFunctionMetric(name string) bool {
 	switch name {
-	case MetricFunctionEvents,
+	case MetricFunctionEventsMatched,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
@@ -840,7 +879,7 @@ func isFunctionMetric(name string) bool {
 var functionMetrics = []string{
 	MetricHandlerInvocations,
 	MetricBuildFailures,
-	MetricFunctionEvents,
+	MetricFunctionEventsMatched,
 	MetricFunctionHandlerSuccess,
 	MetricFunctionHandlerFailure,
 	MetricFunctionRetries,

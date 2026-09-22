@@ -22,15 +22,15 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
 	c.RecordDiscovered(fnFor(t, "beta", tmpl))
 	c.RecordDiscovered(fnFor(t, "gone", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsProcessedTotal: 5})
+	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsMatchedTotal: 5})
 	if _, err := c.db.ExecContext(context.Background(), `DELETE FROM functions WHERE name = 'gone'`); err != nil {
 		t.Fatalf("delete gone functions row: %v", err)
 	}
 	// A prior global row to prove the snapshot replaces (not accumulates) it.
-	c.RecordStats(Stats{EventsProcessedTotal: 100})
+	c.RecordStats(Stats{EventsMatchedTotal: 100})
 
 	s := Stats{
-		EventsProcessedTotal:    200,
+		EventsMatchedTotal:      200,
 		HandlerSuccessTotal:     190,
 		HandlerFailureTotal:     10,
 		RetryTotal:              3,
@@ -39,11 +39,11 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 		OldestPendingAgeSeconds: 42,
 	}
 	fns := []FunctionStats{
-		{Function: "alpha", EventsProcessedTotal: 30, HandlerSuccessTotal: 25, HandlerFailureTotal: 5, RetryTotal: 1, DLQTotal: 0},
-		{Function: "beta", EventsProcessedTotal: 40, HandlerSuccessTotal: 35, HandlerFailureTotal: 5, RetryTotal: 2, DLQTotal: 1},
+		{Function: "alpha", EventsMatchedTotal: 30, HandlerSuccessTotal: 25, HandlerFailureTotal: 5, RetryTotal: 1, DLQTotal: 0},
+		{Function: "beta", EventsMatchedTotal: 40, HandlerSuccessTotal: 35, HandlerFailureTotal: 5, RetryTotal: 2, DLQTotal: 1},
 		// "gone"'s stale row is present in the snapshot but its functions row was
 		// deleted, so it must be pruned and NOT re-created.
-		{Function: "gone", EventsProcessedTotal: 5, HandlerSuccessTotal: 5},
+		{Function: "gone", EventsMatchedTotal: 5, HandlerSuccessTotal: 5},
 	}
 
 	if err := c.RecordStatsSnapshot(context.Background(), s, fns); err != nil {
@@ -62,11 +62,11 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 
 	// alpha/beta upserted with the snapshot values.
 	a, ok := c.FunctionStats("alpha")
-	if !ok || a.EventsProcessedTotal != 30 || a.HandlerSuccessTotal != 25 {
+	if !ok || a.EventsMatchedTotal != 30 || a.HandlerSuccessTotal != 25 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 30 success 25", a, ok)
 	}
 	b, ok := c.FunctionStats("beta")
-	if !ok || b.EventsProcessedTotal != 40 || b.RetryTotal != 2 {
+	if !ok || b.EventsMatchedTotal != 40 || b.RetryTotal != 2 {
 		t.Fatalf("beta = %+v, ok=%v; want events 40 retries 2", b, ok)
 	}
 
@@ -88,8 +88,8 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	if !ok {
 		t.Fatal("expected global stats row after second snapshot")
 	}
-	if gs.EventsProcessedTotal != 200 {
-		t.Fatalf("events after second snapshot = %d, want 200 (no double counting)", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 200 {
+		t.Fatalf("events after second snapshot = %d, want 200 (no double counting)", gs.EventsMatchedTotal)
 	}
 	prevT, _ := time.Parse(time.RFC3339, prevUpdated)
 	curT, _ := time.Parse(time.RFC3339, gs.UpdatedAt)
@@ -106,15 +106,15 @@ func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedFunction(t *testing.T)
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
 	fns := []FunctionStats{
-		{Function: "alpha", EventsProcessedTotal: 10},
-		{Function: "ghost", EventsProcessedTotal: 99}, // never discovered, no functions row
+		{Function: "alpha", EventsMatchedTotal: 10},
+		{Function: "ghost", EventsMatchedTotal: 99}, // never discovered, no functions row
 	}
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 10}, fns); err != nil {
+	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 10}, fns); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
 	a, ok := c.FunctionStats("alpha")
-	if !ok || a.EventsProcessedTotal != 10 {
+	if !ok || a.EventsMatchedTotal != 10 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 10", a, ok)
 	}
 	if _, ok := c.FunctionStats("ghost"); ok {
@@ -132,15 +132,15 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	c := openTestState(t)
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
-	prev := Stats{EventsProcessedTotal: 50, HandlerSuccessTotal: 40, HandlerFailureTotal: 10, RetryTotal: 2, DLQTotal: 1}
+	prev := Stats{EventsMatchedTotal: 50, HandlerSuccessTotal: 40, HandlerFailureTotal: 10, RetryTotal: 2, DLQTotal: 1}
 	c.RecordStats(prev)
 
 	// Force a failure WITHOUT deleting the DB: a cancelled ctx makes BeginTx (and,
 	// if it somehow succeeded, every bound Exec) fail, so nothing commits.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	fns := []FunctionStats{{Function: "alpha", EventsProcessedTotal: 5}}
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsProcessedTotal: 500, HandlerSuccessTotal: 300}, fns); err == nil {
+	fns := []FunctionStats{{Function: "alpha", EventsMatchedTotal: 5}}
+	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300}, fns); err == nil {
 		t.Fatal("expected error on a cancelled-context snapshot")
 	}
 
@@ -149,8 +149,8 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	if !ok {
 		t.Fatal("expected global stats row after failed flush")
 	}
-	if gs.EventsProcessedTotal != 50 {
-		t.Fatalf("events after failed flush = %d, want 50 preserved", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 50 {
+		t.Fatalf("events after failed flush = %d, want 50 preserved", gs.EventsMatchedTotal)
 	}
 	if gs.HandlerSuccessTotal != 40 {
 		t.Fatalf("success after failed flush = %d, want 40 preserved", gs.HandlerSuccessTotal)
@@ -161,7 +161,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	}
 
 	// A later successful flush with a live ctx persists the accumulated values.
-	want := Stats{EventsProcessedTotal: 500, HandlerSuccessTotal: 300, HandlerFailureTotal: 150, RetryTotal: 4, DLQTotal: 1}
+	want := Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300, HandlerFailureTotal: 150, RetryTotal: 4, DLQTotal: 1}
 	if err := c.RecordStatsSnapshot(context.Background(), want, fns); err != nil {
 		t.Fatalf("recovery snapshot: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 		t.Fatalf("global stats after recovery = %+v, want %+v", gs, want)
 	}
 	a, ok := c.FunctionStats("alpha")
-	if !ok || a.EventsProcessedTotal != 5 {
+	if !ok || a.EventsMatchedTotal != 5 {
 		t.Fatalf("alpha after recovery = %+v, ok=%v; want events 5", a, ok)
 	}
 }
@@ -186,30 +186,30 @@ func TestRecordStatsSnapshotAbsoluteNotDelta(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsProcessedTotal: 100}, nil); err != nil {
+	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("first snapshot: %v", err)
 	}
 	gs, ok := c.Stats()
-	if !ok || gs.EventsProcessedTotal != 100 {
-		t.Fatalf("events = %d, ok=%v; want 100", gs.EventsProcessedTotal, ok)
+	if !ok || gs.EventsMatchedTotal != 100 {
+		t.Fatalf("events = %d, ok=%v; want 100", gs.EventsMatchedTotal, ok)
 	}
 
 	// No new activity, identical value: still 100, not 200.
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsProcessedTotal: 100}, nil); err != nil {
+	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 100}, nil); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 	gs, _ = c.Stats()
-	if gs.EventsProcessedTotal != 100 {
-		t.Fatalf("events after repeat = %d, want 100 (absolute, not delta)", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 100 {
+		t.Fatalf("events after repeat = %d, want 100 (absolute, not delta)", gs.EventsMatchedTotal)
 	}
 
 	// New activity raises the absolute total to 150.
-	if err := c.RecordStatsSnapshot(ctx, Stats{EventsProcessedTotal: 150}, nil); err != nil {
+	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 150}, nil); err != nil {
 		t.Fatalf("third snapshot: %v", err)
 	}
 	gs, _ = c.Stats()
-	if gs.EventsProcessedTotal != 150 {
-		t.Fatalf("events after bump = %d, want 150", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 150 {
+		t.Fatalf("events after bump = %d, want 150", gs.EventsMatchedTotal)
 	}
 }
 
@@ -220,17 +220,17 @@ func TestRecordStatsContextHonorsContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	c.RecordStatsContext(ctx, Stats{EventsProcessedTotal: 100})
+	c.RecordStatsContext(ctx, Stats{EventsMatchedTotal: 100})
 	if _, ok := c.Stats(); ok {
 		t.Fatal("cancelled-context RecordStatsContext must not write a stats row")
 	}
 
-	c.RecordStatsContext(context.Background(), Stats{EventsProcessedTotal: 100})
+	c.RecordStatsContext(context.Background(), Stats{EventsMatchedTotal: 100})
 	gs, ok := c.Stats()
 	if !ok {
 		t.Fatal("expected stats row after background-context write")
 	}
-	if gs.EventsProcessedTotal != 100 {
-		t.Fatalf("events = %d, want 100", gs.EventsProcessedTotal)
+	if gs.EventsMatchedTotal != 100 {
+		t.Fatalf("events = %d, want 100", gs.EventsMatchedTotal)
 	}
 }

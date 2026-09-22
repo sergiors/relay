@@ -785,7 +785,9 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 		return
 	}
 	if gs, ok := st.Stats(); ok {
-		metricsInstance.SeedCounter(metrics.MetricEventsProcessed, gs.EventsProcessedTotal)
+		metricsInstance.SeedCounter(metrics.MetricEventsReceived, gs.EventsReceivedTotal)
+		metricsInstance.SeedCounter(metrics.MetricEventsMatched, gs.EventsMatchedTotal)
+		metricsInstance.SeedCounter(metrics.MetricEventsUnmatched, gs.EventsUnmatchedTotal)
 		metricsInstance.SeedCounter(metrics.MetricHandlerSuccess, gs.HandlerSuccessTotal)
 		metricsInstance.SeedCounter(metrics.MetricHandlerFailure, gs.HandlerFailureTotal)
 		metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
@@ -794,7 +796,7 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 	for _, fs := range st.AllFunctionStats() {
 		metricsInstance.SeedFunctionStat(metrics.FunctionStat{
 			Function:            fs.Function,
-			Events:              fs.EventsProcessedTotal,
+			EventsMatchedTotal:  fs.EventsMatchedTotal,
 			HandlerSuccessTotal: fs.HandlerSuccessTotal,
 			HandlerFailureTotal: fs.HandlerFailureTotal,
 			RetriesTotal:        fs.RetryTotal,
@@ -843,11 +845,13 @@ func unixSecToRFC3339(ts int64) string {
 	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
 }
 
-// relayGlobalCounters are the five unlabeled cumulative counters the worker
-// persists. They are the global counterpart of the per-function counters read
-// by FunctionStatsSnapshot, and the set the relay baseline captures/subtracts.
+// relayGlobalCounters are the unlabeled cumulative counters the worker persists.
+// They are the global counterpart of the per-function counters read by
+// FunctionStatsSnapshot, and the set the relay baseline captures/subtracts.
 var relayGlobalCounters = []string{
-	metrics.MetricEventsProcessed,
+	metrics.MetricEventsReceived,
+	metrics.MetricEventsMatched,
+	metrics.MetricEventsUnmatched,
 	metrics.MetricHandlerSuccess,
 	metrics.MetricHandlerFailure,
 	metrics.MetricRetries,
@@ -893,7 +897,7 @@ func (b *relayBaseline) applyFunctionStat(fs metrics.FunctionStat) metrics.Funct
 	if !ok {
 		return fs
 	}
-	fs.Events -= base.Events
+	fs.EventsMatchedTotal -= base.EventsMatchedTotal
 	fs.HandlerSuccessTotal -= base.HandlerSuccessTotal
 	fs.HandlerFailureTotal -= base.HandlerFailureTotal
 	fs.RetriesTotal -= base.RetriesTotal
@@ -947,6 +951,8 @@ func captureRelayBaseline(metricsInstance *metrics.Registry) relayBaseline {
 // an operator reset starts the persisted totals from zero while Prometheus stays
 // monotonic; before any reset the baseline is zero and this equals the raw
 // counter. The backlog gauges are point-in-time values and are never baselined.
+// The three event-classification counters are copied verbatim, preserving the
+// received == matched + unmatched partition.
 // It is nil-safe: a nil registry yields a zero Stats so the snapshot path can
 // never panic or block processing.
 func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state.Stats {
@@ -954,8 +960,12 @@ func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state
 		return state.Stats{}
 	}
 	return state.Stats{
-		EventsProcessedTotal: base.counter(
-			metrics.MetricEventsProcessed, metricsInstance.Counter(metrics.MetricEventsProcessed)),
+		EventsReceivedTotal: base.counter(
+			metrics.MetricEventsReceived, metricsInstance.Counter(metrics.MetricEventsReceived)),
+		EventsMatchedTotal: base.counter(
+			metrics.MetricEventsMatched, metricsInstance.Counter(metrics.MetricEventsMatched)),
+		EventsUnmatchedTotal: base.counter(
+			metrics.MetricEventsUnmatched, metricsInstance.Counter(metrics.MetricEventsUnmatched)),
 		HandlerSuccessTotal: base.counter(
 			metrics.MetricHandlerSuccess, metricsInstance.Counter(metrics.MetricHandlerSuccess)),
 		HandlerFailureTotal: base.counter(
@@ -987,19 +997,19 @@ func snapshotFunctionStats(metricsInstance *metrics.Registry, base *relayBaselin
 	for _, fs := range stats {
 		fs = base.applyFunctionStat(fs)
 		out = append(out, state.FunctionStats{
-			Function:             fs.Function,
-			EventsProcessedTotal: fs.Events,
-			HandlerSuccessTotal:  fs.HandlerSuccessTotal,
-			HandlerFailureTotal:  fs.HandlerFailureTotal,
-			RetryTotal:           fs.RetriesTotal,
-			DLQTotal:             fs.DLQTotal,
-			WarmAcquiresTotal:    fs.WarmAcquiresTotal,
-			ColdStartsTotal:      fs.ColdStartsTotal,
-			DiscardedTotal:       fs.DiscardedTotal,
-			LastExecutionAt:      unixSecToRFC3339(fs.LastExecution),
-			LastSuccessAt:        unixSecToRFC3339(fs.LastSuccess),
-			LastFailureAt:        unixSecToRFC3339(fs.LastFailure),
-			LastDLQAt:            unixSecToRFC3339(fs.LastDLQ),
+			Function:            fs.Function,
+			EventsMatchedTotal:  fs.EventsMatchedTotal,
+			HandlerSuccessTotal: fs.HandlerSuccessTotal,
+			HandlerFailureTotal: fs.HandlerFailureTotal,
+			RetryTotal:          fs.RetriesTotal,
+			DLQTotal:            fs.DLQTotal,
+			WarmAcquiresTotal:   fs.WarmAcquiresTotal,
+			ColdStartsTotal:     fs.ColdStartsTotal,
+			DiscardedTotal:      fs.DiscardedTotal,
+			LastExecutionAt:     unixSecToRFC3339(fs.LastExecution),
+			LastSuccessAt:       unixSecToRFC3339(fs.LastSuccess),
+			LastFailureAt:       unixSecToRFC3339(fs.LastFailure),
+			LastDLQAt:           unixSecToRFC3339(fs.LastDLQ),
 		})
 	}
 	return out

@@ -20,7 +20,8 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	// otherwise the registry only surfaces the 10 unlabeled counters and 4
 	// gauges.
 	r.Inc(MetricEventsReceived)
-	r.Inc(MetricEventsProcessed)
+	r.Inc(MetricEventsMatched)
+	r.Inc(MetricEventsUnmatched)
 	r.Inc(MetricRetries)
 	r.Inc(MetricDLQEntries)
 	r.Inc(MetricHandlerSuccess)
@@ -31,7 +32,7 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.Inc(MetricSchedulePublishFailures)
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
 	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "a"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
 	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "a"}})
 	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", "a"}})
 	r.IncLabels(MetricFunctionRetries, []Label{{"function", "a"}})
@@ -85,16 +86,16 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 // pre-registered zero gauges are still present in the rendered snapshot.
 func TestCounterAddsAccumulateAcrossIncAndAdd(t *testing.T) {
 	r := New()
-	r.Inc(MetricEventsProcessed)
-	r.Inc(MetricEventsProcessed)
-	r.Add(MetricEventsProcessed, 3)
+	r.Inc(MetricEventsMatched)
+	r.Inc(MetricEventsMatched)
+	r.Add(MetricEventsMatched, 3)
 	r.Inc(MetricRetries)
 	got := r.Snapshot()
 	// Pre-registered counters and gauges render their current (zero) value too;
 	// assert the accumulated counters and that the required zero gauges are
 	// present rather than an exact full-string match (the gauge set grows).
 	for _, want := range []string{
-		"events_processed_total count=5",
+		"events_matched_total count=5",
 		"retries_total count=1",
 		"pending_entries value=0",
 		"pending_oldest_age_seconds value=0",
@@ -142,11 +143,11 @@ func TestDurationCountSum(t *testing.T) {
 
 func TestCounterGetter(t *testing.T) {
 	r := New()
-	r.Inc(MetricEventsProcessed)
-	r.Add(MetricEventsProcessed, 3)
+	r.Inc(MetricEventsMatched)
+	r.Add(MetricEventsMatched, 3)
 	r.Inc(MetricRetries)
-	if got := r.Counter(MetricEventsProcessed); got != 4 {
-		t.Fatalf("Counter(events_processed_total) = %d, want 4", got)
+	if got := r.Counter(MetricEventsMatched); got != 4 {
+		t.Fatalf("Counter(events_matched_total) = %d, want 4", got)
 	}
 	if got := r.Counter(MetricRetries); got != 1 {
 		t.Fatalf("Counter(retries_total) = %d, want 1", got)
@@ -201,7 +202,7 @@ func TestGaugeSet(t *testing.T) {
 func TestSnapshotDeterminism(t *testing.T) {
 	r := New()
 	r.Inc(MetricDLQEntries)
-	r.Inc(MetricEventsProcessed)
+	r.Inc(MetricEventsMatched)
 	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", "a"}}, time.Second)
 	r.SetGauge(MetricPendingEntries, 1)
 	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
@@ -231,9 +232,9 @@ func TestNilReceiverNoop(t *testing.T) {
 func TestFunctionStatsSnapshot(t *testing.T) {
 	r := New()
 	// Two functions with distinct per-function counters.
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "b"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "b"}})
 	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "a"}})
 	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", "b"}})
 	r.IncLabels(MetricFunctionRetries, []Label{{"function", "b"}})
@@ -247,10 +248,10 @@ func TestFunctionStatsSnapshot(t *testing.T) {
 	if got[0].Function != "a" || got[1].Function != "b" {
 		t.Fatalf("unexpected order: %+v", got)
 	}
-	if got[0].Events != 2 || got[0].HandlerSuccessTotal != 1 || got[0].HandlerFailureTotal != 0 {
+	if got[0].EventsMatchedTotal != 2 || got[0].HandlerSuccessTotal != 1 || got[0].HandlerFailureTotal != 0 {
 		t.Fatalf("function a stats = %+v", got[0])
 	}
-	if got[1].Events != 1 || got[1].HandlerFailureTotal != 1 || got[1].RetriesTotal != 1 || got[1].DLQTotal != 1 {
+	if got[1].EventsMatchedTotal != 1 || got[1].HandlerFailureTotal != 1 || got[1].RetriesTotal != 1 || got[1].DLQTotal != 1 {
 		t.Fatalf("function b stats = %+v", got[1])
 	}
 }
@@ -278,7 +279,7 @@ func TestFunctionStatsSnapshotIncludesPoolCounters(t *testing.T) {
 	// A pool-only function (no operational counter series) still surfaces.
 	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "poolonly"}, {"outcome", RuntimeOutcomeCold}}, 1)
 	got = byFn(r.FunctionStatsSnapshot(), "poolonly")
-	if got.Function != "poolonly" || got.ColdStartsTotal != 1 || got.Events != 0 {
+	if got.Function != "poolonly" || got.ColdStartsTotal != 1 || got.EventsMatchedTotal != 0 {
 		t.Fatalf("pool-only function = %+v, want cold 1", got)
 	}
 }
@@ -435,7 +436,7 @@ func TestHandlerNilRegistryServesEmpty(t *testing.T) {
 func TestSetFunctionTimestampSnapshot(t *testing.T) {
 	r := New()
 	// "a": counters + all four timestamps.
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "a"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
 	ts := int64(1700000000)
 	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
 	r.SetFunctionTimestamp("a", FunctionTimestampSuccess, ts+1)
@@ -459,10 +460,10 @@ func TestSetFunctionTimestampSnapshot(t *testing.T) {
 	}
 
 	// A function with counters but NO timestamp entry reads zeros (counters-only shape).
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "c"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "c"}})
 	got = r.FunctionStatsSnapshot()
 	c := byFn(got, "c")
-	if c.Events != 1 || c.LastExecution != 0 || c.LastSuccess != 0 || c.LastFailure != 0 || c.LastDLQ != 0 {
+	if c.EventsMatchedTotal != 1 || c.LastExecution != 0 || c.LastSuccess != 0 || c.LastFailure != 0 || c.LastDLQ != 0 {
 		t.Fatalf("c (counters-only) = %+v", c)
 	}
 
@@ -492,9 +493,9 @@ func byFn(fs []FunctionStat, name string) FunctionStat {
 func TestSeedFunctionStatTimestamps(t *testing.T) {
 	r := New()
 	ts := int64(1700000000)
-	r.SeedFunctionStat(FunctionStat{Function: "alpha", Events: 1, LastExecution: ts, LastSuccess: ts + 1})
+	r.SeedFunctionStat(FunctionStat{Function: "alpha", EventsMatchedTotal: 1, LastExecution: ts, LastSuccess: ts + 1})
 	// beta has counters but only zero timestamps: nothing is stored.
-	r.SeedFunctionStat(FunctionStat{Function: "beta", Events: 1})
+	r.SeedFunctionStat(FunctionStat{Function: "beta", EventsMatchedTotal: 1})
 
 	got := r.FunctionStatsSnapshot()
 	a := byFn(got, "alpha")
@@ -506,9 +507,9 @@ func TestSeedFunctionStatTimestamps(t *testing.T) {
 	}
 
 	// A partial overwrite preserves the kinds that were not seeded.
-	r.SeedFunctionStat(FunctionStat{Function: "alpha", Events: 2, LastFailure: ts + 5})
+	r.SeedFunctionStat(FunctionStat{Function: "alpha", EventsMatchedTotal: 2, LastFailure: ts + 5})
 	a = byFn(r.FunctionStatsSnapshot(), "alpha")
-	if a.Events != 3 || a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != ts+5 {
+	if a.EventsMatchedTotal != 3 || a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != ts+5 {
 		t.Fatalf("alpha after partial seed = %+v", a)
 	}
 }
@@ -518,9 +519,9 @@ func TestSeedFunctionStatTimestamps(t *testing.T) {
 func TestRemoveFunctionClearsTimestamps(t *testing.T) {
 	r := New()
 	ts := int64(1700000000)
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "a"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
 	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
-	r.IncLabels(MetricFunctionEvents, []Label{{"function", "b"}})
+	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "b"}})
 	r.SetFunctionTimestamp("b", FunctionTimestampExecution, ts)
 
 	r.RemoveFunction("a")

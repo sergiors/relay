@@ -112,7 +112,9 @@ func printStats(w io.Writer, st *state.State) {
 		updated = state.RelativeAgo(s.UpdatedAt)
 	}
 
-	fmt.Fprintf(tw, "Events processed:\t%d\n", s.EventsProcessedTotal)
+	fmt.Fprintf(tw, "Events received:\t%d\n", s.EventsReceivedTotal)
+	fmt.Fprintf(tw, "Events matched:\t%d\n", s.EventsMatchedTotal)
+	fmt.Fprintf(tw, "Events unmatched:\t%d\n", s.EventsUnmatchedTotal)
 	fmt.Fprintf(tw, "Handler successes:\t%d\n", s.HandlerSuccessTotal)
 	fmt.Fprintf(tw, "Handler failures:\t%d\n", s.HandlerFailureTotal)
 	fmt.Fprintf(tw, "Retries:\t%d\n", s.RetryTotal)

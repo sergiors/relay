@@ -45,7 +45,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	c.RecordReconcileSuccess("alpha", "img", "fp", base, fnFor(t, "alpha", tmpl))
 
 	c.RecordStats(Stats{
-		EventsProcessedTotal:    100,
+		EventsReceivedTotal:     110,
+		EventsMatchedTotal:      100,
+		EventsUnmatchedTotal:    10,
 		HandlerSuccessTotal:     90,
 		HandlerFailureTotal:     10,
 		RetryTotal:              7,
@@ -55,21 +57,21 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	})
 	exec := base.Add(-time.Hour).Format(time.RFC3339)
 	c.RecordFunctionStats(FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 40,
-		HandlerSuccessTotal:  30,
-		HandlerFailureTotal:  10,
-		RetryTotal:           5,
-		DLQTotal:             2,
-		WarmAcquiresTotal:    11,
-		ColdStartsTotal:      4,
-		DiscardedTotal:       2,
-		LastExecutionAt:      exec,
-		LastSuccessAt:        exec,
-		LastFailureAt:        exec,
-		LastDLQAt:            exec,
+		Function:            "alpha",
+		EventsMatchedTotal:  40,
+		HandlerSuccessTotal: 30,
+		HandlerFailureTotal: 10,
+		RetryTotal:          5,
+		DLQTotal:            2,
+		WarmAcquiresTotal:   11,
+		ColdStartsTotal:     4,
+		DiscardedTotal:      2,
+		LastExecutionAt:     exec,
+		LastSuccessAt:       exec,
+		LastFailureAt:       exec,
+		LastDLQAt:           exec,
 	})
-	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsMatchedTotal: 3})
 
 	c.nowFn = func() time.Time { return base.Add(time.Minute) }
 	if err := c.ResetStats(); err != nil {
@@ -82,7 +84,8 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	if !ok {
 		t.Fatal("stats row must still exist after reset")
 	}
-	if s.EventsProcessedTotal != 0 || s.HandlerSuccessTotal != 0 ||
+	if s.EventsReceivedTotal != 0 || s.EventsMatchedTotal != 0 || s.EventsUnmatchedTotal != 0 ||
+		s.HandlerSuccessTotal != 0 ||
 		s.HandlerFailureTotal != 0 || s.RetryTotal != 0 || s.DLQTotal != 0 {
 		t.Fatalf("cumulative counters must be zeroed: %+v", s)
 	}
@@ -100,7 +103,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 		t.Fatalf("function_stats rows = %d, want 2 (rows preserved): %+v", len(all), all)
 	}
 	for _, fs := range all {
-		if fs.EventsProcessedTotal != 0 || fs.HandlerSuccessTotal != 0 ||
+		if fs.EventsMatchedTotal != 0 || fs.HandlerSuccessTotal != 0 ||
 			fs.HandlerFailureTotal != 0 || fs.RetryTotal != 0 || fs.DLQTotal != 0 ||
 			fs.WarmAcquiresTotal != 0 || fs.ColdStartsTotal != 0 || fs.DiscardedTotal != 0 {
 			t.Fatalf("function %q counters must be zeroed: %+v", fs.Function, fs)
@@ -148,7 +151,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 func TestResetStatsPreservesUnrelatedGlobalJSONFields(t *testing.T) {
 	c := openTestState(t)
 	c.RecordStats(Stats{
-		EventsProcessedTotal:    9,
+		EventsMatchedTotal:      9,
 		HandlerSuccessTotal:     8,
 		HandlerFailureTotal:     1,
 		RetryTotal:              1,
@@ -180,19 +183,19 @@ func TestResetStatsZeroesPoolCountersAndTimestamps(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	c.RecordFunctionStats(FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 5,
-		HandlerSuccessTotal:  4,
-		HandlerFailureTotal:  1,
-		RetryTotal:           1,
-		DLQTotal:             1,
-		WarmAcquiresTotal:    11,
-		ColdStartsTotal:      4,
-		DiscardedTotal:       2,
-		LastExecutionAt:      exec,
-		LastSuccessAt:        exec,
-		LastFailureAt:        exec,
-		LastDLQAt:            exec,
+		Function:            "alpha",
+		EventsMatchedTotal:  5,
+		HandlerSuccessTotal: 4,
+		HandlerFailureTotal: 1,
+		RetryTotal:          1,
+		DLQTotal:            1,
+		WarmAcquiresTotal:   11,
+		ColdStartsTotal:     4,
+		DiscardedTotal:      2,
+		LastExecutionAt:     exec,
+		LastSuccessAt:       exec,
+		LastFailureAt:       exec,
+		LastDLQAt:           exec,
 	})
 
 	if err := c.ResetStats(); err != nil {
@@ -202,7 +205,7 @@ func TestResetStatsZeroesPoolCountersAndTimestamps(t *testing.T) {
 	if !ok {
 		t.Fatal("alpha row must survive the reset")
 	}
-	if fs.EventsProcessedTotal != 0 || fs.HandlerSuccessTotal != 0 || fs.HandlerFailureTotal != 0 ||
+	if fs.EventsMatchedTotal != 0 || fs.HandlerSuccessTotal != 0 || fs.HandlerFailureTotal != 0 ||
 		fs.RetryTotal != 0 || fs.DLQTotal != 0 || fs.WarmAcquiresTotal != 0 ||
 		fs.ColdStartsTotal != 0 || fs.DiscardedTotal != 0 {
 		t.Fatalf("all cumulative counters must be zeroed: %+v", fs)
@@ -216,8 +219,8 @@ func TestResetStatsZeroesPoolCountersAndTimestamps(t *testing.T) {
 // including one with no timestamps and one with only pool counters.
 func TestResetStatsMultipleFunctionRows(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 5, WarmAcquiresTotal: 2})
-	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 5, WarmAcquiresTotal: 2})
+	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsMatchedTotal: 3})
 	c.RecordFunctionStats(FunctionStats{Function: "gamma", WarmAcquiresTotal: 7, DiscardedTotal: 1})
 
 	if err := c.ResetStats(); err != nil {
@@ -239,33 +242,33 @@ func TestResetStatsMultipleFunctionRows(t *testing.T) {
 // record and read back normally on the cleared slate.
 func TestResetStatsThenAccumulate(t *testing.T) {
 	c := openTestState(t)
-	c.RecordStats(Stats{EventsProcessedTotal: 50, PendingEntries: 3})
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 5})
+	c.RecordStats(Stats{EventsMatchedTotal: 50, PendingEntries: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 5})
 
 	if err := c.ResetStats(); err != nil {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
-	c.RecordStats(Stats{EventsProcessedTotal: 3, PendingEntries: 9})
+	c.RecordStats(Stats{EventsMatchedTotal: 3, PendingEntries: 9})
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	c.RecordFunctionStatsContext(context.Background(), FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 3,
-		HandlerSuccessTotal:  3,
-		WarmAcquiresTotal:    2,
-		LastExecutionAt:      exec,
-		LastSuccessAt:        exec,
+		Function:            "alpha",
+		EventsMatchedTotal:  3,
+		HandlerSuccessTotal: 3,
+		WarmAcquiresTotal:   2,
+		LastExecutionAt:     exec,
+		LastSuccessAt:       exec,
 	})
 
 	s, ok := c.Stats()
-	if !ok || s.EventsProcessedTotal != 3 || s.PendingEntries != 9 {
+	if !ok || s.EventsMatchedTotal != 3 || s.PendingEntries != 9 {
 		t.Fatalf("post-reset global stats = %+v, ok=%v", s, ok)
 	}
 	fs, ok := c.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("post-reset function stats row must exist after a new record")
 	}
-	if fs.EventsProcessedTotal != 3 || fs.HandlerSuccessTotal != 3 || fs.WarmAcquiresTotal != 2 {
+	if fs.EventsMatchedTotal != 3 || fs.HandlerSuccessTotal != 3 || fs.WarmAcquiresTotal != 2 {
 		t.Fatalf("post-reset function counters = %+v", fs)
 	}
 	// The reset cleared the timestamps, so the incoming ones land as-is.
@@ -278,8 +281,8 @@ func TestResetStatsThenAccumulate(t *testing.T) {
 // succeeds and keeps the fresh state.
 func TestResetStatsIdempotent(t *testing.T) {
 	c := openTestState(t)
-	c.RecordStats(Stats{EventsProcessedTotal: 1, PendingEntries: 4})
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 1})
+	c.RecordStats(Stats{EventsMatchedTotal: 1, PendingEntries: 4})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 1})
 
 	for i := 1; i <= 2; i++ {
 		if err := c.ResetStats(); err != nil {
@@ -288,10 +291,10 @@ func TestResetStatsIdempotent(t *testing.T) {
 	}
 
 	s, ok := c.Stats()
-	if !ok || s.EventsProcessedTotal != 0 || s.PendingEntries != 4 {
+	if !ok || s.EventsMatchedTotal != 0 || s.PendingEntries != 4 {
 		t.Fatalf("stats after repeated reset = %+v, ok=%v", s, ok)
 	}
-	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsProcessedTotal != 0 {
+	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsMatchedTotal != 0 {
 		t.Fatalf("function_stats after repeated reset = %+v", all)
 	}
 }
@@ -322,7 +325,7 @@ func TestResetStatsFreshDB(t *testing.T) {
 // transaction fails and the function_stats rows are NOT modified.
 func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 5})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 5})
 
 	// Bypass the marshaller to plant an undecodable payload (the schema allows
 	// arbitrary TEXT in data).
@@ -334,7 +337,7 @@ func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 	if err := c.ResetStats(); err == nil {
 		t.Fatal("ResetStats with a corrupt payload: err = nil, want error")
 	}
-	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsProcessedTotal != 5 {
+	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsMatchedTotal != 5 {
 		t.Fatalf("failed reset must roll back function_stats changes: %+v", all)
 	}
 }
@@ -345,23 +348,23 @@ func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 // row — keeps its pre-reset values.
 func TestResetStatsRollsBackOnCorruptFunctionPayload(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "good", EventsProcessedTotal: 5})
+	c.RecordFunctionStats(FunctionStats{Function: "good", EventsMatchedTotal: 5})
 	if _, err := c.db.ExecContext(context.Background(),
 		`INSERT INTO function_stats (function_name, data, updated_at) VALUES ('broken', '{not-json', '2020-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
-	c.RecordStats(Stats{EventsProcessedTotal: 9})
+	c.RecordStats(Stats{EventsMatchedTotal: 9})
 
 	if err := c.ResetStats(); err == nil {
 		t.Fatal("ResetStats with a corrupt function payload: err = nil, want error")
 	}
 	// Nothing landed: the global counters and the good function row keep their
 	// pre-reset values.
-	if s, _ := c.Stats(); s.EventsProcessedTotal != 9 {
+	if s, _ := c.Stats(); s.EventsMatchedTotal != 9 {
 		t.Fatalf("global counters must roll back: %+v", s)
 	}
 	good, ok := c.FunctionStats("good")
-	if !ok || good.EventsProcessedTotal != 5 {
+	if !ok || good.EventsMatchedTotal != 5 {
 		t.Fatalf("good row must roll back: %+v, ok=%v", good, ok)
 	}
 	// The corrupt row survives untouched.

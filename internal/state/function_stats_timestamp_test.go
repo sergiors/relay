@@ -13,15 +13,15 @@ func TestFunctionStatsTimestampsRoundTrip(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().Add(-2 * time.Minute).UTC()
 	in := FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 5,
-		HandlerSuccessTotal:  4,
-		HandlerFailureTotal:  1,
-		RetryTotal:           1,
-		LastExecutionAt:      exec.Format(time.RFC3339),
-		LastSuccessAt:        time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
-		LastFailureAt:        time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339),
-		LastDLQAt:            time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
+		Function:            "alpha",
+		EventsMatchedTotal:  5,
+		HandlerSuccessTotal: 4,
+		HandlerFailureTotal: 1,
+		RetryTotal:          1,
+		LastExecutionAt:     exec.Format(time.RFC3339),
+		LastSuccessAt:       time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+		LastFailureAt:       time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339),
+		LastDLQAt:           time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
 	}
 	c.RecordFunctionStats(in)
 
@@ -54,16 +54,16 @@ func TestRecordFunctionStatsEmptyTimestampPreservesExisting(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().Add(-time.Hour).UTC()
 	c.RecordFunctionStats(FunctionStats{
-		Function:             "alpha",
-		EventsProcessedTotal: 1,
-		LastExecutionAt:      exec.Format(time.RFC3339),
-		LastDLQAt:            exec.Format(time.RFC3339),
+		Function:           "alpha",
+		EventsMatchedTotal: 1,
+		LastExecutionAt:    exec.Format(time.RFC3339),
+		LastDLQAt:          exec.Format(time.RFC3339),
 	})
 
 	// A later flush carries counters but NO timestamps: both must survive.
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 2})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 2})
 	s, ok := c.FunctionStats("alpha")
-	if !ok || s.EventsProcessedTotal != 2 {
+	if !ok || s.EventsMatchedTotal != 2 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 2 (counters replaced)", s, ok)
 	}
 	if s.LastExecutionAt != exec.Format(time.RFC3339) || s.LastDLQAt != exec.Format(time.RFC3339) {
@@ -72,7 +72,7 @@ func TestRecordFunctionStatsEmptyTimestampPreservesExisting(t *testing.T) {
 
 	// A NEW value does overwrite (latest wins).
 	reExec := time.Now().UTC()
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 3, LastExecutionAt: reExec.Format(time.RFC3339)})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3, LastExecutionAt: reExec.Format(time.RFC3339)})
 	s, _ = c.FunctionStats("alpha")
 	if s.LastExecutionAt != reExec.Format(time.RFC3339) {
 		t.Fatalf("newer execution timestamp must overwrite: %+v", s)
@@ -91,18 +91,18 @@ func TestRecordStatsSnapshotTimestampsPersist(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
 	exec := time.Now().Add(-time.Minute).UTC()
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 1},
-		[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 1, LastExecutionAt: exec.Format(time.RFC3339)}}); err != nil {
+	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 1},
+		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 1, LastExecutionAt: exec.Format(time.RFC3339)}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
 	// A follow-up flush carries NO timestamps: the stored one must survive.
-	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsProcessedTotal: 2},
-		[]FunctionStats{{Function: "alpha", EventsProcessedTotal: 2}}); err != nil {
+	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 2},
+		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 2}}); err != nil {
 		t.Fatalf("second snapshot: %v", err)
 	}
 	s, ok := c.FunctionStats("alpha")
-	if !ok || s.EventsProcessedTotal != 2 {
+	if !ok || s.EventsMatchedTotal != 2 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 2", s, ok)
 	}
 	if s.LastExecutionAt != exec.Format(time.RFC3339) {
@@ -115,8 +115,8 @@ func TestRecordStatsSnapshotTimestampsPersist(t *testing.T) {
 func TestAllFunctionStatsTimestamps(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().UTC()
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 1, LastExecutionAt: exec.Format(time.RFC3339)})
-	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 2})
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 1, LastExecutionAt: exec.Format(time.RFC3339)})
+	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsMatchedTotal: 2})
 
 	all := c.AllFunctionStats()
 	if len(all) != 2 {

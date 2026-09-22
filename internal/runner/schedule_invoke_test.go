@@ -42,14 +42,15 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 		t.Fatalf("expected per-function success; got:\n%s", got)
 	}
 	// InvokeHandler (called directly here, without the stream layer) must not
-	// inflate the event counters: events_processed_total is counted by the stream
-	// layer (stream.processScheduleMessage) and events_received_total by Handle's
-	// message path, not by the schedule execution path.
-	if strings.Contains(got, metrics.MetricEventsReceived) || strings.Contains(got, metrics.MetricEventsProcessed) {
+	// touch the event classification counters: received/matched/unmatched are
+	// counted by Handle's event path, not by the schedule execution path.
+	if strings.Contains(got, metrics.MetricEventsReceived) ||
+		strings.Contains(got, metrics.MetricEventsMatched) ||
+		strings.Contains(got, metrics.MetricEventsUnmatched) {
 		t.Fatalf("schedule must not inflate event counters:\n%s", got)
 	}
-	if strings.Contains(got, metrics.MetricFunctionEvents) {
-		t.Fatalf("schedule must not inflate function_events_total:\n%s", got)
+	if strings.Contains(got, metrics.MetricFunctionEventsMatched) {
+		t.Fatalf("schedule must not inflate function_events_matched_total:\n%s", got)
 	}
 }
 

@@ -98,8 +98,19 @@ type invocationStateStore interface {
 	) (time.Time, error)
 	markExhausted(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
 	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
+	// claimClassification atomically claims the one-time event classification
+	// for this message (HSETNX on a reserved field). It returns true only for
+	// the first caller across redeliveries and replicas.
+	claimClassification(ctx context.Context, stream, group, msgID string) (bool, error)
 	clear(ctx context.Context, stream, group, msgID string) error
 }
+
+// classificationField is the reserved invocation-state hash field that records
+// whether this message's logical-event classification (received/matched/
+// unmatched) has already been claimed. It cannot collide with a real invocation
+// ID, which is always "<function>/<handler>": function names are validated to
+// start with [a-z0-9], so a leading "__" is not a legal function name.
+const classificationField = "__classification"
 
 // invocationStore is a thin Redis-backed store for per-message invocation
 // state. Each key is a HASH mapping an invocation ID ("<function>/<handler>")
@@ -330,6 +341,38 @@ func (p *invocationStore) clear(ctx context.Context, stream, group, msgID string
 	return p.client.Del(ctx, invocationStateKey(stream, group, msgID)).Err()
 }
 
+// claimClassification atomically claims this message's one-time logical-event
+// classification. It uses HSETNX on the reserved classificationField, which is
+// atomic in Redis: exactly one caller (across redeliveries, reclaims, and
+// replicas) receives true and therefore counts the event once; every later
+// delivery of the same message sees the field present and receives false. The
+// claim is written before the runner classifies, so a crash between the claim
+// and the metric increment can only LOSE a count for that event — it can never
+// double-count one. The TTL is refreshed alongside the write so the claim is
+// cleaned up with the rest of the message's invocation state.
+//
+// The claim lives and dies with the message's invocation-state hash: terminal
+// paths (successful ACK or DLQ routing) clear that hash only after the message
+// leaves the PEL, so no redelivery can follow a clear. The claim also cannot
+// outlive the invocationStateTTL; a message left pending longer than the TTL
+// could in principle be re-classified, but that TTL is comfortably longer than
+// the maximum pending lifetime (see invocationStateTTL).
+//
+// On a Redis error it returns (false, err): the caller must NOT count the
+// event, because it cannot prove the claim. Failing open here would risk
+// double-counting on redelivery, and classification counters are exact
+// partition counts, not at-least-once accounting.
+func (p *invocationStore) claimClassification(ctx context.Context, stream, group, msgID string) (bool, error) {
+	key := invocationStateKey(stream, group, msgID)
+	pipe := p.client.Pipeline()
+	set := pipe.HSetNX(ctx, key, classificationField, "1")
+	pipe.Expire(ctx, key, invocationStateTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+	return set.Val(), nil
+}
+
 // runningValue encodes a protected attempt's absolute deadline and attempt
 // number as the field value "running:<unixnano>#<attempts>". The "running:"
 // prefix distinguishes it from the "ok" completion sentinel; the Unix-nano
@@ -435,6 +478,12 @@ type InvocationState interface {
 	// DLQ). A Redis read error fails open to false (not terminal), so the
 	// message is conservatively left pending rather than DLQ'd.
 	IsTerminal(invocation string) bool
+	// ClaimClassification atomically claims this message's one-time logical
+	// event classification. It returns true only for the first delivery
+	// (across redeliveries and replicas) of the message; every later delivery
+	// returns false. A store error returns (false, err) so the caller counts
+	// nothing rather than risk a double count.
+	ClaimClassification() (bool, error)
 }
 
 // invocationStateContextKey is the context key carrying the per-message
@@ -607,6 +656,19 @@ func (p *invocationState) IsTerminal(invocation string) bool {
 		return false
 	}
 	return terminal
+}
+
+// ClaimClassification atomically claims this message's one-time logical-event
+// classification and reports whether this delivery won the claim. A store error
+// is not fail-open here: classification counters must be exact, so the error is
+// logged and (false, err) returned so the caller counts nothing.
+func (p *invocationState) ClaimClassification() (bool, error) {
+	claimed, err := p.store.claimClassification(p.ctx, p.stream, p.group, p.msgID)
+	if err != nil {
+		p.log.Debug("Invocation state: classification claim failed; not counting event", "error", err)
+		return false, err
+	}
+	return claimed, nil
 }
 
 // MarkComplete logs but does not fail the handler on a write error: the message

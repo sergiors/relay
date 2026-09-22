@@ -630,9 +630,11 @@ The guarantee is therefore:
 Publication is best-effort across the fleet: every worker evaluates the cron
 independently, so a publish failure on one worker only loses that worker's
 tick — other workers still publish the same occurrence. Scheduled handlers do
-not advance the event counters (`events_received_total`,
-`events_processed_total`, `function_events_total`); schedule coordination has
-its own counters (see _Observability_).
+not advance the event-classification counters (`events_received_total`,
+`events_matched_total`, `events_unmatched_total`) or
+`function_events_matched_total`: schedule occurrences bypass event matching
+entirely, so they have no matched/unmatched class. Schedule coordination has its
+own counters (see _Observability_).
 
 Adding, changing, or removing a function's schedules (or handler/cron/
 timezone/timeout) converges live through the reconciler: the worker's cron
@@ -1263,11 +1265,11 @@ failed reconcile with an active version keeps `Status: ready` and shows
 `Last reconcile: failed (...)` — the function is never marked unavailable.
 
 `relay function inspect <name>` also includes the current per-function
-operational stats (zeros until the function has processed events):
+operational stats (zeros until the function has matched events):
 
 ```
 Stats:
-  Events processed:    12493
+  Events matched:      12493
   Handler successes:   12470
   Handler failures:    23
   Retries:             17
@@ -1563,10 +1565,12 @@ remains the health check.
 - **Prometheus metrics**: when `METRICS_ADDR` is set to a non-empty listen
   address, the Relay runtime exposes `GET /metrics` on that address in Prometheus
   text format via the official
-  Prometheus client. Counters: `events_received_total`, `events_processed_total`,
-  `handler_success_total`, `handler_failure_total`, `retries_total`,
+  Prometheus client. Counters: `events_received_total`, `events_matched_total`,
+  `events_unmatched_total`, `handler_success_total`, `handler_failure_total`,
+  `retries_total`,
   `dlq_entries_total`, `handler_invocations_total{outcome,function,handler}`,
   `build_failures_total{function}`, and per-function
+  `function_events_matched_total{function}` plus the other
   `function_*_total{function}` counters. Histograms:
   `handler_duration_seconds{function,handler}`,
   `function_build_seconds{function}`. Gauges: `pending_entries`,
@@ -1587,6 +1591,26 @@ remains the health check.
   metrics server is operationally isolated: bind failures
   are logged and retried, scrape errors never stop event consumption, and
   shutdown is graceful. Prometheus is the source for time-series metrics.
+- **Event classification counters**: `events_received_total`,
+  `events_matched_total`, and `events_unmatched_total` form a closed partition
+  of the **logical** incoming events the runner handled:
+  `received == matched + unmatched`. Each logical event is classified **exactly
+  once** across redeliveries and retries — a message reclaimed by recovery (or
+  redelivered after a failed handler/ACK) is the same logical event, so it does
+  not increment them again. The once-only claim is an atomic Redis `HSETNX`
+  field in the message's invocation-state hash, which also makes the claim safe
+  across replicas; if the claim cannot be written (Redis error) nothing is
+  counted, because the counters are an exact partition and a missed count is
+  preferable to a double count. The class is decided from **matching alone,
+  before any execution**, so a handler failure stays `matched`; `unmatched`
+  events are acknowledged and never retried. `function_events_matched_total`
+  attributes a function once per matched logical event (deduped across that
+  function's multiple matching rules), so an event matching two functions counts
+  once globally and once per function. Schedule occurrences bypass event
+  matching and are **not** part of this partition; malformed messages never
+  reach the runner and are likewise not classified. These three counters (plus
+  the per-function matched counter) are persisted in the SQLite snapshot and
+  restored at startup like the other cumulative counters.
 - **Warm-container pool metrics**: the per-function warm container pool
   (see _Execution container lifecycle_) publishes its own series, all
   function-scoped and low-cardinality:
@@ -1634,7 +1658,9 @@ relay stats
 ```
 
 ```
-Events processed:    152934
+Events received:     153000
+Events matched:      152934
+Events unmatched:    66
 Handler successes:   152801
 Handler failures:    133
 Retries:             82

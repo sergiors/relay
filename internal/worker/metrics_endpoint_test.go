@@ -29,7 +29,7 @@ func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
 	_ = l.Close()
 
 	metricsInstance := metrics.New()
-	metricsInstance.Inc(metrics.MetricEventsProcessed)
+	metricsInstance.Inc(metrics.MetricEventsMatched)
 	metricsInstance.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
 	metricsInstance.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
@@ -75,7 +75,7 @@ func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	for _, want := range []string{
-		"relay_events_processed_total 1",
+		"relay_events_matched_total 1",
 		`handler_invocations_total{function="demo",handler="index.hi",outcome="success"} 1`,
 		`handler_duration_seconds_count{function="demo",handler="index.hi"} 1`,
 		"relay_pending_entries 3",

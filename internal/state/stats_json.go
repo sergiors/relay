@@ -16,7 +16,7 @@ import (
 // typed Stats / FunctionStats values.
 //
 // Payload field names mirror the previous explicit column names
-// (events_processed_total, warm_acquires_total, last_execution_at, ...), so the
+// (events_matched_total, warm_acquires_total, last_execution_at, ...), so the
 // storage format stays self-describing. Absent fields decode to their Go zero
 // value: a payload written by an older/future writer that does not carry a
 // field reads as 0 (or "" for timestamps), exactly like the old NOT NULL

@@ -149,10 +149,10 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 	// A global counter the removal must never touch.
 	m.Inc(metrics.MetricEventsReceived)
 	before := m.Snapshot()
-	if !strings.Contains(before, "function_events_total{function=victim}") {
+	if !strings.Contains(before, "function_events_matched_total{function=victim}") {
 		t.Fatalf("expected victim series before removal:\n%s", before)
 	}
-	if !strings.Contains(before, "function_events_total{function=bystander}") {
+	if !strings.Contains(before, "function_events_matched_total{function=bystander}") {
 		t.Fatalf("expected bystander series before removal:\n%s", before)
 	}
 
@@ -172,7 +172,7 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 
 	got := m.Snapshot()
 	// Victim's series are gone from every function-scoped vec.
-	if strings.Contains(got, "function_events_total{function=victim}") {
+	if strings.Contains(got, "function_events_matched_total{function=victim}") {
 		t.Fatalf("victim series must be deleted on removal:\n%s", got)
 	}
 	if strings.Contains(got, "handler_invocations_total{function=victim,") {
@@ -182,7 +182,7 @@ func TestReconcileRemovalDeletesMetricsSeries(t *testing.T) {
 		t.Fatalf("victim function_build_seconds must be deleted:\n%s", got)
 	}
 	// Bystander's series and the global counter survive.
-	if !strings.Contains(got, "function_events_total{function=bystander}") {
+	if !strings.Contains(got, "function_events_matched_total{function=bystander}") {
 		t.Fatalf("bystander series must survive removal:\n%s", got)
 	}
 	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
@@ -196,7 +196,7 @@ func seedMetricsFunction(m *metrics.Registry, name string) {
 	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
 	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "failure"}, {Name: "function", Value: name}, {Name: "handler", Value: "x"}})
 	m.IncLabels(metrics.MetricBuildFailures, []metrics.Label{{Name: "function", Value: name}})
-	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: name}})
+	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: name}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: name}})
 	m.IncLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: name}})
 	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: name}})
@@ -244,9 +244,9 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 
 	// Simulate prior activity: per-function counters for both and a cumulative
 	// global row.
-	st.RecordFunctionStats(state.FunctionStats{Function: "victim", EventsProcessedTotal: 5, HandlerSuccessTotal: 3})
-	st.RecordFunctionStats(state.FunctionStats{Function: "bystander", EventsProcessedTotal: 7, HandlerSuccessTotal: 4})
-	wantGlobal := state.Stats{EventsProcessedTotal: 12, HandlerSuccessTotal: 7}
+	st.RecordFunctionStats(state.FunctionStats{Function: "victim", EventsMatchedTotal: 5, HandlerSuccessTotal: 3})
+	st.RecordFunctionStats(state.FunctionStats{Function: "bystander", EventsMatchedTotal: 7, HandlerSuccessTotal: 4})
+	wantGlobal := state.Stats{EventsMatchedTotal: 12, HandlerSuccessTotal: 7}
 	st.RecordStats(wantGlobal)
 
 	// Capture bystander's handler count before the removal for the untouched check.
@@ -286,7 +286,7 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 		t.Fatal("bystander functions row must survive")
 	}
 	bs, ok := st.FunctionStats("bystander")
-	if !ok || bs.EventsProcessedTotal != 7 || bs.HandlerSuccessTotal != 4 {
+	if !ok || bs.EventsMatchedTotal != 7 || bs.HandlerSuccessTotal != 4 {
 		t.Fatalf("bystander function_stats = %+v, ok=%v; want events 7 success 4", bs, ok)
 	}
 	bystanderAfter, ok := st.GetFunction("bystander")
@@ -302,7 +302,7 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 	if !ok {
 		t.Fatal("expected global stats row")
 	}
-	if gs.EventsProcessedTotal != wantGlobal.EventsProcessedTotal || gs.HandlerSuccessTotal != wantGlobal.HandlerSuccessTotal {
+	if gs.EventsMatchedTotal != wantGlobal.EventsMatchedTotal || gs.HandlerSuccessTotal != wantGlobal.HandlerSuccessTotal {
 		t.Fatalf("global stats changed by removal: %+v, want %+v", gs, wantGlobal)
 	}
 }
@@ -326,7 +326,7 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 	}
 	b.fail = false
 	r.reconcileFunction("flaky") // success -> ready row
-	st.RecordFunctionStats(state.FunctionStats{Function: "flaky", EventsProcessedTotal: 5, HandlerSuccessTotal: 3})
+	st.RecordFunctionStats(state.FunctionStats{Function: "flaky", EventsMatchedTotal: 5, HandlerSuccessTotal: 3})
 
 	before, ok := st.FunctionStats("flaky")
 	if !ok {
@@ -380,7 +380,7 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 	}
 	b.fail = false
 	r.reconcileFunction("guarded") // success -> ready row
-	st.RecordFunctionStats(state.FunctionStats{Function: "guarded", EventsProcessedTotal: 9, HandlerSuccessTotal: 6})
+	st.RecordFunctionStats(state.FunctionStats{Function: "guarded", EventsMatchedTotal: 9, HandlerSuccessTotal: 6})
 	before, ok := st.FunctionStats("guarded")
 	if !ok {
 		t.Fatal("expected guarded stats before invalid template")
