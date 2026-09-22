@@ -136,13 +136,19 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 }
 
 func (e *scheduleEnv) cleanup() {
+	// Cancel FIRST, then wait for the consumer goroutine to actually exit.
+	// Consume returns only once e.ctx is cancelled (its XREADGROUP block is
+	// bounded, but it re-blocks until ctx is done), so waiting for e.done before
+	// cancelling can never succeed early: it would always burn the full timeout,
+	// which is exactly the fixed-sleep anti-pattern. The wait below remains a
+	// genuine bounded join on the real shutdown condition.
+	e.cancel()
 	if e.done != nil {
 		select {
 		case <-e.done:
 		case <-time.After(5 * time.Second):
 		}
 	}
-	e.cancel()
 	cctx := context.Background()
 	_ = e.client.Del(cctx, e.stream, e.dlq).Err()
 	// Best-effort removal of this env's invocation-state keys. The stream/group

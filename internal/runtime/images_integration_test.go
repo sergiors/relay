@@ -34,7 +34,7 @@ func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{All: true})
+		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
 		if err != nil {
 			return
 		}
@@ -341,8 +341,10 @@ events:
 	}
 
 	// v2 manifest: add a package. The function source and template are unchanged,
-	// so only the dependencies differ.
-	writeFile(t, dir, "requirements.txt", "six==1.16.0\nrequests==2.32.3\n")
+	// so only the dependencies differ. idna is a single tiny wheel with no
+	// transitive dependencies, so the added package proves the invalidation
+	// without pulling the multi-wheel `requests` tree.
+	writeFile(t, dir, "requirements.txt", "six==1.16.0\nidna==3.10\n")
 	dep2 := expectedDependencyRef(t, fn)
 	if dep1 == dep2 {
 		t.Fatalf("dependency reference did not change across a manifest change, both %s", dep1)

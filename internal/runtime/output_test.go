@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 )
@@ -33,6 +35,27 @@ func newFunctionOutputSink(t *testing.T) *bytes.Buffer {
 	prev := SetFunctionOutput(buf)
 	t.Cleanup(func() { SetFunctionOutput(prev) })
 	return buf
+}
+
+// awaitFunctionOutput polls the function-output sink until every wanted
+// substring is present and returns the full buffer contents. Handler output is
+// forwarded to the sink asynchronously: it is usually complete when Execute
+// returns, but under load the lines can trail the invocation response, so an
+// immediate read is not a reliable assertion basis.
+func awaitFunctionOutput(t *testing.T, ctx context.Context, out *bytes.Buffer, wants ...string) string {
+	t.Helper()
+	if !pollUntil(ctx, 10*time.Second, func() bool {
+		logs := out.String()
+		for _, want := range wants {
+			if !strings.Contains(logs, want) {
+				return false
+			}
+		}
+		return true
+	}) {
+		t.Fatalf("function output missing %v within 10s; got:\n%s", wants, out.String())
+	}
+	return out.String()
 }
 
 // runForwarders drives stdcopy.StdCopy with the given forwarded stdout/stderr

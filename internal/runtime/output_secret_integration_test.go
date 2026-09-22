@@ -67,10 +67,7 @@ export function env(event) {
 	if err := m.Execute(ctx, prepared, "index.env", event, []string{"GREETING=hello"}); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	logs := out.String()
-	if !strings.Contains(logs, "GREETING=hello") {
-		t.Errorf("expected container env to contain GREETING=hello, got: %s", logs)
-	}
+	logs := awaitFunctionOutput(t, ctx, out, "GREETING=hello")
 	// template.yaml must NOT be in the image.
 	if strings.Contains(logs, "template.yaml") {
 		t.Errorf("template.yaml must not be baked into the image, got: %s", logs)
@@ -116,18 +113,14 @@ export function secret(event) {
 	if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=v1"}); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
-	if !strings.Contains(out.String(), "TOKEN=v1") {
-		t.Errorf("expected TOKEN=v1, got: %s", out.String())
-	}
+	awaitFunctionOutput(t, ctx, out, "TOKEN=v1")
 
 	// Rotate the value; the second execution sees v2 with NO rebuild (the
 	// prepared image and fingerprint are unchanged).
 	if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=v2"}); err != nil {
 		t.Fatalf("execute v2: %v", err)
 	}
-	if !strings.Contains(out.String(), "TOKEN=v2") {
-		t.Errorf("expected TOKEN=v2 after rotation, got: %s", out.String())
-	}
+	awaitFunctionOutput(t, ctx, out, "TOKEN=v2")
 	if prepared.Fingerprint != fp1 {
 		t.Errorf("fingerprint changed across secret rotation: %s -> %s", fp1, prepared.Fingerprint)
 	}
@@ -188,6 +181,7 @@ export function secret(event) {
 	// joining the segments with '\n'; the assertion is on the VALUE's exact
 	// bytes, not on the incidental prefix wording. Every segment of the fixture
 	// must arrive, in order, including the blank line.
+	awaitFunctionOutput(t, ctx, out, "<end>")
 	expected := "PK<begin>" + pemValue + "<end>"
 	got := stripForwardingPrefix(out.String())
 	if !strings.Contains(got, expected) {
@@ -246,9 +240,7 @@ export function secret(event) {
 			if err := m.Execute(ctx, prepared, "index.secret", event, []string{"TOKEN=shared-value"}); err != nil {
 				t.Fatalf("execute: %v", err)
 			}
-			if !strings.Contains(out.String(), "TOKEN=shared-value") {
-				t.Errorf("expected TOKEN=shared-value, got: %s", out.String())
-			}
+			awaitFunctionOutput(t, ctx, out, "TOKEN=shared-value")
 		})
 	}
 }
@@ -300,16 +292,11 @@ export function emit(event) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	logs := out.String()
-	for _, want := range []string{
+	awaitFunctionOutput(t, ctx, out,
 		"[loglevel-e2e/index.emit] stdout: out-first",
 		"[loglevel-e2e/index.emit] stdout: out-second",
 		"[loglevel-e2e/index.emit] stderr: err-line",
-	} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("expected %q in function output despite ERROR-level Relay logs, got:\n%s", want, logs)
-		}
-	}
+	)
 }
 
 // TestIntegrationPanickingSinkDoesNotBreakInvocation drives a reused execution
@@ -355,7 +342,7 @@ export function paniclog(event) {
 		if pv != nil {
 			t.Fatalf("sink panic leaked out of Execute: %v", pv)
 		}
-	case <-time.After(2 * time.Minute):
+	case <-time.After(30 * time.Second):
 		t.Fatal("Execute did not return")
 	}
 	if err := <-done; err != nil {

@@ -63,7 +63,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("setInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
 		t.Fatalf("write service: %v", err)
 	}
 
@@ -154,7 +154,9 @@ func serviceReconcileTemplate(port, replicas int) string {
 }
 
 // assertServiceCounts waits (up to 20s) until exactly want running service
-// containers exist for name.
+// containers exist for name. The poll cadence is short because the condition is
+// what matters; the 20s budget is a generous upper bound for daemon latency,
+// never a delay normally paid.
 func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -176,7 +178,7 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 		if n == want && allRunning {
 			return
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	list, _ := m.ServiceContainerList(context.Background())
 	got := 0
@@ -221,12 +223,18 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// complete scoping assertion; a plain no-label container sub-assertion is
 	// omitted because no relay-labeled start path exists for one.
 	fn1, fn2 := fmt.Sprintf("int-sc-a-%d", stamp), fmt.Sprintf("int-sc-b-%d", stamp)
+	// A stop-responsive long-lived process: a plain `sleep 600` as PID 1 ignores
+	// SIGTERM, so each StopServiceContainers would pay the daemon's full 10s
+	// grace before SIGKILL. node with a SIGTERM handler exits immediately; the
+	// container is still long-lived and the hostname-scoping assertion is
+	// unchanged.
+	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
 	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
 		Function:   fn1,
 		Entrypoint: "svc.js",
 		Port:       80,
 		Image:      "node:24-alpine",
-		Entry:      []string{"sh", "-c", "sleep 600"},
+		Entry:      stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w1 service: %v", err)
@@ -236,7 +244,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		Entrypoint: "svc.js",
 		Port:       80,
 		Image:      "node:24-alpine",
-		Entry:      []string{"sh", "-c", "sleep 600"},
+		Entry:      stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w2 service: %v", err)

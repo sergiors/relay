@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,12 +50,117 @@ func isClassicBuilderIntermediateCmd(command string) bool {
 	return strings.Contains(command, "#(nop)") || strings.Contains(command, "/bin/sh -c")
 }
 
+// imageSet snapshots every local image ID -> ParentID on the daemon in ONE list
+// call (including dangling intermediate images). It is taken once per test, not
+// per build: ImageList(All:true) is O(all images on the daemon), so the per-build
+// attribution below uses ImageHistory (one image's chain) instead.
+func imageSet(ctx context.Context, cli *client.Client) map[string]string {
+	list, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
+	if err != nil {
+		return nil
+	}
+	parents := make(map[string]string, len(list.Items))
+	for _, img := range list.Items {
+		parents[img.ID] = img.ParentID
+	}
+	return parents
+}
+
+// buildOwnLayers returns the image layer IDs committed by the build that
+// produced built: the layers in built's history that did NOT exist before the
+// build (the known set), stopping at the first pre-existing layer (the FROM base
+// or a cache-reused ancestor). ImageHistory is a single-image call, far cheaper
+// than listing every image, and it yields the exact chain including the base's
+// layers — so the same boundary logic applies without a per-build ImageList.
+//
+// The layer chain is the deterministic build identity: every classic-builder
+// step commits a layer whose ID is the step's intermediate container's
+// Summary.ImageID. Two different builds only share a layer ID when their content
+// AND ancestry are byte-identical, so a concurrent build of different source can
+// never alias into these IDs.
+func buildOwnLayers(ctx context.Context, cli *client.Client, built string, known map[string]string) map[string]bool {
+	hist, err := cli.ImageHistory(ctx, built)
+	if err != nil {
+		return nil
+	}
+	own := make(map[string]bool)
+	// History is ordered newest-first; the base's layers continue to the end. We
+	// include every layer that was not already known, and stop at the first known
+	// layer (everything below it is pre-existing base/cache).
+	for _, h := range hist.Items {
+		if h.ID == "" || strings.Contains(h.ID, "<missing>") {
+			continue // base layers built by the image producer carry no local ID
+		}
+		if _, existed := known[h.ID]; existed {
+			break
+		}
+		own[h.ID] = true
+	}
+	return own
+}
+
+// rememberLayers adds every layer ID in built's history to known, so the next
+// build's attribution treats the just-built image's layers as pre-existing
+// (they are neither a leak nor another build's).
+func rememberLayers(ctx context.Context, cli *client.Client, known map[string]string, built string) {
+	if known == nil {
+		return
+	}
+	if hist, err := cli.ImageHistory(ctx, built); err == nil {
+		for _, h := range hist.Items {
+			if h.ID != "" && !strings.Contains(h.ID, "<missing>") {
+				known[h.ID] = ""
+			}
+		}
+	}
+}
+
+// ourClassicIntermediates returns the IDs of classic-builder intermediate
+// containers attributable to THIS build: non-relay containers whose command
+// matches the intermediate shape and that ran in one of the build's own new
+// layers (own). Foreign concurrent builds' intermediates ran in THEIR own
+// layers, which are absent from this set.
+func ourClassicIntermediates(ctx context.Context, cli *client.Client, own map[string]bool) []string {
+	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, c := range list.Items {
+		if _, ok := c.Labels[labelFunction]; ok {
+			continue // a Relay execution container, not a build intermediate
+		}
+		if !isClassicBuilderIntermediateCmd(c.Command) {
+			continue
+		}
+		if own[c.ImageID] {
+			out = append(out, c.ID)
+		}
+	}
+	return out
+}
+
 // TestIntegrationRebuildLeavesNoIntermediateContainers verifies that rebuilding
-// a function (v1 -> v2 -> v3) does not leak classic-builder intermediate
-// containers. It snapshots the daemon's container set before each build and
-// asserts that no NEW non-relay-labeled container matching the classic-builder
-// intermediate shape remains after the build. It exercises the real daemon path
-// (Manager.Prepare -> buildImage -> ImageBuild).
+// a function (v1 -> v2) does not leak classic-builder intermediate containers.
+// After each build it computes the image layers that build created (from the
+// built image's history, minus the pre-build layer set) and asserts no
+// intermediate-shaped container ran in any of them. It exercises the real daemon
+// path (Manager.Prepare -> buildImage -> ImageBuild).
+//
+// Two versions is the minimum that proves a REBUILD: the second, changed-source
+// build is where a missing Remove:true / rm=1 regression would leave a step
+// container behind. (The old three-version loop only re-ran the same assertion a
+// third time.)
+//
+// Attribution by layer ancestry (not a whole-daemon before/after delta) is what
+// makes this deterministic on a shared daemon: another package running
+// concurrently under `go test ./...` creates its own classic intermediates, and
+// those must never be mistaken for this build's leak. A foreign build's step
+// containers run in that foreign build's layers, which are absent from this
+// build's parent chain, so they are ignored. The daemon removes a successful
+// classic build's intermediates asynchronously as it proceeds, so the assertion
+// polls (bounded) for this build's own layers to settle rather than sampling a
+// single instant.
 func TestIntegrationRebuildLeavesNoIntermediateContainers(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -84,35 +190,33 @@ events:
 		}
 	})
 
-	// Build v1, then v2, then v3. After each build assert no new intermediate
-	// container remains. Each version writes distinct source so every Prepare
-	// produces a distinct fingerprint and a real rebuild (not a cache reuse).
-	versions := []string{"v1", "v2", "v3"}
+	// Snapshot the image set ONCE before the first build so the first build's
+	// own new layers can be identified; later builds extend the known set with
+	// their own output (rememberLayers) rather than re-listing every image.
+	known := imageSet(ctx, cli)
+
+	// Build v1 then v2. Each version writes source carrying a per-run nonce so
+	// every Prepare produces a genuinely NEW layer chain, not a cache reuse: the
+	// assertion must observe a build's intermediates, and a reused image leaves
+	// nothing to attribute. A fixed marker would be a cache hit on a re-run
+	// (`-count>1`) or when another process builds the same content on the shared
+	// daemon, making `buildOwnLayers` find no new layer and the test fail for a
+	// reason unrelated to the intermediate-cleanup contract under test.
+	nonce := time.Now().UnixNano()
+	versions := []string{"v1", "v2"}
 	for _, ver := range versions {
-		// Write this version's distinct source before building it.
-		writeFile(t, dir, "index.js", "export function hi(e){ console.log('"+ver+"'); }\n")
-		// Snapshot the container set BEFORE this build, and count the
-		// classic-intermediate-shaped non-relay containers so we can assert no
-		// growth. The count is scoped to the intermediate SHAPE (not all
-		// non-relay containers) because the daemon is global: unrelated
-		// transient containers (another package's concurrent tests under
-		// `go test ./...`, the daemon's own async AutoRemove of an earlier
-		// test's container, buildkit helpers) can appear in the build window
-		// and must never fail this assertion — only a genuine intermediate
-		// leak should. The per-container shape check below is the primary
-		// assertion; this count is the redundant secondary signal.
-		preList, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
+		writeFile(t, dir, "index.js", "export function hi(e){ console.log('"+ver+"-"+strconv.FormatInt(nonce, 10)+"'); }\n")
+
+		// Remove this version's target image first (it is this test's own
+		// relay-fn-rebuild-int:* namespace) so each Prepare is a REAL build, not
+		// a cache reuse: the assertion must observe a build's intermediates, and
+		// a reused image would leave nothing to attribute.
+		fp, err := function.Fingerprint(dir)
 		if err != nil {
-			t.Fatalf("snapshot containers before %s: %v", ver, err)
+			t.Fatalf("fingerprint %s: %v", ver, err)
 		}
-		before := make(map[string]bool, len(preList.Items))
-		interBefore := 0
-		for _, c := range preList.Items {
-			before[c.ID] = true
-			if _, ok := c.Labels[labelFunction]; !ok && isClassicBuilderIntermediateCmd(c.Command) {
-				interBefore++
-			}
-		}
+		ref := ImageRef(fn.Name, fp)
+		cleanupImage(cli, ctx, ref)
 
 		prepared, err := mPrepare(ctx, t, fn)
 		if err != nil {
@@ -120,55 +224,30 @@ events:
 		}
 		createdImages = append(createdImages, prepared.Image)
 
-		// The current function image must exist after the build.
 		if !imageExistsInDaemon(cli, ctx, prepared.Image) {
 			t.Fatalf("image %s should exist after %s build", prepared.Image, ver)
 		}
 
-		// After the build, list containers and classify any that are NEW (not in
-		// the pre-build snapshot) and NOT relay-labeled.
-		after, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
-		if err != nil {
-			t.Fatalf("list containers after %s: %v", ver, err)
+		own := buildOwnLayers(ctx, cli, prepared.Image, known)
+		if len(own) == 0 {
+			t.Fatalf("could not attribute any new image layer to the %s build of %s; "+
+				"cannot prove intermediates were pruned", ver, prepared.Image)
 		}
-		var newNonRelay []string
-		interAfter := 0
-		for _, c := range after.Items {
-			if _, ok := c.Labels[labelFunction]; !ok {
-				if isClassicBuilderIntermediateCmd(c.Command) {
-					interAfter++
-				}
-			}
-			if before[c.ID] {
-				continue // pre-existing; not ours
-			}
-			if _, ok := c.Labels[labelFunction]; ok {
-				continue // a Relay execution container, not a build intermediate
-			}
-			newNonRelay = append(newNonRelay, c.ID)
-		}
+		// The just-built image's layers become pre-existing for the next build.
+		rememberLayers(ctx, cli, known, prepared.Image)
 
-		// Any new non-relay container must NOT be a classic-builder intermediate.
-		// Inspect each to classify it; a leaked intermediate fails the test.
-		for _, id := range newNonRelay {
-			insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-			if err != nil {
-				t.Fatalf("inspect new container %s after %s: %v", id, ver, err)
-			}
-			var cmd []string
-			if insp.Container.Config != nil {
-				cmd = insp.Container.Config.Cmd
-			}
-			if isClassicBuilderIntermediate(cmd) {
-				t.Errorf("leaked classic-builder intermediate container %s after %s build (Cmd %v)", id, ver, cmd)
-			}
-		}
-
-		// The count of classic-intermediate-shaped non-relay containers must not
-		// grow across the rebuild (no linear accumulation of intermediates).
-		if interAfter > interBefore {
-			t.Errorf("intermediate-shaped container count grew across %s build: before=%d after=%d "+
-				"(leaked intermediates)", ver, interBefore, interAfter)
+		// Poll (bounded) for THIS build's intermediates to be gone: the daemon
+		// prunes a successful classic build's intermediates asynchronously. In
+		// the healthy path they are already gone by the time ImageBuild returns,
+		// so this costs a single list; the budget is an upper bound, never a
+		// delay normally paid.
+		var leaked []string
+		if !pollUntil(ctx, 30*time.Second, func() bool {
+			leaked = ourClassicIntermediates(ctx, cli, own)
+			return len(leaked) == 0
+		}) {
+			t.Errorf("leaked %d classic-builder intermediate container(s) from the %s build "+
+				"(build layers %d; a Remove:false/rm=0 regression): %v", len(leaked), ver, len(own), leaked)
 		}
 	}
 }
@@ -265,7 +344,7 @@ events:
 		}
 		// Remove any tagged relay-fn-failed-build-int:* image (the failed build
 		// may or may not have produced a tagged image).
-		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{All: true})
+		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
 		if err != nil {
 			return
 		}
@@ -282,19 +361,20 @@ events:
 
 // TestIntegrationConcurrentDepBuilds verifies two concurrent Prepare calls for
 // the same function version (two Manager instances, as two worker replicas
-// would) both succeed and leave exactly ONE NEW dependency image tag — the
-// shared, content-addressed layer is built once even under a build race. Only
-// the delta vs a snapshot taken at test start is counted, so unrelated
-// relay-dep-* layers from other tests/workers on the shared daemon are ignored.
+// would) both succeed and resolve to exactly ONE dependency image — the shared,
+// content-addressed layer is build-once under a build race. The dependency
+// reference is derived deterministically from the manifest with the production
+// helpers; a whole-daemon before/after tag delta would race any other test/worker
+// building the same content-addressed manifest on the shared daemon.
 func TestIntegrationConcurrentDepBuilds(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Snapshot the pre-existing dep images so the assertions AND the cleanup
-	// count only what THIS test's concurrent builds add. Register cleanup FIRST
-	// (before any Fatalf) so a mid-test failure never leaks the dep-layer nor
-	// function images into the sibling tests that follow on the shared daemon.
+	// Register cleanup FIRST (before any Fatalf) so a mid-test failure never
+	// leaks the dep-layer nor function images into the sibling tests that follow
+	// on the shared daemon. The dep cleanup is scoped to this test's own
+	// additions (delta vs snapshot).
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
 	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-race:"))
@@ -310,6 +390,7 @@ events:
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 	fn := function.Function{Name: "dep-race", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	wantDep := expectedDependencyRef(t, fn)
 
 	start := make(chan struct{})
 	errs := make(chan error, 2)
@@ -332,6 +413,7 @@ events:
 		}()
 	}
 	close(start)
+	deps := make(map[string]bool, 2)
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-errs:
@@ -344,17 +426,20 @@ events:
 			if !pollUntil(ctx, 20*time.Second, func() bool { return imageExistsInDaemon(cli, ctx, p.Image) }) {
 				t.Fatalf("concurrently prepared image %s must exist", p.Image)
 			}
+			// Both goroutines must resolve to the SAME dependency reference: the
+			// shared, content-addressed layer is one image even under the race.
+			if p.Dependency != wantDep {
+				t.Fatalf("concurrent prepare dependency = %q, want the shared layer %q", p.Dependency, wantDep)
+			}
+			deps[p.Dependency] = true
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for concurrent prepares")
 		}
 	}
-
-	// Exactly one NEW relay-dep-* image may exist after the race (both goroutines
-	// built the same fingerprint; Docker racing same-content builds => one tag).
-	// Count only the delta vs the snapshot so unrelated relay-dep-* layers from
-	// other tests/workers on the shared daemon are ignored.
-	newDeps := newDepTagsSince(ctx, cli, depBefore)
-	if len(newDeps) != 1 {
-		t.Errorf("expected exactly one new dependency image after concurrent builds, got %v", newDeps)
+	if len(deps) != 1 {
+		t.Errorf("expected exactly one dependency image after concurrent builds, got %v", deps)
+	}
+	if !imageExistsInDaemon(cli, ctx, wantDep) {
+		t.Errorf("shared dependency image %s must exist after concurrent builds", wantDep)
 	}
 }

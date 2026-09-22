@@ -144,6 +144,15 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		Consumer: cfg.consumerName,
 		Log:      logger,
 		Metrics:  m,
+		// A short XREADGROUP BLOCK (the production default is 5s): go-redis's
+		// blocking read is not interrupted by ctx cancellation, so the read loop
+		// observes shutdown only on the next block expiry. The message still has
+		// to arrive and be delivered to the handler before the test cancels; the
+		// shutdown path (container killed, message left pending, clean Consume
+		// return) is identical either way, and the block is purely a read-poll
+		// cadence. 250ms keeps the test's shutdown wait bounded without any
+		// behavioral change to what is proven.
+		Block: 250 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -421,8 +430,9 @@ export async function slow(event) {
 	shutdownStart := time.Now()
 	env.cancel()
 
-	// Assert Consume returns within a hard bound. The XREADGROUP Block is 5s
-	// (returns immediately on cancel); the in-flight kill is ~8s worst case.
+	// Assert Consume returns within a hard bound. The XREADGROUP Block is short
+	// (250ms, set on the consumer above), so it returns promptly on cancel; the
+	// remainder is the in-flight container kill.
 	var consumeErr error
 	select {
 	case consumeErr = <-env.consumeDone:

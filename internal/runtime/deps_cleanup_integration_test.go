@@ -4,6 +4,7 @@ package runtime
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -159,31 +160,64 @@ events:
 		return function.Function{Name: name, Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 	}
 
+	// Per-run manifest marker. The dependency fingerprint hashes the manifest's
+	// raw bytes, so a comment gives this test a layer that is content-addressed
+	// UNIQUELY to this run: the GC contract below ends with depX becoming fully
+	// unreferenced and removable, which the daemon only honours once EVERY
+	// tagged function image inheriting depX's layers is gone. The canonical
+	// six==1.16.0 layer is shared daemon-wide by sibling tests and by any leak
+	// from an interrupted earlier run, so asserting its removal races them; a
+	// per-run marker makes the assertion deterministic without changing what is
+	// proven (A and B still share exactly one layer, and the manifest change
+	// still produces a new one).
+	marker := "# gc-run " + strconv.FormatInt(time.Now().UnixNano(), 10) + "\n"
+
 	// A and B share one dependency fingerprint (identical requirements).
-	fnA := newManaged("dep-gc-a", "six==1.16.0\n")
-	fnB := newManaged("dep-gc-b", "six==1.16.0\n")
+	fnA := newManaged("dep-gc-a", marker+"six==1.16.0\n")
+	fnB := newManaged("dep-gc-b", marker+"six==1.16.0\n")
+
+	// Name the shared layer deterministically with the production helpers rather
+	// than inferring it from a whole-daemon before/after tag delta: the relay-dep-*
+	// namespace is content-addressed and shared daemon-wide, so a delta count is
+	// inherently racy. Identical manifests MUST resolve to one reference, which is
+	// the "A and B share exactly one dependency image" claim.
+	depX := expectedDependencyRef(t, fnA)
+	if got := expectedDependencyRef(t, fnB); got != depX {
+		t.Fatalf("A+B should share exactly one dependency image, got %s and %s", depX, got)
+	}
+
 	pa, err := mgr.Prepare(ctx, fnA)
 	if err != nil {
 		t.Fatalf("prepare A: %v", err)
 	}
-	if _, err := mgr.Prepare(ctx, fnB); err != nil {
+	if pa.Dependency != depX {
+		t.Fatalf("prepare A dependency = %q, want the shared layer %q", pa.Dependency, depX)
+	}
+	pb, err := mgr.Prepare(ctx, fnB)
+	if err != nil {
 		t.Fatalf("prepare B: %v", err)
 	}
-	newDeps := newDepTagsSince(ctx, cli, depBefore)
-	if len(newDeps) != 1 {
-		t.Fatalf("A+B should share exactly one dependency image, got %v", newDeps)
+	if pb.Dependency != depX {
+		t.Fatalf("prepare B dependency = %q, want the shared layer %q", pb.Dependency, depX)
 	}
-	depX := newDeps[0]
+	if !imageExistsInDaemon(cli, ctx, depX) {
+		t.Fatalf("shared dependency image %s must exist after both prepares", depX)
+	}
 
 	// Create an unmanaged image tagged relay-dep-evil: NO relay.type label. It
-	// must NEVER be a GC candidate. Tag the python base (an unrelated image with
-	// a relay-dep-* name but no label) under the relay-dep- namespace.
-	buildTestImage(ctx, t, "relay-dep-evil:1", "FROM python:3.14-slim\nRUN echo unmanaged > /unmanaged\n")
+	// must NEVER be a GC candidate. The fixture only needs a relay-dep-*-named
+	// image carrying no relay.type label; its content is irrelevant, so an empty
+	// scratch image keeps the fixture instant and pull-free instead of exporting
+	// the 217MB python base.
+	buildTestImage(ctx, t, "relay-dep-evil:1", "FROM scratch\nCMD []\n")
 
 	// Migrate A to a different manifest, then remove A's OLD function image
 	// (which references depX), so depX is then referenced only by B's function
-	// image.
-	fnA2 := newManaged("dep-gc-a", "requests==2.32.3\n")
+	// image. The new manifest is a different SINGLE tiny package (six 1.15.0):
+	// a one-package change is the minimum that produces a new fingerprint, and it
+	// avoids the five transitive wheels `requests` would pull — the invalidation
+	// proof is identical.
+	fnA2 := newManaged("dep-gc-a", marker+"six==1.15.0\n")
 	pa2, err := mgr.Prepare(ctx, fnA2)
 	if err != nil {
 		t.Fatalf("prepare A v2: %v", err)
@@ -209,7 +243,7 @@ events:
 
 	// Migrate B to the same new manifest, prepare, and remove B's OLD image,
 	// which was the last reference to depX.
-	fnB2 := newManaged("dep-gc-b", "requests==2.32.3\n")
+	fnB2 := newManaged("dep-gc-b", marker+"six==1.15.0\n")
 	pb2, err := mgr.Prepare(ctx, fnB2)
 	if err != nil {
 		t.Fatalf("prepare B v2: %v", err)

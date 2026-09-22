@@ -332,11 +332,11 @@ export async function c(event) {
 	}
 
 	// A and B occupy both pool slots and block in their handlers long enough
-	// for the assertions below (6s; the blocked-C window is <1s).
+	// for the assertions below (3s; the blocked-C barrier window is <1s).
 	aErr := make(chan error, 1)
 	bErr := make(chan error, 1)
-	go func() { aErr <- exec("index.a", `{"event_name":"INSERT","blockMs":6000}`) }()
-	go func() { bErr <- exec("index.b", `{"event_name":"INSERT","blockMs":6000}`) }()
+	go func() { aErr <- exec("index.a", `{"event_name":"INSERT","blockMs":3000}`) }()
+	go func() { bErr <- exec("index.b", `{"event_name":"INSERT","blockMs":3000}`) }()
 
 	if !waitForSinkContains(ctx, sink, "START a") || !waitForSinkContains(ctx, sink, "START b") {
 		t.Fatalf("expected both handlers to start concurrently; sink:\n%s", sink.String())
@@ -811,7 +811,9 @@ events:
 `)
 	writeFile(t, dir, "index.js", `
 export async function sleep(event) {
-  await new Promise(r => setTimeout(r, 3000));
+  // Long enough that the busy==2 poll below observes both leases before either
+  // handler releases; the poll interval is 25ms, so 1500ms is a wide margin.
+  await new Promise(r => setTimeout(r, 1500));
   console.log("done");
 }
 `)
@@ -1379,7 +1381,9 @@ events:
 `)
 	writeFile(t, dir, "index.js", `
 export async function sleeper(event) {
-  await new Promise(r => setTimeout(r, 10000));
+  // 5s is ample for the 1s invocation timeout to fire and kill the container;
+  // the handler never needs to reach its end.
+  await new Promise(r => setTimeout(r, 5000));
   console.log("done");
 }
 export function quick(event) {
@@ -1480,7 +1484,13 @@ def check(event):
 
     print("python hardening ok")
 `)
-	writeFile(t, pyDir, "requirements.txt", "# no deps\n")
+	// No requirements.txt: this test's subject is the container hardening applied
+	// by the daemon (uid, read-only rootfs, tmpfs, caps), not the dependency
+	// install path. An empty requirements.txt would still force a full relay-dep-*
+	// layer build (a 217MB python base export) whose only effect here is a
+	// slower image with identical hardening; the dependency-layer contract has
+	// dedicated coverage (TestIntegrationDependencyImageLabels,
+	// TestIntegrationDependencyLayerReuse, TestIntegrationRequirementsInstalledWithUvAndExecutes).
 
 	// Node handler: same assertions via process.getuid(), fs write to /, /tmp
 	// write, and /proc/self/status CapEff.
@@ -1550,16 +1560,14 @@ export function check(event) {
 			fn := function.Function{Name: "harden-" + tc.name, Dir: tc.dir, Template: &function.Template{Runtime: tc.runtime}}
 			m, _ := newManager(t)
 			out := newFunctionOutputSink(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
-			// The python subtest's Prepare builds a relay-dep-* layer from its
-			// requirements.txt; the node subtest has no package.json so it builds
-			// no dep layer (cleanup is a harmless no-op for it). Clean only dep
-			// images this subtest adds (delta vs snapshot, leaving other
-			// tests'/workers' layers untouched) and register it BEFORE Prepare so
-			// it also runs on failure and never leaks into the sibling dep-layer
-			// tests on the shared daemon.
+			// Neither subtest declares dependencies, so no relay-dep-* layer is
+			// built (this cleanup is a harmless no-op). It is kept as a safety net
+			// so any dep image a future edit introduces is still cleaned up, and
+			// it scopes removal to this subtest's own additions (delta vs
+			// snapshot, leaving other tests'/workers' layers untouched).
 			depBefore := depTagSet(ctx, m.cli)
 			t.Cleanup(cleanupNewDepImagesSince(m.cli, depBefore))
 

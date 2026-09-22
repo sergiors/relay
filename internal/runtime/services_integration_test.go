@@ -43,10 +43,18 @@ events:
 	// Long-lived service entrypoint in a nested subdirectory: an interval keeps
 	// node alive indefinitely. The file lives at <dir>/app/service.js, which the
 	// image COPYies to /app/app/service.js (the function dir is the /app root).
+	//
+	// The handler stops on SIGTERM (Docker's stop signal). Without it node as PID
+	// 1 ignores SIGTERM (the kernel reserves default signal actions for PID 1),
+	// so every StopServiceContainers call would pay the daemon's full 10s
+	// SIGKILL grace period — 10s of dead time per container per test that proves
+	// nothing about Relay's lifecycle. A real long-lived service handles SIGTERM;
+	// the container-state transitions under test are identical either way.
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
 	writeFile(t, dir, "app/service.js", `
+process.on("SIGTERM", () => process.exit(0));
 console.log("started");
 setInterval(() => {}, 1 << 30);
 `)
@@ -69,15 +77,17 @@ setInterval(() => {}, 1 << 30);
 func TestIntegrationPythonServiceModuleExecution(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
+		// Scope cleanup to THIS test's function: stopping every service container
+		// on the daemon would also stop unrelated ones (e.g. a service a local
+		// worker owns), and a container without a SIGTERM handler costs the
+		// daemon's full 10s SIGKILL grace.
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-py-svc")
 		cleanupImagePrefixes(cli, "relay-fn-svc-py-svc:")()
 	})
 
@@ -100,7 +110,20 @@ events:
 	// keeping the process alive forever. Printing proves python executed the file
 	// as an importable module, not as a bare script (a bare script run of
 	// app/main.py cannot resolve `.deps`).
-	writeFile(t, dir, "app/main.py", `from .deps import NAME
+	//
+	// SIGTERM is handled so Docker's stop is prompt: python as PID 1 ignores the
+	// default SIGTERM action, so without this handler the daemon would wait its
+	// full 10s grace period before SIGKILL on every stop. The module-execution
+	// proof (<entrypoint> and the relative import) is independent of how the
+	// process is later stopped.
+	writeFile(t, dir, "app/main.py", `import signal
+from .deps import NAME
+
+def _on_sigterm(_signum, _frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, _on_sigterm)
+
 # stdout is block-buffered when not attached to a TTY, so flush explicitly
 # before the keep-alive blocks forever -- otherwise the proof never reaches us.
 print("module-entrypoint-started " + NAME, flush=True)
@@ -180,7 +203,7 @@ keep_alive()
 func TestIntegrationServiceStartListStop(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// Clean up any containers this test's function ever starts, even on failure,
@@ -188,16 +211,22 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
+		// Scope cleanup to THIS test's function (see the note in the python
+		// service test): stopping unrelated daemon services can cost a 10s
+		// SIGKILL grace and is not this test's to tear down.
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-lifecycle")
 		cleanupImagePrefixes(cli, "relay-fn-svc-lifecycle:")()
 	})
 
 	_, image := buildServiceHost(t, ctx, "svc-lifecycle")
 
-	// Start 2 replicas.
-	for i := 0; i < 2; i++ {
+	// Start ONE replica. The test's subject is the per-container contract
+	// (labels, hardening, user, entrypoint, env) and the list/stop lifecycle,
+	// all of which one container proves exactly; a second replica would only
+	// duplicate the same inspect assertions and add another 10s-or-less
+	// start/stop cycle without changing what is proven.
+	const replicas = 1
+	for i := 0; i < replicas; i++ {
 		if _, err := m.StartService(ctx, ServiceSpec{
 			Function:   "svc-lifecycle",
 			Entrypoint: "app/service.js",
@@ -210,7 +239,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 		}
 	}
 
-	// Both replicas listed and running.
+	// The replica is listed and running.
 	var ids []string
 	if !pollUntil(ctx, 15*time.Second, func() bool {
 		list, err := m.ServiceContainerList(ctx)
@@ -227,9 +256,9 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 				}
 			}
 		}
-		return len(ids) == 2 && allRunning
+		return len(ids) == replicas && allRunning
 	}) {
-		t.Fatalf("expected 2 running service containers, got %d", len(ids))
+		t.Fatalf("expected %d running service containers, got %d", replicas, len(ids))
 	}
 
 	// Verify labels on the created containers via inspect of the client.
@@ -286,17 +315,20 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 		}
 		inspectFound++
 	}
-	if inspectFound != 2 {
-		t.Fatalf("inspected %d containers, want 2", inspectFound)
+	if inspectFound != replicas {
+		t.Fatalf("inspected %d containers, want %d", inspectFound, replicas)
 	}
 
-	// StopServiceContainers removes them all.
+	// StopServiceContainers removes it.
 	list, _ := m.ServiceContainerList(ctx)
 	var svcList []ServiceContainer
 	for _, c := range list {
 		if c.Function == "svc-lifecycle" {
 			svcList = append(svcList, c)
 		}
+	}
+	if len(svcList) != replicas {
+		t.Fatalf("list returned %d containers for svc-lifecycle, want %d", len(svcList), replicas)
 	}
 	if err := m.StopServiceContainers(ctx, svcList); err != nil {
 		t.Fatalf("stop: %v", err)
@@ -312,16 +344,15 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 func TestIntegrationServiceImageRetirement(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// Clean up containers and images this test creates.
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
+		// Scope cleanup to this test's function (see the python service test).
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-retire")
 		cleanupImagePrefixes(cli, "relay-fn-svc-retire:", "relay-fn-svc-other:")()
 	})
 
@@ -335,11 +366,15 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir1, "index.js", "export function hi(e){ console.log('v1'); }\n")
-	writeFile(t, dir1, "service.js", "setInterval(() => {}, 1 << 30);\n")
+	// SIGTERM handler so the daemon's stop is prompt (node as PID 1 ignores the
+	// default SIGTERM action; without this every stop pays the full 10s grace).
+	writeFile(t, dir1, "service.js", "process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n")
 	fn1 := function.Function{Name: "svc-retire", Dir: dir1, Template: &function.Template{Runtime: "node24"}}
 
-	// Build v1, get its image ref.
-	p1, err := mPrepare(ctx, t, fn1)
+	// Build v1, get its image ref. Reuse the test's single Manager for every
+	// Prepare (mPrepare would spin a fresh client+manager per call): the
+	// prepares are independent image builds, not independent daemons.
+	p1, err := m.Prepare(ctx, fn1)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
@@ -358,7 +393,7 @@ events:
 
 	// Now create a SECOND fingerprint v2 (touch a file) and build it -> new image.
 	writeFile(t, dir1, "index.js", "export function hi(e){ console.log('v2'); }\n")
-	p2, err := mPrepare(ctx, t, fn1)
+	p2, err := m.Prepare(ctx, fn1)
 	if err != nil {
 		t.Fatalf("prepare v2: %v", err)
 	}
@@ -414,7 +449,7 @@ events:
 `)
 	writeFile(t, dir2, "index.js", "export function hi(e){ console.log('other'); }\n")
 	fn2 := function.Function{Name: "svc-other", Dir: dir2, Template: &function.Template{Runtime: "node24"}}
-	pOther, err := mPrepare(ctx, t, fn2)
+	pOther, err := m.Prepare(ctx, fn2)
 	if err != nil {
 		t.Fatalf("prepare other: %v", err)
 	}
@@ -439,15 +474,14 @@ events:
 func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
+		// Scope cleanup to this test's function (see the python service test).
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-wait")
 		cleanupImagePrefixes(cli, "relay-fn-svc-wait:")()
 	})
 
@@ -480,13 +514,14 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 		t.Fatalf("image must still exist after a refused (non-forced) removal")
 	}
 
-	// Stop the container and wait for it to be gone.
-	if c, err := m.ServiceContainerList(ctx); err == nil {
-		_ = m.StopServiceContainers(ctx, c)
+	// Stop this test's container and wait for it to be gone. Scope the stop and
+	// the "gone" poll to svc-wait: a whole-daemon empty check would wait on
+	// unrelated service containers this test does not own.
+	if _, err := m.RemoveFunctionServiceContainers(ctx, "svc-wait"); err != nil {
+		t.Fatalf("remove function service containers: %v", err)
 	}
 	pollUntil(ctx, 30*time.Second, func() bool {
-		l, _ := m.ServiceContainerList(ctx)
-		return len(l) == 0
+		return countServiceContainers(t, ctx, m, "svc-wait") == 0
 	})
 
 	// Now the image is removable and gone.
@@ -544,7 +579,7 @@ func countServiceContainers(t *testing.T, ctx context.Context, m *Manager, fn st
 func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// A dedicated network with a unique name, created here (the test is the
@@ -556,9 +591,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		if c, err := m.ServiceContainerList(cc); err == nil {
-			_ = m.StopServiceContainers(cc, c)
-		}
+		// Scope cleanup to this test's function (see the python service test).
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-network")
 		_, _ = cli.NetworkRemove(cc, networkName, client.NetworkRemoveOptions{})
 		cleanupImagePrefixes(cli, "relay-fn-svc-network:")()
 	})

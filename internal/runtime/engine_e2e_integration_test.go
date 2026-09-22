@@ -54,17 +54,15 @@ const devEventJSON = `{
 }`
 
 func TestIntegrationPythonEndToEnd(t *testing.T) {
-	cli := testutil.RequireDocker(t)
+	testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// This python build creates a relay-dep-* layer from its requirements.txt.
-	// Clean only the dep images this test adds (delta vs snapshot, so layers
-	// built concurrently by other tests/workers are untouched), and register it
-	// BEFORE Prepare so it also runs on failure and never leaks into the sibling
-	// dep-layer tests that follow on the shared daemon.
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	// No dependency manifest: this smoke test proves python end-to-end prepare +
+	// execute, not the dependency-install path. (The dependency layer is covered
+	// by TestIntegrationDependencyImageLabels / DependencyLayerReuse /
+	// RequirementsInstalledWithUvAndExecutes; an empty requirements.txt here
+	// would only force a redundant 217MB relay-dep-* base export.)
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -78,7 +76,6 @@ events:
 def completed(event):
     print("completed %s" % event.get("event_id"))
 `)
-	writeFile(t, dir, "requirements.txt", "# no deps\n")
 
 	fn := function.Function{Name: "py-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
@@ -95,17 +92,13 @@ def completed(event):
 }
 
 func TestIntegrationPythonAsyncEndToEnd(t *testing.T) {
-	cli := testutil.RequireDocker(t)
+	testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// This python build creates a relay-dep-* layer from its requirements.txt.
-	// Clean only the dep images this test adds (delta vs snapshot, so layers
-	// built concurrently by other tests/workers are untouched), and register it
-	// BEFORE Prepare so it also runs on failure and never leaks into the sibling
-	// dep-layer tests that follow on the shared daemon.
-	depBefore := depTagSet(ctx, cli)
-	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+	// No dependency manifest: this smoke test proves async python handler
+	// execution end to end, not the dependency-install path (see
+	// TestIntegrationPythonEndToEnd).
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -121,7 +114,6 @@ import asyncio
 async def completed(event):
     print("async completed %s" % event.get("event_id"))
 `)
-	writeFile(t, dir, "requirements.txt", "# no deps\n")
 
 	fn := function.Function{Name: "py-async-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
@@ -226,16 +218,11 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	logs := out.String()
-	for _, want := range []string{
+	logs := awaitFunctionOutput(t, ctx, out,
 		"User created: user_123",
 		"User updated: user_123",
 		"User deleted: user_123",
-	} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("expected stdout to contain %q, got: %s", want, logs)
-		}
-	}
+	)
 	t.Logf("captured handler output:\n%s", logs)
 }
 
@@ -264,10 +251,7 @@ func TestIntegrationRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 		t.Fatalf("execute handler.handler: %v", err)
 	}
 
-	logs := out.String()
-	if want := "Sending welcome email to john@example.com"; !strings.Contains(logs, want) {
-		t.Errorf("expected stdout to contain %q, got: %s", want, logs)
-	}
+	logs := awaitFunctionOutput(t, ctx, out, "Sending welcome email to john@example.com")
 	t.Logf("captured handler output:\n%s", logs)
 }
 
@@ -312,10 +296,7 @@ export function run(event) {
 	if strings.Contains(err.Error(), "not found") {
 		t.Errorf("broken dependency must NOT be reported as module not found, got: %v", err)
 	}
-	logs := out.String()
-	if !strings.Contains(logs, "missing-package") {
-		t.Errorf("expected the real import error mentioning 'missing-package' in logs, got: %s", logs)
-	}
+	logs := awaitFunctionOutput(t, ctx, out, "missing-package")
 	t.Logf("execute error: %v", err)
 	t.Logf("container logs: %s", logs)
 }
@@ -372,9 +353,8 @@ export function message(event: { event_id: string }): string {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1757-0","event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	if logs := out.String(); !strings.Contains(logs, "ts created 1757-0") {
-		t.Errorf("expected stdout to contain the transpiled handler output, got: %s", logs)
-	}
+	// The transpiled handler's stdout reaches the function-output sink.
+	awaitFunctionOutput(t, ctx, out, "ts created 1757-0")
 }
 
 // TestIntegrationNodeTSDepsEndToEnd proves packages left external by the bundler
@@ -421,10 +401,9 @@ export function handler(event: { event_id: string }): void {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1757-0","event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// picocolors.red wraps the text in ANSI escapes; match the inner text.
-	if logs := out.String(); !strings.Contains(logs, "dep 1757-0") {
-		t.Errorf("expected stdout to contain the dependency-colored output, got: %s", logs)
-	}
+	// picocolors.red wraps the text in ANSI escapes; match the inner text. The
+	// import resolves at runtime from the dependency layer's node_modules.
+	awaitFunctionOutput(t, ctx, out, "dep 1757-0")
 }
 
 // TestIntegrationNodeTSExampleEndToEnd drives the real
@@ -457,13 +436,11 @@ func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 		t.Fatalf("execute src.handler.handler: %v", err)
 	}
 
-	logs := out.String()
-	if want := "confirmation sent to jane@example.com"; !strings.Contains(logs, want) {
-		t.Errorf("expected stdout to contain %q, got: %s", want, logs)
-	}
-	if !strings.Contains(logs, "ord_42") || !strings.Contains(logs, "$99.50") {
-		t.Errorf("expected the formatted order line, got: %s", logs)
-	}
+	logs := awaitFunctionOutput(t, ctx, out,
+		"confirmation sent to jane@example.com",
+		"ord_42",
+		"$99.50",
+	)
 	t.Logf("captured handler output:\n%s", logs)
 }
 
@@ -520,12 +497,7 @@ export function handler(event: { event_id: string }): void {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	logs := out.String()
-	for _, want := range []string{"created ts 1", "deleted ts 2"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("expected stdout to contain %q, got: %s", want, logs)
-		}
-	}
+	awaitFunctionOutput(t, ctx, out, "created ts 1", "deleted ts 2")
 }
 
 // TestIntegrationNodeTSAmbiguousFailsPrepare pins the build-time ambiguity error:

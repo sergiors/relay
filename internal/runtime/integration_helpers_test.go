@@ -220,7 +220,11 @@ func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		imgs, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
+		// Non-All (tagged images only): every prefix match below is on a
+		// RepoTag, and a dangling image has none, so All:dangling would only add
+		// ~5s of daemon work per call on a large shared daemon with no effect on
+		// the result.
+		imgs, err := cli.ImageList(ctx, client.ImageListOptions{})
 		if err != nil {
 			return
 		}
@@ -240,7 +244,7 @@ func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
 // depTags lists every local relay-dep-* image tag currently present on the
 // daemon.
 func depTags(ctx context.Context, cli *client.Client) []string {
-	list, err := cli.ImageList(ctx, client.ImageListOptions{All: true})
+	list, err := cli.ImageList(ctx, client.ImageListOptions{})
 	if err != nil {
 		return nil
 	}
