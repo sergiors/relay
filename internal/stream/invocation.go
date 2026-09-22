@@ -461,6 +461,56 @@ var ErrInvocationNotEligible = errors.New("invocation not eligible")
 // message).
 var ErrInvocationExhausted = errors.New("invocation exhausted")
 
+// HandlerExhaustedError is the runner's terminal exhaustion signal. It wraps
+// ErrInvocationExhausted (so errors.Is keeps matching) and carries the exhausted
+// handler attempt count read from the per-invocation retry state (TryStart /
+// recordFailure / MarkExhausted) that actually drove the exhaustion decision.
+//
+// The stream layer extracts HandlerAttempts when it dead-letters the message so
+// the DLQ entry's handler_attempts is attributed from the handler retry state,
+// never from the Redis delivery count. That distinction matters because a
+// message can be reclaimed (delivered) many times while the handler attempt
+// advances only on real executions, so deliveries >= handler_attempts.
+type HandlerExhaustedError struct {
+	// HandlerAttempts is the 1-based handler attempt that exhausted (the
+	// 1+retries bound reached), sourced from the invocation retry state. It is
+	// always >= 1 on this error; the stream falls back to an explicit 0 only for
+	// DLQ paths that are not handler exhaustion (e.g. malformed messages).
+	HandlerAttempts int
+	// Err is the underlying runner error describing the exhaustion and naming
+	// the same attempt count, keeping the DLQ `reason` consistent with
+	// `handler_attempts`.
+	Err error
+}
+
+// Error reports the exhaustion reason in the stable, human-readable form the
+// DLQ `reason` field has always used: the ErrInvocationExhausted sentinel
+// followed by the underlying exhaustion message (e.g. `invocation exhausted:
+// function "fn" handler "h" exhausted after 5 handler attempts: ...`). The
+// wrapped Err already embeds the sentinel on the schedule path, so it is
+// returned verbatim there to avoid a duplicate `invocation exhausted:` prefix;
+// errors.Is still matches through Unwrap either way.
+func (e *HandlerExhaustedError) Error() string {
+	if e.Err == nil {
+		return ErrInvocationExhausted.Error()
+	}
+	if errors.Is(e.Err, ErrInvocationExhausted) {
+		return e.Err.Error()
+	}
+	return ErrInvocationExhausted.Error() + ": " + e.Err.Error()
+}
+
+// Unwrap returns ErrInvocationExhausted (so errors.Is(err,
+// ErrInvocationExhausted) keeps matching) plus the underlying error, preserving
+// the full error chain for callers that inspect the wrapped cause.
+func (e *HandlerExhaustedError) Unwrap() []error {
+	errs := []error{ErrInvocationExhausted}
+	if e.Err != nil {
+		errs = append(errs, e.Err)
+	}
+	return errs
+}
+
 // ErrInvocationObsolete is returned (wrapped) by the runner when an invocation
 // no longer exists in the current function/template configuration — the
 // function or its schedule entry/handler was removed while the message was

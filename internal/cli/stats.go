@@ -61,15 +61,10 @@ func statsCommand(deps Dependencies) *cli.Command {
 // worker's Prometheus counters (monotonic for the process lifetime).
 func statsResetCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
-		Name:      "reset",
-		Usage:     "Reset persisted cumulative statistics",
-		UsageText: "relay stats reset",
-		Description: "Reset the global and per-function cumulative statistics (including " +
-			"the Last* execution timestamps). A running worker is reset over its socket so " +
-			"its in-memory totals continue from zero; otherwise the persisted state is " +
-			"rewritten directly. Pending events/backlog, Redis, containers/pools, schedules " +
-			"and services are untouched, and the worker's Prometheus counters keep their " +
-			"process-lifetime values.",
+		Name:        "reset",
+		Usage:       "Reset persisted cumulative statistics",
+		UsageText:   "relay stats reset",
+		Description: "Reset cumulative global and per-function statistics.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats reset: too many arguments", 2)

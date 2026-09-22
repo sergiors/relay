@@ -170,7 +170,7 @@ func Run(logger *slog.Logger) {
 	// (flusher.ResetStats) can never race a flush into resurrecting pre-reset
 	// values: a flush either completes before the reset or captures after it.
 	// Shared by statsLoop, finalStatsFlush, and the socket reset command.
-	flusher := newStatsFlusher(st, metricsInstance)
+	statsFlusher := newStatsFlusher(st, metricsInstance)
 
 	manager, err := runtime.NewManager(
 		logger,
@@ -200,7 +200,7 @@ func Run(logger *slog.Logger) {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
-	rtSocket, err := NewSocketServer(SocketPath, manager, flusher, logger)
+	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
 	if err != nil {
 		logger.Error("Runtime state socket: start failed", "error", err)
 		os.Exit(1)
@@ -336,7 +336,7 @@ func Run(logger *slog.Logger) {
 	// snapshot, and a nil-registry flush would clobber the persisted cumulative
 	// totals with zeros. The loop parks on ctx so shutdown ordering stays uniform.
 	if metricsInstance != nil {
-		go statsLoop(ctx, flusher, statsFlushInterval)
+		go statsLoop(ctx, statsFlusher, statsFlushInterval)
 	} else {
 		go parkUntilShutdown(ctx)
 	}
@@ -395,7 +395,7 @@ func Run(logger *slog.Logger) {
 				metricsInstance.RemoveFunction(name)
 				// Drop the function's reset baseline too, so a re-added function
 				// is not offset by a stale pre-removal total.
-				flusher.dropFunctionBaseline(name)
+				statsFlusher.dropFunctionBaseline(name)
 				// Drop the function's warm container state first: no new acquire
 				// may warm a removed function, idle containers are discarded now,
 				// and busy ones are discarded on release. Then retire every image
@@ -506,7 +506,7 @@ func Run(logger *slog.Logger) {
 	// Bounded by a short timeout so a wedged SQLite cannot hang shutdown; failure
 	// is logged and shutdown continues (telemetry, not state). No-op when metrics
 	// are disabled (nil registry).
-	finalStatsFlush(flusher)
+	finalStatsFlush(statsFlusher)
 
 	// Bounded graceful shutdown of the metrics server, so in-flight scrapes drain
 	// rather than being cut off mid-request. No-op when metrics are disabled (the

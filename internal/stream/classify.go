@@ -2,6 +2,7 @@ package stream
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,17 +12,44 @@ import (
 // dlqPayload builds the flat field map written to the DLQ stream. Keeping it
 // flat (no nested JSON) keeps the entry easy to inspect with redis-cli and
 // re-drive by hand.
-func dlqPayload(stream, id, group, consumer, event, reason string, attempts int64) map[string]any {
+//
+// Two distinct counts are emitted, deliberately:
+//
+//   - "deliveries" is the authoritative Redis Stream/PEL delivery count (the
+//     retry counter read from XPENDING and passed through the consumer/reclaim
+//     flow). It counts every message redelivery, including redeliveries that
+//     skipped a protected invocation, so it is >= handler_attempts.
+//   - "handler_attempts" is the handler execution attempt that exhausted the
+//     per-invocation retry state (TryStart/recordFailure/MarkExhausted), i.e.
+//     the count that actually drove the exhaustion decision. It comes from the
+//     runner's typed exhaustion error; for DLQ paths with no handler retry
+//     state (e.g. a malformed message routed pre-handler) it is explicitly 0,
+//     never fabricated from the delivery count.
+func dlqPayload(stream, id, group, consumer, event, reason string, deliveries int64, handlerAttempts int) map[string]any {
 	return map[string]any{
-		"original_stream": stream,
-		"original_id":     id,
-		"group":           group,
-		"consumer":        consumer,
-		"event":           event,
-		"reason":          reason,
-		"attempts":        attempts,
-		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"original_stream":  stream,
+		"original_id":      id,
+		"group":            group,
+		"consumer":         consumer,
+		"event":            event,
+		"reason":           reason,
+		"deliveries":       deliveries,
+		"handler_attempts": handlerAttempts,
+		"timestamp":        time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+// handlerAttemptsFromError extracts the exhausted handler attempt count from the
+// runner's terminal exhaustion signal. It returns 0 when the error is not a
+// *HandlerExhaustedError (e.g. a malformed-message DLQ routing that never
+// reached the handler), so a delivery count is never mistaken for a handler
+// attempt count.
+func handlerAttemptsFromError(err error) int {
+	var exhausted *HandlerExhaustedError
+	if errors.As(err, &exhausted) && exhausted.HandlerAttempts > 0 {
+		return exhausted.HandlerAttempts
+	}
+	return 0
 }
 
 // eventString extracts the raw "event" field value from a message as a string,

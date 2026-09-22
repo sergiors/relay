@@ -977,15 +977,23 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 // XADD-before-XACK ordering matters: if the DLQ write fails the original stays
 // pending so the next recovery cycle retries the DLQ write rather than losing
 // the message.
+//
+// deliveryAttempts is the authoritative Redis Stream/PEL delivery count passed
+// through the consumer/reclaim flow (the DLQ `deliveries` field). The handler
+// attempt count is taken from reason when it is the runner's typed
+// *HandlerExhaustedError; otherwise (e.g. a malformed message routed
+// pre-handler) the DLQ entry carries an explicit handler_attempts of 0 rather
+// than inventing one from the delivery count.
 func (c *Consumer) routeToDLQ(
 	ctx context.Context,
 	msg redis.XMessage,
 	reason error,
-	deliveryAttempts int64,
+	deliveries int64,
 ) {
+	handlerAttempts := handlerAttemptsFromError(reason)
 	entry := dlqPayload(
 		c.stream, msg.ID, c.group, c.consumer,
-		eventString(msg), reason.Error(), deliveryAttempts,
+		eventString(msg), reason.Error(), deliveries, handlerAttempts,
 	)
 	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: c.dlqStream,
@@ -993,7 +1001,7 @@ func (c *Consumer) routeToDLQ(
 	}).Result(); err != nil {
 		c.log.Error("Message: DLQ write failed (leaving pending)",
 			"message_id", msg.ID,
-			"delivery_attempt", deliveryAttempts,
+			"delivery_attempt", deliveries,
 			"reason", err,
 		)
 		c.noteOutcome(err, 0)
@@ -1003,7 +1011,7 @@ func (c *Consumer) routeToDLQ(
 	c.log.Error("Message: routed to DLQ",
 		"message_id", msg.ID,
 		"dlq_stream", c.dlqStream,
-		"delivery_attempt", deliveryAttempts,
+		"delivery_attempt", deliveries,
 		"reason", reason,
 	)
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {

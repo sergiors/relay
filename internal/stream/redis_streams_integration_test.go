@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -310,9 +311,12 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 		}
 		attempts.Store(int64(n))
 		// Simulate the runner's exhaustion: mark the invocation terminal and
-		// return ErrInvocationExhausted so the message routes to the DLQ.
+		// return the typed HandlerExhaustedError (which wraps
+		// ErrInvocationExhausted and carries the exhausted handler attempt) so the
+		// message routes to the DLQ with handler metadata attributed from the
+		// handler retry state.
 		p.MarkExhausted("fn/h", n)
-		return ErrInvocationExhausted
+		return &HandlerExhaustedError{HandlerAttempts: n, Err: ErrInvocationExhausted}
 	})
 	// The message is routed to the DLQ (and acked) on the first delivery, so it
 	// may never linger in the PEL; wait for the DLQ entry instead.
@@ -343,6 +347,99 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	if m.Values["reason"] == "" {
 		t.Errorf("reason missing")
 	}
+	// The exhaustion was attributed from the handler retry state: the first
+	// delivery claimed handler attempt 1, so both deliveries and handler_attempts
+	// are 1 here.
+	if m.Values["handler_attempts"] != "1" {
+		t.Errorf("handler_attempts = %v, want 1 (from the invocation retry state)", m.Values["handler_attempts"])
+	}
+	if m.Values["deliveries"] != "1" {
+		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
+	}
+	if _, legacy := m.Values["attempts"]; legacy {
+		t.Errorf("DLQ entry must not carry the legacy attempts alias: %v", m.Values)
+	}
+}
+
+// TestIntegrationDLQDeliveriesExceedHandlerAttempts proves the semantic split:
+// `deliveries` is the authoritative Redis Stream/PEL delivery count (including
+// reclaims that skipped a protected invocation), while `handler_attempts` is the
+// handler execution/retry count that exhausted. A message can therefore be
+// DLQ'd with deliveries > handler_attempts.
+func TestIntegrationDLQDeliveriesExceedHandlerAttempts(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := invocationStateFromCtx(t, ctx)
+		if !ok {
+			return fmt.Errorf("no invocation state in ctx")
+		}
+		started, n, _ := p.TryStart("fn/h", time.Hour)
+		if !started {
+			// Protected: the prior failed attempt is waiting out its (long)
+			// backoff. Stay pending so reclaim keeps redelivering the message,
+			// growing `deliveries` without advancing the handler attempt.
+			return ErrInvocationNotEligible
+		}
+		if n < 2 {
+			// Attempt 1: retryable failure with a long backoff, so subsequent
+			// reclaims are skipped as protected.
+			p.RecordFailure("fn/h", time.Hour)
+			return fmt.Errorf("retryable failure")
+		}
+		// Attempt 2: exhaust (retries:1 → maxAttempts=2).
+		p.MarkExhausted("fn/h", n)
+		return &HandlerExhaustedError{HandlerAttempts: n, Err: ErrInvocationExhausted}
+	})
+
+	// Let reclaim redeliver the protected message until the PEL retry count is
+	// comfortably above the handler attempt count (still 1 at this point).
+	testutil.WaitFor(t, 8*time.Second, "message reclaimed past the handler attempt count", func() bool {
+		return e.pending()[id] >= 3
+	})
+	// Expire the retry backoff by rewriting the marker with a past deadline and
+	// the persisted attempt count (1), so the next delivery carries the attempt
+	// forward and executes handler attempt 2, which exhausts.
+	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(time.Now().Add(-time.Hour), 1)).Err(); err != nil {
+		t.Fatalf("expire retry marker: %v", err)
+	}
+
+	testutil.WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
+		_, ok := e.dlq()[id]
+		return ok
+	})
+	e.stop(t)
+
+	m, ok := e.dlq()[id]
+	if !ok {
+		t.Fatalf("expected DLQ entry for %s", id)
+	}
+	// handler_attempts is the handler execution count at exhaustion (2).
+	if m.Values["handler_attempts"] != "2" {
+		t.Errorf("handler_attempts = %v, want 2 (from the invocation retry state)", m.Values["handler_attempts"])
+	}
+	// deliveries is the authoritative PEL count, strictly greater than the
+	// handler attempt count because protected reclaims were redelivered without
+	// executing a handler attempt.
+	deliveries, err := strconv.Atoi(m.Values["deliveries"].(string))
+	if err != nil {
+		t.Fatalf("deliveries = %v, not an int: %v", m.Values["deliveries"], err)
+	}
+	if deliveries <= 2 {
+		t.Errorf("deliveries = %d, want > handler_attempts (2): protected reclaims must count as deliveries", deliveries)
+	}
+	if m.Values["reason"] == "" {
+		t.Errorf("reason missing")
+	}
+	if _, legacy := m.Values["attempts"]; legacy {
+		t.Errorf("DLQ entry must not carry the legacy attempts alias: %v", m.Values)
+	}
 }
 
 func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
@@ -372,8 +469,18 @@ func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected DLQ entry for malformed message %s", id)
 	}
-	if m.Values["attempts"] != "1" {
-		t.Errorf("malformed message should go straight to DLQ with attempts==1, got %v", m.Values["attempts"])
+	// A malformed message is routed straight to the DLQ before any handler runs,
+	// so it has NO handler retry state to attribute: handler_attempts is an
+	// explicit 0, never fabricated from the delivery count. deliveries is the
+	// authoritative PEL count (1 on first delivery).
+	if m.Values["handler_attempts"] != "0" {
+		t.Errorf("malformed message has no handler retry state, want handler_attempts==0, got %v", m.Values["handler_attempts"])
+	}
+	if m.Values["deliveries"] != "1" {
+		t.Errorf("malformed message should go straight to DLQ with deliveries==1, got %v", m.Values["deliveries"])
+	}
+	if _, legacy := m.Values["attempts"]; legacy {
+		t.Errorf("DLQ entry must not carry the legacy attempts alias: %v", m.Values)
 	}
 }
 

@@ -1723,7 +1723,17 @@ handler failure — stays in the PEL.
   not claimed; exhaustion of the last runnable invocation routes the message.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
-  `attempts`, `timestamp` (RFC 3339).
+  `deliveries`, `handler_attempts`, `timestamp` (RFC 3339). `deliveries` is the
+  authoritative Redis Stream/PEL delivery count (the retry counter read from
+  `XPENDING`, passed through the consumer/reclaim flow), so it counts every
+  redelivery — including redeliveries that skipped a protected invocation — and
+  is therefore `>= handler_attempts`. `handler_attempts` is the handler
+  execution attempt that exhausted the per-invocation retry state and drove the
+  DLQ decision. They are distinct on purpose: a reclaimed message can be
+  redelivered many times while the handler attempt advances only on real
+  executions. A DLQ path with no handler retry state (a malformed message routed
+  pre-handler) carries an explicit `handler_attempts` of `0`, never a fabricated
+  value derived from `deliveries`.
 - **DLQ write ordering**: the DLQ is written _before_ the original is
   acknowledged. If the DLQ write fails, the original is left pending so the next
   recovery cycle retries the DLQ write instead of losing the message.

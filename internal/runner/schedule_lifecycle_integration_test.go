@@ -467,6 +467,19 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	if got := exec.count(); got != 1 {
 		t.Fatalf("executor calls = %d, want 1 (only the initial attempt before exhaustion)", got)
 	}
+	// The DLQ entry attributes the exhaustion from the handler retry state:
+	// retries:0 exhausts on handler attempt 1, and this is the first delivery, so
+	// both fields are 1 and the legacy `attempts` alias is absent.
+	m := e.dlqGet()[id]
+	if m.Values["handler_attempts"] != "1" {
+		t.Errorf("handler_attempts = %v, want 1 (from the invocation retry state)", m.Values["handler_attempts"])
+	}
+	if m.Values["deliveries"] != "1" {
+		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
+	}
+	if _, legacy := m.Values["attempts"]; legacy {
+		t.Errorf("DLQ entry must not carry the legacy attempts alias: %v", m.Values)
+	}
 }
 
 // dlqGet reads all DLQ entries keyed by original message ID.

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -735,5 +736,61 @@ func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
 	fs := m.FunctionStatsSnapshot()
 	if len(fs) != 0 {
 		t.Fatalf("function stats = %+v, want none (no DLQ/metrics for a removed function)", fs)
+	}
+}
+
+// TestHandleExhaustionCarriesHandlerAttempts pins that the terminal exhaustion
+// error returned by Handle is a *stream.HandlerExhaustedError carrying the
+// exhausted handler attempt read from the invocation retry state (not the
+// delivery count). With the default retries (4) it takes 5 real handler attempts
+// to exhaust, so the typed error must report 5 regardless of how many deliveries
+// carried the message.
+func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Attempts 1..4 are retryable; the 5th exhausts.
+	for i := 1; i <= 4; i++ {
+		if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
+			t.Fatalf("attempt %d: expected a retryable failure, got %v", i, err)
+		}
+		prog.advance(retryBackoff(i))
+	}
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	if exhausted.HandlerAttempts != 5 {
+		t.Fatalf("HandlerAttempts = %d, want 5 (1+retries)", exhausted.HandlerAttempts)
+	}
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("err = %v, want it to wrap stream.ErrInvocationExhausted", err)
+	}
+	// The reason must name the same attempt count so the DLQ `reason` stays
+	// consistent with `handler_attempts`.
+	if !strings.Contains(err.Error(), "exhausted after 5 handler attempts") {
+		t.Fatalf("reason = %q, want it to report 5 handler attempts", err.Error())
+	}
+}
+
+// TestHandleRetriesZeroExhaustionCarriesAttemptOne pins the retries:0 case: a
+// single failed attempt exhausts and the typed error reports handler attempt 1.
+func TestHandleRetriesZeroExhaustionCarriesAttemptOne(t *testing.T) {
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	if exhausted.HandlerAttempts != 1 {
+		t.Fatalf("HandlerAttempts = %d, want 1 (retries:0)", exhausted.HandlerAttempts)
 	}
 }

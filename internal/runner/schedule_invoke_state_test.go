@@ -370,3 +370,52 @@ func TestInvokeHandlerRespectsScheduleRetries(t *testing.T) {
 		t.Fatalf("retries:4 should be retryable (failures=%v terminal=%v)", prog2.failures, prog2.IsTerminal("fn/index.run"))
 	}
 }
+
+// TestInvokeHandlerExhaustionCarriesHandlerAttempts pins that the schedule path's
+// terminal exhaustion error is a *stream.HandlerExhaustedError carrying the
+// exhausted handler attempt, so the stream can attribute the DLQ
+// handler_attempts from the handler retry state. With retries:0 the single failed
+// attempt exhausts and the typed error reports attempt 1.
+func TestInvokeHandlerExhaustionCarriesHandlerAttempts(t *testing.T) {
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "1-0", "fn", "index.run", []byte(`{}`))
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	if exhausted.HandlerAttempts != 1 {
+		t.Fatalf("HandlerAttempts = %d, want 1 (retries:0 → exhaustion on attempt 1)", exhausted.HandlerAttempts)
+	}
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("err = %v, want it to wrap stream.ErrInvocationExhausted", err)
+	}
+}
+
+// TestInvokeHandlerTerminalSkipCarriesExhaustedAttempts pins the redelivery
+// terminal-skip path: when the invocation already carries an exhausted marker
+// (exhausted:5), a redelivery must not re-run it and must return a typed
+// *stream.HandlerExhaustedError reporting the persisted exhausted attempt count
+// (5), read back from TryStart.
+func TestInvokeHandlerTerminalSkipCarriesExhaustedAttempts(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	prog.exhausted["fn/index.run"] = 5
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "1-0", "fn", "index.run", []byte(`{}`))
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	if exhausted.HandlerAttempts != 5 {
+		t.Fatalf("HandlerAttempts = %d, want 5 (persisted exhausted attempt)", exhausted.HandlerAttempts)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (terminal skip)", exec.count())
+	}
+}
