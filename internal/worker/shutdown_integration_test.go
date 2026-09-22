@@ -192,7 +192,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	statsDone := make(chan struct{})
 	go func() {
 		defer close(statsDone)
-		statsLoop(ctx, m, st, statsFlushInterval)
+		statsLoop(ctx, newStatsFlusher(st, m), statsFlushInterval)
 	}()
 
 	if err := consumer.EnsureGroup(ctx); err != nil {
@@ -451,7 +451,7 @@ export async function slow(event) {
 	// finalStatsFlush runs after Consume returns, exactly like Run(). Assert it
 	// completes within its 2s bound and that a stats row exists.
 	flushStart := time.Now()
-	finalStatsFlush(env.m, env.st)
+	finalStatsFlush(newStatsFlusher(env.st, env.m))
 	flushElapsed := time.Since(flushStart)
 	if flushElapsed > 2*time.Second {
 		t.Fatalf("finalStatsFlush took %v, want < 2s", flushElapsed)

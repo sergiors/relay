@@ -1650,17 +1650,21 @@ zeroes with `Updated: never`. Backlog gauges (`pending_entries`,
 `oldest_pending_age_seconds`) are global — the consumer-group backlog is not
 attributed to individual functions.
 
-`relay stats reset` rewrites the persisted totals transactionally: the global
-cumulative counters are zeroed and the per-function `function_stats` rows —
-including the four per-function `Last*` execution timestamps — are cleared. The
+`relay stats reset` resets the totals in place: the global cumulative counters
+are zeroed and every per-function `function_stats` row — including the four
+per-function `Last*` execution timestamps and the cumulative warm/cold/discarded
+pool counters — is zeroed in its existing row (the rows are **not** deleted). The
 backlog gauges are **not** reset: they are point-in-time snapshots of the live
-Redis backlog, and the next worker flush refreshes them. It does not touch Redis
-or pending events, containers/runtime pools, schedules/services, or a running
-worker's Prometheus counters (those are monotonic for the process lifetime;
-restarting the worker resets them). A running worker re-writes its in-memory
-totals on its next ~5s flush, so a clean slate for a live worker requires a
-restart; for a stopped worker the reset is immediate and complete. After a reset,
-stats accumulate normally again.
+Redis backlog, and the next worker flush refreshes them. With a running worker,
+the reset goes through the worker's Unix socket so the worker records a
+worker-owned reset baseline under the same lock as the periodic flush — a
+captured pre-reset snapshot can never be written after the reset, and the
+persisted statistics continue from zero. Without a running worker, the state
+database is rewritten directly. It does not touch Redis or pending events,
+containers/runtime pools, schedules/services, or the worker's Prometheus
+counters (those stay monotonic for the process lifetime; the worker subtracts
+its Relay-side baseline when snapshotting, never mutating Prometheus). After a
+reset, stats accumulate normally again.
 
 ## Acknowledgment semantics
 

@@ -68,6 +68,16 @@
 // fresh registry (restorePersistedStats) so the first snapshot never resets
 // them. Redis event-processing correctness never depends on SQLite stats.
 //
+// `relay stats reset` zeroes the cumulative fields IN PLACE: the global stats
+// row and every function_stats row survive, decoded from their typed JSON
+// payloads, while the live gauges and any known unrelated field are preserved.
+// A running worker performs the reset over its socket, under the same lock as
+// the flush, so its in-memory totals are reset too and no captured pre-reset
+// snapshot can be written afterwards; a stopped worker is reset directly through
+// state.ResetStats. Prometheus counters are never reset: the worker keeps a
+// Relay-side reset baseline and subtracts it when snapshotting, so the persisted
+// totals continue from zero while the counters stay monotonic.
+//
 // The driver is modernc.org/sqlite (pure Go, CGO-free) so the binary stays
 // static under CGO_ENABLED=0 and the CLI is fully read-only with no external
 // dependencies.

@@ -115,7 +115,7 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	m1.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 	m1.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}}, 7)
 	m1.SetFunctionTimestamp("alpha", metrics.FunctionTimestampExecution, exec.Unix())
-	recordSnapshots(context.Background(), c1, m1)
+	recordSnapshots(context.Background(), c1, m1, nil)
 	if err := c1.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestWorkerFlushReopenRestoreRoundTrip(t *testing.T) {
 	}
 
 	// The first post-restart flush must write the same totals back.
-	recordSnapshots(context.Background(), c2, m2)
+	recordSnapshots(context.Background(), c2, m2, nil)
 	gs, ok := c2.Stats()
 	if !ok || gs.EventsProcessedTotal != 100 {
 		t.Fatalf("global after restart flush = %+v, ok=%v; want events 100", gs, ok)
@@ -181,7 +181,7 @@ func TestSnapshotStatsMapping(t *testing.T) {
 	m.SetGauge(metrics.MetricPendingEntries, 4.9)
 	m.SetGauge(metrics.MetricPendingOldestAge, 12.7)
 
-	got := snapshotStats(m)
+	got := snapshotStats(m, nil)
 	want := state.Stats{
 		EventsProcessedTotal:    10,
 		HandlerSuccessTotal:     7,
@@ -198,9 +198,9 @@ func TestSnapshotStatsMapping(t *testing.T) {
 
 // TestSnapshotStatsNilRegistry pins the nil-safety contract of the global mapper.
 func TestSnapshotStatsNilRegistry(t *testing.T) {
-	got := snapshotStats(nil)
+	got := snapshotStats(nil, nil)
 	if got != (state.Stats{}) {
-		t.Fatalf("snapshotStats(nil) = %+v, want zero Stats", got)
+		t.Fatalf("snapshotStats(nil, nil) = %+v, want zero Stats", got)
 	}
 }
 
@@ -215,7 +215,7 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 	m.IncLabels(metrics.MetricFunctionRetries, []metrics.Label{{Name: "function", Value: "b"}})
 	m.IncLabels(metrics.MetricFunctionDLQ, []metrics.Label{{Name: "function", Value: "b"}})
 
-	got := snapshotFunctionStats(m)
+	got := snapshotFunctionStats(m, nil)
 	byName := map[string]state.FunctionStats{}
 	for _, fs := range got {
 		byName[fs.Function] = fs
@@ -234,8 +234,8 @@ func TestFuncSnapshotStatsMapping(t *testing.T) {
 // TestFuncSnapshotStatsNilRegistry pins the nil-safety contract of the
 // per-function mapper.
 func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
-	if got := snapshotFunctionStats(nil); got != nil {
-		t.Fatalf("snapshotFunctionStats(nil) = %+v, want nil", got)
+	if got := snapshotFunctionStats(nil, nil); got != nil {
+		t.Fatalf("snapshotFunctionStats(nil, nil) = %+v, want nil", got)
 	}
 }
 
@@ -244,7 +244,7 @@ func TestFuncSnapshotStatsNilRegistry(t *testing.T) {
 func TestSnapshotStatsIgnoresLabeledCounters(t *testing.T) {
 	m := metrics.New()
 	m.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "a"}, {Name: "handler", Value: "x"}})
-	got := snapshotStats(m)
+	got := snapshotStats(m, nil)
 	if got.HandlerSuccessTotal != 0 {
 		t.Fatalf("HandlerSuccessTotal = %d, want 0 (labeled only)", got.HandlerSuccessTotal)
 	}
@@ -329,7 +329,7 @@ func TestRestorePersistedStatsSeedsPoolCounters(t *testing.T) {
 	m.IncLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
 	m.IncLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "reason", Value: "idle_timeout"}})
 
-	recordSnapshots(context.Background(), st, m)
+	recordSnapshots(context.Background(), st, m, nil)
 	got, ok := st.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha function stats after flush")
@@ -347,7 +347,7 @@ func TestFuncSnapshotStatsPoolCountersMapping(t *testing.T) {
 	m.AddLabels(metrics.MetricRuntimeContainerAcquires, []metrics.Label{{Name: "function", Value: "a"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}}, 1)
 	m.AddLabels(metrics.MetricRuntimeContainerDiscards, []metrics.Label{{Name: "function", Value: "a"}, {Name: "reason", Value: "timeout"}}, 2)
 
-	got := snapshotFunctionStats(m)
+	got := snapshotFunctionStats(m, nil)
 	byName := map[string]state.FunctionStats{}
 	for _, fs := range got {
 		byName[fs.Function] = fs
@@ -379,7 +379,7 @@ func TestFlushPersistsCountersNotLiveGauges(t *testing.T) {
 	m.SetGaugeLabels(metrics.MetricRuntimeContainers, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 4)
 	m.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "function", Value: "alpha"}}, 5)
 
-	recordSnapshots(context.Background(), st, m)
+	recordSnapshots(context.Background(), st, m, nil)
 
 	got, ok := st.FunctionStats("alpha")
 	if !ok {
@@ -445,7 +445,7 @@ func TestStatsLoopFirstSnapshotPreservesPersistedCounters(t *testing.T) {
 		defer close(done)
 		// time.Hour interval so no tick fires during the test; only the
 		// immediate first snapshot runs.
-		statsLoop(ctx, m, st, time.Hour)
+		statsLoop(ctx, newStatsFlusher(st, m), time.Hour)
 	}()
 
 	// Wait (bounded) for the goroutine to run the immediate first snapshot: the
@@ -548,7 +548,7 @@ func TestStartupSweepPrunesBeforeSeeding(t *testing.T) {
 	// Run recordSnapshots (exactly what statsLoop does immediately) and confirm
 	// the persisted function_stats still has exactly one row and the global
 	// counters were written from the seeded registry.
-	recordSnapshots(context.Background(), st, m)
+	recordSnapshots(context.Background(), st, m, nil)
 	all = st.AllFunctionStats()
 	if len(all) != 1 {
 		t.Fatalf("AllFunctionStats after snapshot len = %d, want 1: %+v", len(all), all)
@@ -610,7 +610,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// (seeded) timestamps are republished untouched.
 	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
-	recordSnapshots(context.Background(), st, m)
+	recordSnapshots(context.Background(), st, m, nil)
 	got, ok := st.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after flush")
@@ -625,7 +625,7 @@ func TestRestoreSeedsAndFlushesTimestamps(t *testing.T) {
 	// clobbers them).
 	fresh := metrics.New()
 	fresh.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "alpha"}})
-	recordSnapshots(context.Background(), st, fresh)
+	recordSnapshots(context.Background(), st, fresh, nil)
 	got, ok = st.FunctionStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after fresh-registry flush")
@@ -670,7 +670,7 @@ func TestFuncSnapshotStatsTimestampsMapping(t *testing.T) {
 	m.IncLabels(metrics.MetricFunctionEvents, []metrics.Label{{Name: "function", Value: "b"}})
 	m.SetFunctionTimestamp("b", metrics.FunctionTimestampDLQ, ts+60)
 
-	got := snapshotFunctionStats(m)
+	got := snapshotFunctionStats(m, nil)
 	byName := map[string]state.FunctionStats{}
 	for _, fs := range got {
 		byName[fs.Function] = fs

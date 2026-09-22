@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -29,8 +30,9 @@ services:
 
 // TestResetStatsZeroesCountersKeepsGauges verifies ResetStats zeroes the five
 // global cumulative counters while PRESERVING the two point-in-time backlog
-// gauges, deletes every function_stats row, refreshes updated_at, and leaves
-// the unrelated functions/handlers/schedules/services data intact.
+// gauges and every function_stats ROW (zeroed in place, never deleted),
+// refreshes updated_at, and leaves the unrelated
+// functions/handlers/schedules/services data intact.
 func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	c := openTestState(t)
 
@@ -91,18 +93,33 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 		t.Fatalf("updated_at = %q, want refreshed %q", s.UpdatedAt, want)
 	}
 
-	// function_stats is empty (deletion IS the fresh state), readable both
-	// through the API and directly.
-	if all := c.AllFunctionStats(); len(all) != 0 {
-		t.Fatalf("function_stats must be cleared: %+v", all)
+	// Both function_stats ROWS survive with every cumulative field zeroed and
+	// every Last*At timestamp cleared.
+	all := c.AllFunctionStats()
+	if len(all) != 2 {
+		t.Fatalf("function_stats rows = %d, want 2 (rows preserved): %+v", len(all), all)
+	}
+	for _, fs := range all {
+		if fs.EventsProcessedTotal != 0 || fs.HandlerSuccessTotal != 0 ||
+			fs.HandlerFailureTotal != 0 || fs.RetryTotal != 0 || fs.DLQTotal != 0 ||
+			fs.WarmAcquiresTotal != 0 || fs.ColdStartsTotal != 0 || fs.DiscardedTotal != 0 {
+			t.Fatalf("function %q counters must be zeroed: %+v", fs.Function, fs)
+		}
+		if fs.LastExecutionAt != "" || fs.LastSuccessAt != "" || fs.LastFailureAt != "" || fs.LastDLQAt != "" {
+			t.Fatalf("function %q timestamps must be cleared: %+v", fs.Function, fs)
+		}
+		want := base.Add(time.Minute).Format(time.RFC3339)
+		if fs.UpdatedAt != want {
+			t.Fatalf("function %q updated_at = %q, want refreshed %q", fs.Function, fs.UpdatedAt, want)
+		}
 	}
 	var n int
 	if err := c.db.QueryRowContext(context.Background(),
 		`SELECT COUNT(*) FROM function_stats`).Scan(&n); err != nil {
 		t.Fatalf("count function_stats: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("function_stats rows = %d, want 0", n)
+	if n != 2 {
+		t.Fatalf("function_stats rows = %d, want 2 (no DELETE in reset path)", n)
 	}
 
 	// Unrelated data is untouched: the function record, handlers, schedules,
@@ -122,6 +139,98 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	}
 	if d.Env["API_URL"] != "https://api.example.com" || d.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", d.Env, d.Secrets)
+	}
+}
+
+// TestResetStatsPreservesUnrelatedGlobalJSONFields verifies the reset decodes
+// the typed global payload and rewrites it, so a live gauge (and every other
+// known field) survives while only the cumulative counters are zeroed.
+func TestResetStatsPreservesUnrelatedGlobalJSONFields(t *testing.T) {
+	c := openTestState(t)
+	c.RecordStats(Stats{
+		EventsProcessedTotal:    9,
+		HandlerSuccessTotal:     8,
+		HandlerFailureTotal:     1,
+		RetryTotal:              1,
+		DLQTotal:                1,
+		PendingEntries:          42,
+		OldestPendingAgeSeconds: 3600,
+	})
+
+	if err := c.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
+	// The payload is still valid JSON with exactly the known keys (no unrelated
+	// field was dropped or duplicated).
+	data, _ := rawStatsData(t, c)
+	assertJSONKeysExactly(t, data, statsJSONKeys)
+	var m map[string]any
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if m["pending_entries"] != float64(42) || m["oldest_pending_age_seconds"] != float64(3600) {
+		t.Fatalf("live gauges must survive the rewrite: %s", data)
+	}
+}
+
+// TestResetStatsZeroesPoolCountersAndTimestamps verifies the per-function reset
+// covers the cumulative warm-container pool counters and clears all four
+// execution-history timestamps, while keeping the row.
+func TestResetStatsZeroesPoolCountersAndTimestamps(t *testing.T) {
+	c := openTestState(t)
+	exec := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	c.RecordFunctionStats(FunctionStats{
+		Function:             "alpha",
+		EventsProcessedTotal: 5,
+		HandlerSuccessTotal:  4,
+		HandlerFailureTotal:  1,
+		RetryTotal:           1,
+		DLQTotal:             1,
+		WarmAcquiresTotal:    11,
+		ColdStartsTotal:      4,
+		DiscardedTotal:       2,
+		LastExecutionAt:      exec,
+		LastSuccessAt:        exec,
+		LastFailureAt:        exec,
+		LastDLQAt:            exec,
+	})
+
+	if err := c.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
+	fs, ok := c.FunctionStats("alpha")
+	if !ok {
+		t.Fatal("alpha row must survive the reset")
+	}
+	if fs.EventsProcessedTotal != 0 || fs.HandlerSuccessTotal != 0 || fs.HandlerFailureTotal != 0 ||
+		fs.RetryTotal != 0 || fs.DLQTotal != 0 || fs.WarmAcquiresTotal != 0 ||
+		fs.ColdStartsTotal != 0 || fs.DiscardedTotal != 0 {
+		t.Fatalf("all cumulative counters must be zeroed: %+v", fs)
+	}
+	if fs.LastExecutionAt != "" || fs.LastSuccessAt != "" || fs.LastFailureAt != "" || fs.LastDLQAt != "" {
+		t.Fatalf("all timestamps must be cleared: %+v", fs)
+	}
+}
+
+// TestResetStatsMultipleFunctionRows verifies every row is reset independently,
+// including one with no timestamps and one with only pool counters.
+func TestResetStatsMultipleFunctionRows(t *testing.T) {
+	c := openTestState(t)
+	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 5, WarmAcquiresTotal: 2})
+	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsProcessedTotal: 3})
+	c.RecordFunctionStats(FunctionStats{Function: "gamma", WarmAcquiresTotal: 7, DiscardedTotal: 1})
+
+	if err := c.ResetStats(); err != nil {
+		t.Fatalf("ResetStats: %v", err)
+	}
+	all := c.AllFunctionStats()
+	if len(all) != 3 {
+		t.Fatalf("rows = %d, want 3: %+v", len(all), all)
+	}
+	for _, fs := range all {
+		if fs != (FunctionStats{Function: fs.Function, UpdatedAt: fs.UpdatedAt}) {
+			t.Fatalf("function %q not fully zeroed: %+v", fs.Function, fs)
+		}
 	}
 }
 
@@ -159,7 +268,7 @@ func TestResetStatsThenAccumulate(t *testing.T) {
 	if fs.EventsProcessedTotal != 3 || fs.HandlerSuccessTotal != 3 || fs.WarmAcquiresTotal != 2 {
 		t.Fatalf("post-reset function counters = %+v", fs)
 	}
-	// The fresh row had no stored timestamps, so the incoming ones land as-is.
+	// The reset cleared the timestamps, so the incoming ones land as-is.
 	if fs.LastExecutionAt != exec || fs.LastSuccessAt != exec {
 		t.Fatalf("post-reset timestamps = %+v, want %q", fs, exec)
 	}
@@ -182,7 +291,7 @@ func TestResetStatsIdempotent(t *testing.T) {
 	if !ok || s.EventsProcessedTotal != 0 || s.PendingEntries != 4 {
 		t.Fatalf("stats after repeated reset = %+v, ok=%v", s, ok)
 	}
-	if all := c.AllFunctionStats(); len(all) != 0 {
+	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsProcessedTotal != 0 {
 		t.Fatalf("function_stats after repeated reset = %+v", all)
 	}
 }
@@ -210,7 +319,7 @@ func TestResetStatsFreshDB(t *testing.T) {
 
 // TestResetStatsRollsBackOnCorruptGlobalPayload verifies the reset is
 // transactional: if the global payload cannot be decoded, the whole
-// transaction fails and the function_stats rows are NOT deleted.
+// transaction fails and the function_stats rows are NOT modified.
 func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 	c := openTestState(t)
 	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsProcessedTotal: 5})
@@ -226,6 +335,38 @@ func TestResetStatsRollsBackOnCorruptGlobalPayload(t *testing.T) {
 		t.Fatal("ResetStats with a corrupt payload: err = nil, want error")
 	}
 	if all := c.AllFunctionStats(); len(all) != 1 || all[0].EventsProcessedTotal != 5 {
-		t.Fatalf("failed reset must roll back function_stats deletion: %+v", all)
+		t.Fatalf("failed reset must roll back function_stats changes: %+v", all)
+	}
+}
+
+// TestResetStatsRollsBackOnCorruptFunctionPayload verifies a corrupt
+// per-function payload is fatal: it cannot be decoded and zeroed, so the reset
+// transaction rolls back and every row — the global row and the good function
+// row — keeps its pre-reset values.
+func TestResetStatsRollsBackOnCorruptFunctionPayload(t *testing.T) {
+	c := openTestState(t)
+	c.RecordFunctionStats(FunctionStats{Function: "good", EventsProcessedTotal: 5})
+	if _, err := c.db.ExecContext(context.Background(),
+		`INSERT INTO function_stats (function_name, data, updated_at) VALUES ('broken', '{not-json', '2020-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed corrupt row: %v", err)
+	}
+	c.RecordStats(Stats{EventsProcessedTotal: 9})
+
+	if err := c.ResetStats(); err == nil {
+		t.Fatal("ResetStats with a corrupt function payload: err = nil, want error")
+	}
+	// Nothing landed: the global counters and the good function row keep their
+	// pre-reset values.
+	if s, _ := c.Stats(); s.EventsProcessedTotal != 9 {
+		t.Fatalf("global counters must roll back: %+v", s)
+	}
+	good, ok := c.FunctionStats("good")
+	if !ok || good.EventsProcessedTotal != 5 {
+		t.Fatalf("good row must roll back: %+v, ok=%v", good, ok)
+	}
+	// The corrupt row survives untouched.
+	brokenData, _ := rawFunctionStatsData(t, c, "broken")
+	if brokenData != "{not-json" {
+		t.Fatalf("corrupt row must be preserved unchanged, got %q", brokenData)
 	}
 }

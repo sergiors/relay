@@ -6,7 +6,10 @@
 // flushes the registry into the local state database on a fixed 5-second
 // cadence: stats accumulate in memory (the registry is the single source of
 // truth), Prometheus reflects them immediately, and SQLite receives the current
-// absolute snapshot every interval. The cron scheduler (internal/cron)
+// absolute snapshot every interval. The stats flusher (which serializes the
+// flush and the reset) lets the socket's `reset stats` command restart the
+// persisted totals from zero by capturing a worker-owned baseline, without ever
+// mutating the monotonic Prometheus counters. The cron scheduler (internal/cron)
 // joins the same lifecycle: constructed, seeded from the loaded schedules,
 // started, and stopped on shutdown. Schedules are coordinated through Redis:
 // every worker evaluates the cron locally but publishes one stream entry per
@@ -16,10 +19,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -159,6 +164,14 @@ func Run(logger *slog.Logger) {
 	// restored (they are point-in-time snapshots refreshed each interval).
 	restorePersistedStats(metricsInstance, st)
 
+	// The stats flusher is the single owner of every write of the registry's
+	// Relay-visible totals into SQLite. It holds a mutex across BOTH the capture
+	// of the current snapshot and the write, so an operator reset over the socket
+	// (flusher.ResetStats) can never race a flush into resurrecting pre-reset
+	// values: a flush either completes before the reset or captures after it.
+	// Shared by statsLoop, finalStatsFlush, and the socket reset command.
+	flusher := newStatsFlusher(st, metricsInstance)
+
 	manager, err := runtime.NewManager(
 		logger,
 		metricsInstance,
@@ -187,7 +200,7 @@ func Run(logger *slog.Logger) {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
-	rtSocket, err := NewSocketServer(SocketPath, manager, logger)
+	rtSocket, err := NewSocketServer(SocketPath, manager, flusher, logger)
 	if err != nil {
 		logger.Error("Runtime state socket: start failed", "error", err)
 		os.Exit(1)
@@ -323,7 +336,7 @@ func Run(logger *slog.Logger) {
 	// snapshot, and a nil-registry flush would clobber the persisted cumulative
 	// totals with zeros. The loop parks on ctx so shutdown ordering stays uniform.
 	if metricsInstance != nil {
-		go statsLoop(ctx, metricsInstance, st, statsFlushInterval)
+		go statsLoop(ctx, flusher, statsFlushInterval)
 	} else {
 		go parkUntilShutdown(ctx)
 	}
@@ -380,6 +393,9 @@ func Run(logger *slog.Logger) {
 			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
 			RemoveFunction: func(name string) {
 				metricsInstance.RemoveFunction(name)
+				// Drop the function's reset baseline too, so a re-added function
+				// is not offset by a stale pre-removal total.
+				flusher.dropFunctionBaseline(name)
 				// Drop the function's warm container state first: no new acquire
 				// may warm a removed function, idle containers are discarded now,
 				// and busy ones are discarded on release. Then retire every image
@@ -490,7 +506,7 @@ func Run(logger *slog.Logger) {
 	// Bounded by a short timeout so a wedged SQLite cannot hang shutdown; failure
 	// is logged and shutdown continues (telemetry, not state). No-op when metrics
 	// are disabled (nil registry).
-	finalStatsFlush(metricsInstance, st)
+	finalStatsFlush(flusher)
 
 	// Bounded graceful shutdown of the metrics server, so in-flight scrapes drain
 	// rather than being cut off mid-request. No-op when metrics are disabled (the
@@ -827,39 +843,149 @@ func unixSecToRFC3339(ts int64) string {
 	return time.Unix(ts, 0).UTC().Format(time.RFC3339)
 }
 
+// relayGlobalCounters are the five unlabeled cumulative counters the worker
+// persists. They are the global counterpart of the per-function counters read
+// by FunctionStatsSnapshot, and the set the relay baseline captures/subtracts.
+var relayGlobalCounters = []string{
+	metrics.MetricEventsProcessed,
+	metrics.MetricHandlerSuccess,
+	metrics.MetricHandlerFailure,
+	metrics.MetricRetries,
+	metrics.MetricDLQEntries,
+}
+
+// relayBaseline is the worker-owned reset baseline captured at the last
+// `reset stats`. It is the worker-side replacement for the metrics registry's
+// former subtraction baseline: the registry stays a pure, monotonic Prometheus
+// accumulator, and the worker subtracts the reset point when it snapshots, so
+// the persisted Relay totals continue from zero while /metrics never moves
+// backwards. globals maps a counter name to its raw value at the reset; funcs
+// maps a function to its raw per-function snapshot at the reset (counters are
+// subtracted, and a timestamp not advanced since the reset is suppressed to
+// "never observed" — timestamps are last-observed, not cumulative, so
+// subtraction alone cannot represent their reset). It is guarded by the owning
+// statsFlusher.mu and takes no lock of its own; the zero value is a valid
+// "no reset yet" baseline and a nil *relayBaseline is treated the same.
+type relayBaseline struct {
+	globals map[string]int64
+	funcs   map[string]metrics.FunctionStat
+}
+
+// counter returns v (the raw counter value) minus the reset baseline for name.
+// A nil or zero baseline returns v unchanged.
+func (b *relayBaseline) counter(name string, v int64) int64 {
+	if b == nil {
+		return v
+	}
+	return v - b.globals[name]
+}
+
+// applyFunctionStat returns fs with every cumulative per-function counter
+// reduced by the reset baseline and any timestamp not advanced since the reset
+// suppressed to zero ("never observed"). A nil baseline, or a function absent
+// from the baseline, leaves fs unchanged. It is read-only: the registry is
+// never mutated.
+func (b *relayBaseline) applyFunctionStat(fs metrics.FunctionStat) metrics.FunctionStat {
+	if b == nil {
+		return fs
+	}
+	base, ok := b.funcs[fs.Function]
+	if !ok {
+		return fs
+	}
+	fs.Events -= base.Events
+	fs.HandlerSuccessTotal -= base.HandlerSuccessTotal
+	fs.HandlerFailureTotal -= base.HandlerFailureTotal
+	fs.RetriesTotal -= base.RetriesTotal
+	fs.DLQTotal -= base.DLQTotal
+	fs.WarmAcquiresTotal -= base.WarmAcquiresTotal
+	fs.ColdStartsTotal -= base.ColdStartsTotal
+	fs.DiscardedTotal -= base.DiscardedTotal
+	// Timestamps are last-observed, so a value not newer than the reset point
+	// belongs to pre-reset history and is reported as "never observed". A
+	// post-reset execution always advances the clock past the baseline.
+	if fs.LastExecution <= base.LastExecution {
+		fs.LastExecution = 0
+	}
+	if fs.LastSuccess <= base.LastSuccess {
+		fs.LastSuccess = 0
+	}
+	if fs.LastFailure <= base.LastFailure {
+		fs.LastFailure = 0
+	}
+	if fs.LastDLQ <= base.LastDLQ {
+		fs.LastDLQ = 0
+	}
+	return fs
+}
+
+// captureRelayBaseline reads the registry's current raw counters and
+// per-function snapshot and installs them as the reset baseline. A nil registry
+// yields the zero baseline (there is no in-memory source to reset). The caller
+// holds the flusher mutex, so the captured values are a consistent reset point
+// with respect to any concurrent flush.
+func captureRelayBaseline(metricsInstance *metrics.Registry) relayBaseline {
+	var b relayBaseline
+	if metricsInstance == nil {
+		return b
+	}
+	b.globals = make(map[string]int64, len(relayGlobalCounters))
+	for _, name := range relayGlobalCounters {
+		b.globals[name] = metricsInstance.Counter(name)
+	}
+	b.funcs = make(map[string]metrics.FunctionStat)
+	for _, fs := range metricsInstance.FunctionStatsSnapshot() {
+		b.funcs[fs.Function] = fs
+	}
+	return b
+}
+
 // snapshotStats maps the metrics registry into the state database's Stats row.
 // The registry counter names feed the SQLite columns directly, with one rename
-// (retries_total → RetryTotal) and the float gauges truncated to int64. It is
-// nil-safe: a nil registry yields a zero Stats so the snapshot path can never
-// panic or block processing.
-func snapshotStats(metricsInstance *metrics.Registry) state.Stats {
+// (retries_total → RetryTotal) and the float gauges truncated to int64. Each
+// cumulative counter has the worker-owned relay baseline subtracted (base), so
+// an operator reset starts the persisted totals from zero while Prometheus stays
+// monotonic; before any reset the baseline is zero and this equals the raw
+// counter. The backlog gauges are point-in-time values and are never baselined.
+// It is nil-safe: a nil registry yields a zero Stats so the snapshot path can
+// never panic or block processing.
+func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state.Stats {
 	if metricsInstance == nil {
 		return state.Stats{}
 	}
 	return state.Stats{
-		EventsProcessedTotal:    metricsInstance.Counter(metrics.MetricEventsProcessed),
-		HandlerSuccessTotal:     metricsInstance.Counter(metrics.MetricHandlerSuccess),
-		HandlerFailureTotal:     metricsInstance.Counter(metrics.MetricHandlerFailure),
-		RetryTotal:              metricsInstance.Counter(metrics.MetricRetries),
-		DLQTotal:                metricsInstance.Counter(metrics.MetricDLQEntries),
+		EventsProcessedTotal: base.counter(
+			metrics.MetricEventsProcessed, metricsInstance.Counter(metrics.MetricEventsProcessed)),
+		HandlerSuccessTotal: base.counter(
+			metrics.MetricHandlerSuccess, metricsInstance.Counter(metrics.MetricHandlerSuccess)),
+		HandlerFailureTotal: base.counter(
+			metrics.MetricHandlerFailure, metricsInstance.Counter(metrics.MetricHandlerFailure)),
+		RetryTotal: base.counter(
+			metrics.MetricRetries, metricsInstance.Counter(metrics.MetricRetries)),
+		DLQTotal: base.counter(
+			metrics.MetricDLQEntries, metricsInstance.Counter(metrics.MetricDLQEntries)),
 		PendingEntries:          int64(metricsInstance.Gauge(metrics.MetricPendingEntries)),
 		OldestPendingAgeSeconds: int64(metricsInstance.Gauge(metrics.MetricPendingOldestAge)),
 	}
 }
 
 // snapshotFunctionStats maps the registry's per-function counters AND latest
-// execution-history timestamps into the state layer's FunctionStats rows. The
-// registry stores unix seconds; the state layer stores RFC3339 strings in the
-// updated_at convention (empty = never observed), so zero timestamps map to "".
-// It is nil-safe: a nil registry yields an empty slice so the snapshot path can
-// never panic or block processing.
-func snapshotFunctionStats(metricsInstance *metrics.Registry) []state.FunctionStats {
+// execution-history timestamps into the state layer's FunctionStats rows. Like
+// snapshotStats it applies the worker-owned relay baseline (base), so
+// per-function totals continue from zero after an operator reset and pre-reset
+// timestamps are reported as "never observed", while the Prometheus series stay
+// monotonic. The registry stores unix seconds; the state layer stores RFC3339
+// strings in the updated_at convention (empty = never observed), so zero
+// timestamps map to "". It is nil-safe: a nil registry yields an empty slice so
+// the snapshot path can never panic or block processing.
+func snapshotFunctionStats(metricsInstance *metrics.Registry, base *relayBaseline) []state.FunctionStats {
 	if metricsInstance == nil {
 		return nil
 	}
 	stats := metricsInstance.FunctionStatsSnapshot()
 	out := make([]state.FunctionStats, 0, len(stats))
 	for _, fs := range stats {
+		fs = base.applyFunctionStat(fs)
 		out = append(out, state.FunctionStats{
 			Function:             fs.Function,
 			EventsProcessedTotal: fs.Events,
@@ -879,24 +1005,97 @@ func snapshotFunctionStats(metricsInstance *metrics.Registry) []state.FunctionSt
 	return out
 }
 
+// statsFlusher owns every write of the registry's Relay-visible totals into
+// SQLite and the matching in-memory reset. It is the serialization point that
+// makes a socket-triggered `reset stats` deterministic against the periodic
+// flush: mu is held across BOTH capturing the snapshot and writing it, and
+// ResetStats takes the same mutex, so a flush can never interleave a captured
+// pre-reset snapshot with the reset (pre-reset values cannot be resurrected).
+// It is safe for concurrent use.
+type statsFlusher struct {
+	mu sync.Mutex
+	st *state.State
+	// metrics is nil exactly when METRICS_ADDR is unset. The flush paths are
+	// gated on a non-nil registry (statsLoop is not started, finalStatsFlush
+	// returns early), so a snapshot never runs against nil, which would clobber
+	// the persisted cumulative totals with zeros. ResetStats tolerates nil
+	// (capturing an empty baseline) so the socket can still reset the state DB.
+	metrics *metrics.Registry
+	// baseline is the worker-owned reset point captured by ResetStats. It is
+	// read and replaced under mu, so a concurrent flush always sees a coherent
+	// baseline. Zero value = "no reset yet".
+	baseline relayBaseline
+}
+
+// newStatsFlusher builds a flusher over the state handle and registry.
+func newStatsFlusher(st *state.State, metricsInstance *metrics.Registry) *statsFlusher {
+	return &statsFlusher{st: st, metrics: metricsInstance}
+}
+
+// flush captures the current Relay-visible snapshot and writes it in one short
+// transaction (see recordSnapshots). Held under mu so a concurrent ResetStats
+// cannot land between capture and write. Nil-safe on the flusher.
+func (f *statsFlusher) flush(ctx context.Context) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	recordSnapshots(ctx, f.st, f.metrics, &f.baseline)
+}
+
+// dropFunctionBaseline drops a function's entry from the worker-owned reset
+// baseline. It is called from the reconciler's RemoveFunction hook alongside the
+// registry's series deletion, so a function removed and later re-added starts
+// from its fresh zero-valued series instead of subtracting a stale pre-removal
+// total (which would persist a negative value). It is idempotent, nil-safe, and
+// safe to call before any reset (a zero baseline has no entry to drop).
+func (f *statsFlusher) dropFunctionBaseline(name string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	delete(f.baseline.funcs, name)
+	f.mu.Unlock()
+}
+
+// ResetStats resets the worker's accumulated Relay statistics. It captures the
+// registry's current raw values as the worker-owned subtraction baseline and
+// rewrites the persisted rows to zero, all while holding the SAME mutex flush
+// uses, so no captured pre-reset snapshot can be written after the reset. It
+// implements StatsResetter for the socket's `reset stats` command and never
+// mutates Prometheus: the registry keeps accumulating monotonically, and the
+// flush subtracts the baseline when it snapshots. A missing state handle (state
+// open failed at startup) reports an error so the socket answers
+// stats_reset_failed and the CLI surfaces it rather than masking a failed worker
+// reset; the baseline is still captured so the in-memory totals continue from
+// zero.
+func (f *statsFlusher) ResetStats() error {
+	if f == nil {
+		return errors.New("stats flusher unavailable")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.baseline = captureRelayBaseline(f.metrics)
+	if f.st == nil {
+		return errors.New("state database unavailable")
+	}
+	return f.st.ResetStats()
+}
+
 // statsLoop is the flush loop: it mirrors the in-memory metrics registry into
 // the state database on a fixed interval until ctx is cancelled. The first
 // flush runs immediately so the stats row exists before the first tick (this
-// also makes `relay stats` useful right after startup). It is nil-safe on both
-// the registry and the state handle, so observability can never break
-// processing. The loop's ctx is the shutdown ctx; periodic flushes use it
-// directly (a cancelled ctx simply stops the loop).
-func statsLoop(
-	ctx context.Context,
-	metricsInstance *metrics.Registry,
-	st *state.State,
-	interval time.Duration,
-) {
-	if st == nil {
+// also makes `relay stats` useful right after startup). It is nil-safe on the
+// state handle, so observability can never break processing. The loop's ctx is
+// the shutdown ctx; periodic flushes use it directly (a cancelled ctx simply
+// stops the loop).
+func statsLoop(ctx context.Context, f *statsFlusher, interval time.Duration) {
+	if f == nil || f.st == nil {
 		<-ctx.Done()
 		return
 	}
-	recordSnapshots(ctx, st, metricsInstance)
+	f.flush(ctx)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -904,7 +1103,7 @@ func statsLoop(
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			recordSnapshots(ctx, st, metricsInstance)
+			f.flush(ctx)
 		}
 	}
 }
@@ -913,20 +1112,26 @@ func statsLoop(
 // graceful shutdown, so the last interval of telemetry is not lost. It is
 // bounded by a short timeout so a wedged SQLite cannot hang shutdown; on
 // timeout or error it logs and returns (telemetry, not state). It is nil-safe
-// on both the registry and the state handle.
-func finalStatsFlush(metricsInstance *metrics.Registry, st *state.State) {
-	if metricsInstance == nil || st == nil {
+// on the flusher. The metrics guard is load-bearing: Run calls this even when
+// metrics are disabled (the flusher still holds the state handle), and a
+// nil-registry flush would write zero Stats over the persisted cumulative
+// totals.
+func finalStatsFlush(f *statsFlusher) {
+	if f == nil || f.st == nil || f.metrics == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	recordSnapshots(ctx, st, metricsInstance)
+	f.flush(ctx)
 }
 
 // recordSnapshots writes the whole stats snapshot — the global stats row and
 // one function_stats row per function with any attributed activity — in a
-// single short transaction (see state.RecordStatsSnapshot). Before the write it
-// enforces the metrics/SQLite consistency invariant: it sweeps the registry with
+// single short transaction (see state.RecordStatsSnapshot). base is the
+// worker-owned reset baseline subtracted from every cumulative counter (nil =
+// no reset yet), so an operator reset starts the persisted totals from zero
+// while Prometheus stays monotonic. Before the write it enforces the
+// metrics/SQLite consistency invariant: it sweeps the registry with
 // SweepFunctionMetrics against state.FunctionNames, deleting any function-scoped
 // series whose function no longer has a functions row. This complements the
 // reconciler's RemoveFunction hook (which deletes series at removal time) by
@@ -937,7 +1142,12 @@ func finalStatsFlush(metricsInstance *metrics.Registry, st *state.State) {
 // just above). Per-function writes are bounded by the function count, so the 5s
 // cadence keeps them small. A failed flush is logged and retried next tick with
 // the current absolute values; no path resets counters on failure.
-func recordSnapshots(ctx context.Context, st *state.State, metricsInstance *metrics.Registry) {
+func recordSnapshots(
+	ctx context.Context,
+	st *state.State,
+	metricsInstance *metrics.Registry,
+	base *relayBaseline,
+) {
 	// Sweep the registry against the live function set before snapshotting, so
 	// a function removed (or swept) this interval cannot persist a stale
 	// function_stats row that the orphan-prune would have to reject anyway, and
@@ -961,7 +1171,7 @@ func recordSnapshots(ctx context.Context, st *state.State, metricsInstance *metr
 	// write with a context.
 	_ = st.RecordStatsSnapshot(
 		ctx,
-		snapshotStats(metricsInstance),
-		snapshotFunctionStats(metricsInstance),
+		snapshotStats(metricsInstance, base),
+		snapshotFunctionStats(metricsInstance, base),
 	)
 }

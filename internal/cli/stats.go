@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"text/tabwriter"
@@ -10,14 +11,16 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/state"
+	"relay/internal/worker"
 )
 
 // statsCommand builds the `relay stats ...` subcommand family. It reads and
 // resets the operational snapshot in the local state database at
-// deps.StatePath; it touches only the state database — never Redis, Docker, or
-// the worker — so it works with no REDIS_URI set. A missing or unreadable stats
-// row renders a zero snapshot rather than failing, so an empty state database
-// always produces sensible output with exit 0.
+// deps.StatePath; a reset with a running worker goes through the worker's Unix
+// socket so its in-memory totals are reset too, but the read path never needs
+// Redis, Docker, or the worker, so `relay stats` works with no REDIS_URI set. A
+// missing or unreadable stats row renders a zero snapshot rather than failing,
+// so an empty state database always produces sensible output with exit 0.
 //
 // It is a hybrid grouping command: bare `relay stats` keeps rendering the table
 // through the parent Action (urfave runs it when no subcommand token resolves),
@@ -46,28 +49,40 @@ func statsCommand(deps Dependencies) *cli.Command {
 	}
 }
 
-// statsResetCommand builds `relay stats reset`: it rewrites the persisted
-// global cumulative counters to zero and clears the per-function stats rows in
-// one transaction (see state.ResetStats). It deliberately does not touch
-// pending events/backlog, Redis, containers/runtime pools/schedules/services,
-// or a running worker's Prometheus counters (monotonic for the process
-// lifetime; restarting does that). A running worker's next 5s flush re-writes
-// its in-memory totals, so a truly clean slate for a live worker means
-// restarting it.
+// statsResetCommand builds `relay stats reset`: with a running worker it asks
+// the worker over its Unix socket (worker.ResetRuntimeStats) to reset Relay's
+// accumulated statistics, so the worker's in-memory snapshot source and
+// persisted stats both continue from zero and a captured pre-reset snapshot
+// cannot be written after the reset (the worker performs both under its flush
+// mutex). When no worker answers, it falls back to state.ResetStats, which
+// rewrites the persisted global counters and every per-function stats row to
+// zero in one transaction. It deliberately does not touch pending
+// events/backlog, Redis, containers/runtime pools/schedules/services, or the
+// worker's Prometheus counters (monotonic for the process lifetime).
 func statsResetCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "reset",
 		Usage:     "Reset persisted cumulative statistics",
 		UsageText: "relay stats reset",
 		Description: "Reset the global and per-function cumulative statistics (including " +
-			"the Last* execution timestamps) in one transaction. Pending events/backlog, " +
-			"Redis, containers/pools, schedules and services are untouched, and a running " +
-			"worker's Prometheus counters keep their process-lifetime values (restart to " +
-			"reset those). A running worker re-writes its in-memory totals on its next 5s " +
-			"flush, so a clean slate for a live worker requires a restart.",
+			"the Last* execution timestamps). A running worker is reset over its socket so " +
+			"its in-memory totals continue from zero; otherwise the persisted state is " +
+			"rewritten directly. Pending events/backlog, Redis, containers/pools, schedules " +
+			"and services are untouched, and the worker's Prometheus counters keep their " +
+			"process-lifetime values.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats reset: too many arguments", 2)
+			}
+			// A running worker owns the in-memory source of the persisted
+			// totals, so reset through its socket first; only when no worker
+			// answers do we reset the state database directly (the stopped-worker
+			// path).
+			if err := worker.ResetRuntimeStats(deps.SocketPath); err == nil {
+				fmt.Fprintln(cmd.Writer, "Stats reset")
+				return nil
+			} else if !errors.Is(err, worker.ErrRuntimeStatsUnavailable) {
+				return fmt.Errorf("stats reset: %w", err)
 			}
 			st, cleanup, err := openState(deps.StatePath)
 			if err != nil {

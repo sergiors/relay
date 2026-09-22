@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,9 +52,17 @@ func testSocketPath(t *testing.T) string {
 // startTestSocket starts a SocketServer backed by pools at path.
 func startTestSocket(t *testing.T, path string, pools map[string]runtime.PoolSnapshot) *SocketServer {
 	t.Helper()
+	return startTestSocketWithResetter(t, path, pools, nil)
+}
+
+// startTestSocketWithResetter starts a SocketServer backed by pools at path with
+// an optional stats resetter, so the semantic reset command can be exercised.
+func startTestSocketWithResetter(t *testing.T, path string, pools map[string]runtime.PoolSnapshot, resetter StatsResetter) *SocketServer {
+	t.Helper()
 	s, err := NewSocketServer(
 		path,
 		&fakeSnapshotter{pools: pools},
+		resetter,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	if err != nil {
@@ -143,13 +152,19 @@ func TestRuntimeSocketUnknownFunction(t *testing.T) {
 }
 
 // TestRuntimeSocketMalformedRequest covers the malformed frame path directly at
-// the wire level: a non-JSON line yields a malformed_request error, and an empty
-// function name is rejected the same way.
+// the wire level: a non-JSON line, an absent command, an empty command, and an
+// empty function name are all rejected as malformed_request.
 func TestRuntimeSocketMalformedRequest(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
 
-	for _, line := range []string{"not-json\n", "{}\n", `{"function":""}` + "\n"} {
+	for _, line := range []string{
+		"not-json\n",
+		"{}\n",
+		`{"function":"fn"}` + "\n",
+		`{"command":"","function":"fn"}` + "\n",
+		`{"command":"runtime_state","function":""}` + "\n",
+	} {
 		resp := rawQuery(t, path, line)
 		if resp.Error != errCodeMalformedRequest {
 			t.Fatalf("line %q: error = %q, want %q", line, resp.Error, errCodeMalformedRequest)
@@ -293,5 +308,97 @@ func TestRuntimeSocketActiveOwnershipGuard(t *testing.T) {
 	}
 	if _, err := QueryRuntimeState(path, "fn"); err != nil {
 		t.Fatalf("active worker socket must remain served: %v", err)
+	}
+}
+
+// fakeStatsResetter counts ResetStats calls for socket tests.
+type fakeStatsResetter struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *fakeStatsResetter) ResetStats() error {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return f.err
+}
+
+func (f *fakeStatsResetter) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestRuntimeSocketResetStatsCommand verifies the semantic "reset stats" command
+// invokes the worker's StatsResetter exactly once and answers with the reset
+// frame, and that an unknown command is rejected without invoking the resetter.
+func TestRuntimeSocketResetStatsCommand(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{}
+	startTestSocketWithResetter(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}}, resetter)
+
+	if err := ResetRuntimeStats(path); err != nil {
+		t.Fatalf("ResetRuntimeStats: %v", err)
+	}
+	if got := resetter.count(); got != 1 {
+		t.Fatalf("resetter calls = %d, want 1", got)
+	}
+
+	// The unknown-command path is rejected as malformed and cannot reset.
+	resp := rawQuery(t, path, `{"command":"bogus"}`+"\n")
+	if resp.Error != errCodeMalformedRequest {
+		t.Fatalf("unknown command error = %q, want %q", resp.Error, errCodeMalformedRequest)
+	}
+	if got := resetter.count(); got != 1 {
+		t.Fatalf("unknown command must not reset, calls = %d", got)
+	}
+
+	// The runtime-state query still works alongside the reset command.
+	if _, err := QueryRuntimeState(path, "fn"); err != nil {
+		t.Fatalf("runtime state query after reset command: %v", err)
+	}
+}
+
+// TestRuntimeSocketResetStatsUnavailable verifies a worker with no stats
+// resetter answers stats_unavailable (so the CLI falls back to the state DB)
+// rather than looking like a successful reset.
+func TestRuntimeSocketResetStatsUnavailable(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+
+	err := ResetRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	}
+}
+
+// TestRuntimeSocketResetStatsResetterError verifies a resetter error is
+// reported as ErrRuntimeStatsFailed (the worker answered but failed) rather than
+// ErrRuntimeStatsUnavailable, so the CLI surfaces it instead of masking it.
+func TestRuntimeSocketResetStatsResetterError(t *testing.T) {
+	path := testSocketPath(t)
+	resetter := &fakeStatsResetter{err: errors.New("state unavailable")}
+	startTestSocketWithResetter(t, path, nil, resetter)
+
+	err := ResetRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsFailed) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsFailed", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("resetter error must not look like an unavailable worker: %v", err)
+	}
+	if got := resetter.count(); got != 1 {
+		t.Fatalf("resetter calls = %d, want 1", got)
+	}
+}
+
+// TestResetRuntimeStatsNoSocket verifies the standalone no-worker case reports
+// ErrRuntimeStatsUnavailable so the CLI resets the state database directly.
+func TestResetRuntimeStatsNoSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	if err := ResetRuntimeStats(path); !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
 	}
 }

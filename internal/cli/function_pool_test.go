@@ -31,6 +31,7 @@ func startTestSocketServer(t *testing.T, path string, pools map[string]runtime.P
 	s, err := worker.NewSocketServer(
 		path,
 		fakePoolSnapshotter{pools: pools},
+		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	if err != nil {

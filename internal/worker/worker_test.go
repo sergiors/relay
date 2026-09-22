@@ -15,7 +15,7 @@ func TestStatsLoopNilStateExitsOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		statsLoop(ctx, metrics.New(), nil, time.Hour)
+		statsLoop(ctx, newStatsFlusher(nil, metrics.New()), time.Hour)
 	}()
 	cancel()
 	select {

@@ -2,12 +2,57 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"relay/internal/runtime"
 	"relay/internal/state"
+	"relay/internal/worker"
 )
+
+// fakeStatsResetter counts ResetStats calls so a CLI test can prove the socket
+// path invoked the worker's resetter.
+type fakeStatsResetter struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *fakeStatsResetter) ResetStats() error {
+	f.mu.Lock()
+	f.calls++
+	err := f.err
+	f.mu.Unlock()
+	return err
+}
+
+func (f *fakeStatsResetter) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// startStatsSocket starts a worker query socket at path backed by no pools and
+// the given stats resetter, so the CLI's running-worker reset path is exercised
+// against a real socket.
+func startStatsSocket(t *testing.T, path string, resetter worker.StatsResetter) {
+	t.Helper()
+	s, err := worker.NewSocketServer(
+		path,
+		fakePoolSnapshotter{pools: map[string]runtime.PoolSnapshot{}},
+		resetter,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+}
 
 // seedStatsState creates a temp state DB under test dependencies and records a
 // known global stats snapshot. It returns the opened state DB and the deps
@@ -130,10 +175,11 @@ func TestStatsCommand(t *testing.T) {
 	}
 }
 
-// `relay stats reset` prints the exact confirmation line, clears the global
-// cumulative counters and every function_stats row, but PRESERVES the live
-// backlog gauges. A following bare `relay stats` renders zeros for the counters
-// and the preserved gauge value.
+// `relay stats reset` with no running worker falls back to the state database:
+// it prints the exact confirmation line, zeroes the global cumulative counters
+// and every function_stats row IN PLACE, but PRESERVES the live backlog gauges.
+// A following bare `relay stats` renders zeros for the counters and the
+// preserved gauge value.
 func TestStatsResetCommand(t *testing.T) {
 	st, deps := seedStatsState(t)
 	st.RecordFunctionStats(state.FunctionStats{
@@ -152,7 +198,7 @@ func TestStatsResetCommand(t *testing.T) {
 	}
 
 	// Persisted state: global counters zeroed, gauges preserved, function rows
-	// deleted.
+	// reset in place (not deleted).
 	s, ok := st.Stats()
 	if !ok {
 		t.Fatal("stats row must survive the reset")
@@ -164,8 +210,12 @@ func TestStatsResetCommand(t *testing.T) {
 	if s.PendingEntries != 17 || s.OldestPendingAgeSeconds != 134 {
 		t.Fatalf("backlog gauges must be preserved: %+v", s)
 	}
-	if all := st.AllFunctionStats(); len(all) != 0 {
-		t.Fatalf("function_stats must be cleared: %+v", all)
+	all := st.AllFunctionStats()
+	if len(all) != 1 || all[0].Function != "alpha" {
+		t.Fatalf("function_stats rows must be preserved: %+v", all)
+	}
+	if all[0].EventsProcessedTotal != 0 || all[0].WarmAcquiresTotal != 0 || all[0].LastExecutionAt != "" {
+		t.Fatalf("function_stats must be zeroed in place: %+v", all[0])
 	}
 
 	// A follow-up bare `relay stats` still renders the table (the parent Action
@@ -189,6 +239,52 @@ func TestStatsResetCommand(t *testing.T) {
 	}
 	if strings.Contains(rendered, "COMMANDS:") {
 		t.Errorf("bare stats must render the table, not help:\n%s", rendered)
+	}
+}
+
+// `relay stats reset` surfaces a worker-reported reset failure instead of
+// silently falling back to the direct state write (which would mask it).
+func TestStatsResetCommandWorkerFailureSurfaces(t *testing.T) {
+	st, deps := seedStatsState(t)
+	resetter := &fakeStatsResetter{err: errors.New("state unavailable")}
+	startStatsSocket(t, deps.SocketPath, resetter)
+
+	_, _, err := runCLIWithDeps(t, deps, "", "stats", "reset")
+	if err == nil || !strings.Contains(err.Error(), "stats reset") {
+		t.Fatalf("worker failure must surface as an error, got %v", err)
+	}
+	// The CLI must not have written the state DB as a silent fallback.
+	s, _ := st.Stats()
+	if s.EventsProcessedTotal != 152934 {
+		t.Fatalf("failed worker reset must not fall back to a state write: %+v", s)
+	}
+}
+
+// `relay stats reset` with a RUNNING worker resets through the worker's socket,
+// so the worker's in-memory totals are reset too, and the CLI does NOT fall back
+// to the direct state write. The state DB is left untouched by the CLI itself
+// (the worker owns the persisted reset).
+func TestStatsResetCommandRunningWorker(t *testing.T) {
+	st, deps := seedStatsState(t)
+	// A worker-owned state DB is a separate handle; the CLI's direct fallback
+	// would write here, so an untouched row proves the socket path was taken.
+	resetter := &fakeStatsResetter{}
+	startStatsSocket(t, deps.SocketPath, resetter)
+
+	out, _, err := runCLIWithDeps(t, deps, "", "stats", "reset")
+	if err != nil {
+		t.Fatalf("stats reset: err = %v, want nil", err)
+	}
+	if out != "Stats reset\n" {
+		t.Fatalf("stats reset stdout = %q, want %q", out, "Stats reset\n")
+	}
+	if resetter.count() != 1 {
+		t.Fatalf("worker resetter calls = %d, want 1 (socket path)", resetter.count())
+	}
+	// The CLI must not have written the state DB directly.
+	s, _ := st.Stats()
+	if s.EventsProcessedTotal != 152934 {
+		t.Fatalf("CLI must not reset the state DB when a worker answered: %+v", s)
 	}
 }
 

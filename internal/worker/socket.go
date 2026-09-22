@@ -21,13 +21,16 @@ import (
 // This file implements the worker-owned LIVE runtime-pool query socket at
 // /run/relay/relay.sock, alongside the process lock this worker runs under.
 //
-// It carries ONLY the live warm-container pool gauges (capacity and container
-// counts by lease state). The cumulative acquire/discard counters are PERSISTED
+// It carries two semantic operations: the live warm-container pool gauges
+// (capacity and container counts by lease state), and the operator-facing
+// "reset stats" command. The cumulative acquire/discard counters are PERSISTED
 // per function under /var/lib/relay (state.FunctionStats) and read there by the
 // standalone CLI; they are deliberately never sent over the socket, because the
 // socket's whole purpose is the ephemeral worker-local view the persisted state
 // cannot provide. Conversely the live gauges are never persisted, because a
-// persisted gauge would go stale between flushes.
+// persisted gauge would go stale between flushes. The reset command carries no
+// storage details: the worker resets its own in-memory source and persisted rows
+// behind its StatsResetter, so the socket never learns about SQLite.
 //
 // Lifecycle ownership is the worker's: it creates the runtime directory,
 // removes a STALE socket left by a SIGKILLed worker, binds, serves, stops
@@ -38,7 +41,8 @@ import (
 // socket it would find cannot belong to an active worker.
 
 // SocketPath is the fixed live query socket `relay function inspect` dials for
-// live runtime-pool gauges. It lives beside the process lock in the ephemeral
+// live runtime-pool gauges and `relay stats reset` dials to reset a running
+// worker's statistics. It lives beside the process lock in the ephemeral
 // runtime directory (internal/processlock.DefaultDir), NOT under the persisted
 // /var/lib/relay state volume: a socket is process state that can neither
 // outlive the worker nor be meaningfully persisted.
@@ -76,6 +80,18 @@ const (
 const (
 	errCodeMalformedRequest = "malformed_request"
 	errCodeUnknownFunction  = "unknown_function"
+	errCodeStatsUnavailable = "stats_unavailable"
+	errCodeStatsFailed      = "stats_reset_failed"
+)
+
+// Wire commands. Every request frame MUST name its command explicitly:
+// cmdRuntimeState requests function's live pool gauges, cmdResetStats asks the
+// worker to reset its Relay statistics (the command name is the operator-facing
+// semantic, not a DB operation — the socket never exposes storage details). An
+// absent or unknown command is malformed.
+const (
+	cmdRuntimeState = "runtime_state"
+	cmdResetStats   = "reset_stats"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -86,6 +102,17 @@ var ErrRuntimeStateUnavailable = errors.New("runtime state unavailable")
 // ErrUnknownFunction reports that the worker answered but has no live pool for
 // the requested function (it was never warmed, or was already removed).
 var ErrUnknownFunction = errors.New("unknown function")
+
+// ErrRuntimeStatsUnavailable reports that the worker socket could not reset
+// Relay's statistics because no worker answered — it is unreachable, the socket
+// is stale, or the exchange failed. The CLI treats it as "no worker reset; fall
+// back to resetting the state database directly".
+var ErrRuntimeStatsUnavailable = errors.New("runtime stats unavailable")
+
+// ErrRuntimeStatsFailed reports that a worker DID answer the reset command but
+// could not complete it (e.g. its state handle is unavailable). The CLI surfaces
+// it rather than silently falling back, so a failed worker reset is not masked.
+var ErrRuntimeStatsFailed = errors.New("runtime stats reset failed")
 
 // RuntimeState is the live, worker-local runtime-pool gauge view returned by the
 // query socket. Every field is a valid zero for a function with an existing but
@@ -99,26 +126,44 @@ type RuntimeState struct {
 	Starting   int `json:"starting"`
 }
 
-// socketRequest is the newline-JSON request frame: the function whose live pool
-// gauges are requested.
+// socketRequest is the newline-JSON request frame. Command selects the
+// operation: cmdRuntimeState requests function's live pool gauges (Function is
+// required); cmdResetStats asks the worker to reset its Relay statistics. A
+// frame carries exactly one command, and an absent or unknown command is
+// malformed.
 type socketRequest struct {
-	Function string `json:"function"`
+	Command  string `json:"command,omitempty"`
+	Function string `json:"function,omitempty"`
 }
 
 // socketResponse is the newline-JSON response frame. Exactly one of the
-// embedded RuntimeState (success) or Error (failure) is present. Embedding
-// flattens the gauges to the top level, so a success frame carries only
-// capacity/containers/busy/idle/starting and a failure frame only error.
+// embedded RuntimeState (success), Error (failure), or ResetStats=true
+// (reset success) is present.
 type socketResponse struct {
 	*RuntimeState
-	Error string `json:"error,omitempty"`
+	ResetStats bool   `json:"reset_stats,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
-// PoolSnapshotter is the minimal manager view the socket needs. *runtime.Manager
-// satisfies it via its live PoolSnapshot method, which keeps the socket
-// decoupled from Docker and from the pool internals.
+// PoolSnapshotter is the minimal manager view the runtime-state query needs.
+// *runtime.Manager satisfies it via its live PoolSnapshot method, which keeps
+// the socket decoupled from Docker and from the pool internals.
 type PoolSnapshotter interface {
 	PoolSnapshot(name string) (runtime.PoolSnapshot, bool)
+}
+
+// StatsResetter resets Relay's accumulated in-memory statistics so the persisted
+// flush continues from zero. It is implemented by the worker's own stats source
+// (the stats flusher): the implementation MUST perform the reset and capture the
+// new worker-owned baseline under the SAME lock the flush holds, so a flush that
+// already captured a pre-reset snapshot cannot write it after the reset. It
+// deliberately carries no DB details: the socket only knows the semantic "reset
+// stats" operation, never storage. A non-nil error means the worker could not
+// complete the reset (e.g. its state handle is unavailable or a payload is
+// corrupt), so the socket reports stats_reset_failed and the CLI surfaces it
+// rather than falling back.
+type StatsResetter interface {
+	ResetStats() error
 }
 
 // SocketServer is the worker-owned live query socket. It accepts one request
@@ -126,10 +171,11 @@ type PoolSnapshotter interface {
 // unit: Close stops accepting, closes every in-flight connection (each already
 // bounded by its own deadline), waits for handlers, and unlinks the socket file.
 type SocketServer struct {
-	path    string
-	log     *slog.Logger
-	manager PoolSnapshotter
-	ln      net.Listener
+	path     string
+	log      *slog.Logger
+	manager  PoolSnapshotter
+	resetter StatsResetter
+	ln       net.Listener
 
 	mu     sync.Mutex
 	closed bool
@@ -146,9 +192,20 @@ type SocketServer struct {
 // operation (serve, close, unlink) uses that instance path and never a
 // package-level one.
 //
+// resetter handles the semantic "reset stats" command. Run always supplies the
+// stats flusher (constructed with the state handle even when metrics are
+// disabled), so production always has a resetter; a nil resetter answers
+// stats_unavailable and the CLI falls back to resetting the state database
+// directly.
+//
 // The stale removal is safe because the caller (`relay start` via worker.Run)
 // holds the process lock: see the file comment.
-func NewSocketServer(path string, manager PoolSnapshotter, logger *slog.Logger) (*SocketServer, error) {
+func NewSocketServer(
+	path string,
+	manager PoolSnapshotter,
+	resetter StatsResetter,
+	logger *slog.Logger,
+) (*SocketServer, error) {
 	if err := ensureSocketDir(path); err != nil {
 		return nil, fmt.Errorf("create runtime dir: %w", err)
 	}
@@ -160,12 +217,13 @@ func NewSocketServer(path string, manager PoolSnapshotter, logger *slog.Logger) 
 		return nil, fmt.Errorf("listen %q: %w", path, err)
 	}
 	s := &SocketServer{
-		path:    path,
-		log:     logger,
-		manager: manager,
-		ln:      ln,
-		conns:   make(map[net.Conn]struct{}),
-		done:    make(chan struct{}),
+		path:     path,
+		log:      logger,
+		manager:  manager,
+		resetter: resetter,
+		ln:       ln,
+		conns:    make(map[net.Conn]struct{}),
+		done:     make(chan struct{}),
 	}
 	go s.serve()
 	return s, nil
@@ -230,11 +288,46 @@ func (s *SocketServer) handle(conn net.Conn) {
 		return
 	}
 	var req socketRequest
-	if err := json.Unmarshal(line, &req); err != nil || req.Function == "" {
+	if err := json.Unmarshal(line, &req); err != nil {
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 		return
 	}
-	snap, ok := s.manager.PoolSnapshot(req.Function)
+	switch req.Command {
+	case cmdResetStats:
+		s.handleResetStats(conn)
+	case cmdRuntimeState:
+		s.handleRuntimeState(conn, req.Function)
+	default:
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+	}
+}
+
+// handleResetStats resets the worker's accumulated Relay statistics through the
+// StatsResetter. A nil resetter answers stats_unavailable so the CLI falls back
+// to the state database; a reset error answers stats_reset_failed so the CLI
+// surfaces it instead of masking a failed worker reset. On success the frame
+// carries reset_stats.
+func (s *SocketServer) handleResetStats(conn net.Conn) {
+	if s.resetter == nil {
+		s.respond(conn, socketResponse{Error: errCodeStatsUnavailable})
+		return
+	}
+	if err := s.resetter.ResetStats(); err != nil {
+		s.respond(conn, socketResponse{Error: errCodeStatsFailed})
+		return
+	}
+	s.respond(conn, socketResponse{ResetStats: true})
+}
+
+// handleRuntimeState answers the live pool-gauges query for one function. An
+// empty function name or an unknown function is reported without gauges so the
+// CLI renders the live fields unknown.
+func (s *SocketServer) handleRuntimeState(conn net.Conn, function string) {
+	if function == "" {
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+		return
+	}
+	snap, ok := s.manager.PoolSnapshot(function)
 	if !ok {
 		s.respond(conn, socketResponse{Error: errCodeUnknownFunction})
 		return
@@ -327,7 +420,7 @@ func QueryRuntimeState(path, function string) (RuntimeState, error) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(runtimeStateRequestTimeout))
 
-	if err := json.NewEncoder(conn).Encode(socketRequest{Function: function}); err != nil {
+	if err := json.NewEncoder(conn).Encode(socketRequest{Command: cmdRuntimeState, Function: function}); err != nil {
 		return RuntimeState{}, fmt.Errorf("%w: %v", ErrRuntimeStateUnavailable, err)
 	}
 	var resp socketResponse
@@ -344,4 +437,42 @@ func QueryRuntimeState(path, function string) (RuntimeState, error) {
 		return RuntimeState{}, fmt.Errorf("%w: empty response", ErrRuntimeStateUnavailable)
 	}
 	return *resp.RuntimeState, nil
+}
+
+// ResetRuntimeStats asks the live worker at path to reset its accumulated Relay
+// statistics through the socket's semantic "reset stats" command, so the
+// worker's in-memory snapshot source and persisted stats both continue from
+// zero without losing the flush race. It is the CLI's running-worker path. A
+// missing/unresponsive worker (or one with no stats source) reports
+// ErrRuntimeStatsUnavailable, and the CLI falls back to resetting the state
+// database directly; a worker that answered but failed the reset reports
+// ErrRuntimeStatsFailed so the CLI surfaces it. The worker's Prometheus counters
+// are deliberately left monotonic (the worker resets its Relay-side baseline
+// only).
+func ResetRuntimeStats(path string) error {
+	d := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := d.Dial("unix", path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(runtimeStateRequestTimeout))
+
+	if err := json.NewEncoder(conn).Encode(socketRequest{Command: cmdResetStats}); err != nil {
+		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
+	}
+	var resp socketResponse
+	if err := json.NewDecoder(io.LimitReader(conn, runtimeStateMaxResponse)).Decode(&resp); err != nil {
+		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
+	}
+	if resp.Error != "" {
+		if resp.Error == errCodeStatsUnavailable {
+			return fmt.Errorf("%w: %s", ErrRuntimeStatsUnavailable, resp.Error)
+		}
+		return fmt.Errorf("%w: %s", ErrRuntimeStatsFailed, resp.Error)
+	}
+	if !resp.ResetStats {
+		return fmt.Errorf("%w: empty response", ErrRuntimeStatsFailed)
+	}
+	return nil
 }
