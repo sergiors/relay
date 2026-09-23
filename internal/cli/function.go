@@ -137,10 +137,17 @@ func printList(w io.Writer, st *state.State) error {
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tRUNTIME\tSTATUS\tUPDATED")
+
 	for _, r := range rows {
+		runtime := r.Runtime
+		if runtime == "" {
+			runtime = "-"
+		}
+
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
-			r.Name, r.Runtime, r.Status, displayTime(r))
+			r.Name, runtime, r.Status, displayTime(r))
 	}
+
 	return tw.Flush()
 }
 
@@ -153,7 +160,13 @@ func printList(w io.Writer, st *state.State) error {
 func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionStats {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
-	fmt.Fprintf(tw, "Runtime:\t%s\n", d.Runtime)
+
+	runtime := d.Runtime
+	if runtime == "" {
+		runtime = "-"
+	}
+	fmt.Fprintf(tw, "Runtime:\t%s\n", runtime)
+
 	fmt.Fprintf(tw, "Status:\t%s\n", d.Status)
 	if d.Image != "" {
 		fmt.Fprintf(tw, "Image:\t%s\n", d.Image)
@@ -197,39 +210,42 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		hw.Flush()
 	}
 
-	// The Schedules section renders the template's cron schedules (handler,
-	// verbatim cron expression, effective timezone, resolved timeout). It is
-	// omitted entirely when the template defines none, like Environment.
 	if len(d.Schedules) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Schedules:")
 		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, s := range d.Schedules {
-			// A human-readable description (in 24-hour time) is appended in
-			// parentheses when it is available; the raw cron remains the source
-			// of truth. The command must never fail because of description
-			// generation, so on any error the row renders exactly as before.
+			// Cron descriptions are best-effort; the raw expression remains authoritative.
 			if desc, ok := describeCronFunc(s.Cron); ok {
-				fmt.Fprintf(sw, "  %s\tcron=%q (%s) timezone=%s timeout=%s\n", s.Handler, s.Cron, desc, s.Timezone, s.Timeout)
+				fmt.Fprintf(
+					sw,
+					"  %s\tcron=%q (%s) timezone=%s timeout=%s\n",
+					s.Handler,
+					s.Cron,
+					desc,
+					s.Timezone,
+					s.Timeout,
+				)
 				continue
 			}
-			fmt.Fprintf(sw, "  %s\tcron=%q timezone=%s timeout=%s\n", s.Handler, s.Cron, s.Timezone, s.Timeout)
+			fmt.Fprintf(
+				sw,
+				"  %s\tcron=%q timezone=%s timeout=%s\n",
+				s.Handler,
+				s.Cron,
+				s.Timezone,
+				s.Timeout,
+			)
 		}
 		sw.Flush()
 	}
 
-	// The Services section renders the template's persistent services (source,
-	// effective internal port, desired replica count). It is omitted entirely
-	// when the template defines none, like Schedules. The source is derived from
-	// the configured source fields and rendered with its kind: an entrypoint
-	// file, a `build:` Dockerfile path, or an `image:` reference. The routing
-	// path prefix is appended only when set, so the pre-path rendering of a
-	// host-only service is unchanged.
 	if len(d.Services) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Services:")
 		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, svc := range d.Services {
+			// Prefix non-entrypoint sources so their kind remains visible in CLI output.
 			source := svc.Entrypoint
 			switch {
 			case svc.Build != "":
@@ -237,8 +253,16 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 			case svc.Image != "":
 				source = "image:" + svc.Image
 			}
+
 			if svc.Path != "" {
-				fmt.Fprintf(srw, "  %s\tport=%d replicas=%d path=%s\n", source, svc.Port, svc.Replicas, svc.Path)
+				fmt.Fprintf(
+					srw,
+					"  %s\tport=%d replicas=%d path=%s\n",
+					source,
+					svc.Port,
+					svc.Replicas,
+					svc.Path,
+				)
 				continue
 			}
 			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", source, svc.Port, svc.Replicas)
@@ -246,9 +270,6 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		srw.Flush()
 	}
 
-	// Env and secrets sections render the template's MAPPINGS only: literal env
-	// values (not secret) and secret references (never values). Both are
-	// omitted when the template defines none. Keys are sorted.
 	if len(d.Env) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Environment:")
@@ -258,15 +279,18 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		}
 		ew.Flush()
 	}
+
 	if len(d.Secrets) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Secrets:")
 		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, k := range sortedKeys(d.Secrets) {
+			// Show secret references only; resolved values must never be exposed.
 			fmt.Fprintf(sw, "  %s=%s\n", k, d.Secrets[k])
 		}
 		sw.Flush()
 	}
+
 	return fs
 }
 
