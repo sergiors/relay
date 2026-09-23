@@ -387,8 +387,11 @@ func TestInvokeHandlerExhaustionCarriesHandlerAttempts(t *testing.T) {
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
 	}
-	if exhausted.HandlerAttempts != 1 {
-		t.Fatalf("HandlerAttempts = %d, want 1 (retries:0 → exhaustion on attempt 1)", exhausted.HandlerAttempts)
+	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 1 {
+		t.Fatalf("Invocations = %+v, want one with attempts 1 (retries:0 → exhaustion on attempt 1)", exhausted.Invocations)
+	}
+	if exhausted.Invocations[0].Function != "fn" || exhausted.Invocations[0].Handler != "index.run" {
+		t.Fatalf("exhausted invocation = %+v, want fn/index.run", exhausted.Invocations[0])
 	}
 	if !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("err = %v, want it to wrap stream.ErrInvocationExhausted", err)
@@ -412,8 +415,8 @@ func TestInvokeHandlerTerminalSkipCarriesExhaustedAttempts(t *testing.T) {
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
 	}
-	if exhausted.HandlerAttempts != 5 {
-		t.Fatalf("HandlerAttempts = %d, want 5 (persisted exhausted attempt)", exhausted.HandlerAttempts)
+	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 5 {
+		t.Fatalf("Invocations = %+v, want one with attempts 5 (persisted exhausted attempt)", exhausted.Invocations)
 	}
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0 (terminal skip)", exec.count())

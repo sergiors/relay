@@ -19,10 +19,13 @@
 //     running. Handle then aggregates the per-invocation outcomes into a single
 //     message-level error: a retryable failure keeps the message pending; when
 //     every matched invocation is terminal (complete or exhausted) and at least
-//     one exhausted, the message is terminal and routed to the DLQ; a protected
-//     or slot-timeout skip returns stream.ErrInvocationNotEligible so the
-//     message stays pending (never acked while another replica may still be
-//     processing it, even if other invocations succeeded this delivery)
+//     one exhausted, the message is terminal and routed to the DLQ — the
+//     returned *stream.HandlerExhaustedError carries EVERY exhausted invocation
+//     (exact function/handler and handler attempt), so the stream writes one
+//     correctly-attributed DLQ entry per invocation; a protected or slot-timeout
+//     skip returns stream.ErrInvocationNotEligible so the message stays pending
+//     (never acked while another replica may still be processing it, even if
+//     other invocations succeeded this delivery)
 //   - Panic boundary: each invocation's execution runs inside runInvocation,
 //     which recovers an executor/runtime panic and converts it into a normal
 //     failed attempt (metrics + recordFailure), so a panicking execution is

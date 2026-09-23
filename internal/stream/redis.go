@@ -972,57 +972,131 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	}
 }
 
-// routeToDLQ writes the message to the DLQ and only then acks the original. The
-// XADD-before-XACK ordering matters: if the DLQ write fails the original stays
-// pending so the next recovery cycle retries the DLQ write rather than losing
-// the message.
+// unpersistedDLQSpecs filters the DLQ entry specs down to those whose entry has
+// not already been persisted, consulting each invocation's per-invocation
+// persistence marker ("exhausted:<n>:dlq") rather than scanning the DLQ stream.
+// Skipping already-persisted entries is what makes retrying a partially-written
+// multi-entry DLQ (after a failed XACK, a crash, or a partial write) idempotent:
+// the retry writes only the missing entries and never duplicates the ones that
+// succeeded.
+//
+// A store read error fails safe: the spec is kept so the entry is rewritten (a
+// duplicate is allowed under at-least-once, while skipping a required write
+// would lose the entry). A spec with no invocation ID (the malformed-message
+// placeholder) is always kept; it has no persistence marker to consult.
+func (c *Consumer) unpersistedDLQSpecs(ctx context.Context, msgID string, specs []dlqEntrySpec) []dlqEntrySpec {
+	out := make([]dlqEntrySpec, 0, len(specs))
+	for _, spec := range specs {
+		if spec.invocation == "" {
+			out = append(out, spec)
+			continue
+		}
+		persisted, err := c.invStateStore.exhaustedPersisted(ctx, c.stream, c.group, msgID, spec.invocation)
+		if err != nil {
+			c.log.Warn("Message: DLQ persistence check failed; rewriting entry",
+				"message_id", msgID, "invocation", spec.invocation, "error", err)
+			out = append(out, spec)
+			continue
+		}
+		if persisted {
+			c.log.Debug("Message: DLQ entry already persisted; skipping write",
+				"message_id", msgID, "invocation", spec.invocation)
+			continue
+		}
+		out = append(out, spec)
+	}
+	return out
+}
+
+// routeToDLQ writes one DLQ entry per exhausted invocation and only then acks
+// the original. The XADD-before-XACK ordering matters: if any DLQ write fails
+// the original stays pending so the next recovery cycle retries the remaining
+// writes rather than losing the message.
+//
+// Per-invocation entries: reason is the runner's terminal *HandlerExhaustedError
+// carrying the exact function/handler and exhausted attempt for every terminal
+// invocation, so a message matching several functions or handlers produces one
+// precisely-attributed entry each (see dlqEntrySpecs). A reason without that
+// typed metadata (a malformed message routed pre-handler) produces a single
+// placeholder entry with an explicit handler_attempts of 0, never one invented
+// from the delivery count.
+//
+// Idempotent retry without scanning the DLQ: each invocation's exhausted marker
+// records whether its entry has already been persisted ("exhausted:<n>:dlq").
+// On a redelivery after an XACK failure or a crash — or after a partial
+// multi-entry write — invocations whose entry already exists are skipped, so the
+// retry writes only the missing entries and can never duplicate (or lose) the
+// ones that succeeded.
 //
 // deliveryAttempts is the authoritative Redis Stream/PEL delivery count passed
-// through the consumer/reclaim flow (the DLQ `deliveries` field). The handler
-// attempt count is taken from reason when it is the runner's typed
-// *HandlerExhaustedError; otherwise (e.g. a malformed message routed
-// pre-handler) the DLQ entry carries an explicit handler_attempts of 0 rather
-// than inventing one from the delivery count.
+// through the consumer/reclaim flow (the DLQ `deliveries` field, diagnostic
+// only).
 func (c *Consumer) routeToDLQ(
 	ctx context.Context,
 	msg redis.XMessage,
 	reason error,
 	deliveries int64,
 ) {
-	handlerAttempts := handlerAttemptsFromError(reason)
-	entry := dlqPayload(
-		c.stream, msg.ID, c.group, c.consumer,
-		eventString(msg), reason.Error(), deliveries, handlerAttempts,
-	)
-	if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: c.dlqStream,
-		Values: entry,
-	}).Result(); err != nil {
-		c.log.Error("Message: DLQ write failed (leaving pending)",
-			"message_id", msg.ID,
-			"delivery_attempt", deliveries,
-			"reason", err,
-		)
-		c.noteOutcome(err, 0)
-		return
+	event := eventString(msg)
+	specs := c.unpersistedDLQSpecs(ctx, msg.ID, dlqEntrySpecs(reason))
+	if len(specs) == 0 {
+		// Every invocation's entry was already persisted (a redelivery after an
+		// XACK failure, or a fully-written DLQ whose ACK failed). There is
+		// nothing left to write; fall through to the ACK so the message leaves
+		// the PEL with exactly the entries already written, never duplicated.
+		c.log.Debug("Message: all DLQ entries already persisted; acking without rewrite",
+			"message_id", msg.ID)
 	}
-	c.metrics.Inc(metrics.MetricDLQEntries)
-	c.log.Error("Message: routed to DLQ",
-		"message_id", msg.ID,
-		"dlq_stream", c.dlqStream,
-		"delivery_attempt", deliveries,
-		"reason", reason,
-	)
+	for _, spec := range specs {
+		entry := dlqPayload(
+			c.stream, msg.ID, c.group, c.consumer,
+			event, spec.reason, spec.function, spec.handler, deliveries, spec.attempts,
+		)
+		if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
+			Stream: c.dlqStream,
+			Values: entry,
+		}).Result(); err != nil {
+			c.log.Error("Message: DLQ write failed (leaving pending)",
+				"message_id", msg.ID,
+				"delivery_attempt", deliveries,
+				"invocation", spec.invocation,
+				"error", err,
+			)
+			c.noteOutcome(err, 0)
+			return
+		}
+		c.metrics.Inc(metrics.MetricDLQEntries)
+		// Record per-invocation DLQ persistence ONLY after the XADD succeeded,
+		// so a failed write is retried on redelivery while a successful one is
+		// skipped. A mark failure is logged only: the entry is already written
+		// and the worst case is a duplicate on the next redelivery.
+		if spec.invocation != "" {
+			if err := c.invStateStore.markExhaustedDLQ(ctx, c.stream, c.group, msg.ID, spec.invocation, spec.attempts); err != nil {
+				c.log.Warn("Message: mark DLQ persisted failed",
+					"message_id", msg.ID, "invocation", spec.invocation, "error", err)
+			}
+		}
+		c.log.Error("Message: invocation routed to DLQ",
+			"message_id", msg.ID,
+			"dlq_stream", c.dlqStream,
+			"function", spec.function,
+			"handler", spec.handler,
+			"handler_attempts", spec.attempts,
+			"delivery_attempt", deliveries,
+			"reason", spec.reason,
+		)
+	}
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
 		c.log.Warn("Message: ack after DLQ failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
 	// The message is dead-lettered and the original acked: eagerly clear its
-	// invocation-state hash. Ordering matters — clear only after BOTH the DLQ
+	// invocation-state hash. Ordering matters — clear only after BOTH every DLQ
 	// write and the ACK succeed. If the ACK failed (handled above) the message
-	// stays in the PEL and may be redelivered, so its state must remain. A clear
-	// failure is logged only; the TTL is the fallback cleanup.
+	// stays in the PEL and may be redelivered, so its state (including the
+	// per-invocation DLQ-persisted markers) must remain. A clear failure is
+	// logged only; the TTL is the fallback cleanup.
 	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
 		c.log.Warn("Message: clear invocation state after DLQ failed", "message_id", msg.ID, "error", err)
 	}

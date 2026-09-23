@@ -975,15 +975,18 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// or waiting out a retry backoff) or its concurrency slot timed out — an
 	// unresolved invocation that must keep the message pending even when other
 	// invocations succeeded this call. firstErr holds the first plain retryable
-	// failure; exhaustedErr holds an exhaustion error so the aggregate can return
-	// ErrInvocationExhausted — either the typed error of an exhaustion this
-	// delivery, or one synthesized from a terminal-skip of an invocation already
-	// marked exhausted on a previous delivery (so a redelivery after a failed DLQ
-	// write re-routes instead of ACKing); anyExhausted records whether any matched
-	// invocation is exhausted (this delivery or a previous one). These are only
-	// meaningful when hasState is true.
+	// failure; exhaustedInvocations collects EVERY exhausted matched invocation —
+	// the typed metadata of one that exhausted this delivery, or one synthesized
+	// from a terminal-skip of an invocation already marked exhausted on a previous
+	// delivery (so a redelivery after a failed DLQ write re-routes instead of
+	// ACKing). The aggregate returns them all on a *stream.HandlerExhaustedError,
+	// so each exhausted function/handler gets its own DLQ entry with its own
+	// attempt count. anyExhausted records whether any matched invocation is
+	// exhausted (this delivery or a previous one). These are only meaningful when
+	// hasState is true.
 	skippedPending := false
-	var firstErr, exhaustedErr error
+	var firstErr error
+	var exhaustedInvocations []stream.ExhaustedInvocation
 	anyExhausted := false
 	// executed tracks whether any invocation actually executed, for the
 	// no-state (direct caller/test) path, which preserves the old fail-fast
@@ -1176,15 +1179,11 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						// acknowledged as complete.
 						if n > 0 {
 							anyExhausted = true
-							if exhaustedErr == nil {
-								exhaustedErr = &stream.HandlerExhaustedError{
-									HandlerAttempts: n,
-									Err: fmt.Errorf(
-										"function %q handler %q already exhausted after %d handler attempts",
-										pf.fn.Name, rule.Handler, n,
-									),
-								}
-							}
+							exhaustedInvocations = append(exhaustedInvocations, stream.ExhaustedInvocation{
+								Function: pf.fn.Name,
+								Handler:  rule.Handler,
+								Attempts: n,
+							})
 						}
 						r.log.Debug("Function handler: terminal for event; skipping",
 							"function", pf.fn.Name,
@@ -1356,8 +1355,15 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				}
 			case outcomeExhausted:
 				anyExhausted = true
-				if exhaustedErr == nil {
-					exhaustedErr = err
+				// recordFailure returns a *stream.HandlerExhaustedError carrying
+				// exactly one exhausted invocation; collect it so the aggregate
+				// reports every exhausted function/handler with its own attempt
+				// count. A non-typed error is ignored here (it cannot happen in
+				// production) and the terminal-skip metadata still drives the
+				// aggregate.
+				var typed *stream.HandlerExhaustedError
+				if errors.As(err, &typed) {
+					exhaustedInvocations = append(exhaustedInvocations, typed.Invocations...)
 				}
 			}
 		}
@@ -1374,13 +1380,12 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		// 2. Every matched invocation is terminal (complete or exhausted) AND at
 		//    least one exhausted → the message is terminal; route it to the DLQ.
 		//    allMatchedTerminal fails open to false on a read error, keeping the
-		//    message pending rather than DLQ'ing it. exhaustedErr is the runner's
-		//    *stream.HandlerExhaustedError, which carries the exhausted handler
-		//    attempt and already wraps stream.ErrInvocationExhausted, so it is
-		//    returned as-is (no re-wrap) to keep the handler attempt available to
-		//    the stream layer's DLQ attribution.
+		//    message pending rather than DLQ'ing it. The aggregate error carries
+		//    EVERY exhausted invocation's exact function/handler/attempt metadata
+		//    and wraps stream.ErrInvocationExhausted, so the stream layer writes
+		//    one correctly-attributed DLQ entry per exhausted invocation.
 		if anyExhausted && allMatchedTerminal(invState, matched) {
-			return exhaustedErr
+			return &stream.HandlerExhaustedError{Invocations: dedupeExhausted(exhaustedInvocations)}
 		}
 		// 3. Any matched invocation was protected- or slot-timeout-skipped
 		//    (unresolved) → the message stays pending with NO retry accounting.
@@ -1568,9 +1573,11 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 				"handler_attempt", handlerAttempt,
 			)
 			return &stream.HandlerExhaustedError{
-				HandlerAttempts: handlerAttempt,
-				Err: fmt.Errorf("%w: schedule function %q handler %q exhausted after %d handler attempts",
-					stream.ErrInvocationExhausted, fnName, handler, handlerAttempt),
+				Invocations: []stream.ExhaustedInvocation{{
+					Function: fnName,
+					Handler:  handler,
+					Attempts: handlerAttempt,
+				}},
 			}
 		}
 		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation, msgID)
@@ -1967,11 +1974,12 @@ func (r *Runner) recordFailure(
 			"handler_attempts_total", maxAttempts,
 		)
 		return outcomeExhausted, &stream.HandlerExhaustedError{
-			HandlerAttempts: handlerAttempt,
-			Err: fmt.Errorf(
-				"function %q handler %q exhausted after %d handler attempts: %w",
-				fnName, handler, handlerAttempt, origErr,
-			),
+			Invocations: []stream.ExhaustedInvocation{{
+				Function: fnName,
+				Handler:  handler,
+				Attempts: handlerAttempt,
+				Err:      origErr,
+			}},
 		}
 	}
 	// Retryable: schedule a retry backoff and count the retry.
@@ -1992,6 +2000,28 @@ func (r *Runner) recordFailure(
 		"function %q handler %q: handler attempt %d failed: %w",
 		fnName, handler, handlerAttempt, origErr,
 	)
+}
+
+// dedupeExhausted returns the exhausted invocations deduplicated by
+// "<function>/<handler>", preserving first-seen order. Two event rules in one
+// template may share a handler (a legal configuration), so the same invocation
+// can appear more than once in the aggregate; the DLQ contract is one entry per
+// exhausted invocation, so the duplicate metadata is collapsed here.
+func dedupeExhausted(invocations []stream.ExhaustedInvocation) []stream.ExhaustedInvocation {
+	if len(invocations) < 2 {
+		return invocations
+	}
+	seen := make(map[string]bool, len(invocations))
+	out := make([]stream.ExhaustedInvocation, 0, len(invocations))
+	for _, iv := range invocations {
+		inv := iv.Invocation()
+		if seen[inv] {
+			continue
+		}
+		seen[inv] = true
+		out = append(out, iv)
+	}
+	return out
 }
 
 // allMatchedTerminal reports whether every matched invocation is terminal

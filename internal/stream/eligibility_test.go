@@ -100,8 +100,20 @@ func (f *fakeInvocationStore) finishFailure(
 }
 
 func (f *fakeInvocationStore) markExhausted(_ context.Context, _, _, _, invocation string, attempts int) error {
-	f.fields[invocation] = exhaustedValue(attempts)
+	f.fields[invocation] = exhaustedValue(attempts, false)
 	return nil
+}
+
+func (f *fakeInvocationStore) markExhaustedDLQ(_ context.Context, _, _, _, invocation string, attempts int) error {
+	f.fields[invocation] = exhaustedValue(attempts, true)
+	return nil
+}
+
+func (f *fakeInvocationStore) exhaustedPersisted(_ context.Context, _, _, _, invocation string) (bool, error) {
+	if f.readErr != nil {
+		return false, f.readErr
+	}
+	return isExhaustedDLQValue(f.fields[invocation]), nil
 }
 
 // claimClassification models the Redis HSETNX claim: the first call sets the
@@ -154,7 +166,8 @@ func TestInvocationTryStartEligibilityMatrix(t *testing.T) {
 		wantWaitPos bool // true => wait must be > 0
 	}{
 		{"complete is terminal", "ok", false, 0, false},
-		{"exhausted is terminal", exhaustedValue(5), false, 5, false},
+		{"exhausted is terminal", exhaustedValue(5, false), false, 5, false},
+		{"exhausted+dlq is terminal", exhaustedValue(5, true), false, 5, false},
 		{"unparseable is eligible", "running:notanumber", true, 1, false},
 		{"absent is eligible", "", true, 1, false},
 	}

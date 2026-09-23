@@ -1905,33 +1905,42 @@ handler failure — stays in the PEL.
   `next_attempt_at` marker in the invocation state. Once `1 + retries` attempts
   are exhausted, the invocation is marked `exhausted` (terminal).
 - **Exhaustion → DLQ**: when every non-complete matched invocation is exhausted,
-  the whole message is written to the dead-letter stream `relay:<stream>:dlq` (a
-  Relay-owned `relay:`-prefixed key) and the
-  original is then acknowledged, removing it from the PEL. Per-invocation DLQ is
-  not claimed; exhaustion of the last runnable invocation routes the message.
-  The XACK is issued only after the DLQ write succeeds (and never before it);
-  a failed DLQ write leaves the message pending (see _DLQ write ordering_).
-  Because the exhausted invocation is terminal, a redelivery of a message whose
-  DLQ write or post-DLQ XACK failed skips re-execution and re-reports exhaustion,
-  so the message is re-routed to the DLQ rather than acknowledged without one.
+  the message is dead-lettered and the original is then acknowledged, removing it
+  from the PEL. A message is written to the dead-letter stream
+  `relay:<stream>:dlq` (a Relay-owned `relay:`-prefixed key) as **one entry per
+  exhausted invocation**: a message matching several functions or handlers that
+  all exhaust produces one precisely-attributed entry each. The XACK is issued
+  only after every required DLQ entry is persisted (and never before it); a failed
+  DLQ write leaves the message pending (see _DLQ write ordering_). Because each
+  exhausted invocation is terminal, a redelivery of a message whose DLQ write or
+  post-DLQ XACK failed skips re-execution and re-reports exhaustion, so the
+  message is re-routed to the DLQ rather than acknowledged without an entry.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
-  `deliveries`, `handler_attempts`, `timestamp` (RFC 3339). `handler_attempts` is
-  the handler execution attempt that exhausted the per-invocation retry state and
-  drove the DLQ decision — the real execution count. `deliveries` is the Redis
-  Stream/PEL delivery count (the retry counter read from `XPENDING`, passed
-  through the consumer/reclaim flow): it is **diagnostic only**, counts every
-  redelivery including redeliveries that skipped a protected invocation, and is
-  therefore `>= handler_attempts`. They are distinct on purpose: a reclaimed
-  message can be redelivered many times while the handler attempt advances only
-  on real executions. A DLQ path with no handler retry state (a malformed message
-  routed pre-handler) carries an explicit `handler_attempts` of `0`, never a
+  `function`, `handler`, `deliveries`, `handler_attempts`, `timestamp` (RFC 3339).
+  `function` and `handler` name the exact exhausted invocation the entry
+  attributes; `handler_attempts` is the handler execution attempt that exhausted
+  that invocation's per-invocation retry state and drove the DLQ decision — the
+  real execution count. `deliveries` is the Redis Stream/PEL delivery count (the
+  retry counter read from `XPENDING`, passed through the consumer/reclaim flow):
+  it is **diagnostic only**, counts every redelivery including redeliveries that
+  skipped a protected invocation, and is therefore `>= handler_attempts`. They are
+  distinct on purpose: a reclaimed message can be redelivered many times while the
+  handler attempt advances only on real executions. A DLQ path with no handler
+  retry state (a malformed message routed pre-handler) carries the `-` placeholder
+  for `function`/`handler` and an explicit `handler_attempts` of `0`, never a
   fabricated value derived from `deliveries`.
-- **DLQ write ordering**: the DLQ is written _before_ the original is
-  acknowledged. If the DLQ write fails, the original is left pending so the next
-  recovery cycle redelivers it; the exhausted invocation is skipped without
-  re-running and exhaustion is re-reported, so the message is re-routed to the
-  DLQ instead of being lost.
+- **DLQ write ordering and idempotent retry**: the DLQ is written _before_ the
+  original is acknowledged. If a DLQ write fails, the original is left pending so
+  the next recovery cycle redelivers it; the exhausted invocation is skipped
+  without re-running and exhaustion is re-reported, so the message is re-routed
+  instead of being lost. Once an invocation's entry is successfully written, its
+  invocation-state marker becomes `exhausted:<attempts>:dlq`; a redelivery skips
+  the already-persisted entries (without scanning the DLQ) and writes only the
+  missing ones, so retrying a partially-written multi-entry DLQ (after an XACK
+  failure, a crash, or a one-of-N write failure) neither duplicates nor loses
+  entries. The XACK and the invocation-state clear happen only after every
+  required entry is persisted.
 - **Non-retryable failures**: a message whose `event` field is missing, is not a
   string, or is not a JSON object can never succeed. It is routed straight to
   the DLQ on first encounter — without running any handler — and acknowledged.
@@ -1957,10 +1966,15 @@ field value describes the invocation's lifecycle for this message:
 - `next_attempt_at:<unix-nano deadline>#<attempts>` — a failed attempt is
   waiting out its retry backoff, protected until that absolute deadline.
 - `exhausted:<attempts>` — the invocation's attempts are exhausted; it is
-  terminal and never eligible again. A redelivery of an exhausted invocation
-  skips re-execution but still re-reports exhaustion, so a message whose DLQ
-  write or post-DLQ XACK failed is re-routed to the DLQ rather than being
-  acknowledged without an entry.
+  terminal and never eligible again, and its DLQ entry has not yet been
+  persisted. A redelivery of an exhausted invocation skips re-execution but
+  still re-reports exhaustion, so a message whose DLQ write or post-DLQ XACK
+  failed is re-routed to the DLQ rather than being acknowledged without an entry.
+- `exhausted:<attempts>:dlq` — the invocation's attempts are exhausted and its
+  DLQ entry has been persisted. It parses exactly like `exhausted:<attempts>`
+  (same terminal state and attempt count); the suffix only lets a redelivery
+  skip the already-written entry without scanning the DLQ stream, so retrying a
+  partially-written multi-entry DLQ is idempotent.
 - absent — eligible to execute.
 
 Before executing an invocation, the runner claims it via `TryStart`, which

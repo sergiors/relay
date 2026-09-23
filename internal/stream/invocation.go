@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -97,6 +98,18 @@ type invocationStateStore interface {
 		now time.Time,
 	) (time.Time, error)
 	markExhausted(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
+	// markExhaustedDLQ upgrades an exhausted invocation's marker to the
+	// terminal "exhausted:<attempts>:dlq" form, recording that this
+	// invocation's DLQ entry has been persisted. It is written only after a
+	// successful XADD so a redelivery (e.g. after an XACK failure) can skip the
+	// write idempotently instead of duplicating the entry.
+	markExhaustedDLQ(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
+	// exhaustedPersisted reports whether the invocation's marker already records
+	// a persisted DLQ entry ("exhausted:<attempts>:dlq"). It lets routeToDLQ
+	// skip an invocation whose entry was already written on a previous delivery,
+	// so a partial multi-entry write is completed without duplicating the
+	// entries that succeeded.
+	exhaustedPersisted(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	// claimClassification atomically claims the one-time event classification
 	// for this message (HSETNX on a reserved field). It returns true only for
@@ -125,11 +138,20 @@ const classificationField = "__classification"
 //	                                <attempts> is the 1-based attempt number
 //	"next_attempt_at:<dl>#<attempts>" → a failed attempt is waiting out its retry
 //	                                backoff, protected until <dl>
-//	"exhausted:<attempts>"         → attempts exhausted; terminal, never eligible
+//	"exhausted:<attempts>"         → attempts exhausted; terminal, never eligible,
+//	                                DLQ entry NOT yet persisted
+//	"exhausted:<attempts>:dlq"     → attempts exhausted AND this invocation's DLQ
+//	                                entry has been persisted; terminal, never
+//	                                eligible, and never re-written to the DLQ
 //	(absent)                      → eligible to execute
 //
 // "ok" stays bare because attempts are no longer needed after completion. Any
 // value that does not parse under this grammar is treated as eligible.
+//
+// The ":dlq" suffix records per-invocation DLQ persistence without scanning the
+// DLQ stream: routeToDLQ consults it (exhaustedPersisted) to skip an invocation
+// whose entry was already written, which makes retrying a partially-written
+// multi-entry DLQ (after an XACK failure or crash) idempotent.
 //
 // It is the stream layer's domain (Redis), but the runner decides which
 // invocations match, so the store is exposed to the runner through the
@@ -317,7 +339,12 @@ func (p *invocationStore) finishFailure(
 
 // markExhausted records that the invocation's attempts are exhausted, writing
 // the terminal "exhausted:<attempts>" marker so a redelivery skips it without
-// re-running. HSET + EXPIRE are pipelined.
+// re-running. HSET + EXPIRE are pipelined. It deliberately does NOT set the
+// ":dlq" suffix: the DLQ entry has not been persisted yet. If this write
+// overwrites a marker that already carried ":dlq" (e.g. a concurrent
+// redelivery raced a completed DLQ write), the suffix is lost and the entry is
+// re-written on redelivery; that is the at-least-once duplicate window, not a
+// correctness loss.
 func (p *invocationStore) markExhausted(
 	ctx context.Context,
 	stream,
@@ -326,12 +353,65 @@ func (p *invocationStore) markExhausted(
 	invocation string,
 	attempts int,
 ) error {
+	return p.writeExhausted(ctx, stream, group, msgID, invocation, attempts, false)
+}
+
+// markExhaustedDLQ upgrades the invocation's exhausted marker to
+// "exhausted:<attempts>:dlq", recording that its DLQ entry has been persisted.
+// HSET + EXPIRE are pipelined. It is called only AFTER a successful XADD, so a
+// later redelivery can skip the (already-written) entry without scanning the
+// DLQ stream.
+func (p *invocationStore) markExhaustedDLQ(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+	attempts int,
+) error {
+	return p.writeExhausted(ctx, stream, group, msgID, invocation, attempts, true)
+}
+
+// writeExhausted writes the terminal exhausted marker, optionally with the
+// ":dlq" persistence suffix, refreshing the TTL in the same pipeline.
+func (p *invocationStore) writeExhausted(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+	attempts int,
+	dlqPersisted bool,
+) error {
 	key := invocationStateKey(stream, group, msgID)
 	pipe := p.client.Pipeline()
-	pipe.HSet(ctx, key, invocation, exhaustedValue(attempts))
+	pipe.HSet(ctx, key, invocation, exhaustedValue(attempts, dlqPersisted))
 	pipe.Expire(ctx, key, invocationStateTTL)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// exhaustedPersisted reports whether the invocation's marker already records a
+// persisted DLQ entry ("exhausted:<attempts>:dlq"). redis.Nil (field absent)
+// and any other exhausted marker (without the suffix) return false, so the
+// entry is (re-)written. A read error returns (false, err); the caller fails
+// safe by treating the entry as not persisted (a duplicate is allowed under
+// at-least-once, while skipping a required write would lose the entry).
+func (p *invocationStore) exhaustedPersisted(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) (bool, error) {
+	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return isExhaustedDLQValue(v), nil
 }
 
 // clear deletes the message's invocation-state hash entirely. It is called
@@ -387,9 +467,29 @@ func nextAttemptValue(deadline time.Time, attempts int) string {
 	return "next_attempt_at:" + strconv.FormatInt(deadline.UnixNano(), 10) + "#" + strconv.Itoa(attempts)
 }
 
-// exhaustedValue encodes the terminal exhausted state as "exhausted:<attempts>".
-func exhaustedValue(attempts int) string {
-	return "exhausted:" + strconv.Itoa(attempts)
+// exhaustedValue encodes the terminal exhausted state. With dlqPersisted false
+// it is "exhausted:<attempts>"; with true it appends the ":dlq" suffix
+// ("exhausted:<attempts>:dlq") to record that the invocation's DLQ entry has
+// been persisted.
+func exhaustedValue(attempts int, dlqPersisted bool) string {
+	v := "exhausted:" + strconv.Itoa(attempts)
+	if dlqPersisted {
+		v += ":dlq"
+	}
+	return v
+}
+
+// isExhaustedDLQValue reports whether v is exactly the valid
+// "exhausted:<attempts>:dlq" marker (attempts >= 1), i.e. the invocation's DLQ
+// entry has been persisted. It is strict so a corrupt or near-miss marker can
+// never be mistaken for a persisted entry and cause a required DLQ write to be
+// skipped.
+func isExhaustedDLQValue(v string) bool {
+	if !strings.HasPrefix(v, "exhausted:") || !strings.HasSuffix(v, ":dlq") {
+		return false
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(v[len("exhausted:"):], ":dlq"))
+	return err == nil && n >= 1
 }
 
 // parseInvocationState decodes a field value into its kind, deadline (for
@@ -413,7 +513,11 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 		}
 		return kindNextAttempt, dl, n, true
 	case strings.HasPrefix(v, "exhausted:"):
-		n, err := strconv.Atoi(v[len("exhausted:"):])
+		// The attempts part is mandatory; an optional ":dlq" suffix records
+		// that the invocation's DLQ entry has been persisted. Both forms parse
+		// to kindExhausted with the same attempt count.
+		attemptsStr := strings.TrimSuffix(v[len("exhausted:"):], ":dlq")
+		n, err := strconv.Atoi(attemptsStr)
 		if err != nil || n < 1 {
 			return kindEligible, time.Time{}, 0, false
 		}
@@ -505,57 +609,102 @@ var ErrInvocationNotEligible = errors.New("invocation not eligible")
 // ErrInvocationExhausted is returned (wrapped) by the runner's Handle when a
 // failing invocation's attempts are exhausted AND every other matched invocation
 // is complete or also exhausted, so the message is terminal and must be routed
-// to the DLQ. The stream layer routes the whole message to the DLQ (per-invocation
-// DLQ is not claimed; exhaustion of the last non-complete invocation routes the
-// message).
+// to the DLQ. The stream layer routes the whole message to the DLQ; every
+// exhausted invocation gets its own DLQ entry (see HandlerExhaustedError).
 var ErrInvocationExhausted = errors.New("invocation exhausted")
 
-// HandlerExhaustedError is the runner's terminal exhaustion signal. It wraps
-// ErrInvocationExhausted (so errors.Is keeps matching) and carries the exhausted
-// handler attempt count read from the per-invocation retry state (TryStart /
-// recordFailure / MarkExhausted) that actually drove the exhaustion decision.
+// ExhaustedInvocation identifies one terminal exhausted invocation: the exact
+// function and handler, the handler attempt that exhausted (the 1+retries bound
+// reached, sourced from the invocation retry state, never the Redis delivery
+// count), and the underlying failure cause when it is known.
 //
-// The stream layer extracts HandlerAttempts when it dead-letters the message so
-// the DLQ entry's handler_attempts is attributed from the handler retry state,
-// never from the Redis delivery count. That distinction matters because a
-// message can be reclaimed (delivered) many times while the handler attempt
-// advances only on real executions, so deliveries >= handler_attempts.
-type HandlerExhaustedError struct {
-	// HandlerAttempts is the 1-based handler attempt that exhausted (the
-	// 1+retries bound reached), sourced from the invocation retry state. It is
-	// always >= 1 on this error; the stream falls back to an explicit 0 only for
-	// DLQ paths that are not handler exhaustion (e.g. malformed messages).
-	HandlerAttempts int
-	// Err is the underlying runner error describing the exhaustion and naming
-	// the same attempt count, keeping the DLQ `reason` consistent with
-	// `handler_attempts`.
+// It is the unit of per-invocation DLQ attribution: the stream writes one DLQ
+// entry per ExhaustedInvocation, so a message matching several functions or
+// handlers that all exhaust produces one entry each, with exact metadata.
+type ExhaustedInvocation struct {
+	// Function is the exact function name.
+	Function string
+	// Handler is the exact handler string ("module.function").
+	Handler string
+	// Attempts is the 1-based handler attempt that exhausted. It is always >= 1
+	// for a real exhausted invocation.
+	Attempts int
+	// Err is the underlying failure that exhausted this invocation, when known.
+	// It is nil on a terminal-skip redelivery, where the invocation was already
+	// marked exhausted by an earlier delivery and its original cause is no
+	// longer available.
 	Err error
 }
 
+// Invocation returns the "<function>/<handler>" invocation ID used by the
+// per-message invocation-state hash.
+func (e ExhaustedInvocation) Invocation() string {
+	return e.Function + "/" + e.Handler
+}
+
+// Reason returns the human-readable exhaustion reason for this invocation,
+// naming the exact function/handler and attempt count so the DLQ `reason`
+// field stays consistent with the entry's `handler_attempts` and metadata.
+func (e ExhaustedInvocation) Reason() string {
+	reason := fmt.Sprintf("function %q handler %q exhausted after %d handler attempts",
+		e.Function, e.Handler, e.Attempts)
+	if e.Err != nil {
+		reason += ": " + e.Err.Error()
+	}
+	return reason
+}
+
+// HandlerExhaustedError is the runner's terminal exhaustion signal. It wraps
+// ErrInvocationExhausted (so errors.Is keeps matching) and carries the full set
+// of exhausted invocations for the message, each with its exact function,
+// handler, and exhausted handler attempt. Handle aggregates EVERY exhausted
+// matched invocation (both those that exhausted on this delivery and those
+// already marked exhausted on a previous delivery), so a multi-function or
+// multi-handler message dead-letters each invocation individually with correct
+// metadata.
+//
+// The stream layer extracts Invocations when it dead-letters the message so each
+// DLQ entry's handler_attempts is attributed from the handler retry state, never
+// from the Redis delivery count. That distinction matters because a message can
+// be reclaimed (delivered) many times while a handler attempt advances only on
+// real executions, so deliveries >= handler_attempts.
+type HandlerExhaustedError struct {
+	// Invocations is the exhausted invocation set. It is non-empty on this
+	// error in production; an empty set degrades to the bare sentinel reason.
+	Invocations []ExhaustedInvocation
+}
+
 // Error reports the exhaustion reason in the stable, human-readable form the
-// DLQ `reason` field has always used: the ErrInvocationExhausted sentinel
-// followed by the underlying exhaustion message (e.g. `invocation exhausted:
-// function "fn" handler "h" exhausted after 5 handler attempts: ...`). The
-// wrapped Err already embeds the sentinel on the schedule path, so it is
-// returned verbatim there to avoid a duplicate `invocation exhausted:` prefix;
-// errors.Is still matches through Unwrap either way.
+// DLQ `reason` field uses: the ErrInvocationExhausted sentinel followed by the
+// per-invocation exhaustion message(s). A single invocation reads
+// `invocation exhausted: function "fn" handler "h" exhausted after 5 handler
+// attempts: ...`; multiple invocations are joined. The sentinel is emitted
+// exactly once.
 func (e *HandlerExhaustedError) Error() string {
-	if e.Err == nil {
+	switch len(e.Invocations) {
+	case 0:
 		return ErrInvocationExhausted.Error()
+	case 1:
+		return ErrInvocationExhausted.Error() + ": " + e.Invocations[0].Reason()
+	default:
+		parts := make([]string, 0, len(e.Invocations))
+		for _, iv := range e.Invocations {
+			parts = append(parts, iv.Reason())
+		}
+		return fmt.Sprintf("%s: %d invocations exhausted: %s",
+			ErrInvocationExhausted, len(e.Invocations), strings.Join(parts, "; "))
 	}
-	if errors.Is(e.Err, ErrInvocationExhausted) {
-		return e.Err.Error()
-	}
-	return ErrInvocationExhausted.Error() + ": " + e.Err.Error()
 }
 
 // Unwrap returns ErrInvocationExhausted (so errors.Is(err,
-// ErrInvocationExhausted) keeps matching) plus the underlying error, preserving
-// the full error chain for callers that inspect the wrapped cause.
+// ErrInvocationExhausted) keeps matching) plus each invocation's underlying
+// cause, preserving the full error chain for callers that inspect the causes.
 func (e *HandlerExhaustedError) Unwrap() []error {
 	errs := []error{ErrInvocationExhausted}
-	if e.Err != nil {
-		errs = append(errs, e.Err)
+	for _, iv := range e.Invocations {
+		if iv.Err != nil {
+			errs = append(errs, iv.Err)
+		}
 	}
 	return errs
 }

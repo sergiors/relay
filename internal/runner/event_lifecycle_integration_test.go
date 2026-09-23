@@ -161,18 +161,30 @@ func (e *eventEnv) pending(msgID string) (retry int64, ok bool) {
 }
 
 // dlqEntry returns the DLQ entry whose original_id is msgID, and whether it
-// exists.
+// exists. When a message produces several entries (one per exhausted
+// invocation) it returns the first; use dlqEntries to inspect them all.
 func (e *eventEnv) dlqEntry(msgID string) (redis.XMessage, bool) {
-	msgs, err := e.client.XRange(context.Background(), e.dlq, "-", "+").Result()
-	if err != nil {
+	entries := e.dlqEntries(msgID)
+	if len(entries) == 0 {
 		return redis.XMessage{}, false
 	}
+	return entries[0], true
+}
+
+// dlqEntries returns every DLQ entry whose original_id is msgID, in stream
+// order. Per-invocation DLQ means one message can produce several entries.
+func (e *eventEnv) dlqEntries(msgID string) []redis.XMessage {
+	msgs, err := e.client.XRange(context.Background(), e.dlq, "-", "+").Result()
+	if err != nil {
+		return nil
+	}
+	var out []redis.XMessage
 	for _, m := range msgs {
 		if id, _ := m.Values["original_id"].(string); id == msgID {
-			return m, true
+			out = append(out, m)
 		}
 	}
-	return redis.XMessage{}, false
+	return out
 }
 
 // invocationKey returns the invocation-state hash key for a message.
@@ -289,10 +301,19 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	if m.Values["original_stream"] != e.stream {
 		t.Errorf("original_stream = %v, want %v", m.Values["original_stream"], e.stream)
 	}
+	// The DLQ entry names the exact exhausted invocation (B), not the message or
+	// a sibling that succeeded.
+	if m.Values["function"] != "beta" || m.Values["handler"] != "index.run" {
+		t.Errorf("function/handler = %v/%v, want beta/index.run", m.Values["function"], m.Values["handler"])
+	}
 	// handler_attempts is the execution attempt that exhausted (2), attributed
 	// from the invocation retry state.
 	if m.Values["handler_attempts"] != "2" {
 		t.Errorf("handler_attempts = %v, want 2 (B's exhausting execution attempt)", m.Values["handler_attempts"])
+	}
+	// Exactly one entry: A succeeded and must never be dead-lettered.
+	if entries := e.dlqEntries(id); len(entries) != 1 {
+		t.Errorf("DLQ entries = %d, want 1 (only the exhausted B)", len(entries))
 	}
 	// deliveries is the diagnostic Redis/PEL count and is >= handler_attempts
 	// (protected reclaims count as deliveries without advancing the handler
@@ -306,6 +327,72 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	}
 	if m.Values["reason"] == "" {
 		t.Errorf("reason missing")
+	}
+}
+
+// TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries pins the
+// per-invocation DLQ contract end to end: one message matching a successful
+// handler A and TWO always-failing handlers B and C (retries:0, so each exhausts
+// on attempt 1) must produce exactly TWO DLQ entries — one per exhausted
+// invocation — each carrying its own exact function/handler and
+// handler_attempts, while the successful A is never dead-lettered.
+func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing.T) {
+	_ = redisAvailable(t)
+	aExec := &countingExecutor{}           // A: succeeds, must never be DLQ'd
+	bExec := &countingExecutor{fail: true} // B: exhausts attempt 1
+	cExec := &countingExecutor{fail: true} // C: exhausts attempt 1
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "alpha", 0, aExec),
+		fnWithRetries(t, "beta", 0, bExec),
+		fnWithRetries(t, "gamma", 0, cExec),
+	}, testutil.DiscardLogger(), nil)
+	e := newEventEnv(t)
+	id := e.xadd(`{"a":1}`)
+	e.start(r.Handle)
+
+	// The message is terminal on delivery 1: A completes, B and C each exhaust.
+	// The whole lifecycle (including the state clear) can finish in one delivery,
+	// so wait on the durable outcomes (the two DLQ entries and the ACK) rather
+	// than transient intermediate state.
+	e.eventually("two DLQ entries written", func() bool {
+		return len(e.dlqEntries(id)) == 2
+	})
+	e.eventually("message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("invocation-state key cleared after DLQ", func() bool {
+		return !e.hasStateKey(id)
+	})
+
+	// Each handler executed exactly once and was never re-run after exhaustion.
+	if aExec.count() != 1 || bExec.count() != 1 || cExec.count() != 1 {
+		t.Fatalf("executions alpha=%d beta=%d gamma=%d, want 1/1/1", aExec.count(), bExec.count(), cExec.count())
+	}
+
+	byInv := map[string]redis.XMessage{}
+	for _, m := range e.dlqEntries(id) {
+		fn, _ := m.Values["function"].(string)
+		h, _ := m.Values["handler"].(string)
+		byInv[fn+"/"+h] = m
+	}
+	if _, ok := byInv["alpha/index.run"]; ok {
+		t.Fatalf("successful alpha must never be dead-lettered: %v", byInv)
+	}
+	for _, inv := range []string{"beta/index.run", "gamma/index.run"} {
+		m, ok := byInv[inv]
+		if !ok {
+			t.Fatalf("missing DLQ entry for exhausted %s (got %v)", inv, byInv)
+		}
+		if m.Values["handler_attempts"] != "1" {
+			t.Errorf("%s handler_attempts = %v, want 1 (retries:0 exhausts on attempt 1)", inv, m.Values["handler_attempts"])
+		}
+		if m.Values["original_id"] != id {
+			t.Errorf("%s original_id = %v, want %s", inv, m.Values["original_id"], id)
+		}
+		if m.Values["reason"] == "" {
+			t.Errorf("%s reason missing", inv)
+		}
 	}
 }
 

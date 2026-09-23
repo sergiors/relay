@@ -775,8 +775,12 @@ func TestHandleExhaustedTerminalRedeliveryReRoutes(t *testing.T) {
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
 	}
-	if exhausted.HandlerAttempts != 1 {
-		t.Fatalf("HandlerAttempts = %d, want 1 (persisted exhausted attempt)", exhausted.HandlerAttempts)
+	if len(exhausted.Invocations) != 1 {
+		t.Fatalf("Invocations = %+v, want exactly one exhausted invocation", exhausted.Invocations)
+	}
+	got := exhausted.Invocations[0]
+	if got.Function != "beta" || got.Handler != "index.run" || got.Attempts != 1 {
+		t.Fatalf("exhausted invocation = %+v, want beta/index.run attempt 1 (persisted exhausted attempt)", got)
 	}
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0 (terminal skip must not re-run)", exec.count())
@@ -865,8 +869,11 @@ func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
 	}
-	if exhausted.HandlerAttempts != 5 {
-		t.Fatalf("HandlerAttempts = %d, want 5 (1+retries)", exhausted.HandlerAttempts)
+	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 5 {
+		t.Fatalf("Invocations = %+v, want one with attempts 5 (1+retries)", exhausted.Invocations)
+	}
+	if exhausted.Invocations[0].Function != "user-events" || exhausted.Invocations[0].Handler != "index.run" {
+		t.Fatalf("exhausted invocation = %+v, want user-events/index.run", exhausted.Invocations[0])
 	}
 	if !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("err = %v, want it to wrap stream.ErrInvocationExhausted", err)
@@ -875,6 +882,86 @@ func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
 	// consistent with `handler_attempts`.
 	if !strings.Contains(err.Error(), "exhausted after 5 handler attempts") {
 		t.Fatalf("reason = %q, want it to report 5 handler attempts", err.Error())
+	}
+}
+
+// TestHandleMultipleExhaustionsCarryPerInvocationMetadata pins the aggregate
+// exhaustion metadata: when a message matches several functions/handlers that
+// ALL exhaust in the same delivery, the terminal error carries every exhausted
+// invocation with its exact function, handler, and attempt count. The stream
+// layer turns this into one correctly-attributed DLQ entry per invocation.
+func TestHandleMultipleExhaustionsCarryPerInvocationMetadata(t *testing.T) {
+	alpha := &countingExecutor{fail: true}
+	beta := &countingExecutor{fail: true}
+	gamma := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "alpha", 0, alpha),
+		fnWithRetries(t, "beta", 2, beta),
+		fnWithRetries(t, "gamma", 0, gamma),
+	}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// alpha and gamma (retries:0) exhaust on attempt 1 immediately. beta
+	// (retries:2) is retryable on its first failure, so it does not exhaust yet:
+	// the message must stay pending (plain retryable error) despite alpha/gamma
+	// being exhausted.
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("delivery 1 error = %v, want a plain retryable error (beta still retryable)", err)
+	}
+	// Advance past beta's first backoff (attempt 1 → 1m) and fail again: attempt
+	// 2 is still retryable.
+	prog.advance(retryBackoff(1))
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("delivery 2 error = %v, want a plain retryable error (beta attempt 2)", err)
+	}
+	// Advance past beta's second backoff (attempt 2 → 2m): attempt 3 exhausts.
+	prog.advance(retryBackoff(2))
+	err = r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	want := map[string]int{
+		"alpha/index.run": 1, // retries:0 → attempt 1
+		"beta/index.run":  3, // retries:2 → attempt 3
+		"gamma/index.run": 1, // retries:0 → attempt 1
+	}
+	got := map[string]int{}
+	for _, iv := range exhausted.Invocations {
+		got[iv.Function+"/"+iv.Handler] = iv.Attempts
+	}
+	if len(got) != len(want) {
+		t.Fatalf("exhausted invocations = %+v, want %+v", got, want)
+	}
+	for inv, attempts := range want {
+		if got[inv] != attempts {
+			t.Errorf("exhausted %s attempts = %d, want %d", inv, got[inv], attempts)
+		}
+	}
+	// Every handler exhausted exactly once and never re-ran after exhaustion.
+	if alpha.count() != 1 || beta.count() != 3 || gamma.count() != 1 {
+		t.Fatalf("executions alpha=%d beta=%d gamma=%d, want 1/3/1", alpha.count(), beta.count(), gamma.count())
+	}
+}
+
+// TestDedupeExhaustedCollapsesSameInvocation pins that two rules sharing the
+// same handler (a legal template) collapse to a single exhausted invocation, so
+// the DLQ contract stays one entry per invocation.
+func TestDedupeExhaustedCollapsesSameInvocation(t *testing.T) {
+	in := []stream.ExhaustedInvocation{
+		{Function: "fn", Handler: "notify", Attempts: 3},
+		{Function: "fn", Handler: "notify", Attempts: 3},
+		{Function: "fn", Handler: "other", Attempts: 1},
+	}
+	out := dedupeExhausted(in)
+	if len(out) != 2 {
+		t.Fatalf("dedupeExhausted = %+v, want 2 distinct invocations", out)
+	}
+	if out[0].Handler != "notify" || out[1].Handler != "other" {
+		t.Fatalf("dedupeExhausted order = %+v, want [notify, other] (first-seen)", out)
 	}
 }
 
@@ -891,7 +978,7 @@ func TestHandleRetriesZeroExhaustionCarriesAttemptOne(t *testing.T) {
 	if !errors.As(err, &exhausted) {
 		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
 	}
-	if exhausted.HandlerAttempts != 1 {
-		t.Fatalf("HandlerAttempts = %d, want 1 (retries:0)", exhausted.HandlerAttempts)
+	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 1 {
+		t.Fatalf("Invocations = %+v, want one with attempts 1 (retries:0)", exhausted.Invocations)
 	}
 }

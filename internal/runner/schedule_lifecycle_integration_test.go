@@ -469,16 +469,18 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	}
 	// The DLQ entry attributes the exhaustion from the handler retry state:
 	// retries:0 exhausts on handler attempt 1, and this is the first delivery, so
-	// both fields are 1 and the legacy `attempts` alias is absent.
+	// handler_attempts and deliveries are both 1.
 	m := e.dlqGet()[id]
 	if m.Values["handler_attempts"] != "1" {
 		t.Errorf("handler_attempts = %v, want 1 (from the invocation retry state)", m.Values["handler_attempts"])
 	}
+	// The schedule entry names the exact function/handler that exhausted.
+	if m.Values["function"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
+		t.Errorf("function/handler = %v/%v, want %s/%s",
+			m.Values["function"], m.Values["handler"], scheduleFnName, scheduleHandler)
+	}
 	if m.Values["deliveries"] != "1" {
 		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
-	}
-	if _, legacy := m.Values["attempts"]; legacy {
-		t.Errorf("DLQ entry must not carry the legacy attempts alias: %v", m.Values)
 	}
 }
 

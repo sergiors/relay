@@ -18,12 +18,23 @@
 //   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
 //     before the original is acknowledged. Exhaustion is per-invocation: when
 //     every non-complete matched invocation is exhausted, the whole message is
-//     routed to the DLQ (see ErrInvocationExhausted).
+//     routed to the DLQ and one entry is written PER exhausted invocation (see
+//     ErrInvocationExhausted and HandlerExhaustedError), each carrying its exact
+//     function/handler and handler attempt count. A malformed message that never
+//     reached a handler produces a single entry with the "-" placeholder and an
+//     explicit handler_attempts of 0.
+//   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
+//     successfully XADD'd its marker becomes "exhausted:<attempts>:dlq"; a
+//     redelivery (after an XACK failure, a crash, or a partially-written
+//     multi-entry DLQ) skips the already-persisted entries and writes only the
+//     missing ones. The original is ACKed only after all required entries are
+//     persisted, so a write failure leaves the message pending.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<function>/<handler>" →
 //     "ok" when complete, "running:<deadline>#<attempts>" while an attempt is
 //     protected, "next_attempt_at:<deadline>#<attempts>" while a failed attempt
-//     waits out its retry backoff, or "exhausted:<attempts>" when terminal;
+//     waits out its retry backoff, "exhausted:<attempts>" when terminal, or
+//     "exhausted:<attempts>:dlq" when terminal AND its DLQ entry is persisted;
 //     TTL'd; stream/group names are percent-encoded in the key) so a
 //     redelivered message skips handlers that already completed, are still
 //     within an active attempt deadline or retry backoff, or are exhausted; the

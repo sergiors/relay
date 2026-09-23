@@ -114,6 +114,19 @@ func TestParseInvocationStateValueGrammar(t *testing.T) {
 		t.Fatalf("exhausted:5 = kind %v n %d ok %v", kind, n, ok)
 	}
 
+	// exhausted with the persisted-DLQ suffix parses identically (same kind and
+	// attempt count); the suffix records only DLQ persistence, not a distinct
+	// lifecycle state.
+	if kind, _, n, ok := parseInvocationState("exhausted:5:dlq"); !ok || kind != kindExhausted || n != 5 {
+		t.Fatalf("exhausted:5:dlq = kind %v n %d ok %v", kind, n, ok)
+	}
+	if !isExhaustedDLQValue("exhausted:5:dlq") {
+		t.Fatalf("isExhaustedDLQValue(exhausted:5:dlq) = false, want true")
+	}
+	if isExhaustedDLQValue("exhausted:5") {
+		t.Fatalf("isExhaustedDLQValue(exhausted:5) = true, want false")
+	}
+
 	// Unparseable values → eligible (ok=false). A deadline marker without the
 	// mandatory "#<attempts>" part also does not parse.
 	for _, v := range []string{
@@ -145,8 +158,11 @@ func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
 	if v := nextAttemptValue(dl, 2); v != "next_attempt_at:1757000000000000000#2" {
 		t.Fatalf("nextAttemptValue = %q", v)
 	}
-	if v := exhaustedValue(5); v != "exhausted:5" {
-		t.Fatalf("exhaustedValue = %q", v)
+	if v := exhaustedValue(5, false); v != "exhausted:5" {
+		t.Fatalf("exhaustedValue(5, false) = %q, want exhausted:5", v)
+	}
+	if v := exhaustedValue(5, true); v != "exhausted:5:dlq" {
+		t.Fatalf("exhaustedValue(5, true) = %q, want exhausted:5:dlq", v)
 	}
 }
 
