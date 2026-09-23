@@ -52,13 +52,17 @@ import (
 // (a hard crash loses at most one interval of telemetry).
 const statsFlushInterval = 5 * time.Second
 
-// startupTimeout bounds every bounded startup daemon operation: the orphan
-// container sweep, each single per-function service converge, and the
-// reconciler's UpdateServices/RemoveServices hooks. Each call gets its own
-// fresh bound so one slow Docker call cannot consume the budget of the calls
-// that follow. The 5s shutdown bounds are a separate, deliberately shorter
-// bound (see Run's shutdown tail), not this constant.
-const startupTimeout = 30 * time.Second
+// reconcileTimeout bounds every bounded service-reconcile daemon operation:
+// the startup orphan container sweep, each single per-function service converge,
+// the startup image keep-set list, and the reconciler's
+// UpdateServices/RemoveServices hooks (which run on live reconciles, not only at
+// startup). Each call gets its own fresh bound so one slow Docker call cannot
+// consume the budget of the calls that follow. It deliberately does NOT bound
+// Dockerfile builds: a build is bounded by runtime.buildTimeout (10m) on a
+// context rooted in the worker lifecycle, so a slow image build can never be cut
+// off by this short reconcile budget. The 5s shutdown bounds are a separate,
+// deliberately shorter bound (see Run's shutdown tail), not this constant.
+const reconcileTimeout = 30 * time.Second
 
 // shutdownServiceTimeout bounds the service-container cleanup during graceful
 // shutdown: stopping and removing this worker's persistent service containers
@@ -99,9 +103,20 @@ func Run(logger *slog.Logger) {
 	client := redis.NewClient(redisOpts)
 	defer client.Close()
 
+	// The worker's lifecycle context: cancelled on SIGINT/SIGTERM (or by the
+	// deferred stop when Run returns). It is created here, before the runtime
+	// Manager, so the manager can root Dockerfile builds in it (see
+	// runtime.WithLifecycleContext): a long build is bounded by the runtime's
+	// 10m buildTimeout but is still cancelled when Relay shuts down. Every
+	// bounded startup daemon operation and the reconciler hooks are likewise
+	// rooted here (rather than context.Background), so shutdown cancels them
+	// too. It replaces the signal context that used to be created later.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Metrics are opt-in, gated on METRICS_ADDR. Setup only CREATES the registry
 	// and /metrics server here (nil, nil when disabled); STARTING them happens
-	// later, once the signal ctx exists.
+	// later, once the startup wiring is complete.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
 
 	// A single shared secrets provider, used by both the webhook (below) and the
@@ -183,6 +198,11 @@ func Run(logger *slog.Logger) {
 		// MAX_CONCURRENCY=8) warms, reports, and admits only the cap's worth. It
 		// is startup configuration; a global change requires a worker restart.
 		runtime.WithMaxConcurrency(cfg.MaxConcurrency),
+		// Root Dockerfile builds in the worker lifecycle: they get an
+		// independent 10m bound (runtime.buildTimeout) but are still cancelled
+		// when Relay shuts down. Builds must NOT inherit the short 30s
+		// reconcile budget the worker uses for normal service operations.
+		runtime.WithLifecycleContext(ctx),
 	)
 	if err != nil {
 		// Fatal: the runtime manager owns container execution, which the worker
@@ -232,7 +252,7 @@ func Run(logger *slog.Logger) {
 	// hostname-scoped, so other workers' and non-Relay containers are untouched.
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
-	sweepCtx, sweepCancel := context.WithTimeout(context.Background(), startupTimeout)
+	sweepCtx, sweepCancel := context.WithTimeout(ctx, reconcileTimeout)
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
@@ -243,25 +263,25 @@ func Run(logger *slog.Logger) {
 
 	// Build every function's image. A function whose image cannot be built is
 	// marked unavailable so the runner skips it; the rest continue.
-	prepared := prepareFunctions(manager, functions, st, logger)
+	prepared := prepareFunctions(ctx, manager, functions, st, logger)
 
 	// Converge persistent service containers AFTER every image is built (so the
 	// desired image is present) and BEFORE the startup image sweep (so the sweep's
 	// keep-set can include images live containers reference).
-	reconcileStartupServices(prepared, functions, svcCtrl, logger)
+	reconcileStartupServices(ctx, prepared, functions, svcCtrl, logger)
 
 	// Conservative startup image sweep: remove Relay-owned images no live function
 	// or container references. Kept images include live functions' fingerprints,
 	// running service containers' images, and state-recorded images (the crash
 	// guard for a mid-swap restart).
-	sweepStartupImages(manager, functions, st, logger)
+	sweepStartupImages(ctx, manager, functions, st, logger)
 
 	// Lifecycle-driven dependency GC at startup. The image sweep may leave
 	// superseded images; dependency cleanup then prunes dependency images no
 	// managed function image references anymore. Runs OUTSIDE the st gate (labels,
 	// no state keep-set). Best-effort and single-shot — errors are left for the
 	// next natural lifecycle point.
-	cleanupStartupDependencies(manager, logger)
+	cleanupStartupDependencies(ctx, manager, logger)
 
 	// The runner executes invocations. It is constructed before the stream
 	// consumer so its InvokeHandler can be wired as the consumer's ScheduleRunner
@@ -305,9 +325,6 @@ func Run(logger *slog.Logger) {
 		// template and stamps the message's real Redis stream ID.
 		ScheduleRunner: runWorker.InvokeHandler,
 	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Start the metrics components created earlier. The snapshot logger runs in
 	// its own goroutine (exits on ctx); the server binds synchronously — a bind
@@ -432,7 +449,7 @@ func Run(logger *slog.Logger) {
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
 			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
-				uCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+				uCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 				defer cancel()
 				var preparedEnv []string
 				if cur := runWorker.Registry().GetByName(name); cur != nil && cur.Prepared() != nil {
@@ -444,7 +461,7 @@ func Run(logger *slog.Logger) {
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
 			// running service containers reference those images.
 			RemoveServices: func(name string) {
-				rCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+				rCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 				defer cancel()
 				svcCtrl.Remove(rCtx, name)
 			},
@@ -561,10 +578,10 @@ func shutdownServices(svcCtrl *reconciler.ServiceReconciler, hostname string, lo
 
 // setupMetrics constructs the optional metrics components: a registry and the
 // /metrics HTTP server, both nil when METRICS_ADDR is unset. It only CREATES
-// them; STARTING happens later in Run once the signal ctx exists (the server
-// binds synchronously, well after ctx setup). The nil-safety contract that
-// makes this gating safe: every consumer of the registry is nil-safe, AND the
-// stats flush is gated alongside it — a nil registry must never feed
+// them; STARTING happens later in Run once the startup wiring is complete (the
+// server binds synchronously, well after ctx setup). The nil-safety contract
+// that makes this gating safe: every consumer of the registry is nil-safe, AND
+// the stats flush is gated alongside it — a nil registry must never feed
 // snapshotStats, or the 5s flush loop would clobber the persisted cumulative
 // totals with zeros.
 func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *metrics.Server) {
@@ -581,7 +598,14 @@ func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *m
 // it) rather than failing startup; the rest carry their fresh image. A
 // fingerprint that changed between load and build is recomputed so the state DB
 // records the final value.
+//
+// ctx is the worker lifecycle context. It is passed to Prepare so a build (and
+// the fast reuse probes) is cancelled on shutdown; Prepare itself roots the
+// Dockerfile build in the manager lifecycle with its own 10m buildTimeout, so
+// this context's lack of a short deadline is intentional and the build is never
+// bounded by the 30s reconcileTimeout.
 func prepareFunctions(
+	ctx context.Context,
 	manager *runtime.Manager,
 	functions []function.Function,
 	st *state.State,
@@ -590,7 +614,7 @@ func prepareFunctions(
 	preparedCount := 0
 	prepared := make([]*runner.PreparedFunction, 0, len(functions))
 	for _, fn := range functions {
-		p, err := manager.Prepare(context.Background(), fn)
+		p, err := manager.Prepare(ctx, fn)
 		if err != nil {
 			logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
 			if st != nil {
@@ -636,6 +660,7 @@ func prepareFunctions(
 // its template no longer declares services, lingering containers are stale by
 // definition and are removed now.
 func reconcileStartupServices(
+	lifecycle context.Context,
 	prepared []*runner.PreparedFunction,
 	functions []function.Function,
 	svcCtrl *reconciler.ServiceReconciler,
@@ -647,7 +672,7 @@ func reconcileStartupServices(
 		if p == nil {
 			// Unavailable function: no image this boot.
 			if len(fn.Template.Services) == 0 {
-				ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+				ctx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
 				svcCtrl.Remove(ctx, fn.Name)
 				cancel()
 			} else {
@@ -655,7 +680,7 @@ func reconcileStartupServices(
 			}
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+		ctx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
 		svcCtrl.Apply(ctx, fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
 		cancel()
 	}
@@ -676,7 +701,7 @@ func reconcileStartupServices(
 	for _, fn := range functions {
 		liveNames[fn.Name] = true
 	}
-	svcCtrl.SweepOrphans(context.Background(), liveNames)
+	svcCtrl.SweepOrphans(lifecycle, liveNames)
 }
 
 // sweepStartupImages removes Relay-owned images that no longer correspond to a
@@ -693,6 +718,7 @@ func reconcileStartupServices(
 // self-evidently-current prepared images are kept. Conservative: nothing that
 // might still serve is ever removed.
 func sweepStartupImages(
+	lifecycle context.Context,
 	manager *runtime.Manager,
 	functions []function.Function,
 	st *state.State,
@@ -704,7 +730,7 @@ func sweepStartupImages(
 	// label, and the sweep must not remove an image a running container depends
 	// on. Removal is deferred to the owning function's reconcile, which replaces
 	// the container first and only then retires the image.
-	svcCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+	svcCtx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
 	svcContainers, err := manager.ServiceContainerList(svcCtx)
 	cancel()
 	var serviceImages []string
@@ -730,7 +756,7 @@ func sweepStartupImages(
 
 	keep := startupImageKeepSet(functions, serviceImages, recordedImages)
 	if st != nil {
-		if _, err := manager.RemoveImagesExcept(context.Background(), keep); err != nil {
+		if _, err := manager.RemoveImagesExcept(lifecycle, keep); err != nil {
 			logger.Warn("Image cleanup: startup sweep failed", "error", err)
 		}
 	}
@@ -770,8 +796,12 @@ func startupImageKeepSet(functions []function.Function, serviceImages, recordedI
 // state keep-set — ownership is derived from the managed-image labels the builds
 // just stamped. Best-effort and single-shot: an error is logged and left for the
 // next natural lifecycle point; it never retries in a loop.
-func cleanupStartupDependencies(manager *runtime.Manager, logger *slog.Logger) {
-	if _, err := manager.CleanupUnusedDependencies(context.Background()); err != nil {
+func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Manager, logger *slog.Logger) {
+	// Rooted in the lifecycle (not context.Background) so shutdown cancels a
+	// long dependency GC. It is deliberately unbounded by reconcileTimeout: like
+	// the builds it follows, it is lifecycle-bounded rather than
+	// reconcile-bounded, and it is a single best-effort pass.
+	if _, err := manager.CleanupUnusedDependencies(lifecycle); err != nil {
 		logger.Warn("Dependency image cleanup failed", "error", err)
 	}
 }

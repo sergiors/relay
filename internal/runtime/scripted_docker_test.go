@@ -34,6 +34,16 @@ type dockerRoute struct {
 	// body already read. It lets a test inspect the JSON a client call sends
 	// (e.g. a container create's Config.Env) through the real client path.
 	onBody func(body []byte)
+	// onRequest, when set, runs once when the route matches with the *http.Request
+	// in hand. It lets a test observe the request's context (in particular the
+	// deadline/cancellation of a Docker API call) through the real client path,
+	// without a real daemon.
+	onRequest func(req *http.Request)
+	// fail, when set, is evaluated after onRequest and, if it returns a non-nil
+	// error, is returned by RoundTrip instead of a response. It lets a test
+	// simulate a transport-level failure (e.g. a request whose context was
+	// cancelled) through the real client call path.
+	fail func(req *http.Request) error
 }
 
 func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -46,6 +56,14 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		if rt.onMatch != nil {
 			rt.onMatch()
+		}
+		if rt.onRequest != nil {
+			rt.onRequest(r)
+		}
+		if rt.fail != nil {
+			if err := rt.fail(r); err != nil {
+				return nil, err
+			}
 		}
 		if rt.onBody != nil {
 			// The client has already serialized the request; read it here (the

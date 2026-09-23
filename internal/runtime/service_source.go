@@ -110,7 +110,15 @@ func (m *Manager) resolveBuildServiceImage(
 	}
 
 	start := m.clock()
-	if err := m.buildServiceImage(ctx, fnName, svc, sel, ref); err != nil {
+	// The build runs on an independent, lifecycle-rooted buildTimeout context,
+	// NOT on the caller's ctx: ResolveServiceImage is reached from the service
+	// reconciler, whose ctx is a short reconcile budget, and a slow Dockerfile
+	// build must not be cut off by it (while still being cancelled at Relay
+	// shutdown via the manager lifecycle). The imageExists probe above keeps the
+	// caller's ctx: it is quick and must honor its cancellation.
+	buildCtx, buildCancel := m.buildContext()
+	defer buildCancel()
+	if err := m.buildServiceImage(buildCtx, fnName, svc, sel, ref); err != nil {
 		return ServiceImage{}, err
 	}
 	m.log.Info("Service: build image built",

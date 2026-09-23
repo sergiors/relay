@@ -8,6 +8,12 @@
 //     a declared dependency layer (plan.Deps) is built once as a content-
 //     addressed, shared `relay-dep-*` base image that the function image builds
 //     FROM, so unchanged dependency manifests are reused across source changes
+//   - Build bounds: a Dockerfile build (function, dependency, or service build
+//     source) runs on an independent buildTimeout (10m) rooted in the manager
+//     lifecycle, NOT in the caller's context. The reconciler reaches Prepare
+//     through a short (30s) service-reconcile budget, which must never cut off a
+//     legitimate image build; the lifecycle root keeps builds cancellable on
+//     Relay shutdown.
 //   - Execute: a leased container from the function's warm pool (bounded by the
 //     function's resolved concurrency), event JSON on stdin, stdout/stderr
 //     forwarded verbatim to the process output sink as a raw transport (not

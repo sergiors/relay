@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
@@ -21,6 +22,32 @@ import (
 	"relay/internal/runtime/plan"
 	"relay/internal/source"
 )
+
+// buildTimeout bounds a single Dockerfile build: the ImageBuild request and
+// draining its response stream. It is deliberately far longer than the worker's
+// reconcileTimeout (30s): an install step can legitimately take minutes, while a
+// normal service converge must stay short. Builds are NOT children of the
+// caller's reconcile context — Manager.buildContext roots them in the manager
+// lifecycle instead, so a slow build is bounded here AND still cancelled when
+// Relay shuts down.
+const buildTimeout = 10 * time.Minute
+
+// buildContext returns the bounded context for one Dockerfile build: an
+// independent buildTimeout rooted at the manager's lifecycle context. Rooting at
+// the manager lifecycle (cancelled by Close) rather than the caller's reconcile
+// context is deliberate — a build must not be cut off by a much shorter
+// reconcile budget (the worker's 30s reconcileTimeout reaches the service-build
+// path through Config.UpdateServices), yet it must still be cancelled by Relay
+// worker/reconciler shutdown. A Manager constructed directly by tests leaves
+// lifecycle nil; context.Background keeps builds bounded without leaking a
+// caller's short deadline into them.
+func (m *Manager) buildContext() (context.Context, context.CancelFunc) {
+	parent := m.lifecycle
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, buildTimeout)
+}
 
 // renderDockerfile is the ONLY Dockerfile renderer, shared by every engine; an
 // engine must express its concerns as plan data rather than generate a

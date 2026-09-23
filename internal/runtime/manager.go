@@ -94,6 +94,16 @@ type Manager struct {
 	maxConcurrency int
 	// containers caches the per-function reusable execution containers.
 	containers *containerCache
+	// lifecycle is the manager's lifecycle context: Dockerfile builds are
+	// rooted here (see buildContext), so a long build is bounded by buildTimeout
+	// but still cancelled when Relay shuts down, without ever inheriting a
+	// caller's short reconcile budget. It is derived at construction from
+	// WithLifecycleContext (the worker's signal ctx); lifecycleCancel is owned
+	// by Close so a build in flight during Close is cancelled too. A Manager
+	// constructed directly by tests may leave both nil, in which case
+	// buildContext roots builds at context.Background.
+	lifecycle       context.Context
+	lifecycleCancel context.CancelFunc
 	// now is the injectable clock seam. It defaults to time.Now and is used by
 	// the external-image pull throttle (see service_source.go). It is a Manager
 	// field, never a package global, so a test can advance time deterministically
@@ -136,6 +146,9 @@ type managerOptions struct {
 	// now is the injectable clock seam for deterministic tests. Nil means the
 	// wall clock.
 	now func() time.Time
+	// lifecycle roots the manager's lifecycle context (see WithLifecycleContext).
+	// Nil means the manager starts its own Close-cancelled root.
+	lifecycle context.Context
 }
 
 // WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
@@ -156,6 +169,17 @@ func WithWarmContainerIdleTimeout(d time.Duration) ManagerOption {
 // config; a direct NewManager caller that omits it gets DefaultMaxConcurrency.
 func WithMaxConcurrency(n int) ManagerOption {
 	return func(o *managerOptions) { o.maxConcurrency = n }
+}
+
+// WithLifecycleContext roots the manager's build lifecycle at lifecycle (the
+// worker's signal context). Dockerfile builds are bounded by buildTimeout but
+// are ALSO cancelled when this context is cancelled, so Relay shutdown stops an
+// in-flight build. The manager derives a child of lifecycle, so Close cancels
+// builds as well. Omitting the option (or passing nil) roots the lifecycle at
+// context.Background, so a direct caller still gets Close-cancellable builds
+// without wiring a signal context.
+func WithLifecycleContext(lifecycle context.Context) ManagerOption {
+	return func(o *managerOptions) { o.lifecycle = lifecycle }
 }
 
 // withClock injects a deterministic clock for tests. It is unexported because
@@ -207,6 +231,17 @@ func NewManager(
 	if mgr.now == nil {
 		mgr.now = time.Now
 	}
+	// The build lifecycle: a manager-owned child of the caller's lifecycle (the
+	// worker passes its signal ctx via WithLifecycleContext) or of
+	// context.Background when none was supplied. Owning a child means Close
+	// always cancels in-flight Dockerfile builds, while a cancelled parent (Relay
+	// shutdown) propagates too. Builds are bounded by buildTimeout on top of
+	// this; they are never rooted in a caller's short reconcile context.
+	parent := resolved.lifecycle
+	if parent == nil {
+		parent = context.Background()
+	}
+	mgr.lifecycle, mgr.lifecycleCancel = context.WithCancel(parent)
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
@@ -300,6 +335,14 @@ func (m *Manager) maintenanceLoop(interval time.Duration) {
 // a concurrent eviction can never race the shutdown discard.
 func (m *Manager) Close() error {
 	m.closeOnce.Do(func() {
+		// Cancel the manager-owned build lifecycle first: an in-flight
+		// Dockerfile build rooted here is cancelled promptly rather than running
+		// until buildTimeout. The lifecycle is a manager-owned child of any
+		// caller-supplied parent, so this is correct both for a worker build
+		// (whose signal ctx is the parent) and for a direct caller.
+		if m.lifecycleCancel != nil {
+			m.lifecycleCancel()
+		}
 		if m.done != nil {
 			close(m.done)
 			if m.maintDone != nil {
@@ -506,7 +549,15 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	}
 
 	start := time.Now()
-	if err := buildImage(ctx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash), sel); err != nil {
+	// The build runs on an independent, lifecycle-rooted buildTimeout context,
+	// NOT on the caller's ctx: Prepare is a seam for the reconciler, whose ctx
+	// may be a short service-reconcile budget, and a slow image build must not
+	// be cut off by it (while still being cancelled at Relay shutdown via the
+	// manager lifecycle). The reuse probes above deliberately keep using the
+	// caller's ctx — they are quick and must honor its cancellation.
+	buildCtx, buildCancel := m.buildContext()
+	defer buildCancel()
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash), sel); err != nil {
 		d := time.Since(start)
 		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
@@ -665,7 +716,14 @@ func (m *Manager) ensureDependencyImage(
 	}
 
 	start := time.Now()
-	if err := buildDependencyImage(ctx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
+	// As in Prepare's function-image build, the dependency build uses an
+	// independent lifecycle-rooted buildTimeout context rather than the caller's
+	// ctx, so a slow install step is never cut off by a short reconcile budget
+	// while still being cancelled at Relay shutdown. The imageExists probe above
+	// keeps the caller's ctx.
+	buildCtx, buildCancel := m.buildContext()
+	defer buildCancel()
+	if err := buildDependencyImage(buildCtx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
 		d := time.Since(start)
 		// Dependency-image build failures count as function build failures so the
 		// existing failure metric/label surface stays the single observability
