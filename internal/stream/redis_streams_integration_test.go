@@ -1383,10 +1383,12 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 }
 
 // TestIntegrationExhaustedSkipsWithoutRerun verifies that an exhausted marker is
-// terminal: a redelivery skips the invocation (never re-runs it) and, because
-// nothing executed and the invocation is terminal (not protected), Handle would
-// return nil — but here the handler simulates the runner by returning nil for a
-// terminal skip, so the message is acked.
+// terminal at the stream layer: a redelivery skips the invocation (never re-runs
+// it, as TryStart reports started=false). The handler here is a stand-in that
+// returns nil for the terminal skip, so the message is acked; the real runner's
+// message-level aggregate instead re-reports exhaustion on such a redelivery
+// (see the runner package's event-path integration tests), which is what
+// re-routes a message whose DLQ write previously failed.
 func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})

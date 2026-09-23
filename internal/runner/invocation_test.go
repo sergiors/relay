@@ -750,6 +750,96 @@ func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
 	}
 }
 
+// TestHandleExhaustedTerminalRedeliveryReRoutes pins the redelivery contract
+// after an invocation is already terminal (exhausted) but the original message
+// is still pending — the window created when the DLQ write or the post-DLQ XACK
+// failed, or the worker crashed between MarkExhausted and the DLQ write. The
+// redelivery must NOT return nil (which would make the stream XACK a message
+// with no DLQ entry, losing it): it must re-report exhaustion so the stream
+// re-routes to the DLQ and carries the persisted handler attempt count.
+func TestHandleExhaustedTerminalRedeliveryReRoutes(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	// Simulate the state left behind after a prior delivery marked the
+	// invocation exhausted (retries:0 → attempt 1) but the message stayed in the
+	// PEL because the DLQ write failed.
+	prog.exhausted["beta/index.run"] = 1
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle = %v, want ErrInvocationExhausted (redelivery must re-DLQ, not ACK)", err)
+	}
+	var exhausted *stream.HandlerExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("err = %v (%T), want *stream.HandlerExhaustedError", err, err)
+	}
+	if exhausted.HandlerAttempts != 1 {
+		t.Fatalf("HandlerAttempts = %d, want 1 (persisted exhausted attempt)", exhausted.HandlerAttempts)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (terminal skip must not re-run)", exec.count())
+	}
+}
+
+// TestHandleExhaustedAndCompleteRedeliveryReRoutes pins the aggregate on a
+// redelivery after BOTH invocations are already terminal (A complete, B
+// exhausted). It must return ErrInvocationExhausted (not nil) so the stream
+// re-routes the still-pending message to the DLQ, and A must not be re-run.
+func TestHandleExhaustedAndCompleteRedeliveryReRoutes(t *testing.T) {
+	alpha := &countingExecutor{} // already complete from a prior delivery
+	beta := &countingExecutor{}  // already exhausted from a prior delivery
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "alpha", 0, alpha),
+		fnWithRetries(t, "beta", 0, beta),
+	}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	prog.done["alpha/index.run"] = true
+	prog.exhausted["beta/index.run"] = 1
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle = %v, want ErrInvocationExhausted (all terminal, one exhausted)", err)
+	}
+	if alpha.count() != 0 || beta.count() != 0 {
+		t.Fatalf("executor calls: alpha=%d beta=%d, want 0/0 (both terminal)", alpha.count(), beta.count())
+	}
+}
+
+// TestHandleExhaustedRedeliveryWithProtectedSiblingStaysPending pins the
+// cross-replica safety on the terminal-exhausted redelivery: when one matched
+// invocation is exhausted but another is protected (running or waiting out a
+// retry backoff), the message is unresolved and must stay pending
+// (ErrInvocationNotEligible) — it must NOT be DLQ'd and must NOT be ACKed.
+func TestHandleExhaustedRedeliveryWithProtectedSiblingStaysPending(t *testing.T) {
+	beta := &countingExecutor{} // already exhausted from a prior delivery
+	gamma := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		fnWithRetries(t, "beta", 0, beta),
+		fnWithRetries(t, "gamma", 0, gamma),
+	}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	now := time.Now()
+	prog.setClock(func() time.Time { return now })
+	prog.exhausted["beta/index.run"] = 1
+	// gamma waits out a future retry backoff → protected, unresolved.
+	prog.nextAt["gamma/index.run"] = now.Add(time.Hour)
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle = %v, want ErrInvocationNotEligible (gamma unresolved)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle = %v, must NOT be ErrInvocationExhausted (gamma unresolved)", err)
+	}
+	if beta.count() != 0 || gamma.count() != 0 {
+		t.Fatalf("executor calls: beta=%d gamma=%d, want 0/0", beta.count(), gamma.count())
+	}
+}
+
 // TestHandleExhaustionCarriesHandlerAttempts pins that the terminal exhaustion
 // error returned by Handle is a *stream.HandlerExhaustedError carrying the
 // exhausted handler attempt read from the invocation retry state (not the

@@ -160,10 +160,12 @@ func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 	// A later redelivery of the now-terminal invocation takes the skip path:
 	// none of the four timestamps may move again (the DLQ was already
 	// attributed at the original exhausting attempt). Only function_events
-	// keeps counting the match.
+	// keeps counting the match. The redelivery still re-reports exhaustion so
+	// the stream re-routes a message whose DLQ write or post-DLQ XACK failed
+	// (it must not ACK a message with no DLQ entry).
 	prog.advance(retryBackoff(2))
-	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err != nil {
-		t.Fatalf("terminal skip: got %v, want nil (all matched terminal → stream would ACK)", err)
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("terminal skip error = %v, want ErrInvocationExhausted (redelivery must re-route to the DLQ)", err)
 	}
 	after := execStats(m, "alpha")
 	if after.LastExecution != s.LastExecution || after.LastSuccess != s.LastSuccess ||

@@ -22,8 +22,8 @@ on the stream with a consumer group, decodes each message, and for every event:
 
 1. evaluates every function's rules (declarative patterns in `template.yaml`),
 2. executes each matching handler **sequentially** in an isolated container,
-3. acknowledges the message (XACK) only after **all** matching invocations
-   succeed.
+3. acknowledges the message (XACK) only after every matching invocation is
+   terminal — it either succeeded or was exhausted and routed to the DLQ.
 
 Cron schedules (`schedules` in `template.yaml`) ride the same stream: every
 worker evaluates the cron locally, but the due occurrence is published to the
@@ -1221,9 +1221,11 @@ inferred from the stream.
   `1 + retries` attempts are exhausted, at which point the message is routed to
   the DLQ (see _Recovery and retries_ below).
 - **Failure**: any non-zero container exit is a failure; errors include the
-  function and handler names. **Abort on first failure**: a failed invocation
-  stops the remaining rules for that event and returns the message to the
-  pending entries list (no XACK). See _Acknowledgment semantics_ below.
+  function and handler names. **Every matching handler still runs**: a failure
+  in one invocation does not stop the remaining rules for that event. The
+  message is not acknowledged and returns to the pending entries list until
+  every matching invocation succeeds or is exhausted to the DLQ. See
+  _Acknowledgment semantics_ below.
 
 For example, `examples/functions/user-events-python/` declares three handlers
 (`events.created.handler`, `events.updated.handler`,
@@ -1845,18 +1847,25 @@ reset, stats accumulate normally again.
 
 ## Acknowledgment semantics
 
-A message is acknowledged (XACK) only after **all** matching invocations
-succeed:
+A message is acknowledged (XACK) only after **all** matching invocations reach a
+terminal state: every handler either succeeds, or is routed to the DLQ because
+its retries were exhausted (and no other matched invocation is still
+unresolved):
 
 ```
 event → handler A ✓ → handler B ✓ → ... → XACK
+
+event → handler A ✓ → handler B ✗ (retries exhausted) → DLQ write → XACK
 ```
 
-If any invocation fails (or times out), the message is **not** acknowledged and
-remains pending for redelivery (at-least-once semantics):
+If any invocation fails in a way that will be retried, the message is **not**
+acknowledged and remains pending for redelivery (at-least-once semantics). A
+failure in one handler does **not** stop the other matching handlers from
+running on the same delivery; each matching invocation gets its own independent
+attempt and they are aggregated afterwards:
 
 ```
-event → handler A ✗ → STOP → no XACK (message stays pending)
+event → handler A ✗ (will retry) → handler B ✓ → no XACK (message stays pending)
 ```
 
 An event that matches no rules is a success and is acknowledged. Because
@@ -1882,7 +1891,9 @@ handler failure — stays in the PEL.
 - **Retry counting**: the per-message delivery count is read from Redis
   (`XPENDING` full form / retry counter), not kept in process memory, so the
   count survives restarts. Each reclaim of an idle message increments the count.
-  Retry timing is defined per-invocation, not by the reclaim cadence: a failed
+  This delivery count is **diagnostic only**: it does not drive retry or
+  exhaustion decisions and it is not the handler attempt count. Retry timing and
+  exhaustion are defined per-invocation (see below). A failed
   attempt records a `next_attempt_at` deadline in the invocation state, and a
   redelivery before that deadline is skipped. Actual retry timing is quantized
   by the reclaim cadence (~1m granularity), so a 1m backoff effectively fires at
@@ -1898,22 +1909,29 @@ handler failure — stays in the PEL.
   Relay-owned `relay:`-prefixed key) and the
   original is then acknowledged, removing it from the PEL. Per-invocation DLQ is
   not claimed; exhaustion of the last runnable invocation routes the message.
+  The XACK is issued only after the DLQ write succeeds (and never before it);
+  a failed DLQ write leaves the message pending (see _DLQ write ordering_).
+  Because the exhausted invocation is terminal, a redelivery of a message whose
+  DLQ write or post-DLQ XACK failed skips re-execution and re-reports exhaustion,
+  so the message is re-routed to the DLQ rather than acknowledged without one.
 - **DLQ entry format** (flat fields): `original_stream`, `original_id`,
   `group`, `consumer`, `event` (the original payload string), `reason`,
-  `deliveries`, `handler_attempts`, `timestamp` (RFC 3339). `deliveries` is the
-  authoritative Redis Stream/PEL delivery count (the retry counter read from
-  `XPENDING`, passed through the consumer/reclaim flow), so it counts every
-  redelivery — including redeliveries that skipped a protected invocation — and
-  is therefore `>= handler_attempts`. `handler_attempts` is the handler
-  execution attempt that exhausted the per-invocation retry state and drove the
-  DLQ decision. They are distinct on purpose: a reclaimed message can be
-  redelivered many times while the handler attempt advances only on real
-  executions. A DLQ path with no handler retry state (a malformed message routed
-  pre-handler) carries an explicit `handler_attempts` of `0`, never a fabricated
-  value derived from `deliveries`.
+  `deliveries`, `handler_attempts`, `timestamp` (RFC 3339). `handler_attempts` is
+  the handler execution attempt that exhausted the per-invocation retry state and
+  drove the DLQ decision — the real execution count. `deliveries` is the Redis
+  Stream/PEL delivery count (the retry counter read from `XPENDING`, passed
+  through the consumer/reclaim flow): it is **diagnostic only**, counts every
+  redelivery including redeliveries that skipped a protected invocation, and is
+  therefore `>= handler_attempts`. They are distinct on purpose: a reclaimed
+  message can be redelivered many times while the handler attempt advances only
+  on real executions. A DLQ path with no handler retry state (a malformed message
+  routed pre-handler) carries an explicit `handler_attempts` of `0`, never a
+  fabricated value derived from `deliveries`.
 - **DLQ write ordering**: the DLQ is written _before_ the original is
   acknowledged. If the DLQ write fails, the original is left pending so the next
-  recovery cycle retries the DLQ write instead of losing the message.
+  recovery cycle redelivers it; the exhausted invocation is skipped without
+  re-running and exhaustion is re-reported, so the message is re-routed to the
+  DLQ instead of being lost.
 - **Non-retryable failures**: a message whose `event` field is missing, is not a
   string, or is not a JSON object can never succeed. It is routed straight to
   the DLQ on first encounter — without running any handler — and acknowledged.
@@ -1939,8 +1957,10 @@ field value describes the invocation's lifecycle for this message:
 - `next_attempt_at:<unix-nano deadline>#<attempts>` — a failed attempt is
   waiting out its retry backoff, protected until that absolute deadline.
 - `exhausted:<attempts>` — the invocation's attempts are exhausted; it is
-  terminal and never eligible again (skipped like complete, but distinct so the
-  runner can tell a message whose invocations are all terminal).
+  terminal and never eligible again. A redelivery of an exhausted invocation
+  skips re-execution but still re-reports exhaustion, so a message whose DLQ
+  write or post-DLQ XACK failed is re-routed to the DLQ rather than being
+  acknowledged without an entry.
 - absent — eligible to execute.
 
 Before executing an invocation, the runner claims it via `TryStart`, which
@@ -1956,9 +1976,11 @@ or it is waiting out its backoff. A crashed worker's marker self-expires at its
 deadline, so recovery waits it out (bounded by at most one timeout) instead of
 racing a live attempt. Bookkeeping failures fail open: a Redis error on the read
 or write never blocks delivery, preserving at-least-once. The message is
-acknowledged once all matching invocations are complete, and the invocation-state
-key is cleared on completion or DLQ routing. The keys expire after 7 days as a
-fallback cleanup for abandoned messages.
+acknowledged once every matching invocation is complete, or once all are
+terminal and at least one exhausted (the message is successfully routed to the
+DLQ); the invocation-state key is cleared after a successful XACK on success or
+DLQ routing. The keys expire after 7 days as a fallback cleanup for abandoned
+messages.
 
 This is still at-least-once, not exactly-once: there is a crash window between a
 handler's side effect and its state being recorded, so a handler can still run

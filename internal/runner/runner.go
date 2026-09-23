@@ -934,7 +934,11 @@ func (r *Runner) runInvocation(
 //   - a wrapped stream.ErrInvocationExhausted when every invocation in the
 //     matched set is terminal (complete or exhausted), at least one of them is
 //     exhausted, and no retryable failure occurred this delivery. The whole
-//     message is terminal, so the stream layer routes it to the DLQ.
+//     message is terminal, so the stream layer routes it to the DLQ. This also
+//     fires on a redelivery where the exhausting invocation was already marked
+//     exhausted by an earlier delivery: the message may still be pending because
+//     its DLQ write (or the post-DLQ XACK) failed, so it must be re-routed
+//     rather than returned nil and ACKed without a DLQ entry.
 //   - a wrapped stream.ErrInvocationNotEligible when no retryable failure
 //     occurred and the message is not all-terminal, but at least one matched
 //     invocation was skipped because it is protected (running or waiting out a
@@ -971,10 +975,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// or waiting out a retry backoff) or its concurrency slot timed out — an
 	// unresolved invocation that must keep the message pending even when other
 	// invocations succeeded this call. firstErr holds the first plain retryable
-	// failure; exhaustedErr holds the plain error of an exhaustion this delivery so
-	// the aggregate can wrap ErrInvocationExhausted; anyExhausted records whether
-	// any matched invocation exhausted this delivery. These are only meaningful
-	// when hasState is true.
+	// failure; exhaustedErr holds an exhaustion error so the aggregate can return
+	// ErrInvocationExhausted — either the typed error of an exhaustion this
+	// delivery, or one synthesized from a terminal-skip of an invocation already
+	// marked exhausted on a previous delivery (so a redelivery after a failed DLQ
+	// write re-routes instead of ACKing); anyExhausted records whether any matched
+	// invocation is exhausted (this delivery or a previous one). These are only
+	// meaningful when hasState is true.
 	skippedPending := false
 	var firstErr, exhaustedErr error
 	anyExhausted := false
@@ -1163,11 +1170,22 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							)
 							return outcomePendingSkip, nil
 						}
-						// Terminal (complete or exhausted): skipped like complete,
-						// never eligible again. An exhausted skip (n > 0) is
-						// indistinguishable here from the already-complete case,
-						// which is fine: exhaustion accounting is per-invocation and
-						// the message-level DLQ decision happens in the aggregate.
+						// Terminal (complete or exhausted): never execute again. An exhausted
+						// invocation must still drive the message-level DLQ decision, so a redelivery
+						// after a failed DLQ write or XACK routes to the DLQ again instead of being
+						// acknowledged as complete.
+						if n > 0 {
+							anyExhausted = true
+							if exhaustedErr == nil {
+								exhaustedErr = &stream.HandlerExhaustedError{
+									HandlerAttempts: n,
+									Err: fmt.Errorf(
+										"function %q handler %q already exhausted after %d handler attempts",
+										pf.fn.Name, rule.Handler, n,
+									),
+								}
+							}
+						}
 						r.log.Debug("Function handler: terminal for event; skipping",
 							"function", pf.fn.Name,
 							"handler", rule.Handler,
