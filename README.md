@@ -527,10 +527,13 @@ services:
     replicas: 2
 ```
 
-- `runtime` (required) selects the execution runtime. Only `python3.14` and
-  `node24` are supported; any other value fails validation. On `node24` a
-  handler may be JavaScript **or** TypeScript (see _TypeScript handlers_); the
-  `handler` syntax is identical for both.
+- `runtime` selects the execution runtime. Only `python3.14` and `node24` are
+  supported; any other value fails validation. It is **required** whenever Relay
+  must launch work through a runtime: any `events`/`schedules` entry, or any
+  service using an `entrypoint` source. A services-only template whose services
+  all use `build` or `image` sources needs no `runtime`. On `node24` a handler
+  may be JavaScript **or** TypeScript (see _TypeScript handlers_); the `handler`
+  syntax is identical for both.
 - `events` is a list of rules. Each rule has a required `handler` (of the form
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
 - `schedules` (optional) is a list of cron-triggered handlers; each entry
@@ -579,10 +582,13 @@ hour day-of-month month day-of-week`. The exact expression is shown by
   file (see _TypeScript handlers_); the handler string never carries an
   extension.
 - `services` (optional) is a list of persistent long-running HTTP services (see
-  _Services_ below). Each entry has a required `entrypoint` (an application
-  entrypoint **file**, not the `module.function` form) plus optional `port`
-  (default `80`, `1`–`65535`) and `replicas` (default `1`, positive integer).
-  The template example above shows a service alongside events and schedules.
+  _Services_ below). Each entry declares **exactly one source** — `entrypoint`
+  (an application entrypoint **file**, not the `module.function` form), `build`
+  (a Dockerfile path relative to the function directory), or `image` (an
+  external image reference) — plus optional `port` (default `80`, `1`–`65535`)
+  and `replicas` (default `1`, positive integer). The configured source is the
+  service identity. The template example above shows a service alongside events
+  and schedules.
 
 ### Schedules
 
@@ -802,18 +808,29 @@ containers**: unlike `events` and `schedules`, a service is not an invocation
 container that exits after one request. It is a long-lived process — an HTTP
 server, for example — that Relay keeps running and reconciling continuously.
 
+Each service declares **exactly one source**, and the configured source
+descriptor is the service's **identity** (it keys containers, routing, and the
+persisted service rows — there is no synthetic entrypoint):
+
 ```yaml
 runtime: node24
 
 services:
-  - entrypoint: service.js
+  - entrypoint: service.js   # runtime-managed application entrypoint file
     port: 3000
     replicas: 2
+
+  - build: Dockerfile        # a user-supplied Dockerfile (relative to the fn dir)
+    port: 8080
+
+  - image: ghcr.io/acme/api:1.2   # an external image reference
+    port: 9090
+    replicas: 3
 ```
 
-- `entrypoint` (required) is the application entrypoint **file** the runtime
-  starts as the long-lived process (`service.js` on the Node runtime, or a
-  nested file such as `app/main.py` for Python). It is
+- `entrypoint` is the application entrypoint **file** the runtime starts as the
+  long-lived process (`service.js` on the Node runtime, or a nested file such as
+  `app/main.py` for Python). It is
   not the `module.function` event-handler form, and it is not invoked
   per-request: HTTP requests are handled directly by the user's application
   inside the container. It must be a relative path inside the application
@@ -823,6 +840,32 @@ services:
   directory), while Python executes it **as a module** (`python -m <module>` —
   e.g. `app/main.py` runs as `python -m app.main`) so package-relative imports
   work.
+  An `entrypoint` service needs a `runtime:` (Relay launches it with a
+  runtime-specific command).
+- `build` is a **Dockerfile path relative to the function directory** (e.g.
+  `Dockerfile` or `docker/Dockerfile.prod`). Relay builds an image from the
+  function's **selected source** (the same `.gitignore`-driven selection that
+  fingerprints a function — ignored files never enter the image) using the
+  **Docker Engine API**, not the Docker CLI. The image is content-addressed by a
+  fingerprint that folds the Dockerfile identity into the function's source
+  fingerprint, so a `build` service rebuilds when any selected file (the
+  Dockerfile included) changes and reuses the existing local image otherwise. A
+  build-service image lives in the function's own `relay-fn-<name>` repository,
+  so the existing image-retirement machinery covers it. The image's own
+  `ENTRYPOINT`/`CMD` are **preserved** — Relay does not override them. The path
+  must be relative (no absolute paths, no `..`, no whitespace).
+- `image` is an **external image reference** (e.g. `nginx:1.27`,
+  `ghcr.io/acme/api@sha256:…`). Relay inspects the local image and pulls from its
+  registry when the image is missing locally or the hourly freshness window has
+  elapsed (see _External image freshness_); the image's own `ENTRYPOINT`/`CMD`
+  are preserved. **Relay never removes external images** — cleanup only ever
+  touches Relay's own `relay-fn-*`/`relay-dep-*` namespaces.
+  A `build` or `image` service does **not** need a `runtime:`.
+- A template whose only services use `build`/`image` sources needs **no
+  `runtime:` at all**. A **mixed** template (events or schedules, or any
+  `entrypoint` service) still requires it, because those run through a runtime.
+  An explicitly configured runtime is always validated, so a typo in an
+  otherwise build/image-only template is still a parse error.
 - `port` (optional) is the internal TCP port the service application listens
   on. It defaults to `80` and must be between `1` and `65535`. Relay injects it
   as the `PORT` environment variable (it cannot be overridden by template env
@@ -854,13 +897,22 @@ does not exist` — Relay never creates the network. Changing `host` (or the
 
 ### Lifecycle
 
-The service lifecycle reuses the function image machinery with no separate
-build system: the function image is prepared exactly as for invocations, and a
-service container runs the **same image** with its entrypoint overridden to
-the service entrypoint (e.g. `node /app/service.js`; Python overrides to
-`python -m app.main`). This keeps every version of a
-function in one image repository, so the existing image-retirement machinery
-covers services too.
+All three source kinds share **one cohesive service reconciler and lifecycle** —
+there are no separate reconcilers, pollers, or caches per source. The only
+difference is how the desired image is resolved before convergence:
+
+- an `entrypoint` service runs the function image prepared exactly as for
+  invocations, with its entrypoint overridden per container to the service
+  entrypoint (e.g. `node /app/service.js`; Python overrides to
+  `python -m app.main`);
+- a `build` service runs a content-addressed image Relay builds from the user's
+  Dockerfile over the selected source;
+- an `image` service runs the external reference (inspected locally and pulled
+  when due).
+
+An `entrypoint` service keeps every version of a function in the function's own
+image repository, so the existing image-retirement machinery covers it; a
+`build` service image lives there too. External images are never Relay-cleaned.
 
 At startup and on every reconcile of the owning function, Relay lists its
 service containers and converges them to the template:
@@ -869,9 +921,16 @@ service containers and converges them to the template:
 desired replicas (template)  vs  actual Relay-owned service containers
 ```
 
-- Containers whose image or port no longer match the current version are
-  **replaced** (stop + remove, then start fresh replicas). Containers whose
-  image and port are unchanged are **preserved** — no unnecessary restarts.
+The desired image is resolved **before any container action**: if a source
+cannot be resolved (a failed build or pull, a missing local image, an
+unlaunchable entrypoint, an unresolved secret), the pass reports the failure and
+**preserves the service's existing healthy containers** rather than tearing them
+down. A transient registry outage therefore never degrades a working service.
+
+- Containers whose image (or, for an external tag, image **content**), port, or
+  routing labels no longer match the current version are **replaced** (stop +
+  remove, then start fresh replicas). Containers whose image and port are
+  unchanged are **preserved** — no unnecessary restarts.
 - Scaling up starts the missing replica slots; scaling down stops and removes
   exactly the excess containers (the lowest-numbered replicas are kept).
 - A replica whose process **exits** (a crash) is detected by the same
@@ -895,26 +954,46 @@ finally deferred to a later natural cleanup pass (the next boot sweep, next
 rebuild, or function removal). Image removal is never forced.
 
 Containers are identified by deterministic Relay-owned labels
-(`relay.type=service`, `relay.function`, `relay.entrypoint`, plus the image,
-port, and replica slot), never by name alone. Service containers carry no
-`relay.handler` label (that key identifies event/schedule handlers) — the
-entrypoint IS the service. On graceful shutdown, Relay stops and removes the
-service containers owned by that worker (scoped by `relay.hostname`, so other
-workers' containers are untouched); stale containers left behind by a crashed
-Relay process are swept at the next startup (per-function reconcile plus the
-startup orphan sweep).
+(`relay.type=service`, `relay.function`, `relay.identity`, plus the image, the
+image content id, port, and replica slot), never by name alone.
+`relay.identity` is the configured source descriptor (entrypoint file, Dockerfile
+path, or image reference) — an honest identity for every source kind, never a
+synthetic entrypoint. Service containers carry no
+`relay.handler` label (that key identifies event/schedule handlers) — the source
+IS the service. Generated container names (`relay-svc-<function>-<identity>…`)
+are for human greppability only: like the routing ids, they end in a 64-bit hash
+of the full identity so distinct identities that sanitize or truncate to the
+same readable prefix still never share a name. On graceful shutdown, Relay stops
+and removes the service containers owned by that worker (scoped by
+`relay.hostname`, so other workers' containers are untouched); stale containers
+left behind by a crashed Relay process are swept at the next startup
+(per-function reconcile plus the startup orphan sweep).
 
 The environment each replica gets: the runtime's plan environment (e.g.
-`PYTHONDONTWRITEBYTECODE=1` for Python), then the template's `env` values,
-then resolved `secrets` values, then `PORT`. Containers run under the same
-hardening as invocation containers: non-root user, dropped capabilities,
-memory/CPU/pids limits, read-only rootfs, and a bounded `/tmp`.
+`PYTHONDONTWRITEBYTECODE=1` for Python; empty for build/image sources), then the
+template's `env` values, then resolved `secrets` values, then `PORT`. Containers
+run under the same hardening as invocation containers: non-root user, dropped
+capabilities, memory/CPU/pids limits, read-only rootfs, and a bounded `/tmp`.
 
-`relay function inspect` shows the effective values (defaults included):
+**External image freshness.** For an `image` service, Relay checks its registry
+**at most once per hour per independent service** (per function + identity). A
+*successful* remote check is recorded in memory; while the window is open no
+further remote check runs, and a running container is preserved. The window is
+**not persisted** (a worker restart checks again), and changing the configured
+source (a new identity) is checked **immediately**. A **failed** check does not
+advance the window, so it is retried at the next reconcile — a transient
+registry outage recovers promptly and never advances the clock. This is an
+in-memory, per-worker policy: there is no separate poller, cache table, or
+persisted timestamp.
+
+`relay function inspect` shows the effective values (defaults included). A
+`build` or `image` source is rendered with its kind prefix:
 
 ```
 Services:
-  app/service.js   port=3000 replicas=2
+  app/service.js                    port=3000 replicas=2
+  build:docker/Dockerfile.prod      port=8080 replicas=1
+  image:ghcr.io/acme/api:1.2        port=9090 replicas=3
 ```
 
 Out of scope for this first version: host port publishing, autoscaling, and
@@ -966,20 +1045,27 @@ traefik.http.routers.<id>.middlewares                       = <middleware>
 traefik.http.middlewares.<middleware>.stripprefix.prefixes  = /v2
 ```
 
-`<middleware>` is the deterministic `<id>-path` (Traefik-safe, capped at 100
-characters). It is distinct from `<id>`, so adding a path never overwrites the
-router/service slices, and it is per-service (the id already encodes function +
-entrypoint), so two services on the same host with different paths get distinct
-router and middleware names. An empty/omitted path adds **nothing** — the label
-set is byte-for-byte the host-only one.
+`<middleware>` is the deterministic `<id base>-path-<hash>` (Traefik-safe, capped
+at 100 characters; see `<id>` below). It is distinct from `<id>`, so adding a
+path never overwrites the router/service slices, and it is per-service (the id
+already encodes function + service identity), so two services on the same host
+with different paths get distinct router and middleware names. An empty/omitted
+path adds **nothing** — the label set is byte-for-byte the host-only one.
 
 - `<id>` is a single deterministic Traefik-safe router/service id shared by the
   router and service slices: it is derived from the service identity (the
-  function name + entrypoint, never the host or path) as
-  `relay-<function>-<entrypoint>`, lowercased, with every character outside
-  `[a-z0-9-]` sanitized to `-` (entrypoints like `app/main.py` contain `/` and
-  `.`), consecutive `-` collapsed, and trimmed/capped at 100 characters.
-  Because the id is deterministic, reconciliation produces stable labels.
+  function name + source descriptor — entrypoint file, Dockerfile path, or image
+  reference — never the host or path) as `relay-<function>-<identity>-<hash>`,
+  lowercased, with every character outside `[a-z0-9-]` sanitized to `-`
+  (identities like `app/main.py` or `ghcr.io/acme/api:1.2` contain `/`, `.`, and
+  `:`), consecutive `-` collapsed, and the readable part trimmed/capped at 100
+  characters. Because the id is deterministic, reconciliation produces stable
+  labels. `<hash>` is a fixed 16-hex-character (64-bit) suffix hashed from the
+  **full, untruncated** function name and identity, so distinct identities that
+  sanitize to the same readable base (e.g. `ghcr.io/acme/a/b:1` and
+  `ghcr.io/acme/a-b:1`) or that would truncate to the same prefix still get
+  distinct ids. The readable base is trimmed to make room, so the hash (and
+  therefore collision resistance) is always preserved at the cap.
 - `traefik.docker.network` tells Traefik which network the container routes on
   (the `TRAEFIK_NETWORK` Docker network). The container is **created attached
   to that network**. The network itself is owned outside Relay: Relay never
@@ -1090,9 +1176,10 @@ invocation.
   `compilerOptions` (e.g. `strict`, `experimentalDecorators`). Relay **does not
   type-check**: esbuild only strips types. Run `tsc --noEmit` yourself in
   development or CI if you want type checking.
-- This is a handler-level transpile, not a general frontend build pipeline.
-  React/Next/Vite-style builds need the custom build/Dockerfile service work,
-  which is out of scope by design.
+- This is a handler-level transpile only for **event/schedule handlers**. A
+  service that needs a real frontend/build pipeline declares a `build:` source
+  with its own Dockerfile (see _Services_), which Relay builds from the selected
+  source and runs with its own ENTRYPOINT.
 
 ## Handler contract
 
@@ -1181,6 +1268,8 @@ how the last reconcile of each function went without touching Redis or Docker.
 - **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
   prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at,
   env, secrets), a `handlers` table (function_name, handler, timeout), a
+  `services` table (`function_name`, `entrypoint`, `build`, `image`,
+  `path`, `port`, `replicas`), a
   single-row `stats` table (`id`, `updated_at`, and a JSON `data` payload
   holding the current global operational counters plus backlog gauges), and a
   `function_stats` table (`function_name`, `updated_at`, and a JSON `data`
@@ -1864,6 +1953,13 @@ get_settings` and serves `GET /health` (started via `uvicorn.run` in user
   code, reading `PORT`). FastAPI/Uvicorn live in the user's code — Relay only
   decides how the entrypoint file is executed.
 
+- `examples/functions/custom-build-service/` (**no runtime**): a persistent
+  **build-source service** — a user `Dockerfile` (built by Relay from the
+  function's selected source via the Docker Engine API) with its own
+  `ENTRYPOINT`, a `server.js`, and a `template.yaml` that declares
+  `build: Dockerfile` and no `runtime` at all. An equivalent `image:` service
+  would reference an external image instead.
+
 A single generic, cross-engine event matches both functions:
 
 ```json
@@ -1905,9 +2001,9 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 
 ## Out of scope
 
-Custom images/Dockerfiles, other runtimes, poetry/pipenv/pnpm/yarn/bun,
+Other runtimes, poetry/pipenv/pnpm/yarn/bun,
 build caching, source hashing,
-registries, k8s, configurable retry _policies per rule_ (delays/attempt counts
+k8s, configurable retry _policies per rule_ (delays/attempt counts
 are fixed internals — a rule's `retries` count is configurable, the backoff
 schedule is not), idempotency, exactly-once, per-function
 resource limits/networking, external secret-management providers (Vault/AWS/K8s

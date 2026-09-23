@@ -37,10 +37,11 @@ func ptr(i int) *int { return &i }
 // values, with router id == service id.
 func TestTraefikLabelsRouted(t *testing.T) {
 	labels := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, TraefikConfig{Network: "proxy"})
+	id := ServiceProviderID("fastapi-service", "app/main.py")
 	want := []string{
 		enableKey,
-		"traefik.http.routers.relay-fastapi-service-app-main-py.rule",
-		"traefik.http.services.relay-fastapi-service-app-main-py.loadbalancer.server.port",
+		routerPrefix + id + ruleSuffix,
+		servicePrefix + id + portSuffix,
 		networkKey,
 	}
 	if len(labels) != 4 {
@@ -54,10 +55,10 @@ func TestTraefikLabelsRouted(t *testing.T) {
 	if labels[enableKey] != "true" {
 		t.Fatalf("enable = %q, want true", labels[enableKey])
 	}
-	if got := labels["traefik.http.routers.relay-fastapi-service-app-main-py.rule"]; got != "Host(`api.example.com`)" {
+	if got := labels[routerPrefix+id+ruleSuffix]; got != "Host(`api.example.com`)" {
 		t.Fatalf("rule = %q, want Host(`api.example.com`)", got)
 	}
-	if got := labels["traefik.http.services.relay-fastapi-service-app-main-py.loadbalancer.server.port"]; got != "8000" {
+	if got := labels[servicePrefix+id+portSuffix]; got != "8000" {
 		t.Fatalf("lb port = %q, want 8000", got)
 	}
 	if labels[networkKey] != "proxy" {
@@ -108,7 +109,7 @@ func TestTraefikLabelsNoNetworkOmitted(t *testing.T) {
 
 // Each optional config value alone adds exactly its label(s) to the base set.
 func TestTraefikLabelsOptionalIndividual(t *testing.T) {
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
 	t.Run("entrypoint", func(t *testing.T) {
 		labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{Network: "proxy", EntryPoints: "websecure"})
 		if got := labels[routerPrefix+id+".entrypoints"]; got != "websecure" {
@@ -152,7 +153,7 @@ func TestTraefikLabelsOptionalIndividual(t *testing.T) {
 // label: no trimming, splitting, or reordering (Traefik accepts the raw
 // comma-separated string in its label grammar).
 func TestTraefikLabelsEntryPointsCommaSeparatedVerbatim(t *testing.T) {
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
 	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80,
 		TraefikConfig{Network: "proxy", EntryPoints: "web,websecure"})
 	if got := labels[routerPrefix+id+".entrypoints"]; got != "web,websecure" {
@@ -171,7 +172,7 @@ func TestTraefikLabelsFullHTTPS(t *testing.T) {
 		CertResolver: "letsencrypt",
 		Priority:     ptr(100),
 	})
-	id := "relay-fastapi-service-app-main-py"
+	id := ServiceProviderID("fastapi-service", "app/main.py")
 	want := map[string]string{
 		enableKey:                               "true",
 		networkKey:                              "proxy",
@@ -205,8 +206,9 @@ func TestTraefikLabelsEmptyOptionalsUnset(t *testing.T) {
 	}
 }
 
-// Deterministic: two calls produce identical maps; the fastapi example id is
-// relay-fastapi-service-app-main-py over the safe charset.
+// Deterministic: two calls produce identical maps; the fastapi example id keeps
+// its readable base over the safe charset and ends in the collision-resistant
+// hash suffix.
 func TestServiceProviderIDDeterministicAndSafe(t *testing.T) {
 	cfg := TraefikConfig{Network: "proxy"}
 	a := TraefikLabels("fastapi-service", "app/main.py", "api.example.com", "", 8000, cfg)
@@ -221,52 +223,116 @@ func TestServiceProviderIDDeterministicAndSafe(t *testing.T) {
 	}
 
 	id := ServiceProviderID("fastapi-service", "app/main.py")
-	if id != "relay-fastapi-service-app-main-py" {
-		t.Fatalf("id = %q, want relay-fastapi-service-app-main-py", id)
+	if !strings.HasPrefix(id, "relay-fastapi-service-app-main-py-") {
+		t.Fatalf("id = %q, want the relay-fastapi-service-app-main-py base", id)
 	}
-	idPattern := regexp.MustCompile(`^relay-fastapi-service-app-main-py$`)
-	if !idPattern.MatchString(id) {
-		t.Fatalf("id %q does not match the expected pattern", id)
+	if !strings.HasSuffix(id, identityHash("fastapi-service", "app/main.py")) {
+		t.Fatalf("id = %q, want the identity hash suffix", id)
 	}
 	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(id) {
 		t.Fatalf("id %q contains unsafe characters", id)
 	}
-	if len(id) > 100 {
-		t.Fatalf("id length %d exceeds the 100-char cap", len(id))
+	if len(id) > serviceProviderIDMaxLen {
+		t.Fatalf("id length %d exceeds the %d-char cap", len(id), serviceProviderIDMaxLen)
 	}
 }
 
-// TestServiceProviderIDTruncatesOverlong pins the >100-char truncation branch: a
-// long function name plus a long entrypoint produces an id capped at exactly 100
-// characters, and the truncation still yields a Traefik-safe identifier.
+// TestServiceProviderIDCollisionResistant pins the core reviewer finding:
+// distinct valid service identities that sanitize to the same readable base must
+// still get distinct ids. "ghcr.io/acme/a/b:1" and "ghcr.io/acme/a-b:1" both
+// sanitize to "ghcr-io-acme-a-b-1".
+func TestServiceProviderIDCollisionResistantForSanitizedIdentities(t *testing.T) {
+	a := ServiceProviderID("fn", "ghcr.io/acme/a/b:1")
+	b := ServiceProviderID("fn", "ghcr.io/acme/a-b:1")
+	if a == b {
+		t.Fatalf("distinct identities collided: %q", a)
+	}
+	if !strings.HasPrefix(a, "relay-fn-ghcr-io-acme-a-b-1-") {
+		t.Fatalf("a = %q, want the shared readable base", a)
+	}
+	// The two ids share the readable prefix but differ in the hash suffix.
+	if strings.TrimPrefix(a, "relay-fn-ghcr-io-acme-a-b-1-") == strings.TrimPrefix(b, "relay-fn-ghcr-io-acme-a-b-1-") {
+		t.Fatalf("hash suffixes must differ: %q vs %q", a, b)
+	}
+}
+
+// TestServiceProviderIDCollisionResistantWhenTruncated pins the second half of
+// the reviewer finding: two long identities whose readable bases are identical
+// up to the length cap still get distinct ids because the suffix is derived from
+// the full, untruncated identity and preserved at the cap.
+func TestServiceProviderIDCollisionResistantWhenTruncated(t *testing.T) {
+	prefix := strings.Repeat("deep/nested/path/", 15) // ~255 chars, well over the cap
+	a := ServiceProviderID("fn", prefix+"one.js")
+	b := ServiceProviderID("fn", prefix+"two.js")
+	if a == b {
+		t.Fatalf("truncated identities collided: %q", a)
+	}
+	if len(a) > serviceProviderIDMaxLen || len(b) > serviceProviderIDMaxLen {
+		t.Fatalf("ids exceed the %d-char cap: %d / %d", serviceProviderIDMaxLen, len(a), len(b))
+	}
+	// Even though the readable bases coincide under the cap, the hash suffix
+	// (derived from the full identity) distinguishes them.
+	if !strings.HasSuffix(a, identityHash("fn", prefix+"one.js")) ||
+		!strings.HasSuffix(b, identityHash("fn", prefix+"two.js")) {
+		t.Fatalf("truncated ids lost the full-identity hash suffix: %q / %q", a, b)
+	}
+}
+
+// TestPathMiddlewareIDCollisionResistant mirrors the provider-id collision
+// guarantee for the middleware namespace: colliding readable bases still yield
+// distinct middleware names, and the "-path" infix is preserved.
+func TestPathMiddlewareIDCollisionResistant(t *testing.T) {
+	a := PathMiddlewareID("fn", "ghcr.io/acme/a/b:1")
+	b := PathMiddlewareID("fn", "ghcr.io/acme/a-b:1")
+	if a == b {
+		t.Fatalf("distinct identities collided for the middleware: %q", a)
+	}
+	if !strings.Contains(a, "-path-") {
+		t.Fatalf("middleware id %q lost the -path infix", a)
+	}
+	if !strings.HasSuffix(a, identityHash("fn", "ghcr.io/acme/a/b:1")) ||
+		!strings.HasSuffix(b, identityHash("fn", "ghcr.io/acme/a-b:1")) {
+		t.Fatalf("middleware ids lost the full-identity hash suffix: %q / %q", a, b)
+	}
+	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(a) {
+		t.Fatalf("middleware id %q contains unsafe characters", a)
+	}
+}
+
+// TestServiceProviderIDTruncatesOverlong pins the truncation branch: a long
+// function name plus a long identity produces an id capped at exactly the max
+// length, with the hash suffix still present and the charset safe.
 func TestServiceProviderIDTruncatesOverlong(t *testing.T) {
 	longName := strings.Repeat("verylongfunction", 5) // 80 chars
 	longEntry := strings.Repeat("deep/nested/path", 5) + ".py"
 	id := ServiceProviderID(longName, longEntry)
-	if len(id) != 100 {
-		t.Fatalf("overlong id length = %d, want exactly 100 (truncated)", len(id))
+	if len(id) > serviceProviderIDMaxLen {
+		t.Fatalf("overlong id length = %d, want <= %d", len(id), serviceProviderIDMaxLen)
 	}
 	if !strings.HasPrefix(id, "relay-") {
 		t.Fatalf("truncated id %q lost the relay- prefix", id)
+	}
+	if !strings.HasSuffix(id, identityHash(longName, longEntry)) {
+		t.Fatalf("truncated id %q lost the hash suffix", id)
 	}
 	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(id) {
 		t.Fatalf("truncated id %q is not Traefik-safe", id)
 	}
 }
 
-// Odd characters in the function name or entrypoint still produce a safe,
-// deterministic id.
+// Odd characters in the function name or identity still produce a safe,
+// deterministic id whose hash suffix reflects the full inputs.
 func TestServiceProviderIDSanitizes(t *testing.T) {
 	for _, tc := range []struct {
-		fn, entrypoint string
+		fn, identity string
 	}{
 		{"Fn.X", "app/Main v2.py"},
 		{"UPPER_function", "SVC.js"},
 		{"a-b", "x  y/z.js"},
 	} {
-		id := ServiceProviderID(tc.fn, tc.entrypoint)
+		id := ServiceProviderID(tc.fn, tc.identity)
 		if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(id) {
-			t.Errorf("id %q (fn=%q ep=%q) is not Traefik-safe", id, tc.fn, tc.entrypoint)
+			t.Errorf("id %q (fn=%q id=%q) is not Traefik-safe", id, tc.fn, tc.identity)
 		}
 		if !strings.HasPrefix(id, "relay-") {
 			t.Errorf("id %q missing the relay- prefix", id)
@@ -274,13 +340,16 @@ func TestServiceProviderIDSanitizes(t *testing.T) {
 		if strings.Contains(id, "--") || strings.HasPrefix(id[6:], "-") || id == "relay-" {
 			t.Errorf("id %q has leading/trailing/double hyphens", id)
 		}
-		if a, b := ServiceProviderID(tc.fn, tc.entrypoint), id; a != b {
+		if !strings.HasSuffix(id, identityHash(tc.fn, tc.identity)) {
+			t.Errorf("id %q missing the identity hash suffix", id)
+		}
+		if a, b := ServiceProviderID(tc.fn, tc.identity), id; a != b {
 			t.Errorf("id not deterministic: %q vs %q", a, b)
 		}
 	}
-	// 'Fn.X' + 'app/Main v2.py' → relay-fn-x-app-main-v2-py
-	if got := ServiceProviderID("Fn.X", "app/Main v2.py"); got != "relay-fn-x-app-main-v2-py" {
-		t.Fatalf("sanitized id = %q, want relay-fn-x-app-main-v2-py", got)
+	// 'Fn.X' + 'app/Main v2.py' → relay-fn-x-app-main-v2-py-<hash>
+	if got := ServiceProviderID("Fn.X", "app/Main v2.py"); !strings.HasPrefix(got, "relay-fn-x-app-main-v2-py-") {
+		t.Fatalf("sanitized id = %q, want the relay-fn-x-app-main-v2-py base", got)
 	}
 }
 
@@ -426,10 +495,10 @@ func TestTraefikLabelsOverrideDistinctSubdomains(t *testing.T) {
 	cfg := TraefikConfig{Network: "proxy", HostOverride: "localhost"}
 	a := TraefikLabels("fn", "a.js", "issuer.example.com", "", 80, cfg)
 	b := TraefikLabels("fn", "b.js", "admin.example.com", "", 80, cfg)
-	if got := a["traefik.http.routers.relay-fn-a-js.rule"]; got != "Host(`issuer.localhost`)" {
+	if got := a[routerPrefix+ServiceProviderID("fn", "a.js")+ruleSuffix]; got != "Host(`issuer.localhost`)" {
 		t.Fatalf("a rule = %q, want Host(`issuer.localhost`)", got)
 	}
-	if got := b["traefik.http.routers.relay-fn-b-js.rule"]; got != "Host(`admin.localhost`)" {
+	if got := b[routerPrefix+ServiceProviderID("fn", "b.js")+ruleSuffix]; got != "Host(`admin.localhost`)" {
 		t.Fatalf("b rule = %q, want Host(`admin.localhost`)", got)
 	}
 }
@@ -439,8 +508,8 @@ func TestTraefikLabelsOverrideDistinctSubdomains(t *testing.T) {
 func TestTraefikLabelsOverrideHostWithPath(t *testing.T) {
 	cfg := TraefikConfig{Network: "proxy", HostOverride: "localhost"}
 	labels := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, cfg)
-	id := "relay-fn-svc-js"
-	mw := "relay-fn-svc-js-path"
+	id := ServiceProviderID("fn", "svc.js")
+	mw := PathMiddlewareID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                          "true",
 		networkKey:                         "proxy",
@@ -465,7 +534,7 @@ func TestTraefikLabelsOverridePreservesOtherValues(t *testing.T) {
 	base := TraefikConfig{Network: "proxy", EntryPoints: "websecure", CertResolver: "letsencrypt", Priority: ptr(100)}
 	overridden := base
 	overridden.HostOverride = "localhost"
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
 	withoutOverride := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, base)
 	withOverride := TraefikLabels("fn", "svc.js", "issuer.example.com", "/v2", 80, overridden)
 	for k, v := range withoutOverride {
@@ -488,7 +557,7 @@ func TestTraefikLabelsOverridePreservesOtherValues(t *testing.T) {
 // only the Host term mapped.
 func TestTraefikLabelsOverrideHostOnly(t *testing.T) {
 	labels := TraefikLabels("fn", "svc.js", "issuer.example.com", "", 80, TraefikConfig{Network: "proxy", HostOverride: "localhost"})
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                       "true",
 		networkKey:                      "proxy",
@@ -522,7 +591,7 @@ func TestTraefikLabelsAbsentOverrideUnchanged(t *testing.T) {
 			t.Fatalf("labels differ at %q: %q vs %q", k, v, explicitEmpty[k])
 		}
 	}
-	if got := without["traefik.http.routers.relay-fn-svc-js.rule"]; got != "Host(`issuer.example.com`) && PathPrefix(`/v2`)" {
+	if got := without[routerPrefix+ServiceProviderID("fn", "svc.js")+ruleSuffix]; got != "Host(`issuer.example.com`) && PathPrefix(`/v2`)" {
 		t.Fatalf("absent-override rule = %q, want the declared host verbatim", got)
 	}
 }
@@ -558,7 +627,7 @@ func TestMissingNetworkMessage(t *testing.T) {
 // has no PathPrefix and there are no middleware labels at all.
 func TestTraefikLabelsHostOnlyNoMiddleware(t *testing.T) {
 	labels := TraefikLabels("fn", "svc.js", "a.test", "", 80, TraefikConfig{Network: "proxy"})
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                       "true",
 		networkKey:                      "proxy",
@@ -585,8 +654,8 @@ func TestTraefikLabelsHostOnlyNoMiddleware(t *testing.T) {
 // name (service id + "-path").
 func TestTraefikLabelsPathAddsRuleAndMiddleware(t *testing.T) {
 	labels := TraefikLabels("fn", "svc.js", "a.test", "/v2", 80, TraefikConfig{Network: "proxy"})
-	id := "relay-fn-svc-js"
-	mw := "relay-fn-svc-js-path"
+	id := ServiceProviderID("fn", "svc.js")
+	mw := PathMiddlewareID("fn", "svc.js")
 	want := map[string]string{
 		enableKey:                          "true",
 		networkKey:                         "proxy",
@@ -609,8 +678,8 @@ func TestTraefikLabelsPathAddsRuleAndMiddleware(t *testing.T) {
 // middleware, distinct from host-only routing.
 func TestTraefikLabelsRootPath(t *testing.T) {
 	labels := TraefikLabels("fn", "svc.js", "a.test", "/", 80, TraefikConfig{Network: "proxy"})
-	id := "relay-fn-svc-js"
-	mw := "relay-fn-svc-js-path"
+	id := ServiceProviderID("fn", "svc.js")
+	mw := PathMiddlewareID("fn", "svc.js")
 	if got := labels[routerPrefix+id+ruleSuffix]; got != "Host(`a.test`) && PathPrefix(`/`)" {
 		t.Fatalf("root rule = %q", got)
 	}
@@ -623,15 +692,18 @@ func TestTraefikLabelsRootPath(t *testing.T) {
 }
 
 // The middleware name is deterministic across calls and distinct from the
-// router/service id.
+// router/service id, carrying the -path infix and the same identity hash.
 func TestPathMiddlewareIDDeterministicDistinct(t *testing.T) {
 	id := ServiceProviderID("fn", "svc.js")
 	mw := PathMiddlewareID("fn", "svc.js")
-	if mw != id+"-path" {
-		t.Fatalf("middleware id = %q, want %q", mw, id+"-path")
-	}
 	if mw == id {
 		t.Fatal("middleware id must differ from the provider id")
+	}
+	if !strings.Contains(mw, "-path-") {
+		t.Fatalf("middleware id = %q, want the -path infix", mw)
+	}
+	if !strings.HasSuffix(mw, identityHash("fn", "svc.js")) {
+		t.Fatalf("middleware id = %q, want the identity hash suffix", mw)
 	}
 	if a, b := PathMiddlewareID("fn", "svc.js"), mw; a != b {
 		t.Fatalf("middleware id not deterministic: %q vs %q", a, b)
@@ -647,8 +719,8 @@ func TestTraefikLabelsSameHostDifferentPathsDistinct(t *testing.T) {
 	cfg := TraefikConfig{Network: "proxy"}
 	a := TraefikLabels("fn", "a.js", "same.test", "/v1", 80, cfg)
 	b := TraefikLabels("fn", "b.js", "same.test", "/v2", 80, cfg)
-	idA, idB := "relay-fn-a-js", "relay-fn-b-js"
-	mwA, mwB := "relay-fn-a-js-path", "relay-fn-b-js-path"
+	idA, idB := ServiceProviderID("fn", "a.js"), ServiceProviderID("fn", "b.js")
+	mwA, mwB := PathMiddlewareID("fn", "a.js"), PathMiddlewareID("fn", "b.js")
 	if !strings.Contains(a[routerPrefix+idA+ruleSuffix], "PathPrefix(`/v1`)") {
 		t.Fatalf("service a rule = %q", a[routerPrefix+idA+ruleSuffix])
 	}
@@ -672,15 +744,16 @@ func TestTraefikLabelsPathWithFullHTTPS(t *testing.T) {
 		CertResolver: "letsencrypt",
 		Priority:     ptr(100),
 	})
-	id := "relay-fn-svc-js"
+	id := ServiceProviderID("fn", "svc.js")
+	mw := PathMiddlewareID("fn", "svc.js")
 	want := map[string]string{
-		routerPrefix + id + ruleSuffix:                                       "Host(`a.test`) && PathPrefix(`/v2`)",
-		routerPrefix + id + ".middlewares":                                   "relay-fn-svc-js-path",
-		routerPrefix + id + ".entrypoints":                                   "websecure",
-		routerPrefix + id + tlsSuffix:                                        "true",
-		routerPrefix + id + ".tls.certresolver":                              "letsencrypt",
-		routerPrefix + id + ".priority":                                      "100",
-		"traefik.http.middlewares.relay-fn-svc-js-path.stripprefix.prefixes": "/v2",
+		routerPrefix + id + ruleSuffix:                             "Host(`a.test`) && PathPrefix(`/v2`)",
+		routerPrefix + id + ".middlewares":                         mw,
+		routerPrefix + id + ".entrypoints":                         "websecure",
+		routerPrefix + id + tlsSuffix:                              "true",
+		routerPrefix + id + ".tls.certresolver":                    "letsencrypt",
+		routerPrefix + id + ".priority":                            "100",
+		"traefik.http.middlewares." + mw + ".stripprefix.prefixes": "/v2",
 	}
 	for k, v := range want {
 		if labels[k] != v {
@@ -689,17 +762,21 @@ func TestTraefikLabelsPathWithFullHTTPS(t *testing.T) {
 	}
 }
 
-// A very long service id still yields a middleware name that keeps the "-path"
-// suffix and stays within the 100-char cap and the safe charset.
+// A very long service identity still yields a middleware name that keeps the
+// "-path" infix and the identity hash, and stays within the cap and safe
+// charset.
 func TestPathMiddlewareIDOverlongKeepsSuffix(t *testing.T) {
 	longName := strings.Repeat("verylongfunction", 5)
 	longEntry := strings.Repeat("deep/nested/path", 5) + ".py"
 	mw := PathMiddlewareID(longName, longEntry)
-	if len(mw) > 100 {
-		t.Fatalf("middleware id length = %d, want <= 100", len(mw))
+	if len(mw) > serviceProviderIDMaxLen {
+		t.Fatalf("middleware id length = %d, want <= %d", len(mw), serviceProviderIDMaxLen)
 	}
-	if !strings.HasSuffix(mw, "-path") {
-		t.Fatalf("middleware id %q lost the -path suffix", mw)
+	if !strings.Contains(mw, "-path-") {
+		t.Fatalf("middleware id %q lost the -path infix", mw)
+	}
+	if !strings.HasSuffix(mw, identityHash(longName, longEntry)) {
+		t.Fatalf("middleware id %q lost the identity hash suffix", mw)
 	}
 	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(mw) {
 		t.Fatalf("middleware id %q is not Traefik-safe", mw)

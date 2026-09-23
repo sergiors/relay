@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -21,17 +23,30 @@ import (
 // one-shot invocation containers (event/schedule), so sweeps/reconcilers can
 // never confuse the two populations.
 
-// ServiceSpec describes one desired service replica's container. The entrypoint
-// is the service's identity: relay.entrypoint is stamped with it (there is no
-// separate relay.service label, and services carry no relay.handler), and it is
-// what Reconcile uses to group a function's containers by service.
+// ServiceSpec describes one desired service replica's container. The service
+// identity is its configured source descriptor (function.Service.SourceRef):
+// relay.identity is stamped with it (there is no separate relay.service label,
+// and services carry no relay.handler), and it is what Reconcile uses to group a
+// function's containers by service. The identity is honest for every source —
+// an entrypoint file, a Dockerfile path, or an external image reference — never
+// a synthetic entrypoint.
 type ServiceSpec struct {
-	Function   string
-	Entrypoint string // application entrypoint file, e.g. "app/service.js"
-	Port       int
-	Image      string
-	Entry      []string // the long-lived process command; empty = image entrypoint
-	Env        []string // runtime env (plan env), no RELAY_HANDLER
+	Function string
+	// Identity is the service's stable identity: the configured source
+	// descriptor (entrypoint file, Dockerfile path, or image reference).
+	Identity string
+	Port     int
+	Image    string
+	// ImageID is the local content ID of Image (relay.image_id), or "" when the
+	// reference itself encodes the content (a Relay-built image tag). It lets
+	// Reconcile detect a moved external tag pointing at different bytes and
+	// replace the container.
+	ImageID string
+	// Entry is the per-container entrypoint override. Empty means preserve the
+	// image's own ENTRYPOINT/CMD (build/image sources); non-empty is the
+	// runtime-resolved command for an entrypoint source.
+	Entry []string
+	Env   []string // runtime env (plan env), no RELAY_HANDLER
 	// Labels are EXTRA labels the caller wants on the container (routing
 	// labels supplied by the service reconciler). They are merged onto the
 	// relay ownership set, with Relay ownership keys always winning: a caller
@@ -52,13 +67,17 @@ type ServiceSpec struct {
 // ownership predicate, because services must be reconcilable across worker
 // restarts on the same host.
 type ServiceContainer struct {
-	ID         string
-	Function   string
-	Entrypoint string
-	Image      string
-	Hostname   string
-	State      container.ContainerState
-	Replica    int
+	ID       string
+	Function string
+	// Identity is the service's identity, parsed from its relay.identity label:
+	// the configured source descriptor. It is the grouping key Reconcile uses.
+	Identity string
+	Image    string
+	// ImageID is the local content ID of Image, parsed from relay.image_id ("").
+	ImageID  string
+	Hostname string
+	State    container.ContainerState
+	Replica  int
 	// Port is the container's configured internal port, parsed from its
 	// relay.port label. It defaults to 0 when the label is missing/invalid.
 	// The service reconciler uses it to detect a port change (a stale-config
@@ -73,14 +92,24 @@ type ServiceContainer struct {
 // serviceContainerLabelName is the deterministic, docker-safe container name for
 // one service replica. Ownership is always derived from labels, never from this
 // name (names are not guaranteed unique/stable across restarts), so this is
-// purely for human greppability. The service entrypoint part is sanitized to
+// purely for human greppability. The service identity part is sanitized to
 // [A-Za-z0-9_.-] and the total is capped well under docker's name length limit.
 const serviceContainerNameLenCap = 100
 
+// serviceIdentityHashLen is the number of hex characters in the
+// collision-resistant suffix appended to a generated service container name. 16
+// hex chars = 64 bits, matching the short-handle convention used for Relay's
+// content-addressed image tags (see tagPrefixLen) and the routing layer's
+// provider-id suffix. The routing and runtime layers derive their suffixes
+// independently (routing is a leaf package that runtime does not import); both
+// use the same full-input SHA-256/NUL-separated construction so the two stay
+// consistent. A birthday collision at Relay's scale is astronomically unlikely.
+const serviceIdentityHashLen = 16
+
 // sanitizeContainerNamePart replaces any character outside [A-Za-z0-9_.-] with
 // '-'. Function names are already validated to a legal docker repo charset, but
-// the service entrypoint is an arbitrary filename the operator chose, so it is
-// sanitized defensively.
+// the service identity is an arbitrary descriptor (a file path, Dockerfile
+// path, or image reference), so it is sanitized defensively.
 func sanitizeContainerNamePart(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -96,23 +125,46 @@ func sanitizeContainerNamePart(s string) string {
 }
 
 // serviceContainerName derives the deterministic container name for a replica:
-// relay-svc-<function>-<entrypoint>-<replica>. Function names are already
-// validated; the entrypoint part is sanitized and the whole name capped.
-func serviceContainerName(functionName, entrypoint string, replica int) string {
-	name := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(entrypoint) + "-" + strconv.Itoa(replica)
-	if len(name) > serviceContainerNameLenCap {
-		name = name[:serviceContainerNameLenCap]
+// relay-svc-<function>-<identity>-<hash>-<replica>. Function names are already
+// validated; the identity part (an entrypoint file, Dockerfile path, or image
+// reference) is sanitized. The name ends with a collision-resistant hash suffix
+// derived from the FULL function name and identity, so distinct identities that
+// sanitize to the same readable base (e.g. "ghcr.io/acme/a/b:1" and
+// "ghcr.io/acme/a-b:1") or that would truncate to the same prefix still get
+// distinct names. The readable base is trimmed to make room for the suffix, so
+// the suffix and the replica index are never lost to the cap.
+func serviceContainerName(functionName, identity string, replica int) string {
+	suffix := "-" + serviceIdentityHash(functionName, identity) + "-" + strconv.Itoa(replica)
+	base := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(identity)
+	maxBase := serviceContainerNameLenCap - len(suffix)
+	if maxBase < 0 {
+		maxBase = 0
 	}
-	return name
+	if len(base) > maxBase {
+		base = strings.TrimRight(base[:maxBase], "-")
+	}
+	return base + suffix
+}
+
+// serviceIdentityHash returns the fixed-length hex collision-resistant suffix
+// for a service identity. It hashes the FULL function name and the FULL identity
+// (never the sanitized or truncated base) with a NUL separator, so the two
+// inputs cannot run together across the join and distinct identities hash apart
+// even when their sanitized bases coincide.
+func serviceIdentityHash(functionName, identity string) string {
+	sum := sha256.Sum256([]byte(functionName + "\x00" + identity))
+	return hex.EncodeToString(sum[:])[:serviceIdentityHashLen]
 }
 
 // serviceLabels is the total, greppable label set stamped on every service
 // container: relay.type=service plus relay.function + relay.hostname make a
 // service container recognizable to Relay while the strict relay.type guard
 // lets sweeps/reconcilers distinguish the service population from one-shot
-// invocation containers. relay.entrypoint is the service identity (the
-// entrypoint string) — there is no relay.service label there, and service
-// containers carry no relay.handler.
+// invocation containers. relay.identity is the service identity (the configured
+// source descriptor) — there is no relay.service label there, and service
+// containers carry no relay.handler. relay.image_id records the local content ID
+// the container was started from (empty when the reference itself is
+// content-addressed), so a moved external tag is detected.
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
@@ -120,24 +172,34 @@ func serviceContainerName(functionName, entrypoint string, replica int) string {
 // clobber or spoof a relay.* key.
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
 	labels := map[string]string{
-		labelType:       ContainerTypeService,
-		labelFunction:   spec.Function,
-		labelEntrypoint: spec.Entrypoint,
-		labelImage:      spec.Image,
-		labelHostname:   hostname,
-		labelPort:       strconv.Itoa(spec.Port),
-		labelReplica:    strconv.Itoa(replica),
+		labelType:     ContainerTypeService,
+		labelFunction: spec.Function,
+		labelIdentity: spec.Identity,
+		labelImage:    spec.Image,
+		labelHostname: hostname,
+		labelPort:     strconv.Itoa(spec.Port),
+		labelReplica:  strconv.Itoa(replica),
+	}
+	if spec.ImageID != "" {
+		labels[labelImageID] = spec.ImageID
 	}
 	for k, v := range spec.Labels {
 		labels[k] = v
 	}
 	labels[labelType] = ContainerTypeService
 	labels[labelFunction] = spec.Function
-	labels[labelEntrypoint] = spec.Entrypoint
+	labels[labelIdentity] = spec.Identity
 	labels[labelImage] = spec.Image
 	labels[labelHostname] = hostname
 	labels[labelPort] = strconv.Itoa(spec.Port)
 	labels[labelReplica] = strconv.Itoa(replica)
+	// The image content ID is an ownership key too; a caller can never spoof it,
+	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
+	if spec.ImageID != "" {
+		labels[labelImageID] = spec.ImageID
+	} else {
+		delete(labels, labelImageID)
+	}
 	return labels
 }
 
@@ -165,8 +227,11 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		ExposedPorts: network.PortSet{network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {}},
 	}
 	if len(spec.Entry) > 0 {
-		// Override the image's invocation-bootstrap entrypoint with the
-		// long-lived service entrypoint (e.g. ["node", "/app/service.js"]).
+		// An entrypoint-source service overrides the function image's
+		// invocation-bootstrap entrypoint with the long-lived service command
+		// (e.g. ["node", "/app/service.js"]). A build/image service leaves
+		// Entry empty so the container preserves the image's own
+		// ENTRYPOINT/CMD.
 		cfg.Entrypoint = spec.Entry
 	}
 
@@ -174,7 +239,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		Config: cfg,
 		// No AutoRemove: persistent, reconciler-owned (see doc comment).
 		HostConfig: hardenedHostConfig(false),
-		Name:       serviceContainerName(spec.Function, spec.Entrypoint, replica),
+		Name:       serviceContainerName(spec.Function, spec.Identity, replica),
 	}
 	if spec.Network != "" {
 		// Join an additional Docker network at create time (containers must
@@ -203,7 +268,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	m.log.Info("Service: started",
 		"function", spec.Function,
-		"entrypoint", spec.Entrypoint,
+		"service", spec.Identity,
 		"replica", replica,
 		"container", id,
 	)
@@ -250,15 +315,16 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			}
 		}
 		out = append(out, ServiceContainer{
-			ID:         c.ID,
-			Function:   c.Labels[labelFunction],
-			Entrypoint: c.Labels[labelEntrypoint],
-			Image:      c.Labels[labelImage],
-			Hostname:   c.Labels[labelHostname],
-			State:      c.State,
-			Replica:    replica,
-			Port:       port,
-			Labels:     labelsCopy,
+			ID:       c.ID,
+			Function: c.Labels[labelFunction],
+			Identity: c.Labels[labelIdentity],
+			Image:    c.Labels[labelImage],
+			ImageID:  c.Labels[labelImageID],
+			Hostname: c.Labels[labelHostname],
+			State:    c.State,
+			Replica:  replica,
+			Port:     port,
+			Labels:   labelsCopy,
 		})
 	}
 	return out, nil
@@ -296,7 +362,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				m.log.Warn("Service: stop container failed",
 					"container", c.ID,
 					"function", c.Function,
-					"entrypoint", c.Entrypoint,
+					"service", c.Identity,
 					"error", err,
 				)
 				continue
@@ -309,7 +375,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 			m.log.Warn("Service: remove container failed",
 				"container", c.ID,
 				"function", c.Function,
-				"entrypoint", c.Entrypoint,
+				"service", c.Identity,
 				"error", err,
 			)
 		}

@@ -21,8 +21,9 @@ import (
 type fakeContainer struct {
 	id         string
 	function   string
-	entrypoint string
+	entrypoint string // the service identity (kept as the field name for existing assertions)
 	image      string
+	imageID    string
 	port       int
 	replica    int
 	state      container.ContainerState
@@ -47,12 +48,52 @@ type fakeDocker struct {
 	failStopFor     string          // when non-empty, StopServiceContainers errors for this id
 	missingNetworks map[string]bool // NetworkExists reports false for these
 	networkLookups  []string        // network names passed to NetworkExists, in order
+	resolveErr      map[string]error
+	resolveCalls    []string // identities passed to ResolveServiceImage, in order
+	resolvedImages  map[string]string
 }
 
 func newFakeDocker() *fakeDocker {
 	return &fakeDocker{
 		ctrs:            map[string]*fakeContainer{},
 		missingNetworks: map[string]bool{},
+		resolveErr:      map[string]error{},
+		resolvedImages:  map[string]string{},
+	}
+}
+
+// ResolveServiceImage mirrors the production resolution shape without Docker:
+// entrypoint sources resolve through runtime.ServiceEntry, build sources get a
+// deterministic content-addressed reference, and image sources resolve to the
+// identity (with a deterministic content ID). A resolveErr entry forces a
+// resolution failure for the matching identity.
+func (f *fakeDocker) ResolveServiceImage(_ context.Context, fnName, _ string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	identity := svc.SourceRef()
+	f.resolveCalls = append(f.resolveCalls, identity)
+	if err := f.resolveErr[identity]; err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	switch svc.Source() {
+	case function.ServiceSourceBuild:
+		ref := f.resolvedImages[identity]
+		if ref == "" {
+			ref = "svc-build-" + fnName + ":" + identity
+		}
+		return runtime.ServiceImage{Ref: ref}, nil
+	case function.ServiceSourceImage:
+		id := f.resolvedImages[identity]
+		if id == "" {
+			id = identity + "-id"
+		}
+		return runtime.ServiceImage{Ref: identity, ID: id}, nil
+	default:
+		entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
+		if err != nil {
+			return runtime.ServiceImage{}, err
+		}
+		return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
 	}
 }
 
@@ -64,8 +105,9 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 	f.ctrs[id] = &fakeContainer{
 		id:         id,
 		function:   spec.Function,
-		entrypoint: spec.Entrypoint,
+		entrypoint: spec.Identity,
 		image:      spec.Image,
+		imageID:    spec.ImageID,
 		port:       spec.Port,
 		replica:    replica,
 		state:      container.StateRunning,
@@ -90,15 +132,16 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	var out []runtime.ServiceContainer
 	for _, c := range f.ctrs {
 		out = append(out, runtime.ServiceContainer{
-			ID:         c.id,
-			Function:   c.function,
-			Entrypoint: c.entrypoint,
-			Image:      c.image,
-			State:      c.state,
-			Replica:    c.replica,
-			Port:       c.port,
-			Hostname:   c.hostname,
-			Labels:     c.labels,
+			ID:       c.id,
+			Function: c.function,
+			Identity: c.entrypoint,
+			Image:    c.image,
+			ImageID:  c.imageID,
+			State:    c.state,
+			Replica:  c.replica,
+			Port:     c.port,
+			Hostname: c.hostname,
+			Labels:   c.labels,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -202,7 +245,7 @@ func serviceTemplate(runtimeName string, services ...function.Service) *function
 // secrets, and a discarded logger — the common shape across the service tests.
 func reconcile(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), d, fn, tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), d, fn, t.TempDir(), tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
@@ -492,7 +535,7 @@ func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
 	f := newFakeDocker()
 	// Another function "other" pre-exists with a running container.
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function: "other", Entrypoint: "svc.js", Port: 80, Image: "img-other",
+		Function: "other", Identity: "svc.js", Port: 80, Image: "img-other",
 	}, 0); err != nil {
 		t.Fatalf("start other: %v", err)
 	}
@@ -559,7 +602,7 @@ func TestSweepOrphans(t *testing.T) {
 		t.Fatalf("reconcile live: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function: "ghost", Entrypoint: "svc.js", Port: 80, Image: "img-ghost",
+		Function: "ghost", Identity: "svc.js", Port: 80, Image: "img-ghost",
 	}, 0); err != nil {
 		t.Fatalf("start ghost: %v", err)
 	}
@@ -644,12 +687,13 @@ func TestReconcileEmptyDesiredRemovesLeftovers(t *testing.T) {
 	}
 }
 
-// A reconcile whose service runtime is unsupported cannot resolve the entrypoint
-// (ServiceEntry errors): it still removes stale containers and reports the
-// failure, but never starts replicas for that service.
-func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
+// A reconcile whose service source cannot be resolved (here an entrypoint under
+// an unsupported runtime) reports the failure and PRESERVES the existing
+// containers: resolution happens before any container action, so a service that
+// cannot produce a runnable image is never torn down for nothing.
+func TestReconcileUnsupportedRuntimePreservesContainersAndFails(t *testing.T) {
 	f := newFakeDocker()
-	f.ctrs["stale-1"] = &fakeContainer{id: "stale-1", function: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
+	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", function: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
 
 	// An unsupported runtime makes ServiceEntry fail for any entrypoint.
 	tmpl := serviceTemplate("rust", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
@@ -660,8 +704,11 @@ func TestReconcileUnsupportedRuntimeStopsStaleAndFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "unsupported runtime") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 0 {
-		t.Fatalf("stale containers must still be removed, got %d", got)
+	if got := f.countForFunction("fn"); got != 1 {
+		t.Fatalf("existing containers must be preserved on a resolve failure, got %d", got)
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("stops = %v, want none on a resolve failure", f.stops)
 	}
 }
 
@@ -715,11 +762,11 @@ func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 }
 
 // A python service whose entrypoint is not a .py importable module cannot
-// resolve its entrypoint (python.ServiceCommand errors): reconcile still stops
-// stale containers but never starts replicas for that service.
-func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
+// resolve its source (python.ServiceCommand errors): reconcile reports the
+// failure, preserves existing containers, and never starts replicas.
+func TestReconcilePythonNonPyEntrypointPreservesAndFails(t *testing.T) {
 	f := newFakeDocker()
-	f.ctrs["stale-1"] = &fakeContainer{id: "stale-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
+	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("python3.14", function.Service{Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
@@ -729,11 +776,16 @@ func TestReconcilePythonNonPyEntrypointStopsStaleAndFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "python services require a .py") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 0 {
-		t.Fatalf("stale containers must still be removed, got %d", got)
+	if got := f.countForFunction("fn"); got != 1 {
+		t.Fatalf("existing containers must be preserved on a resolve failure, got %d", got)
 	}
-	if got := f.runningCount("fn", "app/main.js"); got != 0 {
-		t.Fatalf("python non-importable service must never start, got %d running", got)
+	// The preserved container is the pre-existing one (never a fresh start for
+	// the unresolvable source) and is still running.
+	if got := f.runningCount("fn", "app/main.js"); got != 1 {
+		t.Fatalf("preserved container must still run, got %d running", got)
+	}
+	if len(f.resolveCalls) != 1 || f.resolveCalls[0] != "app/main.js" {
+		t.Fatalf("resolve calls = %v, want a single resolution attempt", f.resolveCalls)
 	}
 }
 
@@ -783,6 +835,15 @@ func TestReconcileListErrorSurfaces(t *testing.T) {
 // listErrDocker is a Docker whose ServiceContainerList always fails.
 type listErrDocker struct{ err error }
 
+func (d *listErrDocker) ResolveServiceImage(
+	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+) (runtime.ServiceImage, error) {
+	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
+	if err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+}
 func (d *listErrDocker) StartService(context.Context, runtime.ServiceSpec, int) (string, error) {
 	return "", nil
 }
@@ -822,6 +883,15 @@ type startFailDocker struct {
 	started     []int
 }
 
+func (d *startFailDocker) ResolveServiceImage(
+	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+) (runtime.ServiceImage, error) {
+	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
+	if err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+}
 func (d *startFailDocker) StartService(_ context.Context, _ runtime.ServiceSpec, replica int) (string, error) {
 	d.started = append(d.started, replica)
 	if replica == d.failReplica {
@@ -863,8 +933,8 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	logger, capture := newCaptureLogger(slog.LevelDebug)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
 
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil) // idempotent second pass
+	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil) // idempotent second pass
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: unchanged") {
@@ -886,7 +956,7 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -910,7 +980,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
-	c.Apply(context.Background(), "fn", tmpl, "img-new", nil)
+	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-new", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -950,7 +1020,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
-	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled with errors") {
@@ -967,4 +1037,137 @@ func newCaptureLogger(level slog.Level) (*slog.Logger, *captureLogger) {
 	c := &captureLogger{}
 	h := slog.NewTextHandler(c, &slog.HandlerOptions{Level: level})
 	return slog.New(h), c
+}
+
+// A build-source service starts with the resolved build image and NO entrypoint
+// override, so the image's own ENTRYPOINT/CMD is preserved.
+func TestReconcileBuildServiceStartPreservesImageEntrypoint(t *testing.T) {
+	f := newFakeDocker()
+	f.resolvedImages["docker/Dockerfile.prod"] = "relay-fn-fn:buildtag"
+	tmpl := serviceTemplate("", function.Service{Build: "docker/Dockerfile.prod", Port: 3000, Replicas: 1})
+
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "docker/Dockerfile.prod")
+	if c == nil {
+		t.Fatal("no started container for the build service")
+	}
+	if c.image != "relay-fn-fn:buildtag" {
+		t.Fatalf("image = %q, want the resolved build image", c.image)
+	}
+	if c.entry != nil {
+		t.Fatalf("entry = %v, want nil (preserve image ENTRYPOINT/CMD)", c.entry)
+	}
+}
+
+// An image-source service starts with the external reference and its content ID,
+// and no entrypoint override.
+func TestReconcileImageServiceStartPreservesImageEntrypoint(t *testing.T) {
+	f := newFakeDocker()
+	f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:cafe"
+	tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
+	if c == nil {
+		t.Fatal("no started container for the image service")
+	}
+	if c.image != "ghcr.io/acme/api:1.2" || c.imageID != "sha256:cafe" {
+		t.Fatalf("image/imageID = %q/%q, want the external ref and its content id", c.image, c.imageID)
+	}
+	if c.entry != nil {
+		t.Fatalf("entry = %v, want nil (preserve image ENTRYPOINT/CMD)", c.entry)
+	}
+}
+
+// A changed external image CONTENT (a moved tag) replaces the running container,
+// even though the image reference string is unchanged.
+func TestReconcileImageContentChangeReplacesContainer(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:latest", Port: 8080, Replicas: 1})
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	first := f.lastStartedFor("fn", "ghcr.io/acme/api:latest")
+	if first == nil || first.imageID != "ghcr.io/acme/api:latest-id" {
+		t.Fatalf("first container = %+v", first)
+	}
+
+	// The tag now points at different bytes.
+	f.mu.Lock()
+	f.resolvedImages["ghcr.io/acme/api:latest"] = "sha256:moved"
+	f.mu.Unlock()
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	f.mu.Lock()
+	var running []*fakeContainer
+	for _, c := range f.ctrs {
+		if c.function == "fn" && c.state == container.StateRunning {
+			running = append(running, c)
+		}
+	}
+	f.mu.Unlock()
+	if len(running) != 1 {
+		t.Fatalf("running = %d, want 1", len(running))
+	}
+	if running[0].imageID != "sha256:moved" {
+		t.Fatalf("running imageID = %q, want the moved content id", running[0].imageID)
+	}
+	if len(f.stops) == 0 {
+		t.Fatal("expected the content-changed container to be stopped/replaced")
+	}
+}
+
+// A build/pull resolution failure preserves the existing healthy container: it is
+// neither stopped nor replaced, and the error surfaces.
+func TestReconcileResolveFailurePreservesHealthyContainer(t *testing.T) {
+	f := newFakeDocker()
+	f.mu.Lock()
+	f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:cafe"
+	f.mu.Unlock()
+	tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	before := f.runningCount("fn", "ghcr.io/acme/api:1.2")
+	if before != 1 {
+		t.Fatalf("running after first reconcile = %d, want 1", before)
+	}
+
+	// The registry is now unreachable.
+	f.mu.Lock()
+	f.resolveErr["ghcr.io/acme/api:1.2"] = fmt.Errorf("pull failed: registry down")
+	f.mu.Unlock()
+	_, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{})
+	if err == nil || !strings.Contains(err.Error(), "registry down") {
+		t.Fatalf("err = %v, want the resolve failure surfaced", err)
+	}
+	if got := f.runningCount("fn", "ghcr.io/acme/api:1.2"); got != 1 {
+		t.Fatalf("running after a resolve failure = %d, want 1 (preserved)", got)
+	}
+	if len(f.stops) != 0 {
+		t.Fatalf("stops = %v, want none on a resolve failure", f.stops)
+	}
+}
+
+// A removed service whose source identity is no longer in the template is
+// stopped regardless of source kind.
+func TestReconcileRemovedImageServiceStopped(t *testing.T) {
+	f := newFakeDocker()
+	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
+		Function: "fn", Identity: "ghcr.io/acme/old:1", Port: 80, Image: "ghcr.io/acme/old:1",
+	}, 0); err != nil {
+		t.Fatalf("seed old service: %v", err)
+	}
+	tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/new:1", Port: 80, Replicas: 1})
+	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if f.runningCount("fn", "ghcr.io/acme/old:1") != 0 {
+		t.Fatal("removed image service container should be stopped")
+	}
 }

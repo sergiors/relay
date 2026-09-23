@@ -420,14 +420,14 @@ func Run(logger *slog.Logger) {
 			// The prepared env comes from the current registry entry (the runtime
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
-			UpdateServices: func(name string, tmpl *function.Template, image string) {
+			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
 				uCtx, cancel := context.WithTimeout(context.Background(), startupTimeout)
 				defer cancel()
 				var preparedEnv []string
 				if cur := runWorker.Registry().GetByName(name); cur != nil && cur.Prepared() != nil {
 					preparedEnv = cur.Prepared().Env
 				}
-				svcCtrl.Apply(uCtx, name, tmpl, image, preparedEnv)
+				svcCtrl.Apply(uCtx, name, fnDir, tmpl, image, preparedEnv)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
@@ -645,7 +645,7 @@ func reconcileStartupServices(
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
-		svcCtrl.Apply(ctx, fn.Name, fn.Template, p.Image, p.Env)
+		svcCtrl.Apply(ctx, fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
 		cancel()
 	}
 	// Startup stale-service sweep: remove any service container whose function is

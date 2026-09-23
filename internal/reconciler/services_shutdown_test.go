@@ -19,12 +19,12 @@ import (
 func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 	f := newFakeDocker()
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function: "fn", Entrypoint: "svc.js", Port: 80, Image: "img-1",
+		Function: "fn", Identity: "svc.js", Port: 80, Image: "img-1",
 	}, 0); err != nil {
 		t.Fatalf("start replica 0: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function: "fn", Entrypoint: "svc.js", Port: 80, Image: "img-1",
+		Function: "fn", Identity: "svc.js", Port: 80, Image: "img-1",
 	}, 1); err != nil {
 		t.Fatalf("start replica 1: %v", err)
 	}

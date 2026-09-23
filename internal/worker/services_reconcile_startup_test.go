@@ -25,6 +25,16 @@ type svcDeadlineDocker struct {
 	deadlines []time.Time // deadline (local time) of each ServiceContainerList call; zero = no deadline
 }
 
+func (f *svcDeadlineDocker) ResolveServiceImage(
+	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+) (runtime.ServiceImage, error) {
+	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
+	if err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+}
+
 func (f *svcDeadlineDocker) StartService(_ context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
 	return "id-1", nil
 }
@@ -137,6 +147,16 @@ type svcShutdownDocker struct {
 
 func newSvcShutdownDocker() *svcShutdownDocker {
 	return &svcShutdownDocker{containers: map[string]runtime.ServiceContainer{}}
+}
+
+func (f *svcShutdownDocker) ResolveServiceImage(
+	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+) (runtime.ServiceImage, error) {
+	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
+	if err != nil {
+		return runtime.ServiceImage{}, err
+	}
+	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
 }
 
 func (f *svcShutdownDocker) StartService(_ context.Context, _ runtime.ServiceSpec, _ int) (string, error) {

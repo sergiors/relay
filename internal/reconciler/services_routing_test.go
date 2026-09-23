@@ -134,7 +134,7 @@ func TestReconcileRoutedHappyPath(t *testing.T) {
 	if c.labels[routingNetworkKey] != "proxy" {
 		t.Fatalf("traefik.docker.network = %q, want proxy", c.labels[routingNetworkKey])
 	}
-	id := "relay-fn-service-js" // relay-<fn>-<entrypoint>
+	id := routing.ServiceProviderID("fn", "service.js") // relay-<fn>-<identity>-<hash>
 	wantRule := "Host(`service.test`)"
 	if c.labels[routingRouterPrefix+id+".rule"] != wantRule {
 		t.Fatalf("router rule = %q, want %q", c.labels[routingRouterPrefix+id+".rule"], wantRule)
@@ -173,7 +173,7 @@ func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
 	if c.network != "proxy" {
 		t.Fatalf("network = %q, want proxy", c.network)
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	want := map[string]string{
 		routingEnableKey:                   "true",
 		routingNetworkKey:                  "proxy",
@@ -216,7 +216,7 @@ func TestReconcileCertResolverClearedReplacesWithoutTLS(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	for _, k := range []string{routingRouterPrefix + id + ".tls", routingRouterPrefix + id + ".tls.certresolver"} {
 		if _, ok := c.labels[k]; ok {
 			t.Fatalf("replacement label %s present after clearing certresolver: %v", k, c.labels)
@@ -251,11 +251,11 @@ func TestReconcilePriorityClearedReplacesWithoutPriority(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	if _, ok := c.labels[routingRouterPrefix+"relay-fn-service-js.priority"]; ok {
+	if _, ok := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".priority"]; ok {
 		t.Fatalf("replacement priority label present after clearing priority: %v", c.labels)
 	}
-	if c.labels[routingRouterPrefix+"relay-fn-service-js.entrypoints"] != "websecure" {
-		t.Fatalf("replacement entrypoints = %q, want websecure", c.labels[routingRouterPrefix+"relay-fn-service-js.entrypoints"])
+	if c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".entrypoints"] != "websecure" {
+		t.Fatalf("replacement entrypoints = %q, want websecure", c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".entrypoints"])
 	}
 }
 
@@ -305,7 +305,7 @@ func TestReconcileHostChangeReplaces(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	if c.labels[routingRouterPrefix+id+".rule"] != "Host(`b.test`)" {
 		t.Fatalf("replacement rule = %q, want Host(`b.test`)", c.labels[routingRouterPrefix+id+".rule"])
 	}
@@ -426,8 +426,8 @@ func TestReconcileRoutedPathLabels(t *testing.T) {
 	if c == nil {
 		t.Fatal("no started container")
 	}
-	id := "relay-fn-service-js"
-	mw := "relay-fn-service-js-path"
+	id := routing.ServiceProviderID("fn", "service.js")
+	mw := routing.PathMiddlewareID("fn", "service.js")
 	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`service.test`) && PathPrefix(`/v2`)" {
 		t.Fatalf("rule = %q", got)
 	}
@@ -455,14 +455,16 @@ func TestReconcileSameHostDifferentPathsDistinct(t *testing.T) {
 	if v1 == nil || v2 == nil {
 		t.Fatal("expected both containers started")
 	}
-	if v1.labels[routingRouterPrefix+"relay-fn-v1-js.rule"] != "Host(`same.test`) && PathPrefix(`/v1`)" {
-		t.Fatalf("v1 rule = %q", v1.labels[routingRouterPrefix+"relay-fn-v1-js.rule"])
+	v1id := routing.ServiceProviderID("fn", "v1.js")
+	v2id := routing.ServiceProviderID("fn", "v2.js")
+	if v1.labels[routingRouterPrefix+v1id+".rule"] != "Host(`same.test`) && PathPrefix(`/v1`)" {
+		t.Fatalf("v1 rule = %q", v1.labels[routingRouterPrefix+v1id+".rule"])
 	}
-	if v2.labels[routingRouterPrefix+"relay-fn-v2-js.rule"] != "Host(`same.test`) && PathPrefix(`/v2`)" {
-		t.Fatalf("v2 rule = %q", v2.labels[routingRouterPrefix+"relay-fn-v2-js.rule"])
+	if v2.labels[routingRouterPrefix+v2id+".rule"] != "Host(`same.test`) && PathPrefix(`/v2`)" {
+		t.Fatalf("v2 rule = %q", v2.labels[routingRouterPrefix+v2id+".rule"])
 	}
-	v1mw := v1.labels[routingRouterPrefix+"relay-fn-v1-js.middlewares"]
-	v2mw := v2.labels[routingRouterPrefix+"relay-fn-v2-js.middlewares"]
+	v1mw := v1.labels[routingRouterPrefix+v1id+".middlewares"]
+	v2mw := v2.labels[routingRouterPrefix+v2id+".middlewares"]
 	if v1mw == "" || v1mw == v2mw {
 		t.Fatalf("same-host services must not share a middleware name: %q vs %q", v1mw, v2mw)
 	}
@@ -492,11 +494,11 @@ func TestReconcilePathChangeReplaces(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`) && PathPrefix(`/v2`)" {
 		t.Fatalf("replacement rule = %q", got)
 	}
-	if got := c.labels["traefik.http.middlewares."+id+"-path.stripprefix.prefixes"]; got != "/v2" {
+	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
 		t.Fatalf("replacement stripprefix = %q", got)
 	}
 }
@@ -525,7 +527,7 @@ func TestReconcilePathRemovedReplacesWithoutMiddleware(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`a.test`)" {
 		t.Fatalf("replacement host-only rule = %q", got)
 	}
@@ -575,11 +577,11 @@ func TestReconcileHostOverrideMapsRule(t *testing.T) {
 	if c == nil {
 		t.Fatal("no started container")
 	}
-	id := "relay-fn-service-js"
+	id := routing.ServiceProviderID("fn", "service.js")
 	if got := c.labels[routingRouterPrefix+id+".rule"]; got != "Host(`issuer.localhost`) && PathPrefix(`/v2`)" {
 		t.Fatalf("rule = %q, want Host(`issuer.localhost`) && PathPrefix(`/v2`)", got)
 	}
-	if got := c.labels["traefik.http.middlewares."+id+"-path.stripprefix.prefixes"]; got != "/v2" {
+	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
 		t.Fatalf("stripprefix = %q, want /v2 (unchanged)", got)
 	}
 	if c.labels[routingNetworkKey] != "proxy" || c.network != "proxy" {
@@ -608,10 +610,10 @@ func TestReconcileHostOverrideDistinctSubdomains(t *testing.T) {
 	if issuer == nil || admin == nil {
 		t.Fatal("expected both containers started")
 	}
-	if got := issuer.labels[routingRouterPrefix+"relay-fn-issuer-js.rule"]; got != "Host(`issuer.localhost`)" {
+	if got := issuer.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "issuer.js")+".rule"]; got != "Host(`issuer.localhost`)" {
 		t.Fatalf("issuer rule = %q", got)
 	}
-	if got := admin.labels[routingRouterPrefix+"relay-fn-admin-js.rule"]; got != "Host(`admin.localhost`)" {
+	if got := admin.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "admin.js")+".rule"]; got != "Host(`admin.localhost`)" {
 		t.Fatalf("admin rule = %q", got)
 	}
 }
@@ -634,7 +636,7 @@ func TestReconcileHostOverrideChangeReplaces(t *testing.T) {
 	if c == nil {
 		t.Fatal("no replacement container")
 	}
-	if got := c.labels[routingRouterPrefix+"relay-fn-service-js.rule"]; got != "Host(`a.localhost`)" {
+	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`a.localhost`)" {
 		t.Fatalf("replacement rule = %q, want Host(`a.localhost`)", got)
 	}
 }
@@ -696,7 +698,7 @@ func TestReconcileHostOverrideLongLabelShortDomainValid(t *testing.T) {
 		t.Fatal("no started container")
 	}
 	wantRule := "Host(`" + strings.Repeat("z", 63) + ".localhost`)"
-	if got := c.labels[routingRouterPrefix+"relay-fn-service-js.rule"]; got != wantRule {
+	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != wantRule {
 		t.Fatalf("rule = %q, want %q", got, wantRule)
 	}
 	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
@@ -716,7 +718,7 @@ func TestReconcileAbsentOverrideUsesDeclaredHost(t *testing.T) {
 	if c == nil {
 		t.Fatal("no started container")
 	}
-	if got := c.labels[routingRouterPrefix+"relay-fn-service-js.rule"]; got != "Host(`issuer.example.com`)" {
+	if got := c.labels[routingRouterPrefix+routing.ServiceProviderID("fn", "service.js")+".rule"]; got != "Host(`issuer.example.com`)" {
 		t.Fatalf("rule = %q, want the declared host verbatim", got)
 	}
 }

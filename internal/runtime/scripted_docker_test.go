@@ -26,6 +26,10 @@ type dockerRoute struct {
 	path   string // path substring; empty matches any
 	body   string
 	status int // 0 means 200
+	// onMatch, when set, runs once when the route matches. It lets a test count
+	// or record calls (e.g. how many pulls were attempted) through the real
+	// client call path.
+	onMatch func()
 }
 
 func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -35,6 +39,9 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		if rt.path != "" && !strings.Contains(r.URL.Path, rt.path) {
 			continue
+		}
+		if rt.onMatch != nil {
+			rt.onMatch()
 		}
 		status := rt.status
 		if status == 0 {

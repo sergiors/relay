@@ -84,13 +84,14 @@ type Config struct {
 	// prepared and swapped into the registry (discovery and update paths; never
 	// on the skip path and never on build failure), so the service reconciler
 	// (services.go) can converge the function's persistent containers to the new
-	// template+image.
+	// template+image. fnDir is the function's directory (build sources resolve
+	// their Dockerfile relative to it).
 	// It is ALSO called on the skip path (unchanged, already-available function)
 	// when the function declares services, so crashed service replicas are
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
-	UpdateServices func(name string, tmpl *function.Template, image string)
+	UpdateServices func(name, fnDir string, tmpl *function.Template, image string)
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveFunction and the function's images are retired. The ordering
 	// invariant: running service containers reference the function's images, so
@@ -116,7 +117,7 @@ type Reconciler struct {
 	retire          func(name, oldImage string)
 	removeFunction  func(name string)
 	updateSchedules func(name string, tmpl *function.Template)
-	updateServices  func(name string, tmpl *function.Template, image string)
+	updateServices  func(name, fnDir string, tmpl *function.Template, image string)
 	removeServices  func(name string)
 
 	mu           sync.Mutex
@@ -478,7 +479,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// no-op (nothing to stop or start), the caller logs it at Debug rather
 		// than Info — the summary line only surfaces real state changes.
 		if r.updateServices != nil && len(fn.Template.Services) > 0 {
-			r.updateServices(name, fn.Template, cur.Prepared().Image)
+			r.updateServices(name, fn.Dir, fn.Template, cur.Prepared().Image)
 		}
 		return
 	}
@@ -540,7 +541,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// not on the skip path above nor on a build failure (where the previous
 	// version — and its service containers — are retained).
 	if r.updateServices != nil {
-		r.updateServices(name, fn.Template, built.Image)
+		r.updateServices(name, fn.Dir, fn.Template, built.Image)
 	}
 
 	// Retire the superseded version now that the registry serves the new one,

@@ -218,21 +218,30 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		sw.Flush()
 	}
 
-	// The Services section renders the template's persistent services (entrypoint
-	// file, effective internal port, desired replica count). It is omitted
-	// entirely when the template defines none, like Schedules. The routing path
-	// prefix is appended only when set, so the pre-path rendering of a
+	// The Services section renders the template's persistent services (source,
+	// effective internal port, desired replica count). It is omitted entirely
+	// when the template defines none, like Schedules. The source is derived from
+	// the configured source fields and rendered with its kind: an entrypoint
+	// file, a `build:` Dockerfile path, or an `image:` reference. The routing
+	// path prefix is appended only when set, so the pre-path rendering of a
 	// host-only service is unchanged.
 	if len(d.Services) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Services:")
 		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, svc := range d.Services {
+			source := svc.Entrypoint
+			switch {
+			case svc.Build != "":
+				source = "build:" + svc.Build
+			case svc.Image != "":
+				source = "image:" + svc.Image
+			}
 			if svc.Path != "" {
-				fmt.Fprintf(srw, "  %s\tport=%d replicas=%d path=%s\n", svc.Entrypoint, svc.Port, svc.Replicas, svc.Path)
+				fmt.Fprintf(srw, "  %s\tport=%d replicas=%d path=%s\n", source, svc.Port, svc.Replicas, svc.Path)
 				continue
 			}
-			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", svc.Entrypoint, svc.Port, svc.Replicas)
+			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", source, svc.Port, svc.Replicas)
 		}
 		srw.Flush()
 	}

@@ -107,9 +107,9 @@ func TestServicesReconcileIntegration(t *testing.T) {
 			Root:     root,
 			Debounce: 20 * time.Millisecond,
 			Interval: time.Hour,
-			UpdateServices: func(fnName string, tmpl *function.Template, image string) {
+			UpdateServices: func(fnName, fnDir string, tmpl *function.Template, image string) {
 				ctx := context.Background()
-				svcCtrl.Apply(ctx, fnName, tmpl, image, nil)
+				svcCtrl.Apply(ctx, fnName, fnDir, tmpl, image, nil)
 			},
 			RemoveServices: func(fnName string) {
 				svcCtrl.Remove(context.Background(), fnName)
@@ -230,21 +230,21 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// unchanged.
 	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
 	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
-		Function:   fn1,
-		Entrypoint: "svc.js",
-		Port:       80,
-		Image:      "node:24-alpine",
-		Entry:      stopResponsive,
+		Function: fn1,
+		Identity: "svc.js",
+		Port:     80,
+		Image:    "node:24-alpine",
+		Entry:    stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w1 service: %v", err)
 	}
 	id2, err := m2.StartService(context.Background(), runtime.ServiceSpec{
-		Function:   fn2,
-		Entrypoint: "svc.js",
-		Port:       80,
-		Image:      "node:24-alpine",
-		Entry:      stopResponsive,
+		Function: fn2,
+		Identity: "svc.js",
+		Port:     80,
+		Image:    "node:24-alpine",
+		Entry:    stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w2 service: %v", err)

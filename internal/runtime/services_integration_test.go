@@ -151,12 +151,12 @@ keep_alive()
 	}
 
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function:   "svc-py-svc",
-		Entrypoint: "app/main.py",
-		Port:       8000,
-		Image:      prepared.Image,
-		Entry:      entry,
-		Env:        []string{"PORT=8000"},
+		Function: "svc-py-svc",
+		Identity: "app/main.py",
+		Port:     8000,
+		Image:    prepared.Image,
+		Entry:    entry,
+		Env:      []string{"PORT=8000"},
 	}, 0)
 	if err != nil {
 		t.Fatalf("start service: %v", err)
@@ -228,12 +228,12 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	const replicas = 1
 	for i := 0; i < replicas; i++ {
 		if _, err := m.StartService(ctx, ServiceSpec{
-			Function:   "svc-lifecycle",
-			Entrypoint: "app/service.js",
-			Port:       3000,
-			Image:      image,
-			Entry:      []string{"node", "/app/app/service.js"},
-			Env:        []string{"PORT=3000"},
+			Function: "svc-lifecycle",
+			Identity: "app/service.js",
+			Port:     3000,
+			Image:    image,
+			Entry:    []string{"node", "/app/app/service.js"},
+			Env:      []string{"PORT=3000"},
 		}, i); err != nil {
 			t.Fatalf("start replica %d: %v", i, err)
 		}
@@ -272,12 +272,12 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 			t.Fatalf("inspect %s: nil Config", id)
 		}
 		want := map[string]string{
-			labelType:       ContainerTypeService,
-			labelFunction:   "svc-lifecycle",
-			labelEntrypoint: "app/service.js",
-			labelImage:      image,
-			labelHostname:   "test-host",
-			labelPort:       "3000",
+			labelType:     ContainerTypeService,
+			labelFunction: "svc-lifecycle",
+			labelIdentity: "app/service.js",
+			labelImage:    image,
+			labelHostname: "test-host",
+			labelPort:     "3000",
 		}
 		for k, v := range want {
 			if got := insp.Container.Config.Labels[k]; got != v {
@@ -382,7 +382,7 @@ events:
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	svc1, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Entrypoint: "service.js", Port: 3000,
+		Function: "svc-retire", Identity: "service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
@@ -413,7 +413,7 @@ events:
 	// depends on", start a NEW replica of v2 and retire -> v2 kept, v1 removed.
 	// Re-start v2 replica so it references v2Ref.
 	svc2, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Entrypoint: "service.js", Port: 3000,
+		Function: "svc-retire", Identity: "service.js", Port: 3000,
 		Image: v2Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
@@ -492,7 +492,7 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	if _, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-wait", Entrypoint: "app/service.js", Port: 3000,
+		Function: "svc-wait", Identity: "app/service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0); err != nil {
 		t.Fatalf("start v1 replica: %v", err)
@@ -602,14 +602,14 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	// Happy path: start a routed-looking service with the network + an extra
 	// Traefik label; assert both reach the container.
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function:   "svc-network",
-		Entrypoint: "app/service.js",
-		Port:       3000,
-		Image:      image,
-		Entry:      []string{"node", "/app/app/service.js"},
-		Env:        []string{"PORT=3000"},
-		Labels:     map[string]string{"traefik.enable": "true"},
-		Network:    networkName,
+		Function: "svc-network",
+		Identity: "app/service.js",
+		Port:     3000,
+		Image:    image,
+		Entry:    []string{"node", "/app/app/service.js"},
+		Env:      []string{"PORT=3000"},
+		Labels:   map[string]string{"traefik.enable": "true"},
+		Network:  networkName,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start service: %v", err)
@@ -629,7 +629,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		t.Fatalf("extra routing label missing on container: %v", labels)
 	}
 	if labels[labelType] != ContainerTypeService || labels[labelFunction] != "svc-network" ||
-		labels[labelEntrypoint] != "app/service.js" || labels[labelImage] != image ||
+		labels[labelIdentity] != "app/service.js" || labels[labelImage] != image ||
 		labels[labelHostname] != "test-host" {
 		t.Fatalf("relay ownership labels missing/corrupted on container: %v", labels)
 	}
@@ -644,13 +644,13 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 
 	// Negative: a nonexistent network fails and leaves NO container behind.
 	_, err = m.StartService(ctx, ServiceSpec{
-		Function:   "svc-network",
-		Entrypoint: "app/service.js",
-		Port:       3000,
-		Image:      image,
-		Entry:      []string{"node", "/app/app/service.js"},
-		Env:        []string{"PORT=3000"},
-		Network:    "relay-test-nonexistent-network",
+		Function: "svc-network",
+		Identity: "app/service.js",
+		Port:     3000,
+		Image:    image,
+		Entry:    []string{"node", "/app/app/service.js"},
+		Env:      []string{"PORT=3000"},
+		Network:  "relay-test-nonexistent-network",
 	}, 1)
 	if err == nil {
 		t.Fatal("expected an error starting a service on a nonexistent network")
@@ -663,5 +663,97 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	// The extra replica must not exist: exactly the one happy-path container.
 	if remaining != 1 {
 		t.Fatalf("after a failed create left %d containers for the function; want 1 (the routed one only)", remaining)
+	}
+}
+
+// TestIntegrationBuildServiceImage resolves a `build` source end to end against
+// a real daemon: it builds a service image from a user Dockerfile over the
+// function's selected source, reuses the content-addressed image on a second
+// resolve, invalidates it when a selected source file changes, and runs the
+// resulting image's own ENTRYPOINT (not an overridden one).
+func TestIntegrationBuildServiceImage(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-build")
+		cleanupImagePrefixes(cli, "relay-fn-svc-build:")()
+	})
+
+	dir := t.TempDir()
+	// The Dockerfile builds a tiny image that prints a marker at startup and then
+	// stays alive; its own ENTRYPOINT/CMD are what a container must run.
+	writeFile(t, dir, "Dockerfile", `FROM node:24-alpine
+COPY app.js /app/app.js
+ENTRYPOINT ["node", "/app/app.js"]
+`)
+	writeFile(t, dir, "app.js", "process.on('SIGTERM', () => process.exit(0));\nconsole.log('build-service-marker');\nsetInterval(() => {}, 1 << 30);\n")
+	// A file ignored by selection must not affect the image identity.
+	writeFile(t, dir, ".gitignore", "ignored.txt\n")
+	writeFile(t, dir, "ignored.txt", "junk\n")
+
+	tmpl := &function.Template{Services: []function.Service{{Build: "Dockerfile", Port: 3000, Replicas: 1}}}
+	svc := tmpl.Services[0]
+
+	got, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
+	if err != nil {
+		t.Fatalf("resolve build service: %v", err)
+	}
+	if got.Entry != nil {
+		t.Fatalf("entry = %v, want nil (preserve image ENTRYPOINT)", got.Entry)
+	}
+	if !imageExistsInDaemon(cli, ctx, got.Ref) {
+		t.Fatalf("resolved build image %q does not exist", got.Ref)
+	}
+
+	// A second resolve of an unchanged tree reuses the same content-addressed ref.
+	again, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
+	if err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if again.Ref != got.Ref {
+		t.Fatalf("unchanged tree produced a new ref: %q vs %q", got.Ref, again.Ref)
+	}
+
+	// Editing an IGNORED file keeps the identity; editing a SELECTED file changes
+	// it (and rebuilds).
+	writeFile(t, dir, "ignored.txt", "different junk\n")
+	same, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
+	if err != nil {
+		t.Fatalf("resolve after ignored edit: %v", err)
+	}
+	if same.Ref != got.Ref {
+		t.Fatalf("editing an ignored file changed the build ref: %q vs %q", got.Ref, same.Ref)
+	}
+
+	writeFile(t, dir, "app.js", "process.on('SIGTERM', () => process.exit(0));\nconsole.log('build-service-marker v2');\nsetInterval(() => {}, 1 << 30);\n")
+	changed, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
+	if err != nil {
+		t.Fatalf("resolve after selected edit: %v", err)
+	}
+	if changed.Ref == got.Ref {
+		t.Fatal("editing a selected file did not change the build ref")
+	}
+
+	// The built image's own ENTRYPOINT is preserved on the container.
+	id, err := m.StartService(ctx, ServiceSpec{
+		Function: "svc-build", Identity: "Dockerfile", Port: 3000,
+		Image: changed.Ref, Env: []string{"PORT=3000"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("start build service: %v", err)
+	}
+	waitForContainerRunning(t, ctx, cli, id)
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if insp.Container.Config == nil || len(insp.Container.Config.Entrypoint) != 2 ||
+		insp.Container.Config.Entrypoint[0] != "node" || insp.Container.Config.Entrypoint[1] != "/app/app.js" {
+		t.Fatalf("entrypoint = %v, want the image's own [node /app/app.js]", insp.Container.Config.Entrypoint)
 	}
 }

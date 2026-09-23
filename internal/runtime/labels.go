@@ -8,14 +8,15 @@ package runtime
 //	schedule — a one-shot invocation container for a schedule occurrence
 //	          (runner.InvokeHandler). relay.handler is the schedule handler.
 //	service  — a persistent, long-lived service container (Manager.StartService).
-//	          relay.entrypoint is the application entrypoint file — the service
-//	          identity. Service containers carry relay.entrypoint and NO
-//	          relay.handler and NO relay.service label: the entrypoint IS the
+//	          relay.identity is the service identity: the configured source
+//	          descriptor (entrypoint file, Dockerfile path, or external image
+//	          reference). Service containers carry relay.identity and NO
+//	          relay.handler and NO relay.service label: the source IS the
 //	          service.
 //
 // relay.handler identifies the handler for event/schedule containers only
 // (the one-shot invocation form); service containers instead carry
-// relay.entrypoint (the long-lived application entrypoint file). There is no
+// relay.identity (the configured source descriptor). There is no
 // relay.service label. The sweep and reconciliation predicates rely on
 // relay.type being strict: an unknown or missing type is treated as NOT
 // Relay-owned, so the strict label set is the single mechanism that keeps
@@ -44,9 +45,16 @@ const (
 	labelHostname  = "relay.hostname"
 	labelImage     = "relay.image"
 
-	labelEntrypoint = "relay.entrypoint"
-	labelPort       = "relay.port"
-	labelReplica    = "relay.replica"
+	// labelIdentity is the persistent service's identity: the configured source
+	// descriptor (entrypoint file, Dockerfile path, or external image
+	// reference). It replaces the former relay.entrypoint label so every source
+	// kind has an honest identity. labelImageID records the local content ID a
+	// service container was started from (empty for content-addressed Relay
+	// tags), so a moved external tag is detected.
+	labelIdentity = "relay.identity"
+	labelImageID  = "relay.image_id"
+	labelPort     = "relay.port"
+	labelReplica  = "relay.replica"
 
 	// Managed-image labels. These pin the identity and wiring of a managed
 	// image (function or dependency) so the dependency GC can classify images

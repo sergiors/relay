@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -12,20 +13,20 @@ import (
 
 func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	got := serviceLabels(ServiceSpec{
-		Function:   "user-events",
-		Entrypoint: "service.js",
-		Port:       3000,
-		Image:      "relay-fn-user-events:632aca75fa306911",
+		Function: "user-events",
+		Identity: "service.js",
+		Port:     3000,
+		Image:    "relay-fn-user-events:632aca75fa306911",
 	}, "worker-1", 2)
 
 	want := map[string]string{
-		labelType:       ContainerTypeService,
-		labelFunction:   "user-events",
-		labelEntrypoint: "service.js",
-		labelImage:      "relay-fn-user-events:632aca75fa306911",
-		labelHostname:   "worker-1",
-		labelPort:       "3000",
-		labelReplica:    "2",
+		labelType:     ContainerTypeService,
+		labelFunction: "user-events",
+		labelIdentity: "service.js",
+		labelImage:    "relay-fn-user-events:632aca75fa306911",
+		labelHostname: "worker-1",
+		labelPort:     "3000",
+		labelReplica:  "2",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -40,7 +41,7 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 			t.Errorf("relay.type must be %q, got %q", ContainerTypeService, got[k])
 		}
 	}
-	// Service containers carry relay.entrypoint and NO relay.handler and NO
+	// Service containers carry relay.identity and NO relay.handler and NO
 	// relay.service label.
 	if _, ok := got[labelHandler]; ok {
 		t.Errorf("service labels must NOT carry relay.handler, got %v", got)
@@ -56,22 +57,65 @@ func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 		function   string
 		entrypoint string
 		replica    int
-		want       string
+		wantPrefix string
 	}{
-		{"plain", "user-events", "service.js", 0, "relay-svc-user-events-service.js-0"},
-		{"nested", "fn", "app/service.js", 0, "relay-svc-fn-app-service.js-0"},
-		{"sanitize entrypoint", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-1"},
-		{"cap over 100", "averylongfunctionname", strings.Repeat("x", 200), 99, ""},
+		{"plain", "user-events", "service.js", 0, "relay-svc-user-events-service.js-"},
+		{"nested", "fn", "app/service.js", 0, "relay-svc-fn-app-service.js-"},
+		{"sanitize entrypoint", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := serviceContainerName(tc.function, tc.entrypoint, tc.replica)
-			if len(got) > 100 {
-				t.Fatalf("name length %d exceeds cap 100", len(got))
+			if len(got) > serviceContainerNameLenCap {
+				t.Fatalf("name length %d exceeds cap %d", len(got), serviceContainerNameLenCap)
 			}
-			if tc.want != "" && got != tc.want {
-				t.Errorf("name = %q, want %q", got, tc.want)
+			if !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Errorf("name = %q, want prefix %q", got, tc.wantPrefix)
+			}
+			if !strings.HasSuffix(got, "-"+strconv.Itoa(tc.replica)) {
+				t.Errorf("name = %q, want the -%d replica suffix", got, tc.replica)
+			}
+			if !strings.Contains(got, serviceIdentityHash(tc.function, tc.entrypoint)) {
+				t.Errorf("name = %q, want the identity hash %q", got, serviceIdentityHash(tc.function, tc.entrypoint))
 			}
 		})
+	}
+	// A long identity still yields a name within the cap, keeps the replica
+	// suffix, and retains the identity hash.
+	got := serviceContainerName("averylongfunctionname", strings.Repeat("x", 200), 99)
+	if len(got) > serviceContainerNameLenCap {
+		t.Fatalf("long name length %d exceeds cap %d", len(got), serviceContainerNameLenCap)
+	}
+	if !strings.HasSuffix(got, "-99") {
+		t.Fatalf("long name = %q, want the -99 replica suffix preserved", got)
+	}
+	if !strings.Contains(got, serviceIdentityHash("averylongfunctionname", strings.Repeat("x", 200))) {
+		t.Fatalf("long name = %q lost the identity hash", got)
+	}
+}
+
+// TestServiceContainerNameCollisionResistant pins the reviewer finding for the
+// generated container name: distinct identities that sanitize to the same
+// readable base (or that truncate to the same prefix) must still get distinct
+// names.
+func TestServiceContainerNameCollisionResistant(t *testing.T) {
+	a := serviceContainerName("fn", "ghcr.io/acme/a/b:1", 0)
+	b := serviceContainerName("fn", "ghcr.io/acme/a-b:1", 0)
+	if a == b {
+		t.Fatalf("distinct identities collided in the container name: %q", a)
+	}
+	if !strings.Contains(a, serviceIdentityHash("fn", "ghcr.io/acme/a/b:1")) ||
+		!strings.Contains(b, serviceIdentityHash("fn", "ghcr.io/acme/a-b:1")) {
+		t.Fatalf("container names lack the full-identity hash: %q / %q", a, b)
+	}
+	// Long identities truncated to the same readable prefix stay distinct.
+	long := strings.Repeat("deep/nested/path/", 15)
+	x := serviceContainerName("fn", long+"one.js", 0)
+	y := serviceContainerName("fn", long+"two.js", 0)
+	if x == y {
+		t.Fatalf("truncated identities collided in the container name: %q", x)
+	}
+	if len(x) > serviceContainerNameLenCap || len(y) > serviceContainerNameLenCap {
+		t.Fatalf("names exceed the cap: %d / %d", len(x), len(y))
 	}
 }
 
@@ -177,7 +221,7 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 // even though they carry relay.function + relay.hostname and would otherwise be
 // Relay-owned — a service must never be swept as an orphan.
 func TestSweepSkipsServiceContainers(t *testing.T) {
-	svc := serviceLabels(ServiceSpec{Function: "f", Entrypoint: "svc", Image: "img"}, "test-host", 0)
+	svc := serviceLabels(ServiceSpec{Function: "f", Identity: "svc", Image: "img"}, "test-host", 0)
 	if !sweepSkips(svc) {
 		t.Error("sweepSkips(service labels) = false, want true (services are persistent, reconciler-owned)")
 	}
@@ -204,9 +248,9 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 // non-service container (including one with no labels at all) is excluded safely.
 // The client-call path is exercised without a real Docker daemon.
 func TestServiceContainerListParsing(t *testing.T) {
-	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.entrypoint":"svc.js",` +
+	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2"}`
-	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.entrypoint":"svc.js",` +
+	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
 		`{"Id":"c2","Labels":` + c2Labels + `},` +
@@ -228,7 +272,7 @@ func TestServiceContainerListParsing(t *testing.T) {
 	}
 
 	c1 := byID["c1"]
-	if c1.Function != "fn-a" || c1.Entrypoint != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
+	if c1.Function != "fn-a" || c1.Identity != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
 		t.Errorf("c1 identity = %+v, want the label-derived identity", c1)
 	}
 	if c1.Replica != 2 {
@@ -260,10 +304,10 @@ func TestServiceContainerListParsing(t *testing.T) {
 // authoritative relay value.
 func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	spec := ServiceSpec{
-		Function:   "user-events",
-		Entrypoint: "service.js",
-		Port:       3000,
-		Image:      "relay-fn-user-events:deadbeef",
+		Function: "user-events",
+		Identity: "service.js",
+		Port:     3000,
+		Image:    "relay-fn-user-events:deadbeef",
 		Labels: map[string]string{
 			"traefik.enable": "true",
 			// Attempted spoof of Relay ownership keys.
@@ -290,7 +334,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got["custom.key"] != "custom-value" {
 		t.Fatalf("custom label missing: %v", got)
 	}
-	if got[labelEntrypoint] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
+	if got[labelIdentity] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
 		t.Fatalf("ownership labels corrupted: %v", got)
 	}
 }

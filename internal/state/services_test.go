@@ -106,3 +106,61 @@ func TestServiceEmptyStored(t *testing.T) {
 		t.Fatalf("services = %d, want 0 for a template without services", len(d.Services))
 	}
 }
+
+const sourceServicesTmpl = `runtime: node24
+services:
+  - entrypoint: service.js
+    port: 3000
+  - build: docker/Dockerfile.prod
+    port: 8080
+    replicas: 2
+  - image: ghcr.io/acme/api:1.2
+    port: 9090
+`
+
+// stateServiceIdentity derives a persisted service's identity from its source
+// fields — whichever of entrypoint/build/image is set — mirroring
+// function.Service.SourceRef.
+func stateServiceIdentity(s Service) string {
+	switch {
+	case s.Build != "":
+		return s.Build
+	case s.Image != "":
+		return s.Image
+	default:
+		return s.Entrypoint
+	}
+}
+
+// TestServiceSourceKindsRoundTrip seeds a template whose services use all three
+// source kinds and asserts each row round-trips its source and keyed identity.
+func TestServiceSourceKindsRoundTrip(t *testing.T) {
+	st := openTestState(t)
+	tmpl := mustTemplate(t, sourceServicesTmpl)
+	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+
+	d, ok := st.GetFunction("demo")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	if len(d.Services) != 3 {
+		t.Fatalf("services = %d, want 3", len(d.Services))
+	}
+	// Rows are ordered by source.
+	byIdentity := map[string]Service{}
+	for _, s := range d.Services {
+		byIdentity[stateServiceIdentity(s)] = s
+	}
+	ep, ok := byIdentity["service.js"]
+	if !ok || ep.Entrypoint != "service.js" || ep.Build != "" || ep.Image != "" || ep.Port != 3000 {
+		t.Fatalf("entrypoint service = %+v", ep)
+	}
+	bd, ok := byIdentity["docker/Dockerfile.prod"]
+	if !ok || bd.Build != "docker/Dockerfile.prod" || bd.Entrypoint != "" || bd.Image != "" || bd.Port != 8080 || bd.Replicas != 2 {
+		t.Fatalf("build service = %+v", bd)
+	}
+	im, ok := byIdentity["ghcr.io/acme/api:1.2"]
+	if !ok || im.Image != "ghcr.io/acme/api:1.2" || im.Entrypoint != "" || im.Build != "" || im.Port != 9090 {
+		t.Fatalf("image service = %+v", im)
+	}
+}

@@ -55,9 +55,10 @@ type Detail struct {
 	Handlers        []Handler
 	Schedules       []Schedule
 	// Services lists the function's persistent services. It is configuration
-	// metadata (like the schedules): each entry holds the effective entrypoint
-	// file, internal TCP port, and desired replica count. It is nil when the
-	// template defines none.
+	// metadata (like the schedules): each entry holds the effective source
+	// (entrypoint file, Dockerfile path, or image reference), internal TCP
+	// port, and desired replica count. It is nil when the template defines
+	// none.
 	Services []Service
 	// Env and Secrets are the function's env/secret MAPPINGS from its template:
 	// env-var name → literal value, and env-var name → secret reference. They
@@ -85,10 +86,16 @@ type Schedule struct {
 }
 
 // Service is one persistent service's effective configuration as persisted
-// from the template: the application entrypoint file, the optional routing path
-// prefix, its internal TCP port, and the desired replica count.
+// from the template: its source (exactly one of the entrypoint file, the
+// Dockerfile path, or the external image reference), the optional routing path
+// prefix, its internal TCP port, and the desired replica count. Its identity is
+// the configured source descriptor (SourceRef), i.e. whichever of
+// Entrypoint/Build/Image is set; it is derived, never stored as a separate
+// field.
 type Service struct {
 	Entrypoint string
+	Build      string
+	Image      string
 	Path       string
 	Port       int
 	Replicas   int
@@ -234,14 +241,20 @@ func (c *State) initSchema(ctx context.Context) error {
 		// services is keyed by function_name but carries no foreign key, like
 		// handlers and schedules: cleanup is explicit (removeTx), not relational,
 		// for the same reasoning documented above (function stats rows can exist
-		// without a functions row, and no PRAGMA foreign_keys is forced).
+		// without a functions row, and no PRAGMA foreign_keys is forced). The
+		// primary key is the configured source — exactly one of
+		// entrypoint/build/image is non-empty (the others are the empty string,
+		// never NULL, so the composite stays unique) — which is the same stable
+		// identity used on containers and routing (see function.Service.SourceRef).
 		`CREATE TABLE IF NOT EXISTS services (
 			function_name TEXT,
 			entrypoint TEXT,
+			build TEXT,
+			image TEXT,
 			path TEXT,
 			port INTEGER,
 			replicas INTEGER,
-			PRIMARY KEY (function_name, entrypoint)
+			PRIMARY KEY (function_name, entrypoint, build, image)
 		)`,
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
@@ -663,21 +676,30 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	}
 
 	srows2, err := c.db.QueryContext(ctx,
-		`SELECT entrypoint, path, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, port`, name)
+		`SELECT entrypoint, build, image, path, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, build, image`, name)
 	if err != nil {
 		c.log.Warn("State: services read failed", "function", name, "error", err)
 		return d, true
 	}
 	defer srows2.Close()
 	for srows2.Next() {
-		var se string
+		// The three source columns are never NULL: exactly one holds the source
+		// descriptor and the others are the empty string (see the schema).
+		var se, sb, si string
 		var sePath sql.NullString
 		var sp, sr int
-		if err := srows2.Scan(&se, &sePath, &sp, &sr); err != nil {
+		if err := srows2.Scan(&se, &sb, &si, &sePath, &sp, &sr); err != nil {
 			c.log.Warn("State: scan service failed", "function", name, "error", err)
 			continue
 		}
-		d.Services = append(d.Services, Service{Entrypoint: se, Path: sePath.String, Port: sp, Replicas: sr})
+		d.Services = append(d.Services, Service{
+			Entrypoint: se,
+			Build:      sb,
+			Image:      si,
+			Path:       sePath.String,
+			Port:       sp,
+			Replicas:   sr,
+		})
 	}
 	return d, true
 }
@@ -759,17 +781,20 @@ func replaceSchedules(tx *sql.Tx, name string, tmpl *function.Template) error {
 }
 
 // replaceServices deletes a function's services and re-inserts them from the
-// template, so the service list always mirrors the latest parsed template. Path
-// is stored as its canonical string (empty = host-only routing); port and
-// replicas as their effective integer values (defaults included).
+// template, so the service list always mirrors the latest parsed template. The
+// key is the configured source — exactly one of entrypoint/build/image is
+// non-empty (the others are stored as empty strings, never NULL) — which is the
+// service's identity. Path is stored as its canonical string (empty = host-only
+// routing); port and replicas as their effective integer values (defaults
+// included).
 func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
 	if _, err := tx.Exec(`DELETE FROM services WHERE function_name = ?`, name); err != nil {
 		return err
 	}
 	for _, s := range tmpl.Services {
 		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO services (function_name, entrypoint, path, port, replicas) VALUES (?,?,?,?,?)`,
-			name, s.Entrypoint, s.Path, s.Port, s.Replicas); err != nil {
+			`INSERT OR REPLACE INTO services (function_name, entrypoint, build, image, path, port, replicas) VALUES (?,?,?,?,?,?,?)`,
+			name, s.Entrypoint, s.Build, s.Image, s.Path, s.Port, s.Replicas); err != nil {
 			return err
 		}
 	}

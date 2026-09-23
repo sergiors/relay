@@ -145,7 +145,7 @@ func TestReconcileRetireRunsAfterServiceConvergence(t *testing.T) {
 		Root:     root,
 		Debounce: 10 * time.Millisecond,
 		Interval: time.Hour,
-		UpdateServices: func(name string, tmpl *function.Template, image string) {
+		UpdateServices: func(name, _ string, tmpl *function.Template, image string) {
 			mu.Lock()
 			order = append(order, "update "+name+"="+strconv.Itoa(len(tmpl.Services))+"@"+image)
 			mu.Unlock()

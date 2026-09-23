@@ -756,3 +756,43 @@ func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 		}
 	}
 }
+
+// Services using build and image sources render with their source kind prefix,
+// so an operator can tell how each service is produced.
+func TestFunctionInspectServicesSourceKinds(t *testing.T) {
+	st, _ := openTempState(t)
+	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+services:
+  - entrypoint: service.js
+    port: 3000
+  - build: docker/Dockerfile.prod
+    port: 8080
+  - image: ghcr.io/acme/api:1.2
+    port: 9090
+`))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	st.RecordReconcileSuccess("src-kinds", "img", "fp", time.Now(),
+		function.Function{Name: "src-kinds", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
+	d, ok := st.GetFunction("src-kinds")
+	if !ok {
+		t.Fatal("expected function")
+	}
+	var w bytes.Buffer
+	printInspect(&w, st, d)
+	out := w.String()
+	for _, want := range []string{
+		"service.js", "port=3000",
+		"build:docker/Dockerfile.prod", "port=8080",
+		"image:ghcr.io/acme/api:1.2", "port=9090",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inspect output missing %q\n%s", want, out)
+		}
+	}
+}

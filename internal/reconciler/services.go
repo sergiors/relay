@@ -48,6 +48,18 @@ import (
 // satisfies it; the structural assertion lives in the worker wiring (worker.go),
 // not here.
 type Docker interface {
+	// ResolveServiceImage resolves one service's configured source to the image
+	// a container should run: the function image for an `entrypoint` source, a
+	// content-addressed Relay-built image for a `build` source, or an inspected/
+	// pulled external image for an `image` source. It is resolved BEFORE any
+	// container action, so a build or pull failure preserves healthy containers.
+	ResolveServiceImage(
+		ctx context.Context,
+		fnName, fnDir string,
+		tmpl *function.Template,
+		svc function.Service,
+		functionImage string,
+	) (runtime.ServiceImage, error)
 	StartService(ctx context.Context, spec runtime.ServiceSpec, replica int) (string, error)
 	ServiceContainerList(ctx context.Context) ([]runtime.ServiceContainer, error)
 	StopServiceContainers(ctx context.Context, containers []runtime.ServiceContainer) error
@@ -127,9 +139,9 @@ func BuildEnv(
 func Reconcile(
 	ctx context.Context,
 	d Docker,
-	fnName string,
+	fnName, fnDir string,
 	tmpl *function.Template,
-	image string,
+	functionImage string,
 	preparedEnv []string,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
@@ -148,7 +160,7 @@ func Reconcile(
 
 	desired := make(map[string]function.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
-		desired[svc.Entrypoint] = svc
+		desired[svc.SourceRef()] = svc
 	}
 
 	var firstErr error
@@ -166,18 +178,19 @@ func Reconcile(
 			// Another function owns this container; its reconcile handles it.
 			continue
 		}
-		if _, ok := desired[c.Entrypoint]; !ok {
+		if _, ok := desired[c.Identity]; !ok {
 			changed = true
 			if err := d.StopServiceContainers(ctx, []runtime.ServiceContainer{c}); err != nil {
-				fail(fmt.Errorf("service %q removed: %w", c.Entrypoint, err))
+				fail(fmt.Errorf("service %q removed: %w", c.Identity, err))
 			}
 			continue
 		}
-		byService[c.Entrypoint] = append(byService[c.Entrypoint], c)
+		byService[c.Identity] = append(byService[c.Identity], c)
 	}
 
 	for _, svc := range tmpl.Services {
-		existing := byService[svc.Entrypoint]
+		identity := svc.SourceRef()
+		existing := byService[identity]
 
 		// Routing validation runs FIRST, before any classification or stops:
 		// a routed service (one declaring a host) whose routing config is
@@ -188,9 +201,9 @@ func Reconcile(
 		routeNetwork := ""
 		if svc.Host != "" {
 			if err := traefik.Validate(); err != nil {
-				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
+				err := fmt.Errorf("service %q: %w", identity, err)
 				fail(err)
-				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
 			// The per-service effective host (declared host, or the override
@@ -200,9 +213,9 @@ func Reconcile(
 			// preserving the routing-first ordering; with no override it is a
 			// no-op on an already-validated template host.
 			if err := traefik.ValidateHost(svc.Host); err != nil {
-				err := fmt.Errorf("service %q: %w", svc.Entrypoint, err)
+				err := fmt.Errorf("service %q: %w", identity, err)
 				fail(err)
-				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
 			// The routing network (e.g. the Traefik network) is infrastructure
@@ -210,18 +223,18 @@ func Reconcile(
 			// start routed containers otherwise — it never creates it.
 			ok, err := d.NetworkExists(ctx, traefik.Network)
 			if err != nil {
-				err := fmt.Errorf("service %q: check routing network: %w", svc.Entrypoint, err)
+				err := fmt.Errorf("service %q: check routing network: %w", identity, err)
 				fail(err)
-				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
 			if !ok {
-				err := fmt.Errorf("service %q: %w", svc.Entrypoint, routing.MissingNetwork(traefik.Network))
+				err := fmt.Errorf("service %q: %w", identity, routing.MissingNetwork(traefik.Network))
 				fail(err)
-				log.Warn("Service: routing validation failed", "service", svc.Entrypoint, "error", err)
+				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
-			routeLabels = routing.TraefikLabels(fnName, svc.Entrypoint, svc.Host, svc.Path, svc.Port, traefik)
+			routeLabels = routing.TraefikLabels(fnName, identity, svc.Host, svc.Path, svc.Port, traefik)
 			routeNetwork = traefik.Network
 			// Optional routing values log only when set, omitting empty
 			// ones; the generated labels themselves are never logged.
@@ -244,16 +257,38 @@ func Reconcile(
 			log.Debug("Service: routing configured",
 				append([]any{
 					"function", fnName,
-					"service", svc.Entrypoint,
+					"service", identity,
 					"host", svc.Host,
 					"network", routeNetwork,
 				}, attrs...)...)
 		}
 
+		// Resolve the source's image and environment BEFORE any container
+		// action. A source that cannot be resolved — a failed build, a failed
+		// pull, a missing image, an unlaunchable entrypoint, or an unresolved
+		// secret — is reported and this service is skipped entirely: its
+		// existing (healthy) containers are preserved rather than replaced on a
+		// failed resolution. This is the ordering guarantee that a transient
+		// registry outage never tears down a working service.
+		resolved, err := d.ResolveServiceImage(ctx, fnName, fnDir, tmpl, svc, functionImage)
+		if err != nil {
+			fail(fmt.Errorf("service %q: %w", identity, err))
+			log.Warn("Service: cannot resolve source; keeping existing containers",
+				"service", identity, "error", err)
+			continue
+		}
+		env, err := BuildEnv(ctx, tmpl, svc.Port, preparedEnv, secrets)
+		if err != nil {
+			fail(fmt.Errorf("service %q: %w", identity, err))
+			log.Warn("Service: cannot start replicas", "service", identity, "error", err)
+			continue
+		}
+
 		// A container is a keep candidate only when it is both healthy (running)
-		// and currently configured correctly (image and port match the desired
-		// value) and carries a real replica label. Anything else — exited/dead/
-		// removing, a changed image (rebuild), a changed port, or an unlabeled
+		// and currently configured correctly (image, image content, and port
+		// match the desired values) and carries a real replica label. Anything
+		// else — exited/dead/removing, a changed image (rebuild), a moved
+		// external tag (image content changed), a changed port, or an unlabeled
 		// legacy container (Replica == -1) — is stale and must be replaced. In
 		// addition, the container's labels must match the desired routing label
 		// set exactly: a changed host/path/port/network leaves stale Traefik
@@ -263,7 +298,8 @@ func Reconcile(
 		var stale []runtime.ServiceContainer
 		for _, c := range existing {
 			if c.State == container.StateRunning &&
-				c.Image == image &&
+				c.Image == resolved.Ref &&
+				c.ImageID == resolved.ID &&
 				c.Port == svc.Port &&
 				c.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, c.Labels) {
@@ -294,25 +330,8 @@ func Reconcile(
 		if len(stale) > 0 {
 			changed = true
 			if err := d.StopServiceContainers(ctx, stale); err != nil {
-				fail(fmt.Errorf("service %q stale: %w", svc.Entrypoint, err))
+				fail(fmt.Errorf("service %q stale: %w", identity, err))
 			}
-		}
-
-		// Resolve the entrypoint and environment ONCE per service; when either
-		// fails we cannot start replicas, but the stops above already happened.
-		// Log the reason before continuing so the missing-replica condition is
-		// diagnosable rather than silent.
-		entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
-		if err != nil {
-			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
-			log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
-			continue
-		}
-		env, err := BuildEnv(ctx, tmpl, svc.Port, preparedEnv, secrets)
-		if err != nil {
-			fail(fmt.Errorf("service %q: %w", svc.Entrypoint, err))
-			log.Warn("Service: cannot start replicas", "service", svc.Entrypoint, "error", err)
-			continue
 		}
 
 		// Start the deficit: every desired slot 0..Replicas-1 that no kept
@@ -323,17 +342,18 @@ func Reconcile(
 			}
 			changed = true
 			spec := runtime.ServiceSpec{
-				Function:   fnName,
-				Entrypoint: svc.Entrypoint,
-				Port:       svc.Port,
-				Image:      image,
-				Entry:      entry,
-				Env:        env,
-				Labels:     routeLabels,
-				Network:    routeNetwork,
+				Function: fnName,
+				Identity: identity,
+				Port:     svc.Port,
+				Image:    resolved.Ref,
+				ImageID:  resolved.ID,
+				Entry:    resolved.Entry,
+				Env:      env,
+				Labels:   routeLabels,
+				Network:  routeNetwork,
 			}
 			if _, err := d.StartService(ctx, spec, slot); err != nil {
-				fail(fmt.Errorf("service %q replica %d: %w", svc.Entrypoint, slot, err))
+				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))
 			}
 		}
 	}
@@ -463,9 +483,14 @@ func NewServiceReconciler(
 // service-convergence failure must not fail the function's reconcile. The
 // Info/Debug distinction means an unchanged function (periodic self-healing
 // tick) does not log at Info; only converges that actually changed or failed do.
+//
+// fnDir is the function's directory, needed to resolve `build` sources (their
+// Dockerfile is read relative to it) and to fingerprint their selected source.
+// image is the function's own prepared image, used only by `entrypoint`
+// sources. fnDir may be empty when the template declares no build service.
 func (c *ServiceReconciler) Apply(
 	ctx context.Context,
-	fnName string,
+	fnName, fnDir string,
 	tmpl *function.Template,
 	image string,
 	preparedEnv []string,
@@ -478,7 +503,7 @@ func (c *ServiceReconciler) Apply(
 		replicas += svc.Replicas
 	}
 
-	changed, err := Reconcile(ctx, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log)
+	changed, err := Reconcile(ctx, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log)
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
 			"function", fnName,

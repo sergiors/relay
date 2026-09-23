@@ -135,15 +135,55 @@ type Schedule struct {
 	Retries int
 }
 
+// ServiceSource names which of a service's three mutually exclusive sources is
+// configured. A service declares EXACTLY ONE source, so Source() is total for a
+// parsed service.
+type ServiceSource string
+
+const (
+	// ServiceSourceEntrypoint is a runtime-managed application entrypoint file:
+	// the function image is built by the runtime engine and its invocation
+	// bootstrap entrypoint is overridden per container to run the file.
+	ServiceSourceEntrypoint ServiceSource = "entrypoint"
+	// ServiceSourceBuild is a user-supplied Dockerfile (path relative to the
+	// function directory). Relay builds an image from the function's selected
+	// source (the same .gitignore-driven selection that fingerprints a
+	// function) using the Docker Engine API, and runs it preserving the
+	// Dockerfile's own ENTRYPOINT/CMD.
+	ServiceSourceBuild ServiceSource = "build"
+	// ServiceSourceImage is an external image reference. Relay inspects the
+	// local image and pulls it from its registry when needed; the image's own
+	// ENTRYPOINT/CMD are preserved. External images are never removed by
+	// Relay's image cleanup (Relay only ever cleans its relay-fn-* namespace).
+	ServiceSourceImage ServiceSource = "image"
+)
+
 // Service is one persistent HTTP service from the template's `services`
-// list: the application entrypoint file the runtime starts as the long-lived
-// process, the internal TCP port the application listens on, and the desired
-// replica count Relay maintains. Entrypoint is an application entrypoint file
-// (e.g. "service.js" or "app/main.py"), a relative path inside the application
-// directory, NOT the module.function invocation-handler form. Port and
-// Replicas are always effective (non-zero) after ParseTemplate.
+// list. It declares EXACTLY ONE source (entrypoint, build, or image), the
+// internal TCP port the application listens on, and the desired replica count
+// Relay maintains. Port and Replicas are always effective (non-zero) after
+// ParseTemplate.
+//
+// The configured source descriptor (SourceRef) is the service's stable
+// identity: the entrypoint file, the Dockerfile path, or the external image
+// reference. It is deliberately NOT a synthetic entrypoint string, so every
+// source kind has an honest identity that survives reconciliation across
+// restarts. It is the grouping key for containers, the routing id input, and
+// the persisted service key. Source descriptors are unique within a function
+// (rejected at parse time), because they must key containers and routing
+// deterministically.
 type Service struct {
+	// Entrypoint is the runtime-managed entrypoint source: an application
+	// entrypoint file (e.g. "service.js" or "app/main.py"), a relative path
+	// inside the application directory, NOT the module.function handler form.
 	Entrypoint string
+	// Build is the Dockerfile source: a path to a Dockerfile relative to the
+	// function directory (e.g. "Dockerfile" or "docker/Dockerfile.prod"). The
+	// build context is the function's selected source.
+	Build string
+	// Image is the external image source reference (e.g. "ghcr.io/acme/api:1.2"),
+	// inspected locally and pulled when needed. Relay never cleans it up.
+	Image string
 	// Host is the optional hostname (e.g. "api.example.com") this service is
 	// exposed through the routing layer (Traefik, at the wiring level); empty
 	// means an internal unrouted service with no routing labels. It is generic
@@ -162,6 +202,58 @@ type Service struct {
 	Path     string
 	Port     int
 	Replicas int
+}
+
+// NeedsRuntime reports whether Relay must know how to launch this template:
+// any event rule or cron schedule runs through a runtime, and any
+// `entrypoint`-source service is launched by a runtime-specific command. An
+// explicitly configured runtime is also honored (it is what the operator asked
+// Relay to build and run through), so it always counts as needed. Only a
+// template that declares NO runtime and whose only services use `build` or
+// `image` sources needs none — those images carry their own ENTRYPOINT/CMD.
+func (t *Template) NeedsRuntime() bool {
+	if t.Runtime != "" {
+		return true
+	}
+	if len(t.Events) > 0 || len(t.Schedules) > 0 {
+		return true
+	}
+	for _, s := range t.Services {
+		if s.Source() == ServiceSourceEntrypoint {
+			return true
+		}
+	}
+	return false
+}
+
+// Source reports which of the three mutually exclusive sources is configured.
+// Exactly one is set after ParseTemplate.
+func (s Service) Source() ServiceSource {
+	switch {
+	case s.Build != "":
+		return ServiceSourceBuild
+	case s.Image != "":
+		return ServiceSourceImage
+	default:
+		return ServiceSourceEntrypoint
+	}
+}
+
+// SourceRef returns the configured source's descriptor: the entrypoint file,
+// the Dockerfile path, or the external image reference. It is the value that
+// identifies the source bytes, and it is also the service's stable identity —
+// the container grouping key, routing id input, and persisted key (see
+// Service's type comment). Callers derive identity from this, never from a
+// separate field.
+func (s Service) SourceRef() string {
+	switch s.Source() {
+	case ServiceSourceBuild:
+		return s.Build
+	case ServiceSourceImage:
+		return s.Image
+	default:
+		return s.Entrypoint
+	}
 }
 
 // EventRule pairs a handler (module.function) with a matching pattern and a
@@ -417,7 +509,14 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		} `yaml:"schedules"`
 		Services []struct {
 			Entrypoint string `yaml:"entrypoint"`
-			Host       string `yaml:"host"`
+			// Build is the optional Dockerfile source, a path relative to the
+			// function directory. Exactly one of Entrypoint/Build/Image must be
+			// set.
+			Build string `yaml:"build"`
+			// Image is the optional external image source reference. Exactly one
+			// of Entrypoint/Build/Image must be set.
+			Image string `yaml:"image"`
+			Host  string `yaml:"host"`
 			// Path is optional; empty (omitted or "") means host-only routing.
 			// It is decoded as a plain string so an omitted and an explicit ""
 			// are indistinguishable, matching the "empty = omitted" rule.
@@ -452,12 +551,6 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		return nil, err
 	}
 
-	if t.Runtime == "" {
-		return nil, fmt.Errorf("runtime is required")
-	}
-	if !supportedRuntimes[t.Runtime] {
-		return nil, fmt.Errorf("unsupported runtime %q", t.Runtime)
-	}
 	// A template must do SOMETHING: it must carry at least one event rule or at
 	// least one persistent service. A template with neither is inert and almost
 	// certainly a template-authoring mistake, so it is rejected rather than
@@ -465,6 +558,30 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	// is legitimate: a persistent HTTP service does not consume events.
 	if len(raw.Events) == 0 && len(raw.Services) == 0 {
 		return nil, fmt.Errorf("template must contain at least one event rule or one service")
+	}
+
+	// The runtime is required whenever Relay must know how to launch the
+	// function: event/schedule handlers always run through a runtime, and an
+	// `entrypoint` service is launched by a runtime-specific command. A
+	// services-only template whose services ALL use `build` or `image` sources
+	// needs no runtime at all — those images carry their own ENTRYPOINT/CMD —
+	// so runtime is optional there. A mixed template (events or schedules
+	// alongside services) still requires it.
+	needsRuntime := len(raw.Events) > 0 || len(raw.Schedules) > 0
+	for _, s := range raw.Services {
+		if s.Entrypoint != "" {
+			needsRuntime = true
+		}
+	}
+	if t.Runtime == "" {
+		if needsRuntime {
+			return nil, fmt.Errorf("runtime is required")
+		}
+	} else if !supportedRuntimes[t.Runtime] {
+		// An explicitly configured runtime is validated even when it is not
+		// strictly needed, so a typo in an otherwise build/image-only template is
+		// still a configuration error rather than silently ignored.
+		return nil, fmt.Errorf("unsupported runtime %q", t.Runtime)
 	}
 
 	for _, ev := range raw.Events {
@@ -547,53 +664,87 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		})
 	}
 
-	// Parse and validate the optional persistent services. Each entry requires an
-	// entrypoint: an APPLICATION ENTRYPOINT file, a relative path inside the
-	// application directory, e.g. "service.js" or "app/main.py", NOT the
-	// module.function event-handler form, so validateHandler is intentionally
-	// NOT applied. The entrypoint string is the service's identity: duplicates
-	// would be ambiguous for reconciliation, so they are rejected. Port and
-	// replicas are optional with defaults (DefaultServicePort /
-	// DefaultServiceReplicas). Host and path are optional and independently
-	// omitted-preserving: an omitted/empty path leaves the service routed by
-	// host alone, and a path without a host is rejected. Services are optional —
-	// a template without the `services` key parses exactly as before.
+	// Parse and validate the optional persistent services. Each entry requires
+	// EXACTLY ONE source: `entrypoint` (a runtime-managed application entrypoint
+	// file, e.g. "service.js" or "app/main.py", NOT the module.function
+	// event-handler form, so validateHandler is intentionally NOT applied),
+	// `build` (a Dockerfile path relative to the function directory), or
+	// `image` (an external image reference). The source descriptor is the
+	// service's identity: duplicates within the function would be ambiguous for
+	// reconciliation, so they are rejected. Port and replicas are optional with
+	// defaults (DefaultServicePort / DefaultServiceReplicas). Host and path are
+	// optional and independently omitted-preserving: an omitted/empty path
+	// leaves the service routed by host alone, and a path without a host is
+	// rejected. Services are optional — a template without the `services` key
+	// parses exactly as before.
 	seen := make(map[string]bool, len(raw.Services))
 	for _, s := range raw.Services {
-		if s.Entrypoint == "" {
-			return nil, fmt.Errorf("service is missing an entrypoint")
+		entrypoint, build, image := s.Entrypoint, s.Build, s.Image
+		set := 0
+		for _, v := range []string{entrypoint, build, image} {
+			if v != "" {
+				set++
+			}
 		}
-		if strings.ContainsAny(s.Entrypoint, " \t\r\n") {
-			return nil, fmt.Errorf("service %q: entrypoint %q contains whitespace", s.Entrypoint, s.Entrypoint)
+		if set == 0 {
+			return nil, fmt.Errorf("service is missing a source (entrypoint, build, or image)")
 		}
-		if seen[s.Entrypoint] {
-			return nil, fmt.Errorf("duplicate service entrypoint %q", s.Entrypoint)
+		if set > 1 {
+			return nil, fmt.Errorf("service declares multiple sources: exactly one of entrypoint, build, or image is allowed")
 		}
-		seen[s.Entrypoint] = true
+		// A source descriptor is a single whitespace-free token for every kind:
+		// an entrypoint is a path, a build is a path, and an image reference is a
+		// registry reference — none may contain whitespace.
+		source := entrypoint
+		if build != "" {
+			source = build
+		}
+		if image != "" {
+			source = image
+		}
+		if strings.ContainsAny(source, " \t\r\n") {
+			return nil, fmt.Errorf("service %q: source contains whitespace", source)
+		}
+		if seen[source] {
+			return nil, fmt.Errorf("duplicate service %q", source)
+		}
+		seen[source] = true
+		if build != "" {
+			if err := validateServiceBuild(build); err != nil {
+				return nil, fmt.Errorf("service %q: %w", build, err)
+			}
+		}
+		if image != "" {
+			if err := validateServiceImage(image); err != nil {
+				return nil, fmt.Errorf("service %q: %w", image, err)
+			}
+		}
 		port, err := resolveServicePort(s.Port)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+			return nil, fmt.Errorf("service %q: %w", source, err)
 		}
 		replicas, err := resolveServiceReplicas(s.Replicas)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+			return nil, fmt.Errorf("service %q: %w", source, err)
 		}
 		if err := validateServiceHost(s.Host); err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+			return nil, fmt.Errorf("service %q: %w", source, err)
 		}
 		// A configured path only makes sense with a host: PathPrefix alone is
 		// not an externally addressable route, and preserving the existing
 		// no-host behavior (an unrouted, label-free service) requires rejecting
 		// the combination rather than silently ignoring the path.
 		if s.Path != "" && s.Host == "" {
-			return nil, fmt.Errorf("service %q: path requires host", s.Entrypoint)
+			return nil, fmt.Errorf("service %q: path requires host", source)
 		}
 		path, err := canonicalizeServicePath(s.Path)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", s.Entrypoint, err)
+			return nil, fmt.Errorf("service %q: %w", source, err)
 		}
 		t.Services = append(t.Services, Service{
-			Entrypoint: s.Entrypoint,
+			Entrypoint: entrypoint,
+			Build:      build,
+			Image:      image,
 			Host:       s.Host,
 			Path:       path,
 			Port:       port,
@@ -818,6 +969,60 @@ func resolveServiceReplicas(raw any) (int, error) {
 		return 0, fmt.Errorf("replicas %d must be a positive integer", n)
 	}
 	return n, nil
+}
+
+// validateServiceBuild validates a service `build` Dockerfile path. It must be a
+// RELATIVE path inside the function directory (e.g. "Dockerfile" or
+// "docker/Dockerfile.prod"): non-empty, no whitespace, no backslash, not
+// absolute, and every "/" -separated element non-empty, not "."/ ".." and not
+// dot-leading. The Dockerfile is read from the function directory at build
+// time; confining it there keeps the build self-contained.
+func validateServiceBuild(build string) error {
+	if build == "" {
+		return fmt.Errorf("build path is empty")
+	}
+	if strings.ContainsAny(build, " \t\r\n") {
+		return fmt.Errorf("build path %q must not contain whitespace", build)
+	}
+	if strings.ContainsAny(build, "\\") {
+		return fmt.Errorf("build path %q must not contain backslashes", build)
+	}
+	if strings.HasPrefix(build, "/") {
+		return fmt.Errorf("build path %q must be a relative path inside the function directory", build)
+	}
+	for _, el := range strings.Split(build, "/") {
+		if el == "" {
+			return fmt.Errorf("build path %q must not contain empty path elements", build)
+		}
+		if el == ".." || strings.HasPrefix(el, ".") {
+			return fmt.Errorf("build path %q: invalid path element %q (path elements must not start with \".\")", build, el)
+		}
+	}
+	return nil
+}
+
+// serviceImagePattern is a permissive image-reference syntax check: a
+// registry/repository reference with an optional tag or digest. It rejects the
+// characters that would make a reference unparseable by the Docker client
+// (whitespace is already rejected earlier; this additionally refuses an empty
+// repository or a malformed tag separator). Full validation is left to the
+// Docker client, which is the authority; this only catches obvious typos at
+// template parse time.
+var serviceImagePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*(@sha256:[a-fA-F0-9]{64})?$`)
+
+// validateServiceImage validates a service `image` reference. It must be a
+// non-empty container image reference (e.g. "nginx:1.27",
+// "ghcr.io/acme/api@sha256:..."). The final authority is the Docker client's
+// reference parser; this check rejects the obviously malformed cases early so a
+// typo surfaces as a template error rather than a build-time pull failure.
+func validateServiceImage(image string) error {
+	if image == "" {
+		return fmt.Errorf("image reference is empty")
+	}
+	if !serviceImagePattern.MatchString(image) {
+		return fmt.Errorf("image reference %q is not a valid container image reference", image)
+	}
+	return nil
 }
 
 // hostnamePattern is an RFC-1123-style hostname: case-insensitive alphanumeric

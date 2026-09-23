@@ -29,7 +29,10 @@
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
-// runtime Manager's Docker seam.
+// runtime Manager's Docker seam. A service's source (entrypoint, build, or
+// image) is resolved to a runnable image BEFORE any container action; a source
+// that cannot be resolved leaves the service's existing healthy containers
+// untouched.
 //
 // Ordering on a rebuild: the new version is prepared and swapped in, schedules
 // converge, persistent services converge to the new image, and only THEN is the

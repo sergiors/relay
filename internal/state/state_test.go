@@ -554,7 +554,9 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 
 // TestFreshSchemaHasCurrentColumns checks the current schema columns directly:
 // initSchema must create the functions env/secrets columns and the services
-// entrypoint/path columns.
+// source/path columns. The services table stores each source kind as its own
+// column and derives the service identity from whichever is set, so there is no
+// separate identity column.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	c := openTestState(t)
 
@@ -566,9 +568,12 @@ func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	}
 
 	svcCols := tableColumnSet(t, c, "services")
-	for _, want := range []string{"function_name", "entrypoint", "path", "port", "replicas"} {
+	for _, want := range []string{"function_name", "entrypoint", "build", "image", "path", "port", "replicas"} {
 		if !svcCols[want] {
 			t.Errorf("services missing current column %q: %v", want, svcCols)
 		}
+	}
+	if svcCols["identity"] {
+		t.Errorf("services has a redundant identity column: %v", svcCols)
 	}
 }

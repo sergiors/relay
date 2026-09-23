@@ -94,6 +94,17 @@ type Manager struct {
 	maxConcurrency int
 	// containers caches the per-function reusable execution containers.
 	containers *containerCache
+	// now is the injectable clock seam. It defaults to time.Now and is used by
+	// the external-image pull throttle (see service_source.go). It is a Manager
+	// field, never a package global, so a test can advance time deterministically
+	// without mutating shared state.
+	now func() time.Time
+	// pullChecks records, per service image identity, the instant of the last
+	// SUCCESSFUL remote pull check. It enforces the hourly-at-most cadence for
+	// external service images and is in-memory only (never persisted). Guarded by
+	// pullMu.
+	pullMu     sync.Mutex
+	pullChecks map[string]time.Time
 
 	// done is closed by Close to stop the single maintenance loop (the only
 	// eviction driver; there is never a ticker or goroutine per container).
@@ -190,6 +201,11 @@ func NewManager(
 		maxConcurrency: resolved.maxConcurrency,
 		done:           make(chan struct{}),
 		maintDone:      make(chan struct{}),
+		now:            resolved.now,
+		pullChecks:     map[string]time.Time{},
+	}
+	if mgr.now == nil {
+		mgr.now = time.Now
 	}
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
@@ -197,6 +213,17 @@ func NewManager(
 	mgr.containers.metrics = m
 	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
 	return mgr, nil
+}
+
+// clock returns the Manager's injectable clock, defaulting to the wall clock
+// when a Manager was constructed directly (tests) without an option. It is the
+// single time source for the external-image pull throttle, so the cadence is
+// deterministic under an injected clock and never consults a package global.
+func (m *Manager) clock() time.Time {
+	if m.now == nil {
+		return time.Now()
+	}
+	return m.now()
 }
 
 // resolveManagerOptions applies the options in order and normalizes a
@@ -365,6 +392,26 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	fp, err := function.FingerprintSelection(sel)
 	if err != nil {
 		return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
+	}
+
+	// A template that needs no runtime (all of its services use build or image
+	// sources, and it has no events or schedules) has no function image to
+	// build: the services bring their own images. Prepare still succeeds so the
+	// function is available for service convergence, returning a handle with no
+	// image — no entrypoint service exists to consume it. The fingerprint is
+	// still computed (above) and recorded so content changes gate reconciliation
+	// exactly as for a runtime-backed function.
+	if !fn.Template.NeedsRuntime() {
+		m.log.Debug("Function: no runtime required; services bring their own images",
+			"function", fn.Name)
+		funcPrepared := &Prepared{
+			Name:        fn.Name,
+			Fingerprint: fp,
+			Concurrency: m.effectiveConcurrency(fn),
+		}
+		m.containers.activateFunction(fn.Name, "")
+		m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
+		return funcPrepared, nil
 	}
 
 	spec, err := lookup(fn.Template.Runtime)
@@ -781,6 +828,10 @@ func (m *Manager) RemoveFunction(name string) {
 		return
 	}
 	m.containers.removeFunction(name)
+	// Drop the function's external-service pull-check records so a later
+	// re-added function starts with an immediate remote check and the in-memory
+	// map does not grow without bound across removals.
+	m.forgetServicePullChecks(name)
 }
 
 // envMap parses "K=V" entries into a map, later entries winning on duplicate
