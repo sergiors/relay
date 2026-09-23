@@ -46,6 +46,7 @@ relay stats                # show current operational statistics
 relay stats reset          # reset persisted cumulative statistics
 relay function ls          # list functions
 relay function inspect <name>
+relay function invoke <name> --event '{...}'   # run matching handlers on the live worker
 relay secret ls|set|rm     # manage local secrets
 relay git keygen           # generate an SSH deploy key
 relay git set <repository> # set the git source to sync from (optionally --webhook-secret)
@@ -816,14 +817,14 @@ persisted service rows — there is no synthetic entrypoint):
 runtime: node24
 
 services:
-  - entrypoint: service.js   # runtime-managed application entrypoint file
+  - entrypoint: service.js # runtime-managed application entrypoint file
     port: 3000
     replicas: 2
 
-  - build: Dockerfile        # a user-supplied Dockerfile (relative to the fn dir)
+  - build: Dockerfile # a user-supplied Dockerfile (relative to the fn dir)
     port: 8080
 
-  - image: ghcr.io/acme/api:1.2   # an external image reference
+  - image: ghcr.io/acme/api:1.2 # an external image reference
     port: 9090
     replicas: 3
 ```
@@ -985,7 +986,7 @@ capabilities, memory/CPU/pids limits, read-only rootfs, and a bounded `/tmp`.
 
 **External image freshness.** For an `image` service, Relay checks its registry
 **at most once per hour per independent service** (per function + identity). A
-*successful* remote check is recorded in memory; while the window is open no
+_successful_ remote check is recorded in memory; while the window is open no
 further remote check runs, and a running container is preserved. The window is
 **not persisted** (a worker restart checks again), and changing the configured
 source (a new identity) is checked **immediately**. A **failed** check does not
@@ -1094,10 +1095,10 @@ path adds **nothing** — the label set is byte-for-byte the host-only one.
 
 ## Supported runtimes
 
-| Runtime      | Base image         | Dependency handling                                                                                  |
-| ------------ | ------------------ | ---------------------------------------------------------------------------------------------------- |
+| Runtime      | Base image         | Dependency handling                                                                                   |
+| ------------ | ------------------ | ----------------------------------------------------------------------------------------------------- |
 | `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` → native uv project; else `requirements.txt` → `uv pip install --system` |
-| `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none |
+| `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none  |
 
 Base images are fixed; arbitrary base images are not allowed. Dependencies are
 installed **inside** the image at build time, never on the host.
@@ -1154,7 +1155,7 @@ one; the template syntax is identical and never carries an extension:
 runtime: node24
 
 events:
-  - handler: src.handler.handler   # resolves to src/handler.ts
+  - handler: src.handler.handler # resolves to src/handler.ts
     pattern:
       type: [order.created]
 ```
@@ -1442,25 +1443,70 @@ Known live zero values render as `0`; only an unavailable worker renders
 live gauge would go stale between flushes); only the cumulative counters are.
 `Starting` is transient and is usually absent.
 
+### Manual invocation
+
+`relay function invoke <name>` runs a function's matching event handlers
+synchronously on the **running** worker's live runtime pool, without publishing
+anything to the event stream:
+
+```sh
+relay function invoke user-events-python --event '{"event_name":"INSERT"}'
+relay function invoke user-events-python --file event.json
+echo '{"event_name":"INSERT"}' | relay function invoke user-events-python
+```
+
+The event is supplied as inline JSON (`--event`), a JSON file (`--file`), or
+piped on stdin when neither flag is given (the two flags are mutually
+exclusive). It must be a JSON **object**, because event matching is defined over
+an object's fields; arrays, scalars, and `null` are rejected. A bare invocation
+with no payload and an interactive terminal fails fast rather than waiting for a
+typed line.
+
+The worker selects every event rule of `<name>` whose pattern matches the event
+(in declaration order) and executes each through the same runtime path as a
+stream event — the same concurrency limits, timeout (capped like event rules),
+per-invocation env/secret resolution, and handler execution metrics. A failure
+in one handler does not prevent the others from running, and the command reports
+the first failure.
+
+Unlike stream consumption, manual invocation is **not** part of the at-least-once
+delivery lifecycle: it never touches Redis, never claims event classification
+(the `events_*` counters), never schedules a retry, and never writes to the
+DLQ. It is a synchronous operator action against the live runtime; there is no
+offline fallback, so a worker must be running.
+
+Output is a single concise line on success:
+
+```
+No matching handlers
+Invoked 1 handler
+Invoked N handlers
+```
+
+An unknown function, an unavailable function (its image could not be built), a
+handler failure, or a missing worker are reported as errors.
+
 ### Runtime paths
 
 Relay separates **persistent** state from **ephemeral** runtime state:
 
-- `/var/lib/relay` — the volume-mounted persistent state: the SQLite database,
-  the secrets store, and the git material. It survives container restarts.
-- `/run/relay` — tmpfs-backed ephemeral process state that must not survive a
-  reboot:
+- `/var/lib/relay` — volume-mounted persistent state containing the SQLite
+  database, secrets store, and git material. It survives container restarts.
+- `/run/relay` — ephemeral process state that must not be persisted:
   - `/run/relay/relay.lock` — the process-level `flock` held by `relay start`
-    for the runtime lifetime. The kernel releases it on process exit, so a
-    leftover file is inert; keeping it on tmpfs keeps ephemeral coordination out
-    of the persistent volume.
-  - `/run/relay/relay.sock` — the live worker query socket. It serves only the
-    live runtime-pool gauges to `relay function inspect` (see above); it is
-    removed on graceful shutdown and replaced at the next start. `relay start`
-    creates `/run/relay` and takes the lock before the worker binds the socket,
-    so a second process fails the lock and never reaches (or removes) an active
-    worker's socket; a socket left by a `SIGKILL`ed worker is stale and is
-    safely replaced.
+    for the worker lifetime. The kernel releases the lock when the process
+    exits, so a leftover file is inert.
+  - `/run/relay/relay.sock` — the live worker control socket. It provides
+    runtime-pool state to `relay function inspect`, handles the semantic stats
+    reset used by `relay stats reset`, and serves synchronous manual invocations
+    from `relay function invoke`. It is removed on graceful shutdown and
+    recreated on startup.
+
+`relay start` creates `/run/relay` and acquires the process lock before binding
+the socket. A second process therefore fails on the lock before it can interfere
+with the active worker's socket. If a worker is killed without cleanup, the
+leftover socket is stale and can be safely replaced after the next process has
+acquired the lock.
 
 ## Secrets
 

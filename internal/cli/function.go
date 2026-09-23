@@ -38,20 +38,22 @@ func SetPoolSnapshotProvider(fn func(name string) (runtime.PoolSnapshot, bool)) 
 	poolSnapshotProvider = fn
 }
 
-// functionCommand builds the read-only `relay function ...` subcommand family.
-// It touches the local state database only — never Redis, Docker, or the
-// /functions loader — so it works with no REDIS_URI and no worker reachable.
-// deps supplies the state database it opens and the worker socket inspect dials
-// for the live gauges. It is a pure grouping command, so it uses the shared
-// namespaceAction: a bare `relay function` shows the subcommand help, and an
-// unknown first token is a friendly Docker-style usage error naming the full
-// path.
+// functionCommand builds the `relay function ...` subcommand family. `ls` and
+// `inspect` touch the local state database only — never Redis, Docker, or the
+// /functions loader — so they work with no REDIS_URI and no worker reachable;
+// `invoke` instead dials the RUNNING worker's query socket to execute handlers
+// on its live runtime pool (it has no offline fallback). deps supplies the state
+// database those commands open and the worker socket inspect/invoke dial. It is
+// a pure grouping command, so it uses the shared namespaceAction: a bare
+// `relay function` shows the subcommand help, and an unknown first token is a
+// friendly Docker-style usage error naming the full path.
 func functionCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "function",
 		Usage: "Manage functions",
-		Description: "List and inspect the functions Relay has discovered and " +
-			"reconciled, reading the local state database.",
+		Description: "List, inspect, and invoke the functions Relay has discovered " +
+			"and reconciled. list/inspect read the local state database; invoke runs " +
+			"a function's matching handlers on the running worker.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
@@ -82,6 +84,7 @@ func functionCommand(deps Dependencies) *cli.Command {
 					return functionInspect(ctx, cmd.Writer, cmd.StringArgs("name")[0], deps)
 				},
 			},
+			functionInvokeCommand(deps),
 		},
 	}
 }

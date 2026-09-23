@@ -3,6 +3,7 @@ package worker
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,23 +15,29 @@ import (
 	"sync"
 	"time"
 
+	"relay/internal/function"
 	"relay/internal/processlock"
+	"relay/internal/runner"
 	"relay/internal/runtime"
 )
 
 // This file implements the worker-owned LIVE runtime-pool query socket at
 // /run/relay/relay.sock, alongside the process lock this worker runs under.
 //
-// It carries two semantic operations: the live warm-container pool gauges
-// (capacity and container counts by lease state), and the operator-facing
-// "reset stats" command. The cumulative acquire/discard counters are PERSISTED
-// per function under /var/lib/relay (state.FunctionStats) and read there by the
-// standalone CLI; they are deliberately never sent over the socket, because the
-// socket's whole purpose is the ephemeral worker-local view the persisted state
-// cannot provide. Conversely the live gauges are never persisted, because a
-// persisted gauge would go stale between flushes. The reset command carries no
-// storage details: the worker resets its own in-memory source and persisted rows
-// behind its StatsResetter, so the socket never learns about SQLite.
+// It carries three semantic operations: the live warm-container pool gauges
+// (capacity and container counts by lease state), the operator-facing
+// "reset stats" command, and the synchronous manual function invocation
+// (`relay function invoke`). The cumulative acquire/discard counters are
+// PERSISTED per function under /var/lib/relay (state.FunctionStats) and read
+// there by the standalone CLI; they are deliberately never sent over the
+// socket, because the socket's whole purpose is the ephemeral worker-local view
+// the persisted state cannot provide. Conversely the live gauges are never
+// persisted, because a persisted gauge would go stale between flushes. The reset
+// command carries no storage details: the worker resets its own in-memory source
+// and persisted rows behind its StatsResetter, so the socket never learns about
+// SQLite. Manual invocation likewise carries no broker details: it dispatches to
+// the live runner, which executes the function's matching handlers but never
+// touches Redis streams, ACK/retry, invocation state, or the DLQ.
 //
 // Lifecycle ownership is the worker's: it creates the runtime directory,
 // removes a STALE socket left by a SIGKILLed worker, binds, serves, stops
@@ -41,11 +48,13 @@ import (
 // socket it would find cannot belong to an active worker.
 
 // SocketPath is the fixed live query socket `relay function inspect` dials for
-// live runtime-pool gauges and `relay stats reset` dials to reset a running
-// worker's statistics. It lives beside the process lock in the ephemeral
-// runtime directory (internal/processlock.DefaultDir), NOT under the persisted
-// /var/lib/relay state volume: a socket is process state that can neither
-// outlive the worker nor be meaningfully persisted.
+// live runtime-pool gauges, `relay stats reset` dials to reset a running
+// worker's statistics, and `relay function invoke` dials to run a function's
+// matching handlers synchronously against the live runtime. It lives beside the
+// process lock in the ephemeral runtime directory
+// (internal/processlock.DefaultDir), NOT under the persisted /var/lib/relay
+// state volume: a socket is process state that can neither outlive the worker
+// nor be meaningfully persisted.
 const SocketPath = processlock.DefaultDir + "/relay.sock"
 
 // ensureSocketDir creates the socket's parent directory (the ephemeral runtime
@@ -72,6 +81,14 @@ const (
 	// allocate unboundedly.
 	runtimeStateMaxRequest  = 64 << 10
 	runtimeStateMaxResponse = 64 << 10
+	// invokeTimeout bounds one manual invocation end to end on the WORKER side:
+	// it is the context deadline the runner's executor runs under, so a wedged
+	// container cannot hold the socket handler (and the CLI's dial) open
+	// indefinitely. It deliberately exceeds the largest allowed rule timeout
+	// (function.MaxTimeout, 5m) plus a margin for container start/model load, so
+	// a legitimate long-running handler is never cut short by the socket itself;
+	// the per-rule timeout still bounds the actual execution.
+	invokeTimeout = function.MaxTimeout + 2*time.Minute
 )
 
 // Wire error codes. They are stable strings (not prose) so the CLI can
@@ -82,16 +99,27 @@ const (
 	errCodeUnknownFunction  = "unknown_function"
 	errCodeStatsUnavailable = "stats_unavailable"
 	errCodeStatsFailed      = "stats_reset_failed"
+	// Manual-invocation wire codes. errCodeInvokeUnavailable reports that no
+	// runner is wired (the worker is not serving invocations);
+	// errCodeFunctionUnavailable reports a registered function whose image could
+	// not be built; errCodeInvokeFailed reports that every matching handler was
+	// attempted but at least one failed (or the invocation could not start).
+	errCodeInvokeUnavailable   = "invoke_unavailable"
+	errCodeFunctionUnavailable = "function_unavailable"
+	errCodeInvokeFailed        = "invoke_failed"
 )
 
 // Wire commands. Every request frame MUST name its command explicitly:
 // cmdRuntimeState requests function's live pool gauges, cmdResetStats asks the
 // worker to reset its Relay statistics (the command name is the operator-facing
-// semantic, not a DB operation — the socket never exposes storage details). An
-// absent or unknown command is malformed.
+// semantic, not a DB operation — the socket never exposes storage details), and
+// cmdInvokeFunction asks the worker to run function's matching event handlers
+// synchronously against the live runner. An absent or unknown command is
+// malformed.
 const (
-	cmdRuntimeState = "runtime_state"
-	cmdResetStats   = "reset_stats"
+	cmdRuntimeState   = "runtime_state"
+	cmdResetStats     = "reset_stats"
+	cmdInvokeFunction = "invoke_function"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -114,6 +142,19 @@ var ErrRuntimeStatsUnavailable = errors.New("runtime stats unavailable")
 // it rather than silently falling back, so a failed worker reset is not masked.
 var ErrRuntimeStatsFailed = errors.New("runtime stats reset failed")
 
+// ErrInvokeUnavailable reports that the live worker query socket could not be
+// reached — no worker is running, the socket is stale, or the exchange failed —
+// or that the worker has no runner wired to serve manual invocations. The CLI
+// surfaces it as an error (a manual invocation has no offline fallback: it must
+// run through the live runtime pool).
+var ErrInvokeUnavailable = errors.New("function invocation unavailable")
+
+// ErrInvokeFailed reports that the worker attempted the manual invocation but at
+// least one matching handler failed, or the invocation could not start (an
+// unknown/unavailable function, or a concurrency slot timeout). The worker's
+// error text is preserved (the CLI prints it) and no handler count is reported.
+var ErrInvokeFailed = errors.New("function invocation failed")
+
 // RuntimeState is the live, worker-local runtime-pool gauge view returned by the
 // query socket. Every field is a valid zero for a function with an existing but
 // empty pool, so callers must key "known" on the query succeeding, never on the
@@ -126,23 +167,38 @@ type RuntimeState struct {
 	Starting   int `json:"starting"`
 }
 
+// InvokeResult is the synchronous manual-invocation result returned by the query
+// socket: the number of matching handlers the runner executed. It is only
+// meaningful on success; a failed invocation is reported through Error instead.
+type InvokeResult struct {
+	Invoked int `json:"invoked"`
+}
+
 // socketRequest is the newline-JSON request frame. Command selects the
 // operation: cmdRuntimeState requests function's live pool gauges (Function is
-// required); cmdResetStats asks the worker to reset its Relay statistics. A
-// frame carries exactly one command, and an absent or unknown command is
-// malformed.
+// required); cmdResetStats asks the worker to reset its Relay statistics;
+// cmdInvokeFunction asks the worker to run function's matching event handlers
+// synchronously (Function is required and Event carries the operator-supplied
+// JSON event object). A frame carries exactly one command, and an absent or
+// unknown command is malformed.
 type socketRequest struct {
-	Command  string `json:"command,omitempty"`
-	Function string `json:"function,omitempty"`
+	Command  string          `json:"command,omitempty"`
+	Function string          `json:"function,omitempty"`
+	Event    json.RawMessage `json:"event,omitempty"`
 }
 
 // socketResponse is the newline-JSON response frame. Exactly one of the
-// embedded RuntimeState (success), Error (failure), or ResetStats=true
-// (reset success) is present.
+// embedded RuntimeState (success), Error (failure), ResetStats=true
+// (reset success), or *InvokeResult (manual-invocation success) is present.
+// Message optionally carries human-readable detail for an Error, so the CLI can
+// surface a clear cause (e.g. a handler failure reason) while Error remains the
+// stable machine code it classifies on.
 type socketResponse struct {
 	*RuntimeState
+	*InvokeResult
 	ResetStats bool   `json:"reset_stats,omitempty"`
 	Error      string `json:"error,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // PoolSnapshotter is the minimal manager view the runtime-state query needs.
@@ -166,6 +222,19 @@ type StatsResetter interface {
 	ResetStats() error
 }
 
+// FunctionInvoker is the minimal live-runner view the manual-invocation command
+// needs. *runner.Runner satisfies it via its InvokeFunction method, which
+// selects one named function's matching event rules and executes them without
+// touching the broker lifecycle. Keeping the interface local (and the event as a
+// plain map) means the socket dispatches through a narrow seam rather than the
+// runner's concrete type. The socket does import runner to classify the
+// sentinel errors the runner returns (ErrFunctionNotFound /
+// ErrFunctionUnavailable) onto stable wire codes; that import is for the error
+// contract, not dispatch.
+type FunctionInvoker interface {
+	InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error)
+}
+
 // SocketServer is the worker-owned live query socket. It accepts one request
 // per connection, answers with a single newline-JSON frame, and is stopped as a
 // unit: Close stops accepting, closes every in-flight connection (each already
@@ -175,7 +244,21 @@ type SocketServer struct {
 	log      *slog.Logger
 	manager  PoolSnapshotter
 	resetter StatsResetter
-	ln       net.Listener
+	// invoker serves the synchronous manual-invocation command against the LIVE
+	// runner. It is wired after the socket is created (see SetInvoker) because
+	// the runner does not exist yet at socket construction; a nil invoker
+	// answers invoke_unavailable. Both the setter and the handler read it under
+	// s.mu, so a request that races the wiring sees either nil (unavailable) or
+	// the fully built runner — never a torn value.
+	invoker FunctionInvoker
+	ln      net.Listener
+
+	// baseCtx is cancelled by Close, so an in-flight manual invocation (whose
+	// own context bounds it to invokeTimeout) is cancelled promptly on shutdown
+	// instead of holding Close's handler wait for up to invokeTimeout. It is
+	// created once in NewSocketServer.
+	baseCtx context.Context
+	cancel  context.CancelFunc
 
 	mu     sync.Mutex
 	closed bool
@@ -225,8 +308,33 @@ func NewSocketServer(
 		conns:    make(map[net.Conn]struct{}),
 		done:     make(chan struct{}),
 	}
+	s.baseCtx, s.cancel = context.WithCancel(context.Background())
 	go s.serve()
 	return s, nil
+}
+
+// SetInvoker wires the live runner that serves the synchronous manual-invocation
+// command. It is called after the socket is constructed and the runner is built
+// (the socket must start before the runner so a pool query works as early as
+// possible, while the runner needs the reconciler/stream wiring to exist first).
+// The assignment is mutex-guarded so a request racing the wiring reads either nil
+// (invoke_unavailable) or the fully built runner. Passing nil leaves manual
+// invocation unavailable, which is the correct pre-wiring state.
+func (s *SocketServer) SetInvoker(invoker FunctionInvoker) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.invoker = invoker
+	s.mu.Unlock()
+}
+
+// currentInvoker returns the wired manual invoker, or nil when none is set. It
+// takes the mutex so a concurrent SetInvoker is race-free.
+func (s *SocketServer) currentInvoker() FunctionInvoker {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.invoker
 }
 
 // removeStaleSocket unlinks a leftover socket file from a previous worker so the
@@ -297,6 +405,8 @@ func (s *SocketServer) handle(conn net.Conn) {
 		s.handleResetStats(conn)
 	case cmdRuntimeState:
 		s.handleRuntimeState(conn, req.Function)
+	case cmdInvokeFunction:
+		s.handleInvokeFunction(conn, req.Function, req.Event)
 	default:
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 	}
@@ -339,6 +449,85 @@ func (s *SocketServer) handleRuntimeState(conn net.Conn, function string) {
 		Idle:       snap.Idle,
 		Starting:   snap.Starting,
 	}})
+}
+
+// handleInvokeFunction answers the synchronous manual-invocation command for one
+// function. An empty function name or an absent/invalid event object is
+// malformed. A nil runner answers invoke_unavailable (the CLI has no offline
+// fallback, so this is a hard error). The runner selects the function's matching
+// event rules and executes them through the live runtime pool, bounded by
+// invokeTimeout on the worker side; a handler count answers with an
+// invoke_result, while a runner error is classified:
+//
+//   - an unknown function answers unknown_function;
+//   - a registered but unrunnable function answers function_unavailable;
+//   - any other error answers invoke_failed.
+//
+// The error's text is carried in Message (and logged) so the CLI can surface a
+// clear cause, while Error stays the stable code it classifies on. It
+// deliberately never touches Redis, ACK/retry, invocation state, or the DLQ:
+// dispatch is entirely within the runner's broker-free manual path.
+func (s *SocketServer) handleInvokeFunction(conn net.Conn, function string, rawEvent json.RawMessage) {
+	if function == "" || len(rawEvent) == 0 {
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+		return
+	}
+	// The event must be a JSON object because the matcher is defined over a
+	// map[string]any; reject arrays/scalars/null with the malformed code so the
+	// CLI's validation and the worker's agree.
+	var event map[string]any
+	if err := json.Unmarshal(rawEvent, &event); err != nil || event == nil {
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+		return
+	}
+
+	invoker := s.currentInvoker()
+	if invoker == nil {
+		s.respond(conn, socketResponse{Error: errCodeInvokeUnavailable})
+		return
+	}
+
+	// A manual invocation can legitimately run a handler far longer than the
+	// short query exchange the connection deadline was set for at the top of
+	// handle; extend the deadline for the invocation so the response write is not
+	// cut off, while still bounding the whole exchange so a wedged peer can never
+	// hold the handler open. The runner enforces its own per-rule timeout.
+	_ = conn.SetDeadline(time.Now().Add(invokeTimeout + runtimeStateRequestTimeout))
+
+	// Bound the worker side of a manual invocation so a wedged container can
+	// never hold the handler (and the CLI's dial) open indefinitely. The
+	// per-rule timeout still bounds the actual execution. The server's base
+	// context is also a parent, so Close cancels an in-flight invocation
+	// promptly instead of waiting for invokeTimeout.
+	ctx, cancel := context.WithTimeout(s.baseCtx, invokeTimeout)
+	defer cancel()
+	invoked, err := invoker.InvokeFunction(ctx, function, event)
+	if err != nil {
+		code := invokeErrorCode(err)
+		s.log.Warn("Function invoke: manual invocation failed",
+			"function", function,
+			"code", code,
+			"error", err,
+		)
+		s.respond(conn, socketResponse{Error: code, Message: err.Error()})
+		return
+	}
+	s.respond(conn, socketResponse{InvokeResult: &InvokeResult{Invoked: invoked}})
+}
+
+// invokeErrorCode maps a runner manual-invocation error onto a stable wire code.
+// The runner's unknown/unavailable sentinels are recognized with errors.Is;
+// everything else is a handler failure. It keeps the wire classification
+// independent of error prose.
+func invokeErrorCode(err error) string {
+	switch {
+	case errors.Is(err, runner.ErrFunctionNotFound):
+		return errCodeUnknownFunction
+	case errors.Is(err, runner.ErrFunctionUnavailable):
+		return errCodeFunctionUnavailable
+	default:
+		return errCodeInvokeFailed
+	}
 }
 
 // respond writes one newline-JSON frame. json.Encoder appends the trailing
@@ -384,6 +573,12 @@ func (s *SocketServer) Close() error {
 		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+
+	// Cancel any in-flight manual invocation so Close's handler wait is bounded
+	// by the connection teardown below rather than by invokeTimeout.
+	if s.cancel != nil {
+		s.cancel()
+	}
 
 	var firstErr error
 	if ln != nil {
@@ -475,4 +670,77 @@ func ResetRuntimeStats(path string) error {
 		return fmt.Errorf("%w: empty response", ErrRuntimeStatsFailed)
 	}
 	return nil
+}
+
+// InvokeFunction asks the live worker at path to run the named function's
+// matching event handlers synchronously against the live runtime pool, and
+// returns the number of handlers executed. event must be a JSON object (the
+// matcher is defined over a map); the CLI validates it before dialing and the
+// worker validates it again on the wire. ctx bounds the CLI side (a cancelled
+// ctx, e.g. Ctrl-C, closes the connection so the command aborts promptly rather
+// than waiting out the invocation deadline).
+//
+// It is the CLI's running-worker path for `relay function invoke`; there is no
+// offline fallback (a manual invocation must run through the live runner/runtime
+// pool, which only the worker owns). A missing/unresponsive worker, or a worker
+// whose runner is not wired yet, reports ErrInvokeUnavailable. The worker's
+// unknown-function / function-unavailable / handler-failure answers report
+// ErrInvokeFailed with the worker's message, so the CLI surfaces the real cause
+// (including a failed handler's reason) rather than masking it.
+func InvokeFunction(ctx context.Context, path, function string, event json.RawMessage) (int, error) {
+	d := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	defer conn.Close()
+	// A manual invocation can legitimately run a handler up to the rule timeout
+	// (capped at function.MaxTimeout), which can exceed the short query deadline.
+	// The CLI must not cut off a live handler mid-flight, so the client deadline
+	// is the worker-side invocation bound plus the short exchange margin; the
+	// worker enforces its own independent bound regardless.
+	_ = conn.SetDeadline(time.Now().Add(invokeTimeout + runtimeStateRequestTimeout))
+	// A cancelled ctx (Ctrl-C) closes the connection, unblocking the response
+	// read so the command exits promptly instead of waiting out the deadline.
+	// The stop clears the hook when the call finishes normally, so no callback
+	// outlives this call.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
+	if err := json.NewEncoder(conn).Encode(socketRequest{
+		Command:  cmdInvokeFunction,
+		Function: function,
+		Event:    event,
+	}); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	var resp socketResponse
+	if err := json.NewDecoder(io.LimitReader(conn, runtimeStateMaxResponse)).Decode(&resp); err != nil {
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("%w: %v", ErrInvokeUnavailable, ctx.Err())
+		}
+		return 0, fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	if resp.Error != "" {
+		if resp.Error == errCodeInvokeUnavailable {
+			return 0, fmt.Errorf("%w: %s", ErrInvokeUnavailable, messageOr(resp.Message, resp.Error))
+		}
+		return 0, fmt.Errorf("%w: %s", ErrInvokeFailed, messageOr(resp.Message, resp.Error))
+	}
+
+	if resp.InvokeResult == nil {
+		return 0, fmt.Errorf("%w: empty response", ErrInvokeUnavailable)
+	}
+
+	return resp.InvokeResult.Invoked, nil
+}
+
+// messageOr returns msg when it is non-empty, else fallback. It keeps the wire
+// error code as the last-resort message when a worker (an older build, or a
+// defensive path) sends no human-readable detail.
+func messageOr(msg, fallback string) string {
+	if msg != "" {
+		return msg
+	}
+	return fallback
 }

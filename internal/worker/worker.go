@@ -281,6 +281,14 @@ func Run(logger *slog.Logger) {
 	// a value < 1 falls back to the runner's default.
 	runWorker.SetMaxConcurrency(cfg.MaxConcurrency)
 
+	// Expose the live runner to the manual-invocation socket command. It was
+	// wired after the socket was created (the runner is built later, once images
+	// and services are prepared), so a `relay function invoke` that races the
+	// wiring answers invoke_unavailable rather than a torn value. This is what
+	// lets the CLI run handlers against the live runtime pool without ever
+	// instantiating Docker/runtime in the CLI process.
+	rtSocket.SetInvoker(runWorker)
+
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
 		Client:            client,
 		Stream:            cfg.RedisStream,

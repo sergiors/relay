@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"relay/internal/function"
 	"relay/internal/processlock"
+	"relay/internal/runner"
 	"relay/internal/runtime"
 )
 
@@ -400,5 +404,349 @@ func TestResetRuntimeStatsNoSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
 	if err := ResetRuntimeStats(path); !errors.Is(err, ErrRuntimeStatsUnavailable) {
 		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	}
+}
+
+// fakeInvoker records manual-invocation calls for socket tests, so the
+// invoke_function command can be exercised without Docker or a live runner.
+type fakeInvoker struct {
+	mu      sync.Mutex
+	calls   int
+	name    string
+	event   map[string]any
+	invoked int
+	err     error
+	// entered, when non-nil, is signalled once at the start of InvokeFunction;
+	// release, when non-nil, makes InvokeFunction block until it closes or ctx
+	// is done. They let tests observe shutdown cancelling an in-flight call.
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *fakeInvoker) InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error) {
+	f.mu.Lock()
+	f.calls++
+	f.name = name
+	f.event = event
+	entered, release := f.entered, f.release
+	f.mu.Unlock()
+	if entered != nil {
+		f.once.Do(func() { close(entered) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return f.invoked, f.err
+}
+
+func (f *fakeInvoker) snapshot() (calls int, name string, event map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.name, f.event
+}
+
+// startTestSocketWithInvoker starts a SocketServer backed by pools at path with
+// the given manual invoker, so the invoke_function command can be exercised.
+func startTestSocketWithInvoker(t *testing.T, path string, pools map[string]runtime.PoolSnapshot, invoker FunctionInvoker) *SocketServer {
+	t.Helper()
+	s, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: pools},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetInvoker(invoker)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestRuntimeSocketInvokeFunctionDelegates verifies the invoke_function command
+// forwards the function name and decoded event object to the wired invoker and
+// answers with the handler count.
+func TestRuntimeSocketInvokeFunctionDelegates(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{invoked: 2}
+	startTestSocketWithInvoker(t, path, nil, inv)
+
+	invoked, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{"event_name":"INSERT","n":7}`))
+	if err != nil {
+		t.Fatalf("InvokeFunction: %v", err)
+	}
+	if invoked != 2 {
+		t.Fatalf("invoked = %d, want 2", invoked)
+	}
+	calls, name, event := inv.snapshot()
+	if calls != 1 {
+		t.Fatalf("invoker calls = %d, want 1", calls)
+	}
+	if name != "fn" {
+		t.Fatalf("invoker name = %q, want fn", name)
+	}
+	if event["event_name"] != "INSERT" {
+		t.Fatalf("invoker event = %#v, want the decoded object", event)
+	}
+}
+
+// TestRuntimeSocketInvokeFunctionFailed verifies a runner error is reported as
+// ErrInvokeFailed carrying the worker's message, and that the invoker was still
+// called exactly once.
+func TestRuntimeSocketInvokeFunctionFailed(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{err: fmt.Errorf("function %q handler %q: boom", "fn", "index.run")}
+	startTestSocketWithInvoker(t, path, nil, inv)
+
+	_, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrInvokeFailed) {
+		t.Fatalf("error = %v, want ErrInvokeFailed", err)
+	}
+	if errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("a handler failure must not look unavailable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error = %v, want the worker's message preserved", err)
+	}
+}
+
+// TestRuntimeSocketInvokeFunctionUnknownFunction verifies the runner's
+// not-found sentinel is classified as unknown_function, so the CLI reports the
+// right cause (not a generic failure).
+func TestRuntimeSocketInvokeFunctionUnknownFunction(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{err: fmt.Errorf("%w: %q", runner.ErrFunctionNotFound, "ghost")}
+	startTestSocketWithInvoker(t, path, nil, inv)
+
+	_, err := InvokeFunction(context.Background(), path, "ghost", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrInvokeFailed) {
+		t.Fatalf("error = %v, want ErrInvokeFailed", err)
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("error = %v, want it to name the unknown function", err)
+	}
+}
+
+// TestRuntimeSocketInvokeFunctionNoInvoker verifies a socket with no wired
+// invoker answers invoke_unavailable (there is no offline fallback), rather than
+// appearing to have run zero handlers.
+func TestRuntimeSocketInvokeFunctionNoInvoker(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, nil)
+
+	_, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+}
+
+// TestRuntimeSocketInvokeFunctionMalformed verifies the wire validation: an
+// empty function, a missing event, invalid JSON, a non-object event (array),
+// and a null event are all rejected as malformed without invoking the runner.
+func TestRuntimeSocketInvokeFunctionMalformed(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{}
+	startTestSocketWithInvoker(t, path, nil, inv)
+
+	for _, line := range []string{
+		`{"command":"invoke_function"}` + "\n",
+		`{"command":"invoke_function","function":""}` + "\n",
+		`{"command":"invoke_function","function":"fn"}` + "\n",
+		`{"command":"invoke_function","function":"fn","event":"not-json"}` + "\n",
+		`{"command":"invoke_function","function":"fn","event":[1,2]}` + "\n",
+		`{"command":"invoke_function","function":"fn","event":null}` + "\n",
+		`{"command":"invoke_function","function":"fn","event":"scalar"}` + "\n",
+	} {
+		resp := rawQuery(t, path, line)
+		if resp.Error != errCodeMalformedRequest {
+			t.Fatalf("line %q: error = %q, want %q", line, resp.Error, errCodeMalformedRequest)
+		}
+		if resp.InvokeResult != nil {
+			t.Fatalf("line %q: malformed request must not carry a result", line)
+		}
+	}
+	if calls, _, _ := inv.snapshot(); calls != 0 {
+		t.Fatalf("invoker calls = %d, want 0 (malformed requests never invoke)", calls)
+	}
+}
+
+// TestInvokeFunctionNoSocket verifies the standalone no-worker case reports
+// ErrInvokeUnavailable (there is no offline fallback for a manual invocation).
+func TestInvokeFunctionNoSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	if _, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`)); !errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+}
+
+// runnerInvokerContract pins the production wiring contract: the concrete live
+// runner the worker installs via SetInvoker must satisfy the socket's local
+// seam, so the two cannot drift apart. It is a compile-time assertion (the
+// assignment would not type-check otherwise).
+var _ FunctionInvoker = (*runner.Runner)(nil)
+
+// testExecutor is a minimal runner.Executor for the full-stack socket test: it
+// records the executed handlers without Docker.
+type testExecutor struct {
+	mu       sync.Mutex
+	handlers []string
+}
+
+func (e *testExecutor) Execute(_ context.Context, _ *runtime.Prepared, handler string, _ []byte, _ []string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.handlers = append(e.handlers, handler)
+	return nil
+}
+
+func (e *testExecutor) got() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.handlers...)
+}
+
+// TestRuntimeSocketInvokeFunctionFullStack wires the REAL runner through the
+// socket and drives it over the wire with a parsed template: the matching rules
+// execute (and the non-matching one does not), proving the whole CLI-less stack
+// — socket codec, dispatch, and runner matching/execution.
+func TestRuntimeSocketInvokeFunctionFullStack(t *testing.T) {
+	path := testSocketPath(t)
+	exec := &testExecutor{}
+	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+  - handler: events.ignored.handler
+    pattern:
+      event_name: [DELETE]
+`))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	prepared := runner.NewPrepared(
+		function.Function{Name: "user-events", Template: tmpl},
+		&runtime.Prepared{Name: "user-events", Image: "x"},
+		exec,
+	)
+	run := runner.New([]*runner.PreparedFunction{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	startTestSocketWithInvoker(t, path, nil, run)
+
+	invoked, err := InvokeFunction(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"INSERT"}`))
+	if err != nil {
+		t.Fatalf("InvokeFunction: %v", err)
+	}
+	if invoked != 1 {
+		t.Fatalf("invoked = %d, want 1", invoked)
+	}
+	got := exec.got()
+	if len(got) != 1 || got[0] != "events.created.handler" {
+		t.Fatalf("executed handlers = %v, want [events.created.handler]", got)
+	}
+
+	// A non-matching event runs nothing and answers zero (success).
+	invoked, err = InvokeFunction(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"MODIFY"}`))
+	if err != nil {
+		t.Fatalf("non-matching InvokeFunction: %v", err)
+	}
+	if invoked != 0 {
+		t.Fatalf("non-matching invoked = %d, want 0", invoked)
+	}
+	if len(exec.got()) != 1 {
+		t.Fatalf("a non-matching event must execute nothing, got %v", exec.got())
+	}
+}
+
+// TestRuntimeSocketCloseCancelsInflightInvoke verifies Close promptly cancels an
+// in-flight manual invocation (via the server's base context) instead of waiting
+// for the invocation bound, so worker shutdown is never held by a wedged handler.
+func TestRuntimeSocketCloseCancelsInflightInvoke(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{entered: make(chan struct{}), release: make(chan struct{})}
+	s, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetInvoker(inv)
+
+	// Dial directly (not through InvokeFunction) so the client deadline does not
+	// interfere; the invocation blocks in the invoker until Close cancels it.
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(socketRequest{
+		Command: cmdInvokeFunction, Function: "fn", Event: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// Wait until the invoker is actually blocked inside the call, then Close.
+	select {
+	case <-inv.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("invoker was not entered")
+	}
+	closed := make(chan struct{})
+	go func() {
+		_ = s.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return promptly; the in-flight invocation was not cancelled")
+	}
+}
+
+// TestInvokeFunctionClientCancelAborts verifies a cancelled client context
+// (Ctrl-C) aborts an in-flight manual invocation promptly rather than waiting out
+// the invocation deadline: the client closes its connection and the call returns.
+func TestInvokeFunctionClientCancelAborts(t *testing.T) {
+	path := testSocketPath(t)
+	inv := &fakeInvoker{entered: make(chan struct{}), release: make(chan struct{})}
+	s, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetInvoker(inv)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := InvokeFunction(ctx, path, "fn", json.RawMessage(`{}`))
+		done <- err
+	}()
+
+	select {
+	case <-inv.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("invoker was not entered")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvokeUnavailable) {
+			t.Fatalf("error = %v, want ErrInvokeUnavailable after cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("InvokeFunction did not abort promptly on client cancel")
 	}
 }

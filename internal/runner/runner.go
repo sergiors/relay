@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -33,6 +34,20 @@ const DefaultMaxConcurrency = 8
 // sit long enough to defeat the reclaim pacing (see the README's
 // "Concurrency and backpressure" note).
 const slotWaitTimeout = 30 * time.Second
+
+// Manual-invocation sentinel errors. They let the worker socket map a manual
+// invocation failure onto a stable wire code without inspecting error strings
+// (see internal/worker/socket.go). They are returned (wrapped) by
+// Runner.InvokeFunction.
+var (
+	// ErrFunctionNotFound reports a manual invocation for a function that is
+	// absent from the current registry (never loaded, or already removed).
+	ErrFunctionNotFound = errors.New("function not found")
+	// ErrFunctionUnavailable reports a manual invocation for a function that is
+	// registered but not runnable (its image could not be built at
+	// startup/reconcile, so it has no Prepared handle).
+	ErrFunctionUnavailable = errors.New("function unavailable")
+)
 
 // invocationOutcome classifies what one delivery round did for a single matched
 // invocation. Handle's rule loop returns one of these per invocation so it can
@@ -1290,24 +1305,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				if hasState {
 					invState.MarkComplete(invocation)
 				}
-				r.metrics.IncLabels(metrics.MetricHandlerInvocations,
-					[]metrics.Label{
-						{Name: "outcome", Value: "success"},
-						{Name: "function", Value: pf.fn.Name},
-						{Name: "handler", Value: rule.Handler},
-					})
-				// Unlabeled total for the SQLite snapshot; the labeled counter
-				// above stays for Prometheus.
-				r.metrics.Inc(metrics.MetricHandlerSuccess)
-				// Per-function success attribution (per rule execution).
-				r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
-					[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-				r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
-				r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
-					[]metrics.Label{
-						{Name: "function", Value: pf.fn.Name},
-						{Name: "handler", Value: rule.Handler},
-					}, d)
+				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, d)
 				r.log.Info("Function handler: executed for event",
 					append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 						"duration", d,
@@ -1581,6 +1579,162 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "", msgID)
 }
 
+// InvokeFunction executes every event rule of the named function whose pattern
+// matches event, in declaration order, and returns the number of handlers
+// invoked together with a concise error describing any failures. It is the
+// synchronous manual-invocation primitive behind `relay function invoke`,
+// driven by the worker over its query socket against the LIVE runner/runtime
+// pool.
+//
+// It deliberately reuses the event execution path: the current registry
+// snapshot, the worker-global + per-function concurrency slots, the rule
+// timeout (capped at the configured maximum exactly like Handle), per-invocation
+// env/secret resolution, the image in-flight reference, the panic boundary, the
+// normal runtime executor (Manager.Execute), and the handler success/failure
+// execution metrics. It deliberately does NOT reuse the broker lifecycle: it
+// never consults stream.InvocationState, never claims or counts the event
+// classification counters (events_received/matched/unmatched, and not
+// function_events_matched_total), never schedules a retry, and never
+// dead-letters. A manual invocation is an operator action, not a stream
+// delivery, so no broker state is written.
+//
+// Failure semantics mirror Handle's aggregate behavior where it is sensible: a
+// failure in one matching handler does NOT prevent the later matching handlers
+// from running, and the returned error is the first failure after every matching
+// handler has been attempted. Matching zero rules is not an error: it returns
+// (0, nil) so the caller renders "no matching handlers".
+//
+// A function absent from the current registry returns ErrFunctionNotFound; a
+// registered but unrunnable function (its image could not be built) returns
+// ErrFunctionUnavailable. Both are wrapped with the function name so the socket
+// can map them onto stable wire codes.
+func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error) {
+	pf := r.reg.GetByName(name)
+	if pf == nil {
+		return 0, fmt.Errorf("%w: %q", ErrFunctionNotFound, name)
+	}
+	if pf.Prepared() == nil {
+		return 0, fmt.Errorf("%w: %q", ErrFunctionUnavailable, name)
+	}
+
+	// Matching is pure and in declaration order. A function with no matching
+	// rule is a successful no-op.
+	rules := pf.fn.Template.MatchingEventRules(event)
+	if len(rules) == 0 {
+		return 0, nil
+	}
+
+	// Marshal the supplied event once for every matching rule. A marshal
+	// failure is a programming error in the caller's decoded value; report it
+	// rather than executing a handler with a corrupt payload.
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return 0, fmt.Errorf("function %q: marshal event: %w", name, err)
+	}
+	eventID, eventName := eventFields(event)
+
+	count := 0
+	var firstErr error
+	for _, rule := range rules {
+		// Cap the rule timeout at the configured maximum (defense in depth;
+		// template validation enforces the cap at load), exactly like Handle.
+		timeout := rule.Timeout
+		if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
+			timeout = cap
+		}
+
+		// Reserve the worker-global and per-function concurrency slots, exactly
+		// like the event path. A slot timeout is not an execution: record the
+		// first such error and keep trying the later rules (which may themselves
+		// be blocked, in which case they are reported the same way).
+		releaseSlots, _ := r.reserveSlots(ctx, name, pf.fn.Template.Concurrency)
+		if releaseSlots == nil {
+			r.log.Warn("Function invoke: concurrency slot wait timed out",
+				"function", name,
+				"handler", rule.Handler,
+			)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("function %q handler %q: concurrency slot wait timed out", name, rule.Handler)
+			}
+			continue
+		}
+
+		err := func() error {
+			defer releaseSlots()
+
+			// The handler attempt is about to begin: this is the
+			// last_execution_at attribution point, exactly as Handle's rule loop
+			// and InvokeHandler stamp it. A slot timeout above never reaches here
+			// (it is not an execution).
+			r.metrics.SetFunctionTimestamp(name, metrics.FunctionTimestampExecution, time.Now().Unix())
+
+			extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
+			if err != nil {
+				r.recordHandlerFailure(name, rule.Handler, 0)
+				return fmt.Errorf("function %q handler %q: %w", name, rule.Handler, err)
+			}
+
+			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
+			// Stamp the invocation's diagnostic metadata so the execution
+			// container carries its owner and identity labels. The type is the
+			// event one-shot type: a manual invocation runs an event rule against
+			// an operator-supplied event, so it belongs to the same execution
+			// population (and is swept by hostname if the worker dies mid-call).
+			// MessageID is empty: there is no stream message.
+			invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
+				Type:      runtime.ContainerTypeEvent,
+				Function:  name,
+				Handler:   rule.Handler,
+				EventID:   eventID,
+				EventName: eventName,
+				Hostname:  r.hostname,
+				Image:     toImage(pf),
+			})
+
+			start := time.Now()
+			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
+			d := time.Since(start)
+			if panicked {
+				r.log.Error("Function invoke: handler PANICKED",
+					"function", name,
+					"handler", rule.Handler,
+					"panic_value", fmt.Sprintf("%v", panicValue),
+					"stack", string(debug.Stack()),
+				)
+			}
+			if err != nil {
+				r.recordHandlerFailure(name, rule.Handler, d)
+				r.log.Warn("Function invoke: handler execution failed",
+					"function", name,
+					"handler", rule.Handler,
+					"duration", d,
+					"reason", err,
+				)
+				return fmt.Errorf("function %q handler %q: %w", name, rule.Handler, err)
+			}
+			r.recordHandlerSuccess(name, rule.Handler, d)
+			r.log.Info("Function invoke: handler executed",
+				"function", name,
+				"handler", rule.Handler,
+				"duration", d,
+			)
+			return nil
+		}()
+		// Count every handler whose execution was attempted, including a failed
+		// attempt: the count answers "how many handlers ran", and the caller
+		// only prints it when there is no error anyway.
+		count++
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr != nil {
+		return count, firstErr
+	}
+	return count, nil
+}
+
 // invokeOnce is the smallest reusable single-handler execution core shared by
 // InvokeHandler (with or without invocation state): it resolves the per-invocation
 // template env/secrets, runs the handler inside the panic boundary and the
@@ -1665,24 +1819,7 @@ func (r *Runner) invokeOnce(
 	if invState != nil {
 		invState.MarkComplete(invocation)
 	}
-	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
-		[]metrics.Label{
-			{Name: "outcome", Value: "success"},
-			{Name: "function", Value: pf.fn.Name},
-			{Name: "handler", Value: handler},
-		})
-	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
-	// for Prometheus.
-	r.metrics.Inc(metrics.MetricHandlerSuccess)
-	// Per-function success attribution.
-	r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
-		[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-	r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampSuccess, time.Now().Unix())
-	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
-		[]metrics.Label{
-			{Name: "function", Value: pf.fn.Name},
-			{Name: "handler", Value: handler},
-		}, d)
+	r.recordHandlerSuccess(pf.fn.Name, handler, d)
 	r.log.Info("Function handler: executed for schedule",
 		"function", pf.fn.Name,
 		"handler", handler,
@@ -1709,15 +1846,43 @@ func handlerLogFields(hasState bool, fnName, handler, msgID string, handlerAttem
 	return append(fields, "delivery_attempt", int(deliveryAttempt))
 }
 
+// recordHandlerSuccess increments the success metrics shared by Handle's
+// success branch, InvokeHandler, and manual invocation: the labeled invocation
+// outcome counter, the unlabeled total, per-function success attribution, the
+// last_success_at timestamp, and the duration histogram. It deliberately does
+// NOT touch the event classification counters or function_events_matched_total —
+// Handle owns those and counts them once per logical event, so an execution
+// must not be double-attributed here.
+func (r *Runner) recordHandlerSuccess(fnName, handler string, d time.Duration) {
+	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
+		[]metrics.Label{
+			{Name: "outcome", Value: "success"},
+			{Name: "function", Value: fnName},
+			{Name: "handler", Value: handler},
+		})
+	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
+	// for Prometheus.
+	r.metrics.Inc(metrics.MetricHandlerSuccess)
+	// Per-function success attribution.
+	r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
+		[]metrics.Label{{Name: "function", Value: fnName}})
+	r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampSuccess, time.Now().Unix())
+	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
+		[]metrics.Label{
+			{Name: "function", Value: fnName},
+			{Name: "handler", Value: handler},
+		}, d)
+}
+
 // recordHandlerFailure increments the failure metrics shared by Handle's
-// failure branch and InvokeHandler: the labeled invocation outcome counter, the
-// unlabeled total, per-function failure attribution, and the duration
-// histogram. A failed attempt that will retry still counts as a failure here
-// (it sets last_failure_at); only the DLQ-routed exhaustion additionally sets
-// last_dlq_at (see recordFailure). It deliberately does NOT touch the event
-// classification counters or function_events_matched_total — Handle owns those
-// and counts them once per logical event, so a failure must not be
-// double-attributed here.
+// failure branch, InvokeHandler, and manual invocation: the labeled invocation
+// outcome counter, the unlabeled total, per-function failure attribution, and
+// the duration histogram. A failed attempt that will retry still counts as a
+// failure here (it sets last_failure_at); only the DLQ-routed exhaustion
+// additionally sets last_dlq_at (see recordFailure). It deliberately does NOT
+// touch the event classification counters or function_events_matched_total —
+// Handle owns those and counts them once per logical event, so a failure must
+// not be double-attributed here.
 func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
