@@ -10,6 +10,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -151,6 +152,148 @@ func TestServicesReconcileIntegration(t *testing.T) {
 // serviceReconcileTemplate renders a node24 template declaring one service.
 func serviceReconcileTemplate(port, replicas int) string {
 	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
+}
+
+// TestServicesReconcileEnvChangeReplacesContainer proves against a real daemon
+// that a template `env` change replaces the persistent service container (the
+// running container's Config.Env would otherwise stay stale forever, since the
+// entrypoint image reference is unchanged): the container id changes and the
+// replacement's Config.Env carries the new value and the matching relay.env_hash.
+func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
+	testutil.RequireDocker(t)
+
+	root := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m, err := runtime.NewManager(logger, nil, "test-host")
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m.Close()
+
+	name := testutil.UniqueName(t, "svc-env")
+	dir := filepath.Join(root, name)
+	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeTemplate := func(version string) {
+		tmpl := "runtime: node24\nenv:\n  APP_VERSION: " + version + "\nservices:\n  - entrypoint: app/service.js\n    port: 3000\n    replicas: 1\n"
+		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
+			t.Fatalf("write template: %v", err)
+		}
+	}
+	writeTemplate("v1")
+	if err := os.WriteFile(filepath.Join(dir, "app", "service.js"), []byte("process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n"), 0o644); err != nil {
+		t.Fatalf("write service: %v", err)
+	}
+
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		defer cli.Close()
+		if c, err := m.ServiceContainerList(cc); err == nil {
+			var own []runtime.ServiceContainer
+			for _, ct := range c {
+				if ct.Function == name {
+					own = append(own, ct)
+				}
+			}
+			_ = m.StopServiceContainers(cc, own)
+		}
+		imgs, err := cli.ImageList(cc, client.ImageListOptions{All: true})
+		if err != nil {
+			return
+		}
+		for _, img := range imgs.Items {
+			for _, tag := range img.RepoTags {
+				if strings.HasPrefix(tag, "relay-fn-"+name+":") {
+					_, _ = cli.ImageRemove(cc, tag, client.ImageRemoveOptions{Force: true})
+					break
+				}
+			}
+		}
+	})
+
+	reg := &runner.Registry{}
+	reg.Set(nil)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
+
+	// apply builds/prepares the function (through the adapter) and converges its
+	// service containers, so each pass observes the current template's env.
+	rec := New(
+		Config{
+			Root: root, Debounce: 20 * time.Millisecond, Interval: time.Hour,
+			UpdateServices: func(fnName, fnDir string, tmpl *function.Template, image string) {
+				ctx := context.Background()
+				svcCtrl.Apply(ctx, fnName, fnDir, tmpl, image, nil)
+			},
+			RemoveServices: func(fnName string) {
+				svcCtrl.Remove(context.Background(), fnName)
+			},
+		},
+		reg, dockerManagerAdapter{m}, logger,
+	)
+
+	rec.reconcileFunction(name)
+	assertServiceCounts(t, m, name, 1)
+
+	// Find the running container and capture its id + env.
+	findContainer := func() (id string, env []string, envHash string) {
+		t.Helper()
+		list, err := m.ServiceContainerList(context.Background())
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, c := range list {
+			if c.Function != name || c.State != container.StateRunning {
+				continue
+			}
+			insp, err := cli.ContainerInspect(context.Background(), c.ID, client.ContainerInspectOptions{})
+			if err != nil {
+				t.Fatalf("inspect: %v", err)
+			}
+			var e []string
+			if insp.Container.Config != nil {
+				e = insp.Container.Config.Env
+			}
+			return c.ID, e, c.EnvHash
+		}
+		t.Fatal("no running container found")
+		return "", nil, ""
+	}
+	firstID, firstEnv, firstHash := findContainer()
+	if !containsEnv(firstEnv, "APP_VERSION=v1") {
+		t.Fatalf("first container env = %v, want APP_VERSION=v1", firstEnv)
+	}
+
+	// Change only the template env value; re-reconcile.
+	writeTemplate("v2")
+	rec.reconcileFunction(name)
+	assertServiceCounts(t, m, name, 1)
+
+	secondID, secondEnv, secondHash := findContainer()
+	if secondID == firstID {
+		t.Fatalf("container was not replaced on an env change (same id %s); env=%v", secondID, secondEnv)
+	}
+	if !containsEnv(secondEnv, "APP_VERSION=v2") {
+		t.Fatalf("replacement env = %v, want APP_VERSION=v2", secondEnv)
+	}
+	if secondHash == firstHash || secondHash == "" {
+		t.Fatalf("relay.env_hash unchanged across an env change (%q); want a new non-empty hash", secondHash)
+	}
+}
+
+// containsEnv reports whether env carries the exact "K=V" entry.
+func containsEnv(env []string, want string) bool {
+	for _, e := range env {
+		if e == want {
+			return true
+		}
+	}
+	return false
 }
 
 // assertServiceCounts waits (up to 20s) until exactly want running service

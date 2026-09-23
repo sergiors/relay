@@ -927,10 +927,16 @@ unlaunchable entrypoint, an unresolved secret), the pass reports the failure and
 **preserves the service's existing healthy containers** rather than tearing them
 down. A transient registry outage therefore never degrades a working service.
 
-- Containers whose image (or, for an external tag, image **content**), port, or
-  routing labels no longer match the current version are **replaced** (stop +
-  remove, then start fresh replicas). Containers whose image and port are
-  unchanged are **preserved** — no unnecessary restarts.
+- Containers whose image (or, for an external tag, image **content**), port,
+  effective **environment** (`relay.env_hash`), or routing labels no longer match
+  the current version are **replaced** (stop + remove, then start fresh
+  replicas). Containers whose image, port, and environment are unchanged are
+  **preserved** — no unnecessary restarts. The environment comparison is what
+  makes a changed template `env` value or a **rotated secret value** replace a
+  service's container: the image reference and source fingerprint do not change
+  for either, but a long-lived container would otherwise keep serving its old
+  environment forever. A container created before `relay.env_hash` existed
+  carries no label and is replaced once.
 - Scaling up starts the missing replica slots; scaling down stops and removes
   exactly the excess containers (the lowest-numbered replicas are kept).
 - A replica whose process **exits** (a crash) is detected by the same
@@ -955,19 +961,21 @@ rebuild, or function removal). Image removal is never forced.
 
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.function`, `relay.identity`, plus the image, the
-image content id, port, and replica slot), never by name alone.
+image content id, port, replica slot, and `relay.env_hash`), never by name alone.
 `relay.identity` is the configured source descriptor (entrypoint file, Dockerfile
 path, or image reference) — an honest identity for every source kind, never a
 synthetic entrypoint. Service containers carry no
 `relay.handler` label (that key identifies event/schedule handlers) — the source
-IS the service. Generated container names (`relay-svc-<function>-<identity>…`)
-are for human greppability only: like the routing ids, they end in a 64-bit hash
-of the full identity so distinct identities that sanitize or truncate to the
-same readable prefix still never share a name. On graceful shutdown, Relay stops
-and removes the service containers owned by that worker (scoped by
-`relay.hostname`, so other workers' containers are untouched); stale containers
-left behind by a crashed Relay process are swept at the next startup
-(per-function reconcile plus the startup orphan sweep).
+IS the service. `relay.env_hash` is a one-way digest of the replica's effective
+environment (see below); it carries no value. Generated container names
+(`relay-svc-<function>-<identity>…`) are for human greppability only: like the
+routing ids, they end in a 64-bit hash of the full identity so distinct
+identities that sanitize or truncate to the same readable prefix still never
+share a name. On graceful shutdown, Relay stops and removes the service
+containers owned by that worker (scoped by `relay.hostname`, so other workers'
+containers are untouched); stale containers left behind by a crashed Relay
+process are swept at the next startup (per-function reconcile plus the startup
+orphan sweep).
 
 The environment each replica gets: the runtime's plan environment (e.g.
 `PYTHONDONTWRITEBYTECODE=1` for Python; empty for build/image sources), then the
@@ -1468,9 +1476,13 @@ and never shown by `relay function inspect` (which shows only the reference).
   each secret file is written atomically with mode `0600`. `compose.dev.yaml`
   mounts the named volume `relay-data` at `/var/lib/relay`, so secrets survive
   container restarts. **Deleting the volume deletes the secrets.**
-- **Rotation**: changing a secret's value takes effect on the next invocation —
-  no rebuild, no restart, no fingerprint change. Secrets are resolved per
-  execution.
+- **Rotation**: for event/schedule invocations, changing a secret's value takes
+  effect on the next invocation — no rebuild, no restart, no fingerprint change
+  (secrets are resolved per execution). For a persistent **service** container,
+  the rotate takes effect at the next reconcile of the owning function (the
+  periodic pass; default every 30s): the container's environment is part of its
+  configuration, so a value change makes the running container stale and Relay
+  replaces it — still with no rebuild and no fingerprint change.
 - **Provider**: the local filesystem provider is the current (single-host, beta)
   implementation. The provider interface is deliberately tiny so a future
   external provider (Vault, a secrets API, ...) can be added without changing
@@ -1507,7 +1519,11 @@ relay secret rm database-url
   in labels, logs, metrics, or `relay function inspect` output. They exist only
   as files under `/var/lib/relay/secrets` (mode `0600`) and, transiently, in the
   environment of a **running** execution container (visible via
-  `docker inspect` of that running container only).
+  `docker inspect` of that running container only). A service container's
+  `relay.env_hash` label holds a **one-way digest** of its effective environment
+  (including resolved secret values), never a value; it exists so a rotated
+  secret value replaces the stale container, and a digest cannot be reversed into
+  the value.
 - Secret **references** (the names) are configuration metadata: they appear in
   `template.yaml`, in the fingerprint, and in `relay function inspect`.
 - **Never put secret VALUES in `template.yaml`** — the template is copied into

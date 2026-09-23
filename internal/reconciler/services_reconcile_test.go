@@ -28,6 +28,7 @@ type fakeContainer struct {
 	replica    int
 	state      container.ContainerState
 	entry      []string // the long-lived process command passed to StartService
+	envHash    string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	labels     map[string]string
 	network    string // spec.Network passed to StartService
 	hostname   string // the worker identity (relay.hostname) that owns the container
@@ -112,9 +113,14 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		replica:    replica,
 		state:      container.StateRunning,
 		entry:      spec.Entry,
-		labels:     spec.Labels,
-		network:    spec.Network,
-		hostname:   defaultFakeHostname,
+		// Mirror production's serviceLabels: a started container always carries
+		// the effective env's content hash (relay.env_hash), even for an empty
+		// env. Directly seeded fakeContainers omit it to model a legacy/unlabeled
+		// container.
+		envHash:  runtime.EnvHash(spec.Env),
+		labels:   spec.Labels,
+		network:  spec.Network,
+		hostname: defaultFakeHostname,
 	}
 	return id, nil
 }
@@ -141,6 +147,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			Replica:  c.replica,
 			Port:     c.port,
 			Hostname: c.hostname,
+			EnvHash:  c.envHash,
 			Labels:   c.labels,
 		})
 	}
@@ -239,6 +246,15 @@ func serviceTemplate(runtimeName string, services ...function.Service) *function
 		runtimeName = "node24"
 	}
 	return &function.Template{Runtime: runtimeName, Services: services}
+}
+
+// serviceEnvHash is the relay.env_hash label a started container carries for the
+// given port with no prepared env and no secrets — the exact shape the
+// package-level reconcile test helper produces (BuildEnv appends PORT last).
+// Directly seeded fakeContainers in converged-state tests set this so they model
+// a container Relay itself created; omitting it models a legacy/unlabeled one.
+func serviceEnvHash(port int) string {
+	return runtime.EnvHash([]string{fmt.Sprintf("PORT=%d", port)})
 }
 
 // reconcile runs Reconcile with the background context, no prepared env, no
@@ -652,6 +668,186 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 	}
 }
 
+// reconcileEnv runs Reconcile with a secret resolver and prepared env, for the
+// env/secret staleness tests.
+func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
+	t.Helper()
+	return Reconcile(context.Background(), d, fn, t.TempDir(), tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
+}
+
+// TestReconcileEnvChangeReplacesContainer: changing a template env value on an
+// `image` source (whose image reference is unchanged) leaves the running
+// container's environment stale, so it must be replaced. This is the core
+// regression the relay.env_hash label exists to catch.
+func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
+	f := newFakeDocker()
+	start := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	start.Env = map[string]string{"MODE": "a"}
+	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile env=a: %v", err)
+	}
+	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
+	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=a", "PORT=8080"}) {
+		t.Fatalf("started container hash = %+v, want the hash of the env=a effective env", c)
+	}
+
+	// Same image reference, changed env value -> stale by env hash.
+	changed := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	changed.Env = map[string]string{"MODE": "b"}
+	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile env=b: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the env-stale container replaced", f.stops)
+	}
+	c = f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
+	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=8080"}) {
+		t.Fatalf("replacement hash = %+v, want the hash of the env=b effective env", c)
+	}
+}
+
+// TestReconcileEnvRemovedReplacesContainer: removing a template env makes the
+// previous container stale (the desired effective env shrank), so it is replaced.
+func TestReconcileEnvRemovedReplacesContainer(t *testing.T) {
+	f := newFakeDocker()
+	withEnv := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	withEnv.Env = map[string]string{"FEATURE": "on"}
+	if _, err := reconcile(t, f, "fn", withEnv, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile with env: %v", err)
+	}
+
+	withoutEnv := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	if _, err := reconcile(t, f, "fn", withoutEnv, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile without env: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the container replaced when an env was removed", f.stops)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil || c.envHash != runtime.EnvHash([]string{"PORT=80"}) {
+		t.Fatalf("replacement hash = %+v, want the hash of the env-less effective env", c)
+	}
+}
+
+// TestReconcileSecretRotationReplacesContainer: rotating a secret's VALUE (with
+// an unchanged template and image, so the source fingerprint is unchanged) must
+// replace the persistent container, because a long-lived container would
+// otherwise serve the old secret forever. This is the behavior the per-invocation
+// secret path gives event containers but the service path needs a container
+// replacement for.
+func TestReconcileSecretRotationReplacesContainer(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	tmpl.Secrets = map[string]function.SecretRef{"TOKEN": "api-token"}
+
+	provider := &fakeSecretResolver{values: map[string]string{"api-token": "v1"}}
+	if _, err := reconcileEnv(t, f, "fn", tmpl, "", nil, provider); err != nil {
+		t.Fatalf("reconcile v1: %v", err)
+	}
+	first := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
+	if first == nil {
+		t.Fatal("no started container")
+	}
+	// The secret VALUE never appears in a label; only the digest does.
+	for k, v := range first.labels {
+		if strings.Contains(v, "v1") || strings.Contains(k, "TOKEN") {
+			t.Fatalf("secret value/name leaked into label %q=%q", k, v)
+		}
+	}
+
+	// Rotate the value: same template, same image, same fingerprint.
+	provider.values["api-token"] = "v2"
+	if _, err := reconcileEnv(t, f, "fn", tmpl, "", nil, provider); err != nil {
+		t.Fatalf("reconcile v2: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the secret-rotated container replaced", f.stops)
+	}
+	second := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
+	if second == nil {
+		t.Fatal("no replacement container")
+	}
+	if second.envHash == first.envHash {
+		t.Fatalf("env hash unchanged across secret rotation (%q); container would serve the old secret", second.envHash)
+	}
+	if second.envHash != runtime.EnvHash([]string{"TOKEN=v2", "PORT=8080"}) {
+		t.Fatalf("replacement hash = %q, want the v2 effective env hash", second.envHash)
+	}
+}
+
+// TestReconcileEnvUnchangedKeepsContainer: an unchanged effective env keeps the
+// running container (no churn), pinning that the env-hash comparison is exact.
+func TestReconcileEnvUnchangedKeepsContainer(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl.Env = map[string]string{"MODE": "stable"}
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	stopsSoFar := len(f.stops)
+	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
+	if err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if changed || len(f.stops) != stopsSoFar {
+		t.Fatalf("an unchanged env must keep the container: changed=%v stops %d->%d", changed, stopsSoFar, len(f.stops))
+	}
+}
+
+// TestReconcileLegacyContainerWithoutEnvHashReplaced: a running container with
+// no relay.env_hash (created before the label existed, or otherwise unwritable)
+// never matches a desired hash, so it is replaced exactly once — the same
+// missing-label semantics as relay.replica == -1.
+func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["legacy-1"] = &fakeContainer{
+		id: "legacy-1", function: "fn", entrypoint: "service.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+		// No envHash: a pre-label container.
+	}
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(f.stops) != 1 || f.stops[0] != "legacy-1" {
+		t.Fatalf("stops = %v, want [legacy-1] (an unlabeled env hash is always stale)", f.stops)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1 (replacement started)", got)
+	}
+	c := f.lastStartedFor("fn", "service.js")
+	if c == nil || c.envHash != serviceEnvHash(80) {
+		t.Fatalf("replacement = %+v, want a stamped env hash", c)
+	}
+}
+
+// TestReconcileBuildSourceEnvChangeReplaces: the env/secret comparison is
+// source-agnostic — a `build` source (whose resolved image reference is
+// content-addressed and unchanged by an env edit) is replaced on an env change
+// just like an `image` source.
+func TestReconcileBuildSourceEnvChangeReplaces(t *testing.T) {
+	f := newFakeDocker()
+	f.resolvedImages["Dockerfile"] = "relay-fn-fn:buildtag"
+	start := serviceTemplate("", function.Service{Build: "Dockerfile", Port: 3000, Replicas: 1})
+	start.Env = map[string]string{"MODE": "a"}
+	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile env=a: %v", err)
+	}
+
+	changed := serviceTemplate("", function.Service{Build: "Dockerfile", Port: 3000, Replicas: 1})
+	changed.Env = map[string]string{"MODE": "b"}
+	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
+		t.Fatalf("reconcile env=b: %v", err)
+	}
+	if len(f.stops) != 1 {
+		t.Fatalf("stops = %v, want the build-source env-stale container replaced", f.stops)
+	}
+	c := f.lastStartedFor("fn", "Dockerfile")
+	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=3000"}) {
+		t.Fatalf("replacement = %+v, want the env=b effective env hash", c)
+	}
+}
+
 type fakeSecretResolver struct {
 	mu     sync.Mutex
 	values map[string]string
@@ -797,6 +993,7 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", function: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+		envHash: serviceEnvHash(80),
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
@@ -927,6 +1124,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", function: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+		envHash: serviceEnvHash(80),
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 

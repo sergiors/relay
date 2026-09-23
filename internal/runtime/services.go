@@ -83,6 +83,12 @@ type ServiceContainer struct {
 	// The service reconciler uses it to detect a port change (a stale-config
 	// container whose labelPort != the template's desired port is replaced).
 	Port int
+	// EnvHash is the content hash of the effective environment the container
+	// was created with, parsed from relay.env_hash. It is "" for a container
+	// created before the label existed (or with a missing/invalid value), which
+	// never equals a desired hash, so such a container is replaced once —
+	// exactly like a missing relay.image_id or relay.port.
+	EnvHash string
 	// Labels is the container's FULL label set (nil-safe; nil when the
 	// container has none). The service reconciler compares routing metadata
 	// through it without Relay parsing or interpreting foreign label names.
@@ -156,6 +162,28 @@ func serviceIdentityHash(functionName, identity string) string {
 	return hex.EncodeToString(sum[:])[:serviceIdentityHashLen]
 }
 
+// EnvHash returns the short content hash of a service replica's effective
+// environment (relay.env_hash): a deterministic, order-sensitive digest over the
+// exact Config.Env slice StartService applies. It is a one-way hash, so no
+// secret value is ever exposed in a label, log, metric, or inspect output — the
+// environment itself is the only place values live.
+//
+// The reconciler uses it to detect that a container's environment no longer
+// matches the template: a changed template env on an `image` source (whose image
+// reference is unchanged), or a rotated secret value (which never changes the
+// source fingerprint), must replace the stale container. The NUL separator is
+// not valid inside an env entry, so the entries cannot run together across the
+// join. The hash length matches serviceIdentityHashLen so the two label values
+// share one convention.
+func EnvHash(env []string) string {
+	h := sha256.New()
+	for _, kv := range env {
+		_, _ = h.Write([]byte(kv))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:serviceIdentityHashLen]
+}
+
 // serviceLabels is the total, greppable label set stamped on every service
 // container: relay.type=service plus relay.function + relay.hostname make a
 // service container recognizable to Relay while the strict relay.type guard
@@ -164,13 +192,16 @@ func serviceIdentityHash(functionName, identity string) string {
 // source descriptor) — there is no relay.service label there, and service
 // containers carry no relay.handler. relay.image_id records the local content ID
 // the container was started from (empty when the reference itself is
-// content-addressed), so a moved external tag is detected.
+// content-addressed), so a moved external tag is detected. relay.env_hash pins
+// the effective environment's content hash so an env/secret change replaces a
+// container whose image reference is unchanged (see labelEnvHash).
 //
 // Extra caller-supplied labels (spec.Labels, e.g. routing labels) are merged
 // on top, then the relay ownership keys are RE-applied last so Relay's
 // ownership labels are always authoritative: a caller can add labels but never
 // clobber or spoof a relay.* key.
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
+	envHash := EnvHash(spec.Env)
 	labels := map[string]string{
 		labelType:     ContainerTypeService,
 		labelFunction: spec.Function,
@@ -179,6 +210,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 		labelHostname: hostname,
 		labelPort:     strconv.Itoa(spec.Port),
 		labelReplica:  strconv.Itoa(replica),
+		labelEnvHash:  envHash,
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -193,6 +225,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	labels[labelHostname] = hostname
 	labels[labelPort] = strconv.Itoa(spec.Port)
 	labels[labelReplica] = strconv.Itoa(replica)
+	labels[labelEnvHash] = envHash
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
 	if spec.ImageID != "" {
@@ -324,6 +357,7 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			State:    c.State,
 			Replica:  replica,
 			Port:     port,
+			EnvHash:  c.Labels[labelEnvHash],
 			Labels:   labelsCopy,
 		})
 	}

@@ -278,6 +278,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 			labelImage:    image,
 			labelHostname: "test-host",
 			labelPort:     "3000",
+			labelEnvHash:  EnvHash([]string{"PORT=3000"}),
 		}
 		for k, v := range want {
 			if got := insp.Container.Config.Labels[k]; got != v {

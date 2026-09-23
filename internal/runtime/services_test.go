@@ -2,11 +2,14 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/testutil"
 )
@@ -27,6 +30,10 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		labelHostname: "worker-1",
 		labelPort:     "3000",
 		labelReplica:  "2",
+		// No spec.Env -> the hash of an empty env slice (a container created
+		// with no effective env still carries its content hash so discovery can
+		// compare it).
+		labelEnvHash: EnvHash(nil),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -48,6 +55,46 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	}
 	if _, ok := got["relay.service"]; ok {
 		t.Errorf("service labels must NOT carry relay.service, got %v", got)
+	}
+}
+
+// TestServiceLabelsEnvHashPinsEffectiveEnv: the relay.env_hash label is the
+// content hash of the EXACT effective env slice (so discovery can tell an
+// env/secret change happened), never a raw value; distinct env produces a
+// distinct hash, and the same env reproduces it. It also pins order sensitivity:
+// the same entries in a different order are a different effective env.
+func TestServiceLabelsEnvHashPinsEffectiveEnv(t *testing.T) {
+	spec := func(env []string) ServiceSpec {
+		return ServiceSpec{Function: "fn", Identity: "svc.js", Port: 80, Image: "img", Env: env}
+	}
+	base := serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)
+	if base[labelEnvHash] != EnvHash([]string{"A=1", "B=2"}) {
+		t.Errorf("env hash = %q, want the hash of the effective env", base[labelEnvHash])
+	}
+	if base[labelEnvHash] == EnvHash([]string{"A=1", "B=3"}) {
+		t.Error("a changed env value must change the env hash")
+	}
+	if base[labelEnvHash] == EnvHash([]string{"B=2", "A=1"}) {
+		t.Error("a different env order must change the env hash (order-sensitive)")
+	}
+	if serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)[labelEnvHash] != base[labelEnvHash] {
+		t.Error("the same env must reproduce the same hash")
+	}
+}
+
+// TestEnvHashEmptyIsStableAndValueFree pins the two properties the reconciler
+// relies on: the empty env hashes to one fixed value, and the hash is a fixed
+// 16-hex-char digest (never the env itself).
+func TestEnvHashEmptyIsStableAndValueFree(t *testing.T) {
+	if EnvHash(nil) != EnvHash([]string{}) {
+		t.Error("nil and empty env must hash identically")
+	}
+	got := EnvHash([]string{"TOKEN=super-secret-value"})
+	if len(got) != serviceIdentityHashLen {
+		t.Fatalf("env hash length = %d, want %d", len(got), serviceIdentityHashLen)
+	}
+	if strings.Contains(got, "super-secret-value") || strings.Contains(got, "TOKEN") {
+		t.Errorf("env hash %q leaks env content", got)
 	}
 }
 
@@ -249,7 +296,8 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 // The client-call path is exercised without a real Docker daemon.
 func TestServiceContainerListParsing(t *testing.T) {
 	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
-		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2"}`
+		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2",` +
+		`"relay.env_hash":"0123456789abcdef"}`
 	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
@@ -281,15 +329,23 @@ func TestServiceContainerListParsing(t *testing.T) {
 	if c1.Port != 3000 {
 		t.Errorf("c1 port = %d, want the parsed 3000", c1.Port)
 	}
+	if c1.EnvHash != "0123456789abcdef" {
+		t.Errorf("c1 env hash = %q, want the parsed relay.env_hash", c1.EnvHash)
+	}
 
 	// c2 has no relay.replica and a non-numeric relay.port: replica defaults to
-	// -1 (always-stale to Reconcile) and port to 0.
+	// -1 (always-stale to Reconcile) and port to 0. Its env hash is empty
+	// (missing label) — a legacy/unlabeled container that never matches a
+	// desired hash, so it is replaced once.
 	c2 := byID["c2"]
 	if c2.Replica != -1 {
 		t.Errorf("c2 replica = %d, want -1 default for a missing label", c2.Replica)
 	}
 	if c2.Port != 0 {
 		t.Errorf("c2 port = %d, want 0 default for a non-numeric label", c2.Port)
+	}
+	if c2.EnvHash != "" {
+		t.Errorf("c2 env hash = %q, want empty for a missing label", c2.EnvHash)
 	}
 
 	// The full label set is copied, so the reconciler can compare foreign labels.
@@ -314,6 +370,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 			labelType:     ContainerTypeEvent,
 			labelFunction: "spoofed",
 			labelPort:     "9999",
+			labelEnvHash:  "spoofedhash",
 			"custom.key":  "custom-value",
 		},
 	}
@@ -328,6 +385,9 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got[labelPort] != "3000" {
 		t.Fatalf("relay.port = %q, want 3000 (ownership must win)", got[labelPort])
 	}
+	if got[labelEnvHash] != EnvHash(nil) {
+		t.Fatalf("relay.env_hash = %q, want the authoritative env hash (ownership must win)", got[labelEnvHash])
+	}
 	if got["traefik.enable"] != "true" {
 		t.Fatalf("extra routing label missing: %v", got)
 	}
@@ -336,5 +396,125 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	}
 	if got[labelIdentity] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
 		t.Fatalf("ownership labels corrupted: %v", got)
+	}
+}
+
+// captureServiceCreate drives the real StartService client path against the
+// scripted daemon and returns the JSON body of the /containers/create request,
+// so a test can assert the container's Docker Config.Env and labels without a
+// daemon. Start is scripted so the create+start sequence completes.
+func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
+	t.Helper()
+	var createBody []byte
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create",
+			body:   `{"Id":"cid-1"}`,
+			onBody: func(b []byte) { createBody = append([]byte(nil), b...) },
+		},
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
+	if _, err := m.StartService(context.Background(), spec, 0); err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	if len(createBody) == 0 {
+		t.Fatal("no /containers/create body captured")
+	}
+	return createBody
+}
+
+// decodeCreateConfig decodes the captured create request body into its Config,
+// so a test can assert the exact Docker Config.Env/Labels StartService sends.
+func decodeCreateConfig(t *testing.T, body []byte) *container.Config {
+	t.Helper()
+	var req container.CreateRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("decode create request: %v\n%s", err, body)
+	}
+	if req.Config == nil {
+		t.Fatalf("create request has no Config:\n%s", body)
+	}
+	return req.Config
+}
+
+// TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources pins the invariant
+// that ALL THREE source kinds write the caller-assembled effective environment
+// verbatim into Docker Config.Env — entrypoint (with an entry override), build,
+// and image (both preserving the image ENTRYPOINT). The env slice is exactly
+// what the reconciler's BuildEnv produced (prepared env + template env +
+// resolved secrets + PORT), so a service actually receives its configured
+// env/secrets. The relay.env_hash label is the digest of that same slice.
+func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
+	env := []string{"PREPARED=1", "GREETING=hello", "SECRET=s3cr3t", "PORT=3000"}
+	for _, tc := range []struct {
+		name string
+		spec ServiceSpec
+	}{
+		{
+			name: "entrypoint",
+			spec: ServiceSpec{
+				Function: "fn", Identity: "service.js", Port: 3000,
+				Image: "relay-fn-fn:tag", Entry: []string{"node", "/app/service.js"}, Env: env,
+			},
+		},
+		{
+			name: "build",
+			spec: ServiceSpec{
+				Function: "fn", Identity: "Dockerfile", Port: 3000,
+				Image: "relay-fn-fn:buildtag", Env: env,
+			},
+		},
+		{
+			name: "image",
+			spec: ServiceSpec{
+				Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000,
+				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: env,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := decodeCreateConfig(t, captureServiceCreate(t, tc.spec))
+			if len(cfg.Env) != len(env) {
+				t.Fatalf("Config.Env = %v, want the effective env %v", cfg.Env, env)
+			}
+			for i := range env {
+				if cfg.Env[i] != env[i] {
+					t.Fatalf("Config.Env[%d] = %q, want %q (full: %v)", i, cfg.Env[i], env[i], cfg.Env)
+				}
+			}
+			if cfg.Labels[labelEnvHash] != EnvHash(env) {
+				t.Fatalf("relay.env_hash = %q, want the effective env hash %q", cfg.Labels[labelEnvHash], EnvHash(env))
+			}
+			// No secret VALUE is exposed anywhere in the labels; only the digest.
+			for k, v := range cfg.Labels {
+				if strings.Contains(v, "s3cr3t") {
+					t.Fatalf("secret value leaked into label %q=%q", k, v)
+				}
+			}
+		})
+	}
+}
+
+// TestStartServiceEntryOnlyForEntrypointSource pins that the entry override
+// reaches Config.Entrypoint only for an entrypoint source; build/image sources
+// leave it empty so the image's own ENTRYPOINT/CMD is preserved.
+func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
+	entry := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
+		Function: "fn", Identity: "service.js", Port: 3000,
+		Image: "img", Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
+	}))
+	if len(entry.Entrypoint) != 2 || entry.Entrypoint[0] != "node" || entry.Entrypoint[1] != "/app/service.js" {
+		t.Fatalf("entrypoint-source Entrypoint = %v, want [node /app/service.js]", entry.Entrypoint)
+	}
+
+	build := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
+		Function: "fn", Identity: "Dockerfile", Port: 3000, Image: "img", Env: []string{"PORT=3000"},
+	}))
+	if len(build.Entrypoint) != 0 {
+		t.Fatalf("build-source Entrypoint = %v, want none (preserve image ENTRYPOINT)", build.Entrypoint)
+	}
+	if build.Labels[labelHostname] != "test-host" {
+		t.Fatalf("relay.hostname = %q, want test-host", build.Labels[labelHostname])
 	}
 }

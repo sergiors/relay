@@ -56,6 +56,20 @@ const (
 	labelPort     = "relay.port"
 	labelReplica  = "relay.replica"
 
+	// labelEnvHash pins the exact effective environment a service replica was
+	// created with: a short content hash over the Config.Env slice (runtime plan
+	// env + template env + resolved secrets + PORT), never any value itself.
+	//
+	// It exists because the environment is the one piece of a service's
+	// configuration the image reference cannot carry: an external `image`
+	// source keeps its reference when the template's env changes, and a rotated
+	// secret value never changes the fingerprint at all. Without this label the
+	// service reconciler would keep such a container and it would serve its old
+	// environment forever. The hash is a one-way digest, so no secret value is
+	// exposed; a container built before the label carries none and never
+	// matches the desired hash, so it is replaced once.
+	labelEnvHash = "relay.env_hash"
+
 	// Managed-image labels. These pin the identity and wiring of a managed
 	// image (function or dependency) so the dependency GC can classify images
 	// and resolve function→dependency ownership without inferring anything

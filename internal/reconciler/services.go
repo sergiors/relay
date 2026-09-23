@@ -283,17 +283,27 @@ func Reconcile(
 			log.Warn("Service: cannot start replicas", "service", identity, "error", err)
 			continue
 		}
+		// envHash is the desired effective environment's content hash. It is
+		// compared against each container's relay.env_hash label below: the
+		// environment is the one piece of configuration the image reference
+		// cannot carry (a template env change on an `image` source leaves the
+		// reference unchanged; a rotated secret value never changes the source
+		// fingerprint), so without this comparison a stale container would keep
+		// serving its old env/secrets indefinitely. The hash is order-sensitive
+		// and covers the exact slice StartService applies.
+		envHash := runtime.EnvHash(env)
 
 		// A container is a keep candidate only when it is both healthy (running)
-		// and currently configured correctly (image, image content, and port
-		// match the desired values) and carries a real replica label. Anything
-		// else — exited/dead/removing, a changed image (rebuild), a moved
-		// external tag (image content changed), a changed port, or an unlabeled
-		// legacy container (Replica == -1) — is stale and must be replaced. In
-		// addition, the container's labels must match the desired routing label
-		// set exactly: a changed host/path/port/network leaves stale Traefik
-		// labels pointing traffic at whatever the old container served, so the
-		// container is replaced.
+		// and currently configured correctly (image, image content, port, and
+		// effective environment all match the desired values) and carries a real
+		// replica label. Anything else — exited/dead/removing, a changed image
+		// (rebuild), a moved external tag (image content changed), a changed
+		// port, a changed env/secret (env hash mismatch), or an unlabeled legacy
+		// container (Replica == -1) — is stale and must be replaced. In addition,
+		// the container's labels must match the desired routing label set
+		// exactly: a changed host/path/port/network leaves stale Traefik labels
+		// pointing traffic at whatever the old container served, so the container
+		// is replaced.
 		var candidates []runtime.ServiceContainer
 		var stale []runtime.ServiceContainer
 		for _, c := range existing {
@@ -301,6 +311,7 @@ func Reconcile(
 				c.Image == resolved.Ref &&
 				c.ImageID == resolved.ID &&
 				c.Port == svc.Port &&
+				c.EnvHash == envHash &&
 				c.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, c.Labels) {
 				candidates = append(candidates, c)

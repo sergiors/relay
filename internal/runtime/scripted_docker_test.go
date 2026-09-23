@@ -30,6 +30,10 @@ type dockerRoute struct {
 	// or record calls (e.g. how many pulls were attempted) through the real
 	// client call path.
 	onMatch func()
+	// onBody, when set, runs once when the route matches with the FULL request
+	// body already read. It lets a test inspect the JSON a client call sends
+	// (e.g. a container create's Config.Env) through the real client path.
+	onBody func(body []byte)
 }
 
 func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -42,6 +46,13 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		if rt.onMatch != nil {
 			rt.onMatch()
+		}
+		if rt.onBody != nil {
+			// The client has already serialized the request; read it here (the
+			// response below does not depend on the body). A read error leaves
+			// body nil, which the test's assertions will surface.
+			b, _ := io.ReadAll(r.Body)
+			rt.onBody(b)
 		}
 		status := rt.status
 		if status == 0 {
