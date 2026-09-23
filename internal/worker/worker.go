@@ -286,8 +286,11 @@ func Run(logger *slog.Logger) {
 	// and services are prepared), so a `relay function invoke` that races the
 	// wiring answers invoke_unavailable rather than a torn value. This is what
 	// lets the CLI run handlers against the live runtime pool without ever
-	// instantiating Docker/runtime in the CLI process.
+	// instantiating Docker/runtime in the CLI process. The same runner also
+	// serves the `relay dlq replay` semantic command, which re-executes one DLQ
+	// entry's exact recorded function/handler once against the current registry.
 	rtSocket.SetInvoker(runWorker)
+	rtSocket.SetReplayer(runWorker)
 
 	consumer := stream.NewConsumer(stream.ConsumerConfig{
 		Client:            client,

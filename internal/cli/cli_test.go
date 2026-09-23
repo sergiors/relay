@@ -87,7 +87,7 @@ func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencie
 // deps), then call cmd.Run directly with a ctx and args including the program
 // name — no global stdout swapping or subprocess.
 func TestRootHelp(t *testing.T) {
-	commands := []string{"start", "function", "secret", "git", "stats", "health"}
+	commands := []string{"start", "function", "dlq", "secret", "git", "stats", "health"}
 	for _, flag := range []string{"--help", "-h"} {
 		var output bytes.Buffer
 		cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &output, testDeps(t))

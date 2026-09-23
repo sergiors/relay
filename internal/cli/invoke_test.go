@@ -63,6 +63,24 @@ func startTestSocketWithInvoker(t *testing.T, path string, invoker worker.Functi
 	t.Cleanup(func() { _ = s.Close() })
 }
 
+// startTestSocketWithReplayer starts a real worker query socket at path with the
+// given DLQ replayer wired, so `relay dlq replay` can be exercised end to end
+// against the live runner seam.
+func startTestSocketWithReplayer(t *testing.T, path string, replayer worker.HandlerReplayer) {
+	t.Helper()
+	s, err := worker.NewSocketServer(
+		path,
+		fakePoolSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetReplayer(replayer)
+	t.Cleanup(func() { _ = s.Close() })
+}
+
 // TestFunctionInvokeEventFlag verifies the inline --event form: the event object
 // reaches the worker's invoker and the concise success line is written.
 func TestFunctionInvokeEventFlag(t *testing.T) {

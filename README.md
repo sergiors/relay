@@ -35,9 +35,9 @@ Relay is distributed as **one** binary. `relay start` runs the long-running
 process — it consumes events, loads functions, builds images, and reconciles
 `/functions` live, blocking in the foreground until signalled. The remaining
 subcommands are administrative/inspection commands around the same binary;
-they never start the runtime. The only things they write are the local secrets
-store (`relay secret set/rm`) and — read-only otherwise — the state database
-they read from.
+they never start the runtime. Their writes are the local secrets store
+(`relay secret set/rm`), the DLQ stream (`relay dlq rm`, and `relay dlq replay`
+on success), and — read-only otherwise — the state database they read from.
 
 ```
 relay start                # start Relay in the foreground
@@ -47,6 +47,10 @@ relay stats reset          # reset persisted cumulative statistics
 relay function ls          # list functions
 relay function inspect <name>
 relay function invoke <name> --event '{...}'   # run matching handlers on the live worker
+relay dlq ls               # list dead-lettered entries
+relay dlq inspect <id>     # show one entry's metadata and original event
+relay dlq replay <id>      # re-run one entry's exact handler on the live worker
+relay dlq rm <id>          # delete one dead-lettered entry
 relay secret ls|set|rm     # manage local secrets
 relay git keygen           # generate an SSH deploy key
 relay git set <repository> # set the git source to sync from (optionally --webhook-secret)

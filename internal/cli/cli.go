@@ -17,16 +17,35 @@ import (
 
 	"relay/internal/processlock"
 	"relay/internal/state"
+	"relay/internal/stream"
 	"relay/internal/worker"
 )
 
-// Dependencies carries the CLI's injectable filesystem locations. The three
-// paths are the only process-wide filesystem seams the command tree needs;
-// production wires the immutable defaults via DefaultDependencies, while tests
-// (and any embedding host) construct their own pointing at temp locations. It
-// deliberately replaces the former package-level mutable path variables
-// (statePath, runtimeSocketPath, startLockPath), so a command's paths come from
-// its construction rather than from global state.
+// DLQStore is the narrow DLQ view the `relay dlq` commands consume. The
+// Redis-backed *stream.RedisDLQStore satisfies it; tests inject a fake, so the
+// command/presentation layer never touches Redis directly. Close releases
+// whatever the store owns.
+type DLQStore interface {
+	List(ctx context.Context) ([]stream.DLQEntry, error)
+	Get(ctx context.Context, id string) (stream.DLQEntry, bool, error)
+	Delete(ctx context.Context, id string) (bool, error)
+	Close() error
+}
+
+// OpenDLQStore resolves and opens the DLQ store for one `relay dlq` command,
+// returning the store and a cleanup func. It is a function seam so the command
+// tree never reads environment variables or constructs Redis clients itself,
+// and tests (or an embedding host) can inject a fake without mutable globals.
+// Production wires openRedisDLQStore, which follows the same config.Load +
+// config.RedisOptions conventions as `relay health`.
+type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err error)
+
+// Dependencies carries the CLI's injectable process seams: the filesystem
+// locations plus the DLQ store opener the `relay dlq` commands need. Production
+// wires the immutable defaults via DefaultDependencies, while tests (and any
+// embedding host) construct their own. It deliberately replaces package-level
+// mutable variables, so a command's paths and connection come from its
+// construction rather than from global state.
 type Dependencies struct {
 	// StatePath is the local state database the read-only administrative
 	// commands (function, stats) open. Production: state.DBPath.
@@ -38,16 +57,23 @@ type Dependencies struct {
 	// lifetime; its parent directory is created before the lock is acquired.
 	// Production: processlock.DefaultPath.
 	LockPath string
+	// OpenDLQ opens the DLQ store for the `relay dlq` commands. It is called
+	// lazily, only by those commands, so every other command works with no Redis
+	// configured. Production: openRedisDLQStore (config.Load +
+	// config.RedisOptions + stream.NewRedisDLQStore).
+	OpenDLQ OpenDLQStore
 }
 
-// DefaultDependencies returns the fixed production filesystem locations. The
-// referenced constants stay immutable application conventions; there are no
-// environment overrides or setters.
+// DefaultDependencies returns the fixed production seams: the three filesystem
+// locations plus the config-driven DLQ store opener. The referenced constants
+// stay immutable application conventions; there are no environment overrides or
+// setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
 		StatePath:  state.DBPath,
 		SocketPath: worker.SocketPath,
 		LockPath:   processlock.DefaultPath,
+		OpenDLQ:    openRedisDLQStore,
 	}
 }
 
@@ -71,6 +97,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 		Commands: []*cli.Command{
 			startCommand(logger, deps),
 			functionCommand(deps),
+			dlqCommand(logger, deps),
 			secretCommand(),
 			gitCommand(),
 			statsCommand(deps),

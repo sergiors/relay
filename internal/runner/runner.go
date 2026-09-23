@@ -47,6 +47,11 @@ var (
 	// registered but not runnable (its image could not be built at
 	// startup/reconcile, so it has no Prepared handle).
 	ErrFunctionUnavailable = errors.New("function unavailable")
+	// ErrHandlerNotFound reports a DLQ replay whose handler is no longer present
+	// in the function's CURRENT template (an intentional configuration change).
+	// The worker socket maps it onto a stable wire code and the CLI keeps the
+	// DLQ entry.
+	ErrHandlerNotFound = errors.New("handler not found")
 )
 
 // invocationOutcome classifies what one delivery round did for a single matched
@@ -1426,7 +1431,9 @@ func obsoleteOccurrence(fnName, handler string) error {
 // template (single source of truth), capped at the configured maximum exactly
 // like Handle caps rule timeouts, and passed BOTH to TryStart and to
 // context.WithTimeout so the persisted running deadline matches the local kill
-// timer. It reuses the exact event execution path: registry snapshot lookup,
+// timer. A handler with a schedule entry resolves from it; a state-free caller
+// replaying an event-rule handler (the DLQ replay path) resolves from that exact
+// event rule. It reuses the exact event execution path: registry snapshot lookup,
 // the global + per-function concurrency slots, per-invocation secret
 // resolution, the panic boundary, and the same handler metrics.
 //
@@ -1482,10 +1489,9 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	// values apply to future occurrences automatically. The template's FIRST
 	// matching schedule entry provides both; multiple entries sharing a handler
 	// behave identically (occurrence identity distinguishes them by scheduled_at).
-	// Fall back to the event defaults when the handler has no schedule entry,
-	// exactly as Handle falls back to the rule defaults. On the production
-	// (state-carrying) path, a missing schedule entry means the handler was
-	// removed from the template while the occurrence was pending → obsolete.
+	// On the production (state-carrying) path, a missing schedule entry means the
+	// handler was removed from the template while the occurrence was pending →
+	// obsolete.
 	timeout := function.DefaultTimeout
 	retries := function.DefaultRetries
 	found := false
@@ -1503,6 +1509,26 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 			"handler", handler,
 		)
 		return obsoleteOccurrence(fnName, handler)
+	}
+	// No schedule entry: on the state-free path — the DLQ replay, or a direct
+	// single-handler caller — the handler may instead be an event-rule handler,
+	// so resolve its CURRENT event rule's timeout/retries by exact handler match.
+	// This is never event matching: it selects by handler string alone, so no
+	// other rule can run. The production schedule path is always state-carrying,
+	// so this fallback can never turn a removed schedule handler into an
+	// executable one. A non-positive rule timeout (only reachable from a
+	// hand-built template, since ParseTemplate guarantees a positive value) keeps
+	// the default rather than imposing an immediate deadline.
+	if !found {
+		for _, rule := range pf.fn.Template.Events {
+			if rule.Handler == handler {
+				if rule.Timeout > 0 {
+					timeout = rule.Timeout
+				}
+				retries = rule.Retries
+				break
+			}
+		}
 	}
 
 	// Cap the schedule timeout at the configured maximum, exactly like Handle
@@ -1758,6 +1784,77 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 		return count, firstErr
 	}
 	return count, nil
+}
+
+// ReplayDLQ re-executes the exact function/handler recorded by one DLQ entry
+// against the CURRENT registry, for the `relay dlq replay` command. It is the
+// DLQ counterpart of InvokeFunction: an operator action against the LIVE runner,
+// never a stream delivery.
+//
+// It validates the current configuration and then delegates to InvokeHandler:
+//
+//   - a function absent from the current registry returns ErrFunctionNotFound;
+//   - a registered but unrunnable function (image build failed) returns
+//     ErrFunctionUnavailable;
+//   - a handler no longer present in the function's current template (its event
+//     rules or schedules) returns ErrHandlerNotFound — the entry is retained and
+//     the operator sees that the configuration changed.
+//
+// The delegation runs with a context carrying NO stream.InvocationState (an
+// explicit opt-out, so it holds even if the caller's context came from the stream
+// delivery path), so InvokeHandler takes its state-free single-attempt path:
+// exactly one synchronous execution of the named handler (never event matching,
+// so no other rule can run), against the function's current runtime, env/secrets
+// resolution, concurrency slots, and timeout resolution. It writes NO broker
+// state — no invocation-state hash, no event classification counters, and no
+// retry/DLQ counters (recordFailure is only reached on the state-carrying path).
+// It DOES record the normal handler success/failure execution metrics, exactly as
+// a manual invocation does, because those are execution outcomes rather than
+// broker state.
+//
+// The handler timeout follows InvokeHandler's current resolution: the matching
+// schedule entry's timeout when the handler has one, otherwise the CURRENT event
+// rule's timeout for that exact handler, otherwise the function default — always
+// capped by the configured maximum. Resolving the event rule is by exact handler
+// string, never event matching, so the replay still runs exactly one handler.
+// event is the entry's original payload, replayed verbatim.
+func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte) error {
+	pf := r.reg.GetByName(fnName)
+	if pf == nil {
+		return fmt.Errorf("%w: %q", ErrFunctionNotFound, fnName)
+	}
+	if pf.Prepared() == nil {
+		return fmt.Errorf("%w: %q", ErrFunctionUnavailable, fnName)
+	}
+	if !templateHasHandler(pf.fn.Template, handler) {
+		return fmt.Errorf("%w: function %q handler %q", ErrHandlerNotFound, fnName, handler)
+	}
+	// Strip any inherited invocation state and run the state-free path: no
+	// TryStart/complete/retry/exhaustion, and no DLQ accounting. The opt-out
+	// makes the guarantee explicit even when the caller's context came from the
+	// stream delivery path.
+	return r.InvokeHandler(stream.WithoutInvocationState(ctx), "", fnName, handler, event)
+}
+
+// templateHasHandler reports whether handler is present in the template's
+// current event rules or schedules. A DLQ entry attributes an exhausted
+// invocation that came from one of those, so either counts as "still
+// configured". A nil template has no handlers.
+func templateHasHandler(tmpl *function.Template, handler string) bool {
+	if tmpl == nil {
+		return false
+	}
+	for _, rule := range tmpl.Events {
+		if rule.Handler == handler {
+			return true
+		}
+	}
+	for _, sch := range tmpl.Schedules {
+		if sch.Handler == handler {
+			return true
+		}
+	}
+	return false
 }
 
 // invokeOnce is the smallest reusable single-handler execution core shared by

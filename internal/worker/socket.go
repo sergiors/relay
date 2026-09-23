@@ -24,10 +24,13 @@ import (
 // This file implements the worker-owned LIVE runtime-pool query socket at
 // /run/relay/relay.sock, alongside the process lock this worker runs under.
 //
-// It carries three semantic operations: the live warm-container pool gauges
+// It carries four semantic operations: the live warm-container pool gauges
 // (capacity and container counts by lease state), the operator-facing
-// "reset stats" command, and the synchronous manual function invocation
-// (`relay function invoke`). The cumulative acquire/discard counters are
+// "reset stats" command, the synchronous manual function invocation
+// (`relay function invoke`), and the synchronous DLQ replay
+// (`relay dlq replay`), which re-executes one dead-lettered entry's exact
+// recorded function/handler once against the live registry. The cumulative
+// acquire/discard counters are
 // PERSISTED per function under /var/lib/relay (state.FunctionStats) and read
 // there by the standalone CLI; they are deliberately never sent over the
 // socket, because the socket's whole purpose is the ephemeral worker-local view
@@ -49,8 +52,9 @@ import (
 
 // SocketPath is the fixed live query socket `relay function inspect` dials for
 // live runtime-pool gauges, `relay stats reset` dials to reset a running
-// worker's statistics, and `relay function invoke` dials to run a function's
-// matching handlers synchronously against the live runtime. It lives beside the
+// worker's statistics, `relay function invoke` dials to run a function's
+// matching handlers synchronously against the live runtime, and `relay dlq
+// replay` dials to re-execute one dead-lettered handler. It lives beside the
 // process lock in the ephemeral runtime directory
 // (internal/processlock.DefaultDir), NOT under the persisted /var/lib/relay
 // state volume: a socket is process state that can neither outlive the worker
@@ -107,6 +111,13 @@ const (
 	errCodeInvokeUnavailable   = "invoke_unavailable"
 	errCodeFunctionUnavailable = "function_unavailable"
 	errCodeInvokeFailed        = "invoke_failed"
+	// DLQ-replay wire codes. errCodeHandlerNotFound reports that the function is
+	// currently configured but the exact handler recorded in the DLQ entry is no
+	// longer in its template (an intentional configuration change);
+	// errCodeReplayFailed reports that the single replay attempt executed and
+	// failed. The CLI keeps the DLQ entry in both cases.
+	errCodeHandlerNotFound = "handler_not_found"
+	errCodeReplayFailed    = "replay_failed"
 )
 
 // Wire commands. Every request frame MUST name its command explicitly:
@@ -120,6 +131,7 @@ const (
 	cmdRuntimeState   = "runtime_state"
 	cmdResetStats     = "reset_stats"
 	cmdInvokeFunction = "invoke_function"
+	cmdReplayDLQ      = "replay_dlq"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -184,6 +196,7 @@ type InvokeResult struct {
 type socketRequest struct {
 	Command  string          `json:"command,omitempty"`
 	Function string          `json:"function,omitempty"`
+	Handler  string          `json:"handler,omitempty"`
 	Event    json.RawMessage `json:"event,omitempty"`
 }
 
@@ -197,6 +210,7 @@ type socketResponse struct {
 	*RuntimeState
 	*InvokeResult
 	ResetStats bool   `json:"reset_stats,omitempty"`
+	Replayed   bool   `json:"replayed,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Message    string `json:"message,omitempty"`
 }
@@ -235,6 +249,19 @@ type FunctionInvoker interface {
 	InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error)
 }
 
+// HandlerReplayer is the minimal live-runner view the DLQ-replay command needs.
+// *runner.Runner satisfies it via its ReplayDLQ method, which validates the
+// exact recorded function/handler against the CURRENT registry and executes
+// exactly that one handler once, with no broker lifecycle. Keeping the interface
+// local (and the event as raw bytes replayed verbatim) means the socket
+// dispatches through a narrow seam rather than the runner's concrete type. The
+// socket imports runner only to classify the sentinel errors ReplayDLQ returns
+// (ErrFunctionNotFound / ErrFunctionUnavailable / ErrHandlerNotFound) onto stable
+// wire codes; that import is for the error contract, not dispatch.
+type HandlerReplayer interface {
+	ReplayDLQ(ctx context.Context, name, handler string, event []byte) error
+}
+
 // SocketServer is the worker-owned live query socket. It accepts one request
 // per connection, answers with a single newline-JSON frame, and is stopped as a
 // unit: Close stops accepting, closes every in-flight connection (each already
@@ -251,7 +278,12 @@ type SocketServer struct {
 	// s.mu, so a request that races the wiring sees either nil (unavailable) or
 	// the fully built runner — never a torn value.
 	invoker FunctionInvoker
-	ln      net.Listener
+	// replayer serves the synchronous DLQ-replay command against the LIVE
+	// runner. It is the SAME runner instance SetInvoker wires, set via
+	// SetReplayer; a nil replayer answers invoke_unavailable (there is no
+	// offline fallback). Both the setter and the handler read it under s.mu.
+	replayer HandlerReplayer
+	ln       net.Listener
 
 	// baseCtx is cancelled by Close, so an in-flight manual invocation (whose
 	// own context bounds it to invokeTimeout) is cancelled promptly on shutdown
@@ -337,6 +369,27 @@ func (s *SocketServer) currentInvoker() FunctionInvoker {
 	return s.invoker
 }
 
+// SetReplayer wires the live runner that serves the DLQ-replay command. It is
+// called alongside SetInvoker (the same runner implements both seams); passing
+// nil leaves replay unavailable. The assignment is mutex-guarded so a request
+// racing the wiring reads either nil or the fully built runner.
+func (s *SocketServer) SetReplayer(replayer HandlerReplayer) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.replayer = replayer
+	s.mu.Unlock()
+}
+
+// currentReplayer returns the wired DLQ replayer, or nil when none is set. It
+// takes the mutex so a concurrent SetReplayer is race-free.
+func (s *SocketServer) currentReplayer() HandlerReplayer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replayer
+}
+
 // removeStaleSocket unlinks a leftover socket file from a previous worker so the
 // subsequent bind cannot fail with "address already in use". A missing file is
 // not an error.
@@ -407,6 +460,8 @@ func (s *SocketServer) handle(conn net.Conn) {
 		s.handleRuntimeState(conn, req.Function)
 	case cmdInvokeFunction:
 		s.handleInvokeFunction(conn, req.Function, req.Event)
+	case cmdReplayDLQ:
+		s.handleReplayDLQ(conn, req.Function, req.Handler, req.Event)
 	default:
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 	}
@@ -513,6 +568,74 @@ func (s *SocketServer) handleInvokeFunction(conn net.Conn, function string, rawE
 		return
 	}
 	s.respond(conn, socketResponse{InvokeResult: &InvokeResult{Invoked: invoked}})
+}
+
+// handleReplayDLQ answers the synchronous DLQ-replay command for the exact
+// recorded function/handler. An empty function or handler, or an absent event
+// payload, is malformed. A nil replayer answers invoke_unavailable (there is no
+// offline fallback). The runner validates the function and handler against the
+// CURRENT registry and executes exactly that one handler once, bounded by
+// invokeTimeout on the worker side; it never touches Redis, ACK/retry,
+// invocation state, event classification, or the DLQ.
+//
+// The runner's errors are classified:
+//
+//   - an unknown function answers unknown_function;
+//   - a registered but unrunnable function answers function_unavailable;
+//   - a handler no longer in the current template answers handler_not_found;
+//   - any other error answers replay_failed.
+//
+// The error's text is carried in Message (and logged) so the CLI can surface a
+// clear cause, while Error stays the stable code it classifies on. On success the
+// frame carries replayed=true; the CLI deletes the DLQ entry only then.
+func (s *SocketServer) handleReplayDLQ(conn net.Conn, function, handler string, rawEvent json.RawMessage) {
+	if function == "" || handler == "" || len(rawEvent) == 0 {
+		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
+		return
+	}
+
+	replayer := s.currentReplayer()
+	if replayer == nil {
+		s.respond(conn, socketResponse{Error: errCodeInvokeUnavailable})
+		return
+	}
+
+	// A replay can legitimately run a handler for up to the rule timeout, so
+	// extend the connection deadline exactly as a manual invocation does, and
+	// bound the worker side with the same invokeTimeout. Close still cancels an
+	// in-flight replay promptly via the server's base context.
+	_ = conn.SetDeadline(time.Now().Add(invokeTimeout + runtimeStateRequestTimeout))
+
+	ctx, cancel := context.WithTimeout(s.baseCtx, invokeTimeout)
+	defer cancel()
+	if err := replayer.ReplayDLQ(ctx, function, handler, rawEvent); err != nil {
+		code := replayErrorCode(err)
+		s.log.Warn("DLQ replay: handler execution failed",
+			"function", function,
+			"handler", handler,
+			"code", code,
+			"error", err,
+		)
+		s.respond(conn, socketResponse{Error: code, Message: err.Error()})
+		return
+	}
+	s.respond(conn, socketResponse{Replayed: true})
+}
+
+// replayErrorCode maps a runner DLQ-replay error onto a stable wire code. The
+// runner's sentinels are recognized with errors.Is; everything else is a handler
+// failure. It keeps the wire classification independent of error prose.
+func replayErrorCode(err error) string {
+	switch {
+	case errors.Is(err, runner.ErrFunctionNotFound):
+		return errCodeUnknownFunction
+	case errors.Is(err, runner.ErrFunctionUnavailable):
+		return errCodeFunctionUnavailable
+	case errors.Is(err, runner.ErrHandlerNotFound):
+		return errCodeHandlerNotFound
+	default:
+		return errCodeReplayFailed
+	}
 }
 
 // invokeErrorCode maps a runner manual-invocation error onto a stable wire code.
@@ -733,6 +856,62 @@ func InvokeFunction(ctx context.Context, path, function string, event json.RawMe
 	}
 
 	return resp.InvokeResult.Invoked, nil
+}
+
+// ReplayDLQ asks the live worker at path to re-execute the exact function and
+// handler recorded by a DLQ entry, with event as the replayed payload. It is the
+// CLI's running-worker path for `relay dlq replay`; there is no offline fallback
+// (a replay must run through the live runner/runtime pool, which only the worker
+// owns). event must be the entry's payload bytes, replayed verbatim.
+//
+// ctx bounds the CLI side (a cancelled ctx, e.g. Ctrl-C, closes the connection
+// so the command aborts promptly). A missing/unresponsive worker, or a worker
+// whose runner is not wired yet, reports ErrInvokeUnavailable. The worker's
+// unknown-function / function-unavailable / handler-not-found / handler-failure
+// answers report ErrInvokeFailed with the worker's message, so the CLI surfaces
+// the real cause (including a failed handler's reason) rather than masking it.
+func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte) error {
+	d := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	defer conn.Close()
+	// A replay can legitimately run a handler up to the rule timeout, which can
+	// exceed the short query deadline, so the client deadline is the worker-side
+	// invocation bound plus the short exchange margin. The worker enforces its
+	// own bound regardless.
+	_ = conn.SetDeadline(time.Now().Add(invokeTimeout + runtimeStateRequestTimeout))
+	// A cancelled ctx (Ctrl-C) closes the connection, unblocking the response
+	// read so the command exits promptly instead of waiting out the deadline.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
+	if err := json.NewEncoder(conn).Encode(socketRequest{
+		Command:  cmdReplayDLQ,
+		Function: function,
+		Handler:  handler,
+		Event:    event,
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	var resp socketResponse
+	if err := json.NewDecoder(io.LimitReader(conn, runtimeStateMaxResponse)).Decode(&resp); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %v", ErrInvokeUnavailable, ctx.Err())
+		}
+		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
+	}
+	if resp.Error != "" {
+		if resp.Error == errCodeInvokeUnavailable {
+			return fmt.Errorf("%w: %s", ErrInvokeUnavailable, messageOr(resp.Message, resp.Error))
+		}
+		return fmt.Errorf("%w: %s", ErrInvokeFailed, messageOr(resp.Message, resp.Error))
+	}
+	if !resp.Replayed {
+		return fmt.Errorf("%w: empty response", ErrInvokeUnavailable)
+	}
+	return nil
 }
 
 // messageOr returns msg when it is non-empty, else fallback. It keeps the wire

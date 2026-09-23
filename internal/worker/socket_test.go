@@ -590,6 +590,156 @@ func TestInvokeFunctionNoSocket(t *testing.T) {
 // assignment would not type-check otherwise).
 var _ FunctionInvoker = (*runner.Runner)(nil)
 
+// HandlerReplayerContract pins the production wiring contract for DLQ replay:
+// the concrete live runner the worker installs via SetReplayer must satisfy the
+// socket's local seam.
+var _ HandlerReplayer = (*runner.Runner)(nil)
+
+// fakeReplayer records DLQ-replay calls for socket tests, so the replay_dlq
+// command can be exercised without Docker or a live runner.
+type fakeReplayer struct {
+	mu      sync.Mutex
+	calls   int
+	name    string
+	handler string
+	event   []byte
+	err     error
+}
+
+func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.name = name
+	f.handler = handler
+	f.event = append([]byte(nil), event...)
+	return f.err
+}
+
+func (f *fakeReplayer) snapshot() (int, string, string, []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.name, f.handler, append([]byte(nil), f.event...)
+}
+
+// startTestSocketWithReplayer starts a SocketServer at path with the given DLQ
+// replayer, so the replay_dlq command can be exercised.
+func startTestSocketWithReplayer(t *testing.T, path string, replayer HandlerReplayer) *SocketServer {
+	t.Helper()
+	s, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetReplayer(replayer)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestRuntimeSocketReplayDLQDelegates verifies the replay_dlq command forwards
+// the exact function, handler, and event bytes to the wired replayer and answers
+// with replayed=true.
+func TestRuntimeSocketReplayDLQDelegates(t *testing.T) {
+	path := testSocketPath(t)
+	rep := &fakeReplayer{}
+	startTestSocketWithReplayer(t, path, rep)
+
+	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{"a":1}`)); err != nil {
+		t.Fatalf("ReplayDLQ: %v", err)
+	}
+	calls, name, handler, event := rep.snapshot()
+	if calls != 1 || name != "fn" || handler != "index.run" {
+		t.Fatalf("replayer calls/name/handler = %d/%q/%q", calls, name, handler)
+	}
+	if string(event) != `{"a":1}` {
+		t.Fatalf("replayer event = %q, want the replayed payload", event)
+	}
+}
+
+// TestRuntimeSocketReplayDLQErrorCodes verifies the runner sentinels are mapped
+// onto stable wire codes surfaced to the CLI as ErrInvokeFailed with the worker's
+// message.
+func TestRuntimeSocketReplayDLQErrorCodes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"unknown function", fmt.Errorf("%w: %q", runner.ErrFunctionNotFound, "ghost")},
+		{"unavailable function", fmt.Errorf("%w: %q", runner.ErrFunctionUnavailable, "broken")},
+		{"removed handler", fmt.Errorf("%w: function %q handler %q", runner.ErrHandlerNotFound, "fn", "old.handler")},
+		{"handler failure", fmt.Errorf("function %q handler %q: boom", "fn", "index.run")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := testSocketPath(t)
+			startTestSocketWithReplayer(t, path, &fakeReplayer{err: tc.err})
+
+			err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`))
+			if !errors.Is(err, ErrInvokeFailed) {
+				t.Fatalf("error = %v, want ErrInvokeFailed", err)
+			}
+			if errors.Is(err, ErrInvokeUnavailable) {
+				t.Fatalf("a runner failure must not look unavailable: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.err.Error()) {
+				t.Fatalf("error = %v, want the worker's message preserved", err)
+			}
+		})
+	}
+}
+
+// TestRuntimeSocketReplayDLQNoReplayer verifies a socket without a wired
+// replayer answers invoke_unavailable (there is no offline fallback).
+func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, nil)
+
+	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`))
+	if !errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+}
+
+// TestRuntimeSocketReplayDLQMalformed verifies the wire validation: empty
+// function/handler and an absent payload are rejected without invoking the
+// replayer.
+func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
+	path := testSocketPath(t)
+	rep := &fakeReplayer{}
+	startTestSocketWithReplayer(t, path, rep)
+
+	for _, line := range []string{
+		`{"command":"replay_dlq"}` + "\n",
+		`{"command":"replay_dlq","function":"fn"}` + "\n",
+		`{"command":"replay_dlq","function":"fn","handler":"index.run"}` + "\n",
+		`{"command":"replay_dlq","function":"","handler":"index.run","event":"{}"}` + "\n",
+		`{"command":"replay_dlq","function":"fn","handler":"","event":"{}"}` + "\n",
+	} {
+		resp := rawQuery(t, path, line)
+		if resp.Error != errCodeMalformedRequest {
+			t.Fatalf("line %q: error = %q, want %q", line, resp.Error, errCodeMalformedRequest)
+		}
+		if resp.Replayed {
+			t.Fatalf("line %q: malformed request must not report a replay", line)
+		}
+	}
+	if calls, _, _, _ := rep.snapshot(); calls != 0 {
+		t.Fatalf("replayer calls = %d, want 0 (malformed requests never replay)", calls)
+	}
+}
+
+// TestReplayDLQNoSocket verifies the standalone no-worker case reports
+// ErrInvokeUnavailable (there is no offline fallback for a replay).
+func TestReplayDLQNoSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`)); !errors.Is(err, ErrInvokeUnavailable) {
+		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
+	}
+}
+
 // testExecutor is a minimal runner.Executor for the full-stack socket test: it
 // records the executed handlers without Docker.
 type testExecutor struct {

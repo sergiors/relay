@@ -725,11 +725,32 @@ func WithInvocationState(ctx context.Context, p InvocationState) context.Context
 	return context.WithValue(ctx, invocationStateContextKey{}, p)
 }
 
+// noInvocationStateKey is a marker value that masks any InvocationState already
+// carried by a context. It lets a caller explicitly opt OUT of the broker
+// lifecycle for one invocation (e.g. a DLQ replay), which context.WithValue
+// cannot otherwise express: there is no way to remove another package's context
+// value.
+type noInvocationStateKey struct{}
+
+// WithoutInvocationState returns a child of ctx that reports no InvocationState
+// from InvocationStateFrom, even if an ancestor carried one. It is the explicit
+// "this invocation must not participate in the broker lifecycle" opt-out: the
+// runner's DLQ replay uses it so InvokeHandler always takes its state-free
+// single-attempt path, regardless of the caller's context.
+func WithoutInvocationState(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noInvocationStateKey{}, true)
+}
+
 // InvocationStateFrom returns the InvocationState carried in ctx, or (nil,
-// false) if absent. Callers must treat the value as best-effort context: it
-// never panics and returns false when no invocation state was injected (e.g.
-// when the runner is driven directly in tests).
+// false) if absent. A context marked by WithoutInvocationState always reports
+// (nil, false), masking any state inherited from an ancestor. Callers must treat
+// the value as best-effort context: it never panics and returns false when no
+// invocation state was injected (e.g. when the runner is driven directly in
+// tests).
 func InvocationStateFrom(ctx context.Context) (InvocationState, bool) {
+	if ctx.Value(noInvocationStateKey{}) != nil {
+		return nil, false
+	}
 	p, ok := ctx.Value(invocationStateContextKey{}).(InvocationState)
 	return p, ok
 }
