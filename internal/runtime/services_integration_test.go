@@ -667,6 +667,72 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	}
 }
 
+// TestIntegrationServiceJoinsMultipleTemplateNetworks pins the ServiceSpec.Network
+// + ServiceSpec.Networks union end to end: a service created with both joins the
+// union of the routing network and the template networks, each exactly once, and
+// the canonical relay.networks label records the sorted union.
+func TestIntegrationServiceJoinsMultipleTemplateNetworks(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	routingNet := "relay-test-svc-route-" + suffix
+	tmplNet := "relay-test-svc-tmpl-" + suffix
+	for _, n := range []string{routingNet, tmplNet} {
+		if _, err := cli.NetworkCreate(ctx, n, client.NetworkCreateOptions{Driver: "bridge"}); err != nil {
+			t.Fatalf("create network %s: %v", n, err)
+		}
+	}
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-multi-net")
+		for _, n := range []string{routingNet, tmplNet} {
+			_, _ = cli.NetworkRemove(cc, n, client.NetworkRemoveOptions{})
+		}
+		cleanupImagePrefixes(cli, "relay-fn-svc-multi-net:")()
+	})
+
+	_, image := buildServiceHost(t, ctx, "svc-multi-net")
+	id, err := m.StartService(ctx, ServiceSpec{
+		Function: "svc-multi-net",
+		Identity: "app/service.js",
+		Port:     3000,
+		Image:    image,
+		Entry:    []string{"node", "/app/app/service.js"},
+		Env:      []string{"PORT=3000"},
+		Network:  routingNet,
+		// The routing network is also listed here; it must be joined once.
+		Networks: []string{routingNet, tmplNet},
+	}, 0)
+	if err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	waitForContainerRunning(t, ctx, cli, id)
+	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if insp.Container.NetworkSettings == nil {
+		t.Fatal("inspect: nil NetworkSettings")
+	}
+	got := insp.Container.NetworkSettings.Networks
+	for _, n := range []string{routingNet, tmplNet} {
+		if _, ok := got[n]; !ok {
+			t.Errorf("container not attached to network %q; networks = %v", n, got)
+		}
+	}
+	// Exactly the two networks: the routing network deduped.
+	if len(got) != 2 {
+		t.Fatalf("networks = %v, want exactly %s and %s", got, routingNet, tmplNet)
+	}
+	if want := NetworksLabel(routingNet, []string{routingNet, tmplNet}); insp.Container.Config.Labels[labelNetworks] != want {
+		t.Errorf("relay.networks = %q, want %q", insp.Container.Config.Labels[labelNetworks], want)
+	}
+}
+
 // TestIntegrationBuildServiceImage resolves a `build` source end to end against
 // a real daemon: it builds a service image from a user Dockerfile over the
 // function's selected source, reuses the content-addressed image on a second

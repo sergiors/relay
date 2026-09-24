@@ -19,6 +19,11 @@
 //     and mutates nothing, so calling it on every periodic reconcile tick (as a
 //     cheap no-op) is safe and gives crash replacement within the default 30s
 //     cadence without a separate services-only loop.
+//   - Removed-service cleanup runs BEFORE the template-networks pre-flight, so
+//     a missing network (which preserves the desired services' healthy
+//     containers) never prevents a service removed from the template from being
+//     stopped. The pre-flight gates only the start/replacement of DESIRED
+//     services.
 //   - RemoveAll (via the reconciler's RemoveServices hook) must run BEFORE the
 //     function's images are retired, because running service containers still
 //     reference those images.
@@ -70,6 +75,12 @@ type Docker interface {
 	// service reconciler uses it to refuse routed services whose routing
 	// network is missing; Relay never creates networks.
 	NetworkExists(ctx context.Context, network string) (bool, error)
+	// VerifyNetworks checks that every named network exists, returning the first
+	// missing one (ok=false). It exists so the start/replacement of a template's
+	// DESIRED services is refused when one of its top-level `networks` is
+	// missing; removed-service cleanup still runs (it does not depend on the
+	// networks). Relay never creates networks.
+	VerifyNetworks(ctx context.Context, networks []string) (missing string, ok bool, err error)
 }
 
 // SecretResolver resolves a secret reference to its value. It is a structural
@@ -154,14 +165,9 @@ func Reconcile(
 		return false, fmt.Errorf("service: list containers: %w", err)
 	}
 	// changed reports whether any convergence action (a stop or a start
-	// attempt) was issued during this pass. It starts false and is only set by
-	// the classify/start work below.
+	// attempt) was issued during this pass. It starts false and is set by the
+	// removed-service cleanup below and by the classify/start work further down.
 	changed := false
-
-	desired := make(map[string]function.Service, len(tmpl.Services))
-	for _, svc := range tmpl.Services {
-		desired[svc.SourceRef()] = svc
-	}
 
 	var firstErr error
 	fail := func(err error) {
@@ -170,8 +176,18 @@ func Reconcile(
 		}
 	}
 
-	// Group this function's containers by service; containers whose service is
-	// no longer in the template (removed service) are stopped outright.
+	desired := make(map[string]function.Service, len(tmpl.Services))
+	for _, svc := range tmpl.Services {
+		desired[svc.SourceRef()] = svc
+	}
+
+	// Classify this function's containers by service. Containers whose service
+	// is no longer in the template (removed service) are stopped OUTRIGHT and
+	// BEFORE the network pre-flight below: removed-service cleanup does not
+	// depend on the template's networks — the container is not part of the
+	// desired set regardless of network availability — so a missing network must
+	// never leave a removed service's container running. Desired services'
+	// containers are grouped for the per-service pass further down.
 	byService := make(map[string][]runtime.ServiceContainer)
 	for _, c := range containers {
 		if c.Function != fnName {
@@ -186,6 +202,36 @@ func Reconcile(
 			continue
 		}
 		byService[c.Identity] = append(byService[c.Identity], c)
+	}
+
+	// The template's top-level `networks` are joined by every service container
+	// (and every execution container). They are infrastructure owned OUTSIDE
+	// Relay, so Relay verifies them before any START or STALE REPLACEMENT and
+	// refuses to converge the desired services otherwise: a missing network must
+	// preserve the function's healthy current service containers and be retried
+	// on the next pass, never tear them down. The warning is structured
+	// (function + network) and scoped to THIS function — it never affects any
+	// other function. The check is skipped when the template declares no
+	// services (nothing to start; removed services were already cleaned up
+	// above), so a services-less function never logs a spurious network warning.
+	// Removed-service cleanup above has already run and is reported through
+	// `changed`.
+	if len(tmpl.Services) > 0 {
+		if missing, ok, err := d.VerifyNetworks(ctx, tmpl.Networks); err != nil {
+			fail(fmt.Errorf("function networks: %w", err))
+			log.Warn("Service: cannot verify networks; keeping existing containers",
+				"function", fnName, "error", err)
+			return changed, firstErr
+		} else if !ok {
+			err := fmt.Errorf("network %q does not exist", missing)
+			fail(err)
+			log.Warn("Service: required Docker network is missing; keeping existing containers",
+				"function", fnName,
+				"network", missing,
+				"effect", "desired services skipped; removed-service cleanup still applied; relay never creates networks",
+			)
+			return changed, firstErr
+		}
 	}
 
 	for _, svc := range tmpl.Services {
@@ -292,18 +338,25 @@ func Reconcile(
 		// serving its old env/secrets indefinitely. The hash is order-sensitive
 		// and covers the exact slice StartService applies.
 		envHash := runtime.EnvHash(env)
+		// desiredNetworks is the canonical relay.networks value the container
+		// must carry: the union of the routing network (if routed) and the
+		// template's top-level `networks`, sorted and de-duplicated. A network
+		// change — adding, removing, or renaming a template network — makes the
+		// running container stale and replaces it WITHOUT rebuilding the image
+		// (the image fingerprint ignores runtime-only config).
+		desiredNetworks := runtime.NetworksLabel(routeNetwork, tmpl.Networks)
 
 		// A container is a keep candidate only when it is both healthy (running)
-		// and currently configured correctly (image, image content, port, and
-		// effective environment all match the desired values) and carries a real
-		// replica label. Anything else — exited/dead/removing, a changed image
-		// (rebuild), a moved external tag (image content changed), a changed
-		// port, a changed env/secret (env hash mismatch), or an unlabeled legacy
-		// container (Replica == -1) — is stale and must be replaced. In addition,
-		// the container's labels must match the desired routing label set
-		// exactly: a changed host/path/port/network leaves stale Traefik labels
-		// pointing traffic at whatever the old container served, so the container
-		// is replaced.
+		// and currently configured correctly (image, image content, port,
+		// effective environment, and Docker networks all match the desired
+		// values) and carries a real replica label. Anything else —
+		// exited/dead/removing, a changed image (rebuild), a moved external tag
+		// (image content changed), a changed port, a changed env/secret (env hash
+		// mismatch), a changed network set, or an unlabeled legacy container
+		// (Replica == -1) — is stale and must be replaced. In addition, the
+		// container's labels must match the desired routing label set exactly: a
+		// changed host/path/port leaves stale Traefik labels pointing traffic at
+		// whatever the old container served, so the container is replaced.
 		var candidates []runtime.ServiceContainer
 		var stale []runtime.ServiceContainer
 		for _, c := range existing {
@@ -312,6 +365,7 @@ func Reconcile(
 				c.ImageID == resolved.ID &&
 				c.Port == svc.Port &&
 				c.EnvHash == envHash &&
+				c.Networks == desiredNetworks &&
 				c.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, c.Labels) {
 				candidates = append(candidates, c)
@@ -362,6 +416,7 @@ func Reconcile(
 				Env:      env,
 				Labels:   routeLabels,
 				Network:  routeNetwork,
+				Networks: tmpl.Networks,
 			}
 			if _, err := d.StartService(ctx, spec, slot); err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))

@@ -67,6 +67,11 @@ type Detail struct {
 	// template defines none.
 	Env     map[string]string
 	Secrets map[string]string
+	// Networks lists the template's normalized top-level Docker networks: the
+	// networks every execution and service container of this function joins. It
+	// is configuration metadata (like env/secrets), never secret values. It is
+	// nil when the template defines none.
+	Networks []string
 }
 
 // Handler is one rule's handler and its resolved timeout.
@@ -206,9 +211,10 @@ func (c *State) initSchema(ctx context.Context) error {
 			last_reconcile_at TEXT,
 			last_reconcile_status TEXT,
 			last_error TEXT,
-			updated_at TEXT,
 			env TEXT,
-			secrets TEXT
+			secrets TEXT,
+			networks TEXT
+			updated_at TEXT,
 		)`,
 		// handlers is keyed by function_name but carries no foreign key: cleanup
 		// is explicit (removeTx), not relational. A relational ON DELETE CASCADE
@@ -287,11 +293,13 @@ func (c *State) initSchema(ctx context.Context) error {
 			updated_at TEXT
 		)`,
 	}
+
 	for _, s := range stmts {
 		if _, err := c.db.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
+
 	return nil
 }
 
@@ -375,19 +383,25 @@ func (c *State) RebuildFromFS(dir string) error {
 	return c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, p := range prepared {
 			ts := c.nowString()
-			env, secrets := serializeMappings(p.fn.Template)
+			env, secrets, networks := serializeTemplate(p.fn.Template)
+
 			if err := insertStmt(tx)(
-				p.fn.Name, p.fn.Template.Runtime, StatusPending, "", p.fp,
-				"", "", "", "", ts, env, secrets,
+				p.fn.Name,
+				p.fn.Template.Runtime,
+				StatusPending, "", p.fp, "", "", "", "",
+				ts, env, secrets, networks,
 			); err != nil {
 				return err
 			}
+
 			if err := replaceHandlers(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
+
 			if err := replaceSchedules(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
+
 			if err := replaceServices(tx, p.fn.Name, p.fn.Template); err != nil {
 				return err
 			}
@@ -412,16 +426,24 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		fp = ""
 	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		env, secrets := serializeMappings(fn.Template)
-		if err := insertStmt(tx)(fn.Name, fn.Template.Runtime, StatusPending, "", fp, "", "", "", "", ts, env, secrets); err != nil {
+		env, secrets, networks := serializeTemplate(fn.Template)
+		if err := insertStmt(tx)(
+			fn.Name,
+			fn.Template.Runtime,
+			StatusPending, "", fp, "", "", "", "",
+			ts, env, secrets, networks,
+		); err != nil {
 			return err
 		}
+
 		if err := replaceHandlers(tx, fn.Name, fn.Template); err != nil {
 			return err
 		}
+
 		if err := replaceSchedules(tx, fn.Name, fn.Template); err != nil {
 			return err
 		}
+
 		return replaceServices(tx, fn.Name, fn.Template)
 	})
 	if err != nil {
@@ -435,24 +457,34 @@ func (c *State) RecordDiscovered(fn function.Function) {
 // reconcile), cleared last_error, and the handlers replaced. On conflict
 // (existing row) the upsert persists these outcome columns too, so a success on
 // a previously-discovered row records its own outcome and timestamp.
-func (c *State) RecordReconcileSuccess(name, image, fingerprint string, preparedAt time.Time, fn function.Function) {
+func (c *State) RecordReconcileSuccess(
+	name,
+	image,
+	fingerprint string,
+	preparedAt time.Time,
+	fn function.Function,
+) {
 	ctx := context.Background()
 	ts := c.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		env, secrets := serializeMappings(fn.Template)
+		env, secrets, networks := serializeTemplate(fn.Template)
+
 		if err := insertStmt(tx)(
 			name, fn.Template.Runtime, StatusReady, image, fingerprint,
-			prepared, ts, ReconcileSuccess, "", ts, env, secrets,
+			prepared, ts, ReconcileSuccess, "", ts, env, secrets, networks,
 		); err != nil {
 			return err
 		}
+
 		if err := replaceHandlers(tx, name, fn.Template); err != nil {
 			return err
 		}
+
 		if err := replaceSchedules(tx, name, fn.Template); err != nil {
 			return err
 		}
+
 		return replaceServices(tx, name, fn.Template)
 	})
 	if err != nil {
@@ -610,14 +642,14 @@ func (c *State) ListFunctions() []Row {
 func (c *State) GetFunction(name string) (Detail, bool) {
 	ctx := context.Background()
 	d := Detail{}
-	var envJSON, secretsJSON sql.NullString
+	var envJSON, secretsJSON, networksJSON sql.NullString
 	err := c.db.QueryRowContext(ctx,
-		`SELECT name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets
+		`SELECT name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets, networks
 		 FROM functions WHERE name = ?`, name,
 	).Scan(
 		&d.Name, &d.Runtime, &d.Status, &d.Image, &d.Fingerprint, &d.PreparedAt,
 		&d.LastReconcileAt, &d.LastReconcileStatus, &d.LastError, &d.UpdatedAt,
-		&envJSON, &secretsJSON,
+		&envJSON, &secretsJSON, &networksJSON,
 	)
 	if err == sql.ErrNoRows {
 		return Detail{}, false
@@ -633,6 +665,9 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 	}
 	if secretsJSON.Valid && secretsJSON.String != "" {
 		_ = json.Unmarshal([]byte(secretsJSON.String), &d.Secrets)
+	}
+	if networksJSON.Valid && networksJSON.String != "" {
+		_ = json.Unmarshal([]byte(networksJSON.String), &d.Networks)
 	}
 
 	hrows, err := c.db.QueryContext(ctx,
@@ -712,23 +747,24 @@ func (c *State) GetFunction(name string) (Detail, bool) {
 // the record in the VALUES row, so a success on an existing row persists its
 // own outcome and timestamp; only the active-version fields
 // (image/fingerprint/prepared_at — and status on the failure path) are guarded.
-// env and secrets are the serialized env/secret MAPPINGS (JSON objects), never
+// env, secrets, and networks are the serialized env/secret MAPPINGS (JSON
+// objects) and the normalized top-level Docker-network list (JSON array), never
 // secret values.
 type insertFn func(
 	name, runtime, status, image, fingerprint, prepared string,
 	reconcileAt, reconcileStatus, lastError, updated string,
-	env, secrets string,
+	env, secrets, networks string,
 ) error
 
 func insertStmt(tx *sql.Tx) insertFn {
 	return func(
 		name, runtime, status, image, fingerprint, prepared string,
 		reconcileAt, reconcileStatus, lastError, updated string,
-		env, secrets string,
+		env, secrets, networks string,
 	) error {
 		_, err := tx.Exec(
-			`INSERT INTO functions (name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+			`INSERT INTO functions (name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets, networks)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(name) DO UPDATE SET
 			   runtime = excluded.runtime,
 			   status = excluded.status,
@@ -740,8 +776,9 @@ func insertStmt(tx *sql.Tx) insertFn {
 			   last_error = excluded.last_error,
 			   updated_at = excluded.updated_at,
 			   env = excluded.env,
-			   secrets = excluded.secrets`,
-			name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets)
+			   secrets = excluded.secrets,
+			   networks = excluded.networks`,
+			name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets, networks)
 		return err
 	}
 }
@@ -801,13 +838,14 @@ func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
 	return nil
 }
 
-// serializeMappings renders a template's env and secrets maps as JSON object
-// strings for the functions table. Only the MAPPINGS are stored (env-var name →
+// serializeTemplate renders a template's env and secrets maps as JSON object
+// strings and its normalized `networks` list as a JSON array string for the
+// functions table. Only the env/secret MAPPINGS are stored (env-var name →
 // literal value, and env-var name → secret reference) — never a secret VALUE.
 // JSON is used (rather than a "k=v" logfmt) because env values may legitimately
-// contain '=' (e.g. connection strings). An empty map serializes to "null",
-// which is stored as NULL.
-func serializeMappings(tmpl *function.Template) (env, secrets string) {
+// contain '=' (e.g. connection strings). An empty map or list serializes to
+// "null", which is stored as NULL.
+func serializeTemplate(tmpl *function.Template) (env, secrets, networks string) {
 	if len(tmpl.Env) > 0 {
 		if b, err := json.Marshal(tmpl.Env); err == nil {
 			env = string(b)
@@ -822,7 +860,12 @@ func serializeMappings(tmpl *function.Template) (env, secrets string) {
 			secrets = string(b)
 		}
 	}
-	return env, secrets
+	if len(tmpl.Networks) > 0 {
+		if b, err := json.Marshal(tmpl.Networks); err == nil {
+			networks = string(b)
+		}
+	}
+	return env, secrets, networks
 }
 
 // RelativeAgo renders an RFC3339 timestamp as a short relative age: "12s ago",

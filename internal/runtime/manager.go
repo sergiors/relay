@@ -365,16 +365,18 @@ func (m *Manager) Close() error {
 // startContainer builds one fresh execution container for a function version.
 // It is the containerCache factory, called with the creating invocation's
 // parameters: env is the function's plan env (per-function, applied at
-// container create) and meta is the creation-time identity RunMeta stamped as
-// labels (per-invocation fields left empty — labels are immutable while the
-// container outlives invocations).
+// container create), networks is the template's top-level `networks` list
+// (joined at create time), and meta is the creation-time identity RunMeta
+// stamped as labels (per-invocation fields left empty — labels are immutable
+// while the container outlives invocations).
 func (m *Manager) startContainer(
 	ctx context.Context,
 	fnName, image string,
 	env []string,
+	networks []string,
 	meta RunMeta,
 ) (reusableContainer, error) {
-	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, meta)
+	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, networks, meta)
 }
 
 // Prepared is a function whose image has been built.
@@ -404,6 +406,18 @@ type Prepared struct {
 	// to dependency garbage collection. It is populated on BOTH the build and
 	// reuse paths.
 	Dependency string
+	// Networks is the template's normalized top-level `networks` list: the
+	// Docker networks every execution container for this function joins at
+	// create time. It is runtime-only configuration: it does NOT affect the
+	// image, so changing it never rebuilds (see function.ImageFingerprint) but
+	// DOES invalidate warm and service containers for the new networks.
+	Networks []string
+	// RuntimeGeneration is a digest of the runtime-only configuration (today
+	// the Networks list). The warm pool keys container reuse on
+	// (Image, RuntimeGeneration), so a runtime-only change replaces warm
+	// containers without a rebuild. It is empty when there is no runtime-only
+	// configuration.
+	RuntimeGeneration string
 }
 
 // Prepare builds exactly ONE image for the function's current content (never per
@@ -436,6 +450,14 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	if err != nil {
 		return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
 	}
+	// imgFP is the IMAGE fingerprint: the same digest with runtime-only template
+	// keys (the `networks` list) removed. The image tag is derived from imgFP so
+	// a runtime-only edit never yields a new tag and never forces a rebuild; the
+	// full fp still gates reconciliation. See function.ImageFingerprint.
+	imgFP, err := function.ImageFingerprintSelection(sel)
+	if err != nil {
+		return nil, fmt.Errorf("function %q: image fingerprint: %w", fn.Name, err)
+	}
 
 	// A template that needs no runtime (all of its services use build or image
 	// sources, and it has no events or schedules) has no function image to
@@ -448,9 +470,11 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		m.log.Debug("Function: no runtime required; services bring their own images",
 			"function", fn.Name)
 		funcPrepared := &Prepared{
-			Name:        fn.Name,
-			Fingerprint: fp,
-			Concurrency: m.effectiveConcurrency(fn),
+			Name:              fn.Name,
+			Fingerprint:       fp,
+			Concurrency:       m.effectiveConcurrency(fn),
+			Networks:          append([]string(nil), fn.Template.Networks...),
+			RuntimeGeneration: fn.Template.RuntimeGeneration(),
 		}
 		m.containers.activateFunction(fn.Name, "")
 		m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
@@ -472,7 +496,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		return nil, fmt.Errorf("function %q: plan: %w", fn.Name, err)
 	}
 
-	image := ImageRef(fn.Name, fp)
+	image := ImageRef(fn.Name, imgFP)
 
 	// bootstrapHash pins the runtime-injected bootstrap content (the engine's
 	// embedded plan files) plus the entrypoint onto the image as a label. The
@@ -488,11 +512,13 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// built). Computing the dependency fingerprint needs the same fnDir reads the
 	// function fingerprint above already performed, so it stays cheap.
 	funcPrepared := &Prepared{
-		Name:        fn.Name,
-		Image:       image,
-		Fingerprint: fp,
-		Env:         p.Env,
-		Concurrency: m.effectiveConcurrency(fn),
+		Name:              fn.Name,
+		Image:             image,
+		Fingerprint:       fp,
+		Env:               p.Env,
+		Concurrency:       m.effectiveConcurrency(fn),
+		Networks:          append([]string(nil), fn.Template.Networks...),
+		RuntimeGeneration: fn.Template.RuntimeGeneration(),
 	}
 	if !p.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
@@ -589,12 +615,14 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	m.containers.activateFunction(fn.Name, image)
 	m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
 	return &Prepared{
-		Name:        fn.Name,
-		Image:       image,
-		Fingerprint: fp,
-		Env:         p.Env,
-		Concurrency: funcPrepared.Concurrency,
-		Dependency:  funcPrepared.Dependency,
+		Name:              fn.Name,
+		Image:             image,
+		Fingerprint:       fp,
+		Env:               p.Env,
+		Concurrency:       funcPrepared.Concurrency,
+		Dependency:        funcPrepared.Dependency,
+		Networks:          funcPrepared.Networks,
+		RuntimeGeneration: funcPrepared.RuntimeGeneration,
 	}, nil
 }
 
@@ -819,7 +847,23 @@ func (m *Manager) Execute(
 	idMeta.EventID = ""
 	idMeta.EventName = ""
 	start := func() (reusableContainer, error) {
-		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, idMeta)
+		// Verify the template's networks exist BEFORE creating the container.
+		// The networks are infrastructure owned OUTSIDE Relay — never created
+		// here — so a missing one is a structured operator warning, not a
+		// chaos fix-up. This runs only on the cold-create path (a warm reuse
+		// creates no container), so it adds no per-invocation Docker round
+		// trip. A missing network fails THIS function's invocation only.
+		if missing, ok, err := m.VerifyNetworks(ctx, prepared.Networks); err != nil {
+			return nil, fmt.Errorf("verify networks: %w", err)
+		} else if !ok {
+			m.log.Warn("Runtime: required Docker network is missing",
+				"function", prepared.Name,
+				"network", missing,
+				"effect", "function execution skipped; relay never creates networks",
+			)
+			return nil, fmt.Errorf("required Docker network %q does not exist", missing)
+		}
+		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, prepared.Networks, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound
 	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
@@ -829,8 +873,8 @@ func (m *Manager) Execute(
 	// semaphore uses is what the pool enforces, keeping the pool from ever being
 	// a stricter limiter than the runner's per-function semaphore.
 	max := m.clipConcurrency(prepared.Concurrency)
-	return m.containers.execute(
-		ctx, prepared.Name, prepared.Image, max, start, handler, eventJSON, envMap(extraEnv),
+	return m.containers.executeVersion(
+		ctx, prepared.Name, prepared.Image, prepared.RuntimeGeneration, max, start, handler, eventJSON, envMap(extraEnv),
 	)
 }
 

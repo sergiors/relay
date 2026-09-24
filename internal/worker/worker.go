@@ -772,20 +772,26 @@ func sweepStartupImages(
 func startupImageKeepSet(functions []function.Function, serviceImages, recordedImages []string) map[string]bool {
 	keep := make(map[string]bool)
 	for _, fn := range functions {
-		if fp, err := function.Fingerprint(fn.Dir); err == nil {
+		// The image tag is derived from the IMAGE fingerprint (runtime-only
+		// template keys such as `networks` removed), so the keep-set names
+		// exactly the image a build/reuse would produce.
+		if fp, err := function.ImageFingerprint(fn.Dir); err == nil {
 			keep[runtime.ImageRef(fn.Name, fp)] = true
 		}
 	}
+
 	for _, img := range serviceImages {
 		if img != "" {
 			keep[img] = true
 		}
 	}
+
 	for _, img := range recordedImages {
 		if img != "" {
 			keep[img] = true
 		}
 	}
+
 	return keep
 }
 

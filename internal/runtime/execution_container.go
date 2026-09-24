@@ -14,8 +14,30 @@ import (
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
+
+// executionEndpoints builds the Docker NetworkingConfig EndpointsConfig for an
+// execution (event/schedule) container from the template's `networks` list:
+// each named network exactly once. An empty/nil list yields nil, so a template
+// that declares no networks sends no NetworkingConfig (unchanged default
+// bridge/network behavior).
+func executionEndpoints(networks []string) map[string]*network.EndpointSettings {
+	if len(networks) == 0 {
+		return nil
+	}
+	endpoints := make(map[string]*network.EndpointSettings, len(networks))
+	for _, n := range networks {
+		if n != "" {
+			endpoints[n] = &network.EndpointSettings{}
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil
+	}
+	return endpoints
+}
 
 // executionContainer is one reused execution container for a function. It holds
 // a long-running bootstrap process (python/node) speaking the line-JSON
@@ -84,15 +106,23 @@ type failEvent struct {
 // start failures are plain errors (there is no container to discard); after a
 // successful start the container cleans itself up via AutoRemove the moment
 // its process exits, or via an explicit kill/remove on our discard paths.
+//
+// networks is the template's top-level `networks` list: every execution
+// container joins them at create time so it can reach (and be reached on) those
+// Docker networks. The networks are infrastructure owned OUTSIDE Relay — Relay
+// never creates them — and the manager verifies they exist before any execution
+// begins (see Manager.VerifyNetworks); a network that disappears between
+// verification and create surfaces as a create error here.
 func startExecutionContainer(
 	ctx context.Context,
 	cli *client.Client,
 	log *slog.Logger,
 	fn, image string,
 	env []string,
+	networks []string,
 	meta RunMeta,
 ) (*executionContainer, error) {
-	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+	createOps := client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image: image,
 			Env:   env,
@@ -115,7 +145,11 @@ func startExecutionContainer(
 		// tmpfs, non-root user baked into the image) is identical to the
 		// one-shot containers.
 		HostConfig: hardenedHostConfig(true),
-	})
+	}
+	if endpoints := executionEndpoints(networks); len(endpoints) > 0 {
+		createOps.NetworkingConfig = &network.NetworkingConfig{EndpointsConfig: endpoints}
+	}
+	createResp, err := cli.ContainerCreate(ctx, createOps)
 	if err != nil {
 		return nil, fmt.Errorf("docker run: create container: %w", err)
 	}

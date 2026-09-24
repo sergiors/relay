@@ -35,6 +35,7 @@ type reusableContainer interface {
 // container itself on self-initiated teardown; the others are pool-initiated.
 const (
 	reasonImageChanged      = "image_changed"
+	reasonNetworkChanged    = "network_changed"
 	reasonShutdown          = "shutdown"
 	reasonFunctionRemove    = "function_removed"
 	reasonIdleTimeout       = "idle_timeout"
@@ -120,22 +121,36 @@ type containerCache struct {
 	metrics *metrics.Registry
 }
 
-// generation is one image version's container set inside a function pool. A
-// pool has exactly one active generation (the image new acquires serve) plus
-// zero or more draining generations: superseded or invalidated versions whose
-// busy containers are still completing. Idle containers of a non-active
-// generation are never kept — they are discarded the moment the generation is
-// superseded — and a draining generation is dropped as soon as its last busy
-// container releases. Grouping by generation makes "no new acquires of an old
-// image" structural: acquire only ever leases from or appends to p.active.
+// generation is one container version's set inside a function pool. A version
+// is the pair (image, runtimeGen), where runtimeGen is a digest of the
+// template's RUNTIME-ONLY configuration (today, the `networks` list). A pool has
+// exactly one active generation (the version new acquires serve) plus zero or
+// more draining generations: superseded or invalidated versions whose busy
+// containers are still completing. Idle containers of a non-active generation
+// are never kept — they are discarded the moment the generation is superseded —
+// and a draining generation is dropped as soon as its last busy container
+// releases. Grouping by generation makes "no new acquires of an old version"
+// structural: acquire only ever leases from or appends to p.active.
+//
+// image and runtimeGen are both part of the key because a runtime-only change
+// (e.g. a new Docker network) must replace warm containers WITHOUT a new image:
+// the image tag is unchanged, yet a container created for the old runtime
+// generation joined the wrong networks and must not be reused.
 type generation struct {
-	image string
-	idle  []*pooledContainer
-	busy  map[*pooledContainer]struct{}
+	image      string
+	runtimeGen string
+	idle       []*pooledContainer
+	busy       map[*pooledContainer]struct{}
 }
 
-func newGeneration(image string) *generation {
-	return &generation{image: image, busy: map[*pooledContainer]struct{}{}}
+func newGeneration(image, runtimeGen string) *generation {
+	return &generation{image: image, runtimeGen: runtimeGen, busy: map[*pooledContainer]struct{}{}}
+}
+
+// matches reports whether this generation serves the requested version (both
+// the image and the runtime generation match).
+func (g *generation) matches(image, runtimeGen string) bool {
+	return g.image == image && g.runtimeGen == runtimeGen
 }
 
 // functionPool is one function's bounded warm container pool.
@@ -207,15 +222,16 @@ type functionPool struct {
 	notify chan struct{}
 }
 
-// pooledContainer is one reusable container in a function pool, with its image
-// version, owning generation, and retirement state. retired/retireReason/idleSince
-// are guarded by the owning functionPool.mu; membership in a generation's
-// idle/busy set (or the pool's transient set) is the lease state. gen is nil for
-// transient containers.
+// pooledContainer is one reusable container in a function pool, with its
+// version (image + runtime generation), owning generation, and retirement
+// state. retired/retireReason/idleSince are guarded by the owning
+// functionPool.mu; membership in a generation's idle/busy set (or the pool's
+// transient set) is the lease state. gen is nil for transient containers.
 type pooledContainer struct {
-	c     reusableContainer
-	image string
-	gen   *generation
+	c          reusableContainer
+	image      string
+	runtimeGen string
+	gen        *generation
 	// retired marks a container that must not be leased again and must be
 	// discarded as soon as it is not busy (busy ones are discarded on release).
 	retired      bool
@@ -228,6 +244,25 @@ type pooledContainer struct {
 	// paths may race to discard the same wrapper (lease release, eviction,
 	// removal, close), but the discard counter increments exactly once.
 	discardOnce sync.Once
+}
+
+// matchesVersion reports whether the wrapper's container was created for the
+// requested version (image + runtime generation). It is the per-container form
+// of generation.matches.
+func (pc *pooledContainer) matchesVersion(image, runtimeGen string) bool {
+	return pc.image == image && pc.runtimeGen == runtimeGen
+}
+
+// versionTransitionReason names why a container built for fromImage is being
+// superseded after a request for toImage: an image change is reported as
+// image_changed, while the SAME image under a different runtime generation (a
+// no-rebuild network replace) is reported as network_changed. It keeps the
+// discard reason honest so metrics/logs distinguish the two.
+func versionTransitionReason(fromImage, toImage string) string {
+	if fromImage == toImage {
+		return reasonNetworkChanged
+	}
+	return reasonImageChanged
 }
 
 func newContainerCache() *containerCache {
@@ -422,12 +457,14 @@ func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
 	return discard
 }
 
-// execute runs one invocation through a leased container for fnName. start
-// creates a fresh container when the pool has no idle one and capacity remains
-// (lazily); it returns the caller's error verbatim on failure. A container that
-// the invocation poisoned (timeout/process exit/protocol error/panic) is
-// dropped on release so a later call starts fresh; a plain handler error keeps
-// the container.
+// execute runs one invocation through a leased container for fnName's image
+// version at the EMPTY runtime generation. It is the image-only convenience
+// wrapper over executeVersion, kept for direct/integration callers that have no
+// runtime-only configuration. start creates a fresh container when the pool has
+// no idle one and capacity remains (lazily); it returns the caller's error
+// verbatim on failure. A container that the invocation poisoned
+// (timeout/process exit/protocol error/panic) is dropped on release so a later
+// call starts fresh; a plain handler error keeps the container.
 func (cc *containerCache) execute(
 	ctx context.Context,
 	fnName, image string,
@@ -437,7 +474,25 @@ func (cc *containerCache) execute(
 	eventJSON []byte,
 	env map[string]string,
 ) error {
-	lease, err := cc.acquire(ctx, fnName, image, max, start)
+	return cc.executeVersion(ctx, fnName, image, "", max, start, handler, eventJSON, env)
+}
+
+// executeVersion runs one invocation through a leased container for fnName's
+// (image, runtimeGen) version. runtimeGen is a digest of the template's
+// runtime-only configuration (today the `networks` list); two requests sharing
+// an image but differing in runtimeGen are DIFFERENT versions and never share a
+// pooled container, so a network change replaces warm containers without a new
+// image. See acquireVersion for the leasing/transition rules.
+func (cc *containerCache) executeVersion(
+	ctx context.Context,
+	fnName, image, runtimeGen string,
+	max int,
+	start func() (reusableContainer, error),
+	handler string,
+	eventJSON []byte,
+	env map[string]string,
+) error {
+	lease, err := cc.acquireVersion(ctx, fnName, image, runtimeGen, max, start)
 	if err != nil {
 		return err
 	}
@@ -448,9 +503,20 @@ func (cc *containerCache) execute(
 	return lease.invoke(ctx, handler, eventJSON, env)
 }
 
-// acquire leases one container for fnName/image, blocking (context-aware) when
-// the pool is at capacity until a release/close/eviction/transition/removal
-// notifies it. It:
+// acquire leases one container for fnName's image at the EMPTY runtime
+// generation. It is the image-only convenience wrapper over acquireVersion.
+func (cc *containerCache) acquire(
+	ctx context.Context,
+	fnName, image string,
+	max int,
+	start func() (reusableContainer, error),
+) (*containerLease, error) {
+	return cc.acquireVersion(ctx, fnName, image, "", max, start)
+}
+
+// acquireVersion leases one container for fnName's (image, runtimeGen) version,
+// blocking (context-aware) when the pool is at capacity until a
+// release/close/eviction/transition/removal notifies it. It:
 //
 //   - refuses to serve a REMOVED or CLOSED pool, returning errPoolClosed;
 //   - refuses to POOL containers for an image that has been invalidated: a
@@ -459,11 +525,12 @@ func (cc *containerCache) execute(
 //     ("no new acquires old image"), without reaping, rewinding, or waiting on
 //     the current (newer) version. The runner's per-function semaphore keeps
 //     the number of such in-flight stale requests bounded in production;
-//   - on a request for a NEW image, supersedes the active generation: the old
-//     image is retired, its idle containers are discarded immediately, its busy
-//     ones are moved to a draining generation and discarded on release, and the
-//     new image becomes the sole active generation. No further acquire can
-//     lease an old-image container, and no new old-image generation is created;
+//   - on a request for a NEW version (a different image OR a different runtime
+//     generation), supersedes the active generation: idle containers of the old
+//     version are discarded immediately, its busy ones are moved to a draining
+//     generation and discarded on release, and the new version becomes the sole
+//     active generation. No further acquire can lease an old-version container,
+//     and no new old-version generation is created;
 //   - leases an idle matching container from the active generation, or lazily
 //     starts a new one while capacity remains (reserving the slot before start
 //     so concurrent waiters account for it, and rolling the reservation back on
@@ -472,9 +539,9 @@ func (cc *containerCache) execute(
 // invalidateImage (the runner's image-retirement path) is what retires a
 // known-dead image's busy containers; the forward transition above covers
 // direct callers that switch Prepared without an explicit invalidation.
-func (cc *containerCache) acquire(
+func (cc *containerCache) acquireVersion(
 	ctx context.Context,
-	fnName, image string,
+	fnName, image, runtimeGen string,
 	max int,
 	start func() (reusableContainer, error),
 ) (*containerLease, error) {
@@ -557,7 +624,7 @@ func (cc *containerCache) acquire(
 				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
+				p.discardContainer(&pooledContainer{c: c, image: image, runtimeGen: runtimeGen}, reason)
 				if removing {
 					// The removal may have run while this transient was starting,
 					// when the pool was not yet empty; it can be deleted now.
@@ -565,7 +632,7 @@ func (cc *containerCache) acquire(
 				}
 				return nil, errPoolClosed
 			}
-			pc := &pooledContainer{c: c, image: image, retired: true, retireReason: reasonImageChanged}
+			pc := &pooledContainer{c: c, image: image, runtimeGen: runtimeGen, retired: true, retireReason: reasonImageChanged}
 			p.transient[pc] = struct{}{}
 			p.publishPoolGaugesLocked()
 			p.recordAcquireLocked(metrics.RuntimeOutcomeCold, time.Since(acquiredAt))
@@ -573,30 +640,45 @@ func (cc *containerCache) acquire(
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
-		// Forward image transition: a request for a new image supersedes the
-		// active generation. The old image is retired so its idle containers are
-		// discarded now and its busy ones on release, and it can never be pooled
-		// again. This also covers direct callers that use a new Prepared without
-		// a runner InvalidateImage call.
+		// Forward version transition: a request for a new version (a different
+		// image OR a different runtime generation) supersedes the active
+		// generation. The old version's idle containers are discarded now and
+		// its busy ones on release, and it can never be pooled again. This also
+		// covers direct callers that use a new Prepared without a runner
+		// InvalidateImage call. A runtime-only change (same image, new runtime
+		// generation) is reported as network_changed; an image change as
+		// image_changed.
 		var transitioned []*pooledContainer
 		switch {
 		case p.active == nil:
-			p.active = newGeneration(image)
-		case p.active.image != image:
+			p.active = newGeneration(image, runtimeGen)
+		case !p.active.matches(image, runtimeGen):
 			old := p.active
-			p.retiredImages[old.image] = true
+			reason := versionTransitionReason(old.image, image)
+			if old.image != image {
+				// A retired IMAGE must not be repooled by any later acquire,
+				// whereas a runtime-generation change is purely local to the
+				// version transition.
+				p.retiredImages[old.image] = true
+			}
+			for _, pc := range old.idle {
+				if !pc.retired {
+					pc.retired = true
+					pc.retireReason = reason
+				}
+			}
 			transitioned = append(transitioned, old.idle...)
 			old.idle = nil
 			for pc := range old.busy {
 				if !pc.retired {
 					pc.retired = true
-					pc.retireReason = reasonImageChanged
+					pc.retireReason = reason
 				}
 			}
 			if len(old.busy) > 0 {
 				p.draining = append(p.draining, old)
 			}
-			p.active = newGeneration(image)
+			p.active = newGeneration(image, runtimeGen)
 		}
 
 		// Reap idle containers that may not be leased, before the capacity check
@@ -611,10 +693,10 @@ func (cc *containerCache) acquire(
 				reaped = append(reaped, pc)
 				continue
 			}
-			if pc.retired || pc.image != image {
+			if pc.retired || !pc.matchesVersion(image, runtimeGen) {
 				pc.retired = true
 				if pc.retireReason == "" {
-					pc.retireReason = reasonImageChanged
+					pc.retireReason = versionTransitionReason(pc.image, image)
 				}
 				reaped = append(reaped, pc)
 				continue
@@ -636,7 +718,7 @@ func (cc *containerCache) acquire(
 		// Prefer an idle matching container.
 		for i := len(p.active.idle) - 1; i >= 0; i-- {
 			pc := p.active.idle[i]
-			if pc.image != image || pc.retired {
+			if !pc.matchesVersion(image, runtimeGen) || pc.retired {
 				continue
 			}
 			p.active.idle = append(p.active.idle[:i], p.active.idle[i+1:]...)
@@ -675,7 +757,7 @@ func (cc *containerCache) acquire(
 				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
+				p.discardContainer(&pooledContainer{c: c, image: image, runtimeGen: runtimeGen}, reason)
 				if removing {
 					// The removal may have run while this start was in flight,
 					// when the pool still held the reservation; it can be
@@ -684,14 +766,23 @@ func (cc *containerCache) acquire(
 				}
 				return nil, errPoolClosed
 			}
-			pc := &pooledContainer{c: c, image: image}
+			pc := &pooledContainer{c: c, image: image, runtimeGen: runtimeGen}
 			// Invalidation or transition landed while this start was in flight:
 			// serve the invocation, but never pool the container. The active
-			// generation's image is the requested one only when no transition
-			// occurred; if it is retired, this start still loses its slot.
-			if p.active == nil || p.active.image != image || p.retiredImages[image] {
+			// generation serves the requested version only when no transition
+			// occurred; if it was superseded, this start still loses its slot.
+			if p.active == nil || !p.active.matches(image, runtimeGen) || p.retiredImages[image] {
 				pc.retired = true
-				pc.retireReason = reasonImageChanged
+				switch {
+				case p.retiredImages[image]:
+					// The image itself was invalidated: report the image reason
+					// rather than a runtime-generation change.
+					pc.retireReason = reasonImageChanged
+				case p.active != nil:
+					pc.retireReason = versionTransitionReason(image, p.active.image)
+				default:
+					pc.retireReason = reasonImageChanged
+				}
 				p.transient[pc] = struct{}{}
 			} else {
 				pc.gen = p.active

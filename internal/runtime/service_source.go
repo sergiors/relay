@@ -98,7 +98,12 @@ func (m *Manager) resolveBuildServiceImage(
 	if err != nil {
 		return ServiceImage{}, fmt.Errorf("select sources: %w", err)
 	}
-	fp, err := function.FingerprintSelection(sel)
+	// The image tag is derived from the IMAGE fingerprint (runtime-only template
+	// keys such as `networks` removed), so a runtime-only edit does not rebuild
+	// the Dockerfile image while the reconciler still replaces the stale service
+	// container for the new networks. An actual source or Dockerfile edit still
+	// changes the tag and rebuilds.
+	fp, err := function.ImageFingerprintSelection(sel)
 	if err != nil {
 		return ServiceImage{}, fmt.Errorf("fingerprint: %w", err)
 	}

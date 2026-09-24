@@ -294,6 +294,18 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		sw.Flush()
 	}
 
+	if len(d.Networks) > 0 {
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "Networks:")
+		nw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
+		// The list is normalized (trimmed, deduped, sorted) at parse time, so it
+		// renders deterministically.
+		for _, n := range d.Networks {
+			fmt.Fprintf(nw, "  %s\n", n)
+		}
+		nw.Flush()
+	}
+
 	return fs
 }
 
