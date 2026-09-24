@@ -129,24 +129,24 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 
 	// Unrelated data is untouched: the function record, handlers, schedules,
 	// services, networks, and env/secret mappings all survive.
-	d, ok := c.GetFunction("alpha")
+	detail, ok := c.GetFunction("alpha")
 	if !ok {
 		t.Fatal("function row must survive the stats reset")
 	}
-	if len(d.Handlers) != 1 || d.Handlers[0].Name != "events.created.handler" {
-		t.Fatalf("handlers must survive: %+v", d.Handlers)
+	if len(detail.Handlers) != 1 || detail.Handlers[0].Name != "events.created.handler" {
+		t.Fatalf("handlers must survive: %+v", detail.Handlers)
 	}
-	if len(d.Schedules) != 1 || d.Schedules[0].Cron != "0 3 * * *" {
-		t.Fatalf("schedules must survive: %+v", d.Schedules)
+	if len(detail.Schedules) != 1 || detail.Schedules[0].Cron != "0 3 * * *" {
+		t.Fatalf("schedules must survive: %+v", detail.Schedules)
 	}
-	if len(d.Services) != 1 || d.Services[0].Port != 3000 || d.Services[0].Replicas != 2 {
-		t.Fatalf("services must survive: %+v", d.Services)
+	if len(detail.Services) != 1 || detail.Services[0].Port != 3000 || detail.Services[0].Replicas != 2 {
+		t.Fatalf("services must survive: %+v", detail.Services)
 	}
-	if d.Env["API_URL"] != "https://api.example.com" || d.Secrets["DATABASE_URL"] != "database-url" {
-		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", d.Env, d.Secrets)
+	if detail.Env["API_URL"] != "https://api.example.com" || detail.Secrets["DATABASE_URL"] != "database-url" {
+		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", detail.Env, detail.Secrets)
 	}
-	if len(d.Networks) != 1 || d.Networks[0] != "backend" {
-		t.Fatalf("networks must survive: %v", d.Networks)
+	if len(detail.Networks) != 1 || detail.Networks[0] != "backend" {
+		t.Fatalf("networks must survive: %v", detail.Networks)
 	}
 }
 

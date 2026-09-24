@@ -228,7 +228,7 @@ func TestEnqueueStartupServicesBoundedPerFunction(t *testing.T) {
 
 // TestStartupHousekeepingBarrierOrderAndNonBlocking is the deterministic seam
 // test for the background startup housekeeping. It proves:
-//   - startStartupHousekeeping returns immediately (Run never blocks on it);
+//   - startInitialHousekeeping returns immediately (Run never blocks on it);
 //   - the exclusive barrier runs FIRST and nothing runs until the callback
 //     completes;
 //   - the passes then run in the safe order sweep → images → deps;
@@ -246,7 +246,7 @@ func TestStartupHousekeepingBarrierOrderAndNonBlocking(t *testing.T) {
 		mu.Unlock()
 	}
 
-	h := startupHousekeeper{
+	h := startupHousekeeping{
 		exclusive: func(_ context.Context, fn func(context.Context)) error {
 			record("wait")
 			close(enteredWait)
@@ -260,7 +260,7 @@ func TestStartupHousekeepingBarrierOrderAndNonBlocking(t *testing.T) {
 	}
 
 	// Returns immediately even though the barrier blocks.
-	done := startStartupHousekeeping(context.Background(), logger, h)
+	done := startInitialHousekeeping(context.Background(), logger, h)
 	select {
 	case <-done:
 		t.Fatal("housekeeping returned before the barrier cleared; Run must not block on it")
@@ -297,13 +297,13 @@ func TestStartupHousekeepingBarrierOrderAndNonBlocking(t *testing.T) {
 
 	// Barrier failure skips every sweep.
 	var failed []string
-	h2 := startupHousekeeper{
+	h2 := startupHousekeeping{
 		exclusive: func(context.Context, func(context.Context)) error { return context.Canceled },
 		sweep:     func(context.Context) { failed = append(failed, "sweep") },
 		images:    func(context.Context) { failed = append(failed, "images") },
 		deps:      func(context.Context) { failed = append(failed, "deps") },
 	}
-	done2 := startStartupHousekeeping(context.Background(), logger, h2)
+	done2 := startInitialHousekeeping(context.Background(), logger, h2)
 	select {
 	case <-done2:
 	case <-time.After(2 * time.Second):
@@ -315,7 +315,7 @@ func TestStartupHousekeepingBarrierOrderAndNonBlocking(t *testing.T) {
 }
 
 // TestStartupHousekeepingExcludesLiveUpdates is the end-to-end wiring proof: it
-// runs the real startStartupHousekeeping with the real coordinator's RunExclusive
+// runs the real startInitialHousekeeping with the real coordinator's RunExclusive
 // seam and a real orphan sweep. A live service update published while the sweep
 // is parked must NOT start an Apply (no concurrent resolve) until the exclusive
 // window closes, then it must run with the latest desired state.
@@ -336,7 +336,7 @@ func TestStartupHousekeepingExcludesLiveUpdates(t *testing.T) {
 	sweepCtx, cancelSweep := context.WithCancel(context.Background())
 	defer cancelSweep()
 	imagesRan := make(chan struct{}, 1)
-	done := startStartupHousekeeping(sweepCtx, logger, startupHousekeeper{
+	done := startInitialHousekeeping(sweepCtx, logger, startupHousekeeping{
 		exclusive: coordinator.RunExclusive,
 		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, map[string]bool{"alpha": true}) },
 		images: func(context.Context) {

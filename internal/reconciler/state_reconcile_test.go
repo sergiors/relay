@@ -25,18 +25,18 @@ func TestReconcileStateDiscoverSuccess(t *testing.T) {
 	if pf := reg.GetByName("brand-new"); pf == nil || pf.Prepared() == nil {
 		t.Fatal("expected brand-new registered and prepared")
 	}
-	d, ok := st.GetFunction("brand-new")
+	detail, ok := st.GetFunction("brand-new")
 	if !ok {
 		t.Fatal("expected state row for brand-new")
 	}
-	if d.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready", d.Status)
+	if detail.Status != state.StatusReady {
+		t.Fatalf("status = %s, want ready", detail.Status)
 	}
-	if d.LastReconcileStatus != state.ReconcileSuccess {
-		t.Fatalf("last_reconcile_status = %s, want success", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != state.ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s, want success", detail.LastReconcileStatus)
 	}
-	if len(d.Handlers) != 1 {
-		t.Fatalf("handlers = %d, want 1", len(d.Handlers))
+	if len(detail.Handlers) != 1 {
+		t.Fatalf("handlers = %d, want 1", len(detail.Handlers))
 	}
 }
 
@@ -67,19 +67,19 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 	b.fail = true
 	r.reconcileFunction("flaky") // fails -> retained + failed
 
-	d, ok := st.GetFunction("flaky")
+	detail, ok := st.GetFunction("flaky")
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if d.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready after failure", d.Status)
+	if detail.Status != state.StatusReady {
+		t.Fatalf("status = %s, want ready after failure", detail.Status)
 	}
-	if d.LastReconcileStatus != state.ReconcileFailed {
-		t.Fatalf("last_reconcile_status = %s, want failed", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != state.ReconcileFailed {
+		t.Fatalf("last_reconcile_status = %s, want failed", detail.LastReconcileStatus)
 	}
-	if d.Image != before.Image || d.Fingerprint != before.Fingerprint {
+	if detail.Image != before.Image || detail.Fingerprint != before.Fingerprint {
 		t.Fatalf("failed reconcile must preserve active image/fingerprint: got %q/%q want %q/%q",
-			d.Image, d.Fingerprint, before.Image, before.Fingerprint)
+			detail.Image, detail.Fingerprint, before.Image, before.Fingerprint)
 	}
 }
 
@@ -96,15 +96,15 @@ func TestReconcileStateUnchangedDoesNotRecordOutcome(t *testing.T) {
 
 	r.reconcileFunction("stable") // unchanged -> skip
 
-	d, ok := st.GetFunction("stable")
+	detail, ok := st.GetFunction("stable")
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if d.LastReconcileStatus != "" {
-		t.Fatalf("last_reconcile_status = %s, want empty (unchanged check must not record an outcome)", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != "" {
+		t.Fatalf("last_reconcile_status = %s, want empty (unchanged check must not record an outcome)", detail.LastReconcileStatus)
 	}
-	if d.LastReconcileAt != "" {
-		t.Fatalf("last_reconcile_at = %s, want empty (unchanged check must not record a timestamp)", d.LastReconcileAt)
+	if detail.LastReconcileAt != "" {
+		t.Fatalf("last_reconcile_at = %s, want empty (unchanged check must not record a timestamp)", detail.LastReconcileAt)
 	}
 }
 
@@ -219,12 +219,12 @@ func TestReconcileStateNoWriteOnInvalidTemplate(t *testing.T) {
 	}
 	r.reconcileFunction("guarded")
 
-	d, ok := st.GetFunction("guarded")
+	detail, ok := st.GetFunction("guarded")
 	if !ok {
 		t.Fatal("row should exist from initial seeding")
 	}
-	if d.LastReconcileStatus != "" {
-		t.Fatalf("invalid template must not write a reconcile outcome, got %q", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != "" {
+		t.Fatalf("invalid template must not write a reconcile outcome, got %q", detail.LastReconcileStatus)
 	}
 }
 
@@ -273,12 +273,12 @@ func TestReconcileStateRemovalCleansAllTables(t *testing.T) {
 	// detail must carry only the fresh template's handlers (no stale ones).
 	writeFnDir(t, root, "victim")
 	r.reconcileFunction("victim")
-	d, ok := st.GetFunction("victim")
+	detail, ok := st.GetFunction("victim")
 	if !ok {
 		t.Fatal("expected victim re-discovered after re-creating dir")
 	}
-	if len(d.Handlers) != 1 {
-		t.Fatalf("victim handlers = %d, want 1 (fresh template only)", len(d.Handlers))
+	if len(detail.Handlers) != 1 {
+		t.Fatalf("victim handlers = %d, want 1 (fresh template only)", len(detail.Handlers))
 	}
 
 	// Bystander untouched: row, function_stats, and handler count unchanged.
@@ -341,15 +341,15 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 	r.reconcileFunction("flaky") // fails -> retained + failed
 
 	// Function row still exists, still ready, marked failed (not removed).
-	d, ok := st.GetFunction("flaky")
+	detail, ok := st.GetFunction("flaky")
 	if !ok {
 		t.Fatal("flaky row must survive a failed rebuild")
 	}
-	if d.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready after failure", d.Status)
+	if detail.Status != state.StatusReady {
+		t.Fatalf("status = %s, want ready after failure", detail.Status)
 	}
-	if d.LastReconcileStatus != state.ReconcileFailed {
-		t.Fatalf("last_reconcile_status = %s, want failed (no removal)", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != state.ReconcileFailed {
+		t.Fatalf("last_reconcile_status = %s, want failed (no removal)", detail.LastReconcileStatus)
 	}
 
 	// function_stats row still exists with identical counters and updated_at.
@@ -392,12 +392,12 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 	}
 	r.reconcileFunction("guarded")
 
-	d, ok := st.GetFunction("guarded")
+	detail, ok := st.GetFunction("guarded")
 	if !ok {
 		t.Fatal("guarded row must survive an invalid template")
 	}
-	if d.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready (retained)", d.Status)
+	if detail.Status != state.StatusReady {
+		t.Fatalf("status = %s, want ready (retained)", detail.Status)
 	}
 
 	after, ok := st.FunctionStats("guarded")

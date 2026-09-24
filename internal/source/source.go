@@ -102,16 +102,16 @@ func New(root, dir string) (*Selection, error) {
 		return nil, fmt.Errorf("source: dir %q is outside root %q", dir, root)
 	}
 
-	s := &Selection{root: root, dir: dir, ignoreFiles: map[string]bool{}, descendantOnly: map[string]bool{}}
+	selection := &Selection{root: root, dir: dir, ignoreFiles: map[string]bool{}, descendantOnly: map[string]bool{}}
 	if rel != "." {
-		s.selRel = filepath.ToSlash(rel)
+		selection.selRel = filepath.ToSlash(rel)
 	}
-	patterns, err := s.gather()
+	patterns, err := selection.gather()
 	if err != nil {
 		return nil, err
 	}
-	s.matcher = gitignore.NewMatcher(patterns)
-	return s, nil
+	selection.matcher = gitignore.NewMatcher(patterns)
+	return selection, nil
 }
 
 // Root returns the anchor directory the selection's ignore rules are relative to.
@@ -291,7 +291,7 @@ func (s *Selection) gatherChildren(dir string, ps []gitignore.Pattern) ([]gitign
 	if err != nil {
 		return nil, fmt.Errorf("source: read dir %q: %w", dir, err)
 	}
-	m := gitignore.NewMatcher(ps)
+	matcher := gitignore.NewMatcher(ps)
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == ".git" {
 			continue
@@ -301,7 +301,7 @@ func (s *Selection) gatherChildren(dir string, ps []gitignore.Pattern) ([]gitign
 		if rerr != nil {
 			return nil, fmt.Errorf("source: relate %q to %q: %w", child, s.root, rerr)
 		}
-		if m.Match(strings.Split(filepath.ToSlash(childRel), "/"), true) {
+		if matcher.Match(strings.Split(filepath.ToSlash(childRel), "/"), true) {
 			continue
 		}
 		ps, err = s.readIgnore(child, ps)
@@ -322,14 +322,14 @@ func (s *Selection) gatherChildren(dir string, ps []gitignore.Pattern) ([]gitign
 // absence is simply the absence of rules at that level.
 func (s *Selection) readIgnore(dir string, ps []gitignore.Pattern) ([]gitignore.Pattern, error) {
 	ignorePath := filepath.Join(dir, IgnoreFile)
-	f, err := os.Open(ignorePath)
+	file, err := os.Open(ignorePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return ps, nil
 		}
 		return nil, fmt.Errorf("source: read %q: %w", ignorePath, err)
 	}
-	defer f.Close()
+	defer file.Close()
 
 	rel, err := filepath.Rel(s.root, ignorePath)
 	if err != nil {
@@ -338,7 +338,7 @@ func (s *Selection) readIgnore(dir string, ps []gitignore.Pattern) ([]gitignore.
 	s.ignoreFiles[filepath.ToSlash(rel)] = true
 
 	domain := domainOf(s.root, dir)
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(file)
 	for sc.Scan() {
 		line := sc.Text()
 

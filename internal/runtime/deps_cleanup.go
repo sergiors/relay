@@ -141,8 +141,8 @@ func partitionManagedImages(items []image.Summary) (candidates []string, referen
 		case ImageTypeFunction:
 			// A tagged managed function image holds exactly one dependency
 			// reference (its parent). Collect it.
-			if d := img.Labels[labelDependency]; d != "" {
-				referenced[d] = true
+			if dependency := img.Labels[labelDependency]; dependency != "" {
+				referenced[dependency] = true
 			}
 		case ImageTypeDependency:
 			// A managed dependency image's full tagged references name the

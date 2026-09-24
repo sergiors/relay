@@ -131,9 +131,9 @@ func NewGitHubProvider(
 // The webhook secret value is NEVER logged: only its reference name and the
 // resolution error's name (which the Provider guarantees). The signature header
 // value is likewise never logged.
-func (h *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (provider *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Read the body with a hard size cap, before anything else.
-	body, ok := readBody(h.logger, w, r)
+	body, ok := readBody(provider.logger, w, r)
 	if !ok {
 		return
 	}
@@ -142,30 +142,30 @@ func (h *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// signature verification entirely (a GitHub webhook set up without a secret
 	// sends no signature header, so unsigned deliveries are valid and must be
 	// accepted). Log this at Debug — per-request — never as a per-request Warn.
-	if h.secretRef == "" {
-		logAt(h.logger, r.Context(), slog.LevelDebug,
+	if provider.secretRef == "" {
+		logAt(provider.logger, r.Context(), slog.LevelDebug,
 			"webhook: no webhook secret configured; accepting delivery without signature verification")
-	} else if h.secrets == nil {
+	} else if provider.secrets == nil {
 		// A non-empty secretRef with no resolver cannot be verified. Defensive
 		// only — NewServer prevents this combination — but keep the 500 so a
 		// misassembled provider never silently accepts an unauthenticated push.
-		logAt(h.logger, r.Context(), slog.LevelError, "webhook secret not configured")
+		logAt(provider.logger, r.Context(), slog.LevelError, "webhook secret not configured")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	} else {
-		secret, err := h.secrets.Resolve(r.Context(), h.secretRef)
+		secret, err := provider.secrets.Resolve(r.Context(), provider.secretRef)
 		if err != nil {
 			// The error never carries the value (Provider guarantee); it may carry
 			// the name, which is safe to log.
-			logAt(h.logger, r.Context(), slog.LevelError, "webhook: resolve secret",
-				"secret_ref", h.secretRef, "error", err)
+			logAt(provider.logger, r.Context(), slog.LevelError, "webhook: resolve secret",
+				"secret_ref", provider.secretRef, "error", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		// Verify X-Hub-Signature-256 (constant-time HMAC), never logging the
 		// header value.
 		if !verifySignature(secret, r.Header.Get("X-Hub-Signature-256"), body) {
-			logAt(h.logger, r.Context(), slog.LevelWarn, "webhook signature verification failed")
+			logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook signature verification failed")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -175,7 +175,7 @@ func (h *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ignored. Event names are not secret, so they are logged at Debug.
 	ev := r.Header.Get("X-GitHub-Event")
 	if ev != "push" {
-		logAt(h.logger, r.Context(), slog.LevelDebug, "webhook: ignoring event", "event", ev)
+		logAt(provider.logger, r.Context(), slog.LevelDebug, "webhook: ignoring event", "event", ev)
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ignored")
 		return
@@ -183,30 +183,30 @@ func (h *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 5. Parse the payload.
 	var payload pushPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		logAt(h.logger, r.Context(), slog.LevelWarn, "webhook: malformed push payload")
+		logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook: malformed push payload")
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	// A deleted push removes a ref; nothing to sync (there is no new tree).
 	if payload.Deleted {
-		logAt(h.logger, r.Context(), slog.LevelDebug, "webhook: push deleted; nothing to sync", "repo", h.repoName(&payload))
+		logAt(provider.logger, r.Context(), slog.LevelDebug, "webhook: push deleted; nothing to sync", "repo", provider.repoName(&payload))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ignored")
 		return
 	}
 	// 6. Resolve the configured source per request (so `relay git set` takes
 	// effect without a restart) and match the repository identity.
-	cfg, cfgErr := git.LoadConfig(h.configPath)
+	cfg, cfgErr := git.LoadConfig(provider.configPath)
 	if cfgErr != nil || !matchRepository(cfg.Repository, &payload) {
-		logAt(h.logger, r.Context(), slog.LevelWarn, "webhook: repository mismatch", "repo", h.repoName(&payload))
+		logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook: repository mismatch", "repo", provider.repoName(&payload))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ignored")
 		return
 	}
 	// 7. Match the pushed ref against the configured ref.
 	if !git.MatchPushedRef(payload.Ref, cfg.Ref) {
-		logAt(h.logger, r.Context(), slog.LevelDebug, "webhook: pushed ref does not match configured ref",
-			"repo", h.repoName(&payload), "ref", payload.Ref, "configured_ref", cfg.Ref)
+		logAt(provider.logger, r.Context(), slog.LevelDebug, "webhook: pushed ref does not match configured ref",
+			"repo", provider.repoName(&payload), "ref", payload.Ref, "configured_ref", cfg.Ref)
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ignored")
 		return
@@ -214,39 +214,39 @@ func (h *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 8. Schedule the coalescing sync. This never blocks the handler; the
 	// scheduler goroutine owns the actual git sync. A scheduler failure (only a
 	// nil receiver) is an internal error.
-	if h.sync == nil {
-		logAt(h.logger, r.Context(), slog.LevelError, "webhook: sync trigger not configured")
+	if provider.sync == nil {
+		logAt(provider.logger, r.Context(), slog.LevelError, "webhook: sync trigger not configured")
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if err := h.sync.Trigger(); err != nil {
-		logAt(h.logger, r.Context(), slog.LevelError, "webhook: schedule sync", "error", err)
+	if err := provider.sync.Trigger(); err != nil {
+		logAt(provider.logger, r.Context(), slog.LevelError, "webhook: schedule sync", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	logAt(h.logger, r.Context(), slog.LevelInfo, "GitHub push accepted",
-		"repo", h.repoName(&payload), "ref", payload.Ref)
+	logAt(provider.logger, r.Context(), slog.LevelInfo, "GitHub push accepted",
+		"repo", provider.repoName(&payload), "ref", payload.Ref)
 	w.WriteHeader(http.StatusAccepted)
 	_, _ = io.WriteString(w, "accepted")
 }
 
 // Name implements Provider: GitHub deliveries are served at POST /github.
-func (h *GitHubProvider) Name() string {
+func (provider *GitHubProvider) Name() string {
 	return "github"
 }
 
 // repoName renders a safe human-readable label for the payload's repository,
 // preferring full_name (owner/repo), then the bare name, then "<unknown>". It is
 // used in logs for an unrecognized/non-matching delivery.
-func (h *GitHubProvider) repoName(p *pushPayload) string {
-	if p == nil {
+func (provider *GitHubProvider) repoName(payload *pushPayload) string {
+	if payload == nil {
 		return "<unknown>"
 	}
-	if p.Repository.FullName != "" {
-		return p.Repository.FullName
+	if payload.Repository.FullName != "" {
+		return payload.Repository.FullName
 	}
-	if p.Repository.Name != "" {
-		return p.Repository.Name
+	if payload.Repository.Name != "" {
+		return payload.Repository.Name
 	}
 	return "<unknown>"
 }
@@ -288,9 +288,9 @@ func endpointIdentity(raw string) (host, path string, ok bool) {
 	if ep.Host == "" {
 		return "", "", false
 	}
-	p := strings.ToLower(strings.Trim(ep.Path, "/"))
-	p = strings.TrimSuffix(p, ".git")
-	return strings.ToLower(ep.Host), p, true
+	normalizedPath := strings.ToLower(strings.Trim(ep.Path, "/"))
+	normalizedPath = strings.TrimSuffix(normalizedPath, ".git")
+	return strings.ToLower(ep.Host), normalizedPath, true
 }
 
 // matchRepository reports whether the payload's repository matches the
@@ -313,8 +313,8 @@ func matchRepository(configured string, payload *pushPayload) bool {
 		payload.Repository.GitURL,
 		payload.Repository.HTMLURL,
 	} {
-		h, p, uok := endpointIdentity(u)
-		if uok && h == cfgHost && p == cfgPath {
+		host, path, uok := endpointIdentity(u)
+		if uok && host == cfgHost && path == cfgPath {
 			return true
 		}
 	}

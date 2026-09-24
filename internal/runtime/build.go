@@ -131,7 +131,7 @@ func buildImage(
 	p plan.BuildPlan,
 	image string,
 	labels map[string]string,
-	sel *source.Selection,
+	selection *source.Selection,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
@@ -139,8 +139,8 @@ func buildImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	// sel is the SAME source-selection policy the caller fingerprinted, so the
-	// image contains exactly the selected source: files excluded by the
+	// selection is the SAME source-selection policy the caller fingerprinted, so
+	// the image contains exactly the selected source: files excluded by the
 	// function's .gitignore rules are never baked into the image and the
 	// applicable ignore files are. Resolving it once in the caller keeps the
 	// fingerprint and the context from racing a concurrent rule edit. Staging is
@@ -153,7 +153,7 @@ func buildImage(
 	// fingerprint still covers template.yaml (its content gates rebuilds), but the
 	// image never contains it. Generated plan files are written separately, so the
 	// user's function directory is never modified.
-	if err := copySourceDir(sel, ctxDir); err != nil {
+	if err := copySourceDir(selection, ctxDir); err != nil {
 		return fmt.Errorf("function %q: copy sources: %w", name, err)
 	}
 
@@ -406,12 +406,12 @@ func tarContext(ctxDir string) (io.Reader, error) {
 // base name so a nested template.yaml can never leak Relay configuration —
 // including env values and secret references — into an image; the loader only
 // ever reads the top-level one, so nested copies are dead weight at best.
-func copySourceDir(sel *source.Selection, dst string) error {
-	return sel.WalkDir(func(path string, d fs.DirEntry, err error) error {
+func copySourceDir(selection *source.Selection, dst string) error {
+	return selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(sel.Dir(), path)
+		rel, err := filepath.Rel(selection.Dir(), path)
 		if err != nil {
 			return err
 		}

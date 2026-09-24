@@ -331,7 +331,7 @@ func NewSocketServer(
 	if err != nil {
 		return nil, fmt.Errorf("listen %q: %w", path, err)
 	}
-	s := &SocketServer{
+	server := &SocketServer{
 		path:     path,
 		log:      logger,
 		manager:  manager,
@@ -340,9 +340,9 @@ func NewSocketServer(
 		conns:    make(map[net.Conn]struct{}),
 		done:     make(chan struct{}),
 	}
-	s.baseCtx, s.cancel = context.WithCancel(context.Background())
-	go s.serve()
-	return s, nil
+	server.baseCtx, server.cancel = context.WithCancel(context.Background())
+	go server.serve()
+	return server, nil
 }
 
 // SetInvoker wires the live runner that serves the synchronous manual-invocation
@@ -692,8 +692,8 @@ func (s *SocketServer) Close() error {
 	close(s.done)
 	ln := s.ln
 	conns := make([]net.Conn, 0, len(s.conns))
-	for c := range s.conns {
-		conns = append(conns, c)
+	for conn := range s.conns {
+		conns = append(conns, conn)
 	}
 	s.mu.Unlock()
 
@@ -709,8 +709,8 @@ func (s *SocketServer) Close() error {
 			firstErr = err
 		}
 	}
-	for _, c := range conns {
-		_ = c.Close()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 	s.wg.Wait()
 	if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -730,8 +730,8 @@ func (s *SocketServer) Close() error {
 // `relay start`) and returns only the wire value type, so there is no package
 // cycle and the CLI never holds a worker or manager.
 func QueryRuntimeState(path, function string) (RuntimeState, error) {
-	d := net.Dialer{Timeout: runtimeStateDialTimeout}
-	conn, err := d.Dial("unix", path)
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.Dial("unix", path)
 	if err != nil {
 		return RuntimeState{}, fmt.Errorf("%w: %v", ErrRuntimeStateUnavailable, err)
 	}
@@ -768,8 +768,8 @@ func QueryRuntimeState(path, function string) (RuntimeState, error) {
 // are deliberately left monotonic (the worker resets its Relay-side baseline
 // only).
 func ResetRuntimeStats(path string) error {
-	d := net.Dialer{Timeout: runtimeStateDialTimeout}
-	conn, err := d.Dial("unix", path)
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.Dial("unix", path)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
 	}
@@ -811,8 +811,8 @@ func ResetRuntimeStats(path string) error {
 // ErrInvokeFailed with the worker's message, so the CLI surfaces the real cause
 // (including a failed handler's reason) rather than masking it.
 func InvokeFunction(ctx context.Context, path, function string, event json.RawMessage) (int, error) {
-	d := net.Dialer{Timeout: runtimeStateDialTimeout}
-	conn, err := d.DialContext(ctx, "unix", path)
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
 	}
@@ -871,8 +871,8 @@ func InvokeFunction(ctx context.Context, path, function string, event json.RawMe
 // answers report ErrInvokeFailed with the worker's message, so the CLI surfaces
 // the real cause (including a failed handler's reason) rather than masking it.
 func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte) error {
-	d := net.Dialer{Timeout: runtimeStateDialTimeout}
-	conn, err := d.DialContext(ctx, "unix", path)
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
 	}

@@ -131,40 +131,40 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 	c.nowFn = func() time.Time { return base }
 	c.RecordReconcileSuccess("demo", "img", "fp", base, fnFor(t, "demo", tmpl))
 
-	d, ok := c.GetFunction("demo")
+	detail, ok := c.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected demo")
 	}
-	if d.Runtime != "python3.14" || d.Status != StatusReady || d.Image != "img" || d.Fingerprint != "fp" {
-		t.Fatalf("lifecycle fields = %+v", d)
+	if detail.Runtime != "python3.14" || detail.Status != StatusReady || detail.Image != "img" || detail.Fingerprint != "fp" {
+		t.Fatalf("lifecycle fields = %+v", detail)
 	}
-	if d.PreparedAt != base.Format(time.RFC3339) || d.LastReconcileAt != base.Format(time.RFC3339) || d.LastReconcileStatus != ReconcileSuccess {
-		t.Fatalf("reconcile fields = prepared %q at %q status %q", d.PreparedAt, d.LastReconcileAt, d.LastReconcileStatus)
+	if detail.PreparedAt != base.Format(time.RFC3339) || detail.LastReconcileAt != base.Format(time.RFC3339) || detail.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("reconcile fields = prepared %q at %q status %q", detail.PreparedAt, detail.LastReconcileAt, detail.LastReconcileStatus)
 	}
 
 	// Handlers: name-ordered, exact timeouts, plus the retry budget.
-	if len(d.Handlers) != 2 || d.Handlers[0].Name != "events.created.handler" || d.Handlers[0].Timeout != 6*time.Second {
-		t.Fatalf("handlers = %+v", d.Handlers)
+	if len(detail.Handlers) != 2 || detail.Handlers[0].Name != "events.created.handler" || detail.Handlers[0].Timeout != 6*time.Second {
+		t.Fatalf("handlers = %+v", detail.Handlers)
 	}
-	if d.Handlers[1].Name != "events.updated.handler" || d.Handlers[1].Timeout != 20*time.Second || d.Handlers[1].Retries != 2 {
-		t.Fatalf("handler[1] = %+v", d.Handlers[1])
+	if detail.Handlers[1].Name != "events.updated.handler" || detail.Handlers[1].Timeout != 20*time.Second || detail.Handlers[1].Retries != 2 {
+		t.Fatalf("handler[1] = %+v", detail.Handlers[1])
 	}
 
 	// Schedules: timezone, timeout, retries.
-	if len(d.Schedules) != 1 {
-		t.Fatalf("schedules = %+v", d.Schedules)
+	if len(detail.Schedules) != 1 {
+		t.Fatalf("schedules = %+v", detail.Schedules)
 	}
-	s := d.Schedules[0]
+	s := detail.Schedules[0]
 	if s.Handler != "jobs.report.handler" || s.Cron != "0 8 * * 1-5" || s.Timezone != "Europe/Rome" || s.Timeout != 20*time.Second || s.Retries != 3 {
 		t.Fatalf("schedule = %+v", s)
 	}
 
 	// Services: all three source kinds plus host/path/port/replicas.
-	if len(d.Services) != 3 {
-		t.Fatalf("services = %+v", d.Services)
+	if len(detail.Services) != 3 {
+		t.Fatalf("services = %+v", detail.Services)
 	}
 	byEntry := map[string]Service{}
-	for _, svc := range d.Services {
+	for _, svc := range detail.Services {
 		byEntry[svc.Entrypoint+svc.Build+svc.Image] = svc
 	}
 	ep := byEntry["service.js"]
@@ -180,20 +180,20 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 
 	// Env values (including one containing '=') survive; secrets hold only the
 	// reference name, never a value.
-	if d.Env["API_URL"] != "https://api.example.com" || d.Env["CONN"] != "postgres://user:pass@host/db" {
-		t.Fatalf("env = %v", d.Env)
+	if detail.Env["API_URL"] != "https://api.example.com" || detail.Env["CONN"] != "postgres://user:pass@host/db" {
+		t.Fatalf("env = %v", detail.Env)
 	}
-	if d.Secrets["DATABASE_URL"] != "database-url" {
-		t.Fatalf("secrets = %v", d.Secrets)
+	if detail.Secrets["DATABASE_URL"] != "database-url" {
+		t.Fatalf("secrets = %v", detail.Secrets)
 	}
 	// Networks are normalized (sorted).
-	if len(d.Networks) != 2 || d.Networks[0] != "backend" || d.Networks[1] != "frontend" {
-		t.Fatalf("networks = %v", d.Networks)
+	if len(detail.Networks) != 2 || detail.Networks[0] != "backend" || detail.Networks[1] != "frontend" {
+		t.Fatalf("networks = %v", detail.Networks)
 	}
 
 	// HandlerCount is derived from the snapshot on read.
-	if d.HandlerCount != 2 {
-		t.Fatalf("HandlerCount = %d, want 2", d.HandlerCount)
+	if detail.HandlerCount != 2 {
+		t.Fatalf("HandlerCount = %d, want 2", detail.HandlerCount)
 	}
 }
 
@@ -220,24 +220,24 @@ services:
 `)
 	c.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	d, ok := c.GetFunction("demo")
+	detail, ok := c.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected demo")
 	}
-	if d.Runtime != "node24" || d.Image != "img2" || d.Fingerprint != "fp2" {
-		t.Fatalf("lifecycle not replaced: %+v", d)
+	if detail.Runtime != "node24" || detail.Image != "img2" || detail.Fingerprint != "fp2" {
+		t.Fatalf("lifecycle not replaced: %+v", detail)
 	}
-	if len(d.Handlers) != 1 || d.Handlers[0].Name != "index.main" || d.Handlers[0].Timeout != 30*time.Second {
-		t.Fatalf("handlers not replaced: %+v", d.Handlers)
+	if len(detail.Handlers) != 1 || detail.Handlers[0].Name != "index.main" || detail.Handlers[0].Timeout != 30*time.Second {
+		t.Fatalf("handlers not replaced: %+v", detail.Handlers)
 	}
-	if len(d.Schedules) != 0 {
-		t.Fatalf("stale schedules survived: %+v", d.Schedules)
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("stale schedules survived: %+v", detail.Schedules)
 	}
-	if len(d.Services) != 1 || d.Services[0].Entrypoint != "api.js" || d.Services[0].Port != 7000 || d.Services[0].Replicas != 4 {
-		t.Fatalf("services not replaced: %+v", d.Services)
+	if len(detail.Services) != 1 || detail.Services[0].Entrypoint != "api.js" || detail.Services[0].Port != 7000 || detail.Services[0].Replicas != 4 {
+		t.Fatalf("services not replaced: %+v", detail.Services)
 	}
-	if d.Env != nil || d.Secrets != nil || d.Networks != nil {
-		t.Fatalf("stale env/secrets/networks survived: env=%v secrets=%v networks=%v", d.Env, d.Secrets, d.Networks)
+	if detail.Env != nil || detail.Secrets != nil || detail.Networks != nil {
+		t.Fatalf("stale env/secrets/networks survived: env=%v secrets=%v networks=%v", detail.Env, detail.Secrets, detail.Networks)
 	}
 
 	// The replacement was a single-row UPDATE: the row count is unchanged.

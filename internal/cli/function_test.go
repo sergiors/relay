@@ -108,12 +108,12 @@ func TestFunctionListColumns(t *testing.T) {
 // inspect returns full detail including handlers and timeouts.
 func TestFunctionInspectDetail(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := normWS(w.String())
 	// Whitespace is normalized: this test pins which detail rows render, not
 	// their tabwriter column alignment (that is anchored in TestPrintStats).
@@ -139,12 +139,12 @@ func TestFunctionInspectDetail(t *testing.T) {
 // A pending function omits Image/Fingerprint/Prepared.
 func TestFunctionInspectPendingOmitsActiveFields(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("welcome-email-node")
+	detail, ok := st.GetFunction("welcome-email-node")
 	if !ok {
 		t.Fatal("expected pending function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 	if strings.Contains(out, "Image:") || strings.Contains(out, "Prepared:") || strings.Contains(out, "Fingerprint:") {
 		t.Fatalf("pending function should omit Image/Fingerprint/Prepared:\n%s", out)
@@ -164,12 +164,12 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 		RetryTotal:          17,
 		DLQTotal:            2,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
@@ -195,12 +195,12 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 // section rather than omitting it.
 func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Stats:",
@@ -235,12 +235,12 @@ events:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 	for _, want := range []string{
 		"Environment:",
@@ -279,12 +279,12 @@ schedules:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 
 	// The Schedules section follows Events.
@@ -322,12 +322,12 @@ schedules:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	return w.String()
 }
 
@@ -401,12 +401,12 @@ func TestFunctionInspectSchedulesDescriptionFallback(t *testing.T) {
 // A template without schedules renders no Schedules: header.
 func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	if strings.Contains(w.String(), "Schedules:") {
 		t.Fatalf("inspect must omit Schedules: for a template without schedules:\n%s", w.String())
 	}
@@ -487,12 +487,12 @@ services:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 	si, se := strings.Index(out, "Schedules:"), strings.Index(out, "Services:")
 	if si == -1 || se == -1 || si > se {
@@ -503,12 +503,12 @@ services:
 // A template without services renders no Services: header.
 func TestFunctionInspectNoServicesHeader(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	if strings.Contains(w.String(), "Services:") {
 		t.Fatalf("inspect must omit Services: for a template without services:\n%s", w.String())
 	}
@@ -534,12 +534,12 @@ events:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 	if !strings.Contains(out, "Networks:") {
 		t.Fatalf("inspect output missing Networks:\n%s", out)
@@ -556,12 +556,12 @@ events:
 // A template without networks renders no Networks: header.
 func TestFunctionInspectNoNetworksHeader(t *testing.T) {
 	st, _ := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	if strings.Contains(w.String(), "Networks:") {
 		t.Fatalf("inspect must omit Networks: for a template without networks:\n%s", w.String())
 	}
@@ -596,12 +596,12 @@ events:
 	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
 		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
 
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	return w.String()
 }
 
@@ -759,12 +759,12 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 		LastFailureAt:       failure.Format(time.RFC3339),
 		LastDLQAt:           dlq.Format(time.RFC3339),
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Last execution: 2s ago",
@@ -791,12 +791,12 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 	st, _ := seedTestState(t)
 	st.RecordFunctionStats(state.FunctionStats{Function: "user-events-python", EventsMatchedTotal: 3})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := normWS(w.String())
 	for _, want := range []string{
 		"Last execution: never",
@@ -832,12 +832,12 @@ services:
 	}
 	st.RecordReconcileSuccess("src-kinds", "img", "fp", time.Now(),
 		function.Function{Name: "src-kinds", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
-	d, ok := st.GetFunction("src-kinds")
+	detail, ok := st.GetFunction("src-kinds")
 	if !ok {
 		t.Fatal("expected function")
 	}
 	var w bytes.Buffer
-	printInspect(&w, st, d)
+	printInspect(&w, st, detail)
 	out := w.String()
 	for _, want := range []string{
 		"service.js", "port=3000",

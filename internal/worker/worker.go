@@ -292,7 +292,7 @@ func Run(logger *slog.Logger) {
 	for _, fn := range functions {
 		liveNames[fn.Name] = true
 	}
-	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
+	housekeepingDone := startInitialHousekeeping(ctx, logger, startupHousekeeping{
 		exclusive: services.RunExclusive,
 		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, liveNames) },
 		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
@@ -654,7 +654,7 @@ func prepareFunctions(
 	preparedCount := 0
 	prepared := make([]*runner.PreparedFunction, 0, len(functions))
 	for _, fn := range functions {
-		p, err := manager.Prepare(ctx, fn)
+		prep, err := manager.Prepare(ctx, fn)
 		if err != nil {
 			logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
 			if st != nil {
@@ -671,9 +671,9 @@ func prepareFunctions(
 				logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", fperr)
 				fp = ""
 			}
-			st.RecordReconcileSuccess(fn.Name, p.Image, fp, time.Now(), fn)
+			st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
 		}
-		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
+		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
 		preparedCount++
 	}
 	logger.Info("Prepared functions", "count", preparedCount)
@@ -729,8 +729,8 @@ func enqueueStartupServices(
 ) {
 	for _, pf := range prepared {
 		fn := pf.Function()
-		if p := pf.Prepared(); p != nil {
-			services.Enqueue(fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
+		if prep := pf.Prepared(); prep != nil {
+			services.Enqueue(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env)
 			continue
 		}
 		if len(fn.Template.Services) == 0 {
@@ -741,7 +741,7 @@ func enqueueStartupServices(
 	}
 }
 
-// startupHousekeeper groups the background startup cleanup passes so their
+// startupHousekeeping groups the background startup cleanup passes so their
 // ordering and lifecycle behavior are deterministic to test without Docker.
 // exclusive is the coordinator's housekeeping seam (see
 // ServiceCoordinator.RunExclusive): it atomically waits for current service work
@@ -751,14 +751,14 @@ func enqueueStartupServices(
 // sweep, then image sweep (whose keep-set must observe the settled service
 // containers), then dependency GC (which prunes dependency images the image
 // sweep orphaned) — so no live UpdateServices can race them.
-type startupHousekeeper struct {
+type startupHousekeeping struct {
 	exclusive func(context.Context, func(context.Context)) error
 	sweep     func(context.Context)
 	images    func(context.Context)
 	deps      func(context.Context)
 }
 
-// startStartupHousekeeping launches the lifecycle-aware startup housekeeping in a
+// startInitialHousekeeping launches the lifecycle-aware startup housekeeping in a
 // background goroutine and returns a channel closed when it completes. Startup
 // must NOT block on it: Run publishes the initial desired states and returns
 // immediately, and only this pass waits at the coordinator barrier for the
@@ -769,10 +769,10 @@ type startupHousekeeper struct {
 // unconverged or shutting-down world. An update arriving while the exclusive
 // callback runs is coalesced as a pending desired state and scheduled only once
 // the callback returns, so it can never run concurrently with a sweep.
-func startStartupHousekeeping(
+func startInitialHousekeeping(
 	lifecycle context.Context,
 	logger *slog.Logger,
-	h startupHousekeeper,
+	h startupHousekeeping,
 ) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
@@ -829,8 +829,8 @@ func sweepStartupImages(
 	var serviceImages []string
 	if err == nil {
 		serviceImages = make([]string, 0, len(svcContainers))
-		for _, c := range svcContainers {
-			serviceImages = append(serviceImages, c.Image)
+		for _, container := range svcContainers {
+			serviceImages = append(serviceImages, container.Image)
 		}
 	} else {
 		logger.Warn("Service: keep-set list failed; continuing without", "error", err)
@@ -841,8 +841,8 @@ func sweepStartupImages(
 	var recordedImages []string
 	if st != nil {
 		for _, fn := range functions {
-			if d, ok := st.GetFunction(fn.Name); ok && d.Image != "" {
-				recordedImages = append(recordedImages, d.Image)
+			if detail, ok := st.GetFunction(fn.Name); ok && detail.Image != "" {
+				recordedImages = append(recordedImages, detail.Image)
 			}
 		}
 	}
@@ -968,11 +968,11 @@ func rfc3339ToUnix(s string) int64 {
 	if s == "" {
 		return 0
 	}
-	t, err := time.Parse(time.RFC3339, s)
+	parsed, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return 0
 	}
-	return t.Unix()
+	return parsed.Unix()
 }
 
 // unixSecToRFC3339 renders a unix-seconds value as an RFC3339 timestamp,
@@ -1185,13 +1185,13 @@ func newStatsFlusher(st *state.State, metricsInstance *metrics.Registry) *statsF
 // flush captures the current Relay-visible snapshot and writes it in one short
 // transaction (see recordSnapshots). Held under mu so a concurrent ResetStats
 // cannot land between capture and write. Nil-safe on the flusher.
-func (f *statsFlusher) flush(ctx context.Context) {
-	if f == nil {
+func (flusher *statsFlusher) flush(ctx context.Context) {
+	if flusher == nil {
 		return
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	recordSnapshots(ctx, f.st, f.metrics, &f.baseline)
+	flusher.mu.Lock()
+	defer flusher.mu.Unlock()
+	recordSnapshots(ctx, flusher.st, flusher.metrics, &flusher.baseline)
 }
 
 // dropFunctionBaseline drops a function's entry from the worker-owned reset
@@ -1200,13 +1200,13 @@ func (f *statsFlusher) flush(ctx context.Context) {
 // from its fresh zero-valued series instead of subtracting a stale pre-removal
 // total (which would persist a negative value). It is idempotent, nil-safe, and
 // safe to call before any reset (a zero baseline has no entry to drop).
-func (f *statsFlusher) dropFunctionBaseline(name string) {
-	if f == nil {
+func (flusher *statsFlusher) dropFunctionBaseline(name string) {
+	if flusher == nil {
 		return
 	}
-	f.mu.Lock()
-	delete(f.baseline.funcs, name)
-	f.mu.Unlock()
+	flusher.mu.Lock()
+	delete(flusher.baseline.funcs, name)
+	flusher.mu.Unlock()
 }
 
 // ResetStats resets the worker's accumulated Relay statistics. It captures the
@@ -1220,17 +1220,17 @@ func (f *statsFlusher) dropFunctionBaseline(name string) {
 // stats_reset_failed and the CLI surfaces it rather than masking a failed worker
 // reset; the baseline is still captured so the in-memory totals continue from
 // zero.
-func (f *statsFlusher) ResetStats() error {
-	if f == nil {
+func (flusher *statsFlusher) ResetStats() error {
+	if flusher == nil {
 		return errors.New("stats flusher unavailable")
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.baseline = captureRelayBaseline(f.metrics)
-	if f.st == nil {
+	flusher.mu.Lock()
+	defer flusher.mu.Unlock()
+	flusher.baseline = captureRelayBaseline(flusher.metrics)
+	if flusher.st == nil {
 		return errors.New("state database unavailable")
 	}
-	return f.st.ResetStats()
+	return flusher.st.ResetStats()
 }
 
 // statsLoop is the flush loop: it mirrors the in-memory metrics registry into
@@ -1240,20 +1240,20 @@ func (f *statsFlusher) ResetStats() error {
 // state handle, so observability can never break processing. The loop's ctx is
 // the shutdown ctx; periodic flushes use it directly (a cancelled ctx simply
 // stops the loop).
-func statsLoop(ctx context.Context, f *statsFlusher, interval time.Duration) {
-	if f == nil || f.st == nil {
+func statsLoop(ctx context.Context, flusher *statsFlusher, interval time.Duration) {
+	if flusher == nil || flusher.st == nil {
 		<-ctx.Done()
 		return
 	}
-	f.flush(ctx)
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	flusher.flush(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			f.flush(ctx)
+		case <-ticker.C:
+			flusher.flush(ctx)
 		}
 	}
 }
@@ -1266,13 +1266,13 @@ func statsLoop(ctx context.Context, f *statsFlusher, interval time.Duration) {
 // metrics are disabled (the flusher still holds the state handle), and a
 // nil-registry flush would write zero Stats over the persisted cumulative
 // totals.
-func finalStatsFlush(f *statsFlusher) {
-	if f == nil || f.st == nil || f.metrics == nil {
+func finalStatsFlush(flusher *statsFlusher) {
+	if flusher == nil || flusher.st == nil || flusher.metrics == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	f.flush(ctx)
+	flusher.flush(ctx)
 }
 
 // recordSnapshots writes the whole stats snapshot — the global stats row and

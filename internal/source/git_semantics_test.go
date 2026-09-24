@@ -64,13 +64,13 @@ func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
 			}
 		}
 		// our source
-		sel, err := ForDir(repo)
+		selection, err := ForDir(repo)
 		if err != nil {
 			t.Fatalf("ForDir: %v", err)
 		}
 		var ourExcluded []string
 		for _, f := range files {
-			if !sel.Includes(f, false) {
+			if !selection.Includes(f, false) {
 				ourExcluded = append(ourExcluded, f)
 			}
 		}
@@ -78,7 +78,7 @@ func TestGitIgnoreMatchesGitSemantics(t *testing.T) {
 		for _, d := range dirs {
 			cmd := exec.Command("git", "-C", repo, "check-ignore", "-q", "--", d)
 			g := cmd.Run() == nil
-			o := !sel.Includes(d, true)
+			o := !selection.Includes(d, true)
 			if g != o {
 				t.Errorf("PATTERN %q DIR %q: git=%v ours=%v", pat, d, g, o)
 			}

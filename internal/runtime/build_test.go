@@ -326,12 +326,12 @@ func TestCopyDirSkipsTemplateYaml(t *testing.T) {
 		t.Fatalf("write nested template: %v", err)
 	}
 
-	sel, err := source.ForDir(src)
+	selection, err := source.ForDir(src)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	dst := t.TempDir()
-	if err := copySourceDir(sel, dst); err != nil {
+	if err := copySourceDir(selection, dst); err != nil {
 		t.Fatalf("copySourceDir: %v", err)
 	}
 
@@ -365,12 +365,12 @@ func TestCopySourceDirHonorsSelection(t *testing.T) {
 	write("index.js", "export function h(){}\n")
 	write("debug.log", "noise\n")
 
-	sel, err := source.ForDir(src)
+	selection, err := source.ForDir(src)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	dst := t.TempDir()
-	if err := copySourceDir(sel, dst); err != nil {
+	if err := copySourceDir(selection, dst); err != nil {
 		t.Fatalf("copySourceDir: %v", err)
 	}
 

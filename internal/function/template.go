@@ -977,17 +977,17 @@ func resolveTimeout(raw string) (time.Duration, error) {
 	if raw == "" {
 		return DefaultTimeout, nil
 	}
-	d, err := time.ParseDuration(raw)
+	timeout, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("invalid timeout %q", raw)
 	}
-	if d <= 0 {
+	if timeout <= 0 {
 		return 0, fmt.Errorf("timeout %q must be positive", raw)
 	}
-	if d > MaxTimeout {
+	if timeout > MaxTimeout {
 		return 0, fmt.Errorf("timeout %q exceeds max %s", raw, MaxTimeout)
 	}
-	return d, nil
+	return timeout, nil
 }
 
 // resolveConcurrency parses the optional per-function `concurrency` key. A nil
@@ -1345,9 +1345,9 @@ func buildComparison(key string, op comparisonOp, raw any, path string, now func
 			// cutoff is computed from it at match time; the relative duration's
 			// sign is already baked in, so now.Add(durNow) shifts the cutoff
 			// correctly (now()-5m -> the cutoff is 5 minutes in the past).
-			d, _, _ := parseNowOperand(s)
+			offset, _, _ := parseNowOperand(s)
 			m.kind = nowComparison
-			m.durNow = d
+			m.durNow = offset
 			m.now = now
 		} else {
 			m.kind = numericComparison
@@ -1436,9 +1436,9 @@ func parseNowOperand(value string) (time.Duration, bool, error) {
 		return 0, true, fmt.Errorf("invalid now() expression %q: expected %q or %q followed by a duration",
 			value, "now()", "now()±duration")
 	}
-	d, err := time.ParseDuration(value[5:])
+	offset, err := time.ParseDuration(value[5:])
 	if err != nil {
 		return 0, true, fmt.Errorf("invalid now() expression %q: %w", value, err)
 	}
-	return d, true, nil
+	return offset, true, nil
 }

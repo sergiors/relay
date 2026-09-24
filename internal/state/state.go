@@ -145,7 +145,7 @@ func Open(path string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state %s: %w", path, err)
 	}
-	c := &State{db: db, log: fallbackLogger}
+	st := &State{db: db, log: fallbackLogger}
 
 	// Serialize all access through a single pooled connection. Relay's local
 	// state is a tiny, low-frequency, single-file workload (reconciler writes, a
@@ -179,23 +179,23 @@ func Open(path string) (*State, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("set WAL: %w", err)
 	}
-	if err := c.initSchema(ctx); err != nil {
+	if err := st.initSchema(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return c, nil
+	return st, nil
 }
 
-// SetLogger redirects log output; used by tests and CLI wiring. A nil l (or a
+// SetLogger redirects log output; used by tests and CLI wiring. A nil logger (or a
 // nil receiver) is a no-op, leaving the current logger in place.
-func (c *State) SetLogger(l *slog.Logger) {
-	if c != nil && l != nil {
-		c.log = l
+func (st *State) SetLogger(logger *slog.Logger) {
+	if st != nil && logger != nil {
+		st.log = logger
 	}
 }
 
 // Close releases the underlying connection pool. It is non-fatal on error.
-func (c *State) Close() error { return c.db.Close() }
+func (st *State) Close() error { return st.db.Close() }
 
 // initSchema creates the current tables if they do not already exist, so a
 // fresh database is initialized with the current schema. Plain SQL: these
@@ -209,7 +209,7 @@ func (c *State) Close() error { return c.db.Close() }
 // replaces one row atomically. stats is the single-row global counter snapshot,
 // and function_stats the per-function counterpart; both keep their stable key
 // and updated_at relational while the evolving payload lives in data.
-func (c *State) initSchema(ctx context.Context) error {
+func (st *State) initSchema(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS functions (
 			name TEXT PRIMARY KEY,
@@ -249,7 +249,7 @@ func (c *State) initSchema(ctx context.Context) error {
 	}
 
 	for _, s := range stmts {
-		if _, err := c.db.ExecContext(ctx, s); err != nil {
+		if _, err := st.db.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
@@ -265,17 +265,17 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 // injectable clock when set and the package default otherwise. It is the single
 // timestamp source for every State write, so an injected clock (tests) governs
 // every updated_at/last_reconcile_at consistently.
-func (c *State) nowString() string {
-	if c.nowFn != nil {
-		return c.nowFn().UTC().Format(time.RFC3339)
+func (st *State) nowString() string {
+	if st.nowFn != nil {
+		return st.nowFn().UTC().Format(time.RFC3339)
 	}
 	return now()
 }
 
 // rebuildTx runs fn inside a transaction, which the rebuild path uses so a
 // partial scan never leaves a half-populated state database.
-func (c *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := c.db.BeginTx(ctx, nil)
+func (st *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -289,9 +289,9 @@ func (c *State) rebuildTx(ctx context.Context, fn func(tx *sql.Tx) error) error 
 // empty reports whether the functions table has no rows. Only an empty state
 // database is rebuilt from disk — we never overwrite existing state from
 // /functions.
-func (c *State) empty(ctx context.Context) (bool, error) {
+func (st *State) empty(ctx context.Context) (bool, error) {
 	var n int
-	err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM functions`).Scan(&n)
+	err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM functions`).Scan(&n)
 	return n == 0, err
 }
 
@@ -300,9 +300,9 @@ func (c *State) empty(ctx context.Context) (bool, error) {
 // recorded as status=pending (loaded, not yet built/verified). It is a no-op
 // when the state database already has rows — /functions is the source of truth,
 // but only for (re)seeding a fresh database.
-func (c *State) RebuildFromFS(dir string) error {
+func (st *State) RebuildFromFS(dir string) error {
 	ctx := context.Background()
-	populated, err := c.empty(ctx)
+	populated, err := st.empty(ctx)
 	if err != nil {
 		return fmt.Errorf("check state empty: %w", err)
 	}
@@ -310,8 +310,8 @@ func (c *State) RebuildFromFS(dir string) error {
 		return nil
 	}
 
-	l := function.NewLoader(dir, c.log)
-	fns, err := l.Load()
+	loader := function.NewLoader(dir, st.log)
+	fns, err := loader.Load()
 	if err != nil {
 		return fmt.Errorf("load functions for state: %w", err)
 	}
@@ -328,17 +328,17 @@ func (c *State) RebuildFromFS(dir string) error {
 	for _, fn := range fns {
 		fp, ferr := function.Fingerprint(fn.Dir)
 		if ferr != nil {
-			c.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
+			st.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
 			fp = ""
 		}
 		prepared = append(prepared, fpFn{fn: fn, fp: fp})
 	}
 
-	return c.rebuildTx(ctx, func(tx *sql.Tx) error {
+	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, p := range prepared {
-			d := functionSnapshot(p.fn.Name, p.fn.Template, StatusPending, "", p.fp, "", "", "", "")
-			d.UpdatedAt = c.nowString()
-			if err := upsertFunctionTx(ctx, tx, d); err != nil {
+			detail := functionSnapshot(p.fn.Name, p.fn.Template, StatusPending, "", p.fp, "", "", "", "")
+			detail.UpdatedAt = st.nowString()
+			if err := upsertFunctionTx(ctx, tx, detail); err != nil {
 				return err
 			}
 		}
@@ -350,23 +350,23 @@ func (c *State) RebuildFromFS(dir string) error {
 // state database (or when no row exists). It sets runtime/status=pending, the
 // fingerprint, and the full configuration snapshot, clearing any stale prior
 // state. It is an upsert keyed by name.
-func (c *State) RecordDiscovered(fn function.Function) {
+func (st *State) RecordDiscovered(fn function.Function) {
 	ctx := context.Background()
 	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
 	// external I/O (filesystem reads), so the closure only writes. Fingerprint
 	// errors are logged and fall back to fp="" exactly as before.
 	fp, ferr := function.Fingerprint(fn.Dir)
 	if ferr != nil {
-		c.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
+		st.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
 		fp = ""
 	}
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		d := functionSnapshot(fn.Name, fn.Template, StatusPending, "", fp, "", "", "", "")
-		d.UpdatedAt = c.nowString()
-		return upsertFunctionTx(ctx, tx, d)
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail := functionSnapshot(fn.Name, fn.Template, StatusPending, "", fp, "", "", "", "")
+		detail.UpdatedAt = st.nowString()
+		return upsertFunctionTx(ctx, tx, detail)
 	})
 	if err != nil {
-		c.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
+		st.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
 	}
 }
 
@@ -376,7 +376,7 @@ func (c *State) RecordDiscovered(fn function.Function) {
 // reconcile), cleared last_error, and the full configuration snapshot. On
 // conflict (existing row) the upsert replaces the whole snapshot, so a success
 // on a previously-discovered row records its own outcome and timestamp.
-func (c *State) RecordReconcileSuccess(
+func (st *State) RecordReconcileSuccess(
 	name,
 	image,
 	fingerprint string,
@@ -384,15 +384,15 @@ func (c *State) RecordReconcileSuccess(
 	fn function.Function,
 ) {
 	ctx := context.Background()
-	ts := c.nowString()
+	ts := st.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		d := functionSnapshot(name, fn.Template, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "")
-		d.UpdatedAt = ts
-		return upsertFunctionTx(ctx, tx, d)
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail := functionSnapshot(name, fn.Template, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "")
+		detail.UpdatedAt = ts
+		return upsertFunctionTx(ctx, tx, detail)
 	})
 	if err != nil {
-		c.log.Warn("State: record success failed", "function", name, "error", err)
+		st.log.Warn("State: record success failed", "function", name, "error", err)
 	}
 }
 
@@ -404,11 +404,11 @@ func (c *State) RecordReconcileSuccess(
 // change. The rest of the persisted snapshot is preserved by a read-modify-write
 // inside the transaction. Status stays as-is (ready if it was ready). The
 // function is never marked unavailable because of a failed rebuild.
-func (c *State) RecordReconcileFailure(name string, err2 error) {
+func (st *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
-	ts := c.nowString()
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		d, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+	ts := st.nowString()
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
 			 FROM functions WHERE name = ?`, name))
 		if err != nil {
@@ -418,11 +418,11 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 			// The old UPDATE ... WHERE name = ? was a no-op on an absent row.
 			return nil
 		}
-		d.LastReconcileAt = ts
-		d.LastReconcileStatus = ReconcileFailed
-		d.LastError = err2.Error()
-		d.UpdatedAt = ts
-		payload, err := marshalFunction(d)
+		detail.LastReconcileAt = ts
+		detail.LastReconcileStatus = ReconcileFailed
+		detail.LastError = err2.Error()
+		detail.UpdatedAt = ts
+		payload, err := marshalFunction(detail)
 		if err != nil {
 			return err
 		}
@@ -432,19 +432,19 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 		return err
 	})
 	if err != nil {
-		c.log.Warn("State: record failure failed", "function", name, "error", err)
+		st.log.Warn("State: record failure failed", "function", name, "error", err)
 	}
 }
 
 // RecordRemoved deletes a function and its per-function stats from the state
 // database, so a removed function never leaves a stale stats row behind.
-func (c *State) RecordRemoved(name string) {
+func (st *State) RecordRemoved(name string) {
 	ctx := context.Background()
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		return removeTx(ctx, tx, name)
 	})
 	if err != nil {
-		c.log.Warn("State: record removed failed", "function", name, "error", err)
+		st.log.Warn("State: record removed failed", "function", name, "error", err)
 	}
 }
 
@@ -459,22 +459,22 @@ func (c *State) RecordRemoved(name string) {
 // function_stats (restorePersistedStats), so a function removed while the worker
 // was down is pruned before its stale function_stats row could be re-seeded into
 // metrics.
-func (c *State) PruneRemoved(dir string) {
+func (st *State) PruneRemoved(dir string) {
 	ctx := context.Background()
 
 	// Collect every recorded name up front and close the rows before deleting:
 	// the delete transaction below acquires its own connection from the pool, and
 	// fully consuming the query first keeps the read and write paths independent.
-	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
+	rows, err := st.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Warn("State: prune removed: list functions failed", "error", err)
+		st.log.Warn("State: prune removed: list functions failed", "error", err)
 		return
 	}
 	var names []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Warn("State: prune removed: scan name failed", "error", err)
+			st.log.Warn("State: prune removed: scan name failed", "error", err)
 			_ = rows.Close()
 			return
 		}
@@ -486,13 +486,13 @@ func (c *State) PruneRemoved(dir string) {
 		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
 			// Reuse the same single-function removal path as RecordRemoved so the
 			// live reconciler and the startup sweep behave identically.
-			if rerr := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+			if rerr := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 				return removeTx(ctx, tx, name)
 			}); rerr != nil {
-				c.log.Warn("State: prune removed failed", "function", name, "error", rerr)
+				st.log.Warn("State: prune removed failed", "function", name, "error", rerr)
 				continue
 			}
-			c.log.Info("State: function pruned at startup", "function", name)
+			st.log.Info("State: function pruned at startup", "function", name)
 		}
 		// Any other stat error (permissions/I/O) is skipped: only a genuine
 		// os.IsNotExist means the function was removed from the filesystem.
@@ -518,13 +518,13 @@ func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 // row. A nil/empty slice and nil error mean the state database is simply empty.
 // A row whose stored snapshot is corrupt is logged (naming the function and the
 // decode error) and skipped, so one bad row cannot hide the others.
-func (c *State) ListFunctions() []Row {
+func (st *State) ListFunctions() []Row {
 	ctx := context.Background()
-	rows, err := c.db.QueryContext(ctx,
+	rows, err := st.db.QueryContext(ctx,
 		`SELECT name, `+jsonPayloadExpr+`, updated_at
 		 FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Warn("State: list functions failed", "error", err)
+		st.log.Warn("State: list functions failed", "error", err)
 		return nil
 	}
 	defer rows.Close()
@@ -537,18 +537,18 @@ func (c *State) ListFunctions() []Row {
 			updatedAt string
 		)
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
-			c.log.Warn("State: scan list failed", "error", err)
+			st.log.Warn("State: scan list failed", "error", err)
 			return out
 		}
-		d, err := unmarshalFunction(data.String)
+		detail, err := unmarshalFunction(data.String)
 		if err != nil {
-			c.log.Warn("State: read function payload failed", "function", name, "error", err)
+			st.log.Warn("State: read function payload failed", "function", name, "error", err)
 			continue
 		}
-		d.Name = name
-		d.UpdatedAt = updatedAt
-		d.HandlerCount = len(d.Handlers)
-		out = append(out, d.Row)
+		detail.Name = name
+		detail.UpdatedAt = updatedAt
+		detail.HandlerCount = len(detail.Handlers)
+		out = append(out, detail.Row)
 	}
 	return out
 }
@@ -556,19 +556,19 @@ func (c *State) ListFunctions() []Row {
 // GetFunction returns the full detail for name, or (zero, false) if unknown. A
 // corrupt persisted snapshot fails clearly: the decode error is logged and the
 // row reads as unknown rather than yielding a partial record.
-func (c *State) GetFunction(name string) (Detail, bool) {
+func (st *State) GetFunction(name string) (Detail, bool) {
 	ctx := context.Background()
-	d, found, err := scanFunction(name, c.db.QueryRowContext(ctx,
+	detail, found, err := scanFunction(name, st.db.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at
 		 FROM functions WHERE name = ?`, name))
 	if err != nil {
-		c.log.Warn("State: get failed", "function", name, "error", err)
+		st.log.Warn("State: get failed", "function", name, "error", err)
 		return Detail{}, false
 	}
 	if !found {
 		return Detail{}, false
 	}
-	return d, true
+	return detail, true
 }
 
 // scanFunction decodes one functions row selected as (json(data), updated_at)
@@ -585,22 +585,22 @@ func scanFunction(name string, row *sql.Row) (Detail, bool, error) {
 		}
 		return Detail{}, false, err
 	}
-	d, err := unmarshalFunction(data.String)
+	detail, err := unmarshalFunction(data.String)
 	if err != nil {
 		return Detail{}, false, err
 	}
-	d.Name = name
-	d.UpdatedAt = updatedAt.String
-	d.HandlerCount = len(d.Handlers)
-	return d, true, nil
+	detail.Name = name
+	detail.UpdatedAt = updatedAt.String
+	detail.HandlerCount = len(detail.Handlers)
+	return detail, true, nil
 }
 
 // upsertFunctionTx writes the whole Detail snapshot as one JSONB value in
 // functions.data, upserting on the name key. The snapshot replaces the previous
 // one atomically, so a template change never leaves a mixture of old and new
 // handler/schedule/service configuration.
-func upsertFunctionTx(ctx context.Context, tx *sql.Tx, d Detail) error {
-	payload, err := marshalFunction(d)
+func upsertFunctionTx(ctx context.Context, tx *sql.Tx, detail Detail) error {
+	payload, err := marshalFunction(detail)
 	if err != nil {
 		return err
 	}
@@ -609,7 +609,7 @@ func upsertFunctionTx(ctx context.Context, tx *sql.Tx, d Detail) error {
 		 ON CONFLICT(name) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
-		d.Name, payload, d.UpdatedAt)
+		detail.Name, payload, detail.UpdatedAt)
 	return err
 }
 
@@ -764,16 +764,16 @@ func RelativeAgo(rfc3339 string) string {
 	if t.After(now) {
 		return "just now"
 	}
-	d := now.Sub(t)
+	age := now.Sub(t)
 	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds ago", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm ago", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(d.Hours()))
-	case d < 30*24*time.Hour:
-		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	case age < time.Minute:
+		return fmt.Sprintf("%ds ago", int(age.Seconds()))
+	case age < time.Hour:
+		return fmt.Sprintf("%dm ago", int(age.Minutes()))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(age.Hours()))
+	case age < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(age.Hours()/24))
 	default:
 		return t.Format("2006-01-02")
 	}

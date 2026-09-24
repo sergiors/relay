@@ -162,40 +162,40 @@ type invocationStore struct {
 
 // completed reports whether the invocation has already completed for this
 // message; redis.Nil (field absent) means not completed.
-func (p *invocationStore) completed(
+func (store *invocationStore) completed(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
 ) (bool, error) {
-	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return v == "ok", nil
+	return value == "ok", nil
 }
 
 // terminal reports whether the invocation is terminal (complete or exhausted);
 // redis.Nil (field absent) means not terminal.
-func (p *invocationStore) terminal(
+func (store *invocationStore) terminal(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
 ) (bool, error) {
-	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	kind, _, _, ok := parseInvocationState(v)
+	kind, _, _, ok := parseInvocationState(value)
 	if !ok {
 		return false, nil
 	}
@@ -207,7 +207,7 @@ func (p *invocationStore) terminal(
 // round trip. Writing "ok" overwrites any "running:<...>" or
 // "next_attempt_at:<...>" marker the same invocation carried, so a successful
 // attempt atomically transitions the field from protected to complete.
-func (p *invocationStore) markComplete(
+func (store *invocationStore) markComplete(
 	ctx context.Context,
 	stream,
 	group,
@@ -215,7 +215,7 @@ func (p *invocationStore) markComplete(
 	invocation string,
 ) error {
 	key := invocationStateKey(stream, group, msgID)
-	pipe := p.client.Pipeline()
+	pipe := store.client.Pipeline()
 	pipe.HSet(ctx, key, invocation, "ok")
 	pipe.Expire(ctx, key, invocationStateTTL)
 	_, err := pipe.Exec(ctx)
@@ -248,7 +248,7 @@ func (p *invocationStore) markComplete(
 // the tolerance (allowed under at-least-once, and handlers are idempotent),
 // while never lengthening the protected window by unbounded skew. The
 // tolerance must stay far smaller than the minimum sensible handler timeout.
-func (p *invocationStore) tryStart(
+func (store *invocationStore) tryStart(
 	ctx context.Context,
 	stream,
 	group,
@@ -258,13 +258,13 @@ func (p *invocationStore) tryStart(
 	deadline time.Time,
 ) (started bool, attempt int, wait time.Duration, err error) {
 	key := invocationStateKey(stream, group, msgID)
-	v, err := p.client.HGet(ctx, key, invocation).Result()
+	value, err := store.client.HGet(ctx, key, invocation).Result()
 	if err == redis.Nil {
 		// Field absent: eligible.
 	} else if err != nil {
 		return false, 0, 0, err
 	} else {
-		kind, dl, n, ok := parseInvocationState(v)
+		kind, dl, n, ok := parseInvocationState(value)
 		if !ok {
 			// Unparseable: eligible.
 		} else {
@@ -290,7 +290,7 @@ func (p *invocationStore) tryStart(
 	// Absent, expired, or unparseable: start a new attempt. HSET + EXPIRE are
 	// pipelined so the TTL is refreshed on the write without an extra round trip.
 	attempt++
-	pipe := p.client.Pipeline()
+	pipe := store.client.Pipeline()
 	pipe.HSet(ctx, key, invocation, runningValue(deadline, attempt))
 	pipe.Expire(ctx, key, invocationStateTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -306,7 +306,7 @@ func (p *invocationStore) tryStart(
 // the TTL in a pipeline. If the field went missing (a race), attempts defaults
 // to 1. On a read error it returns the error so the caller can fail open (leave
 // the field as-is, making the invocation eligible immediately — at-least-once).
-func (p *invocationStore) finishFailure(
+func (store *invocationStore) finishFailure(
 	ctx context.Context,
 	stream,
 	group,
@@ -316,19 +316,19 @@ func (p *invocationStore) finishFailure(
 	now time.Time,
 ) (nextDeadline time.Time, err error) {
 	key := invocationStateKey(stream, group, msgID)
-	v, err := p.client.HGet(ctx, key, invocation).Result()
+	value, err := store.client.HGet(ctx, key, invocation).Result()
 	if err == redis.Nil {
 		// Field missing (race): treat as attempt 1.
-		v = ""
+		value = ""
 	} else if err != nil {
 		return time.Time{}, err
 	}
 	attempts := 1
-	if kind, _, n, ok := parseInvocationState(v); ok && kind != kindComplete {
+	if kind, _, n, ok := parseInvocationState(value); ok && kind != kindComplete {
 		attempts = n
 	}
 	nextDeadline = now.Add(backoff)
-	pipe := p.client.Pipeline()
+	pipe := store.client.Pipeline()
 	pipe.HSet(ctx, key, invocation, nextAttemptValue(nextDeadline, attempts))
 	pipe.Expire(ctx, key, invocationStateTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -345,7 +345,7 @@ func (p *invocationStore) finishFailure(
 // redelivery raced a completed DLQ write), the suffix is lost and the entry is
 // re-written on redelivery; that is the at-least-once duplicate window, not a
 // correctness loss.
-func (p *invocationStore) markExhausted(
+func (store *invocationStore) markExhausted(
 	ctx context.Context,
 	stream,
 	group,
@@ -353,7 +353,7 @@ func (p *invocationStore) markExhausted(
 	invocation string,
 	attempts int,
 ) error {
-	return p.writeExhausted(ctx, stream, group, msgID, invocation, attempts, false)
+	return store.writeExhausted(ctx, stream, group, msgID, invocation, attempts, false)
 }
 
 // markExhaustedDLQ upgrades the invocation's exhausted marker to
@@ -361,7 +361,7 @@ func (p *invocationStore) markExhausted(
 // HSET + EXPIRE are pipelined. It is called only AFTER a successful XADD, so a
 // later redelivery can skip the (already-written) entry without scanning the
 // DLQ stream.
-func (p *invocationStore) markExhaustedDLQ(
+func (store *invocationStore) markExhaustedDLQ(
 	ctx context.Context,
 	stream,
 	group,
@@ -369,12 +369,12 @@ func (p *invocationStore) markExhaustedDLQ(
 	invocation string,
 	attempts int,
 ) error {
-	return p.writeExhausted(ctx, stream, group, msgID, invocation, attempts, true)
+	return store.writeExhausted(ctx, stream, group, msgID, invocation, attempts, true)
 }
 
 // writeExhausted writes the terminal exhausted marker, optionally with the
 // ":dlq" persistence suffix, refreshing the TTL in the same pipeline.
-func (p *invocationStore) writeExhausted(
+func (store *invocationStore) writeExhausted(
 	ctx context.Context,
 	stream,
 	group,
@@ -384,7 +384,7 @@ func (p *invocationStore) writeExhausted(
 	dlqPersisted bool,
 ) error {
 	key := invocationStateKey(stream, group, msgID)
-	pipe := p.client.Pipeline()
+	pipe := store.client.Pipeline()
 	pipe.HSet(ctx, key, invocation, exhaustedValue(attempts, dlqPersisted))
 	pipe.Expire(ctx, key, invocationStateTTL)
 	_, err := pipe.Exec(ctx)
@@ -397,28 +397,28 @@ func (p *invocationStore) writeExhausted(
 // entry is (re-)written. A read error returns (false, err); the caller fails
 // safe by treating the entry as not persisted (a duplicate is allowed under
 // at-least-once, while skipping a required write would lose the entry).
-func (p *invocationStore) exhaustedPersisted(
+func (store *invocationStore) exhaustedPersisted(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
 ) (bool, error) {
-	v, err := p.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
 	if err == redis.Nil {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return isExhaustedDLQValue(v), nil
+	return isExhaustedDLQValue(value), nil
 }
 
 // clear deletes the message's invocation-state hash entirely. It is called
 // eagerly on completion (successful ACK or DLQ routing) so the key does not
 // linger.
-func (p *invocationStore) clear(ctx context.Context, stream, group, msgID string) error {
-	return p.client.Del(ctx, invocationStateKey(stream, group, msgID)).Err()
+func (store *invocationStore) clear(ctx context.Context, stream, group, msgID string) error {
+	return store.client.Del(ctx, invocationStateKey(stream, group, msgID)).Err()
 }
 
 // claimClassification atomically claims this message's one-time logical-event
@@ -442,9 +442,9 @@ func (p *invocationStore) clear(ctx context.Context, stream, group, msgID string
 // event, because it cannot prove the claim. Failing open here would risk
 // double-counting on redelivery, and classification counters are exact
 // partition counts, not at-least-once accounting.
-func (p *invocationStore) claimClassification(ctx context.Context, stream, group, msgID string) (bool, error) {
+func (store *invocationStore) claimClassification(ctx context.Context, stream, group, msgID string) (bool, error) {
 	key := invocationStateKey(stream, group, msgID)
-	pipe := p.client.Pipeline()
+	pipe := store.client.Pipeline()
 	set := pipe.HSetNX(ctx, key, classificationField, "1")
 	pipe.Expire(ctx, key, invocationStateTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -472,11 +472,11 @@ func nextAttemptValue(deadline time.Time, attempts int) string {
 // ("exhausted:<attempts>:dlq") to record that the invocation's DLQ entry has
 // been persisted.
 func exhaustedValue(attempts int, dlqPersisted bool) string {
-	v := "exhausted:" + strconv.Itoa(attempts)
+	value := "exhausted:" + strconv.Itoa(attempts)
 	if dlqPersisted {
-		v += ":dlq"
+		value += ":dlq"
 	}
-	return v
+	return value
 }
 
 // isExhaustedDLQValue reports whether v is exactly the valid
@@ -721,8 +721,8 @@ var ErrInvocationObsolete = errors.New("invocation obsolete")
 // InvocationState. The stream layer sets this before invoking the Handler so
 // the runner can skip already-completed or in-flight invocations without
 // changing the Handler signature.
-func WithInvocationState(ctx context.Context, p InvocationState) context.Context {
-	return context.WithValue(ctx, invocationStateContextKey{}, p)
+func WithInvocationState(ctx context.Context, state InvocationState) context.Context {
+	return context.WithValue(ctx, invocationStateContextKey{}, state)
 }
 
 // noInvocationStateKey is a marker value that masks any InvocationState already
@@ -751,8 +751,8 @@ func InvocationStateFrom(ctx context.Context) (InvocationState, bool) {
 	if ctx.Value(noInvocationStateKey{}) != nil {
 		return nil, false
 	}
-	p, ok := ctx.Value(invocationStateContextKey{}).(InvocationState)
-	return p, ok
+	invState, ok := ctx.Value(invocationStateContextKey{}).(InvocationState)
+	return invState, ok
 }
 
 // Option configures an invocationState built by NewInvocationState. Options are
@@ -763,7 +763,7 @@ type Option func(*invocationState)
 // It lets tests freeze or advance time without changing production semantics;
 // production passes no option, so the real time.Now is used.
 func WithClock(next func() time.Time) Option {
-	return func(p *invocationState) { p.now = next }
+	return func(state *invocationState) { state.now = next }
 }
 
 // NewInvocationState builds the concrete per-message InvocationState handle the
@@ -779,7 +779,7 @@ func NewInvocationState(
 	log *slog.Logger,
 	opts ...Option,
 ) InvocationState {
-	p := &invocationState{
+	state := &invocationState{
 		ctx:    ctx,
 		store:  store,
 		stream: stream,
@@ -789,9 +789,9 @@ func NewInvocationState(
 		now:    time.Now,
 	}
 	for _, opt := range opts {
-		opt(p)
+		opt(state)
 	}
-	return p
+	return state
 }
 
 // invocationState is the concrete per-message handle the stream layer injects.
@@ -807,10 +807,10 @@ type invocationState struct {
 
 // IsComplete treats a Redis read error as not completed (fail-open): the runner
 // re-runs the invocation, preserving at-least-once semantics.
-func (p *invocationState) IsComplete(invocation string) bool {
-	done, err := p.store.completed(p.ctx, p.stream, p.group, p.msgID, invocation)
+func (state *invocationState) IsComplete(invocation string) bool {
+	done, err := state.store.completed(state.ctx, state.stream, state.group, state.msgID, invocation)
 	if err != nil {
-		p.log.Debug("Invocation state: read failed; treating as not completed", "invocation", invocation, "error", err)
+		state.log.Debug("Invocation state: read failed; treating as not completed", "invocation", invocation, "error", err)
 		return false
 	}
 	return done
@@ -819,10 +819,10 @@ func (p *invocationState) IsComplete(invocation string) bool {
 // IsTerminal reports whether the invocation is terminal (complete or exhausted).
 // A Redis read error fails open to false (not terminal), so the message is
 // conservatively left pending rather than DLQ'd.
-func (p *invocationState) IsTerminal(invocation string) bool {
-	terminal, err := p.store.terminal(p.ctx, p.stream, p.group, p.msgID, invocation)
+func (state *invocationState) IsTerminal(invocation string) bool {
+	terminal, err := state.store.terminal(state.ctx, state.stream, state.group, state.msgID, invocation)
 	if err != nil {
-		p.log.Debug("Invocation state: read failed; treating as not terminal", "invocation", invocation, "error", err)
+		state.log.Debug("Invocation state: read failed; treating as not terminal", "invocation", invocation, "error", err)
 		return false
 	}
 	return terminal
@@ -832,10 +832,10 @@ func (p *invocationState) IsTerminal(invocation string) bool {
 // classification and reports whether this delivery won the claim. A store error
 // is not fail-open here: classification counters must be exact, so the error is
 // logged and (false, err) returned so the caller counts nothing.
-func (p *invocationState) ClaimClassification() (bool, error) {
-	claimed, err := p.store.claimClassification(p.ctx, p.stream, p.group, p.msgID)
+func (state *invocationState) ClaimClassification() (bool, error) {
+	claimed, err := state.store.claimClassification(state.ctx, state.stream, state.group, state.msgID)
 	if err != nil {
-		p.log.Debug("Invocation state: classification claim failed; not counting event", "error", err)
+		state.log.Debug("Invocation state: classification claim failed; not counting event", "error", err)
 		return false, err
 	}
 	return claimed, nil
@@ -844,9 +844,9 @@ func (p *invocationState) ClaimClassification() (bool, error) {
 // MarkComplete logs but does not fail the handler on a write error: the message
 // will simply be re-run later, preserving at-least-once semantics. State
 // bookkeeping must never become a new failure source.
-func (p *invocationState) MarkComplete(invocation string) {
-	if err := p.store.markComplete(p.ctx, p.stream, p.group, p.msgID, invocation); err != nil {
-		p.log.Warn("Invocation state: mark failed; message will be re-run later", "invocation", invocation, "error", err)
+func (state *invocationState) MarkComplete(invocation string) {
+	if err := state.store.markComplete(state.ctx, state.stream, state.group, state.msgID, invocation); err != nil {
+		state.log.Warn("Invocation state: mark failed; message will be re-run later", "invocation", invocation, "error", err)
 	}
 }
 
@@ -867,11 +867,11 @@ func (p *invocationState) MarkComplete(invocation string) {
 // read failed, attempt 1 is returned (nothing was known). The persisted
 // deadline matches the local timer by construction: the runner passes the same
 // capped timeout to TryStart and to context.WithTimeout.
-func (p *invocationState) TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration) {
-	now := p.now()
-	started, attempt, wait, err := p.store.tryStart(p.ctx, p.stream, p.group, p.msgID, invocation, now, now.Add(timeout))
+func (state *invocationState) TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration) {
+	now := state.now()
+	started, attempt, wait, err := state.store.tryStart(state.ctx, state.stream, state.group, state.msgID, invocation, now, now.Add(timeout))
 	if err != nil {
-		p.log.Debug("Invocation state: try-start failed; failing open (running)", "invocation", invocation, "error", err)
+		state.log.Debug("Invocation state: try-start failed; failing open (running)", "invocation", invocation, "error", err)
 		if attempt < 1 {
 			attempt = 1
 		}
@@ -885,21 +885,21 @@ func (p *invocationState) TryStart(invocation string, timeout time.Duration) (st
 // error is logged only: if the marker is lost, the invocation becomes eligible
 // immediately (at-least-once), and the message stays pending for a later
 // delivery regardless.
-func (p *invocationState) RecordFailure(invocation string, backoff time.Duration) {
-	next, err := p.store.finishFailure(p.ctx, p.stream, p.group, p.msgID, invocation, backoff, p.now())
+func (state *invocationState) RecordFailure(invocation string, backoff time.Duration) {
+	next, err := state.store.finishFailure(state.ctx, state.stream, state.group, state.msgID, invocation, backoff, state.now())
 	if err != nil {
-		p.log.Warn("Invocation state: record failure failed; leaving field as-is (eligible immediately)",
+		state.log.Warn("Invocation state: record failure failed; leaving field as-is (eligible immediately)",
 			"invocation", invocation, "error", err)
 		return
 	}
-	p.log.Debug("Invocation state: failure recorded; next attempt eligible", "invocation", invocation, "next", next)
+	state.log.Debug("Invocation state: failure recorded; next attempt eligible", "invocation", invocation, "next", next)
 }
 
 // MarkExhausted records that the invocation's attempts are exhausted, making
 // it terminal. A write error is logged only: if the marker is lost, a later
 // delivery may re-run the invocation once (at-least-once), which is safe.
-func (p *invocationState) MarkExhausted(invocation string, attempts int) {
-	if err := p.store.markExhausted(p.ctx, p.stream, p.group, p.msgID, invocation, attempts); err != nil {
-		p.log.Warn("Invocation state: mark exhausted failed", "invocation", invocation, "error", err)
+func (state *invocationState) MarkExhausted(invocation string, attempts int) {
+	if err := state.store.markExhausted(state.ctx, state.stream, state.group, state.msgID, invocation, attempts); err != nil {
+		state.log.Warn("Invocation state: mark exhausted failed", "invocation", invocation, "error", err)
 	}
 }

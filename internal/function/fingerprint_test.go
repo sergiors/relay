@@ -250,16 +250,16 @@ func TestFingerprintTracksAncestorIgnoreAfterSubselection(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: node24\n")
 	writeFile(t, filepath.Join(dir, "handler.js"), "export const x = 1\n")
 
-	sel, err := source.New(root, dir)
+	selection, err := source.New(root, dir)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	before, err := FingerprintSelection(sel)
+	before, err := FingerprintSelection(selection)
 	if err != nil {
 		t.Fatalf("before: %v", err)
 	}
 	writeFile(t, filepath.Join(root, ".gitignore"), "*.generated\nchanged-policy\n")
-	after, err := FingerprintSelection(sel)
+	after, err := FingerprintSelection(selection)
 	if err != nil {
 		t.Fatalf("after: %v", err)
 	}

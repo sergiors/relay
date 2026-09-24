@@ -21,8 +21,8 @@ import (
 // materialize is exactly what the reconciler would load. An ignored directory is
 // skipped just as the loader would (git never descends into it), so a function
 // directory excluded by .gitignore is not materialized.
-func discoverFunctions(sel *source.Selection) ([]string, error) {
-	entries, err := os.ReadDir(sel.Dir())
+func discoverFunctions(selection *source.Selection) ([]string, error) {
+	entries, err := os.ReadDir(selection.Dir())
 	if err != nil {
 		// A missing source dir means the validated monorepo path (or the whole
 		// checkout) is absent from the checked-out ref. That is a hard sync
@@ -30,9 +30,9 @@ func discoverFunctions(sel *source.Selection) ([]string, error) {
 		// successful "there are no functions yet" sync and could erase valid
 		// materialized functions through the deterministic-removal rule.
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("git: source dir %q does not exist in the checkout", sel.Dir())
+			return nil, fmt.Errorf("git: source dir %q does not exist in the checkout", selection.Dir())
 		}
-		return nil, fmt.Errorf("git: read source dir %q: %w", sel.Dir(), err)
+		return nil, fmt.Errorf("git: read source dir %q: %w", selection.Dir(), err)
 	}
 	// A successfully read but empty directory is a valid, deliberate "no
 	// functions here" source, NOT an error: materialize still runs the
@@ -48,10 +48,10 @@ func discoverFunctions(sel *source.Selection) ([]string, error) {
 		if function.ValidName(name) != nil {
 			continue
 		}
-		if !sel.IncludesPath(filepath.Join(sel.Dir(), name, "template.yaml"), false) {
+		if !selection.IncludesPath(filepath.Join(selection.Dir(), name, "template.yaml"), false) {
 			continue // excluded by the source-selection policy
 		}
-		if _, err := os.Stat(filepath.Join(sel.Dir(), name, "template.yaml")); err != nil {
+		if _, err := os.Stat(filepath.Join(selection.Dir(), name, "template.yaml")); err != nil {
 			continue // no template.yaml, or unreadable: not a function
 		}
 		names = append(names, name)
@@ -61,10 +61,10 @@ func discoverFunctions(sel *source.Selection) ([]string, error) {
 }
 
 // materialize rewrites dstDir (the /functions root) so that it contains exactly
-// the function directories discovered under sel, recursively and
+// the function directories discovered under selection, recursively and
 // deterministically:
 //
-//   - Each function in the discovered set is copied/refreshed from sel into
+//   - Each function in the discovered set is copied/refreshed from selection into
 //     dstDir. The copy is made "atomic-ish" per function: the tree is copied
 //     into a temp directory beside dstDir, then the existing target is removed
 //     and the temp renamed over it. A reader (the reconciler's watcher) sees at
@@ -87,12 +87,12 @@ func discoverFunctions(sel *source.Selection) ([]string, error) {
 // managed by git. Operator-placed function directories are subject to the same
 // deterministic rule: a sync removes any directory not in the source. This is
 // documented in README.md "Git" and in Sync's doc comment.
-func materialize(sel *source.Selection, dstDir string) (materialized, removed []string, err error) {
+func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return nil, nil, fmt.Errorf("git: create functions dir %q: %w", dstDir, err)
 	}
 
-	newSet, err := discoverFunctions(sel)
+	newSet, err := discoverFunctions(selection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,11 +104,11 @@ func materialize(sel *source.Selection, dstDir string) (materialized, removed []
 	// Copy/refresh each wanted function atomically-ish: temp dir beside dst,
 	// remove old target, rename temp into place.
 	for _, name := range newSet {
-		fnSel, err := sel.Sub(filepath.Join(sel.Dir(), name))
+		fnSelection, err := selection.Sub(filepath.Join(selection.Dir(), name))
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := copyFunctionDir(fnSel, dstDir, name); err != nil {
+		if err := copyFunctionDir(fnSelection, dstDir, name); err != nil {
 			return nil, nil, err
 		}
 		materialized = append(materialized, name)
@@ -142,13 +142,14 @@ func materialize(sel *source.Selection, dstDir string) (materialized, removed []
 	return materialized, removed, nil
 }
 
-// copyFunctionDir copies the whole tree at sel into dst/name atomically-ish: the
-// tree is first copied to a temp directory created beside dst, then the existing
-// dst/name is removed and the temp renamed into place, so the reconciler never
-// observes a partially-written function directory. Files the source-selection
-// policy excludes are not copied; the applicable .gitignore files are (they are
-// the policy and must travel with the function). File modes are preserved.
-func copyFunctionDir(sel *source.Selection, dst, name string) error {
+// copyFunctionDir copies the whole tree at selection into dst/name
+// atomically-ish: the tree is first copied to a temp directory created beside
+// dst, then the existing dst/name is removed and the temp renamed into place, so
+// the reconciler never observes a partially-written function directory. Files the
+// source-selection policy excludes are not copied; the applicable .gitignore
+// files are (they are the policy and must travel with the function). File modes
+// are preserved.
+func copyFunctionDir(selection *source.Selection, dst, name string) error {
 	tmp, err := os.MkdirTemp(dst, ".sync-*")
 	if err != nil {
 		return fmt.Errorf("git: create temp dir: %w", err)
@@ -161,10 +162,10 @@ func copyFunctionDir(sel *source.Selection, dst, name string) error {
 		}
 	}()
 
-	if err := copyTree(sel, tmpPath); err != nil {
+	if err := copyTree(selection, tmpPath); err != nil {
 		return err
 	}
-	if err := preserveAncestorIgnoreFiles(sel, tmpPath); err != nil {
+	if err := preserveAncestorIgnoreFiles(selection, tmpPath); err != nil {
 		return err
 	}
 
@@ -187,11 +188,11 @@ func copyFunctionDir(sel *source.Selection, dst, name string) error {
 // materialized function. Without this, a subsequent runtime fingerprint would
 // forget an ancestor .gitignore when the ancestor rule happened not to change
 // the selected files.
-func preserveAncestorIgnoreFiles(sel *source.Selection, dst string) error {
-	local := filepath.Join(sel.Dir(), source.IgnoreFile)
+func preserveAncestorIgnoreFiles(selection *source.Selection, dst string) error {
+	local := filepath.Join(selection.Dir(), source.IgnoreFile)
 	var contents []byte
-	for _, path := range sel.ApplicableIgnoreFiles() {
-		if path == local || strings.HasPrefix(path, sel.Dir()+string(filepath.Separator)) {
+	for _, path := range selection.ApplicableIgnoreFiles() {
+		if path == local || strings.HasPrefix(path, selection.Dir()+string(filepath.Separator)) {
 			continue
 		}
 		b, err := os.ReadFile(path)
@@ -215,17 +216,17 @@ func preserveAncestorIgnoreFiles(sel *source.Selection, dst string) error {
 	return os.WriteFile(filepath.Join(dst, source.IgnoreFile), contents, 0o644)
 }
 
-// copyTree recursively copies the selected source tree at sel into dst (which
-// must already exist), preserving file permissions. Excluded files (the
+// copyTree recursively copies the selected source tree at selection into dst
+// (which must already exist), preserving file permissions. Excluded files (the
 // .gitignore rules) and ".git" are skipped by the selection itself. Symlinks are
 // dereferenced and copied as regular files/dirs by walking the target, mirroring
 // a naive cp -r.
-func copyTree(sel *source.Selection, dst string) error {
-	return sel.WalkDir(func(path string, d fs.DirEntry, err error) error {
+func copyTree(selection *source.Selection, dst string) error {
+	return selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(sel.Dir(), path)
+		rel, err := filepath.Rel(selection.Dir(), path)
 		if err != nil {
 			return err
 		}

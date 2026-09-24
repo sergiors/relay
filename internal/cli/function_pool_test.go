@@ -65,7 +65,7 @@ func TestFunctionInspectRuntimePoolSection(t *testing.T) {
 		ColdStartsTotal:   3,
 		DiscardedTotal:    2,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -92,7 +92,7 @@ func TestFunctionInspectRuntimePoolSection(t *testing.T) {
 	defer SetPoolSnapshotProvider(orig)
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	for _, want := range []string{
@@ -153,7 +153,7 @@ func TestFunctionInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T
 		ColdStartsTotal:   3,
 		DiscardedTotal:    2,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -161,7 +161,7 @@ func TestFunctionInspectRuntimePoolPersistedCountersWithoutProvider(t *testing.T
 	withProviderDisabled(t)
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") {
@@ -199,7 +199,7 @@ func TestFunctionInspectRuntimePoolProviderUnknownFunction(t *testing.T) {
 		Function:          "user-events-python",
 		WarmAcquiresTotal: 4,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -209,7 +209,7 @@ func TestFunctionInspectRuntimePoolProviderUnknownFunction(t *testing.T) {
 	defer SetPoolSnapshotProvider(orig)
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Runtime pool:") || !strings.Contains(out, "Warm acquires: 4") {
@@ -253,7 +253,7 @@ func TestFunctionInspectSocketLiveGauges(t *testing.T) {
 		ColdStartsTotal:   4,
 		DiscardedTotal:    1,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -263,7 +263,7 @@ func TestFunctionInspectSocketLiveGauges(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
@@ -293,7 +293,7 @@ func TestFunctionInspectSocketLiveGauges(t *testing.T) {
 // query succeeding rather than on non-zero values.
 func TestFunctionInspectSocketKnownZeros(t *testing.T) {
 	st, deps := seedTestState(t)
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -305,7 +305,7 @@ func TestFunctionInspectSocketKnownZeros(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	for _, row := range []string{
@@ -332,7 +332,7 @@ func TestFunctionInspectSocketUnknownFunction(t *testing.T) {
 		Function:          "user-events-python",
 		WarmAcquiresTotal: 5,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -344,7 +344,7 @@ func TestFunctionInspectSocketUnknownFunction(t *testing.T) {
 	})
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 5") || !strings.Contains(out, "Capacity: unknown") {
@@ -361,7 +361,7 @@ func TestFunctionInspectSocketUnavailable(t *testing.T) {
 		Function:          "user-events-python",
 		WarmAcquiresTotal: 6,
 	})
-	d, ok := st.GetFunction("user-events-python")
+	detail, ok := st.GetFunction("user-events-python")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -369,7 +369,7 @@ func TestFunctionInspectSocketUnavailable(t *testing.T) {
 	// No socket server is started at deps.SocketPath: the dial fails.
 
 	var w bytes.Buffer
-	fs := printInspect(&w, st, d)
+	fs := printInspect(&w, st, detail)
 	appendRuntimePool(&w, "user-events-python", fs, deps.SocketPath)
 	out := normWS(w.String())
 	if !strings.Contains(out, "Warm acquires: 6") || !strings.Contains(out, "Capacity: unknown") {

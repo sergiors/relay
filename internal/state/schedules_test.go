@@ -27,21 +27,21 @@ func TestScheduleRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, schedulesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Schedules) != 2 {
-		t.Fatalf("schedules = %d, want 2", len(d.Schedules))
+	if len(detail.Schedules) != 2 {
+		t.Fatalf("schedules = %d, want 2", len(detail.Schedules))
 	}
-	s0 := d.Schedules[0]
+	s0 := detail.Schedules[0]
 	if s0.Handler != "jobs.cleanup.handler" || s0.Cron != "0 3 * * *" || s0.Timezone != "UTC" {
 		t.Fatalf("schedule 0 = %+v", s0)
 	}
 	if s0.Timeout != 6*time.Second {
 		t.Fatalf("schedule 0 timeout = %s, want default 6s", s0.Timeout)
 	}
-	s1 := d.Schedules[1]
+	s1 := detail.Schedules[1]
 	if s1.Handler != "jobs.report.handler" || s1.Cron != "0 8 * * 1-5" || s1.Timezone != "Europe/Rome" {
 		t.Fatalf("schedule 1 = %+v", s1)
 	}
@@ -69,14 +69,14 @@ schedules:
 `)
 	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Schedules) != 1 {
-		t.Fatalf("schedules = %d, want 1 after replacement", len(d.Schedules))
+	if len(detail.Schedules) != 1 {
+		t.Fatalf("schedules = %d, want 1 after replacement", len(detail.Schedules))
 	}
-	s := d.Schedules[0]
+	s := detail.Schedules[0]
 	if s.Handler != "jobs.report.handler" || s.Cron != "0 4 * * *" || s.Timezone != "America/New_York" {
 		t.Fatalf("schedule after change = %+v", s)
 	}
@@ -104,11 +104,11 @@ func TestScheduleEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no schedules key
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Schedules) != 0 {
-		t.Fatalf("schedules = %d, want 0 for a template without schedules", len(d.Schedules))
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("schedules = %d, want 0 for a template without schedules", len(detail.Schedules))
 	}
 }

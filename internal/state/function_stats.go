@@ -67,14 +67,14 @@ type FunctionStats struct {
 	UpdatedAt           string `json:"-"`
 }
 
-// RecordFunctionStats upserts the function_stats row for s.Function. It is a
+// RecordFunctionStats upserts the function_stats row for functionStats.Function. It is a
 // thin wrapper over RecordFunctionStatsContext using a background context, kept
 // for callers (tests, CLI) that do not need to bound the write.
-func (c *State) RecordFunctionStats(s FunctionStats) {
-	c.RecordFunctionStatsContext(context.Background(), s)
+func (st *State) RecordFunctionStats(functionStats FunctionStats) {
+	st.RecordFunctionStatsContext(context.Background(), functionStats)
 }
 
-// RecordFunctionStatsContext upserts the function_stats row for s.Function,
+// RecordFunctionStatsContext upserts the function_stats row for functionStats.Function,
 // replacing the JSON payload with the supplied value and setting updated_at to
 // now(). The payload is written as SQLite binary JSON via jsonb(?). Counters
 // behave as an absolute snapshot (see RecordStats); the four Last*At timestamps
@@ -86,10 +86,10 @@ func (c *State) RecordFunctionStats(s FunctionStats) {
 // values; the worker seeds the fresh process registry from this table at
 // startup so the first snapshot never resets counters. It is non-fatal on
 // error: it logs and returns.
-func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats) {
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		stored := c.storedFunctionStatsTx(ctx, tx, s.Function)
-		merged := mergeFunctionStatsTimestamps(stored, s)
+func (st *State) RecordFunctionStatsContext(ctx context.Context, functionStats FunctionStats) {
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		stored := st.storedFunctionStatsTx(ctx, tx, functionStats.Function)
+		merged := mergeFunctionStatsTimestamps(stored, functionStats)
 		payload, err := marshalFunctionStats(merged)
 		if err != nil {
 			return err
@@ -99,11 +99,11 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 			 ON CONFLICT(function_name) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
-			s.Function, payload, c.nowString())
+			functionStats.Function, payload, st.nowString())
 		return err
 	})
 	if err != nil {
-		c.log.Warn("State: record function stats failed", "function", s.Function, "error", err)
+		st.log.Warn("State: record function stats failed", "function", functionStats.Function, "error", err)
 	}
 }
 
@@ -111,28 +111,28 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 // when no row has been recorded yet or the read/decoding fails (which is
 // logged). The Function field is set to name on success (it is relational
 // metadata, not part of the JSON payload).
-func (c *State) FunctionStats(name string) (FunctionStats, bool) {
+func (st *State) FunctionStats(name string) (FunctionStats, bool) {
 	ctx := context.Background()
 	var data sql.NullString
 	var updatedAt sql.NullString
-	err := c.db.QueryRowContext(ctx,
+	err := st.db.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at FROM function_stats WHERE function_name = ?`, name,
 	).Scan(&data, &updatedAt)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}, false
 	}
 	if err != nil {
-		c.log.Warn("State: read function stats failed", "function", name, "error", err)
+		st.log.Warn("State: read function stats failed", "function", name, "error", err)
 		return FunctionStats{}, false
 	}
-	s, err := unmarshalFunctionStats(data)
+	functionStats, err := unmarshalFunctionStats(data)
 	if err != nil {
-		c.log.Warn("State: read function stats failed", "function", name, "error", err)
+		st.log.Warn("State: read function stats failed", "function", name, "error", err)
 		return FunctionStats{}, false
 	}
-	s.Function = name
-	s.UpdatedAt = updatedAt.String
-	return s, true
+	functionStats.Function = name
+	functionStats.UpdatedAt = updatedAt.String
+	return functionStats, true
 }
 
 // FunctionNames returns the names of every function row, ordered by name, and
@@ -146,11 +146,11 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 // OPEN — retain every series; the next successful flush sweeps — because
 // sweeping with an empty set would delete live functions' series. This is why
 // callers must distinguish an empty-but-known live set from a failed read.
-func (c *State) FunctionNames() ([]string, bool) {
+func (st *State) FunctionNames() ([]string, bool) {
 	ctx := context.Background()
-	rows, err := c.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
+	rows, err := st.db.QueryContext(ctx, `SELECT name FROM functions ORDER BY name`)
 	if err != nil {
-		c.log.Warn("State: list function names failed", "error", err)
+		st.log.Warn("State: list function names failed", "error", err)
 		return nil, false
 	}
 	defer rows.Close()
@@ -159,7 +159,7 @@ func (c *State) FunctionNames() ([]string, bool) {
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			c.log.Warn("State: scan function name failed", "error", err)
+			st.log.Warn("State: scan function name failed", "error", err)
 			return out, false
 		}
 		out = append(out, name)
@@ -174,12 +174,12 @@ func (c *State) FunctionNames() ([]string, bool) {
 // taken from the relational key column (not the JSON payload). A row whose JSON
 // is invalid is logged and skipped (its stats are unknowable); it returns nil
 // on a read error, matching the file's non-fatal style.
-func (c *State) AllFunctionStats() []FunctionStats {
+func (st *State) AllFunctionStats() []FunctionStats {
 	ctx := context.Background()
-	rows, err := c.db.QueryContext(ctx,
+	rows, err := st.db.QueryContext(ctx,
 		`SELECT function_name, `+jsonPayloadExpr+`, updated_at FROM function_stats ORDER BY function_name`)
 	if err != nil {
-		c.log.Warn("State: list function stats failed", "error", err)
+		st.log.Warn("State: list function stats failed", "error", err)
 		return nil
 	}
 	defer rows.Close()
@@ -189,17 +189,17 @@ func (c *State) AllFunctionStats() []FunctionStats {
 		var name string
 		var data, updatedAt sql.NullString
 		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
-			c.log.Warn("State: scan function stats failed", "error", err)
+			st.log.Warn("State: scan function stats failed", "error", err)
 			return out
 		}
-		s, err := unmarshalFunctionStats(data)
+		functionStats, err := unmarshalFunctionStats(data)
 		if err != nil {
-			c.log.Warn("State: read function stats failed", "function", name, "error", err)
+			st.log.Warn("State: read function stats failed", "function", name, "error", err)
 			continue
 		}
-		s.Function = name
-		s.UpdatedAt = updatedAt.String
-		out = append(out, s)
+		functionStats.Function = name
+		functionStats.UpdatedAt = updatedAt.String
+		out = append(out, functionStats)
 	}
 	return out
 }

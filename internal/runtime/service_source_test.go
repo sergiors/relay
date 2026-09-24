@@ -184,13 +184,13 @@ func TestResolveBuildServiceNetworksEditDoesNotInvalidate(t *testing.T) {
 	write("Dockerfile", "FROM scratch\n")
 	write("app.js", "v1\n")
 	write("template.yaml", "runtime: node24\nnetworks: [backend]\nservices:\n  - build: Dockerfile\n")
-	sel, err := source.ForDir(dir)
+	selection, err := source.ForDir(dir)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	refFor := func() string {
 		t.Helper()
-		fp, err := function.ImageFingerprintSelection(sel)
+		fp, err := function.ImageFingerprintSelection(selection)
 		if err != nil {
 			t.Fatalf("image fingerprint: %v", err)
 		}

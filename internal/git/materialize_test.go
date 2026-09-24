@@ -14,11 +14,11 @@ import (
 // error. Tests use it to drive materialize with the shared policy explicitly.
 func mustSelect(t *testing.T, root, dir string) *source.Selection {
 	t.Helper()
-	sel, err := source.New(root, dir)
+	selection, err := source.New(root, dir)
 	if err != nil {
 		t.Fatalf("select %q under %q: %v", dir, root, err)
 	}
-	return sel
+	return selection
 }
 
 // TestSelectMissingSourceDir pins that a Selection cannot be built for a source
@@ -46,12 +46,12 @@ func TestMaterializeMissingSourceRace(t *testing.T) {
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sel := mustSelect(t, src, src)
+	selection := mustSelect(t, src, src)
 	if err := os.RemoveAll(src); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(funcs, "keep", "template.yaml"), "runtime: node\n")
-	if _, _, err := materialize(sel, funcs); err == nil {
+	if _, _, err := materialize(selection, funcs); err == nil {
 		t.Fatal("materialize of vanished source: nil error, want missing-source error")
 	} else if !strings.Contains(err.Error(), "does not exist in the checkout") {
 		t.Fatalf("err = %v, want clear missing-source message", err)

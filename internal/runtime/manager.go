@@ -155,8 +155,8 @@ type managerOptions struct {
 // container is kept before the maintenance loop evicts it. A non-positive value
 // is treated as the package default, so a caller cannot accidentally disable
 // eviction; config.Load rejects non-positive values before they reach here.
-func WithWarmContainerIdleTimeout(d time.Duration) ManagerOption {
-	return func(o *managerOptions) { o.idleTimeout = d }
+func WithWarmContainerIdleTimeout(idleTimeout time.Duration) ManagerOption {
+	return func(o *managerOptions) { o.idleTimeout = idleTimeout }
 }
 
 // WithMaxConcurrency sets the worker-global concurrency cap (MAX_CONCURRENCY).
@@ -191,7 +191,7 @@ func withClock(now func() time.Time) ManagerOption {
 // NewManager connects to the Docker daemon so failures surface at startup
 // rather than per event. The client is configured from the environment
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
-// version automatically. m is an optional observability registry; a nil registry
+// version automatically. registry is an optional observability registry; a nil registry
 // disables metric recording (every call is a no-op). hostname is this worker's
 // hostname-scoped container ownership identity (e.g. config.ConsumerName()); it
 // is stamped as the relay.hostname label on every execution container and gates
@@ -203,7 +203,7 @@ func withClock(now func() time.Time) ManagerOption {
 // Close.
 func NewManager(
 	logger *slog.Logger,
-	m *metrics.Registry,
+	registry *metrics.Registry,
 	hostname string,
 	opts ...ManagerOption,
 ) (*Manager, error) {
@@ -220,7 +220,7 @@ func NewManager(
 	mgr := &Manager{
 		log:            logger,
 		cli:            cli,
-		metrics:        m,
+		metrics:        registry,
 		hostname:       hostname,
 		maxConcurrency: resolved.maxConcurrency,
 		done:           make(chan struct{}),
@@ -245,7 +245,7 @@ func NewManager(
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
-	mgr.containers.metrics = m
+	mgr.containers.metrics = registry
 	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
 	return mgr, nil
 }
@@ -287,14 +287,14 @@ func resolveManagerOptions(opts []ManagerOption) managerOptions {
 // timeout still gets prompt eviction, and floored at 10ms so a tiny test
 // timeout does not busy-loop. This is the ONLY ticker driving eviction.
 func maintenanceInterval(idle time.Duration) time.Duration {
-	d := idle / 2
-	if d > time.Minute {
-		d = time.Minute
+	interval := idle / 2
+	if interval > time.Minute {
+		interval = time.Minute
 	}
-	if d < 10*time.Millisecond {
-		d = 10 * time.Millisecond
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
 	}
-	return d
+	return interval
 }
 
 // startMaintenance launches the single maintenance loop. It is a method so
@@ -315,13 +315,13 @@ func (m *Manager) startMaintenance(interval time.Duration) {
 // eviction driver: there is no per-container goroutine or ticker.
 func (m *Manager) maintenanceLoop(interval time.Duration) {
 	defer close(m.maintDone)
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-m.done:
 			return
-		case <-t.C:
+		case <-ticker.C:
 			m.containers.evictIdle()
 		}
 	}
@@ -442,19 +442,19 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// fingerprint and the build context: both must select exactly the same files
 	// (the function's .gitignore rules), and resolving a single Selection keeps
 	// them from disagreeing if a rule file is edited concurrently.
-	sel, err := source.ForDir(fn.Dir)
+	selection, err := source.ForDir(fn.Dir)
 	if err != nil {
 		return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
 	}
-	fp, err := function.FingerprintSelection(sel)
+	fp, err := function.FingerprintSelection(selection)
 	if err != nil {
 		return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
 	}
-	// imgFP is the IMAGE fingerprint: the same digest with runtime-only template
-	// keys (the `networks` list) removed. The image tag is derived from imgFP so
+	// imageFP is the IMAGE fingerprint: the same digest with runtime-only template
+	// keys (the `networks` list) removed. The image tag is derived from imageFP so
 	// a runtime-only edit never yields a new tag and never forces a rebuild; the
 	// full fp still gates reconciliation. See function.ImageFingerprint.
-	imgFP, err := function.ImageFingerprintSelection(sel)
+	imageFP, err := function.ImageFingerprintSelection(selection)
 	if err != nil {
 		return nil, fmt.Errorf("function %q: image fingerprint: %w", fn.Name, err)
 	}
@@ -469,7 +469,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	if !fn.Template.NeedsRuntime() {
 		m.log.Debug("Function: no runtime required; services bring their own images",
 			"function", fn.Name)
-		funcPrepared := &Prepared{
+		prepared := &Prepared{
 			Name:              fn.Name,
 			Fingerprint:       fp,
 			Concurrency:       m.effectiveConcurrency(fn),
@@ -477,8 +477,8 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 			RuntimeGeneration: fn.Template.RuntimeGeneration(),
 		}
 		m.containers.activateFunction(fn.Name, "")
-		m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
-		return funcPrepared, nil
+		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		return prepared, nil
 	}
 
 	spec, err := lookup(fn.Template.Runtime)
@@ -491,19 +491,19 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 	}
 
-	p, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
+	planResult, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
 	if err != nil {
 		return nil, fmt.Errorf("function %q: plan: %w", fn.Name, err)
 	}
 
-	image := ImageRef(fn.Name, imgFP)
+	image := ImageRef(fn.Name, imageFP)
 
 	// bootstrapHash pins the runtime-injected bootstrap content (the engine's
 	// embedded plan files) plus the entrypoint onto the image as a label. The
 	// fingerprint above covers ONLY the function dir, so the label is what
 	// lets the reuse path below detect an image built with a stale bootstrap
 	// (e.g. by an older Relay version) under the exact same tag.
-	bHash := bootstrapHash(p)
+	bootstrapLabelHash := bootstrapHash(planResult)
 
 	// Prepare the dependency label reference for the return value on both paths.
 	// On the build path it is the dependency image built FROM; on the reuse path
@@ -511,30 +511,30 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// the existing function image — which inherits its layers — would never have
 	// built). Computing the dependency fingerprint needs the same fnDir reads the
 	// function fingerprint above already performed, so it stays cheap.
-	funcPrepared := &Prepared{
+	prepared := &Prepared{
 		Name:              fn.Name,
 		Image:             image,
 		Fingerprint:       fp,
-		Env:               p.Env,
+		Env:               planResult.Env,
 		Concurrency:       m.effectiveConcurrency(fn),
 		Networks:          append([]string(nil), fn.Template.Networks...),
 		RuntimeGeneration: fn.Template.RuntimeGeneration(),
 	}
-	if !p.Deps.IsZero() {
+	if !planResult.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
 		// name the function image's dependency without touching the daemon.
-		depFp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, p.Deps)
+		depFP, err := DependencyFingerprint(arch, platform, spec, fn.Dir, planResult.Deps)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
-		funcPrepared.Dependency = depImageRef(depFp)
+		prepared.Dependency = depImageRef(depFP)
 	}
 
 	// Reuse an existing local image when present. The fingerprinted reference is
 	// the identity: an image carrying this exact tag was necessarily built from
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed.
-	if m.imageExists(ctx, image) && m.bootstrapLabelMatches(ctx, image, bHash) {
+	if m.imageExists(ctx, image) && m.bootstrapLabelMatches(ctx, image, bootstrapLabelHash) {
 		m.log.Debug(
 			"Function: image exists; reusing",
 			"function", fn.Name,
@@ -547,8 +547,8 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		// Propagate the reconciled concurrency to the live pool: the effective
 		// bound must follow a successful Prepare even when the image was reused
 		// (a concurrency-only change rebuilds the same fingerprinted image).
-		m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
-		return funcPrepared, nil
+		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		return prepared, nil
 	}
 
 	// When the function declares a dependency layer, ensure the dependency image
@@ -557,9 +557,9 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// and every version with identical (runtime + arch + manifest + install), so
 	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
 	// existing layer with no rebuild (even when the function's source changed).
-	depRef := funcPrepared.Dependency
-	if !p.Deps.IsZero() {
-		depRef, err = m.ensureDependencyImage(ctx, fn, spec, p.Deps, depRef)
+	depRef := prepared.Dependency
+	if !planResult.Deps.IsZero() {
+		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depRef)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 		}
@@ -570,8 +570,8 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		// Entrypoint on top of the dependency layer. The dependency image was
 		// built with the runtime's external tools (e.g. uv), so the function
 		// image inherits them via FROM and does not need to copy them again.
-		p.BaseImage = depRef
-		p.ToolCopies = nil
+		planResult.BaseImage = depRef
+		planResult.ToolCopies = nil
 	}
 
 	start := time.Now()
@@ -583,11 +583,11 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// caller's ctx — they are quick and must honor its cancellation.
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, p, image, functionImageLabels(fn.Name, fp, depRef, bHash), sel); err != nil {
-		d := time.Since(start)
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), selection); err != nil {
+		elapsed := time.Since(start)
 		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
-		}, d)
+		}, elapsed)
 		m.metrics.IncLabels(metrics.MetricBuildFailures, []metrics.Label{
 			{Name: "function", Value: fn.Name},
 		})
@@ -595,17 +595,17 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		// function count), so using them as labels is low-cardinality.
 		m.log.Error("Function: build failed",
 			"function", fn.Name,
-			"duration", d,
+			"duration", elapsed,
 			"result", "failed",
 		)
 		return nil, err
 	}
-	d := time.Since(start)
+	elapsed := time.Since(start)
 	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
-		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
+		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
 	m.log.Info("Function: built",
 		"function", fn.Name,
-		"duration", d,
+		"duration", elapsed,
 		"result", "success",
 	)
 	// The build succeeded: activate the exact image so a removed-then-recreated
@@ -613,16 +613,16 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// propagate the reconciled concurrency to the live pool (a hot-swapped
 	// concurrency takes effect without a worker restart).
 	m.containers.activateFunction(fn.Name, image)
-	m.containers.setFunctionConcurrency(fn.Name, funcPrepared.Concurrency)
+	m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
 	return &Prepared{
 		Name:              fn.Name,
 		Image:             image,
 		Fingerprint:       fp,
-		Env:               p.Env,
-		Concurrency:       funcPrepared.Concurrency,
-		Dependency:        funcPrepared.Dependency,
-		Networks:          funcPrepared.Networks,
-		RuntimeGeneration: funcPrepared.RuntimeGeneration,
+		Env:               planResult.Env,
+		Concurrency:       prepared.Concurrency,
+		Dependency:        prepared.Dependency,
+		Networks:          prepared.Networks,
+		RuntimeGeneration: prepared.RuntimeGeneration,
 	}, nil
 }
 
@@ -752,7 +752,7 @@ func (m *Manager) ensureDependencyImage(
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
 	if err := buildDependencyImage(buildCtx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
-		d := time.Since(start)
+		elapsed := time.Since(start)
 		// Dependency-image build failures count as function build failures so the
 		// existing failure metric/label surface stays the single observability
 		// contract for "this function could not be prepared".
@@ -761,18 +761,18 @@ func (m *Manager) ensureDependencyImage(
 		})
 		m.log.Error("Function: dependency build failed",
 			"function", fn.Name,
-			"duration", d,
+			"duration", elapsed,
 			"dep_image", depRef,
 			"result", "failed",
 		)
 		return "", err
 	}
-	d := time.Since(start)
+	elapsed := time.Since(start)
 	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
-		[]metrics.Label{{Name: "function", Value: fn.Name}}, d)
+		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
 	m.log.Info("Function: dependency layer built",
 		"function", fn.Name,
-		"duration", d,
+		"duration", elapsed,
 		"dep_image", depRef,
 		"result", "success",
 	)

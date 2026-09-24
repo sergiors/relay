@@ -170,7 +170,7 @@ func BuildEnv(
 func Reconcile(
 	ctx context.Context,
 	reconcileTimeout time.Duration,
-	d Docker,
+	docker Docker,
 	fnName, fnDir string,
 	tmpl *function.Template,
 	functionImage string,
@@ -187,7 +187,7 @@ func Reconcile(
 	if reconcileTimeout > 0 {
 		listCtx, listCancel = context.WithTimeout(ctx, reconcileTimeout)
 	}
-	containers, err := d.ServiceContainerList(listCtx)
+	containers, err := docker.ServiceContainerList(listCtx)
 	listCancel()
 	if err != nil {
 		// Without a listing we cannot know the running set; surface the error
@@ -219,25 +219,25 @@ func Reconcile(
 	// never leave a removed service's container running. Desired services'
 	// containers are grouped for the per-service pass further down.
 	byService := make(map[string][]runtime.ServiceContainer)
-	for _, c := range containers {
-		if c.Function != fnName {
+	for _, ctr := range containers {
+		if ctr.Function != fnName {
 			// Another function owns this container; its reconcile handles it.
 			continue
 		}
-		if _, ok := desired[c.Identity]; !ok {
+		if _, ok := desired[ctr.Identity]; !ok {
 			changed = true
 			stopCtx, stopCancel := ctx, func() {}
 			if reconcileTimeout > 0 {
 				stopCtx, stopCancel = context.WithTimeout(ctx, reconcileTimeout)
 			}
-			err := d.StopServiceContainers(stopCtx, []runtime.ServiceContainer{c})
+			err := docker.StopServiceContainers(stopCtx, []runtime.ServiceContainer{ctr})
 			stopCancel()
 			if err != nil {
-				fail(fmt.Errorf("service %q removed: %w", c.Identity, err))
+				fail(fmt.Errorf("service %q removed: %w", ctr.Identity, err))
 			}
 			continue
 		}
-		byService[c.Identity] = append(byService[c.Identity], c)
+		byService[ctr.Identity] = append(byService[ctr.Identity], ctr)
 	}
 
 	// The template's top-level `networks` are joined by every service container
@@ -257,7 +257,7 @@ func Reconcile(
 		if reconcileTimeout > 0 {
 			netCtx, netCancel = context.WithTimeout(ctx, reconcileTimeout)
 		}
-		missing, ok, err := d.VerifyNetworks(netCtx, tmpl.Networks)
+		missing, ok, err := docker.VerifyNetworks(netCtx, tmpl.Networks)
 		netCancel()
 		if err != nil {
 			fail(fmt.Errorf("function networks: %w", err))
@@ -324,7 +324,7 @@ func Reconcile(
 			// The routing network (e.g. the Traefik network) is infrastructure
 			// owned outside Relay; Relay verifies it exists and refuses to
 			// start routed containers otherwise — it never creates it.
-			ok, err := d.NetworkExists(preCtx, traefik.Network)
+			ok, err := docker.NetworkExists(preCtx, traefik.Network)
 			if err != nil {
 				preCancel()
 				err := fmt.Errorf("service %q: check routing network: %w", identity, err)
@@ -377,7 +377,7 @@ func Reconcile(
 		// itself does not use preCtx: the runtime roots it in the manager
 		// lifecycle under buildTimeout, so a long build cannot outlive the
 		// pre-build budget here either.
-		resolved, err := d.ResolveServiceImage(preCtx, fnName, fnDir, tmpl, svc, functionImage)
+		resolved, err := docker.ResolveServiceImage(preCtx, fnName, fnDir, tmpl, svc, functionImage)
 		preCancel()
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", identity, err))
@@ -434,18 +434,18 @@ func Reconcile(
 		// whatever the old container served, so the container is replaced.
 		var candidates []runtime.ServiceContainer
 		var stale []runtime.ServiceContainer
-		for _, c := range existing {
-			if c.State == container.StateRunning &&
-				c.Image == resolved.Ref &&
-				c.ImageID == resolved.ID &&
-				c.Port == svc.Port &&
-				c.EnvHash == envHash &&
-				c.Networks == desiredNetworks &&
-				c.Replica >= 0 &&
-				routingLabelsMatch(routeLabels, c.Labels) {
-				candidates = append(candidates, c)
+		for _, ctr := range existing {
+			if ctr.State == container.StateRunning &&
+				ctr.Image == resolved.Ref &&
+				ctr.ImageID == resolved.ID &&
+				ctr.Port == svc.Port &&
+				ctr.EnvHash == envHash &&
+				ctr.Networks == desiredNetworks &&
+				ctr.Replica >= 0 &&
+				routingLabelsMatch(routeLabels, ctr.Labels) {
+				candidates = append(candidates, ctr)
 			} else {
-				stale = append(stale, c)
+				stale = append(stale, ctr)
 			}
 		}
 
@@ -458,18 +458,18 @@ func Reconcile(
 		// desired slot that no candidate holds.
 		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Replica < candidates[j].Replica })
 		occupied := make(map[int]bool, svc.Replicas)
-		for _, c := range candidates {
-			if c.Replica < svc.Replicas && !occupied[c.Replica] {
-				occupied[c.Replica] = true
+		for _, ctr := range candidates {
+			if ctr.Replica < svc.Replicas && !occupied[ctr.Replica] {
+				occupied[ctr.Replica] = true
 				continue
 			}
-			stale = append(stale, c)
+			stale = append(stale, ctr)
 		}
 
 		// Stop every stale/excess container for this service.
 		if len(stale) > 0 {
 			changed = true
-			if err := d.StopServiceContainers(postCtx, stale); err != nil {
+			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
 				fail(fmt.Errorf("service %q stale: %w", identity, err))
 			}
 		}
@@ -493,7 +493,7 @@ func Reconcile(
 				Network:  routeNetwork,
 				Networks: tmpl.Networks,
 			}
-			if _, err := d.StartService(postCtx, spec, slot); err != nil {
+			if _, err := docker.StartService(postCtx, spec, slot); err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))
 			}
 		}
@@ -532,8 +532,8 @@ func routingLabelsMatch(desired, actual map[string]string) bool {
 // delegating to the Docker implementation's RemoveFunctionServiceContainers.
 // Used when a function is removed: its service containers must be stopped before
 // its images are retired (see the reconciler's RemoveServices hook ordering).
-func RemoveAll(ctx context.Context, d Docker, fnName string, log *slog.Logger) {
-	n, err := d.RemoveFunctionServiceContainers(ctx, fnName)
+func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logger) {
+	n, err := docker.RemoveFunctionServiceContainers(ctx, fnName)
 	if err != nil {
 		log.Warn("Service: remove function containers failed", "function", fnName, "error", err)
 		return
@@ -624,14 +624,14 @@ type ServiceReconciler struct {
 // post-build Docker operation (a non-positive value leaves them bounded only by
 // the lifecycle context; builds are never bounded by it).
 func NewServiceReconciler(
-	d Docker,
+	docker Docker,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 	reconcileTimeout time.Duration,
 ) *ServiceReconciler {
 	return &ServiceReconciler{
-		docker:           d,
+		docker:           docker,
 		secrets:          secrets,
 		traefik:          traefik,
 		log:              log,

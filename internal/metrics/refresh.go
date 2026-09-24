@@ -41,13 +41,13 @@ func NewRefresher(interval time.Duration, sources ...GaugeSource) *Refresher {
 // Start runs each source's Refresh on the configured interval until ctx is
 // cancelled. Sources are invoked sequentially, in registration order.
 func (ref *Refresher) Start(ctx context.Context) {
-	t := time.NewTicker(ref.interval)
-	defer t.Stop()
+	ticker := time.NewTicker(ref.interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 			ref.refreshAll(ctx)
 		}
 	}

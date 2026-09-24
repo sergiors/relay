@@ -123,11 +123,11 @@ func functionInspect(ctx context.Context, w io.Writer, name string, deps Depende
 	}
 	defer cleanup()
 
-	d, ok := st.GetFunction(name)
+	detail, ok := st.GetFunction(name)
 	if !ok {
 		return fmt.Errorf("unknown function %q", name)
 	}
-	fs := printInspect(w, st, d)
+	fs := printInspect(w, st, detail)
 	appendRuntimePool(w, name, fs, deps.SocketPath)
 	return nil
 }
@@ -160,38 +160,38 @@ func printList(w io.Writer, st *state.State) error {
 // tabwriter so padding matches the longest label without hand-maintained spaces.
 // The Events, Schedules, and Services sections are rendered with the same
 // alignment, using a wider padding for visual grouping.
-func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionStats {
+func printInspect(w io.Writer, st *state.State, detail state.Detail) state.FunctionStats {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tw, "Name:\t%s\n", d.Name)
+	fmt.Fprintf(tw, "Name:\t%s\n", detail.Name)
 
-	runtime := d.Runtime
+	runtime := detail.Runtime
 	if runtime == "" {
 		runtime = "-"
 	}
 	fmt.Fprintf(tw, "Runtime:\t%s\n", runtime)
 
-	fmt.Fprintf(tw, "Status:\t%s\n", d.Status)
-	if d.Image != "" {
-		fmt.Fprintf(tw, "Image:\t%s\n", d.Image)
+	fmt.Fprintf(tw, "Status:\t%s\n", detail.Status)
+	if detail.Image != "" {
+		fmt.Fprintf(tw, "Image:\t%s\n", detail.Image)
 	}
-	if d.Fingerprint != "" {
-		fmt.Fprintf(tw, "Fingerprint:\t%s\n", d.Fingerprint)
+	if detail.Fingerprint != "" {
+		fmt.Fprintf(tw, "Fingerprint:\t%s\n", detail.Fingerprint)
 	}
-	if d.PreparedAt != "" {
-		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", d.PreparedAt, state.RelativeAgo(d.PreparedAt))
+	if detail.PreparedAt != "" {
+		fmt.Fprintf(tw, "Prepared:\t%s (%s)\n", detail.PreparedAt, state.RelativeAgo(detail.PreparedAt))
 	}
-	if d.LastReconcileAt != "" {
-		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", d.LastReconcileStatus, state.RelativeAgo(d.LastReconcileAt))
+	if detail.LastReconcileAt != "" {
+		fmt.Fprintf(tw, "Last reconcile:\t%s (%s)\n", detail.LastReconcileStatus, state.RelativeAgo(detail.LastReconcileAt))
 	}
-	if d.LastError != "" {
-		fmt.Fprintf(tw, "Last error:\t%s\n", d.LastError)
+	if detail.LastError != "" {
+		fmt.Fprintf(tw, "Last error:\t%s\n", detail.LastError)
 	}
 	tw.Flush()
 
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Stats:")
 	sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-	fs, _ := st.FunctionStats(d.Name)
+	fs, _ := st.FunctionStats(detail.Name)
 	fmt.Fprintf(sw, "  Events matched:\t%d\n", fs.EventsMatchedTotal)
 	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
 	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
@@ -203,21 +203,21 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 	fmt.Fprintf(sw, "  Last DLQ:\t%s\n", lastAgo(fs.LastDLQAt))
 	sw.Flush()
 
-	if len(d.Handlers) > 0 {
+	if len(detail.Handlers) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Events:")
 		hw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, h := range d.Handlers {
+		for _, h := range detail.Handlers {
 			fmt.Fprintf(hw, "  %s\ttimeout=%s\n", h.Name, h.Timeout)
 		}
 		hw.Flush()
 	}
 
-	if len(d.Schedules) > 0 {
+	if len(detail.Schedules) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Schedules:")
 		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, s := range d.Schedules {
+		for _, s := range detail.Schedules {
 			// Cron descriptions are best-effort; the raw expression remains authoritative.
 			if desc, ok := describeCronFunc(s.Cron); ok {
 				fmt.Fprintf(
@@ -243,11 +243,11 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		sw.Flush()
 	}
 
-	if len(d.Services) > 0 {
+	if len(detail.Services) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Services:")
 		srw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, svc := range d.Services {
+		for _, svc := range detail.Services {
 			// Prefix non-entrypoint sources so their kind remains visible in CLI output.
 			source := svc.Entrypoint
 			switch {
@@ -273,34 +273,34 @@ func printInspect(w io.Writer, st *state.State, d state.Detail) state.FunctionSt
 		srw.Flush()
 	}
 
-	if len(d.Env) > 0 {
+	if len(detail.Env) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Environment:")
 		ew := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, k := range sortedKeys(d.Env) {
-			fmt.Fprintf(ew, "  %s=%s\n", k, d.Env[k])
+		for _, k := range sortedKeys(detail.Env) {
+			fmt.Fprintf(ew, "  %s=%s\n", k, detail.Env[k])
 		}
 		ew.Flush()
 	}
 
-	if len(d.Secrets) > 0 {
+	if len(detail.Secrets) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Secrets:")
 		sw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
-		for _, k := range sortedKeys(d.Secrets) {
+		for _, k := range sortedKeys(detail.Secrets) {
 			// Show secret references only; resolved values must never be exposed.
-			fmt.Fprintf(sw, "  %s=%s\n", k, d.Secrets[k])
+			fmt.Fprintf(sw, "  %s=%s\n", k, detail.Secrets[k])
 		}
 		sw.Flush()
 	}
 
-	if len(d.Networks) > 0 {
+	if len(detail.Networks) > 0 {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Networks:")
 		nw := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		// The list is normalized (trimmed, deduped, sorted) at parse time, so it
 		// renders deterministically.
-		for _, n := range d.Networks {
+		for _, n := range detail.Networks {
 			fmt.Fprintf(nw, "  %s\n", n)
 		}
 		nw.Flush()

@@ -358,11 +358,11 @@ func New(prepared []*PreparedFunction, logger *slog.Logger) *Runner {
 
 // NewWithMetrics is like New but wires an optional metrics registry. A nil
 // registry is safe: every metric call is a no-op.
-func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, m *metrics.Registry) *Runner {
+func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, registry *metrics.Registry) *Runner {
 	r := &Runner{
 		reg:                     &Registry{},
 		log:                     logger,
-		metrics:                 m,
+		metrics:                 registry,
 		refs:                    newImageRefCounter(),
 		fnSems:                  map[string]*semaphore{},
 		slotWait:                slotWaitTimeout,
@@ -396,19 +396,19 @@ func (r *Runner) Registry() *Registry { return r.reg }
 // Consume begins processing; it takes effect on the next Handle, so setting it
 // right after construction (as internal/worker does) labels every invocation.
 // The constructor guarantees a non-nil Runner.
-func (r *Runner) SetHostname(h string) {
-	r.hostname = h
+func (r *Runner) SetHostname(hostname string) {
+	r.hostname = hostname
 }
 
-// SetMaxHandlerTimeout caps every rule's handler timeout to at most d. A value
+// SetMaxHandlerTimeout caps every rule's handler timeout to at most timeout. A value
 // of 0 (the default) leaves rule timeouts uncapped. It takes effect on the next
 // Handle. It is defense in depth: template validation enforces the cap at load,
 // and this runtime cap guarantees a misconfigured or hot-swapped template can
 // never run a handler longer than the stream layer's MaxRuleTimeout. The capped
 // value is also what TryStart persists as the invocation's running deadline, so
 // the persisted deadline matches the local timer by construction.
-func (r *Runner) SetMaxHandlerTimeout(d time.Duration) {
-	r.maxHandlerTimeout.Store(int64(d))
+func (r *Runner) SetMaxHandlerTimeout(timeout time.Duration) {
+	r.maxHandlerTimeout.Store(int64(timeout))
 }
 
 // SetSecretProvider wires the provider that resolves secret references to
@@ -416,8 +416,8 @@ func (r *Runner) SetMaxHandlerTimeout(d time.Duration) {
 // means no secrets are available: a template that references a secret then fails
 // the invocation with a clear error. The worker wires the production local
 // provider after construction.
-func (r *Runner) SetSecretProvider(p secrets.Provider) {
-	r.secrets = p
+func (r *Runner) SetSecretProvider(provider secrets.Provider) {
+	r.secrets = provider
 }
 
 // SetMaxConcurrency sets the worker-global cap on concurrently executing
@@ -440,8 +440,8 @@ func (r *Runner) SetMaxConcurrency(n int) {
 func (r *Runner) resolver() ImageCleaner {
 	r.cleanerOnce.Do(func() {
 		for _, pf := range r.reg.snapshot() {
-			if c, ok := pf.executor.(ImageCleaner); ok {
-				r.cleaner = c
+			if cleaner, ok := pf.executor.(ImageCleaner); ok {
+				r.cleaner = cleaner
 				return
 			}
 		}
@@ -455,8 +455,8 @@ func (r *Runner) resolver() ImageCleaner {
 func (r *Runner) invalidatorResolver() ContainerInvalidator {
 	r.invalidatorOnce.Do(func() {
 		for _, pf := range r.reg.snapshot() {
-			if c, ok := pf.executor.(ContainerInvalidator); ok {
-				r.invalidator = c
+			if invalidator, ok := pf.executor.(ContainerInvalidator); ok {
+				r.invalidator = invalidator
 				return
 			}
 		}
@@ -1256,7 +1256,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				})
 				start := time.Now()
 				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
-				d := time.Since(start)
+				elapsed := time.Since(start)
 				if panicked {
 					// A panicking execution is a misbehaving handler, not a
 					// healthy failure: log the panic value and the full stack so
@@ -1291,10 +1291,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						[]metrics.Label{
 							{Name: "function", Value: pf.fn.Name},
 							{Name: "handler", Value: rule.Handler},
-						}, d)
+						}, elapsed)
 					r.log.Warn("Function handler: execution failed for event",
 						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
-							"duration", d,
+							"duration", elapsed,
 							"reason", err,
 						)...,
 					)
@@ -1327,10 +1327,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				if hasState {
 					invState.MarkComplete(invocation)
 				}
-				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, d)
+				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, elapsed)
 				r.log.Info("Function handler: executed for event",
 					append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
-						"duration", d,
+						"duration", elapsed,
 					)...,
 				)
 				return outcomeExecuted, nil
@@ -1744,7 +1744,7 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 
 			start := time.Now()
 			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
-			d := time.Since(start)
+			elapsed := time.Since(start)
 			if panicked {
 				r.log.Error("Function invoke: handler PANICKED",
 					"function", name,
@@ -1754,20 +1754,20 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 				)
 			}
 			if err != nil {
-				r.recordHandlerFailure(name, rule.Handler, d)
+				r.recordHandlerFailure(name, rule.Handler, elapsed)
 				r.log.Warn("Function invoke: handler execution failed",
 					"function", name,
 					"handler", rule.Handler,
-					"duration", d,
+					"duration", elapsed,
 					"reason", err,
 				)
 				return fmt.Errorf("function %q handler %q: %w", name, rule.Handler, err)
 			}
-			r.recordHandlerSuccess(name, rule.Handler, d)
+			r.recordHandlerSuccess(name, rule.Handler, elapsed)
 			r.log.Info("Function invoke: handler executed",
 				"function", name,
 				"handler", rule.Handler,
-				"duration", d,
+				"duration", elapsed,
 			)
 			return nil
 		}()
@@ -1913,7 +1913,7 @@ func (r *Runner) invokeOnce(
 	})
 	start := time.Now()
 	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv)
-	d := time.Since(start)
+	elapsed := time.Since(start)
 	if panicked {
 		r.log.Error("Function handler: PANICKED for schedule",
 			"function", pf.fn.Name,
@@ -1921,15 +1921,15 @@ func (r *Runner) invokeOnce(
 			"panic_value", fmt.Sprintf("%v", panicValue),
 			"stack", string(debug.Stack()),
 		)
-		r.recordHandlerFailure(pf.fn.Name, handler, d)
+		r.recordHandlerFailure(pf.fn.Name, handler, elapsed)
 		return err
 	}
 	if err != nil {
-		r.recordHandlerFailure(pf.fn.Name, handler, d)
+		r.recordHandlerFailure(pf.fn.Name, handler, elapsed)
 		r.log.Warn("Function handler: execution failed for schedule",
 			"function", pf.fn.Name,
 			"handler", handler,
-			"duration", d,
+			"duration", elapsed,
 			"reason", err,
 		)
 		return err
@@ -1941,11 +1941,11 @@ func (r *Runner) invokeOnce(
 	if invState != nil {
 		invState.MarkComplete(invocation)
 	}
-	r.recordHandlerSuccess(pf.fn.Name, handler, d)
+	r.recordHandlerSuccess(pf.fn.Name, handler, elapsed)
 	r.log.Info("Function handler: executed for schedule",
 		"function", pf.fn.Name,
 		"handler", handler,
-		"duration", d,
+		"duration", elapsed,
 	)
 	return nil
 }
@@ -1975,7 +1975,7 @@ func handlerLogFields(hasState bool, fnName, handler, msgID string, handlerAttem
 // NOT touch the event classification counters or function_events_matched_total —
 // Handle owns those and counts them once per logical event, so an execution
 // must not be double-attributed here.
-func (r *Runner) recordHandlerSuccess(fnName, handler string, d time.Duration) {
+func (r *Runner) recordHandlerSuccess(fnName, handler string, duration time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "success"},
@@ -1993,7 +1993,7 @@ func (r *Runner) recordHandlerSuccess(fnName, handler string, d time.Duration) {
 		[]metrics.Label{
 			{Name: "function", Value: fnName},
 			{Name: "handler", Value: handler},
-		}, d)
+		}, duration)
 }
 
 // recordHandlerFailure increments the failure metrics shared by Handle's
@@ -2005,7 +2005,7 @@ func (r *Runner) recordHandlerSuccess(fnName, handler string, d time.Duration) {
 // touch the event classification counters or function_events_matched_total —
 // Handle owns those and counts them once per logical event, so a failure must
 // not be double-attributed here.
-func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
+func (r *Runner) recordHandlerFailure(fnName, handler string, duration time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "failure"},
@@ -2020,7 +2020,7 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, d time.Duration) {
 		[]metrics.Label{
 			{Name: "function", Value: fnName},
 			{Name: "handler", Value: handler},
-		}, d)
+		}, duration)
 }
 
 // recordFailure handles a failed invocation attempt: it decides whether the

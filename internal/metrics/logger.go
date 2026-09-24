@@ -48,13 +48,13 @@ func (ml *MetricsLogger) Start(ctx context.Context) {
 		<-ctx.Done()
 		return
 	}
-	t := time.NewTicker(ml.interval)
-	defer t.Stop()
+	ticker := time.NewTicker(ml.interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 			s := ml.reg.Snapshot()
 			if s == "" {
 				continue

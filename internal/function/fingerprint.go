@@ -45,18 +45,18 @@ var runtimeOnlyTemplateKeys = []string{"networks"}
 // An unreadable included file — or an unreadable .gitignore — is surfaced as an
 // error so the reconciler can retain the previous version rather than guessing.
 func Fingerprint(dir string) (string, error) {
-	sel, err := source.ForDir(dir)
+	selection, err := source.ForDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("select %q: %w", dir, err)
 	}
-	return FingerprintSelection(sel)
+	return FingerprintSelection(selection)
 }
 
 // FingerprintSelection fingerprints an already-resolved source selection. It is
 // the seam the manager uses when it has already selected a function's source (so
 // the policy is not re-derived), and it keeps the hashing logic in one place.
-func FingerprintSelection(sel *source.Selection) (string, error) {
-	return fingerprintSelection(sel, nil)
+func FingerprintSelection(selection *source.Selection) (string, error) {
+	return fingerprintSelection(selection, nil)
 }
 
 // ImageFingerprint returns the fingerprint that versions a function's IMAGE: the
@@ -71,39 +71,39 @@ func FingerprintSelection(sel *source.Selection) (string, error) {
 // edit through the full Fingerprint and re-prepares; the reused image is
 // unchanged, and the runtime generation (networks) reaches the container set.
 func ImageFingerprint(dir string) (string, error) {
-	sel, err := source.ForDir(dir)
+	selection, err := source.ForDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("select %q: %w", dir, err)
 	}
-	return ImageFingerprintSelection(sel)
+	return ImageFingerprintSelection(selection)
 }
 
 // ImageFingerprintSelection is ImageFingerprint over an already-resolved
 // selection, for callers (the runtime manager and the service build path) that
 // already hold one. It shares FingerprintSelection's file-walk and hashing; only
 // the template.yaml bytes differ.
-func ImageFingerprintSelection(sel *source.Selection) (string, error) {
-	return fingerprintSelection(sel, templateImageContent)
+func ImageFingerprintSelection(selection *source.Selection) (string, error) {
+	return fingerprintSelection(selection, templateImageContent)
 }
 
 // fingerprintSelection hashes the selected source. When transform is non-nil it
 // is applied to each included file's relative path and raw bytes to produce the
 // bytes that are hashed (nil means hash the raw file). A transform returning nil
 // leaves the raw bytes unchanged.
-func fingerprintSelection(sel *source.Selection, transform func(rel string, raw []byte) []byte) (string, error) {
+func fingerprintSelection(selection *source.Selection, transform func(rel string, raw []byte) []byte) (string, error) {
 	// Collect the included files as (hash path, filesystem path) pairs. The hash
 	// path is root-relative and slash-separated so the serialization is canonical
 	// and independent of how the walk produced absolute paths.
 	type entry struct{ rel, path string }
 	var entries []entry
-	err := sel.WalkDir(func(path string, d fs.DirEntry, err error) error {
+	err := selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
-		rel, err := sel.Rel(path)
+		rel, err := selection.Rel(path)
 		if err != nil {
 			return err
 		}
@@ -111,7 +111,7 @@ func fingerprintSelection(sel *source.Selection, transform func(rel string, raw 
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("walk %q: %w", sel.Dir(), err)
+		return "", fmt.Errorf("walk %q: %w", selection.Dir(), err)
 	}
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
@@ -119,8 +119,8 @@ func fingerprintSelection(sel *source.Selection, transform func(rel string, raw 
 	}
 	// A subtree walk cannot visit policy files above the selected directory,
 	// but those files still affect the selected source and must be versioned.
-	for _, path := range sel.ApplicableIgnoreFiles() {
-		rel, err := sel.Rel(path)
+	for _, path := range selection.ApplicableIgnoreFiles() {
+		rel, err := selection.Rel(path)
 		if err != nil {
 			continue
 		}

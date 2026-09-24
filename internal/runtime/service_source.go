@@ -94,7 +94,7 @@ func (m *Manager) resolveBuildServiceImage(
 	fnName, fnDir string,
 	svc function.Service,
 ) (ServiceImage, error) {
-	sel, err := source.ForDir(fnDir)
+	selection, err := source.ForDir(fnDir)
 	if err != nil {
 		return ServiceImage{}, fmt.Errorf("select sources: %w", err)
 	}
@@ -103,7 +103,7 @@ func (m *Manager) resolveBuildServiceImage(
 	// the Dockerfile image while the reconciler still replaces the stale service
 	// container for the new networks. An actual source or Dockerfile edit still
 	// changes the tag and rebuilds.
-	fp, err := function.ImageFingerprintSelection(sel)
+	fp, err := function.ImageFingerprintSelection(selection)
 	if err != nil {
 		return ServiceImage{}, fmt.Errorf("fingerprint: %w", err)
 	}
@@ -132,7 +132,7 @@ func (m *Manager) resolveBuildServiceImage(
 	// caller's ctx: it is quick and must honor its cancellation.
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
-	if err := m.buildServiceImage(buildCtx, fnName, svc, sel, ref); err != nil {
+	if err := m.buildServiceImage(buildCtx, fnName, svc, selection, ref); err != nil {
 		return ServiceImage{}, err
 	}
 	m.log.Info("Service: build image built",
@@ -154,7 +154,7 @@ func (m *Manager) buildServiceImage(
 	ctx context.Context,
 	fnName string,
 	svc function.Service,
-	sel *source.Selection,
+	selection *source.Selection,
 	ref string,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-svc-build-*")
@@ -163,7 +163,7 @@ func (m *Manager) buildServiceImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	if err := copySourceDir(sel, ctxDir); err != nil {
+	if err := copySourceDir(selection, ctxDir); err != nil {
 		return fmt.Errorf("copy sources: %w", err)
 	}
 	dockerfile := filepath.ToSlash(svc.Build)

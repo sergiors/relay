@@ -252,7 +252,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	// root-level rule governs a monorepo subtree exactly as git would), and the
 	// selected dir scopes the walk. A missing source dir is the hard missing-source
 	// failure materialize reports; a missing .gitignore is not an error.
-	sel, err := source.New(opts.CheckoutDir, srcDir)
+	selection, err := source.New(opts.CheckoutDir, srcDir)
 	if err != nil {
 		if errors.Is(err, source.ErrNotExist) {
 			return fmt.Errorf("git: source dir %q does not exist in the checkout", srcDir)
@@ -261,7 +261,7 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 	}
 
 	// Materialize /functions deterministically.
-	materialized, removed, err := materialize(sel, opts.FunctionsDir)
+	materialized, removed, err := materialize(selection, opts.FunctionsDir)
 	if err != nil {
 		return err
 	}

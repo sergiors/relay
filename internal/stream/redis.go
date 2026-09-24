@@ -535,17 +535,17 @@ type PendingGaugeSource struct {
 // satisfies metrics.GaugeSource. It never blocks processing: it runs in its own
 // goroutine (via the Refresher), holds no locks across the Redis call, and any
 // error is logged and skipped, never propagated.
-func (p *PendingGaugeSource) Refresh(ctx context.Context) {
+func (source *PendingGaugeSource) Refresh(ctx context.Context) {
 	// The summary form (no Start/End/Count) is O(1)-ish and returns the total
 	// Count plus the oldest pending message ID in Lower.
-	pending, err := p.client.XPending(ctx, p.stream, p.group).Result()
+	pending, err := source.client.XPending(ctx, source.stream, source.group).Result()
 	if err != nil {
-		p.log.Debug("Metrics: xpending failed", "stream", p.stream, "group", p.group, "error", err)
+		source.log.Debug("Metrics: xpending failed", "stream", source.stream, "group", source.group, "error", err)
 		return
 	}
-	p.metrics.SetGauge(metrics.MetricPendingEntries, float64(pending.Count))
+	source.metrics.SetGauge(metrics.MetricPendingEntries, float64(pending.Count))
 	if age, ok := pendingAge(pending.Lower); ok {
-		p.metrics.SetGauge(metrics.MetricPendingOldestAge, age.Seconds())
+		source.metrics.SetGauge(metrics.MetricPendingOldestAge, age.Seconds())
 	}
 }
 

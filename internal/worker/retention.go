@@ -120,13 +120,13 @@ func retentionLoop(
 	retentionTick(initCtx, client, stream, retention, time.Now, logger)
 	initCancel()
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 			trimCtx, trimCancel := context.WithTimeout(ctx, 30*time.Second)
 			retentionTick(trimCtx, client, stream, retention, time.Now, logger)
 			trimCancel()

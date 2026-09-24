@@ -37,8 +37,8 @@ type Stats struct {
 // RecordStats upserts the single stats row with the values the caller passes.
 // It is a thin wrapper over RecordStatsContext using a background context, kept
 // for callers (tests, CLI) that do not need to bound the write.
-func (c *State) RecordStats(s Stats) {
-	c.RecordStatsContext(context.Background(), s)
+func (st *State) RecordStats(stats Stats) {
+	st.RecordStatsContext(context.Background(), stats)
 }
 
 // RecordStatsContext upserts the single stats row with the values the caller
@@ -56,20 +56,20 @@ func (c *State) RecordStats(s Stats) {
 // CURRENT cumulative values; the worker seeds the fresh process registry from
 // this table at startup so the first snapshot never resets counters. It is
 // non-fatal on error: it logs and returns.
-func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
-	payload, err := marshalStats(s)
+func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
+	payload, err := marshalStats(stats)
 	if err != nil {
-		c.log.Warn("State: record stats failed", "error", err)
+		st.log.Warn("State: record stats failed", "error", err)
 		return
 	}
-	_, err = c.db.ExecContext(ctx,
+	_, err = st.db.ExecContext(ctx,
 		`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
-		payload, c.nowString())
+		payload, st.nowString())
 	if err != nil {
-		c.log.Warn("State: record stats failed", "error", err)
+		st.log.Warn("State: record stats failed", "error", err)
 	}
 }
 
@@ -91,13 +91,13 @@ func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
 // once inside the transaction and merged before writing (see
 // mergeFunctionStatsTimestamps); counters are never merged — they are absolute
 // snapshots and always overwrite.
-func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []FunctionStats) error {
-	globalPayload, err := marshalStats(s)
+func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []FunctionStats) error {
+	globalPayload, err := marshalStats(stats)
 	if err != nil {
-		c.log.Warn("State: flush stats snapshot failed", "error", err)
+		st.log.Warn("State: flush stats snapshot failed", "error", err)
 		return err
 	}
-	err = c.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err = st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		// Prune orphaned function_stats rows first so a removed function's row
 		// is gone before the upserts below could re-create it.
 		if _, err := tx.ExecContext(ctx,
@@ -105,14 +105,14 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 			return err
 		}
 		// Read the surviving stored payloads once, for the timestamp merge.
-		stored, err := c.storedFunctionStatsPayloads(ctx, tx)
+		stored, err := st.storedFunctionStatsPayloads(ctx, tx)
 		if err != nil {
 			return err
 		}
 		// One timestamp for the whole snapshot, so the global row and every
 		// per-function row share the same updated_at (the previous explicit-
 		// column flush computed ts once too).
-		ts := c.nowString()
+		ts := st.nowString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)
 			 ON CONFLICT(id) DO UPDATE SET
@@ -146,7 +146,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 		return nil
 	})
 	if err != nil {
-		c.log.Warn("State: flush stats snapshot failed", "error", err)
+		st.log.Warn("State: flush stats snapshot failed", "error", err)
 	}
 	return err
 }
@@ -156,7 +156,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 // (naming the function and the decode error) and treated as the zero value, so
 // one corrupt row cannot abort the whole flush; the flush below overwrites it
 // with the incoming absolute snapshot, self-healing the row.
-func (c *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]FunctionStats, error) {
+func (st *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]FunctionStats, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT function_name, `+jsonPayloadExpr+` FROM function_stats`)
 	if err != nil {
@@ -172,7 +172,7 @@ func (c *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (ma
 		}
 		fs, err := unmarshalFunctionStats(data)
 		if err != nil {
-			c.log.Warn("State: read function stats failed", "function", name, "error", err)
+			st.log.Warn("State: read function stats failed", "function", name, "error", err)
 			continue
 		}
 		out[name] = fs
@@ -186,7 +186,7 @@ func (c *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (ma
 // the zero value, so the caller's incoming absolute snapshot still lands and
 // self-heals the row. It is the single-row companion of
 // storedFunctionStatsPayloads, shared by the standalone upsert.
-func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name string) FunctionStats {
+func (st *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name string) FunctionStats {
 	var data sql.NullString
 	err := tx.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+` FROM function_stats WHERE function_name = ?`, name,
@@ -195,12 +195,12 @@ func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name stri
 		return FunctionStats{}
 	}
 	if err != nil {
-		c.log.Warn("State: read function stats failed", "function", name, "error", err)
+		st.log.Warn("State: read function stats failed", "function", name, "error", err)
 		return FunctionStats{}
 	}
 	fs, err := unmarshalFunctionStats(data)
 	if err != nil {
-		c.log.Warn("State: read function stats failed", "function", name, "error", err)
+		st.log.Warn("State: read function stats failed", "function", name, "error", err)
 		return FunctionStats{}
 	}
 	return fs
@@ -242,19 +242,19 @@ func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name stri
 //
 // Returns the error so the CLI can surface it; the package's Warn log also
 // records the failure, matching RecordStats.
-func (c *State) ResetStats() error {
+func (st *State) ResetStats() error {
 	ctx := context.Background()
-	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		// One timestamp for every rewritten row, so the global row and all
 		// per-function rows share it (the flush snapshot does the same).
-		ts := c.nowString()
-		if err := c.resetGlobalStatsTx(ctx, tx, ts); err != nil {
+		ts := st.nowString()
+		if err := st.resetGlobalStatsTx(ctx, tx, ts); err != nil {
 			return err
 		}
-		return c.resetFunctionStatsTx(ctx, tx, ts)
+		return st.resetFunctionStatsTx(ctx, tx, ts)
 	})
 	if err != nil {
-		c.log.Warn("State: reset stats failed", "error", err)
+		st.log.Warn("State: reset stats failed", "error", err)
 	}
 	return err
 }
@@ -264,7 +264,7 @@ func (c *State) ResetStats() error {
 // absent row has nothing cumulative to zero and is left untouched (creating one
 // would falsely claim stats were recorded). A corrupt payload is returned as an
 // error so the transaction rolls back.
-func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
+func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	var data sql.NullString
 	err := tx.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+` FROM stats WHERE id = 1`).Scan(&data)
@@ -277,20 +277,20 @@ func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) e
 	// The column is NOT NULL, so a NULL rendering means the stored blob is not
 	// valid JSON; unmarshalStats surfaces that as a decode failure (rolling the
 	// reset back) rather than silently zeroing a corrupt row.
-	s, err := unmarshalStats(data)
+	stats, err := unmarshalStats(data)
 	if err != nil {
 		return err
 	}
 	// Zero ONLY the cumulative counters; the two gauges are live backlog
 	// snapshots and are preserved (the next flush refreshes them).
-	s.EventsReceivedTotal = 0
-	s.EventsMatchedTotal = 0
-	s.EventsUnmatchedTotal = 0
-	s.HandlerSuccessTotal = 0
-	s.HandlerFailureTotal = 0
-	s.RetryTotal = 0
-	s.DLQTotal = 0
-	payload, err := marshalStats(s)
+	stats.EventsReceivedTotal = 0
+	stats.EventsMatchedTotal = 0
+	stats.EventsUnmatchedTotal = 0
+	stats.HandlerSuccessTotal = 0
+	stats.HandlerFailureTotal = 0
+	stats.RetryTotal = 0
+	stats.DLQTotal = 0
+	payload, err := marshalStats(stats)
 	if err != nil {
 		return err
 	}
@@ -311,7 +311,7 @@ func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) e
 // still open), then written back. A corrupt payload returns the decode error,
 // rolling the whole reset back. Timestamps are cleared (not merged) because a
 // reset is an explicit erasure of execution history.
-func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
+func (st *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	type row struct {
 		name string
 		data sql.NullString
@@ -370,25 +370,25 @@ func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string)
 // has been recorded yet or the read/decoding fails (which is logged). A stored
 // payload that is not valid JSON is logged with the underlying error and
 // surfaced as unreadable.
-func (c *State) Stats() (Stats, bool) {
+func (st *State) Stats() (Stats, bool) {
 	ctx := context.Background()
 	var data sql.NullString
 	var updatedAt sql.NullString
-	err := c.db.QueryRowContext(ctx,
+	err := st.db.QueryRowContext(ctx,
 		`SELECT `+jsonPayloadExpr+`, updated_at FROM stats WHERE id = 1`,
 	).Scan(&data, &updatedAt)
 	if err == sql.ErrNoRows {
 		return Stats{}, false
 	}
 	if err != nil {
-		c.log.Warn("State: read stats failed", "error", err)
+		st.log.Warn("State: read stats failed", "error", err)
 		return Stats{}, false
 	}
-	s, err := unmarshalStats(data)
+	stats, err := unmarshalStats(data)
 	if err != nil {
-		c.log.Warn("State: read stats failed", "error", err)
+		st.log.Warn("State: read stats failed", "error", err)
 		return Stats{}, false
 	}
-	s.UpdatedAt = updatedAt.String
-	return s, true
+	stats.UpdatedAt = updatedAt.String
+	return stats, true
 }

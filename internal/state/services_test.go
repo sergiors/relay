@@ -28,19 +28,19 @@ func TestServiceRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, servicesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Services) != 2 {
-		t.Fatalf("services = %d, want 2", len(d.Services))
+	if len(detail.Services) != 2 {
+		t.Fatalf("services = %d, want 2", len(detail.Services))
 	}
 	// Rows are ordered by entrypoint, so api.js sorts before service.js.
-	s0 := d.Services[0]
+	s0 := detail.Services[0]
 	if s0.Entrypoint != "api.js" || s0.Port != 3000 || s0.Replicas != 3 || s0.Path != "" {
 		t.Fatalf("service 0 = %+v, want api.js port=3000 replicas=3 path=\"\"", s0)
 	}
-	s1 := d.Services[1]
+	s1 := detail.Services[1]
 	if s1.Entrypoint != "service.js" || s1.Port != 80 || s1.Replicas != 1 || s1.Path != "/v2" {
 		t.Fatalf("service 1 = %+v, want path=/v2 defaults port=80 replicas=1", s1)
 	}
@@ -67,14 +67,14 @@ services:
 `)
 	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Services) != 1 {
-		t.Fatalf("services = %d, want 1 after replacement", len(d.Services))
+	if len(detail.Services) != 1 {
+		t.Fatalf("services = %d, want 1 after replacement", len(detail.Services))
 	}
-	s := d.Services[0]
+	s := detail.Services[0]
 	if s.Entrypoint != "api.js" || s.Port != 8080 || s.Replicas != 5 || s.Path != "/v3" {
 		t.Fatalf("service after change = %+v, want path=/v3 port=8080 replicas=5", s)
 	}
@@ -98,12 +98,12 @@ func TestServiceEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no services key
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Services) != 0 {
-		t.Fatalf("services = %d, want 0 for a template without services", len(d.Services))
+	if len(detail.Services) != 0 {
+		t.Fatalf("services = %d, want 0 for a template without services", len(detail.Services))
 	}
 }
 
@@ -139,16 +139,16 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, sourceServicesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Services) != 3 {
-		t.Fatalf("services = %d, want 3", len(d.Services))
+	if len(detail.Services) != 3 {
+		t.Fatalf("services = %d, want 3", len(detail.Services))
 	}
 	// Rows are ordered by source.
 	byIdentity := map[string]Service{}
-	for _, s := range d.Services {
+	for _, s := range detail.Services {
 		byIdentity[stateServiceIdentity(s)] = s
 	}
 	ep, ok := byIdentity["service.js"]

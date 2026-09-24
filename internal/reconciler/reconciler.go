@@ -255,13 +255,13 @@ func (r *Reconciler) pump() {
 // ticker periodically reconciles every known function, catching events the
 // watcher missed.
 func (r *Reconciler) ticker() {
-	t := time.NewTicker(r.interval)
-	defer t.Stop()
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
-		case <-t.C:
+		case <-ticker.C:
 			r.reconcileAll()
 		}
 	}

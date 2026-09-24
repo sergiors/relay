@@ -22,12 +22,12 @@ func TestNetworksRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, networksTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Networks) != 2 || d.Networks[0] != "backend" || d.Networks[1] != "frontend" {
-		t.Fatalf("networks = %v, want [backend frontend]", d.Networks)
+	if len(detail.Networks) != 2 || detail.Networks[0] != "backend" || detail.Networks[1] != "frontend" {
+		t.Fatalf("networks = %v, want [backend frontend]", detail.Networks)
 	}
 }
 
@@ -37,12 +37,12 @@ func TestNetworksEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if d.Networks != nil {
-		t.Fatalf("networks = %v, want nil", d.Networks)
+	if detail.Networks != nil {
+		t.Fatalf("networks = %v, want nil", detail.Networks)
 	}
 }
 
@@ -61,11 +61,11 @@ events:
 `)
 	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	d, ok := st.GetFunction("demo")
+	detail, ok := st.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(d.Networks) != 1 || d.Networks[0] != "onlynet" {
-		t.Fatalf("networks = %v, want [onlynet]", d.Networks)
+	if len(detail.Networks) != 1 || detail.Networks[0] != "onlynet" {
+		t.Fatalf("networks = %v, want [onlynet]", detail.Networks)
 	}
 }

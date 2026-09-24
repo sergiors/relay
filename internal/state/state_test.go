@@ -77,37 +77,37 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
 
-	d, ok := c.GetFunction("fn")
+	detail, ok := c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after discovered")
 	}
-	if d.Status != StatusPending {
-		t.Fatalf("status = %s, want pending", d.Status)
+	if detail.Status != StatusPending {
+		t.Fatalf("status = %s, want pending", detail.Status)
 	}
-	if len(d.Handlers) != 2 {
-		t.Fatalf("handler count = %d, want 2", len(d.Handlers))
+	if len(detail.Handlers) != 2 {
+		t.Fatalf("handler count = %d, want 2", len(detail.Handlers))
 	}
 
 	c.RecordReconcileSuccess("fn", "img-fn", "fp-new", time.Now(), fnFor(t, "fn", tmpl))
 
-	d, ok = c.GetFunction("fn")
+	detail, ok = c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
-	if d.Status != StatusReady {
-		t.Fatalf("status = %s, want ready", d.Status)
+	if detail.Status != StatusReady {
+		t.Fatalf("status = %s, want ready", detail.Status)
 	}
-	if d.Image != "img-fn" {
-		t.Fatalf("image = %q, want img-fn", d.Image)
+	if detail.Image != "img-fn" {
+		t.Fatalf("image = %q, want img-fn", detail.Image)
 	}
-	if d.Fingerprint != "fp-new" {
-		t.Fatalf("fingerprint = %q, want fp-new", d.Fingerprint)
+	if detail.Fingerprint != "fp-new" {
+		t.Fatalf("fingerprint = %q, want fp-new", detail.Fingerprint)
 	}
-	if d.LastError != "" {
-		t.Fatalf("last_error = %q, want cleared", d.LastError)
+	if detail.LastError != "" {
+		t.Fatalf("last_error = %q, want cleared", detail.LastError)
 	}
-	if len(d.Handlers) != 2 {
-		t.Fatalf("handler count = %d, want 2 after success", len(d.Handlers))
+	if len(detail.Handlers) != 2 {
+		t.Fatalf("handler count = %d, want 2 after success", len(detail.Handlers))
 	}
 }
 
@@ -122,28 +122,28 @@ func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 
 	c.RecordReconcileFailure("fn", &boomErr{})
 
-	d, ok := c.GetFunction("fn")
+	detail, ok := c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after failure")
 	}
-	if d.Status != StatusReady {
-		t.Fatalf("status = %s, want ready (never marked unavailable)", d.Status)
+	if detail.Status != StatusReady {
+		t.Fatalf("status = %s, want ready (never marked unavailable)", detail.Status)
 	}
-	if d.Image != "img-active" {
-		t.Fatalf("image = %q, want preserved img-active", d.Image)
+	if detail.Image != "img-active" {
+		t.Fatalf("image = %q, want preserved img-active", detail.Image)
 	}
-	if d.Fingerprint != "fp-active" {
-		t.Fatalf("fingerprint = %q, want preserved fp-active", d.Fingerprint)
+	if detail.Fingerprint != "fp-active" {
+		t.Fatalf("fingerprint = %q, want preserved fp-active", detail.Fingerprint)
 	}
-	if d.LastReconcileStatus != ReconcileFailed {
-		t.Fatalf("last_reconcile_status = %s, want failed", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != ReconcileFailed {
+		t.Fatalf("last_reconcile_status = %s, want failed", detail.LastReconcileStatus)
 	}
-	if d.LastError == "" {
+	if detail.LastError == "" {
 		t.Fatal("last_error should be set on failure")
 	}
 	// The prepared_at of the active version is preserved, not overwritten.
-	if !strings.HasPrefix(d.PreparedAt, prepared.UTC().Format(time.RFC3339)[:19]) {
-		t.Fatalf("prepared_at = %s, want preserved active version time", d.PreparedAt)
+	if !strings.HasPrefix(detail.PreparedAt, prepared.UTC().Format(time.RFC3339)[:19]) {
+		t.Fatalf("prepared_at = %s, want preserved active version time", detail.PreparedAt)
 	}
 }
 
@@ -216,28 +216,28 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 
 	// (i) success on the existing row persists status + timestamp.
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn)
-	d, ok := c.GetFunction("fn")
+	detail, ok := c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
-	if d.LastReconcileStatus != ReconcileSuccess {
-		t.Fatalf("last_reconcile_status = %s, want %s", d.LastReconcileStatus, ReconcileSuccess)
+	if detail.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s, want %s", detail.LastReconcileStatus, ReconcileSuccess)
 	}
-	if d.LastReconcileAt == "" {
+	if detail.LastReconcileAt == "" {
 		t.Fatal("last_reconcile_at must be persisted by a success on an existing row")
 	}
 
 	// (ii) re-discovery resets the outcome view (it is not a meaningful reconcile).
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
-	d, ok = c.GetFunction("fn")
+	detail, ok = c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after re-discovery")
 	}
-	if d.LastReconcileStatus != "" {
-		t.Fatalf("last_reconcile_status = %s after re-discovery, want empty", d.LastReconcileStatus)
+	if detail.LastReconcileStatus != "" {
+		t.Fatalf("last_reconcile_status = %s after re-discovery, want empty", detail.LastReconcileStatus)
 	}
-	if d.LastReconcileAt != "" {
-		t.Fatalf("last_reconcile_at = %s after re-discovery, want empty", d.LastReconcileAt)
+	if detail.LastReconcileAt != "" {
+		t.Fatalf("last_reconcile_at = %s after re-discovery, want empty", detail.LastReconcileAt)
 	}
 }
 
@@ -285,9 +285,9 @@ func TestListFunctionsShapeAndSort(t *testing.T) {
 // GetFunction of an unknown name returns false with an empty detail.
 func TestGetFunctionUnknownReturnsFalse(t *testing.T) {
 	c := openTestState(t)
-	d, ok := c.GetFunction("nope")
+	detail, ok := c.GetFunction("nope")
 	if ok {
-		t.Fatalf("expected not found, got %+v", d)
+		t.Fatalf("expected not found, got %+v", detail)
 	}
 }
 
@@ -309,12 +309,12 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	if rows[0].Name != "demo" || rows[0].Runtime != "python3.14" || rows[0].Status != StatusPending {
 		t.Fatalf("unexpected rebuild row: %+v", rows[0])
 	}
-	d, ok := c.GetFunction("demo")
+	detail, ok := c.GetFunction("demo")
 	if !ok {
 		t.Fatal("expected demo detail")
 	}
-	if len(d.Handlers) != 2 {
-		t.Fatalf("handler count = %d, want 2", len(d.Handlers))
+	if len(detail.Handlers) != 2 {
+		t.Fatalf("handler count = %d, want 2", len(detail.Handlers))
 	}
 
 	// A second rebuild on a non-empty DB must not duplicate rows.
@@ -337,15 +337,15 @@ func TestRecordReconcileSuccessRoundTripsFingerprintedImage(t *testing.T) {
 	fp := "3f8a2c1d9b6e4a1700aa11bb22cc33dd44ee55ff66778899aabbccddeeff0011"
 	c.RecordReconcileSuccess("user-events", img, fp, time.Now(), fnFor(t, "user-events", tmpl))
 
-	d, ok := c.GetFunction("user-events")
+	detail, ok := c.GetFunction("user-events")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
-	if d.Image != img {
-		t.Fatalf("image = %q, want %q", d.Image, img)
+	if detail.Image != img {
+		t.Fatalf("image = %q, want %q", detail.Image, img)
 	}
-	if d.Fingerprint != fp {
-		t.Fatalf("fingerprint = %q, want %q", d.Fingerprint, fp)
+	if detail.Fingerprint != fp {
+		t.Fatalf("fingerprint = %q, want %q", detail.Fingerprint, fp)
 	}
 }
 
@@ -469,19 +469,19 @@ events:
 `)
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
 
-	d, ok := c.GetFunction("fn")
+	detail, ok := c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if d.Env["API_URL"] != "https://api.example.com" {
-		t.Errorf("env API_URL = %q, want https://api.example.com", d.Env["API_URL"])
+	if detail.Env["API_URL"] != "https://api.example.com" {
+		t.Errorf("env API_URL = %q, want https://api.example.com", detail.Env["API_URL"])
 	}
 	// An env value containing '=' must survive intact.
-	if d.Env["CONN"] != "postgres://user:pass@host/db" {
-		t.Errorf("env CONN = %q, want the full connection string", d.Env["CONN"])
+	if detail.Env["CONN"] != "postgres://user:pass@host/db" {
+		t.Errorf("env CONN = %q, want the full connection string", detail.Env["CONN"])
 	}
-	if d.Secrets["DATABASE_URL"] != "database-url" {
-		t.Errorf("secrets DATABASE_URL = %q, want database-url (the reference, never a value)", d.Secrets["DATABASE_URL"])
+	if detail.Secrets["DATABASE_URL"] != "database-url" {
+		t.Errorf("secrets DATABASE_URL = %q, want database-url (the reference, never a value)", detail.Secrets["DATABASE_URL"])
 	}
 }
 
@@ -492,15 +492,15 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
 
-	d, ok := c.GetFunction("fn")
+	detail, ok := c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if d.Env != nil {
-		t.Errorf("env = %v, want nil when absent", d.Env)
+	if detail.Env != nil {
+		t.Errorf("env = %v, want nil when absent", detail.Env)
 	}
-	if d.Secrets != nil {
-		t.Errorf("secrets = %v, want nil when absent", d.Secrets)
+	if detail.Secrets != nil {
+		t.Errorf("secrets = %v, want nil when absent", detail.Secrets)
 	}
 }
 
