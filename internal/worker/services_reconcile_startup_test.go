@@ -133,17 +133,20 @@ func (f *blockingListDocker) VerifyNetworks(_ context.Context, _ []string) (stri
 	return "", true, nil
 }
 
-// TestReconcileStartupServicesRootedInLifecycle proves the per-function reconcile
-// contexts are rooted in the worker lifecycle: cancelling that lifecycle cancels
-// an in-flight service converge promptly, rather than waiting out the 30s
-// reconcileTimeout. It uses a Docker fake whose list blocks until ctx is done.
-func TestReconcileStartupServicesRootedInLifecycle(t *testing.T) {
-	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
-	defer cancelLifecycle()
-
+// TestEnqueueStartupServicesRootedInLifecycle proves the enqueued per-function
+// converge contexts are rooted in the worker lifecycle: cancelling that
+// lifecycle cancels an in-flight service converge promptly, rather than waiting
+// out the 30s reconcileTimeout. It uses a Docker fake whose list blocks until
+// ctx is done.
+func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 	fake := &blockingListDocker{entered: make(chan struct{})}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	coordinator.Start(lifecycle)
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
@@ -152,13 +155,8 @@ func TestReconcileStartupServicesRootedInLifecycle(t *testing.T) {
 	prepared := []*runner.PreparedFunction{
 		runner.NewPrepared(function.Function{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
 	}
-	functions := []function.Function{{Name: "alpha", Template: tmpl}}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		reconcileStartupServices(lifecycle, prepared, functions, svcCtrl, logger)
-	}()
+	enqueueStartupServices(prepared, coordinator, logger)
 
 	select {
 	case <-fake.entered:
@@ -168,28 +166,28 @@ func TestReconcileStartupServicesRootedInLifecycle(t *testing.T) {
 
 	start := time.Now()
 	cancelLifecycle()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("lifecycle cancellation did not cancel the in-flight service converge")
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join after lifecycle cancel: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("service converge took %v to cancel after lifecycle cancel; want prompt", elapsed)
 	}
 }
 
-// TestReconcileStartupServicesBoundedPerFunction pins the per-function timeout
-// guarantee through the new mechanism: reconcileStartupServices passes the
-// shared lifecycle context to each Apply, and the ServiceReconciler derives a
-// FRESH per-operation ~reconcileTimeout bound from it, so each function's
-// container listing observes its own distinct deadline rather than one shared
-// (potentially already-consumed) context. The trailing SweepOrphans call is
-// rooted in the lifecycle context, which here is the unbounded
-// context.Background, so it carries no deadline.
-func TestReconcileStartupServicesBoundedPerFunction(t *testing.T) {
+// TestEnqueueStartupServicesBoundedPerFunction pins the per-function timeout
+// guarantee through the new mechanism: enqueueStartupServices enqueues each
+// desired state, the coordinator converges it with its lifecycle context, and
+// the ServiceReconciler derives a FRESH per-operation ~reconcileTimeout bound
+// from it, so each function's container listing observes its own distinct
+// deadline rather than one shared (potentially already-consumed) context.
+func TestEnqueueStartupServicesBoundedPerFunction(t *testing.T) {
 	fake := &svcDeadlineDocker{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
+	defer stop()
 
 	tmpl := &function.Template{
 		Runtime: "node24",
@@ -201,47 +199,197 @@ func TestReconcileStartupServicesBoundedPerFunction(t *testing.T) {
 		runner.NewPrepared(function.Function{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha", Env: nil}, nil),
 		runner.NewPrepared(function.Function{Name: "beta", Template: tmpl}, &runtime.Prepared{Image: "img-beta", Env: nil}, nil),
 	}
-	// liveNames is derived from `functions` in the helper; provide the matching
-	// on-disk set so the orphan sweep finds nothing to remove.
-	functions := []function.Function{
-		{Name: "alpha", Template: tmpl},
-		{Name: "beta", Template: tmpl},
-	}
 
-	reconcileStartupServices(context.Background(), prepared, functions, svcCtrl, logger)
+	enqueueStartupServices(prepared, coordinator, logger)
+	if err := coordinator.Wait(context.Background()); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
 
 	deadlines := fake.recordedDeadlines()
-	// Two per-function Applys (each with a bounded deadline) + the SweepOrphans
-	// call (context.Background, no deadline).
-	if len(deadlines) != 3 {
-		t.Fatalf("ServiceContainerList saw %d calls, want 3 (two Applys + sweep): %v", len(deadlines), deadlines)
-	}
-
-	var applyDeadlines []time.Time
-	for _, d := range deadlines {
-		if !d.IsZero() {
-			applyDeadlines = append(applyDeadlines, d)
-		} else if deadlines[len(deadlines)-1] != d {
-			t.Fatalf("a non-final call carried no deadline; only SweepOrphans should: %v", deadlines)
-		}
-	}
-	// The sweep is the final call and must be unbounded.
-	if !deadlines[len(deadlines)-1].IsZero() {
-		t.Fatalf("SweepOrphans call must use an unbounded context, got deadline %v", deadlines[len(deadlines)-1])
-	}
-
-	if len(applyDeadlines) != 2 {
-		t.Fatalf("per-function Applys = %d, want 2: %v", len(applyDeadlines), deadlines)
+	// Two per-function Applys, each with its own bounded listing. The orphan
+	// sweep is no longer part of this helper (it is the housekeeping pass).
+	if len(deadlines) != 2 {
+		t.Fatalf("ServiceContainerList saw %d calls, want 2 (two Applys): %v", len(deadlines), deadlines)
 	}
 	// Both Applys must be bounded and each must have a DISTINCT deadline (a
 	// fresh ~reconcileTimeout bound per function, not one shared context).
-	for i, d := range applyDeadlines {
+	for i, d := range deadlines {
+		if d.IsZero() {
+			t.Fatalf("Apply %d carried no deadline; want a fresh reconcileTimeout bound", i)
+		}
 		if got := time.Until(d); got <= 0 || got > reconcileTimeout {
 			t.Fatalf("Apply %d deadline %v is not bounded to reconcileTimeout=%v (until=%v)", i, d, reconcileTimeout, got)
 		}
 	}
-	if applyDeadlines[0].Equal(applyDeadlines[1]) {
-		t.Fatalf("Apply deadlines are identical (%v); want distinct per-function bounds", applyDeadlines)
+	if deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("Apply deadlines are identical (%v); want distinct per-function bounds", deadlines)
+	}
+}
+
+// TestStartupHousekeepingBarrierOrderAndNonBlocking is the deterministic seam
+// test for the background startup housekeeping. It proves:
+//   - startStartupHousekeeping returns immediately (Run never blocks on it);
+//   - the exclusive barrier runs FIRST and nothing runs until the callback
+//     completes;
+//   - the passes then run in the safe order sweep → images → deps;
+//   - a barrier failure skips every sweep (cleanup never runs against an
+//     unconverged or shutting-down world).
+func TestStartupHousekeepingBarrierOrderAndNonBlocking(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	release := make(chan struct{})
+	enteredWait := make(chan struct{})
+	var mu sync.Mutex
+	var order []string
+	record := func(step string) {
+		mu.Lock()
+		order = append(order, step)
+		mu.Unlock()
+	}
+
+	h := startupHousekeeper{
+		exclusive: func(_ context.Context, fn func(context.Context)) error {
+			record("wait")
+			close(enteredWait)
+			<-release
+			fn(context.Background())
+			return nil
+		},
+		sweep:  func(context.Context) { record("sweep") },
+		images: func(context.Context) { record("images") },
+		deps:   func(context.Context) { record("deps") },
+	}
+
+	// Returns immediately even though the barrier blocks.
+	done := startStartupHousekeeping(context.Background(), logger, h)
+	select {
+	case <-done:
+		t.Fatal("housekeeping returned before the barrier cleared; Run must not block on it")
+	case <-enteredWait:
+	}
+
+	// Nothing but the barrier may have run yet.
+	mu.Lock()
+	if len(order) != 1 || order[0] != "wait" {
+		mu.Unlock()
+		t.Fatalf("passes ran before the barrier cleared: %v", order)
+	}
+	mu.Unlock()
+
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("housekeeping did not finish after the barrier cleared")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	want := []string{"wait", "sweep", "images", "deps"}
+	if len(got) != len(want) {
+		t.Fatalf("pass order = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("pass order = %v, want %v", got, want)
+		}
+	}
+
+	// Barrier failure skips every sweep.
+	var failed []string
+	h2 := startupHousekeeper{
+		exclusive: func(context.Context, func(context.Context)) error { return context.Canceled },
+		sweep:     func(context.Context) { failed = append(failed, "sweep") },
+		images:    func(context.Context) { failed = append(failed, "images") },
+		deps:      func(context.Context) { failed = append(failed, "deps") },
+	}
+	done2 := startStartupHousekeeping(context.Background(), logger, h2)
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("housekeeping did not return after a barrier failure")
+	}
+	if len(failed) != 0 {
+		t.Fatalf("a failed barrier must skip every sweep, got %v", failed)
+	}
+}
+
+// TestStartupHousekeepingExcludesLiveUpdates is the end-to-end wiring proof: it
+// runs the real startStartupHousekeeping with the real coordinator's RunExclusive
+// seam and a real orphan sweep. A live service update published while the sweep
+// is parked must NOT start an Apply (no concurrent resolve) until the exclusive
+// window closes, then it must run with the latest desired state.
+func TestStartupHousekeepingExcludesLiveUpdates(t *testing.T) {
+	fake := newCtxRecordDocker()
+	fake.block["list"] = true // the orphan sweep's listing parks until released
+	logger := discardLogger()
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+	coordinator := reconciler.NewServiceCoordinator(svcCtrl)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	coordinator.Start(lifecycle)
+
+	tmpl := applyServiceTemplate()
+	// Housekeeping's sweep lifecycle is separate so the test can release the
+	// parked sweep without cancelling the coordinator.
+	sweepCtx, cancelSweep := context.WithCancel(context.Background())
+	defer cancelSweep()
+	imagesRan := make(chan struct{}, 1)
+	done := startStartupHousekeeping(sweepCtx, logger, startupHousekeeper{
+		exclusive: coordinator.RunExclusive,
+		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, map[string]bool{"alpha": true}) },
+		images: func(context.Context) {
+			// Runs after the sweep and before resume; unblock the resumed Apply's
+			// listing so it can complete.
+			fake.mu.Lock()
+			fake.block["list"] = false
+			fake.mu.Unlock()
+			imagesRan <- struct{}{}
+		},
+		deps: func(context.Context) {},
+	})
+
+	// The sweep has entered its listing (recorded before blocking): the exclusive
+	// window is now open with the coordinator paused.
+	fake.waitCount(t, "list", 1)
+
+	// A live update arrives during the sweep: it must coalesce, not Apply. Give
+	// the scheduler ample opportunity to (wrongly) start it; the exclusive pause
+	// must keep the resolve count at zero.
+	coordinator.Enqueue("alpha", t.TempDir(), tmpl, "img-2", nil)
+	time.Sleep(50 * time.Millisecond)
+	if got := len(fake.forOp("resolve")); got != 0 {
+		t.Fatalf("a live Apply ran during the exclusive housekeeping window: resolve calls = %d, want 0", got)
+	}
+	if fake.tryEntered("resolve") {
+		t.Fatal("a live Apply signalled entry during the exclusive housekeeping window")
+	}
+
+	// Release the sweep: the exclusive window closes, resume schedules the update.
+	cancelSweep()
+	select {
+	case <-imagesRan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("housekeeping did not proceed past the sweep")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("housekeeping did not finish")
+	}
+	fake.waitEntered(t, "resolve")
+
+	resolves := fake.forOp("resolve")
+	if len(resolves) != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (the resumed update)", len(resolves))
+	}
+
+	cancel()
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer joinCancel()
+	if err := coordinator.Join(joinCtx); err != nil {
+		t.Fatalf("join: %v", err)
 	}
 }
 

@@ -54,17 +54,17 @@ const statsFlushInterval = 5 * time.Second
 
 // reconcileTimeout bounds every bounded service-reconcile daemon operation:
 // the startup orphan container sweep, the startup image keep-set list, the
-// reconciler's RemoveServices hook, and — injected into the ServiceReconciler —
-// each normal pre-build and post-build Docker operation inside a per-function
-// Apply. Each such operation gets its own fresh bound so one slow Docker call
-// cannot consume the budget of the calls that follow. It deliberately does NOT
-// bound Dockerfile builds: a build is bounded by runtime.buildTimeout (10m) on a
-// context rooted in the worker lifecycle, so a slow image build can never be cut
-// off by this short reconcile budget. Apply receives the worker lifecycle
-// context (NOT this constant wrapped around the whole pass) and the reconciler
-// derives the per-operation bounds from it. The 5s shutdown bounds are a
-// separate, deliberately shorter bound (see Run's shutdown tail), not this
-// constant.
+// coordinator's per-removal operation context (RemoveAndWait/EnqueueRemove), and
+// — injected into the ServiceReconciler — each normal pre-build and post-build
+// Docker operation inside a per-function Apply. Each such operation gets its own
+// fresh bound so one slow Docker call cannot consume the budget of the calls
+// that follow. It deliberately does NOT bound Dockerfile builds: a build is
+// bounded by runtime.buildTimeout (10m) on a context rooted in the worker
+// lifecycle, so a slow image build can never be cut off by this short reconcile
+// budget. Apply receives the worker lifecycle context (NOT this constant wrapped
+// around the whole pass) and the reconciler derives the per-operation bounds
+// from it. The 5s shutdown bounds are a separate, deliberately shorter bound
+// (see Run's shutdown tail), not this constant.
 const reconcileTimeout = 30 * time.Second
 
 // shutdownServiceTimeout bounds the service-container cleanup during graceful
@@ -235,12 +235,15 @@ func Run(logger *slog.Logger) {
 	// containers to its template (manager is the Docker seam; secretProvider is
 	// the shared secrets resolver). Service containers now stop on graceful
 	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
-	// hostname (cfg.ConsumerName). Startup reconciliation (per-function Apply +
-	// SweepOrphans) remains the crash-recovery path when shutdown cleanup did
-	// not execute. The service reconciler itself decides whether routing
-	// applies (only services declaring a host are routed) and validates
-	// TRAEFIK_NETWORK per routed service; wiring only forwards the configured
-	// value.
+	// hostname (cfg.ConsumerName). The coordinator runs the per-function Applys
+	// asynchronously (bounded workers, latest-desired-state coalescing), so
+	// startup never blocks on a service's Dockerfile build; the startup orphan
+	// sweep + image GC run inside the coordinator's exclusive housekeeping window
+	// in the background pass. Startup reconciliation remains the crash-recovery
+	// path when shutdown cleanup did not execute. The service reconciler itself
+	// decides whether routing applies (only services declaring a host are routed)
+	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
+	// configured value.
 	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
 		Network:      cfg.TraefikNetwork,
 		EntryPoints:  cfg.TraefikEntryPoints,
@@ -248,6 +251,8 @@ func Run(logger *slog.Logger) {
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
 	}, logger, reconcileTimeout)
+	services := reconciler.NewServiceCoordinator(svcCtrl)
+	services.Start(ctx)
 
 	// Conservative startup orphan sweep: before any function is prepared or any
 	// container created, remove execution containers a previous Relay process on
@@ -268,23 +273,31 @@ func Run(logger *slog.Logger) {
 	// marked unavailable so the runner skips it; the rest continue.
 	prepared := prepareFunctions(ctx, manager, functions, st, logger)
 
-	// Converge persistent service containers AFTER every image is built (so the
-	// desired image is present) and BEFORE the startup image sweep (so the sweep's
-	// keep-set can include images live containers reference).
-	reconcileStartupServices(ctx, prepared, functions, svcCtrl, logger)
+	// Publish each function's initial desired service state and return
+	// immediately. The coordinator's bounded workers converge the states in the
+	// background, so startup never blocks on a service's Dockerfile build — nor
+	// on the unavailable/no-services removals, which are published the same
+	// nonblocking way (the coordinator derives their own fresh bound).
+	enqueueStartupServices(prepared, services, logger)
 
-	// Conservative startup image sweep: remove Relay-owned images no live function
-	// or container references. Kept images include live functions' fingerprints,
-	// running service containers' images, and state-recorded images (the crash
-	// guard for a mid-swap restart).
-	sweepStartupImages(ctx, manager, functions, st, logger)
-
-	// Lifecycle-driven dependency GC at startup. The image sweep may leave
-	// superseded images; dependency cleanup then prunes dependency images no
-	// managed function image references anymore. Runs OUTSIDE the st gate (labels,
-	// no state keep-set). Best-effort and single-shot — errors are left for the
-	// next natural lifecycle point.
-	cleanupStartupDependencies(ctx, manager, logger)
+	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
+	// barrier for the initial service attempts to settle, then runs the startup
+	// cleanup passes in their safe order: orphan container sweep, image sweep
+	// (whose keep-set must observe the settled service containers), then
+	// dependency GC (which prunes dependency images the image sweep orphaned).
+	// Run does NOT call image GC synchronously; housekeepingDone is joined in the
+	// shutdown tail so no sweep overlaps shutdown cleanup or the closing state DB
+	// and Docker client.
+	liveNames := make(map[string]bool, len(functions))
+	for _, fn := range functions {
+		liveNames[fn.Name] = true
+	}
+	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
+		exclusive: services.RunExclusive,
+		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, liveNames) },
+		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
+		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
+	})
 
 	// The runner executes invocations. It is constructed before the stream
 	// consumer so its InvokeHandler can be wired as the consumer's ScheduleRunner
@@ -457,19 +470,19 @@ func Run(logger *slog.Logger) {
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
 			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
-				applyLiveServices(ctx, svcCtrl, runWorker.Registry(), name, fnDir, tmpl, image)
+				enqueueLiveServices(services, runWorker.Registry(), name, fnDir, tmpl, image)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
-			// running service containers reference those images. Remove is a
-			// standalone removal operation with no build, so it keeps its own
-			// fresh 30s bound rooted in the lifecycle context; the hook runs
-			// synchronously in the single pump goroutine, so the context never
-			// races itself.
+			// running service containers reference those images. RemoveAndWait
+			// waits DETERMINISTICALLY for the queued removal to complete; the
+			// coordinator derives the operation's own fresh 30s bound rooted in
+			// the lifecycle context, and shutdown releases the wait via the
+			// lifecycle, so the hook can never let image retirement race the
+			// removal. The hook runs in the single pump goroutine, so it never
+			// blocks a reconcile of another function.
 			RemoveServices: func(name string) {
-				rCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
-				defer cancel()
-				svcCtrl.Remove(rCtx, name)
+				services.RemoveAndWait(name)
 			},
 		},
 		runWorker.Registry(),
@@ -528,12 +541,33 @@ func Run(logger *slog.Logger) {
 		logger.Warn("Scheduler: graceful shutdown failed", "error", err)
 	}
 
+	// Wait for the background startup housekeeping (service barrier, orphan
+	// sweep, image sweep, dependency GC) to finish or observe the cancelled
+	// lifecycle. Joining it BEFORE ShutdownCleanup guarantees no startup sweep
+	// overlaps shutdown cleanup or the closing state DB and Docker client. It is
+	// bounded so a wedged sweep can never hang shutdown, and non-fatal for the
+	// same reason. On a normal boot the goroutine has long since exited, so this
+	// is a no-op receive.
+	housekeepingCtx, housekeepingCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
+	select {
+	case <-housekeepingDone:
+	case <-housekeepingCtx.Done():
+		logger.Warn("Startup: housekeeping did not finish before shutdown", "error", housekeepingCtx.Err())
+	}
+	housekeepingCancel()
+
 	// Stop and remove this worker's persistent service containers. Order:
-	// AFTER the scheduler stop (no more schedule work can start new services),
-	// BEFORE the final stats flush (cleanup is bounded work; the flush is the
-	// last-chance telemetry write and must not wait behind it). Non-fatal:
-	// ShutdownCleanup logs internally, and a Docker problem or timeout must
-	// never fail the process.
+	// AFTER the startup housekeeping join and scheduler stop (no more schedule
+	// work can start new services), BEFORE the final stats flush (cleanup is
+	// bounded work; the flush is the last-chance telemetry write and must not
+	// wait behind it). The coordinator Join releases the workers and their
+	// waiters and drains in-flight Applys. Non-fatal: ShutdownCleanup logs
+	// internally, and a Docker problem or timeout must never fail the process.
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
+	if err := services.Join(joinCtx); err != nil {
+		logger.Warn("Service: coordinator shutdown failed", "error", err)
+	}
+	joinCancel()
 	shutdownServices(svcCtrl, cfg.ConsumerName, logger)
 
 	// Final flush of the registry into SQLite before the deferred st.Close() runs.
@@ -646,23 +680,15 @@ func prepareFunctions(
 	return prepared
 }
 
-// applyLiveServices converges one function's persistent service containers on a
-// live reconcile (the reconciler's UpdateServices hook). It is the live
-// counterpart of reconcileStartupServices' per-function Apply and follows the
-// same context rule: it passes the worker LIFECYCLE context to Apply, NOT a 30s
-// budget wrapped around the whole pass. The ServiceReconciler derives fresh
-// per-operation bounds (reconcileTimeout) for the pre-build and post-build
-// Docker operations itself, so a long Dockerfile build — bounded separately by
-// the runtime's buildTimeout on the manager lifecycle — can never consume the
-// post-build deadline. Shutdown still cancels the operation promptly because ctx
-// is the signal context.
-//
-// The prepared env comes from the current registry entry (the runtime plan env);
-// a nil Prepared (unavailable) falls back to no plan env, mirroring the runner's
-// nil-safe behavior.
-func applyLiveServices(
-	ctx context.Context,
-	svcCtrl *reconciler.ServiceReconciler,
+// enqueueLiveServices snapshots the current prepared environment and publishes
+// the desired service state without blocking the function reconciler pump. The
+// coordinator coalesces updates to the latest desired state per function and its
+// bounded workers converge it with the worker LIFECYCLE context, so a long
+// Dockerfile build for one function cannot stall the reconciler or the other
+// functions. A nil Prepared (unavailable) entry falls back to no plan env,
+// mirroring the runner's nil-safe behavior.
+func enqueueLiveServices(
+	services *reconciler.ServiceCoordinator,
 	reg *runner.Registry,
 	name, fnDir string,
 	tmpl *function.Template,
@@ -672,25 +698,18 @@ func applyLiveServices(
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	svcCtrl.Apply(ctx, name, fnDir, tmpl, image, preparedEnv)
+	services.Enqueue(name, fnDir, tmpl, image, preparedEnv)
 }
 
-// reconcileStartupServices converges each prepared function's persistent service
-// containers to its freshly prepared template and image, then sweeps orphaned
-// containers for functions no longer on disk. It runs AFTER every function's
-// image is built (so the desired image is present) and BEFORE the startup image
-// sweep (so the sweep's keep-set can include images the containers we just
-// converged reference).
+// enqueueStartupServices publishes each prepared function's initial desired
+// service state and returns immediately; the coordinator converges them in the
+// background, so startup never blocks on a service's Dockerfile build. The
+// unavailable/no-services removals are published the same nonblocking way (see
+// the special case below), so startup never blocks on Docker work at all; the
+// background housekeeping pass' barrier waits for every published operation to
+// settle before touching containers or images.
 //
-// Each per-function Apply receives the shared LIFECYCLE context: the
-// ServiceReconciler derives its own fresh per-operation bounds (reconcileTimeout)
-// for the pre-build and post-build Docker operations, so one slow Docker call
-// cannot consume the budget of the functions that follow, and a long build can
-// never consume the post-build deadline (see applyLiveServices for the live
-// path). The availability/empty-services special cases below still bound their
-// standalone Remove calls with a fresh reconcileTimeout.
-//
-// Prepared (available) functions are applied UNCONDITIONALLY — including
+// Prepared (available) functions are enqueued UNCONDITIONALLY — including
 // templates that now declare no services: Reconcile with an empty desired set
 // stops any containers a previous boot left behind when services were removed
 // while Relay was down (the fingerprint was re-seeded from changed content, so
@@ -698,55 +717,84 @@ func applyLiveServices(
 //
 // An unavailable function (no image this boot) is left alone when its template
 // still declares services (its stale containers may still be serving the old
-// image, until a later successful reconcile or RemoveAll replaces them); when
-// its template no longer declares services, lingering containers are stale by
-// definition and are removed now.
-func reconcileStartupServices(
-	lifecycle context.Context,
+// image, until a later successful reconcile or Remove replaces them); when its
+// template no longer declares services, lingering containers are stale by
+// definition and are removed via the nonblocking EnqueueRemove. The coordinator
+// derives the removal's own fresh reconcileTimeout bound; the housekeeping
+// barrier serializes the image sweep behind it exactly as it does for Applys.
+func enqueueStartupServices(
 	prepared []*runner.PreparedFunction,
-	functions []function.Function,
-	svcCtrl *reconciler.ServiceReconciler,
+	services *reconciler.ServiceCoordinator,
 	logger *slog.Logger,
 ) {
 	for _, pf := range prepared {
 		fn := pf.Function()
-		p := pf.Prepared()
-		if p == nil {
-			// Unavailable function: no image this boot.
-			if len(fn.Template.Services) == 0 {
-				ctx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
-				svcCtrl.Remove(ctx, fn.Name)
-				cancel()
-			} else {
-				logger.Warn("Service: function unavailable; skipping service reconcile", "function", fn.Name)
-			}
+		if p := pf.Prepared(); p != nil {
+			services.Enqueue(fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
 			continue
 		}
-		// Apply receives the LIFECYCLE context, not a 30s budget wrapped around
-		// the whole pass: Reconcile derives fresh per-operation bounds from it
-		// and the reconciler's injected reconcileTimeout, so a long Dockerfile
-		// build (bounded by the runtime's buildTimeout on the manager lifecycle)
-		// cannot consume the deadline of the post-build work that follows.
-		svcCtrl.Apply(lifecycle, fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
+		if len(fn.Template.Services) == 0 {
+			services.EnqueueRemove(fn.Name)
+		} else {
+			logger.Warn("Service: function unavailable; skipping service reconcile", "function", fn.Name)
+		}
 	}
-	// Startup stale-service sweep: remove any service container whose function is
-	// not on disk at all (removed while Relay was down, or stale from a previous
-	// boot on this host). hostname is NOT part of the predicate — same-host
-	// restart is a documented limitation — so this runs once at startup against
-	// the full on-disk function set, not per reconcile.
-	//
-	// liveNames is built from the loaded `functions` slice (on-disk function
-	// directories with valid templates). A build-failed (unavailable) function is
-	// still "live" because its directory exists and it may have stale containers
-	// serving the old image — those must NOT be swept. A persistently-broken
-	// template directory is not in `functions` (the loader skips it), so its stale
-	// containers could linger until the template is fixed or the dir removed — an
-	// accepted v1 edge.
-	liveNames := make(map[string]bool, len(functions))
-	for _, fn := range functions {
-		liveNames[fn.Name] = true
-	}
-	svcCtrl.SweepOrphans(lifecycle, liveNames)
+}
+
+// startupHousekeeper groups the background startup cleanup passes so their
+// ordering and lifecycle behavior are deterministic to test without Docker.
+// exclusive is the coordinator's housekeeping seam (see
+// ServiceCoordinator.RunExclusive): it atomically waits for current service work
+// to settle, PAUSES scheduling of new requests for the duration of the callback,
+// and resumes/schedules the latest coalesced desired states afterward. The three
+// passes run inside that exclusive window in the safe order — orphan container
+// sweep, then image sweep (whose keep-set must observe the settled service
+// containers), then dependency GC (which prunes dependency images the image
+// sweep orphaned) — so no live UpdateServices can race them.
+type startupHousekeeper struct {
+	exclusive func(context.Context, func(context.Context)) error
+	sweep     func(context.Context)
+	images    func(context.Context)
+	deps      func(context.Context)
+}
+
+// startStartupHousekeeping launches the lifecycle-aware startup housekeeping in a
+// background goroutine and returns a channel closed when it completes. Startup
+// must NOT block on it: Run publishes the initial desired states and returns
+// immediately, and only this pass waits at the coordinator barrier for the
+// initial service attempts to settle before touching containers or images. Its
+// lifecycle is the worker lifecycle, so shutdown cancels an in-flight wait/sweep
+// promptly. A barrier failure (lifecycle cancellation or a bounded wait that did
+// not clear) skips the sweeps: image/orphan cleanup must never run against an
+// unconverged or shutting-down world. An update arriving while the exclusive
+// callback runs is coalesced as a pending desired state and scheduled only once
+// the callback returns, so it can never run concurrently with a sweep.
+func startStartupHousekeeping(
+	lifecycle context.Context,
+	logger *slog.Logger,
+	h startupHousekeeper,
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := h.exclusive(lifecycle, func(hctx context.Context) {
+			h.sweep(hctx)
+			h.images(hctx)
+			h.deps(hctx)
+		})
+		if err == nil {
+			return
+		}
+		// A cancelled lifecycle is the normal shutdown path, not a barrier
+		// failure: log it at Debug and note the sweeps were skipped (they must
+		// never run against a shutting-down world).
+		if lifecycle.Err() != nil {
+			logger.Debug("Startup: housekeeping stopped by shutdown", "error", err)
+		} else {
+			logger.Warn("Startup: service reconciliation barrier failed", "error", err)
+		}
+	}()
+	return done
 }
 
 // sweepStartupImages removes Relay-owned images that no longer correspond to a

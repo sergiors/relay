@@ -596,9 +596,9 @@ func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string
 
 // ServiceReconciler ties Reconcile, RemoveAll, SweepOrphans, and ShutdownCleanup
 // to a single
-// Docker implementation, secret resolver, and logger, serializing all service
-// mutations with one mutex so concurrent reconciler ticks and startup sweeps
-// cannot interleave container operations.
+// Docker implementation, secret resolver, and logger. Function-scoped Apply
+// calls are serialized by ServiceCoordinator in the worker; the mutex remains
+// around cross-function cleanup operations.
 type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
@@ -656,6 +656,8 @@ func NewServiceReconciler(
 // Dockerfile is read relative to it) and to fingerprint their selected source.
 // image is the function's own prepared image, used only by `entrypoint`
 // sources. fnDir may be empty when the template declares no build service.
+// Callers that run Apply concurrently must provide function-level serialization
+// (ServiceCoordinator does this for the worker).
 func (c *ServiceReconciler) Apply(
 	ctx context.Context,
 	fnName, fnDir string,
@@ -663,9 +665,6 @@ func (c *ServiceReconciler) Apply(
 	image string,
 	preparedEnv []string,
 ) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	replicas := 0
 	for _, svc := range tmpl.Services {
 		replicas += svc.Replicas
