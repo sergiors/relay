@@ -3,11 +3,11 @@ package state
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -21,89 +21,90 @@ import (
 // the parent so host-side runs (and tests) work without it existing first.
 const DBPath = "/var/lib/relay/db.sqlite3"
 
-// status values for the functions.status column.
+// status values for the persisted function status.
 const (
 	StatusReady   = "ready"
 	StatusPending = "pending"
 )
 
-// last reconcile status values for functions.last_reconcile_status.
+// last reconcile status values for the persisted last_reconcile_status.
 const (
 	ReconcileSuccess = "success"
 	ReconcileFailed  = "failed"
 )
 
-// Row is the per-function summary returned by ListFunctions.
+// Row is the per-function summary returned by ListFunctions. Its fields are part
+// of the functions.data snapshot except the relational Name/UpdatedAt (columns)
+// and the derived HandlerCount; it is embedded in Detail, so the JSON tags below
+// also shape the persisted snapshot.
 type Row struct {
-	Name                string
-	Runtime             string
-	Status              string
-	HandlerCount        int
-	LastReconcileStatus string
-	PreparedAt          string
-	UpdatedAt           string
+	Name                string `json:"-"`
+	Runtime             string `json:"runtime,omitempty"`
+	Status              string `json:"status,omitempty"`
+	HandlerCount        int    `json:"-"`
+	LastReconcileStatus string `json:"last_reconcile_status,omitempty"`
+	PreparedAt          string `json:"prepared_at,omitempty"`
+	UpdatedAt           string `json:"-"`
 }
 
 // Detail is the full per-function record returned by GetFunction, including the
-// handler list (name + timeout).
+// handler list, the schedules, and the services. It is the persistence model:
+// the whole snapshot is stored as one JSON object in functions.data (marshalled
+// through function_json.go), with only name and updated_at kept as columns. The
+// embedded Row fields and every field below — except Name, UpdatedAt, and the
+// derived HandlerCount — are part of that snapshot.
 type Detail struct {
 	Row
-	Image           string
-	Fingerprint     string
-	LastReconcileAt string
-	LastError       string
-	Handlers        []Handler
-	Schedules       []Schedule
-	// Services lists the function's persistent services. It is configuration
-	// metadata (like the schedules): each entry holds the effective source
-	// (entrypoint file, Dockerfile path, or image reference), internal TCP
-	// port, and desired replica count. It is nil when the template defines
-	// none.
-	Services []Service
-	// Env and Secrets are the function's env/secret MAPPINGS from its template:
-	// env-var name → literal value, and env-var name → secret reference. They
-	// are configuration metadata (like the handler timeouts), never secret
-	// VALUES — a secret's value is never stored in SQLite. Both are nil when the
-	// template defines none.
-	Env     map[string]string
-	Secrets map[string]string
-	// Networks lists the template's normalized top-level Docker networks: the
-	// networks every execution and service container of this function joins. It
-	// is configuration metadata (like env/secrets), never secret values. It is
-	// nil when the template defines none.
-	Networks []string
+	Image           string            `json:"image,omitempty"`
+	Fingerprint     string            `json:"fingerprint,omitempty"`
+	LastReconcileAt string            `json:"last_reconcile_at,omitempty"`
+	LastError       string            `json:"last_error,omitempty"`
+	Handlers        []Handler         `json:"handlers,omitempty"`
+	Schedules       []Schedule        `json:"schedules,omitempty"`
+	Services        []Service         `json:"services,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Secrets         map[string]string `json:"secrets,omitempty"`
+	Networks        []string          `json:"networks,omitempty"`
 }
 
-// Handler is one rule's handler and its resolved timeout.
+// Handler is one rule's handler, its resolved timeout, and its retry count (the
+// same retry budget as schedules). The rule's pattern is deliberately NOT part
+// of the persisted snapshot: matching is rebuilt from template.yaml, never from
+// this read-only view, and the parser's opaque matcher interfaces cannot be
+// JSON round-tripped.
 type Handler struct {
-	Name    string
-	Timeout time.Duration
+	Name    string        `json:"name"`
+	Timeout time.Duration `json:"timeout"`
+	Retries int           `json:"retries"`
 }
 
-// Schedule is one cron schedule's handler, its verbatim 5-field cron
-// expression, the effective timezone name (e.g. "UTC", "Europe/Rome"), and its
-// resolved per-invocation timeout.
+// Schedule is one cron schedule's handler, its verbatim cron expression, the
+// effective timezone name (e.g. "UTC", "Europe/Rome"), its resolved
+// per-invocation timeout, and its retry count (the same retry budget as event
+// rules).
 type Schedule struct {
-	Handler  string
-	Cron     string
-	Timezone string
-	Timeout  time.Duration
+	Handler  string        `json:"handler"`
+	Cron     string        `json:"cron"`
+	Timezone string        `json:"timezone"`
+	Timeout  time.Duration `json:"timeout"`
+	Retries  int           `json:"retries"`
 }
 
 // Service is one persistent service's effective configuration as persisted
 // from the template: its source (exactly one of the entrypoint file, the
-// Dockerfile path, or the external image reference), the optional routing path
-// prefix, its internal TCP port, and the desired replica count. Its identity is
-// the configured source descriptor (SourceRef), i.e. whichever of
+// Dockerfile path, or the external image reference), the optional routing host
+// and path prefix, its internal TCP port, and the desired replica count. Its
+// identity is the configured source descriptor (SourceRef), i.e. whichever of
 // Entrypoint/Build/Image is set; it is derived, never stored as a separate
 // field.
 type Service struct {
-	Entrypoint string
-	Build      string
-	Image      string
-	Path       string
-	Port       int
-	Replicas   int
+	Entrypoint string `json:"entrypoint,omitempty"`
+	Build      string `json:"build,omitempty"`
+	Image      string `json:"image,omitempty"`
+	Host       string `json:"host,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Port       int    `json:"port"`
+	Replicas   int    `json:"replicas"`
 }
 
 // State is a concrete SQLite-backed local state view. It is safe for use from
@@ -199,68 +200,21 @@ func (c *State) Close() error { return c.db.Close() }
 // initSchema creates the current tables if they do not already exist, so a
 // fresh database is initialized with the current schema. Plain SQL: these
 // tables are internal local state and are (re)created on first open.
+//
+// functions stores a whole per-function snapshot as one JSON object in data
+// (SQLite's binary JSON/JSONB, written with jsonb(?) and read back with
+// json(data)), with only the stable name key and the write timestamp kept as
+// columns. There are deliberately no per-handler/per-schedule/per-service child
+// tables: the nested configuration is part of the snapshot, so a template change
+// replaces one row atomically. stats is the single-row global counter snapshot,
+// and function_stats the per-function counterpart; both keep their stable key
+// and updated_at relational while the evolving payload lives in data.
 func (c *State) initSchema(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS functions (
 			name TEXT PRIMARY KEY,
-			runtime TEXT,
-			status TEXT,
-			image TEXT,
-			fingerprint TEXT,
-			prepared_at TEXT,
-			last_reconcile_at TEXT,
-			last_reconcile_status TEXT,
-			last_error TEXT,
-			env TEXT,
-			secrets TEXT,
-			networks TEXT
-			updated_at TEXT,
-		)`,
-		// handlers is keyed by function_name but carries no foreign key: cleanup
-		// is explicit (removeTx), not relational. A relational ON DELETE CASCADE
-		// was considered but rejected: it would require PRAGMA foreign_keys=ON on
-		// every pooled connection (modernc applies DSN pragmas per connection),
-		// and — decisively — the data model lets
-		// function_stats rows exist for a name without a functions row
-		// (RecordFunctionStats is a standalone upsert used by the CLI/tests and by
-		// callers that snapshot per-function counters directly), which FK
-		// enforcement would reject. Keep the explicit deletes: they are the tested
-		// contract.
-		`CREATE TABLE IF NOT EXISTS handlers (
-			function_name TEXT,
-			handler TEXT,
-			timeout TEXT,
-			PRIMARY KEY (function_name, handler)
-		)`,
-		// schedules is keyed by function_name but carries no foreign key, like
-		// handlers: cleanup is explicit (removeTx), not relational, for the same
-		// reasoning documented above (function stats rows can exist without a
-		// functions row, and no PRAGMA foreign_keys is forced).
-		`CREATE TABLE IF NOT EXISTS schedules (
-			function_name TEXT,
-			handler TEXT,
-			cron TEXT,
-			timezone TEXT,
-			timeout TEXT,
-			PRIMARY KEY (function_name, handler, cron, timezone)
-		)`,
-		// services is keyed by function_name but carries no foreign key, like
-		// handlers and schedules: cleanup is explicit (removeTx), not relational,
-		// for the same reasoning documented above (function stats rows can exist
-		// without a functions row, and no PRAGMA foreign_keys is forced). The
-		// primary key is the configured source — exactly one of
-		// entrypoint/build/image is non-empty (the others are the empty string,
-		// never NULL, so the composite stays unique) — which is the same stable
-		// identity used on containers and routing (see function.Service.SourceRef).
-		`CREATE TABLE IF NOT EXISTS services (
-			function_name TEXT,
-			entrypoint TEXT,
-			build TEXT,
-			image TEXT,
-			path TEXT,
-			port INTEGER,
-			replicas INTEGER,
-			PRIMARY KEY (function_name, entrypoint, build, image)
+			data BLOB NOT NULL,
+			updated_at TEXT NOT NULL
 		)`,
 		// stats holds the single "current operational snapshot" consumed by
 		// Relay itself: monotonically increasing counters persisted across
@@ -273,8 +227,8 @@ func (c *State) initSchema(ctx context.Context) error {
 		// fields decode to zero.
 		`CREATE TABLE IF NOT EXISTS stats (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
-			data TEXT,
-			updated_at TEXT
+			data BLOB NOT NULL,
+			updated_at TEXT NOT NULL
 		)`,
 		// function_stats holds the per-function operational snapshot, keyed by
 		// function name. It mirrors the global stats table but attributes each
@@ -282,15 +236,15 @@ func (c *State) initSchema(ctx context.Context) error {
 		// The key function_name and the write timestamp updated_at stay
 		// relational; the payload — including the cumulative warm-container pool
 		// counters (warm_acquires_total, cold_starts_total, discarded_total) and
-		// the four last_*_at execution-history timestamps — lives in the JSON
+		// the four last_*_at execution-history timestamps — lives in the JSONB
 		// data column (see stats_json.go). Backlog metrics
 		// (pending_entries/oldest_pending_age) stay global-only in stats: they
 		// describe the stream backlog, not any one function. The live pool
 		// gauges are deliberately never persisted.
 		`CREATE TABLE IF NOT EXISTS function_stats (
 			function_name TEXT PRIMARY KEY,
-			data TEXT,
-			updated_at TEXT
+			data BLOB NOT NULL,
+			updated_at TEXT NOT NULL
 		)`,
 	}
 
@@ -382,27 +336,9 @@ func (c *State) RebuildFromFS(dir string) error {
 
 	return c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, p := range prepared {
-			ts := c.nowString()
-			env, secrets, networks := serializeTemplate(p.fn.Template)
-
-			if err := insertStmt(tx)(
-				p.fn.Name,
-				p.fn.Template.Runtime,
-				StatusPending, "", p.fp, "", "", "", "",
-				ts, env, secrets, networks,
-			); err != nil {
-				return err
-			}
-
-			if err := replaceHandlers(tx, p.fn.Name, p.fn.Template); err != nil {
-				return err
-			}
-
-			if err := replaceSchedules(tx, p.fn.Name, p.fn.Template); err != nil {
-				return err
-			}
-
-			if err := replaceServices(tx, p.fn.Name, p.fn.Template); err != nil {
+			d := functionSnapshot(p.fn.Name, p.fn.Template, StatusPending, "", p.fp, "", "", "", "")
+			d.UpdatedAt = c.nowString()
+			if err := upsertFunctionTx(ctx, tx, d); err != nil {
 				return err
 			}
 		}
@@ -412,11 +348,10 @@ func (c *State) RebuildFromFS(dir string) error {
 
 // RecordDiscovered records a function discovered from /functions on a fresh
 // state database (or when no row exists). It sets runtime/status=pending, the
-// fingerprint, and the handlers, clearing any stale prior state. It is an
-// upsert keyed by name.
+// fingerprint, and the full configuration snapshot, clearing any stale prior
+// state. It is an upsert keyed by name.
 func (c *State) RecordDiscovered(fn function.Function) {
 	ctx := context.Background()
-	ts := c.nowString()
 	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
 	// external I/O (filesystem reads), so the closure only writes. Fingerprint
 	// errors are logged and fall back to fp="" exactly as before.
@@ -426,25 +361,9 @@ func (c *State) RecordDiscovered(fn function.Function) {
 		fp = ""
 	}
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		env, secrets, networks := serializeTemplate(fn.Template)
-		if err := insertStmt(tx)(
-			fn.Name,
-			fn.Template.Runtime,
-			StatusPending, "", fp, "", "", "", "",
-			ts, env, secrets, networks,
-		); err != nil {
-			return err
-		}
-
-		if err := replaceHandlers(tx, fn.Name, fn.Template); err != nil {
-			return err
-		}
-
-		if err := replaceSchedules(tx, fn.Name, fn.Template); err != nil {
-			return err
-		}
-
-		return replaceServices(tx, fn.Name, fn.Template)
+		d := functionSnapshot(fn.Name, fn.Template, StatusPending, "", fp, "", "", "", "")
+		d.UpdatedAt = c.nowString()
+		return upsertFunctionTx(ctx, tx, d)
 	})
 	if err != nil {
 		c.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
@@ -454,9 +373,9 @@ func (c *State) RecordDiscovered(fn function.Function) {
 // RecordReconcileSuccess records that a function built and serves an active
 // version: status=ready, the new image/fingerprint/prepared_at,
 // last_reconcile_status=success AND last_reconcile_at=now (the last meaningful
-// reconcile), cleared last_error, and the handlers replaced. On conflict
-// (existing row) the upsert persists these outcome columns too, so a success on
-// a previously-discovered row records its own outcome and timestamp.
+// reconcile), cleared last_error, and the full configuration snapshot. On
+// conflict (existing row) the upsert replaces the whole snapshot, so a success
+// on a previously-discovered row records its own outcome and timestamp.
 func (c *State) RecordReconcileSuccess(
 	name,
 	image,
@@ -468,24 +387,9 @@ func (c *State) RecordReconcileSuccess(
 	ts := c.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		env, secrets, networks := serializeTemplate(fn.Template)
-
-		if err := insertStmt(tx)(
-			name, fn.Template.Runtime, StatusReady, image, fingerprint,
-			prepared, ts, ReconcileSuccess, "", ts, env, secrets, networks,
-		); err != nil {
-			return err
-		}
-
-		if err := replaceHandlers(tx, name, fn.Template); err != nil {
-			return err
-		}
-
-		if err := replaceSchedules(tx, name, fn.Template); err != nil {
-			return err
-		}
-
-		return replaceServices(tx, name, fn.Template)
+		d := functionSnapshot(name, fn.Template, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "")
+		d.UpdatedAt = ts
+		return upsertFunctionTx(ctx, tx, d)
 	})
 	if err != nil {
 		c.log.Warn("State: record success failed", "function", name, "error", err)
@@ -497,17 +401,34 @@ func (c *State) RecordReconcileSuccess(
 // Key state model: the image/fingerprint/prepared_at of the PREVIOUS active
 // version are deliberately left intact so the last good build still serves;
 // only last_reconcile_at/last_reconcile_status (failed) and last_error/updated_at
-// change. Status stays as-is (ready if it was ready). The function is never
-// marked unavailable because of a failed rebuild.
+// change. The rest of the persisted snapshot is preserved by a read-modify-write
+// inside the transaction. Status stays as-is (ready if it was ready). The
+// function is never marked unavailable because of a failed rebuild.
 func (c *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := c.nowString()
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE functions
-			 SET last_reconcile_at = ?, last_reconcile_status = ?, last_error = ?, updated_at = ?
-			 WHERE name = ?`,
-			ts, ReconcileFailed, err2.Error(), ts, name)
+		d, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at
+			 FROM functions WHERE name = ?`, name))
+		if err != nil {
+			return err
+		}
+		if !found {
+			// The old UPDATE ... WHERE name = ? was a no-op on an absent row.
+			return nil
+		}
+		d.LastReconcileAt = ts
+		d.LastReconcileStatus = ReconcileFailed
+		d.LastError = err2.Error()
+		d.UpdatedAt = ts
+		payload, err := marshalFunction(d)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE functions SET data = jsonb(?), updated_at = ? WHERE name = ?`,
+			payload, ts, name)
 		return err
 	})
 	if err != nil {
@@ -515,9 +436,8 @@ func (c *State) RecordReconcileFailure(name string, err2 error) {
 	}
 }
 
-// RecordRemoved deletes a function, its handlers, and its per-function stats
-// from the state database, so a removed function never leaves a stale stats row
-// behind.
+// RecordRemoved deletes a function and its per-function stats from the state
+// database, so a removed function never leaves a stale stats row behind.
 func (c *State) RecordRemoved(name string) {
 	ctx := context.Background()
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -530,15 +450,15 @@ func (c *State) RecordRemoved(name string) {
 
 // PruneRemoved removes state rows for every function recorded in the database
 // that no longer exists in dir (the authoritative /functions root), including
-// its handlers and function_stats. The filesystem is the source of truth; this
-// only removes rows for functions genuinely absent from disk. Transient stat
-// errors (permissions/I/O) are skipped — a flaky read must not drop a function
-// that is still on disk, mirroring the reconciler's removal tolerance. The
-// global single-row stats table is deliberately untouched. It is intended to
-// run at startup, before the fresh registry's counters are seeded from the
-// persisted function_stats (restorePersistedStats), so a function removed while
-// the worker was down is pruned before its stale function_stats row could be
-// re-seeded into metrics.
+// its function_stats. The filesystem is the source of truth; this only removes
+// rows for functions genuinely absent from disk. Transient stat errors
+// (permissions/I/O) are skipped — a flaky read must not drop a function that is
+// still on disk, mirroring the reconciler's removal tolerance. The global
+// single-row stats table is deliberately untouched. It is intended to run at
+// startup, before the fresh registry's counters are seeded from the persisted
+// function_stats (restorePersistedStats), so a function removed while the worker
+// was down is pruned before its stale function_stats row could be re-seeded into
+// metrics.
 func (c *State) PruneRemoved(dir string) {
 	ctx := context.Background()
 
@@ -579,21 +499,13 @@ func (c *State) PruneRemoved(dir string) {
 	}
 }
 
-// removeTx deletes a function and all of its state rows — handlers, schedules,
-// services, function_stats, and the functions row itself — inside tx. It is
-// shared by the live reconciler removal (RecordRemoved) and the startup sweep
-// (PruneRemoved) so both are behaviorally identical: a removed function never
-// leaves a stale handlers, schedules, services, or function_stats row behind.
+// removeTx deletes a function and its per-function stats row — the functions
+// row itself and the matching function_stats row — inside tx. The nested
+// handler/schedule/service configuration lives inside functions.data, so no
+// child-table delete is needed. It is shared by the live reconciler removal
+// (RecordRemoved) and the startup sweep (PruneRemoved) so both are behaviorally
+// identical: a removed function never leaves a stale function_stats row behind.
 func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM schedules WHERE function_name = ?`, name); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE function_name = ?`, name); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM function_stats WHERE function_name = ?`, name); err != nil {
 		return err
 	}
@@ -601,17 +513,16 @@ func removeTx(ctx context.Context, tx *sql.Tx, name string) error {
 	return err
 }
 
-// ListFunctions returns the function summaries sorted by name. A nil/empty
-// slice and nil error mean the state database is simply empty.
+// ListFunctions returns the function summaries sorted by name, decoding the
+// relational name/updated_at columns and the functions.data snapshot for each
+// row. A nil/empty slice and nil error mean the state database is simply empty.
+// A row whose stored snapshot is corrupt is logged (naming the function and the
+// decode error) and skipped, so one bad row cannot hide the others.
 func (c *State) ListFunctions() []Row {
 	ctx := context.Background()
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT f.name, f.runtime, f.status, f.prepared_at, f.last_reconcile_status, f.updated_at,
-		        COUNT(h.handler)
-		 FROM functions f
-		 LEFT JOIN handlers h ON h.function_name = f.name
-		 GROUP BY f.name
-		 ORDER BY f.name`)
+		`SELECT name, `+jsonPayloadExpr+`, updated_at
+		 FROM functions ORDER BY name`)
 	if err != nil {
 		c.log.Warn("State: list functions failed", "error", err)
 		return nil
@@ -620,252 +531,224 @@ func (c *State) ListFunctions() []Row {
 
 	var out []Row
 	for rows.Next() {
-		var r Row
-		if err := rows.Scan(
-			&r.Name,
-			&r.Runtime,
-			&r.Status,
-			&r.PreparedAt,
-			&r.LastReconcileStatus,
-			&r.UpdatedAt,
-			&r.HandlerCount,
-		); err != nil {
+		var (
+			name      string
+			data      sql.NullString
+			updatedAt string
+		)
+		if err := rows.Scan(&name, &data, &updatedAt); err != nil {
 			c.log.Warn("State: scan list failed", "error", err)
 			return out
 		}
-		out = append(out, r)
+		d, err := unmarshalFunction(data.String)
+		if err != nil {
+			c.log.Warn("State: read function payload failed", "function", name, "error", err)
+			continue
+		}
+		d.Name = name
+		d.UpdatedAt = updatedAt
+		d.HandlerCount = len(d.Handlers)
+		out = append(out, d.Row)
 	}
 	return out
 }
 
-// GetFunction returns the full detail for name, or (zero, false) if unknown.
+// GetFunction returns the full detail for name, or (zero, false) if unknown. A
+// corrupt persisted snapshot fails clearly: the decode error is logged and the
+// row reads as unknown rather than yielding a partial record.
 func (c *State) GetFunction(name string) (Detail, bool) {
 	ctx := context.Background()
-	d := Detail{}
-	var envJSON, secretsJSON, networksJSON sql.NullString
-	err := c.db.QueryRowContext(ctx,
-		`SELECT name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets, networks
-		 FROM functions WHERE name = ?`, name,
-	).Scan(
-		&d.Name, &d.Runtime, &d.Status, &d.Image, &d.Fingerprint, &d.PreparedAt,
-		&d.LastReconcileAt, &d.LastReconcileStatus, &d.LastError, &d.UpdatedAt,
-		&envJSON, &secretsJSON, &networksJSON,
-	)
-	if err == sql.ErrNoRows {
-		return Detail{}, false
-	}
+	d, found, err := scanFunction(name, c.db.QueryRowContext(ctx,
+		`SELECT `+jsonPayloadExpr+`, updated_at
+		 FROM functions WHERE name = ?`, name))
 	if err != nil {
 		c.log.Warn("State: get failed", "function", name, "error", err)
 		return Detail{}, false
 	}
-	// Decode the env/secret MAPPINGS (never values). A NULL or unparseable
-	// column yields a nil map, which is harmless.
-	if envJSON.Valid && envJSON.String != "" {
-		_ = json.Unmarshal([]byte(envJSON.String), &d.Env)
-	}
-	if secretsJSON.Valid && secretsJSON.String != "" {
-		_ = json.Unmarshal([]byte(secretsJSON.String), &d.Secrets)
-	}
-	if networksJSON.Valid && networksJSON.String != "" {
-		_ = json.Unmarshal([]byte(networksJSON.String), &d.Networks)
-	}
-
-	hrows, err := c.db.QueryContext(ctx,
-		`SELECT handler, timeout FROM handlers WHERE function_name = ? ORDER BY handler`, name)
-	if err != nil {
-		c.log.Warn("State: handlers read failed", "function", name, "error", err)
-		return d, true
-	}
-	defer hrows.Close()
-	for hrows.Next() {
-		var hn, ht string
-		if err := hrows.Scan(&hn, &ht); err != nil {
-			c.log.Warn("State: scan handler failed", "function", name, "error", err)
-			continue
-		}
-		dur, derr := time.ParseDuration(ht)
-		if derr != nil {
-			dur = 0
-		}
-		d.Handlers = append(d.Handlers, Handler{Name: hn, Timeout: dur})
-	}
-
-	srows, err := c.db.QueryContext(ctx,
-		`SELECT handler, cron, timezone, timeout FROM schedules WHERE function_name = ? ORDER BY handler, cron`, name)
-	if err != nil {
-		c.log.Warn("State: schedules read failed", "function", name, "error", err)
-		return d, true
-	}
-	defer srows.Close()
-	for srows.Next() {
-		var sh, sc, stz, sto string
-		if err := srows.Scan(&sh, &sc, &stz, &sto); err != nil {
-			c.log.Warn("State: scan schedule failed", "function", name, "error", err)
-			continue
-		}
-		dur, derr := time.ParseDuration(sto)
-		if derr != nil {
-			dur = 0
-		}
-		d.Schedules = append(d.Schedules, Schedule{Handler: sh, Cron: sc, Timezone: stz, Timeout: dur})
-	}
-
-	srows2, err := c.db.QueryContext(ctx,
-		`SELECT entrypoint, build, image, path, port, replicas FROM services WHERE function_name = ? ORDER BY entrypoint, build, image`, name)
-	if err != nil {
-		c.log.Warn("State: services read failed", "function", name, "error", err)
-		return d, true
-	}
-	defer srows2.Close()
-	for srows2.Next() {
-		// The three source columns are never NULL: exactly one holds the source
-		// descriptor and the others are the empty string (see the schema).
-		var se, sb, si string
-		var sePath sql.NullString
-		var sp, sr int
-		if err := srows2.Scan(&se, &sb, &si, &sePath, &sp, &sr); err != nil {
-			c.log.Warn("State: scan service failed", "function", name, "error", err)
-			continue
-		}
-		d.Services = append(d.Services, Service{
-			Entrypoint: se,
-			Build:      sb,
-			Image:      si,
-			Path:       sePath.String,
-			Port:       sp,
-			Replicas:   sr,
-		})
+	if !found {
+		return Detail{}, false
 	}
 	return d, true
 }
 
-// insertStmt returns a function that INSERTs a function row, upserting
-// (replacing) on conflict keyed by name. On conflict only the non-active fields
-// are overwritten; a rebuild/discovery never clobbers a ready image until a
-// later success records it. The reconcile outcome columns
-// (last_reconcile_at/last_reconcile_status/last_error) are also overwritten by
-// the record in the VALUES row, so a success on an existing row persists its
-// own outcome and timestamp; only the active-version fields
-// (image/fingerprint/prepared_at — and status on the failure path) are guarded.
-// env, secrets, and networks are the serialized env/secret MAPPINGS (JSON
-// objects) and the normalized top-level Docker-network list (JSON array), never
-// secret values.
-type insertFn func(
-	name, runtime, status, image, fingerprint, prepared string,
-	reconcileAt, reconcileStatus, lastError, updated string,
-	env, secrets, networks string,
-) error
-
-func insertStmt(tx *sql.Tx) insertFn {
-	return func(
-		name, runtime, status, image, fingerprint, prepared string,
-		reconcileAt, reconcileStatus, lastError, updated string,
-		env, secrets, networks string,
-	) error {
-		_, err := tx.Exec(
-			`INSERT INTO functions (name, runtime, status, image, fingerprint, prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at, env, secrets, networks)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-			 ON CONFLICT(name) DO UPDATE SET
-			   runtime = excluded.runtime,
-			   status = excluded.status,
-			   image = excluded.image,
-			   fingerprint = excluded.fingerprint,
-			   prepared_at = excluded.prepared_at,
-			   last_reconcile_at = excluded.last_reconcile_at,
-			   last_reconcile_status = excluded.last_reconcile_status,
-			   last_error = excluded.last_error,
-			   updated_at = excluded.updated_at,
-			   env = excluded.env,
-			   secrets = excluded.secrets,
-			   networks = excluded.networks`,
-			name, runtime, status, image, fingerprint, prepared, reconcileAt, reconcileStatus, lastError, updated, env, secrets, networks)
-		return err
-	}
-}
-
-// replaceHandlers deletes a function's handlers and re-inserts them from the
-// template, so the handler list always mirrors the latest parsed template.
-func replaceHandlers(tx *sql.Tx, name string, tmpl *function.Template) error {
-	if _, err := tx.Exec(`DELETE FROM handlers WHERE function_name = ?`, name); err != nil {
-		return err
-	}
-	for _, rule := range tmpl.Events {
-		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO handlers (function_name, handler, timeout) VALUES (?,?,?)`,
-			name, rule.Handler, rule.Timeout.String()); err != nil {
-			return err
+// scanFunction decodes one functions row selected as (json(data), updated_at)
+// into a Detail. name is relational metadata supplied by the caller (it is not
+// part of the payload). found is false for an absent row; a stored payload whose
+// JSON is invalid is returned as an error so the caller can log a clear decode
+// failure.
+func scanFunction(name string, row *sql.Row) (Detail, bool, error) {
+	var data sql.NullString
+	var updatedAt sql.NullString
+	if err := row.Scan(&data, &updatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return Detail{}, false, nil
 		}
+		return Detail{}, false, err
 	}
-	return nil
+	d, err := unmarshalFunction(data.String)
+	if err != nil {
+		return Detail{}, false, err
+	}
+	d.Name = name
+	d.UpdatedAt = updatedAt.String
+	d.HandlerCount = len(d.Handlers)
+	return d, true, nil
 }
 
-// replaceSchedules deletes a function's schedules and re-inserts them from the
-// template, so the schedule list always mirrors the latest parsed template. The
-// timezone is stored as its effective location name (e.g. "UTC",
-// "Europe/Rome"); the timeout as its string form.
-func replaceSchedules(tx *sql.Tx, name string, tmpl *function.Template) error {
-	if _, err := tx.Exec(`DELETE FROM schedules WHERE function_name = ?`, name); err != nil {
+// upsertFunctionTx writes the whole Detail snapshot as one JSONB value in
+// functions.data, upserting on the name key. The snapshot replaces the previous
+// one atomically, so a template change never leaves a mixture of old and new
+// handler/schedule/service configuration.
+func upsertFunctionTx(ctx context.Context, tx *sql.Tx, d Detail) error {
+	payload, err := marshalFunction(d)
+	if err != nil {
 		return err
 	}
-	for _, s := range tmpl.Schedules {
-		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO schedules (function_name, handler, cron, timezone, timeout) VALUES (?,?,?,?,?)`,
-			name, s.Handler, s.Cron, s.Location.String(), s.Timeout.String()); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO functions (name, data, updated_at) VALUES (?, jsonb(?), ?)
+		 ON CONFLICT(name) DO UPDATE SET
+		   data       = excluded.data,
+		   updated_at = excluded.updated_at`,
+		d.Name, payload, d.UpdatedAt)
+	return err
 }
 
-// replaceServices deletes a function's services and re-inserts them from the
-// template, so the service list always mirrors the latest parsed template. The
-// key is the configured source — exactly one of entrypoint/build/image is
-// non-empty (the others are stored as empty strings, never NULL) — which is the
-// service's identity. Path is stored as its canonical string (empty = host-only
-// routing); port and replicas as their effective integer values (defaults
-// included).
-func replaceServices(tx *sql.Tx, name string, tmpl *function.Template) error {
-	if _, err := tx.Exec(`DELETE FROM services WHERE function_name = ?`, name); err != nil {
-		return err
+// functionSnapshot builds the persisted snapshot for a function template: the
+// lifecycle fields passed in PLUS the whole configuration (env/secret
+// references, networks, handlers, schedules, services). Name is relational
+// metadata and UpdatedAt is stamped by the caller; HandlerCount is derived on
+// read. Secret entries hold only the reference name — never a resolved value.
+func functionSnapshot(
+	name string,
+	tmpl *function.Template,
+	status,
+	image,
+	fingerprint,
+	prepared,
+	reconcileAt,
+	reconcileStatus,
+	lastError string,
+) Detail {
+	env, secrets, networks := snapshotConfig(tmpl)
+	return Detail{
+		Row: Row{
+			Name:                name,
+			Runtime:             tmpl.Runtime,
+			Status:              status,
+			LastReconcileStatus: reconcileStatus,
+			PreparedAt:          prepared,
+		},
+		Image:           image,
+		Fingerprint:     fingerprint,
+		LastReconcileAt: reconcileAt,
+		LastError:       lastError,
+		Handlers:        snapshotHandlers(tmpl),
+		Schedules:       snapshotSchedules(tmpl),
+		Services:        snapshotServices(tmpl),
+		Env:             env,
+		Secrets:         secrets,
+		Networks:        networks,
 	}
-	for _, s := range tmpl.Services {
-		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO services (function_name, entrypoint, build, image, path, port, replicas) VALUES (?,?,?,?,?,?,?)`,
-			name, s.Entrypoint, s.Build, s.Image, s.Path, s.Port, s.Replicas); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
-// serializeTemplate renders a template's env and secrets maps as JSON object
-// strings and its normalized `networks` list as a JSON array string for the
-// functions table. Only the env/secret MAPPINGS are stored (env-var name →
-// literal value, and env-var name → secret reference) — never a secret VALUE.
-// JSON is used (rather than a "k=v" logfmt) because env values may legitimately
-// contain '=' (e.g. connection strings). An empty map or list serializes to
-// "null", which is stored as NULL.
-func serializeTemplate(tmpl *function.Template) (env, secrets, networks string) {
+// snapshotConfig copies a template's env and secret MAPPINGS and its normalized
+// `networks` list for the persisted snapshot. Only the env/secret MAPPINGS are
+// stored (env-var name → literal value, and env-var name → secret reference) —
+// never a secret VALUE. Empty maps/lists stay nil so the payload omits them and
+// a read-back yields nil (the CLI's "section absent" convention).
+func snapshotConfig(tmpl *function.Template) (env, secrets map[string]string, networks []string) {
 	if len(tmpl.Env) > 0 {
-		if b, err := json.Marshal(tmpl.Env); err == nil {
-			env = string(b)
+		env = make(map[string]string, len(tmpl.Env))
+		for name, value := range tmpl.Env {
+			env[name] = value
 		}
 	}
 	if len(tmpl.Secrets) > 0 {
-		refs := make(map[string]string, len(tmpl.Secrets))
+		secrets = make(map[string]string, len(tmpl.Secrets))
 		for name, ref := range tmpl.Secrets {
-			refs[name] = ref.String()
-		}
-		if b, err := json.Marshal(refs); err == nil {
-			secrets = string(b)
+			secrets[name] = ref.String()
 		}
 	}
 	if len(tmpl.Networks) > 0 {
-		if b, err := json.Marshal(tmpl.Networks); err == nil {
-			networks = string(b)
-		}
+		networks = append([]string(nil), tmpl.Networks...)
 	}
 	return env, secrets, networks
+}
+
+// snapshotHandlers renders the template's event rules as name-ordered handlers
+// (name + resolved timeout). It mirrors the ordering the former handlers table
+// produced (ORDER BY handler), so list/detail output is unchanged.
+func snapshotHandlers(tmpl *function.Template) []Handler {
+	if len(tmpl.Events) == 0 {
+		return nil
+	}
+	out := make([]Handler, 0, len(tmpl.Events))
+	for _, rule := range tmpl.Events {
+		out = append(out, Handler{Name: rule.Handler, Timeout: rule.Timeout, Retries: rule.Retries})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// snapshotSchedules renders the template's cron schedules with their verbatim
+// expression, effective location name, resolved timeout, and retry count. It
+// mirrors the former schedules table ordering (ORDER BY handler, cron).
+func snapshotSchedules(tmpl *function.Template) []Schedule {
+	if len(tmpl.Schedules) == 0 {
+		return nil
+	}
+	out := make([]Schedule, 0, len(tmpl.Schedules))
+	for _, s := range tmpl.Schedules {
+		// time.Location.String() is nil-safe (a nil location reports "UTC"),
+		// matching the persisted timezone semantics of the former table.
+		out = append(out, Schedule{
+			Handler:  s.Handler,
+			Cron:     s.Cron,
+			Timezone: s.Location.String(),
+			Timeout:  s.Timeout,
+			Retries:  s.Retries,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Handler != out[j].Handler {
+			return out[i].Handler < out[j].Handler
+		}
+		return out[i].Cron < out[j].Cron
+	})
+	return out
+}
+
+// snapshotServices renders the template's persistent services with their source
+// (exactly one of entrypoint/build/image), routing host/path, effective port,
+// and desired replicas. It mirrors the former services table ordering (ORDER BY
+// entrypoint, build, image), so a source-kind service keeps a deterministic
+// position.
+func snapshotServices(tmpl *function.Template) []Service {
+	if len(tmpl.Services) == 0 {
+		return nil
+	}
+	out := make([]Service, 0, len(tmpl.Services))
+	for _, s := range tmpl.Services {
+		out = append(out, Service{
+			Entrypoint: s.Entrypoint,
+			Build:      s.Build,
+			Image:      s.Image,
+			Host:       s.Host,
+			Path:       s.Path,
+			Port:       s.Port,
+			Replicas:   s.Replicas,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Entrypoint != out[j].Entrypoint {
+			return out[i].Entrypoint < out[j].Entrypoint
+		}
+		if out[i].Build != out[j].Build {
+			return out[i].Build < out[j].Build
+		}
+		return out[i].Image < out[j].Image
+	})
+	return out
 }
 
 // RelativeAgo renders an RFC3339 timestamp as a short relative age: "12s ago",

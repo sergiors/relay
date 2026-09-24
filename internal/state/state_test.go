@@ -241,7 +241,7 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	}
 }
 
-// removal deletes the function row and its handlers.
+// removal deletes the function row and its snapshot.
 func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
@@ -252,7 +252,7 @@ func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 	if _, ok := c.GetFunction("fn"); ok {
 		t.Fatal("expected fn to be removed")
 	}
-	// Re-adding must not resurrect stale handlers (they were deleted).
+	// Re-adding must not resurrect stale handlers (the old snapshot was deleted).
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
 	if _, ok := c.GetFunction("fn"); !ok {
 		t.Fatal("expected fn re-added")
@@ -378,14 +378,14 @@ func TestRelativeAgo(t *testing.T) {
 }
 
 // PruneRemoved removes state for functions missing from the authoritative dir,
-// INCLUDING handlers and function_stats, while keeping functions that still
-// exist on disk and leaving the global stats row untouched.
+// INCLUDING their snapshot and function_stats, while keeping functions that
+// still exist on disk and leaving the global stats row untouched.
 func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
-	// rows (handlers + function_stats) so the sweep must clean them inclusively.
+	// rows (snapshot + function_stats) so the sweep must clean them inclusively.
 	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), fnFor(t, "gone", tmpl))
 	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsMatchedTotal: 5})
 	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), fnFor(t, "kept", tmpl))
@@ -552,28 +552,40 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 	return set
 }
 
-// TestFreshSchemaHasCurrentColumns checks the current schema columns directly:
-// initSchema must create the functions env/secrets columns and the services
-// source/path columns. The services table stores each source kind as its own
-// column and derives the service identity from whichever is set, so there is no
-// separate identity column.
+// TestFreshSchemaHasCurrentColumns checks the current schema shape directly:
+// initSchema must create the functions table with exactly name/data/updated_at,
+// and must NOT create any of the removed child tables. The whole nested
+// function configuration (handlers, schedules, services, env/secrets/networks)
+// lives inside functions.data, so there are no per-handler/schedule/service
+// tables.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	c := openTestState(t)
 
 	fnCols := tableColumnSet(t, c, "functions")
-	for _, want := range []string{"env", "secrets"} {
+	for _, want := range []string{"name", "data", "updated_at"} {
 		if !fnCols[want] {
 			t.Errorf("functions missing current column %q: %v", want, fnCols)
 		}
 	}
+	if len(fnCols) != 3 {
+		t.Errorf("functions must have exactly name/data/updated_at, got %v", fnCols)
+	}
 
-	svcCols := tableColumnSet(t, c, "services")
-	for _, want := range []string{"function_name", "entrypoint", "build", "image", "path", "port", "replicas"} {
-		if !svcCols[want] {
-			t.Errorf("services missing current column %q: %v", want, svcCols)
+	for _, table := range []string{"handlers", "schedules", "services"} {
+		if tableExists(t, c, table) {
+			t.Errorf("obsolete child table %q must not exist in the current schema", table)
 		}
 	}
-	if svcCols["identity"] {
-		t.Errorf("services has a redundant identity column: %v", svcCols)
+}
+
+// tableExists reports whether table is present in the database.
+func tableExists(t *testing.T, c *State, table string) bool {
+	t.Helper()
+	var n int
+	err := c.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
+	if err != nil {
+		t.Fatalf("check table %s: %v", table, err)
 	}
+	return n > 0
 }

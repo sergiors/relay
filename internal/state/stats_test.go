@@ -86,7 +86,7 @@ func TestStatsOnEmptyDB(t *testing.T) {
 }
 
 // RebuildFromFS does not erase the stats row: discovery only touches the
-// functions/handlers tables.
+// functions table.
 func TestRebuildFromFSKeepsStats(t *testing.T) {
 	root := t.TempDir()
 	writeFunctionsDir(t, root)
@@ -188,7 +188,7 @@ func TestFunctionStatsAbsent(t *testing.T) {
 	}
 }
 
-// RecordRemoved deletes the function_stats row alongside the function/handlers.
+// RecordRemoved deletes the function_stats row alongside the functions row.
 func TestRemovalDeletesFunctionStats(t *testing.T) {
 	c := openTestState(t)
 	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3})

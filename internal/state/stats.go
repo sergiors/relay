@@ -47,6 +47,9 @@ func (c *State) RecordStats(s Stats) {
 // the CURRENT cumulative registry values for the counters and current gauge
 // snapshots for the backlog, so the row always mirrors the latest known totals.
 //
+// The payload is written as SQLite binary JSON via jsonb(?), which also
+// validates it at write time.
+//
 // Absolute snapshot semantics: each flush writes the caller's current
 // cumulative values; a repeated flush with identical values is a no-op effect
 // (same totals, refreshed updated_at), never double-counting. Callers must pass
@@ -60,7 +63,7 @@ func (c *State) RecordStatsContext(ctx context.Context, s Stats) {
 		return
 	}
 	_, err = c.db.ExecContext(ctx,
-		`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)
+		`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
@@ -111,7 +114,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 		// column flush computed ts once too).
 		ts := c.nowString()
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)
+			`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
@@ -131,7 +134,7 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 			// re-created even though the prune above already removed it.
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO function_stats (function_name, data, updated_at)
-				 SELECT ?, ?, ?
+				 SELECT ?, jsonb(?), ?
 				 WHERE EXISTS (SELECT 1 FROM functions WHERE name = ?)
 				 ON CONFLICT(function_name) DO UPDATE SET
 				   data       = excluded.data,
@@ -149,13 +152,13 @@ func (c *State) RecordStatsSnapshot(ctx context.Context, s Stats, fns []Function
 }
 
 // storedFunctionStatsPayloads reads every function_stats row's decoded payload,
-// keyed by function name, inside tx. A NULL/empty column yields the zero value.
-// A row whose JSON is invalid is logged (naming the function and the decode
-// error) and treated as the zero value, so one corrupt row cannot abort the
-// whole flush; the flush below overwrites it with the incoming absolute
-// snapshot, self-healing the row.
+// keyed by function name, inside tx. A row whose JSON is invalid is logged
+// (naming the function and the decode error) and treated as the zero value, so
+// one corrupt row cannot abort the whole flush; the flush below overwrites it
+// with the incoming absolute snapshot, self-healing the row.
 func (c *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]FunctionStats, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT function_name, data FROM function_stats`)
+	rows, err := tx.QueryContext(ctx,
+		`SELECT function_name, `+jsonPayloadExpr+` FROM function_stats`)
 	if err != nil {
 		return nil, err
 	}
@@ -178,15 +181,15 @@ func (c *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (ma
 }
 
 // storedFunctionStatsTx reads and decodes one function_stats row's payload
-// inside tx, returning the zero value when the row is absent or its data column
-// is NULL/empty. An invalid payload is logged (naming the function and the
-// decode error) and treated as the zero value, so the caller's incoming
-// absolute snapshot still lands and self-heals the row. It is the single-row
-// companion of storedFunctionStatsPayloads, shared by the standalone upsert.
+// inside tx, returning the zero value when the row is absent. An invalid
+// payload is logged (naming the function and the decode error) and treated as
+// the zero value, so the caller's incoming absolute snapshot still lands and
+// self-heals the row. It is the single-row companion of
+// storedFunctionStatsPayloads, shared by the standalone upsert.
 func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name string) FunctionStats {
 	var data sql.NullString
 	err := tx.QueryRowContext(ctx,
-		`SELECT data FROM function_stats WHERE function_name = ?`, name,
+		`SELECT `+jsonPayloadExpr+` FROM function_stats WHERE function_name = ?`, name,
 	).Scan(&data)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}
@@ -222,9 +225,9 @@ func (c *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name stri
 // does not know about are not round-tripped (the typed structs are the source
 // of truth); every KNOWN unrelated field survives. updated_at is refreshed to
 // now() on every rewritten row (generic last-write metadata, same semantics as
-// RecordStats). Everything else in the database (functions, handlers,
-// schedules, services, git state, secrets, invocation state) is untouched; no
-// Prometheus counter, Redis state, worker, or container is involved.
+// RecordStats). Everything else in the database (functions and their
+// snapshots, git state, secrets, invocation state) is untouched; no Prometheus
+// counter, Redis state, worker, or container is involved.
 //
 // Concurrency: one transaction (rebuildTx), so a partial reset never lands. The
 // in-memory metrics registry is NOT touched here — a running worker must reset
@@ -258,20 +261,22 @@ func (c *State) ResetStats() error {
 
 // resetGlobalStatsTx zeroes the global stats row's cumulative counters in
 // tx while preserving the live backlog gauges and any other decoded field. An
-// absent, NULL, or empty row has nothing cumulative to zero and is left
-// untouched (creating one would falsely claim stats were recorded). A corrupt
-// non-empty payload is returned as an error so the transaction rolls back.
+// absent row has nothing cumulative to zero and is left untouched (creating one
+// would falsely claim stats were recorded). A corrupt payload is returned as an
+// error so the transaction rolls back.
 func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	var data sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT data FROM stats WHERE id = 1`).Scan(&data)
-	switch {
-	case err == sql.ErrNoRows:
-		return nil
-	case err != nil:
-		return err
-	case !data.Valid || data.String == "":
+	err := tx.QueryRowContext(ctx,
+		`SELECT `+jsonPayloadExpr+` FROM stats WHERE id = 1`).Scan(&data)
+	if err == sql.ErrNoRows {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	// The column is NOT NULL, so a NULL rendering means the stored blob is not
+	// valid JSON; unmarshalStats surfaces that as a decode failure (rolling the
+	// reset back) rather than silently zeroing a corrupt row.
 	s, err := unmarshalStats(data)
 	if err != nil {
 		return err
@@ -290,7 +295,7 @@ func (c *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) e
 		return err
 	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO stats (id, data, updated_at) VALUES (1, ?, ?)
+		`INSERT INTO stats (id, data, updated_at) VALUES (1, jsonb(?), ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   data       = excluded.data,
 		   updated_at = excluded.updated_at`,
@@ -311,7 +316,8 @@ func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string)
 		name string
 		data sql.NullString
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT function_name, data FROM function_stats`)
+	rows, err := tx.QueryContext(ctx,
+		`SELECT function_name, `+jsonPayloadExpr+` FROM function_stats`)
 	if err != nil {
 		return err
 	}
@@ -352,7 +358,7 @@ func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string)
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE function_stats SET data = ?, updated_at = ? WHERE function_name = ?`,
+			`UPDATE function_stats SET data = jsonb(?), updated_at = ? WHERE function_name = ?`,
 			payload, ts, r.name); err != nil {
 			return err
 		}
@@ -361,15 +367,15 @@ func (c *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string)
 }
 
 // Stats returns the current operational snapshot, or (zero, false) when no row
-// has been recorded yet or the read/decoding fails (which is logged). An empty
-// or NULL payload decodes to the zero Stats; a non-empty invalid payload is
-// logged with the underlying JSON error and surfaced as unreadable.
+// has been recorded yet or the read/decoding fails (which is logged). A stored
+// payload that is not valid JSON is logged with the underlying error and
+// surfaced as unreadable.
 func (c *State) Stats() (Stats, bool) {
 	ctx := context.Background()
 	var data sql.NullString
 	var updatedAt sql.NullString
 	err := c.db.QueryRowContext(ctx,
-		`SELECT data, updated_at FROM stats WHERE id = 1`,
+		`SELECT `+jsonPayloadExpr+`, updated_at FROM stats WHERE id = 1`,
 	).Scan(&data, &updatedAt)
 	if err == sql.ErrNoRows {
 		return Stats{}, false

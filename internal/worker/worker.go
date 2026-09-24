@@ -854,7 +854,7 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 			WarmAcquiresTotal: fs.WarmAcquiresTotal,
 			ColdStartsTotal:   fs.ColdStartsTotal,
 			DiscardedTotal:    fs.DiscardedTotal,
-			// Parse the RFC3339 timestamp columns back to unix seconds for the
+			// Parse the RFC3339 timestamp strings back to unix seconds for the
 			// registry (an unparseable/empty value parses to a zero time, which
 			// SeedFunctionStat skips as "never observed").
 			LastExecution: rfc3339ToUnix(fs.LastExecutionAt),
@@ -991,15 +991,15 @@ func captureRelayBaseline(metricsInstance *metrics.Registry) relayBaseline {
 	return b
 }
 
-// snapshotStats maps the metrics registry into the state database's Stats row.
-// The registry counter names feed the SQLite columns directly, with one rename
-// (retries_total → RetryTotal) and the float gauges truncated to int64. Each
-// cumulative counter has the worker-owned relay baseline subtracted (base), so
-// an operator reset starts the persisted totals from zero while Prometheus stays
-// monotonic; before any reset the baseline is zero and this equals the raw
-// counter. The backlog gauges are point-in-time values and are never baselined.
-// The three event-classification counters are copied verbatim, preserving the
-// received == matched + unmatched partition.
+// snapshotStats maps the metrics registry into the state database's Stats
+// payload. The registry counter names feed the persisted Stats fields directly,
+// with one rename (retries_total → RetryTotal) and the float gauges truncated to
+// int64. Each cumulative counter has the worker-owned relay baseline subtracted
+// (base), so an operator reset starts the persisted totals from zero while
+// Prometheus stays monotonic; before any reset the baseline is zero and this
+// equals the raw counter. The backlog gauges are point-in-time values and are
+// never baselined. The three event-classification counters are copied verbatim,
+// preserving the received == matched + unmatched partition.
 // It is nil-safe: a nil registry yields a zero Stats so the snapshot path can
 // never panic or block processing.
 func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state.Stats {

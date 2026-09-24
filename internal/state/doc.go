@@ -12,7 +12,7 @@
 //   - status: "ready" (an active version is built and serving) or "pending"
 //     (loaded but not yet built/verified)
 //   - last_reconcile_status: "success" | "failed"
-//     (skipped periodic checks are not recorded; the columns reflect the last
+//     (skipped periodic checks are not recorded; the snapshot reflects the last
 //     MEANINGFUL reconcile — a success or a failure — so an unchanged-function
 //     periodic pass never overwrites them)
 //
@@ -20,18 +20,26 @@
 // active image/fingerprint/prepared_at are retained so the last good version
 // still serves. All timestamps are RFC3339 strings.
 //
-// Env and secrets columns: the functions table stores the env/secret MAPPINGS
-// from each function's template (env-var name → literal value, and env-var name
-// → secret reference) as JSON object strings. These are configuration metadata
-// like the handler timeouts — never secret VALUES. A secret's value is never
-// stored in SQLite; only the reference name is. The env and secrets columns are
-// part of the current schema created by initSchema on a fresh database.
+// Function storage model:
 //
-// Schedules: a `schedules` table (function_name, handler, cron, timezone,
-// timeout) mirrors the template's cron schedules — the handler, its verbatim
-// 5-field cron expression, the effective IANA timezone name, and the resolved
-// timeout — so `relay function inspect` can render them. Like handlers, it is
-// keyed by function_name with no foreign key; cleanup is explicit via removeTx.
+//   - functions(name TEXT PRIMARY KEY, data BLOB NOT NULL, updated_at TEXT NOT
+//     NULL) stores ONE whole per-function snapshot as a JSON object in data,
+//     written through SQLite's jsonb(?) (binary JSON / JSONB format) and read
+//     back with json(data). Only the stable name key and the write timestamp
+//     stay as columns. The nested configuration — the env and secret MAPPINGS
+//     (env-var name → literal value, and env-var name → secret REFERENCE, never
+//     a secret value), the normalized Docker networks, the event handlers (name
+//   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
+//     services (entrypoint/build/image/host/path/port/replicas) — is all part of
+//     that one payload, so a template change replaces the snapshot atomically
+//     and there are no per-handler/schedule/service child tables.
+//   - The handler/event and schedule entries deliberately omit the template
+//     parser's opaque matcher patterns: matching is rebuilt from template.yaml,
+//     never from this read-only view, and those matcher interfaces cannot be
+//     JSON round-tripped.
+//
+// Secret values are never stored: only the reference names appear in the
+// snapshot.
 //
 // Design Constraint:
 //   - State errors are never fatal. Callers (main, reconciler) log them and
@@ -43,13 +51,13 @@
 // snapshot of Relay's operational counters — idempotent, no deltas. Only stable
 // relational metadata is kept as columns: stats.id and stats.updated_at, and
 // function_stats.function_name and function_stats.updated_at. The evolving
-// counter/gauge/execution-history payload is a JSON object in the data TEXT
-// column of each table, marshalled and unmarshalled ONLY through stats_json.go;
-// the worker, CLI, runtime, and metrics layers pass typed Stats/FunctionStats
-// values and never touch the JSON. This keeps the schema stable as
-// instrumentation grows: absent fields decode to zero, so a payload written by
-// an older or newer Relay remains readable. The typed structs are the source of
-// truth.
+// counter/gauge/execution-history payload is a JSON object — stored as binary
+// JSON (JSONB) in the data BLOB column — marshalled and unmarshalled ONLY
+// through stats_json.go; the worker, CLI, runtime, and metrics layers pass typed
+// Stats/FunctionStats values and never touch the JSON. This keeps the schema
+// stable as instrumentation grows: absent fields decode to zero. The typed
+// structs are the source of truth. There is no migration or backward
+// compatibility for payloads written by a different schema.
 //
 // In addition to the event/handler counters, function_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,

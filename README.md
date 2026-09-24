@@ -1367,20 +1367,23 @@ how the last reconcile of each function went without touching Redis or Docker.
   also works for host-side runs. It is **not** external infrastructure — it is
   a local file you can volume-mount to persist across restarts. `compose.dev.yaml`
   mounts a named volume `relay-data` at `/var/lib/relay`.
-- **Schema**: a `functions` table (name, runtime, status, image, fingerprint,
-  prepared_at, last_reconcile_at, last_reconcile_status, last_error, updated_at,
-  env, secrets), a `handlers` table (function_name, handler, timeout), a
-  `services` table (`function_name`, `entrypoint`, `build`, `image`,
-  `path`, `port`, `replicas`), a
-  single-row `stats` table (`id`, `updated_at`, and a JSON `data` payload
-  holding the current global operational counters plus backlog gauges), and a
-  `function_stats` table (`function_name`, `updated_at`, and a JSON `data`
-  payload holding the per-function counters). Only stable relational metadata is
+- **Schema**: a `functions` table (`name`, `data`, `updated_at`) where `data` is
+  a single stored JSON snapshot of the whole function — runtime/status/image/
+  fingerprint/prepared_at/last-reconcile outcome, env/secret **mappings**,
+  networks, handlers (name/timeout/retries), schedules (handler/cron/timezone/
+  timeout/retries), and services (entrypoint/build/image/host/path/port/
+  replicas) — with only the stable name key and write timestamp kept as columns.
+  There are no per-handler/per-schedule/per-service child tables, so a template
+  change replaces one row atomically. A single-row `stats` table (`id`,
+  `updated_at`, and a JSON `data` payload holding the current global operational
+  counters plus backlog gauges), and a `function_stats` table (`function_name`,
+  `updated_at`, and a JSON `data` payload holding the per-function counters).
+  The `data` payloads are stored in SQLite's binary JSON (JSONB) format
+  (`jsonb(?)` on write, `json(data)` on read). Only stable relational metadata is
   a column; the evolving payload is JSON so new instrumentation needs no schema
-  change, and absent fields decode to zero for old/new readers alike. The `env`
-  and `secrets` columns store the function's env/secret **mappings** (JSON) —
-  never secret values. These are **current snapshots only** — no per-event rows,
-  no metric history (Prometheus is the time-series source).
+  change, and absent fields decode to zero. Secret **references** (never values)
+  live inside the function snapshot. These are **current snapshots only** — no
+  per-event rows, no metric history (Prometheus is the time-series source).
 - **State model**: `status` is `ready` (an active version is built and serving)
   or `pending` (loaded but not yet built). `last_reconcile_status` is
   `success` / `failed` (the last MEANINGFUL reconcile outcome; unchanged periodic

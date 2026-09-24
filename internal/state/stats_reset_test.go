@@ -7,14 +7,16 @@ import (
 	"time"
 )
 
-// resetSeedTmpl exercises every functions-adjacent table (handlers, schedules,
-// services) plus the env/secret MAPPINGS so a reset can be proven not to touch
-// them.
+// resetSeedTmpl exercises every part of the persisted functions snapshot
+// (handlers, schedules, services, env/secret references, networks) so a reset
+// can be proven not to touch them.
 const resetSeedTmpl = `runtime: python3.14
 env:
   API_URL: https://api.example.com
 secrets:
   DATABASE_URL: database-url
+networks:
+  - backend
 events:
   - handler: events.created.handler
     pattern:
@@ -31,8 +33,8 @@ services:
 // TestResetStatsZeroesCountersKeepsGauges verifies ResetStats zeroes the five
 // global cumulative counters while PRESERVING the two point-in-time backlog
 // gauges and every function_stats ROW (zeroed in place, never deleted),
-// refreshes updated_at, and leaves the unrelated
-// functions/handlers/schedules/services data intact.
+// refreshes updated_at, and leaves the unrelated functions snapshot
+// (handlers/schedules/services/env/secret references) intact.
 func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	c := openTestState(t)
 
@@ -126,7 +128,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	}
 
 	// Unrelated data is untouched: the function record, handlers, schedules,
-	// services, and env/secret mappings all survive.
+	// services, networks, and env/secret mappings all survive.
 	d, ok := c.GetFunction("alpha")
 	if !ok {
 		t.Fatal("function row must survive the stats reset")
@@ -142,6 +144,9 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	}
 	if d.Env["API_URL"] != "https://api.example.com" || d.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", d.Env, d.Secrets)
+	}
+	if len(d.Networks) != 1 || d.Networks[0] != "backend" {
+		t.Fatalf("networks must survive: %v", d.Networks)
 	}
 }
 
@@ -367,9 +372,9 @@ func TestResetStatsRollsBackOnCorruptFunctionPayload(t *testing.T) {
 	if !ok || good.EventsMatchedTotal != 5 {
 		t.Fatalf("good row must roll back: %+v, ok=%v", good, ok)
 	}
-	// The corrupt row survives untouched.
-	brokenData, _ := rawFunctionStatsData(t, c, "broken")
-	if brokenData != "{not-json" {
+	// The corrupt row survives untouched (its raw stored bytes are unchanged).
+	brokenData, _, _ := rawFunctionStatsBlob(t, c, "broken")
+	if string(brokenData) != "{not-json" {
 		t.Fatalf("corrupt row must be preserved unchanged, got %q", brokenData)
 	}
 }

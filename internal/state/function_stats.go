@@ -76,15 +76,16 @@ func (c *State) RecordFunctionStats(s FunctionStats) {
 
 // RecordFunctionStatsContext upserts the function_stats row for s.Function,
 // replacing the JSON payload with the supplied value and setting updated_at to
-// now(). Counters behave as an absolute snapshot (see RecordStats); the
-// four Last*At timestamps are additionally merged so an EMPTY incoming value
-// preserves the previously stored timestamp instead of overwriting it with ""
-// — "no observation" must never erase "last observed at". The read and write
-// happen in one transaction (the same short-transaction pattern as
-// RecordStatsSnapshot), so the merge is atomic with respect to other writers.
-// Callers must pass CURRENT cumulative values; the worker seeds the fresh
-// process registry from this table at startup so the first snapshot never
-// resets counters. It is non-fatal on error: it logs and returns.
+// now(). The payload is written as SQLite binary JSON via jsonb(?). Counters
+// behave as an absolute snapshot (see RecordStats); the four Last*At timestamps
+// are additionally merged so an EMPTY incoming value preserves the previously
+// stored timestamp instead of overwriting it with "" — "no observation" must
+// never erase "last observed at". The read and write happen in one transaction
+// (the same short-transaction pattern as RecordStatsSnapshot), so the merge is
+// atomic with respect to other writers. Callers must pass CURRENT cumulative
+// values; the worker seeds the fresh process registry from this table at
+// startup so the first snapshot never resets counters. It is non-fatal on
+// error: it logs and returns.
 func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats) {
 	err := c.rebuildTx(ctx, func(tx *sql.Tx) error {
 		stored := c.storedFunctionStatsTx(ctx, tx, s.Function)
@@ -94,7 +95,7 @@ func (c *State) RecordFunctionStatsContext(ctx context.Context, s FunctionStats)
 			return err
 		}
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)
+			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, jsonb(?), ?)
 			 ON CONFLICT(function_name) DO UPDATE SET
 			   data       = excluded.data,
 			   updated_at = excluded.updated_at`,
@@ -115,7 +116,7 @@ func (c *State) FunctionStats(name string) (FunctionStats, bool) {
 	var data sql.NullString
 	var updatedAt sql.NullString
 	err := c.db.QueryRowContext(ctx,
-		`SELECT data, updated_at FROM function_stats WHERE function_name = ?`, name,
+		`SELECT `+jsonPayloadExpr+`, updated_at FROM function_stats WHERE function_name = ?`, name,
 	).Scan(&data, &updatedAt)
 	if err == sql.ErrNoRows {
 		return FunctionStats{}, false
@@ -176,7 +177,7 @@ func (c *State) FunctionNames() ([]string, bool) {
 func (c *State) AllFunctionStats() []FunctionStats {
 	ctx := context.Background()
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT function_name, data, updated_at FROM function_stats ORDER BY function_name`)
+		`SELECT function_name, `+jsonPayloadExpr+`, updated_at FROM function_stats ORDER BY function_name`)
 	if err != nil {
 		c.log.Warn("State: list function stats failed", "error", err)
 		return nil
