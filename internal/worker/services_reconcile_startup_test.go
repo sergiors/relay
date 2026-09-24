@@ -17,9 +17,10 @@ import (
 
 // svcDeadlineDocker is a minimal reconciler.Docker fake that records the
 // deadline of every ctx passed to ServiceContainerList. Apply drives Reconcile,
-// which lists containers once per call, so the per-function Applys in
-// reconcileStartupServices are observable: each must receive its OWN bounded
-// context (a distinct ~reconcileTimeout deadline), not a single shared one.
+// which lists containers once per call; Reconcile now derives its own fresh
+// per-operation bound from the LIFECYCLE context the worker passes, so each
+// per-function Apply is still observable as its OWN bounded (~reconcileTimeout)
+// listing, not one shared deadline consumed across functions.
 type svcDeadlineDocker struct {
 	mu        sync.Mutex
 	deadlines []time.Time // deadline (local time) of each ServiceContainerList call; zero = no deadline
@@ -142,7 +143,7 @@ func TestReconcileStartupServicesRootedInLifecycle(t *testing.T) {
 
 	fake := &blockingListDocker{entered: make(chan struct{})}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
@@ -178,17 +179,17 @@ func TestReconcileStartupServicesRootedInLifecycle(t *testing.T) {
 }
 
 // TestReconcileStartupServicesBoundedPerFunction pins the per-function timeout
-// fix: reconcileStartupServices must give each function's service converge its
-// OWN bounded context, so one slow Docker call cannot consume the budget of the
-// functions that follow. It does so by recording the deadline each Apply's
-// ServiceContainerList saw: two available functions must each observe a distinct
-// ~reconcileTimeout deadline. The trailing SweepOrphans call is rooted in the
-// lifecycle context, which here is the unbounded context.Background, so it must
-// carry no deadline.
+// guarantee through the new mechanism: reconcileStartupServices passes the
+// shared lifecycle context to each Apply, and the ServiceReconciler derives a
+// FRESH per-operation ~reconcileTimeout bound from it, so each function's
+// container listing observes its own distinct deadline rather than one shared
+// (potentially already-consumed) context. The trailing SweepOrphans call is
+// rooted in the lifecycle context, which here is the unbounded
+// context.Background, so it carries no deadline.
 func TestReconcileStartupServicesBoundedPerFunction(t *testing.T) {
 	fake := &svcDeadlineDocker{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
 
 	tmpl := &function.Template{
 		Runtime: "node24",
@@ -341,7 +342,7 @@ func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	fake.addService("own-2", "relay-worker-a")
 	fake.addService("other-1", "relay-worker-b")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
 
 	shutdownServices(svcCtrl, "relay-worker-a", logger)
 

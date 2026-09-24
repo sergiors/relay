@@ -115,6 +115,15 @@ func (m *Manager) resolveBuildServiceImage(
 	}
 
 	start := m.clock()
+	// Pre-build structured log: emitted once, immediately before the Dockerfile
+	// build is issued, so a slow build is visible while it runs (the completion
+	// log below only appears on success). The generated image reference is
+	// content-addressed and safe to log.
+	m.log.Info("Service: building image",
+		"function", fnName,
+		"service", svc.SourceRef(),
+		"image", ref,
+	)
 	// The build runs on an independent, lifecycle-rooted buildTimeout context,
 	// NOT on the caller's ctx: ResolveServiceImage is reached from the service
 	// reconciler, whose ctx is a short reconcile budget, and a slow Dockerfile

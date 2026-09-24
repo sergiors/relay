@@ -29,7 +29,7 @@ func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 		t.Fatalf("start replica 1: %v", err)
 	}
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), defaultFakeHostname)
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -61,7 +61,7 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	seed("w2-a", "w2")
 	seed("none-a", "") // no hostname label: never claimed by any worker
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "w1")
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -94,7 +94,7 @@ func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
 		port: 80, replica: 0, state: container.StateRunning, hostname: "",
 	}
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "")
 	if err != nil {
 		t.Fatalf("shutdown cleanup: %v", err)
@@ -126,7 +126,7 @@ func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 	f.failStopFor = "fail-1"
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	n, err := c.ShutdownCleanup(context.Background(), "w1")
 	if err == nil {
 		t.Fatal("expected the stop failure to be surfaced")

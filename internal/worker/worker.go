@@ -53,15 +53,18 @@ import (
 const statsFlushInterval = 5 * time.Second
 
 // reconcileTimeout bounds every bounded service-reconcile daemon operation:
-// the startup orphan container sweep, each single per-function service converge,
-// the startup image keep-set list, and the reconciler's
-// UpdateServices/RemoveServices hooks (which run on live reconciles, not only at
-// startup). Each call gets its own fresh bound so one slow Docker call cannot
-// consume the budget of the calls that follow. It deliberately does NOT bound
-// Dockerfile builds: a build is bounded by runtime.buildTimeout (10m) on a
+// the startup orphan container sweep, the startup image keep-set list, the
+// reconciler's RemoveServices hook, and — injected into the ServiceReconciler —
+// each normal pre-build and post-build Docker operation inside a per-function
+// Apply. Each such operation gets its own fresh bound so one slow Docker call
+// cannot consume the budget of the calls that follow. It deliberately does NOT
+// bound Dockerfile builds: a build is bounded by runtime.buildTimeout (10m) on a
 // context rooted in the worker lifecycle, so a slow image build can never be cut
-// off by this short reconcile budget. The 5s shutdown bounds are a separate,
-// deliberately shorter bound (see Run's shutdown tail), not this constant.
+// off by this short reconcile budget. Apply receives the worker lifecycle
+// context (NOT this constant wrapped around the whole pass) and the reconciler
+// derives the per-operation bounds from it. The 5s shutdown bounds are a
+// separate, deliberately shorter bound (see Run's shutdown tail), not this
+// constant.
 const reconcileTimeout = 30 * time.Second
 
 // shutdownServiceTimeout bounds the service-container cleanup during graceful
@@ -244,7 +247,7 @@ func Run(logger *slog.Logger) {
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
-	}, logger)
+	}, logger, reconcileTimeout)
 
 	// Conservative startup orphan sweep: before any function is prepared or any
 	// container created, remove execution containers a previous Relay process on
@@ -440,26 +443,29 @@ func Run(logger *slog.Logger) {
 			// Converge the function's persistent service containers whenever its
 			// new version is swapped in (and on the skip path when it declares
 			// services, so crashed replicas self-heal on the periodic tick). The
-			// hooks run synchronously in the reconciler pump goroutine, so each is
-			// bounded with its own timeout; a slow daemon must not stall a
-			// function's reconcile. The contexts are safe to create fresh here —
-			// the pump is a single goroutine, so they never race themselves.
+			// hook runs synchronously in the reconciler pump goroutine.
+			//
+			// Apply receives the LIFECYCLE context, NOT a 30s budget wrapped
+			// around the whole pass: the ServiceReconciler injects the worker's
+			// reconcileTimeout into Reconcile, which derives a fresh bound for
+			// each normal Docker operation itself. A Dockerfile build is rooted
+			// in the runtime manager lifecycle under buildTimeout, so a long
+			// build can never consume the post-build deadline. Shutdown still
+			// cancels the operation promptly because ctx is the signal context.
 			//
 			// The prepared env comes from the current registry entry (the runtime
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
 			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
-				uCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
-				defer cancel()
-				var preparedEnv []string
-				if cur := runWorker.Registry().GetByName(name); cur != nil && cur.Prepared() != nil {
-					preparedEnv = cur.Prepared().Env
-				}
-				svcCtrl.Apply(uCtx, name, fnDir, tmpl, image, preparedEnv)
+				applyLiveServices(ctx, svcCtrl, runWorker.Registry(), name, fnDir, tmpl, image)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
-			// running service containers reference those images.
+			// running service containers reference those images. Remove is a
+			// standalone removal operation with no build, so it keeps its own
+			// fresh 30s bound rooted in the lifecycle context; the hook runs
+			// synchronously in the single pump goroutine, so the context never
+			// races itself.
 			RemoveServices: func(name string) {
 				rCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 				defer cancel()
@@ -640,13 +646,49 @@ func prepareFunctions(
 	return prepared
 }
 
+// applyLiveServices converges one function's persistent service containers on a
+// live reconcile (the reconciler's UpdateServices hook). It is the live
+// counterpart of reconcileStartupServices' per-function Apply and follows the
+// same context rule: it passes the worker LIFECYCLE context to Apply, NOT a 30s
+// budget wrapped around the whole pass. The ServiceReconciler derives fresh
+// per-operation bounds (reconcileTimeout) for the pre-build and post-build
+// Docker operations itself, so a long Dockerfile build — bounded separately by
+// the runtime's buildTimeout on the manager lifecycle — can never consume the
+// post-build deadline. Shutdown still cancels the operation promptly because ctx
+// is the signal context.
+//
+// The prepared env comes from the current registry entry (the runtime plan env);
+// a nil Prepared (unavailable) falls back to no plan env, mirroring the runner's
+// nil-safe behavior.
+func applyLiveServices(
+	ctx context.Context,
+	svcCtrl *reconciler.ServiceReconciler,
+	reg *runner.Registry,
+	name, fnDir string,
+	tmpl *function.Template,
+	image string,
+) {
+	var preparedEnv []string
+	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
+		preparedEnv = cur.Prepared().Env
+	}
+	svcCtrl.Apply(ctx, name, fnDir, tmpl, image, preparedEnv)
+}
+
 // reconcileStartupServices converges each prepared function's persistent service
 // containers to its freshly prepared template and image, then sweeps orphaned
 // containers for functions no longer on disk. It runs AFTER every function's
 // image is built (so the desired image is present) and BEFORE the startup image
 // sweep (so the sweep's keep-set can include images the containers we just
-// converged reference). Each function gets its OWN bounded context: one slow
-// Docker call cannot consume the budget of the functions that follow.
+// converged reference).
+//
+// Each per-function Apply receives the shared LIFECYCLE context: the
+// ServiceReconciler derives its own fresh per-operation bounds (reconcileTimeout)
+// for the pre-build and post-build Docker operations, so one slow Docker call
+// cannot consume the budget of the functions that follow, and a long build can
+// never consume the post-build deadline (see applyLiveServices for the live
+// path). The availability/empty-services special cases below still bound their
+// standalone Remove calls with a fresh reconcileTimeout.
 //
 // Prepared (available) functions are applied UNCONDITIONALLY — including
 // templates that now declare no services: Reconcile with an empty desired set
@@ -680,9 +722,12 @@ func reconcileStartupServices(
 			}
 			continue
 		}
-		ctx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
-		svcCtrl.Apply(ctx, fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
-		cancel()
+		// Apply receives the LIFECYCLE context, not a 30s budget wrapped around
+		// the whole pass: Reconcile derives fresh per-operation bounds from it
+		// and the reconciler's injected reconcileTimeout, so a long Dockerfile
+		// build (bounded by the runtime's buildTimeout on the manager lifecycle)
+		// cannot consume the deadline of the post-build work that follows.
+		svcCtrl.Apply(lifecycle, fn.Name, fn.Dir, fn.Template, p.Image, p.Env)
 	}
 	// Startup stale-service sweep: remove any service container whose function is
 	// not on disk at all (removed while Relay was down, or stale from a previous

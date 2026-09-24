@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/moby/moby/api/types/container"
 
@@ -280,11 +281,19 @@ func serviceEnvHash(port int) string {
 	return runtime.EnvHash([]string{fmt.Sprintf("PORT=%d", port)})
 }
 
-// reconcile runs Reconcile with the background context, no prepared env, no
-// secrets, and a discarded logger — the common shape across the service tests.
+// testReconcileTimeout is the normal-operation budget the service tests pass to
+// Reconcile. It mirrors the worker's 30s reconcileTimeout so the tests exercise
+// the same per-operation bounding production does, without hard-coding the value
+// into the tests' semantics.
+const testReconcileTimeout = 30 * time.Second
+
+// reconcile runs Reconcile with a background LIFECYCLE context, no prepared env,
+// no secrets, and a discarded logger — the common shape across the service
+// tests. The lifecycle context is unbounded; Reconcile derives its own
+// per-operation bounds from the explicit timeout.
 func reconcile(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), d, fn, t.TempDir(), tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, t.TempDir(), tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
@@ -646,7 +655,7 @@ func TestSweepOrphans(t *testing.T) {
 		t.Fatalf("start ghost: %v", err)
 	}
 
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	c.SweepOrphans(context.Background(), map[string]bool{"live": true})
 
 	if got := f.runningCount("live", "service.js"); got != 1 {
@@ -695,7 +704,7 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 // env/secret staleness tests.
 func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), d, fn, t.TempDir(), tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, t.TempDir(), tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
 }
 
 // TestReconcileEnvChangeReplacesContainer: changing a template env value on an
@@ -1158,7 +1167,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelDebug)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 
 	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
 	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil) // idempotent second pass
@@ -1182,7 +1191,7 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
 
 	out := capture.String()
@@ -1206,7 +1215,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-new", nil)
 
 	out := capture.String()
@@ -1246,7 +1255,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 	tmpl := serviceTemplate("node24")
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
-	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger)
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
 
 	out := capture.String()

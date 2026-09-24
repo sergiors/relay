@@ -102,7 +102,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// reconciler, so discovery/update converge service containers and removal
 	// stops them (before the images would be retired by the worker's removal
 	// hook, which this test does not wire).
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	rec := New(
 		Config{
 			Root:     root,
@@ -219,7 +219,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 
 	reg := &runner.Registry{}
 	reg.Set(nil)
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 
 	// apply builds/prepares the function (through the adapter) and converges its
 	// service containers, so each pass observes the current template's env.
@@ -411,7 +411,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		}
 	})
 
-	svcW1 := NewServiceReconciler(m1, nil, routing.TraefikConfig{}, logger)
+	svcW1 := NewServiceReconciler(m1, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	n, err := svcW1.ShutdownCleanup(context.Background(), w1host)
 	if err != nil {
 		t.Fatalf("shutdown cleanup w1: %v", err)
@@ -521,7 +521,7 @@ func TestServicesReconcileMissingNetworkPreservesGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	svcCtrl.Apply(context.Background(), name, dir, fn.Template, prepared.Image, nil)
 	assertServiceCounts(t, m, name, 1)
 
@@ -546,7 +546,7 @@ func TestServicesReconcileMissingNetworkPreservesGeneration(t *testing.T) {
 	// exactly the reconcile-visible condition. The next reconcile must preserve
 	// the healthy container and report the missing network.
 	missingDocker := &networksMissingDocker{Docker: m, missing: networkName}
-	missingCtrl := NewServiceReconciler(missingDocker, nil, routing.TraefikConfig{}, logger)
+	missingCtrl := NewServiceReconciler(missingDocker, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	missingCtrl.Apply(context.Background(), name, dir, fn.Template, prepared.Image, nil)
 
 	list, err = m.ServiceContainerList(context.Background())
@@ -669,7 +669,7 @@ func TestServicesReconcileMissingNetworkStillRemovesRemovedService(t *testing.T)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger)
+	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	svcCtrl.Apply(context.Background(), name, dir, fn.Template, prepared.Image, nil)
 	assertServiceCounts(t, m, name, 2)
 
@@ -680,7 +680,7 @@ func TestServicesReconcileMissingNetworkStillRemovesRemovedService(t *testing.T)
 	if err != nil {
 		t.Fatalf("parse reduced: %v", err)
 	}
-	missingCtrl := NewServiceReconciler(&networksMissingDocker{Docker: m, missing: networkName}, nil, routing.TraefikConfig{}, logger)
+	missingCtrl := NewServiceReconciler(&networksMissingDocker{Docker: m, missing: networkName}, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 	missingCtrl.Apply(context.Background(), name, dir, reduced, prepared.Image, nil)
 
 	deadline := time.Now().Add(20 * time.Second)

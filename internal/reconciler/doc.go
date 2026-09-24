@@ -34,6 +34,14 @@
 // that cannot be resolved leaves the service's existing healthy containers
 // untouched.
 //
+// Reconcile owns its timeouts: it receives the LIFECYCLE context (the worker
+// passes its signal context, never a pass-wide short deadline) and a reconcile
+// timeout injected into the *ServiceReconciler, and derives a FRESH bound for
+// each normal pre-build and post-build Docker operation itself. A Dockerfile
+// build is rooted in the runtime manager lifecycle under buildTimeout, so a
+// long build can never consume the post-build deadline; lifecycle cancellation
+// still cancels builds and normal operations promptly.
+//
 // Ordering on a rebuild: the new version is prepared and swapped in, schedules
 // converge, persistent services converge to the new image, and only THEN is the
 // superseded image retired (via the Config.Retire hook). Retiring after service
