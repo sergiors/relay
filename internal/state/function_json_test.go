@@ -23,13 +23,10 @@ func rawFunctionData(t *testing.T, c *State, name string) (data, updatedAt, type
 }
 
 // fullSnapshotTmpl exercises every persisted snapshot field: runtime, env,
-// secret references, networks, event handlers (name + timeout), schedules
+// secret references, event handlers (name + timeout), schedules
 // (handler/cron/timezone/timeout/retries), and services (all source kinds plus
 // host/path/port/replicas).
 const fullSnapshotTmpl = `runtime: python3.14
-networks:
-  - backend
-  - frontend
 env:
   API_URL: https://api.example.com
   CONN: postgres://user:pass@host/db
@@ -186,10 +183,6 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 	if detail.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("secrets = %v", detail.Secrets)
 	}
-	// Networks are normalized (sorted).
-	if len(detail.Networks) != 2 || detail.Networks[0] != "backend" || detail.Networks[1] != "frontend" {
-		t.Fatalf("networks = %v", detail.Networks)
-	}
 
 	// HandlerCount is derived from the snapshot on read.
 	if detail.HandlerCount != 2 {
@@ -206,7 +199,7 @@ func TestFunctionSnapshotAtomicReplacement(t *testing.T) {
 	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
 	// Replace with a leaner template: one handler (new timeout), no schedules,
-	// one service (new source/port), no networks, no secrets.
+	// one service (new source/port), no secrets.
 	changed := mustTemplate(t, `runtime: node24
 events:
   - handler: index.main
@@ -236,8 +229,8 @@ services:
 	if len(detail.Services) != 1 || detail.Services[0].Entrypoint != "api.js" || detail.Services[0].Port != 7000 || detail.Services[0].Replicas != 4 {
 		t.Fatalf("services not replaced: %+v", detail.Services)
 	}
-	if detail.Env != nil || detail.Secrets != nil || detail.Networks != nil {
-		t.Fatalf("stale env/secrets/networks survived: env=%v secrets=%v networks=%v", detail.Env, detail.Secrets, detail.Networks)
+	if detail.Env != nil || detail.Secrets != nil {
+		t.Fatalf("stale env/secrets survived: env=%v secrets=%v", detail.Env, detail.Secrets)
 	}
 
 	// The replacement was a single-row UPDATE: the row count is unchanged.
@@ -351,8 +344,8 @@ func TestReconcileFailurePreservesNestedSnapshot(t *testing.T) {
 	if len(after.Handlers) != len(before.Handlers) || len(after.Schedules) != len(before.Schedules) || len(after.Services) != len(before.Services) {
 		t.Fatalf("nested snapshot changed: before=%+v after=%+v", before, after)
 	}
-	if len(after.Networks) != len(before.Networks) || after.Secrets["DATABASE_URL"] != before.Secrets["DATABASE_URL"] {
-		t.Fatalf("networks/secrets changed: before=%v/%v after=%v/%v", before.Networks, before.Secrets, after.Networks, after.Secrets)
+	if after.Secrets["DATABASE_URL"] != before.Secrets["DATABASE_URL"] {
+		t.Fatalf("secrets changed: before=%v after=%v", before.Secrets, after.Secrets)
 	}
 }
 

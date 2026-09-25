@@ -208,13 +208,6 @@ func runInvoke(t *testing.T, cc *containerCache, ff *fakeFactory, fnName, image 
 	return cc.execute(context.Background(), fnName, image, max, ff.start(), handler, []byte(`{}`), nil)
 }
 
-// runInvokeVersion drives one invoke through the cache at a specific runtime
-// generation and returns its error.
-func runInvokeVersion(t *testing.T, cc *containerCache, ff *fakeFactory, fnName, image, runtimeGen string, max int, handler string) error {
-	t.Helper()
-	return cc.executeVersion(context.Background(), fnName, image, runtimeGen, max, ff.start(), handler, []byte(`{}`), nil)
-}
-
 // newBlockingContainer returns a fakeContainer whose Invoke blocks until its
 // release channel is closed, signalling once per Invoke entry on entered (buffer
 // bounds how many concurrent entries a test observes). It is the shared fixture
@@ -417,50 +410,6 @@ func TestContainerPoolPanicInStartRollsBackReservation(t *testing.T) {
 	}
 	if ff.count() != 1 {
 		t.Fatalf("creations = %d, want 1 (reservation rolled back after panic)", ff.count())
-	}
-}
-
-// TestContainerPoolRuntimeGenerationChangeDiscardsWithoutImageChange proves a
-// runtime-only change (a new runtime generation: e.g. the template's `networks`
-// list) replaces warm containers even though the IMAGE is unchanged, and the
-// discard is attributed to network_changed rather than image_changed.
-func TestContainerPoolRuntimeGenerationChangeDiscardsWithoutImageChange(t *testing.T) {
-	cc, ff := newTestCache()
-	if err := runInvokeVersion(t, cc, ff, "fn-a", "img-1", "gen-1", 1, "h"); err != nil {
-		t.Fatalf("execute gen-1: %v", err)
-	}
-	c1 := ff.lastContainer()
-	if c1 == nil {
-		t.Fatal("first container not tracked")
-	}
-
-	// Same image, new runtime generation: the idle old container is discarded
-	// immediately on the new acquire and a fresh container is created. The
-	// image is IDENTICAL, so this is the no-rebuild network replace.
-	if err := runInvokeVersion(t, cc, ff, "fn-a", "img-1", "gen-2", 1, "h"); err != nil {
-		t.Fatalf("execute gen-2: %v", err)
-	}
-	if got := c1.reasons(); len(got) != 1 || got[0] != reasonNetworkChanged {
-		t.Fatalf("old container discards = %v, want [%s]", got, reasonNetworkChanged)
-	}
-	if ff.count() != 2 {
-		t.Fatalf("creations = %d, want 2 after runtime-generation change", ff.count())
-	}
-}
-
-// TestContainerPoolRuntimeGenerationSameReuses proves two invokes at the SAME
-// runtime generation reuse one container (a network change is what invalidates,
-// not merely passing a generation).
-func TestContainerPoolRuntimeGenerationSameReuses(t *testing.T) {
-	cc, ff := newTestCache()
-	if err := runInvokeVersion(t, cc, ff, "fn-a", "img-1", "gen-1", 2, "h1"); err != nil {
-		t.Fatalf("first: %v", err)
-	}
-	if err := runInvokeVersion(t, cc, ff, "fn-a", "img-1", "gen-1", 2, "h2"); err != nil {
-		t.Fatalf("second: %v", err)
-	}
-	if ff.count() != 1 {
-		t.Fatalf("creations = %d, want 1 (same version reused)", ff.count())
 	}
 }
 

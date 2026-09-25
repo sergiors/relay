@@ -139,11 +139,6 @@ func (d *phaseDocker) NetworkExists(ctx context.Context, _ string) (bool, error)
 	return true, nil
 }
 
-func (d *phaseDocker) VerifyNetworks(ctx context.Context, _ []string) (string, bool, error) {
-	d.record("verify-networks", ctx)
-	return "", true, nil
-}
-
 func (d *phaseDocker) observationsFor(op string) []ctxObservation {
 	d.mu.Lock()
 	defer d.mu.Unlock()

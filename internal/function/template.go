@@ -1,8 +1,6 @@
 package function
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"sort"
@@ -117,16 +115,6 @@ type Template struct {
 	// resolved defaults (never zero) after ParseTemplate, and Path is
 	// canonicalized (see Service.Path).
 	Services []Service
-	// Networks lists the Docker networks every execution container (event and
-	// schedule) and every persistent service container of this function joins.
-	// It is generic template config: a plain list of Docker network names, never
-	// a Traefik-specific term. It is nil when the template omits `networks`.
-	// After ParseTemplate the list is normalized: each entry trimmed, empty
-	// entries rejected, duplicates removed, and the result sorted, so it is
-	// deterministic regardless of authoring order. The networks themselves are
-	// infrastructure owned OUTSIDE Relay — Relay only verifies they exist and
-	// never creates them.
-	Networks []string
 }
 
 // Schedule is one cron schedule from the template's `schedules` list: the
@@ -236,31 +224,6 @@ func (t *Template) NeedsRuntime() bool {
 		}
 	}
 	return false
-}
-
-// RuntimeGeneration returns a deterministic, short digest of the template's
-// RUNTIME-ONLY configuration: the configuration that shapes how a container is
-// created but not what image it runs. Today that is exactly the top-level
-// `networks` list (already normalized). It is the runtime counterpart to the
-// content fingerprint: editing `networks` changes this digest but NOT the image
-// fingerprint (see ImageFingerprint), so the reconciler replaces warm/service
-// containers for the new networks without rebuilding the image.
-//
-// It is deterministic and order-independent because the network list is
-// normalized (sorted, deduped) at parse time; a template assembled by hand
-// (tests, direct callers) is hashed in its given order. An empty generation
-// (no networks) returns the empty string, which is the "no runtime config"
-// value callers compare against.
-func (t *Template) RuntimeGeneration() string {
-	if t == nil || len(t.Networks) == 0 {
-		return ""
-	}
-	h := sha256.New()
-	for _, n := range t.Networks {
-		h.Write([]byte(n))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // Source reports which of the three mutually exclusive sources is configured.
@@ -518,11 +481,6 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		Runtime string            `yaml:"runtime"`
 		Env     map[string]string `yaml:"env"`
 		Secrets map[string]string `yaml:"secrets"`
-		// Networks is decoded as `[]any` so a non-string entry (a number, bool,
-		// map, or list) is distinguishable from a valid network name and
-		// rejected with a clear message instead of being silently coerced by
-		// yaml.v3.
-		Networks []any `yaml:"networks"`
 		// Concurrency is decoded as `any` (not `*int`) so a non-integer value
 		// (e.g. "abc", "1.5", true) is distinguishable from an omitted one and
 		// rejected with a clear message instead of being silently truncated or
@@ -592,18 +550,6 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	if err := parseEnvSecrets(t, raw.Env, raw.Secrets); err != nil {
 		return nil, err
 	}
-
-	// Parse the optional top-level `networks` list. Every execution container
-	// and every persistent service container of this function joins these
-	// networks; each must be a non-empty Docker network name. Normalization is
-	// deterministic: entries are trimmed, empty entries rejected, duplicates
-	// removed, and the result sorted, so authoring order and cosmetic
-	// whitespace never churn container configuration.
-	networks, err := normalizeNetworks(raw.Networks)
-	if err != nil {
-		return nil, err
-	}
-	t.Networks = networks
 
 	// A template must do SOMETHING: it must carry at least one event rule or at
 	// least one persistent service. A template with neither is inert and almost
@@ -887,40 +833,6 @@ func parseEnvSecrets(t *Template, env, secrets map[string]string) error {
 		}
 	}
 	return nil
-}
-
-// normalizeNetworks parses and normalizes the optional top-level `networks`
-// list: each entry is trimmed, empty entries are rejected, duplicates are
-// removed, and the result is sorted. Nil/omitted input yields a nil slice. A
-// non-string entry (a number, bool, map, or list) is rejected rather than
-// coerced, so a template authoring mistake surfaces at parse time.
-//
-// The returned slice is deterministic: two templates that list the same set of
-// networks in any order, with or without surrounding whitespace, normalize to
-// the same slice, so reconciliation never churns on cosmetic differences.
-func normalizeNetworks(raw []any) ([]string, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	seen := make(map[string]bool, len(raw))
-	out := make([]string, 0, len(raw))
-	for _, entry := range raw {
-		name, ok := entry.(string)
-		if !ok {
-			return nil, fmt.Errorf("network name must be a string, got %v", entry)
-		}
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return nil, fmt.Errorf("network name must not be empty")
-		}
-		if seen[name] {
-			continue
-		}
-		seen[name] = true
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out, nil
 }
 
 // validateEnvVarName reports whether name is a legal env-var name. It rejects

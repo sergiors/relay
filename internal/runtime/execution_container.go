@@ -19,10 +19,10 @@ import (
 )
 
 // executionEndpoints builds the Docker NetworkingConfig EndpointsConfig for an
-// execution (event/schedule) container from the template's `networks` list:
-// each named network exactly once. An empty/nil list yields nil, so a template
-// that declares no networks sends no NetworkingConfig (unchanged default
-// bridge/network behavior).
+// execution (event/schedule) container from the worker-global network set
+// (WithNetworks): each named network exactly once. An empty/nil list yields
+// nil, so a worker with no NETWORKS sends no NetworkingConfig (unchanged
+// default bridge/network behavior).
 func executionEndpoints(networks []string) map[string]*network.EndpointSettings {
 	if len(networks) == 0 {
 		return nil
@@ -107,12 +107,12 @@ type failEvent struct {
 // successful start the container cleans itself up via AutoRemove the moment
 // its process exits, or via an explicit kill/remove on our discard paths.
 //
-// networks is the template's top-level `networks` list: every execution
+// networks is the worker-global network set (NETWORKS): every execution
 // container joins them at create time so it can reach (and be reached on) those
 // Docker networks. The networks are infrastructure owned OUTSIDE Relay — Relay
-// never creates them — and the manager verifies they exist before any execution
-// begins (see Manager.VerifyNetworks); a network that disappears between
-// verification and create surfaces as a create error here.
+// never creates them — and the worker verifies they exist at startup (see
+// Manager.VerifyNetworks); a network that disappears between verification and
+// create surfaces as a create error here.
 func startExecutionContainer(
 	ctx context.Context,
 	cli *client.Client,

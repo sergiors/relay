@@ -390,13 +390,13 @@ func (c *ServiceCoordinator) removalContext() (context.Context, context.CancelFu
 }
 
 // cloneServiceTemplate snapshots the template fields the service reconcile path
-// reads — Runtime, Env, Secrets, Services, and Networks — so a live reconciler
+// reads — Runtime, Env, Secrets, and Services — so a live reconciler
 // replacing a function's *Template while a request is queued or in flight cannot
 // mutate the copy a worker is converging. Template is otherwise treated as
 // immutable, but the live registry shares the pointer with the reconciler, so a
 // copied slice/map is the race-free envelope. Services are value structs, so a
-// copied slice fully detaches them; Env/Secrets get fresh maps and Networks a
-// fresh slice. A nil template clones to nil.
+// copied slice fully detaches them; Env/Secrets get fresh maps. A nil template
+// clones to nil.
 func cloneServiceTemplate(tmpl *function.Template) *function.Template {
 	if tmpl == nil {
 		return nil
@@ -405,7 +405,6 @@ func cloneServiceTemplate(tmpl *function.Template) *function.Template {
 	clone.Env = cloneStringMap(tmpl.Env)
 	clone.Secrets = cloneSecretMap(tmpl.Secrets)
 	clone.Services = append([]function.Service(nil), tmpl.Services...)
-	clone.Networks = append([]string(nil), tmpl.Networks...)
 	return &clone
 }
 

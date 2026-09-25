@@ -555,7 +555,7 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 // TestFreshSchemaHasCurrentColumns checks the current schema shape directly:
 // initSchema must create the functions table with exactly name/data/updated_at,
 // and must NOT create any of the removed child tables. The whole nested
-// function configuration (handlers, schedules, services, env/secrets/networks)
+// function configuration (handlers, schedules, services, env/secrets)
 // lives inside functions.data, so there are no per-handler/schedule/service
 // tables.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {

@@ -28,7 +28,7 @@
 //     back with json(data). Only the stable name key and the write timestamp
 //     stay as columns. The nested configuration — the env and secret MAPPINGS
 //     (env-var name → literal value, and env-var name → secret REFERENCE, never
-//     a secret value), the normalized Docker networks, the event handlers (name
+//     a secret value), the event handlers (name
 //   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
 //     services (entrypoint/build/image/host/path/port/replicas) — is all part of
 //     that one payload, so a template change replaces the snapshot atomically

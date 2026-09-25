@@ -6,9 +6,10 @@
 // Every Config field maps 1:1 to an environment variable, with no computed or
 // invented settings. Required Redis variables (REDIS_URI, REDIS_STREAM,
 // REDIS_GROUP) and malformed tuning knobs abort startup via os.Exit, while the
-// optional knobs (stream retention, metrics/webhook addresses, Traefik routing)
-// stay zero/empty when unset and are gated by the caller. The parse helpers
-// (ParsePositiveInt, ParsePositiveDuration, ParseOptionalPositiveInt,
-// ParseLogLevel) are exported and pure so they are directly testable; RedisOptions
+// optional knobs (stream retention, metrics/webhook addresses, Traefik routing,
+// and the NETWORKS list) stay zero/empty when unset and are gated by the
+// caller. The parse helpers (ParsePositiveInt, ParsePositiveDuration,
+// ParseOptionalPositiveInt, ParseLogLevel, ParseNetworks) are exported and pure
+// so they are directly testable; RedisOptions
 // maps a Redis address or DSN to go-redis options without echoing credentials.
 package config

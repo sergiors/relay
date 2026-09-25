@@ -175,6 +175,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `LOG_LEVEL`                   | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                                                   |
 | `MAX_CONCURRENCY`             | no       | Max concurrent function invocations per worker; default `8`.                                                                                                                             |
 | `MAX_BUFFERED_EVENTS`         | no       | Max events read from Redis and held locally before completion; default `16`.                                                                                                             |
+| `NETWORKS`                    | no       | Comma-separated Docker networks every execution container joins at create time; unset = no extra networks (default bridge).                                                              |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                                                     |
 | `TRAEFIK_NETWORK`             | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                                                     |
 | `TRAEFIK_ENTRYPOINTS`         | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted.                                    |
@@ -198,6 +199,16 @@ eviction (see _Execution container lifecycle_): it takes a Go duration (for
 example `90s`, `5m`, `1h`) and defaults to `5m` when unset or empty. A
 malformed or non-positive duration is a configuration error that fails startup
 (unlike `REDIS_STREAM_RETENTION`, which logs and disables).
+
+`NETWORKS` is optional and sets the Docker networks every **execution**
+container (one per event/schedule invocation) joins at create time (see _Docker
+networks_). It is a comma-separated list: entries are trimmed of surrounding
+whitespace, empty entries are ignored, duplicates are removed, and declaration
+order is preserved. Every configured network is verified to exist at startup —
+Relay never creates networks, and a missing one fails startup. Unset means no
+extra networks (the default bridge behavior). Persistent service containers are
+**not** attached to `NETWORKS`: service networking is owned by the routing layer
+via `TRAEFIK_NETWORK` (see _Routing_).
 
 ### Concurrency and backpressure
 
@@ -369,16 +380,8 @@ Function images are **versioned by source fingerprint**. Each function's
 **selected source** is hashed (SHA-256 over file paths + bytes) and the image is
 tagged `relay-fn-<name>:<first-16-hex-of-fingerprint>`; the full 64-hex
 fingerprint stays authoritative in the local state database and on the prepared
-function.
-
-A function's content has two fingerprints that differ in exactly one respect:
-the **content fingerprint** hashes `template.yaml` verbatim, while the **image
-fingerprint** ignores **runtime-only template keys** (today, the top-level
-`networks` list) before hashing. The image tag is derived from the **image
-fingerprint**, so a `networks`-only edit does **not** yield a new tag and does
-**not** rebuild; the full content fingerprint still changes, so the reconciler
-still reacts to the edit and converges the affected containers (see _Docker
-networks_). Every other template or source edit changes both.
+function. `template.yaml` is hashed **verbatim**: any template or source edit
+changes the tag and rebuilds.
 
 Selection is governed by `.gitignore` rules (the same policy git uses): a source
 file matched by an applicable rule is not source, so its bytes never enter the
@@ -449,19 +452,14 @@ between invocations, and per-invocation environment values are applied to the
 long-running process for each request.
 
 A container is returned to the idle pool only while it remains healthy.
-Timeouts, process exits, protocol errors, image changes, runtime generation
-changes, and shutdown invalidate the container and it is discarded instead of
-reused.
+Timeouts, process exits, protocol errors, image changes, and shutdown invalidate
+the container and it is discarded instead of reused.
 
-A container's **version** is the pair `(image, runtime generation)`, where the
-runtime generation is a digest of the template's runtime-only configuration
-(today, the `networks` list). On an image **or** runtime-generation change, the
-old version enters a draining state. Idle old-version containers are discarded
-immediately, while busy containers are allowed to finish their current
-invocation and are discarded when released. No new invocation is leased to a
-draining version, and all new invocations use the current version. A
-runtime-only change (e.g. a new Docker network) thus replaces warm containers
-**without an image rebuild**.
+A container's **version** is its image. On an image change, the old version
+enters a draining state. Idle old-version containers are discarded immediately,
+while busy containers are allowed to finish their current invocation and are
+discarded when released. No new invocation is leased to a draining version, and
+all new invocations use the current version.
 
 Idle containers are not kept forever. A healthy container is evicted once it
 has remained idle longer than `WARM_CONTAINER_IDLE_TIMEOUT`; eviction never
@@ -513,9 +511,6 @@ networking enabled.
 ```yaml
 runtime: python3.14
 concurrency: 2
-networks:
-  - backend
-  - monitoring
 
 events:
   - handler: events.created.handler
@@ -611,15 +606,6 @@ hour day-of-month month day-of-week`. The exact expression is shown by
   and `replicas` (default `1`, positive integer). The configured source is the
   service identity. The template example above shows a service alongside events
   and schedules.
-- `networks` (optional, top-level) is a list of Docker networks every
-  **execution** container (event/schedule) and every persistent **service**
-  container of this function joins at create time (see _Docker networks_ below).
-  Each entry must be a non-empty network name. The list is **normalized** at
-  parse time — each entry trimmed, empty entries rejected, duplicates removed,
-  and the result sorted — so authoring order and cosmetic whitespace never churn
-  container configuration. A non-string entry (a number, bool, map, or list) is
-  rejected. The networks are infrastructure owned **outside** Relay: Relay
-  verifies they exist and **never creates them**.
 
 ### Schedules
 
@@ -834,55 +820,34 @@ operators are `equals`, `prefix`, `suffix`, `exists`, and `gt`/`gte`/`lt`/`lte`.
 
 ### Docker networks
 
-The optional top-level `networks` list attaches a function's containers to
-operator-provided Docker networks:
+The `NETWORKS` environment variable attaches every **execution** container (one
+per event/schedule invocation) this worker creates to operator-provided Docker
+networks. It is worker-wide configuration, not template configuration:
 
-```yaml
-runtime: node24
-networks:
-  - backend
-  - monitoring
-
-events:
-  - handler: index.main
-    pattern:
-      event_name: [INSERT]
+```sh
+NETWORKS=backend,monitoring
 ```
 
-- Every **execution** container (one per event/schedule invocation) and every
-  persistent **service** container of the function joins the listed networks at
-  create time, via the Docker Engine `NetworkingConfig`. A function with no
-  `networks` key sends no `NetworkingConfig` — the default bridge behavior is
-  unchanged.
-- Each entry must be a non-empty network name; the list is **normalized** at
-  parse time (trimmed, empty entries rejected, duplicates removed, sorted), so
-  reordering or whitespace never changes container configuration. A non-string
-  entry is a parse error.
+- Every execution container joins the listed networks at create time, via the
+  Docker Engine `NetworkingConfig`. A worker with `NETWORKS` unset sends no
+  `NetworkingConfig` — the default bridge behavior is unchanged. Warm containers
+  are reused as-is; joining the networks happens only at container creation, so
+  changing `NETWORKS` requires a worker restart.
+- The value is a comma-separated list: entries are trimmed of surrounding
+  whitespace, empty entries are ignored, duplicates are removed, and declaration
+  order is preserved.
 - The networks are **infrastructure owned outside Relay**: Relay **never
-  creates them**. It verifies every network exists **before** creating any
-  container:
-  - for execution containers, a missing network fails **only that function's**
-    invocation — Relay logs a structured warning (`function`, `network`, and
-    `effect`) and creates no container;
-  - for service reconciliation, a missing network makes the pass report the
-    missing network and **preserve the function's healthy current service
-    containers** (it never tears them down); convergence resumes on a later pass
-    once the network exists. A service **removed** from the template is still
-    cleaned up (its containers are stopped even while the network is missing —
-    removal does not depend on network availability). A missing network **only
-    affects the function whose template declares it** — other functions
-    reconcile normally.
-- A **routed** service (one declaring a `host`) additionally joins
-  `TRAEFIK_NETWORK`; the union of `TRAEFIK_NETWORK` and the template `networks`
-  is joined **exactly once each**. An **unrouted** service never joins
-  `TRAEFIK_NETWORK` on its own.
-- Each service container carries a `relay.networks` label recording its
-  canonical (sorted, deduped) network set. Changing the set — adding, removing,
-  or renaming a network — makes the running service container stale and replaces
-  it, and invalidates the function's warm execution containers, **without
-  rebuilding the image**: the image fingerprint deliberately ignores
-  runtime-only template keys such as `networks` (see _Image lifecycle_), so a
-  network-only edit reuses the existing image and only re-creates containers.
+  creates them**. It verifies every configured network exists **at startup**,
+  before any function is prepared or any container created; a missing network
+  (or a daemon error) is a fatal startup error rather than a per-invocation
+  skip.
+- Persistent **service** containers are deliberately **not** attached to
+  `NETWORKS`: a service is reached through its routing layer, which owns the
+  network it joins (`TRAEFIK_NETWORK`). An **unrouted** service joins no network
+  on its own. `TRAEFIK_NETWORK` is independent of `NETWORKS`.
+- Each service container carries a `relay.networks` label recording its routing
+  network, so the service reconciler can detect a routing-network change and
+  replace the stale container.
 
 ## Services
 
@@ -1085,15 +1050,6 @@ Services:
   app/service.js                    port=3000 replicas=2
   build:docker/Dockerfile.prod      port=8080 replicas=1
   image:ghcr.io/acme/api:1.2        port=9090 replicas=3
-```
-
-When the template declares top-level `networks`, inspect also renders them
-(normalized: sorted and de-duplicated):
-
-```
-Networks:
-  backend
-  monitoring
 ```
 
 Out of scope for this first version: host port publishing, autoscaling, and
@@ -1370,7 +1326,7 @@ how the last reconcile of each function went without touching Redis or Docker.
 - **Schema**: a `functions` table (`name`, `data`, `updated_at`) where `data` is
   a single stored JSON snapshot of the whole function — runtime/status/image/
   fingerprint/prepared_at/last-reconcile outcome, env/secret **mappings**,
-  networks, handlers (name/timeout/retries), schedules (handler/cron/timezone/
+  handlers (name/timeout/retries), schedules (handler/cron/timezone/
   timeout/retries), and services (entrypoint/build/image/host/path/port/
   replicas) — with only the stable name key and write timestamp kept as columns.
   There are no per-handler/per-schedule/per-service child tables, so a template

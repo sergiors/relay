@@ -526,62 +526,34 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	}
 }
 
-// TestStartServiceNetworkingConfig pins that the template's networks (union the
-// routing network) reach Docker's NetworkingConfig EndpointsConfig, each network
-// exactly once, and that the canonical relay.networks label matches. An empty
-// result means no NetworkingConfig at all (default bridge/network behavior).
+// TestStartServiceNetworkingConfig pins that the routing network reaches
+// Docker's NetworkingConfig EndpointsConfig and that the canonical
+// relay.networks label matches. A service with no routing network sends no
+// NetworkingConfig at all (default bridge/network behavior). Service networking
+// is independent of the worker-global NETWORKS set applied to execution
+// containers.
 func TestStartServiceNetworkingConfig(t *testing.T) {
-	t.Run("template networks only", func(t *testing.T) {
+	t.Run("routing network joined", func(t *testing.T) {
 		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
 			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
-			Env: []string{"PORT=3000"}, Networks: []string{"backend", "frontend"},
+			Env: []string{"PORT=3000"}, Network: "proxy",
 		}))
 		if req.NetworkingConfig == nil {
-			t.Fatal("expected a NetworkingConfig for a template with networks")
+			t.Fatal("expected a NetworkingConfig for a routed service")
 		}
 		got := req.NetworkingConfig.EndpointsConfig
-		if len(got) != 2 {
-			t.Fatalf("endpoints = %v, want backend+frontend", got)
-		}
-		if _, ok := got["backend"]; !ok {
-			t.Fatalf("missing backend endpoint: %v", got)
-		}
-		if _, ok := got["frontend"]; !ok {
-			t.Fatalf("missing frontend endpoint: %v", got)
-		}
-		if req.Config.Labels[labelNetworks] != "backend,frontend" {
-			t.Fatalf("relay.networks = %q, want backend,frontend", req.Config.Labels[labelNetworks])
-		}
-	})
-
-	t.Run("routing network unioned exactly once", func(t *testing.T) {
-		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
-			Env: []string{"PORT=3000"},
-			// The routing network is also listed in the template networks; it
-			// must appear exactly once.
-			Network:  "proxy",
-			Networks: []string{"proxy", "backend"},
-		}))
-		if req.NetworkingConfig == nil {
-			t.Fatal("expected a NetworkingConfig")
-		}
-		got := req.NetworkingConfig.EndpointsConfig
-		if len(got) != 2 {
-			t.Fatalf("endpoints = %v, want proxy+backend (proxy deduped)", got)
+		if len(got) != 1 {
+			t.Fatalf("endpoints = %v, want only proxy", got)
 		}
 		if _, ok := got["proxy"]; !ok {
 			t.Fatalf("missing proxy endpoint: %v", got)
 		}
-		if _, ok := got["backend"]; !ok {
-			t.Fatalf("missing backend endpoint: %v", got)
-		}
-		if req.Config.Labels[labelNetworks] != "backend,proxy" {
-			t.Fatalf("relay.networks = %q, want backend,proxy", req.Config.Labels[labelNetworks])
+		if req.Config.Labels[labelNetworks] != "proxy" {
+			t.Fatalf("relay.networks = %q, want proxy", req.Config.Labels[labelNetworks])
 		}
 	})
 
-	t.Run("no networks sends no NetworkingConfig", func(t *testing.T) {
+	t.Run("no network sends no NetworkingConfig", func(t *testing.T) {
 		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
 			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
 			Env: []string{"PORT=3000"},
@@ -591,24 +563,6 @@ func TestStartServiceNetworkingConfig(t *testing.T) {
 		}
 		if _, ok := req.Config.Labels[labelNetworks]; ok {
 			t.Fatalf("relay.networks must be omitted, got %q", req.Config.Labels[labelNetworks])
-		}
-	})
-
-	t.Run("unrouted template networks never get routing network", func(t *testing.T) {
-		// An unrouted service (no Network) still joins its template networks.
-		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
-			Env: []string{"PORT=3000"}, Networks: []string{"internal"},
-		}))
-		if req.NetworkingConfig == nil {
-			t.Fatal("expected a NetworkingConfig")
-		}
-		if _, ok := req.NetworkingConfig.EndpointsConfig["internal"]; !ok {
-			t.Fatalf("missing internal endpoint: %v", req.NetworkingConfig.EndpointsConfig)
-		}
-		// No Traefik/routing network was configured, so nothing else is joined.
-		if len(req.NetworkingConfig.EndpointsConfig) != 1 {
-			t.Fatalf("endpoints = %v, want only internal", req.NetworkingConfig.EndpointsConfig)
 		}
 	})
 }
@@ -623,17 +577,15 @@ func TestServiceLabelsNetworks(t *testing.T) {
 	}
 
 	got := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img",
-		Network: "proxy", Networks: []string{"zeta", "alpha", "proxy"},
+		Function: "fn", Identity: "svc", Image: "img", Network: "proxy",
 	}, "h", 0)
-	if got[labelNetworks] != "alpha,proxy,zeta" {
-		t.Fatalf("relay.networks = %q, want alpha,proxy,zeta", got[labelNetworks])
+	if got[labelNetworks] != "proxy" {
+		t.Fatalf("relay.networks = %q, want proxy", got[labelNetworks])
 	}
 
 	spoof := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img",
-		Networks: []string{"real"},
-		Labels:   map[string]string{labelNetworks: "spoofed"},
+		Function: "fn", Identity: "svc", Image: "img", Network: "real",
+		Labels: map[string]string{labelNetworks: "spoofed"},
 	}, "h", 0)
 	if spoof[labelNetworks] != "real" {
 		t.Fatalf("relay.networks = %q; caller must not spoof it", spoof[labelNetworks])
@@ -643,13 +595,16 @@ func TestServiceLabelsNetworks(t *testing.T) {
 // TestNetworksLabelCanonical pins the exported canonical helper used by the
 // service reconciler to compare a desired network set to a discovered label.
 func TestNetworksLabelCanonical(t *testing.T) {
-	if got := NetworksLabel("", nil); got != "" {
+	if got := NetworksLabel(); got != "" {
 		t.Fatalf("empty = %q, want empty", got)
 	}
-	if got := NetworksLabel("proxy", nil); got != "proxy" {
+	if got := NetworksLabel(""); got != "" {
+		t.Fatalf("empty name = %q, want empty", got)
+	}
+	if got := NetworksLabel("proxy"); got != "proxy" {
 		t.Fatalf("routing only = %q, want proxy", got)
 	}
-	if got := NetworksLabel("proxy", []string{"b", "a", "proxy", ""}); got != "a,b,proxy" {
+	if got := NetworksLabel("b", "a", "proxy", ""); got != "a,b,proxy" {
 		t.Fatalf("union = %q, want a,b,proxy", got)
 	}
 }

@@ -48,6 +48,14 @@ type Config struct {
 	// worker before they complete/ACK. It bounds the local buffer so the
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
+	// Networks is the NETWORKS value: the ordered, de-duplicated list of Docker
+	// networks every execution container this worker creates joins at create
+	// time. It is empty (nil) when NETWORKS is unset. The names are parsed once
+	// at startup (see ParseNetworks) and are startup configuration: changing
+	// them requires a worker restart. The networks are infrastructure owned
+	// OUTSIDE Relay — Relay verifies they exist at startup and never creates
+	// them.
+	Networks []string
 	// TraefikNetwork is the optional TRAEFIK_NETWORK value: the Docker network
 	// Traefik is attached to. It is required only when a function's template
 	// service declares a `host` (routed service); Relay never creates the
@@ -142,6 +150,7 @@ func Load(logger *slog.Logger) Config {
 			"MAX_BUFFERED_EVENTS",
 			getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents)),
 		),
+		Networks:            ParseNetworks(getEnv("NETWORKS", "")),
 		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
 		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
 		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
@@ -221,6 +230,31 @@ func ParsePositiveDuration(name, value string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %s %q: must be a positive duration", name, value)
 	}
 	return d, nil
+}
+
+// ParseNetworks parses the NETWORKS value: a comma-separated list of Docker
+// network names. Each entry is trimmed of surrounding whitespace, empty entries
+// are ignored, duplicates are removed, and the DECLARATION order is preserved
+// (unlike the former template-level normalization, which sorted). An unset or
+// all-empty value yields nil, so "no networks" is the nil slice. It never
+// fails: a network name is an operator-supplied Docker identifier, and an
+// invalid one surfaces as a startup verification failure rather than a parse
+// error. The value is startup configuration, parsed once by Load.
+func ParseNetworks(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // ParseOptionalPositiveInt parses an optional positive-integer environment

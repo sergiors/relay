@@ -6,7 +6,7 @@ import (
 
 // TestExecutionEndpoints pins the pure NetworkingConfig builder used for
 // execution containers: each named network exactly once, empty names skipped,
-// and nil for no networks (so a template without `networks` sends no
+// and nil for no networks (so a worker with NETWORKS unset sends no
 // NetworkingConfig at all).
 func TestExecutionEndpoints(t *testing.T) {
 	if got := executionEndpoints(nil); got != nil {

@@ -37,6 +37,53 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestParseNetworks pins the NETWORKS parser contract: unset/empty/whitespace
+// yields nil, entries are trimmed, empty entries ignored, duplicates removed,
+// and declaration order preserved.
+func TestParseNetworks(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{"unset", "", nil},
+		{"whitespace only", "   ", nil},
+		{"single", "backend", []string{"backend"}},
+		{"ordered, trimmed", " backend , frontend ", []string{"backend", "frontend"}},
+		{"duplicates removed, order kept", "b,a,b,a", []string{"b", "a"}},
+		{"empty entries ignored", "a,,b,", []string{"a", "b"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseNetworks(tt.value)
+			if len(got) != len(tt.want) {
+				t.Fatalf("ParseNetworks(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("ParseNetworks(%q) = %v, want %v", tt.value, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestLoadNetworks pins that NETWORKS resolves through Load exactly as
+// ParseNetworks parses it, and stays nil when unset.
+func TestLoadNetworks(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("NETWORKS", "")
+	if got := Load(discardLogger()).Networks; got != nil {
+		t.Fatalf("Networks = %v, want nil when unset", got)
+	}
+
+	t.Setenv("NETWORKS", "backend, frontend ,backend")
+	got := Load(discardLogger()).Networks
+	if len(got) != 2 || got[0] != "backend" || got[1] != "frontend" {
+		t.Fatalf("Networks = %v, want [backend frontend]", got)
+	}
+}
+
 // TestLoadResolvesFields proves Load() resolves every Config field from the
 // environment: the required Redis settings pass through, the consumer name is
 // resolved to the hostname, the optional retention window parses, and the

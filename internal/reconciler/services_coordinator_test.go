@@ -51,9 +51,6 @@ func (d *coordinatorDocker) RemoveFunctionServiceContainers(context.Context, str
 	return 0, nil
 }
 func (d *coordinatorDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
-func (d *coordinatorDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 
 func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 	docker := &coordinatorDocker{
@@ -269,9 +266,6 @@ func (d *removalBlockingDocker) RemoveFunctionServiceContainers(ctx context.Cont
 func (d *removalBlockingDocker) NetworkExists(context.Context, string) (bool, error) {
 	return true, nil
 }
-func (d *removalBlockingDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 
 // TestServiceCoordinatorRemoveAndWaitWaitsForCompletion proves RemoveAndWait
 // cannot return before the queued removal operation actually completes. It uses
@@ -415,7 +409,6 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 		Env:      map[string]string{"A": "1"},
 		Secrets:  map[string]function.SecretRef{"S": "ref-1"},
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
-		Networks: []string{"backend"},
 	}
 	coordinator.Enqueue("alpha", "", tmpl, "img", []string{"PLAN=1"})
 
@@ -423,7 +416,6 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	tmpl.Env["A"] = "mutated"
 	tmpl.Secrets["S"] = "mutated-ref"
 	tmpl.Services[0].Port = 9999
-	tmpl.Networks[0] = "mutated-net"
 	tmpl.Services = append(tmpl.Services, function.Service{Entrypoint: "extra.js", Port: 81, Replicas: 1})
 
 	if err := coordinator.Wait(context.Background()); err != nil {
@@ -487,9 +479,6 @@ func (d *snapshotDocker) RemoveFunctionServiceContainers(context.Context, string
 	return 0, nil
 }
 func (d *snapshotDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
-func (d *snapshotDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 
 // pauseProbeDocker records every ResolveServiceImage entry (function=image) and
 // the peak concurrent count. It lets a test prove that a service pass enqueued
@@ -529,9 +518,6 @@ func (d *pauseProbeDocker) RemoveFunctionServiceContainers(context.Context, stri
 	return 0, nil
 }
 func (d *pauseProbeDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
-func (d *pauseProbeDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 func (d *pauseProbeDocker) peak() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()

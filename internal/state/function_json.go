@@ -9,7 +9,7 @@ import (
 // of truth) and the JSON object stored in the functions.data BLOB column. The
 // schema keeps only the stable relational metadata as columns — functions.name
 // and functions.updated_at — while the whole snapshot (runtime/status/image/
-// fingerprint/prepared_at/last-reconcile outcome/env/secret references/networks/
+// fingerprint/prepared_at/last-reconcile outcome/env/secret references/
 // handlers/schedules/services) is marshalled here with encoding/json and written
 // through SQLite's jsonb() so it is stored in SQLite's binary JSON (JSONB)
 // format. Reads render it back to JSON text with json(data).

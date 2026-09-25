@@ -64,7 +64,6 @@ type Detail struct {
 	Services        []Service         `json:"services,omitempty"`
 	Env             map[string]string `json:"env,omitempty"`
 	Secrets         map[string]string `json:"secrets,omitempty"`
-	Networks        []string          `json:"networks,omitempty"`
 }
 
 // Handler is one rule's handler, its resolved timeout, and its retry count (the
@@ -615,7 +614,7 @@ func upsertFunctionTx(ctx context.Context, tx *sql.Tx, detail Detail) error {
 
 // functionSnapshot builds the persisted snapshot for a function template: the
 // lifecycle fields passed in PLUS the whole configuration (env/secret
-// references, networks, handlers, schedules, services). Name is relational
+// references, handlers, schedules, services). Name is relational
 // metadata and UpdatedAt is stamped by the caller; HandlerCount is derived on
 // read. Secret entries hold only the reference name — never a resolved value.
 func functionSnapshot(
@@ -629,7 +628,7 @@ func functionSnapshot(
 	reconcileStatus,
 	lastError string,
 ) Detail {
-	env, secrets, networks := snapshotConfig(tmpl)
+	env, secrets := snapshotConfig(tmpl)
 	return Detail{
 		Row: Row{
 			Name:                name,
@@ -647,16 +646,15 @@ func functionSnapshot(
 		Services:        snapshotServices(tmpl),
 		Env:             env,
 		Secrets:         secrets,
-		Networks:        networks,
 	}
 }
 
-// snapshotConfig copies a template's env and secret MAPPINGS and its normalized
-// `networks` list for the persisted snapshot. Only the env/secret MAPPINGS are
+// snapshotConfig copies a template's env and secret MAPPINGS for the persisted
+// snapshot. Only the env/secret MAPPINGS are
 // stored (env-var name → literal value, and env-var name → secret reference) —
-// never a secret VALUE. Empty maps/lists stay nil so the payload omits them and
+// never a secret VALUE. Empty maps stay nil so the payload omits them and
 // a read-back yields nil (the CLI's "section absent" convention).
-func snapshotConfig(tmpl *function.Template) (env, secrets map[string]string, networks []string) {
+func snapshotConfig(tmpl *function.Template) (env, secrets map[string]string) {
 	if len(tmpl.Env) > 0 {
 		env = make(map[string]string, len(tmpl.Env))
 		for name, value := range tmpl.Env {
@@ -669,10 +667,7 @@ func snapshotConfig(tmpl *function.Template) (env, secrets map[string]string, ne
 			secrets[name] = ref.String()
 		}
 	}
-	if len(tmpl.Networks) > 0 {
-		networks = append([]string(nil), tmpl.Networks...)
-	}
-	return env, secrets, networks
+	return env, secrets
 }
 
 // snapshotHandlers renders the template's event rules as name-ordered handlers

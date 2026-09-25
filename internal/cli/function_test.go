@@ -514,59 +514,6 @@ func TestFunctionInspectNoServicesHeader(t *testing.T) {
 	}
 }
 
-// A function with top-level networks renders a Networks section, sorted, and a
-// template without networks omits it.
-func TestFunctionInspectNetworksSection(t *testing.T) {
-	st, _ := openTempState(t)
-
-	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
-networks:
-  - zeta
-  - alpha
-events:
-  - handler: index.main
-    pattern:
-      status: [COMPLETED]
-`))
-	if err != nil {
-		t.Fatalf("parse template: %v", err)
-	}
-	st.RecordReconcileSuccess("user-events-python", "img", "fp", time.Now(),
-		function.Function{Name: "user-events-python", Dir: filepath.Join(t.TempDir(), "x"), Template: tmpl})
-
-	detail, ok := st.GetFunction("user-events-python")
-	if !ok {
-		t.Fatal("expected function")
-	}
-	var w bytes.Buffer
-	printInspect(&w, st, detail)
-	out := w.String()
-	if !strings.Contains(out, "Networks:") {
-		t.Fatalf("inspect output missing Networks:\n%s", out)
-	}
-	if !strings.Contains(out, "alpha") || !strings.Contains(out, "zeta") {
-		t.Fatalf("inspect output missing the network names:\n%s", out)
-	}
-	// Sorted: alpha before zeta.
-	if ai, zi := strings.Index(out, "alpha"), strings.Index(out, "zeta"); ai == -1 || zi == -1 || ai > zi {
-		t.Fatalf("networks must render sorted (alpha before zeta):\n%s", out)
-	}
-}
-
-// A template without networks renders no Networks: header.
-func TestFunctionInspectNoNetworksHeader(t *testing.T) {
-	st, _ := seedTestState(t)
-	detail, ok := st.GetFunction("user-events-python")
-	if !ok {
-		t.Fatal("expected function")
-	}
-	var w bytes.Buffer
-	printInspect(&w, st, detail)
-	if strings.Contains(w.String(), "Networks:") {
-		t.Fatalf("inspect must omit Networks: for a template without networks:\n%s", w.String())
-	}
-}
-
 // inspectServices is a helper that seeds a temp state DB with a function whose
 // template services match svcs (yaml fragments), then returns the rendered
 // inspect output. When withEnv is true the template also defines an env var so

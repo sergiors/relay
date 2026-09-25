@@ -8,15 +8,13 @@ import (
 )
 
 // resetSeedTmpl exercises every part of the persisted functions snapshot
-// (handlers, schedules, services, env/secret references, networks) so a reset
+// (handlers, schedules, services, env/secret references) so a reset
 // can be proven not to touch them.
 const resetSeedTmpl = `runtime: python3.14
 env:
   API_URL: https://api.example.com
 secrets:
   DATABASE_URL: database-url
-networks:
-  - backend
 events:
   - handler: events.created.handler
     pattern:
@@ -128,7 +126,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	}
 
 	// Unrelated data is untouched: the function record, handlers, schedules,
-	// services, networks, and env/secret mappings all survive.
+	// services, and env/secret mappings all survive.
 	detail, ok := c.GetFunction("alpha")
 	if !ok {
 		t.Fatal("function row must survive the stats reset")
@@ -144,9 +142,6 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	}
 	if detail.Env["API_URL"] != "https://api.example.com" || detail.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", detail.Env, detail.Secrets)
-	}
-	if len(detail.Networks) != 1 || detail.Networks[0] != "backend" {
-		t.Fatalf("networks must survive: %v", detail.Networks)
 	}
 }
 

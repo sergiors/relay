@@ -54,10 +54,10 @@ func TestNetworkExistsNotFoundSemantics(t *testing.T) {
 	})
 }
 
-// TestVerifyNetworks pins the pre-flight verification the runtime performs
-// before creating any execution container: every network must exist; the first
-// missing one is reported (ok=false) and Relay NEVER creates a network. A
-// non-not-found inspect error is surfaced as a genuine error.
+// TestVerifyNetworks pins the startup pre-flight the worker performs for the
+// worker-global NETWORKS set: every network must exist; the first missing one is
+// reported (ok=false) and Relay NEVER creates a network. A non-not-found inspect
+// error is surfaced as a genuine error.
 func TestVerifyNetworks(t *testing.T) {
 	t.Run("all present", func(t *testing.T) {
 		cli := newScriptedDockerClient(t,

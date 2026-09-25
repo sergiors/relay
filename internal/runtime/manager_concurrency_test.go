@@ -60,6 +60,26 @@ func TestResolveManagerOptionsMaxConcurrency(t *testing.T) {
 	}
 }
 
+// TestResolveManagerOptionsNetworks pins the WithNetworks option contract: an
+// omitted option resolves to no networks (nil), and an explicit list is copied
+// so a later mutation of the caller's slice cannot change the manager's
+// configuration.
+func TestResolveManagerOptionsNetworks(t *testing.T) {
+	if got := resolveManagerOptions(nil).networks; got != nil {
+		t.Fatalf("default networks = %v, want nil", got)
+	}
+
+	configured := []string{"backend", "frontend"}
+	resolved := resolveManagerOptions([]ManagerOption{WithNetworks(configured)})
+	if len(resolved.networks) != 2 || resolved.networks[0] != "backend" || resolved.networks[1] != "frontend" {
+		t.Fatalf("networks = %v, want [backend frontend]", resolved.networks)
+	}
+	configured[0] = "mutated"
+	if resolved.networks[0] != "backend" {
+		t.Fatalf("WithNetworks must copy its argument; got %q after caller mutation", resolved.networks[0])
+	}
+}
+
 // TestManagerClampedConcurrencyDrivesPoolAndSnapshot proves the capped effective
 // bound is the one that actually drives the warm pool: a function with template
 // concurrency 15 under MAX_CONCURRENCY 8 warms a pool of capacity 8 (gauge,

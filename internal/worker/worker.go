@@ -332,6 +332,10 @@ func Run(logger *slog.Logger) error {
 		// MAX_CONCURRENCY=8) warms, reports, and admits only the cap's worth. It
 		// is startup configuration; a global change requires a worker restart.
 		runtime.WithMaxConcurrency(cfg.MaxConcurrency),
+		// The worker-global Docker networks (NETWORKS) every execution container
+		// joins at create time. They are verified once below before any function
+		// is prepared or any container created.
+		runtime.WithNetworks(cfg.Networks),
 		// Root Dockerfile builds in the worker lifecycle: they get an
 		// independent 10m bound (runtime.buildTimeout) but are still cancelled
 		// when Relay shuts down. Builds must NOT inherit the short 30s
@@ -349,6 +353,23 @@ func Run(logger *slog.Logger) error {
 		name: shutdownStepManager,
 		run:  func(context.Context) error { return manager.Close() },
 	})
+
+	// Verify every configured NETWORKS network exists BEFORE any function is
+	// prepared or any container created. The networks are infrastructure owned
+	// OUTSIDE Relay — Relay never creates them — so a missing one is an operator
+	// condition that must fail startup rather than silently produce containers
+	// on the wrong (or no) network. A verify error (a broken daemon) is likewise
+	// fatal. The check is skipped entirely when NETWORKS is unset.
+	if err := verifyConfiguredNetworks(ctx, manager, cfg.Networks); err != nil {
+		// A lifecycle cancellation during verification is a shutdown, not a
+		// network failure: classify it like every other fallible startup step
+		// and return nil so the CLI does not report a graceful stop as an error.
+		if startupInterrupted(ctx, err) {
+			logger.Info("Startup: NETWORKS verification interrupted by shutdown", "error", err)
+			return startupResult(errStartupInterrupted)
+		}
+		return err
+	}
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -1069,6 +1090,30 @@ func sweepStartupImages(
 	}
 }
 
+// verifyConfiguredNetworks verifies every network in the worker-global NETWORKS
+// set exists on the Docker daemon before any function is prepared or any
+// container created. A missing network, or a verify error (a broken daemon), is
+// a fatal startup failure: Relay never creates networks, and an execution
+// container silently created on the wrong network would be a latent runtime
+// fault. It is a no-op when networks is empty, so an unset NETWORKS keeps the
+// default bridge behavior. The check is bounded by the worker lifecycle and a
+// reconcileTimeout so a hung daemon cannot stall startup forever.
+func verifyConfiguredNetworks(ctx context.Context, manager *runtime.Manager, networks []string) error {
+	if len(networks) == 0 {
+		return nil
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+	missing, ok, err := manager.VerifyNetworks(verifyCtx, networks)
+	if err != nil {
+		return fmt.Errorf("verify NETWORKS: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("NETWORKS network %q does not exist (relay never creates networks)", missing)
+	}
+	return nil
+}
+
 // startupImageKeepSet computes the set of image references the startup sweep
 // must keep: (a) each function's expected fingerprinted image, (b) every image a
 // running service container references, and (c) every last-active image recorded
@@ -1079,10 +1124,9 @@ func sweepStartupImages(
 func startupImageKeepSet(functions []function.Function, serviceImages, recordedImages []string) map[string]bool {
 	keep := make(map[string]bool)
 	for _, fn := range functions {
-		// The image tag is derived from the IMAGE fingerprint (runtime-only
-		// template keys such as `networks` removed), so the keep-set names
-		// exactly the image a build/reuse would produce.
-		if fp, err := function.ImageFingerprint(fn.Dir); err == nil {
+		// The image tag is derived from the function's content fingerprint, so
+		// the keep-set names exactly the image a build/reuse would produce.
+		if fp, err := function.Fingerprint(fn.Dir); err == nil {
 			keep[runtime.ImageRef(fn.Name, fp)] = true
 		}
 	}

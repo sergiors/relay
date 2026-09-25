@@ -66,10 +66,6 @@ func (f *svcDeadlineDocker) NetworkExists(_ context.Context, _ string) (bool, er
 	return true, nil
 }
 
-func (f *svcDeadlineDocker) VerifyNetworks(_ context.Context, _ []string) (string, bool, error) {
-	return "", true, nil
-}
-
 func (f *svcDeadlineDocker) recordedDeadlines() []time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,10 +126,6 @@ func (f *blockingListDocker) RemoveFunctionServiceContainers(_ context.Context, 
 
 func (f *blockingListDocker) NetworkExists(_ context.Context, _ string) (bool, error) {
 	return true, nil
-}
-
-func (f *blockingListDocker) VerifyNetworks(_ context.Context, _ []string) (string, bool, error) {
-	return "", true, nil
 }
 
 // TestEnqueueStartupServicesRootedInLifecycle proves the enqueued per-function
@@ -428,10 +420,6 @@ func (f *svcShutdownDocker) StartService(_ context.Context, _ runtime.ServiceSpe
 
 func (f *svcShutdownDocker) NetworkExists(_ context.Context, _ string) (bool, error) {
 	return true, nil
-}
-
-func (f *svcShutdownDocker) VerifyNetworks(_ context.Context, _ []string) (string, bool, error) {
-	return "", true, nil
 }
 
 func (f *svcShutdownDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {

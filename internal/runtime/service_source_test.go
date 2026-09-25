@@ -12,7 +12,6 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
-	"relay/internal/source"
 	"relay/internal/testutil"
 )
 
@@ -162,52 +161,6 @@ func TestResolveBuildServiceFingerprintInvalidatesOnSelectedSourceChange(t *test
 	write("Dockerfile", "FROM scratch\n# changed\n")
 	if got := refFor(); got == afterSelected {
 		t.Fatal("editing the selected Dockerfile did not invalidate the build image")
-	}
-}
-
-// TestResolveBuildServiceNetworksEditDoesNotInvalidate proves a `networks`-only
-// template edit does NOT invalidate a build-service image (no rebuild): the
-// build path derives its tag from the IMAGE fingerprint, which ignores
-// runtime-only keys.
-func TestResolveBuildServiceNetworksEditDoesNotInvalidate(t *testing.T) {
-	dir := t.TempDir()
-	write := func(name, content string) {
-		t.Helper()
-		p := filepath.Join(dir, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			t.Fatalf("write %s: %v", name, err)
-		}
-	}
-	write("Dockerfile", "FROM scratch\n")
-	write("app.js", "v1\n")
-	write("template.yaml", "runtime: node24\nnetworks: [backend]\nservices:\n  - build: Dockerfile\n")
-	selection, err := source.ForDir(dir)
-	if err != nil {
-		t.Fatalf("select: %v", err)
-	}
-	refFor := func() string {
-		t.Helper()
-		fp, err := function.ImageFingerprintSelection(selection)
-		if err != nil {
-			t.Fatalf("image fingerprint: %v", err)
-		}
-		return serviceBuildImageRef("fn", "Dockerfile", fp)
-	}
-	base := refFor()
-
-	// A networks-only edit does not invalidate the build image.
-	write("template.yaml", "runtime: node24\nnetworks: [backend, frontend]\nservices:\n  - build: Dockerfile\n")
-	if got := refFor(); got != base {
-		t.Fatalf("a networks-only edit invalidated the build image: %q -> %q", base, got)
-	}
-
-	// A selected app-source edit still invalidates.
-	write("app.js", "v2\n")
-	if got := refFor(); got == base {
-		t.Fatal("editing a selected source file must invalidate the build image")
 	}
 }
 

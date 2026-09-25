@@ -31,9 +31,8 @@ type fakeContainer struct {
 	entry      []string // the long-lived process command passed to StartService
 	envHash    string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	labels     map[string]string
-	network    string   // spec.Network passed to StartService (the routing network)
-	networks   []string // spec.Networks passed to StartService (the template list)
-	hostname   string   // the worker identity (relay.hostname) that owns the container
+	network    string // spec.Network passed to StartService (the routing network)
+	hostname   string // the worker identity (relay.hostname) that owns the container
 }
 
 // defaultFakeHostname is the worker identity containers get when started via
@@ -119,12 +118,10 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// the effective env's content hash (relay.env_hash), even for an empty
 		// env. Directly seeded fakeContainers omit it to model a legacy/unlabeled
 		// container. It also carries the canonical relay.networks label (the
-		// union of the routing network and the template networks), so a
-		// converged pass sees the networks match.
+		// routing network), so a converged pass sees the networks match.
 		envHash:  runtime.EnvHash(spec.Env),
 		labels:   spec.Labels,
 		network:  spec.Network,
-		networks: spec.Networks,
 		hostname: defaultFakeHostname,
 	}
 	return id, nil
@@ -135,24 +132,6 @@ func (f *fakeDocker) NetworkExists(_ context.Context, network string) (bool, err
 	defer f.mu.Unlock()
 	f.networkLookups = append(f.networkLookups, network)
 	return !f.missingNetworks[network], nil
-}
-
-// VerifyNetworks mirrors the production pre-flight: it reports the first
-// configured network that is missing. It records every name it was asked about
-// so tests can assert the template's networks were verified.
-func (f *fakeDocker) VerifyNetworks(_ context.Context, networks []string) (string, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, n := range networks {
-		if n == "" {
-			continue
-		}
-		f.networkLookups = append(f.networkLookups, n)
-		if f.missingNetworks[n] {
-			return n, false, nil
-		}
-	}
-	return "", true, nil
 }
 
 func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceContainer, error) {
@@ -171,7 +150,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			Port:     c.port,
 			Hostname: c.hostname,
 			EnvHash:  c.envHash,
-			Networks: runtime.NetworksLabel(c.network, c.networks),
+			Networks: runtime.NetworksLabel(c.network),
 			Labels:   c.labels,
 		})
 	}
@@ -1086,9 +1065,6 @@ func (d *listErrDocker) RemoveFunctionServiceContainers(context.Context, string)
 	return 0, nil
 }
 func (d *listErrDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
-func (d *listErrDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 
 // TestReconcileStartServiceFailureContinues verifies a StartService failure for
 // one replica is reported while the remaining desired replicas are still
@@ -1141,9 +1117,6 @@ func (d *startFailDocker) RemoveFunctionServiceContainers(context.Context, strin
 	return 0, nil
 }
 func (d *startFailDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
-func (d *startFailDocker) VerifyNetworks(context.Context, []string) (string, bool, error) {
-	return "", true, nil
-}
 
 // captureLogger is a minimal in-memory slog writer used to assert the level and
 // text of ServiceReconciler.Apply's summary lines. Apply (and Reconcile) run

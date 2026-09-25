@@ -57,14 +57,15 @@ const (
 	labelReplica  = "relay.replica"
 
 	// labelNetworks records the canonical, sorted, comma-separated set of
-	// Docker networks a service container was created attached to (the union of
-	// the routing network and the template's top-level `networks`). It exists
-	// so the service reconciler can detect a network change and replace the
-	// stale container, replacing it WITHOUT rebuilding the image (the image
-	// fingerprint deliberately ignores runtime-only config). It is omitted for
-	// a container with no extra networks, so a template that declares none is
-	// byte-for-byte the pre-networks behavior. Docker network names never
-	// contain commas, so the comma-joined form is unambiguous.
+	// Docker networks a service container was created attached to (the routing
+	// network). It exists
+	// so the service reconciler can detect a routing-network change and replace
+	// the stale container. It is omitted for a container with no extra networks,
+	// so a service that declares no host is byte-for-byte the pre-networks
+	// behavior. Docker network names never contain commas, so the comma-joined
+	// form is unambiguous. It covers persistent service containers only:
+	// execution containers join the worker-global NETWORKS set, which is startup
+	// configuration and not tracked per container.
 	labelNetworks = "relay.networks"
 
 	// labelEnvHash pins the exact effective environment a service replica was

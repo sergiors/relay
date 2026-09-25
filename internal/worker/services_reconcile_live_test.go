@@ -120,11 +120,6 @@ func (d *ctxRecordDocker) NetworkExists(ctx context.Context, _ string) (bool, er
 	return true, nil
 }
 
-func (d *ctxRecordDocker) VerifyNetworks(ctx context.Context, _ []string) (string, bool, error) {
-	d.record("verify-networks", ctx)
-	return "", true, nil
-}
-
 func (d *ctxRecordDocker) forOp(op string) []ctxObservation {
 	d.mu.Lock()
 	defer d.mu.Unlock()
