@@ -21,10 +21,11 @@ var errStartAlreadyRunning = errors.New("relay start is already running")
 
 // startRun is the hook the "start" command delegates to. It is a package-level
 // variable so tests can observe dispatch without launching the runtime. The
-// worker's Run signature is fixed and must not change.
+// worker's Run returns any startup/runtime failure (after converging cleanup)
+// and the hook propagates it unchanged, so cmd/main.go prints it and owns the
+// process exit.
 var startRun = func(l *slog.Logger) error {
-	worker.Run(l)
-	return nil
+	return worker.Run(l)
 }
 
 // startCommand builds the `relay start` subcommand. It is the only command

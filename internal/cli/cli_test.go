@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -311,6 +312,29 @@ func TestStartReleasesLockAfterRun(t *testing.T) {
 		if _, _, err := runCLIWithDeps(t, deps, "", "start"); err != nil {
 			t.Fatalf("start run %d: %v", i+1, err)
 		}
+	}
+}
+
+// TestStartPropagatesWorkerError verifies the worker's Run error is returned
+// unchanged to the command layer (cmd/main.go owns printing and exit), and that
+// the deferred lock release still runs on the failure path so a subsequent run
+// is not blocked by a failed one.
+func TestStartPropagatesWorkerError(t *testing.T) {
+	deps := testDeps(t)
+	workerErr := errors.New("worker failed")
+	orig := startRun
+	startRun = func(l *slog.Logger) error { return workerErr }
+	defer func() { startRun = orig }()
+
+	_, _, err := runCLIWithDeps(t, deps, "", "start")
+	if !errors.Is(err, workerErr) {
+		t.Fatalf("err = %v, want %v", err, workerErr)
+	}
+
+	// The deferred lock release must have run: a second start must not report
+	// "already running" from the failed first run.
+	if _, _, err := runCLIWithDeps(t, deps, "", "start"); !errors.Is(err, workerErr) {
+		t.Fatalf("second start err = %v, want %v (lock must be released)", err, workerErr)
 	}
 }
 

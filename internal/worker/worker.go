@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/signal"
 	"sync"
 	"syscall"
@@ -92,35 +91,222 @@ func effectiveMaxBuffered(n int) int {
 	return n
 }
 
+// errStartupInterrupted marks a fallible startup operation that failed only
+// because the worker lifecycle was cancelled (SIGTERM/SIGINT) while it was in
+// flight. Run converts it to a nil return: the process is shutting down anyway,
+// the deferred cleanup converges every resource, and a cancelled startup is a
+// graceful shutdown, not a startup failure. It is never returned to the CLI.
+var errStartupInterrupted = errors.New("startup interrupted by shutdown")
+
+// consumerGroupEnsurer is the narrow view of the stream consumer that the
+// consumer-group startup step needs. *stream.Consumer satisfies it; a test fake
+// can implement it, so the cancellation-vs-genuine-failure classification is
+// unit-testable without Redis (matching retention.go's streamTrimmer seam).
+type consumerGroupEnsurer interface {
+	EnsureGroup(ctx context.Context) error
+}
+
+// startupInterrupted reports whether a fallible startup operation failed only
+// because the worker lifecycle was cancelled (or its deadline elapsed) rather
+// than for a genuine reason. The stream and runtime layers wrap the parent
+// context error, so errors.Is is the reliable predicate; an operation error that
+// merely races cancellation without being a context error is still treated as
+// genuine and surfaced. It deliberately requires ctx.Err() != nil so a stray
+// context.Canceled from an unrelated child context is never misclassified.
+func startupInterrupted(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// logStartupCleanupFailure logs a non-fatal startup cleanup failure at Warn, or
+// at Debug when the lifecycle is being cancelled: a sweep interrupted by
+// shutdown is the normal path and must not pollute the shutdown trace with
+// warnings (the barrier already skips sweeps wholesale on a cancelled
+// lifecycle; this covers a cancellation landing mid-pass). The message is
+// identical in both cases so a genuine failure stays recognisable.
+func logStartupCleanupFailure(ctx context.Context, logger *slog.Logger, msg string, err error) {
+	if startupInterrupted(ctx, err) {
+		logger.Debug(msg, "error", err)
+		return
+	}
+	logger.Warn(msg, "error", err)
+}
+
+// ensureGroup creates the consumer group required for consumption and
+// classifies a failure that only reflects the lifecycle being cancelled during
+// startup. A cancelled lifecycle (SIGTERM during a slow Redis round trip) is a
+// shutdown, not a startup failure: it is logged at Info and reported as
+// errStartupInterrupted, which Run converts to a graceful nil return AFTER
+// unwinding through its deferred cleanup. A genuine Redis or configuration
+// failure is wrapped and returned for the CLI boundary to print and exit on. The
+// classification is testable in isolation through the consumerGroupEnsurer seam,
+// without Redis.
+func ensureGroup(ctx context.Context, c consumerGroupEnsurer, logger *slog.Logger) error {
+	err := c.EnsureGroup(ctx)
+	if err == nil {
+		return nil
+	}
+	if startupInterrupted(ctx, err) {
+		logger.Info("Startup: consumer group creation interrupted by shutdown", "error", err)
+		return errStartupInterrupted
+	}
+	return fmt.Errorf("ensure consumer group failed: %w", err)
+}
+
+// startupResult converts the errStartupInterrupted sentinel into a nil return so
+// Run reports a cancelled startup as a graceful success, while any genuine
+// startup failure is returned unchanged. It is the single place the conversion
+// is decided, so the "cancellation is not a failure" contract is unit-testable
+// without exercising Run's full resource wiring.
+func startupResult(err error) error {
+	if errors.Is(err, errStartupInterrupted) {
+		return nil
+	}
+	return err
+}
+
 // Run wires the whole worker: startup state, then the reconciler and stream
-// consumer. It blocks in Consume until the process is signalled.
-func Run(logger *slog.Logger) {
+// consumer. It blocks in Consume until the process is signalled, then runs the
+// graceful shutdown. It returns an error and never calls os.Exit: the CLI
+// boundary owns process exit, and every post-resource startup or runtime failure
+// converges through the SAME deferred cleanup as a normal shutdown, rather than
+// abandoning live servers, goroutines, containers, and the state DB to process
+// exit.
+func Run(logger *slog.Logger) error {
 	cfg := config.Load(logger)
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
-		// Fatal: Redis config is a hard startup requirement (this worker cannot
-		// consume without a valid DSN), so exit the process rather than return.
-		logger.Error("Redis config invalid", "error", err)
-		os.Exit(1)
+		// Pre-resource failure: nothing owns cleanup yet, so return the error for
+		// the CLI to print and exit on.
+		return fmt.Errorf("redis config invalid: %w", err)
 	}
 	client := redis.NewClient(redisOpts)
-	defer client.Close()
 
 	// The worker's lifecycle context: cancelled on SIGINT/SIGTERM (or by the
-	// deferred stop when Run returns). It is created here, before the runtime
-	// Manager, so the manager can root Dockerfile builds in it (see
-	// runtime.WithLifecycleContext): a long build is bounded by the runtime's
-	// 10m buildTimeout but is still cancelled when Relay shuts down. Every
-	// bounded startup daemon operation and the reconciler hooks are likewise
-	// rooted here (rather than context.Background), so shutdown cancels them
-	// too. It replaces the signal context that used to be created later.
+	// deferred cleanup's stopLifecycle when Run returns). It is created here,
+	// before the runtime Manager, so the manager can root Dockerfile builds in
+	// it (see runtime.WithLifecycleContext): a long build is bounded by the
+	// runtime's 10m buildTimeout but is still cancelled when Relay shuts down.
+	// Every bounded startup daemon operation and the reconciler hooks are
+	// likewise rooted here (rather than context.Background), so shutdown cancels
+	// them too. It replaces the signal context that used to be created later.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Metrics are opt-in, gated on METRICS_ADDR. Setup only CREATES the registry
 	// and /metrics server here (nil, nil when disabled); STARTING them happens
 	// later, once the startup wiring is complete.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
+
+	// Every teardown-relevant handle is declared up front (assigned as startup
+	// progresses) so the single deferred cleanup below can converge EVERY return
+	// path, pre-resource failures excepted. The closure reads these variables when
+	// it runs, so a handle that was never assigned is simply nil and its teardown
+	// is skipped.
+	var (
+		st               *state.State
+		manager          *runtime.Manager
+		rtSocket         *SocketServer
+		svcCtrl          *reconciler.ServiceReconciler
+		services         *reconciler.ServiceCoordinator
+		housekeepingDone <-chan struct{}
+		sched            *cron.Scheduler
+		statsFlusher     *statsFlusher
+		gitWebhookServer *gitwh.Server
+	)
+
+	// The graceful shutdown converges here on every return path — normal
+	// shutdown, a startup failure after resources exist, or a Consume error — in
+	// the documented order. It is registered BEFORE the first fallible
+	// resource-owning step, so even a secrets-provider failure releases the Redis
+	// client and stops the (not-yet-started) servers. Each step is nil-safe on a
+	// handle that was never assigned, and the sequence never stops early: a
+	// cleanup problem is logged and process exit still happens, matching the
+	// shutdown contract.
+	defer func() {
+		shutdownSequence{
+			// Cancel the lifecycle FIRST: a startup failure returns without a
+			// signal having arrived, so the background loops, the coordinator, and
+			// the manager builds observe cancellation before teardown joins them.
+			stopLifecycle: stop,
+			closeSocket: func() error {
+				if rtSocket == nil {
+					return nil
+				}
+				return rtSocket.Close()
+			},
+			stopScheduler: func() error {
+				if sched == nil {
+					return nil
+				}
+				stopSD, cancelSD := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelSD()
+				return sched.Stop(stopSD)
+			},
+			joinHousekeeping: func() error {
+				if housekeepingDone == nil {
+					return nil
+				}
+				housekeepingCtx, housekeepingCancel := context.WithTimeout(
+					context.Background(), shutdownServiceTimeout)
+				defer housekeepingCancel()
+				select {
+				case <-housekeepingDone:
+					return nil
+				case <-housekeepingCtx.Done():
+					return housekeepingCtx.Err()
+				}
+			},
+			joinServices: func() error {
+				if services == nil {
+					return nil
+				}
+				joinCtx, joinCancel := context.WithTimeout(
+					context.Background(), shutdownServiceTimeout)
+				defer joinCancel()
+				return services.Join(joinCtx)
+			},
+			cleanupServices: func() {
+				if svcCtrl == nil {
+					return
+				}
+				shutdownServices(svcCtrl, cfg.ConsumerName, logger)
+			},
+			flushStats: func() {
+				finalStatsFlush(statsFlusher)
+			},
+			stopMetrics: func() error {
+				if metricsServer == nil {
+					return nil
+				}
+				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				return metricsServer.Stop(stopCtx)
+			},
+			stopWebhook: func() error {
+				if gitWebhookServer == nil {
+					return nil
+				}
+				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				return gitWebhookServer.Stop(stopCtx)
+			},
+			closeManager: func() error {
+				if manager == nil {
+					return nil
+				}
+				return manager.Close()
+			},
+			closeState: func() error {
+				if st == nil {
+					return nil
+				}
+				return st.Close()
+			},
+			closeClient: client.Close,
+		}.run(logger)
+	}()
 
 	// A single shared secrets provider, used by both the webhook (below) and the
 	// runner (later). Construction is infallible (the dir is created lazily on
@@ -130,8 +316,7 @@ func Run(logger *slog.Logger) {
 	// and the webhook.
 	secretProvider, err := secrets.NewLocalProvider(secrets.SecretsDir)
 	if err != nil {
-		logger.Error("Secrets: new local provider failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("secrets: new local provider failed: %w", err)
 	}
 
 	// The Git webhook server (internal/git/webhook) is opt-in, gated on
@@ -139,7 +324,6 @@ func Run(logger *slog.Logger) {
 	// reference checks, the coalescing sync scheduler, provider handlers) and
 	// returns nil when disabled. The worker only orchestrates: construct, start
 	// (bind failure is fatal, matching metrics), and stop on shutdown.
-	var gitWebhookServer *gitwh.Server
 	if cfg.GitWebhookAddr != "" {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
@@ -147,23 +331,24 @@ func Run(logger *slog.Logger) {
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
 	if err != nil {
-		// Fatal: the worker cannot run without its function set, so exit the
-		// process rather than continue with nothing to serve.
-		logger.Error("Load functions failed", "error", err)
-		os.Exit(1)
+		// The worker cannot run without its function set. The deferred cleanup
+		// releases the Redis client and stops the servers; the error is returned
+		// for the CLI boundary to print and exit on.
+		return fmt.Errorf("load functions failed: %w", err)
 	}
 	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
 
 	// The state database is a read-only local state view (see internal/state),
 	// NOT the source of truth and never drives matching or building. All state
 	// errors are non-fatal — Relay runs without the state DB if it is broken.
-	st, err := state.Open(state.DBPath)
+	// The handle is owned by the deferred cleanup (which is nil-safe when open
+	// failed), so it is not deferred here.
+	st, err = state.Open(state.DBPath)
 	if err != nil {
 		logger.Warn("State: open failed; continuing without", "error", err)
 		st = nil
 	}
 	if st != nil {
-		defer st.Close()
 		if err := st.RebuildFromFS(function.Dir); err != nil {
 			logger.Warn("State: rebuild from fs failed; continuing", "error", err)
 		}
@@ -188,9 +373,9 @@ func Run(logger *slog.Logger) {
 	// (flusher.ResetStats) can never race a flush into resurrecting pre-reset
 	// values: a flush either completes before the reset or captures after it.
 	// Shared by statsLoop, finalStatsFlush, and the socket reset command.
-	statsFlusher := newStatsFlusher(st, metricsInstance)
+	statsFlusher = newStatsFlusher(st, metricsInstance)
 
-	manager, err := runtime.NewManager(
+	manager, err = runtime.NewManager(
 		logger,
 		metricsInstance,
 		cfg.ConsumerName,
@@ -208,12 +393,10 @@ func Run(logger *slog.Logger) {
 		runtime.WithLifecycleContext(ctx),
 	)
 	if err != nil {
-		// Fatal: the runtime manager owns container execution, which the worker
-		// cannot serve without, so exit the process on construction failure.
-		logger.Error("Runtime: new manager failed", "error", err)
-		os.Exit(1)
+		// The runtime manager owns container execution, which the worker cannot
+		// serve without. The deferred cleanup closes the Redis client and state DB.
+		return fmt.Errorf("runtime: new manager failed: %w", err)
 	}
-	defer manager.Close()
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -223,12 +406,10 @@ func Run(logger *slog.Logger) {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
-	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
+	rtSocket, err = NewSocketServer(SocketPath, manager, statsFlusher, logger)
 	if err != nil {
-		logger.Error("Runtime state socket: start failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
-	defer rtSocket.Close()
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
 	// The service controller converges each function's persistent service
@@ -244,14 +425,14 @@ func Run(logger *slog.Logger) {
 	// decides whether routing applies (only services declaring a host are routed)
 	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
 	// configured value.
-	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
+	svcCtrl = reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
 		Network:      cfg.TraefikNetwork,
 		EntryPoints:  cfg.TraefikEntryPoints,
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
 	}, logger, reconcileTimeout)
-	services := reconciler.NewServiceCoordinator(svcCtrl)
+	services = reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
 
 	// Conservative startup orphan sweep: before any function is prepared or any
@@ -264,7 +445,8 @@ func Run(logger *slog.Logger) {
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
-		logger.Warn("Startup: orphan container sweep failed", "error", sweepErr)
+		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
+		logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
 	} else if n > 0 {
 		logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
 	}
@@ -292,7 +474,7 @@ func Run(logger *slog.Logger) {
 	for _, fn := range functions {
 		liveNames[fn.Name] = true
 	}
-	housekeepingDone := startInitialHousekeeping(ctx, logger, startupHousekeeping{
+	housekeepingDone = startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
 		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, liveNames) },
 		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
@@ -355,10 +537,10 @@ func Run(logger *slog.Logger) {
 		go metricsLogger.Start(ctx)
 
 		if err := metricsServer.Start(); err != nil {
-			// Fatal: a bind failure (taken metrics port) is a config error that
-			// should surface at startup, not retry invisibly.
-			logger.Error("Metrics server: start failed", "error", err)
-			os.Exit(1)
+			// A bind failure (taken metrics port) is a config error that must
+			// surface at startup, not retry invisibly. The deferred cleanup stops
+			// the metrics logger goroutine via the cancelled lifecycle.
+			return fmt.Errorf("metrics server: start failed: %w", err)
 		}
 		logger.Info("Metrics http server listening", "addr", cfg.MetricsAddr)
 	}
@@ -369,8 +551,7 @@ func Run(logger *slog.Logger) {
 	// server means the webhook was disabled, so there is nothing to start.
 	if gitWebhookServer != nil {
 		if err := gitWebhookServer.Start(); err != nil {
-			logger.Error("Git webhook server: start failed", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("git webhook server: start failed: %w", err)
 		}
 		logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
 	}
@@ -394,11 +575,13 @@ func Run(logger *slog.Logger) {
 		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
 	}
 
-	if err := consumer.EnsureGroup(ctx); err != nil {
-		// Fatal: the consumer group is a hard prerequisite for consumption, so
-		// exit the process rather than retry a misconfiguration silently.
-		logger.Error("Ensure consumer group failed", "error", err)
-		os.Exit(1)
+	if err := ensureGroup(ctx, consumer, logger); err != nil {
+		// The consumer group is a hard prerequisite for consumption. Return now so
+		// the deferred cleanup stops the servers and loops; startupResult turns a
+		// lifecycle-cancelled startup into a graceful nil return (the process is
+		// already shutting down), while a genuine failure is returned for the CLI
+		// to print and exit on.
+		return startupResult(err)
 	}
 
 	// The schedule publisher atomically publishes one stream entry per logical
@@ -410,7 +593,7 @@ func Run(logger *slog.Logger) {
 	// publish schedule occurrences through the publisher, seeded from the loaded
 	// function set before Start, then converges live via the reconciler's
 	// UpdateSchedules/RemoveFunction hooks.
-	sched := cron.New(publisher, logger)
+	sched = cron.New(publisher, logger)
 	for _, fn := range functions {
 		sched.ReplaceFunction(fn.Name, fn.Template)
 	}
@@ -507,13 +690,57 @@ func Run(logger *slog.Logger) {
 		"group", cfg.RedisGroup,
 		"consumer", cfg.ConsumerName,
 	)
+	var consumeErr error
 	if err := consumer.Consume(ctx, runWorker.Handle); err != nil {
-		logger.Error("Consume failed", "error", err)
 		// The consumer is the worker's raison d'être; a Consume error means the
-		// consumption loop has stopped, so exit the process rather than return
-		// with nothing running. (Shutdown via a cancelled ctx returns nil, so a
-		// non-nil error here is a genuine failure.)
-		os.Exit(1)
+		// consumption loop has stopped. The deferred cleanup still drains
+		// everything in order, and the error is returned after shutdown rather
+		// than exiting mid-teardown. (Shutdown via a cancelled ctx returns nil, so
+		// a non-nil error here is a genuine failure.)
+		logger.Error("Consume failed", "error", err)
+		consumeErr = fmt.Errorf("consume failed: %w", err)
+	}
+
+	// The graceful shutdown tail (socket, scheduler, housekeeping, services,
+	// stats, servers) is owned by the deferred cleanup registered at the top, so
+	// a startup failure and a normal shutdown converge on the exact same order.
+	return consumeErr
+}
+
+// shutdownSequence is the single ordered teardown the worker runs on every
+// return path once its resources exist. Ordering is the shutdown contract:
+// cancel the lifecycle (so loops, the coordinator, and rooted builds observe
+// cancellation), stop the live socket (no new live state is served), stop the
+// scheduler (no new schedule work), join the startup housekeeping (so no sweep
+// overlaps the teardown), join and clean up service containers, flush the final
+// stats snapshot, then stop the HTTP servers and close the clients. Each step is
+// nil-safe on a never-assigned handle; a non-nil error is logged and does not
+// stop the sequence, matching the original shutdown's non-fatal policy. Run
+// registers it as a defer BEFORE the first fallible resource-owning step, so a
+// startup failure after the Redis client exists still releases it.
+type shutdownSequence struct {
+	stopLifecycle    context.CancelFunc
+	closeSocket      func() error
+	stopScheduler    func() error
+	joinHousekeeping func() error
+	joinServices     func() error
+	cleanupServices  func()
+	flushStats       func()
+	stopMetrics      func() error
+	stopWebhook      func() error
+	closeManager     func() error
+	closeState       func() error
+	closeClient      func() error
+}
+
+// run executes the sequence in the documented order, logging (never returning) a
+// step failure so a cleanup problem can never abort the rest of the teardown.
+// The lifecycle cancel runs first and is unconditional; every later step is
+// guarded by the caller's nil check (so it is safe when that resource never
+// existed).
+func (s shutdownSequence) run(logger *slog.Logger) {
+	if s.stopLifecycle != nil {
+		s.stopLifecycle()
 	}
 
 	// Stop the live runtime-pool query socket first: the worker has stopped
@@ -522,8 +749,10 @@ func Run(logger *slog.Logger) {
 	// rest of shutdown drains. Close stops accepting, closes in-flight
 	// connections, joins their bounded handlers, and unlinks the socket file.
 	// Non-fatal: a unlink failure must never fail process shutdown.
-	if err := rtSocket.Close(); err != nil {
-		logger.Warn("Runtime state socket: shutdown failed", "error", err)
+	if s.closeSocket != nil {
+		if err := s.closeSocket(); err != nil {
+			logger.Warn("Runtime state socket: shutdown failed", "error", err)
+		}
 	}
 
 	// Bounded graceful shutdown of the cron scheduler, so an in-flight
@@ -535,10 +764,10 @@ func Run(logger *slog.Logger) {
 	// at-least-once: the entry is consumed by another consumer if any; if the
 	// whole cluster is down it waits in the stream for the next boot (PEL/group
 	// state persists).
-	stopSD, cancelSD := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelSD()
-	if err := sched.Stop(stopSD); err != nil {
-		logger.Warn("Scheduler: graceful shutdown failed", "error", err)
+	if s.stopScheduler != nil {
+		if err := s.stopScheduler(); err != nil {
+			logger.Warn("Scheduler: graceful shutdown failed", "error", err)
+		}
 	}
 
 	// Wait for the background startup housekeeping (service barrier, orphan
@@ -548,13 +777,11 @@ func Run(logger *slog.Logger) {
 	// bounded so a wedged sweep can never hang shutdown, and non-fatal for the
 	// same reason. On a normal boot the goroutine has long since exited, so this
 	// is a no-op receive.
-	housekeepingCtx, housekeepingCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
-	select {
-	case <-housekeepingDone:
-	case <-housekeepingCtx.Done():
-		logger.Warn("Startup: housekeeping did not finish before shutdown", "error", housekeepingCtx.Err())
+	if s.joinHousekeeping != nil {
+		if err := s.joinHousekeeping(); err != nil {
+			logger.Warn("Startup: housekeeping did not finish before shutdown", "error", err)
+		}
 	}
-	housekeepingCancel()
 
 	// Stop and remove this worker's persistent service containers. Order:
 	// AFTER the startup housekeeping join and scheduler stop (no more schedule
@@ -563,26 +790,28 @@ func Run(logger *slog.Logger) {
 	// wait behind it). The coordinator Join releases the workers and their
 	// waiters and drains in-flight Applys. Non-fatal: ShutdownCleanup logs
 	// internally, and a Docker problem or timeout must never fail the process.
-	joinCtx, joinCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
-	if err := services.Join(joinCtx); err != nil {
-		logger.Warn("Service: coordinator shutdown failed", "error", err)
+	if s.joinServices != nil {
+		if err := s.joinServices(); err != nil {
+			logger.Warn("Service: coordinator shutdown failed", "error", err)
+		}
 	}
-	joinCancel()
-	shutdownServices(svcCtrl, cfg.ConsumerName, logger)
+	if s.cleanupServices != nil {
+		s.cleanupServices()
+	}
 
-	// Final flush of the registry into SQLite before the deferred st.Close() runs.
+	// Final flush of the registry into SQLite before the state handle closes.
 	// Bounded by a short timeout so a wedged SQLite cannot hang shutdown; failure
-	// is logged and shutdown continues (telemetry, not state). No-op when metrics
-	// are disabled (nil registry).
-	finalStatsFlush(statsFlusher)
+	// is logged by the flush and shutdown continues (telemetry, not state). No-op
+	// when metrics are disabled (nil registry).
+	if s.flushStats != nil {
+		s.flushStats()
+	}
 
 	// Bounded graceful shutdown of the metrics server, so in-flight scrapes drain
 	// rather than being cut off mid-request. No-op when metrics are disabled (the
 	// server was never created).
-	if metricsServer != nil {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := metricsServer.Stop(stopCtx); err != nil {
+	if s.stopMetrics != nil {
+		if err := s.stopMetrics(); err != nil {
 			logger.Warn("Metrics server: graceful shutdown failed", "error", err)
 		}
 	}
@@ -591,11 +820,29 @@ func Run(logger *slog.Logger) {
 	// HTTP server shuts down first so no new deliveries arrive, then the scheduler
 	// it assembled waits, bounded by the same short ctx, for in-flight sync to
 	// drain. A no-op when the webhook is disabled (nil server).
-	if gitWebhookServer != nil {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := gitWebhookServer.Stop(stopCtx); err != nil {
+	if s.stopWebhook != nil {
+		if err := s.stopWebhook(); err != nil {
 			logger.Warn("Git webhook server: graceful shutdown failed", "error", err)
+		}
+	}
+
+	// Close the runtime manager (stops its maintenance loop, discards cached
+	// execution containers, releases the Docker client) and then the state DB and
+	// Redis client. The manager closes after the service cleanup so it still owns
+	// live container state while containers are being stopped.
+	if s.closeManager != nil {
+		if err := s.closeManager(); err != nil {
+			logger.Warn("Runtime: manager close failed", "error", err)
+		}
+	}
+	if s.closeState != nil {
+		if err := s.closeState(); err != nil {
+			logger.Warn("State: close failed", "error", err)
+		}
+	}
+	if s.closeClient != nil {
+		if err := s.closeClient(); err != nil {
+			logger.Warn("Redis: client close failed", "error", err)
 		}
 	}
 
@@ -656,9 +903,17 @@ func prepareFunctions(
 	for _, fn := range functions {
 		prep, err := manager.Prepare(ctx, fn)
 		if err != nil {
-			logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
-			if st != nil {
-				st.RecordReconcileFailure(fn.Name, err)
+			// A build cancelled by the lifecycle is a shutdown, not a build
+			// failure: it must not record a spurious reconcile failure in the
+			// state DB. The function is still marked unavailable, but Run is
+			// already converging on shutdown.
+			if startupInterrupted(ctx, err) {
+				logger.Debug("Function: prepare interrupted by shutdown", "function", fn.Name, "error", err)
+			} else {
+				logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
+				if st != nil {
+					st.RecordReconcileFailure(fn.Name, err)
+				}
 			}
 			prepared = append(prepared, runner.NewUnavailable(fn))
 			continue
@@ -741,7 +996,7 @@ func enqueueStartupServices(
 	}
 }
 
-// startupHousekeeping groups the background startup cleanup passes so their
+// startupHousekeeper groups the background startup cleanup passes so their
 // ordering and lifecycle behavior are deterministic to test without Docker.
 // exclusive is the coordinator's housekeeping seam (see
 // ServiceCoordinator.RunExclusive): it atomically waits for current service work
@@ -751,14 +1006,14 @@ func enqueueStartupServices(
 // sweep, then image sweep (whose keep-set must observe the settled service
 // containers), then dependency GC (which prunes dependency images the image
 // sweep orphaned) — so no live UpdateServices can race them.
-type startupHousekeeping struct {
+type startupHousekeeper struct {
 	exclusive func(context.Context, func(context.Context)) error
 	sweep     func(context.Context)
 	images    func(context.Context)
 	deps      func(context.Context)
 }
 
-// startInitialHousekeeping launches the lifecycle-aware startup housekeeping in a
+// startStartupHousekeeping launches the lifecycle-aware startup housekeeping in a
 // background goroutine and returns a channel closed when it completes. Startup
 // must NOT block on it: Run publishes the initial desired states and returns
 // immediately, and only this pass waits at the coordinator barrier for the
@@ -769,10 +1024,10 @@ type startupHousekeeping struct {
 // unconverged or shutting-down world. An update arriving while the exclusive
 // callback runs is coalesced as a pending desired state and scheduled only once
 // the callback returns, so it can never run concurrently with a sweep.
-func startInitialHousekeeping(
+func startStartupHousekeeping(
 	lifecycle context.Context,
 	logger *slog.Logger,
-	h startupHousekeeping,
+	h startupHousekeeper,
 ) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
@@ -833,7 +1088,7 @@ func sweepStartupImages(
 			serviceImages = append(serviceImages, container.Image)
 		}
 	} else {
-		logger.Warn("Service: keep-set list failed; continuing without", "error", err)
+		logStartupCleanupFailure(lifecycle, logger, "Service: keep-set list failed; continuing without", err)
 	}
 	// The state keep-set is only armed when the DB was available. When st is
 	// nil recordedImages stays empty, so the keep-set falls back to the function
@@ -850,7 +1105,7 @@ func sweepStartupImages(
 	keep := startupImageKeepSet(functions, serviceImages, recordedImages)
 	if st != nil {
 		if _, err := manager.RemoveImagesExcept(lifecycle, keep); err != nil {
-			logger.Warn("Image cleanup: startup sweep failed", "error", err)
+			logStartupCleanupFailure(lifecycle, logger, "Image cleanup: startup sweep failed", err)
 		}
 	}
 }
@@ -901,7 +1156,7 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 	// the builds it follows, it is lifecycle-bounded rather than
 	// reconcile-bounded, and it is a single best-effort pass.
 	if _, err := manager.CleanupUnusedDependencies(lifecycle); err != nil {
-		logger.Warn("Dependency image cleanup failed", "error", err)
+		logStartupCleanupFailure(lifecycle, logger, "Dependency image cleanup failed", err)
 	}
 }
 
