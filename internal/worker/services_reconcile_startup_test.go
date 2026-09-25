@@ -1,9 +1,12 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -402,6 +405,7 @@ type svcShutdownDocker struct {
 	nextID     int
 	containers map[string]runtime.ServiceContainer
 	stopped    []string
+	stopErr    error
 }
 
 func newSvcShutdownDocker() *svcShutdownDocker {
@@ -451,7 +455,7 @@ func (f *svcShutdownDocker) StopServiceContainers(_ context.Context, containers 
 		f.stopped = append(f.stopped, c.ID)
 		delete(f.containers, c.ID)
 	}
-	return nil
+	return f.stopErr
 }
 
 // addService inserts one service container for the given worker hostname.
@@ -480,10 +484,11 @@ func (f *svcShutdownDocker) remainingCount() int {
 }
 
 // TestShutdownCleanupHostnameScopedWorkerSide: the worker-side ShutdownCleanup
-// path (via shutdownServices with the bound the helper applies internally)
-// removes only the containers owned by this worker's hostname, preserves other
-// workers', and returns promptly even with an already-cancelled context (the
-// deadline is the caller's responsibility; shutdown continues anyway).
+// path (via shutdownServices with the same shutdownServiceTimeout bound the
+// shutdown registry derives for its step) removes only the containers owned by
+// this worker's hostname, preserves other workers', and returns promptly even
+// with an already-cancelled context (the deadline is the caller's
+// responsibility; shutdown continues anyway).
 func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	fake := newSvcShutdownDocker()
 	fake.addService("own-1", "relay-worker-a")
@@ -492,7 +497,11 @@ func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
 
-	shutdownServices(svcCtrl, "relay-worker-a", logger)
+	// The shutdown registry owns the step's bound; apply the same 30s bound
+	// here so the bounded cleanup path is exercised as production runs it.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
+	shutdownServices(cleanupCtx, svcCtrl, "relay-worker-a")
+	cleanupCancel()
 
 	consoleFake := fake // the same fake: shutdownServices already ran the cleanup
 	stopped := consoleFake.stoppedIDs()
@@ -522,5 +531,56 @@ func TestWorkerShutdownServicesHostnameScopedAndBounded(t *testing.T) {
 	}
 	if remaining := fake.remainingCount(); remaining != 0 {
 		t.Fatalf("remaining containers = %d, want 0 (cancelled ctx still removes via the fake)", remaining)
+	}
+}
+
+// TestWorkerShutdownServiceCleanupStepFailureReachesRegistry pins the fix that a
+// ShutdownCleanup error must propagate out of the service-cleanup step to
+// shutdownRegistry.run, where it is logged once with the structured step name
+// and error. It drives the real production step closure (shutdownServices)
+// through the registry, so a regression to swallowing the error (returning nil)
+// loses the "step=service-cleanup" log and fails the test.
+func TestWorkerShutdownServiceCleanupStepFailureReachesRegistry(t *testing.T) {
+	fake := newSvcShutdownDocker()
+	fake.addService("own-1", "relay-worker-a")
+	stopErr := errors.New("docker stop: daemon unavailable")
+	fake.stopErr = stopErr
+
+	var logs bytes.Buffer
+	// Debug level so the lower-level ShutdownCleanup Warn is captured too; the
+	// test asserts both layers, not just the registry's.
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
+
+	reg := &shutdownRegistry{}
+	reg.register(shutdownStep{
+		name:    shutdownStepServiceCleanup,
+		timeout: shutdownServiceTimeout,
+		run: func(stepCtx context.Context) error {
+			return shutdownServices(stepCtx, svcCtrl, "relay-worker-a")
+		},
+	})
+	reg.run(logger)
+
+	out := logs.String()
+	// The registry surfaced the failure with the structured step name and the
+	// propagated error, rather than the old silent nil return.
+	if !strings.Contains(out, "step="+shutdownStepServiceCleanup) {
+		t.Errorf("registry log missing structured step=%s:\n%s", shutdownStepServiceCleanup, out)
+	}
+	if !strings.Contains(out, stopErr.Error()) {
+		t.Errorf("registry log missing the propagated error %q:\n%s", stopErr, out)
+	}
+	// The lower-level ShutdownCleanup Warn is still present, and the registry
+	// adds its own structured step log — exactly the two expected records, with
+	// no duplicate debug line from the step closure.
+	if n := strings.Count(out, stopErr.Error()); n != 2 {
+		t.Errorf("error appears %d times, want 2 (reconciler Warn + registry step log):\n%s", n, out)
+	}
+	if strings.Contains(out, "shutdown cleanup returned error") {
+		t.Errorf("shutdownServices must not re-log the error it now returns:\n%s", out)
+	}
+	if !strings.Contains(out, "Shutdown complete") {
+		t.Errorf("a failing step must not abort the sequence; missing completion marker:\n%s", out)
 	}
 }

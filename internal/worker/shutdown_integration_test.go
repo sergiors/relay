@@ -448,10 +448,13 @@ export async function slow(event) {
 	}
 	t.Logf("Consume returned cleanly after %v", shutdownElapsed)
 
-	// finalStatsFlush runs after Consume returns, exactly like Run(). Assert it
-	// completes within its 2s bound and that a stats row exists.
+	// The stats-flush shutdown step runs after Consume returns, exactly like
+	// Run(). The shutdown registry owns the step's bound (2s here), so apply it
+	// the same way and assert the flush completes within it with a stats row.
 	flushStart := time.Now()
-	finalStatsFlush(newStatsFlusher(env.st, env.m))
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	finalStatsFlush(flushCtx, newStatsFlusher(env.st, env.m))
+	flushCancel()
 	flushElapsed := time.Since(flushStart)
 	if flushElapsed > 2*time.Second {
 		t.Fatalf("finalStatsFlush took %v, want < 2s", flushElapsed)

@@ -62,14 +62,27 @@ const statsFlushInterval = 5 * time.Second
 // lifecycle, so a slow image build can never be cut off by this short reconcile
 // budget. Apply receives the worker lifecycle context (NOT this constant wrapped
 // around the whole pass) and the reconciler derives the per-operation bounds
-// from it. The 5s shutdown bounds are a separate, deliberately shorter bound
-// (see Run's shutdown tail), not this constant.
+// from it. The 5s shutdown step bounds are a separate, deliberately shorter
+// bound (shutdownStepTimeout), not this constant.
 const reconcileTimeout = 30 * time.Second
 
-// shutdownServiceTimeout bounds the service-container cleanup during graceful
-// shutdown: stopping and removing this worker's persistent service containers
-// must not block shutdown forever.
+// shutdownServiceTimeout bounds the service-container join and cleanup during
+// graceful shutdown: joining the coordinator and stopping/removing this
+// worker's persistent service containers must not block shutdown forever.
 const shutdownServiceTimeout = 30 * time.Second
+
+// shutdownStepTimeout bounds the shutdown steps that gracefully stop a server
+// (scheduler, metrics, webhook). The shutdown registry derives a fresh
+// context.Background bound from it per step, so one slow step can never consume
+// another step's budget. Steps whose teardown historically took no context
+// (socket/manager/state/Redis closes) declare no bound (timeout <= 0) and keep
+// running on context.Background, preserving their pre-registry behavior.
+const shutdownStepTimeout = 5 * time.Second
+
+// shutdownStatsFlushTimeout bounds the final stats flush step. It preserves the
+// 2s bound the flush historically applied internally, now owned by the shutdown
+// registry so it is visible alongside every other step's bound.
+const shutdownStatsFlushTimeout = 2 * time.Second
 
 // effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
 // (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
@@ -185,7 +198,7 @@ func Run(logger *slog.Logger) error {
 	client := redis.NewClient(redisOpts)
 
 	// The worker's lifecycle context: cancelled on SIGINT/SIGTERM (or by the
-	// deferred cleanup's stopLifecycle when Run returns). It is created here,
+	// deferred shutdown when Run returns). It is created here,
 	// before the runtime Manager, so the manager can root Dockerfile builds in
 	// it (see runtime.WithLifecycleContext): a long build is bounded by the
 	// runtime's 10m buildTimeout but is still cancelled when Relay shuts down.
@@ -199,113 +212,31 @@ func Run(logger *slog.Logger) error {
 	// later, once the startup wiring is complete.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
 
-	// Every teardown-relevant handle is declared up front (assigned as startup
-	// progresses) so the single deferred cleanup below can converge EVERY return
-	// path, pre-resource failures excepted. The closure reads these variables when
-	// it runs, so a handle that was never assigned is simply nil and its teardown
-	// is skipped.
-	var (
-		st               *state.State
-		manager          *runtime.Manager
-		rtSocket         *SocketServer
-		svcCtrl          *reconciler.ServiceReconciler
-		services         *reconciler.ServiceCoordinator
-		housekeepingDone <-chan struct{}
-		sched            *cron.Scheduler
-		statsFlusher     *statsFlusher
-		gitWebhookServer *gitwh.Server
-	)
+	// The graceful shutdown registry converges here on every return path —
+	// normal shutdown, a startup failure after resources exist, or a Consume
+	// error. Steps are registered as each resource is successfully
+	// acquired/started (below), but run in the explicit shutdownStepOrder, so a
+	// resource acquired early (Redis) is released last and ordering never
+	// depends on registration/LIFO. The defer is registered BEFORE the first
+	// fallible resource-owning step, so even a secrets-provider failure releases
+	// the Redis client. A step that declares a bound gets its own fresh one (a
+	// step with no bound runs on context.Background); a step failure is logged
+	// with its name and never stops the sequence.
+	shutdown := &shutdownRegistry{}
+	// Redis is acquired first and released last; register its cleanup now.
+	// client.Close took no context before the registry owned the teardown, so
+	// it declares no bound (timeout 0) and keeps running unbounded.
+	shutdown.register(shutdownStep{
+		name: shutdownStepRedis,
+		run:  func(context.Context) error { return client.Close() },
+	})
 
-	// The graceful shutdown converges here on every return path — normal
-	// shutdown, a startup failure after resources exist, or a Consume error — in
-	// the documented order. It is registered BEFORE the first fallible
-	// resource-owning step, so even a secrets-provider failure releases the Redis
-	// client and stops the (not-yet-started) servers. Each step is nil-safe on a
-	// handle that was never assigned, and the sequence never stops early: a
-	// cleanup problem is logged and process exit still happens, matching the
-	// shutdown contract.
+	// Cancel the lifecycle FIRST: a startup failure returns without a signal
+	// having arrived, so background loops, the coordinator, and the manager
+	// builds observe cancellation before teardown joins them.
 	defer func() {
-		shutdownSequence{
-			// Cancel the lifecycle FIRST: a startup failure returns without a
-			// signal having arrived, so the background loops, the coordinator, and
-			// the manager builds observe cancellation before teardown joins them.
-			stopLifecycle: stop,
-			closeSocket: func() error {
-				if rtSocket == nil {
-					return nil
-				}
-				return rtSocket.Close()
-			},
-			stopScheduler: func() error {
-				if sched == nil {
-					return nil
-				}
-				stopSD, cancelSD := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancelSD()
-				return sched.Stop(stopSD)
-			},
-			joinHousekeeping: func() error {
-				if housekeepingDone == nil {
-					return nil
-				}
-				housekeepingCtx, housekeepingCancel := context.WithTimeout(
-					context.Background(), shutdownServiceTimeout)
-				defer housekeepingCancel()
-				select {
-				case <-housekeepingDone:
-					return nil
-				case <-housekeepingCtx.Done():
-					return housekeepingCtx.Err()
-				}
-			},
-			joinServices: func() error {
-				if services == nil {
-					return nil
-				}
-				joinCtx, joinCancel := context.WithTimeout(
-					context.Background(), shutdownServiceTimeout)
-				defer joinCancel()
-				return services.Join(joinCtx)
-			},
-			cleanupServices: func() {
-				if svcCtrl == nil {
-					return
-				}
-				shutdownServices(svcCtrl, cfg.ConsumerName, logger)
-			},
-			flushStats: func() {
-				finalStatsFlush(statsFlusher)
-			},
-			stopMetrics: func() error {
-				if metricsServer == nil {
-					return nil
-				}
-				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				return metricsServer.Stop(stopCtx)
-			},
-			stopWebhook: func() error {
-				if gitWebhookServer == nil {
-					return nil
-				}
-				stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				return gitWebhookServer.Stop(stopCtx)
-			},
-			closeManager: func() error {
-				if manager == nil {
-					return nil
-				}
-				return manager.Close()
-			},
-			closeState: func() error {
-				if st == nil {
-					return nil
-				}
-				return st.Close()
-			},
-			closeClient: client.Close,
-		}.run(logger)
+		stop()
+		shutdown.run(logger)
 	}()
 
 	// A single shared secrets provider, used by both the webhook (below) and the
@@ -323,7 +254,9 @@ func Run(logger *slog.Logger) error {
 	// GIT_WEBHOOK_ADDR. NewServer owns all assembly (git source config, secret
 	// reference checks, the coalescing sync scheduler, provider handlers) and
 	// returns nil when disabled. The worker only orchestrates: construct, start
-	// (bind failure is fatal, matching metrics), and stop on shutdown.
+	// (bind failure is fatal, matching metrics), and stop on shutdown. Its
+	// teardown step is registered only once it has actually started.
+	var gitWebhookServer *gitwh.Server
 	if cfg.GitWebhookAddr != "" {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
@@ -341,14 +274,19 @@ func Run(logger *slog.Logger) error {
 	// The state database is a read-only local state view (see internal/state),
 	// NOT the source of truth and never drives matching or building. All state
 	// errors are non-fatal — Relay runs without the state DB if it is broken.
-	// The handle is owned by the deferred cleanup (which is nil-safe when open
-	// failed), so it is not deferred here.
-	st, err = state.Open(state.DBPath)
+	// A nil handle is never registered, so shutdown simply skips its close.
+	st, err := state.Open(state.DBPath)
 	if err != nil {
 		logger.Warn("State: open failed; continuing without", "error", err)
 		st = nil
 	}
 	if st != nil {
+		// st.Close took no context before the registry owned the teardown, so
+		// it declares no bound (timeout 0) and keeps running unbounded.
+		shutdown.register(shutdownStep{
+			name: shutdownStepState,
+			run:  func(context.Context) error { return st.Close() },
+		})
 		if err := st.RebuildFromFS(function.Dir); err != nil {
 			logger.Warn("State: rebuild from fs failed; continuing", "error", err)
 		}
@@ -373,9 +311,17 @@ func Run(logger *slog.Logger) error {
 	// (flusher.ResetStats) can never race a flush into resurrecting pre-reset
 	// values: a flush either completes before the reset or captures after it.
 	// Shared by statsLoop, finalStatsFlush, and the socket reset command.
-	statsFlusher = newStatsFlusher(st, metricsInstance)
+	statsFlusher := newStatsFlusher(st, metricsInstance)
+	shutdown.register(shutdownStep{
+		name:    shutdownStepStatsFlush,
+		timeout: shutdownStatsFlushTimeout,
+		run: func(stepCtx context.Context) error {
+			finalStatsFlush(stepCtx, statsFlusher)
+			return nil
+		},
+	})
 
-	manager, err = runtime.NewManager(
+	manager, err := runtime.NewManager(
 		logger,
 		metricsInstance,
 		cfg.ConsumerName,
@@ -397,6 +343,12 @@ func Run(logger *slog.Logger) error {
 		// serve without. The deferred cleanup closes the Redis client and state DB.
 		return fmt.Errorf("runtime: new manager failed: %w", err)
 	}
+	// manager.Close took no context before the registry owned the teardown, so
+	// it declares no bound (timeout 0) and keeps running unbounded.
+	shutdown.register(shutdownStep{
+		name: shutdownStepManager,
+		run:  func(context.Context) error { return manager.Close() },
+	})
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -406,10 +358,16 @@ func Run(logger *slog.Logger) error {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
-	rtSocket, err = NewSocketServer(SocketPath, manager, statsFlusher, logger)
+	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
 	if err != nil {
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
+	// rtSocket.Close took no context before the registry owned the teardown, so
+	// it declares no bound (timeout 0) and keeps running unbounded.
+	shutdown.register(shutdownStep{
+		name: shutdownStepSocket,
+		run:  func(context.Context) error { return rtSocket.Close() },
+	})
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
 	// The service controller converges each function's persistent service
@@ -425,15 +383,30 @@ func Run(logger *slog.Logger) error {
 	// decides whether routing applies (only services declaring a host are routed)
 	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
 	// configured value.
-	svcCtrl = reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
+	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
 		Network:      cfg.TraefikNetwork,
 		EntryPoints:  cfg.TraefikEntryPoints,
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
 	}, logger, reconcileTimeout)
-	services = reconciler.NewServiceCoordinator(svcCtrl)
+	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
+	// Joining the coordinator releases its workers and waiters and drains
+	// in-flight Applys; the hostname-scoped container cleanup runs right after,
+	// in the same shutdown bound.
+	shutdown.register(shutdownStep{
+		name:    shutdownStepServicesJoin,
+		timeout: shutdownServiceTimeout,
+		run:     services.Join,
+	})
+	shutdown.register(shutdownStep{
+		name:    shutdownStepServiceCleanup,
+		timeout: shutdownServiceTimeout,
+		run: func(stepCtx context.Context) error {
+			return shutdownServices(stepCtx, svcCtrl, cfg.ConsumerName)
+		},
+	})
 
 	// Conservative startup orphan sweep: before any function is prepared or any
 	// container created, remove execution containers a previous Relay process on
@@ -474,11 +447,23 @@ func Run(logger *slog.Logger) error {
 	for _, fn := range functions {
 		liveNames[fn.Name] = true
 	}
-	housekeepingDone = startStartupHousekeeping(ctx, logger, startupHousekeeper{
+	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
 		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, liveNames) },
 		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
 		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
+	})
+	shutdown.register(shutdownStep{
+		name:    shutdownStepHousekeeping,
+		timeout: shutdownServiceTimeout,
+		run: func(stepCtx context.Context) error {
+			select {
+			case <-housekeepingDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		},
 	})
 
 	// The runner executes invocations. It is constructed before the stream
@@ -542,6 +527,11 @@ func Run(logger *slog.Logger) error {
 			// the metrics logger goroutine via the cancelled lifecycle.
 			return fmt.Errorf("metrics server: start failed: %w", err)
 		}
+		shutdown.register(shutdownStep{
+			name:    shutdownStepMetrics,
+			timeout: shutdownStepTimeout,
+			run:     metricsServer.Stop,
+		})
 		logger.Info("Metrics http server listening", "addr", cfg.MetricsAddr)
 	}
 
@@ -553,6 +543,11 @@ func Run(logger *slog.Logger) error {
 		if err := gitWebhookServer.Start(); err != nil {
 			return fmt.Errorf("git webhook server: start failed: %w", err)
 		}
+		shutdown.register(shutdownStep{
+			name:    shutdownStepWebhook,
+			timeout: shutdownStepTimeout,
+			run:     gitWebhookServer.Stop,
+		})
 		logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
 	}
 
@@ -593,7 +588,7 @@ func Run(logger *slog.Logger) error {
 	// publish schedule occurrences through the publisher, seeded from the loaded
 	// function set before Start, then converges live via the reconciler's
 	// UpdateSchedules/RemoveFunction hooks.
-	sched = cron.New(publisher, logger)
+	sched := cron.New(publisher, logger)
 	for _, fn := range functions {
 		sched.ReplaceFunction(fn.Name, fn.Template)
 	}
@@ -684,6 +679,11 @@ func Run(logger *slog.Logger) error {
 	// (seeded before Start) fire from their first cron tick and jobs the
 	// reconciler later converges schedule immediately.
 	sched.Start()
+	shutdown.register(shutdownStep{
+		name:    shutdownStepScheduler,
+		timeout: shutdownStepTimeout,
+		run:     sched.Stop,
+	})
 
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,
@@ -701,166 +701,125 @@ func Run(logger *slog.Logger) error {
 		consumeErr = fmt.Errorf("consume failed: %w", err)
 	}
 
-	// The graceful shutdown tail (socket, scheduler, housekeeping, services,
-	// stats, servers) is owned by the deferred cleanup registered at the top, so
-	// a startup failure and a normal shutdown converge on the exact same order.
+	// The graceful shutdown (socket, scheduler, housekeeping, services, stats,
+	// servers, manager, state, Redis) is owned by the deferred shutdown registry
+	// registered at the top, so a startup failure and a normal shutdown converge
+	// on the exact same explicit order.
 	return consumeErr
 }
 
-// shutdownSequence is the single ordered teardown the worker runs on every
-// return path once its resources exist. Ordering is the shutdown contract:
-// cancel the lifecycle (so loops, the coordinator, and rooted builds observe
-// cancellation), stop the live socket (no new live state is served), stop the
-// scheduler (no new schedule work), join the startup housekeeping (so no sweep
-// overlaps the teardown), join and clean up service containers, flush the final
-// stats snapshot, then stop the HTTP servers and close the clients. Each step is
-// nil-safe on a never-assigned handle; a non-nil error is logged and does not
-// stop the sequence, matching the original shutdown's non-fatal policy. Run
-// registers it as a defer BEFORE the first fallible resource-owning step, so a
-// startup failure after the Redis client exists still releases it.
-type shutdownSequence struct {
-	stopLifecycle    context.CancelFunc
-	closeSocket      func() error
-	stopScheduler    func() error
-	joinHousekeeping func() error
-	joinServices     func() error
-	cleanupServices  func()
-	flushStats       func()
-	stopMetrics      func() error
-	stopWebhook      func() error
-	closeManager     func() error
-	closeState       func() error
-	closeClient      func() error
+// Shutdown step names. Each names a single teardown step; together they are the
+// explicit teardown order (shutdownStepOrder) and the structured `step` field
+// on a failure log. Registration happens as resources are acquired — which is
+// NOT teardown order (Redis is acquired first and released last) — so the order
+// is declared here rather than inherited from registration/LIFO.
+const (
+	shutdownStepSocket         = "socket"
+	shutdownStepScheduler      = "scheduler"
+	shutdownStepHousekeeping   = "housekeeping"
+	shutdownStepServicesJoin   = "services-join"
+	shutdownStepServiceCleanup = "service-cleanup"
+	shutdownStepStatsFlush     = "stats-flush"
+	shutdownStepMetrics        = "metrics"
+	shutdownStepWebhook        = "webhook"
+	shutdownStepManager        = "manager"
+	shutdownStepState          = "state"
+	shutdownStepRedis          = "redis"
+)
+
+// shutdownStepOrder is the single source of truth for graceful-shutdown
+// ordering, walked top to bottom by shutdownRegistry.run. Lifecycle
+// cancellation is deliberately NOT a step: Run cancels the lifecycle before
+// invoking the registry, so background loops, the coordinator, and rooted
+// builds observe cancellation before teardown joins them. A step that was never
+// registered (an optional resource that never started) is simply skipped.
+var shutdownStepOrder = []string{
+	shutdownStepSocket,
+	shutdownStepScheduler,
+	shutdownStepHousekeeping,
+	shutdownStepServicesJoin,
+	shutdownStepServiceCleanup,
+	shutdownStepStatsFlush,
+	shutdownStepMetrics,
+	shutdownStepWebhook,
+	shutdownStepManager,
+	shutdownStepState,
+	shutdownStepRedis,
 }
 
-// run executes the sequence in the documented order, logging (never returning) a
-// step failure so a cleanup problem can never abort the rest of the teardown.
-// The lifecycle cancel runs first and is unconditional; every later step is
-// guarded by the caller's nil check (so it is safe when that resource never
-// existed).
-func (s shutdownSequence) run(logger *slog.Logger) {
-	if s.stopLifecycle != nil {
-		s.stopLifecycle()
-	}
+// shutdownStep is one teardown action. run receives a fresh context derived
+// from context.Background by the registry (so one step can never consume
+// another's budget): a positive timeout yields a bounded context, while a
+// non-positive timeout yields an unbounded context.Background for steps whose
+// teardown historically took no context. Its error, when non-nil, is logged
+// with the structured name and never aborts the remaining steps.
+type shutdownStep struct {
+	name    string
+	timeout time.Duration
+	run     func(context.Context) error
+}
 
-	// Stop the live runtime-pool query socket first: the worker has stopped
-	// consuming, so there is no new live state to serve, and removing the socket
-	// prevents `relay function inspect` from resolving a dead endpoint while the
-	// rest of shutdown drains. Close stops accepting, closes in-flight
-	// connections, joins their bounded handlers, and unlinks the socket file.
-	// Non-fatal: a unlink failure must never fail process shutdown.
-	if s.closeSocket != nil {
-		if err := s.closeSocket(); err != nil {
-			logger.Warn("Runtime state socket: shutdown failed", "error", err)
+// shutdownRegistry is the small ordered teardown the worker runs on every
+// return path once resources exist. Steps are registered as each resource is
+// successfully acquired/started, but run strictly by shutdownStepOrder, so
+// ordering is explicit rather than defer/LIFO. It is not safe for concurrent
+// registration (Run registers from its single startup goroutine).
+type shutdownRegistry struct {
+	steps []shutdownStep
+}
+
+// register adds a teardown step. Registering a name that is not in
+// shutdownStepOrder would silently never run, so callers must use the
+// shutdownStep* constants.
+func (r *shutdownRegistry) register(step shutdownStep) {
+	r.steps = append(r.steps, step)
+}
+
+// run executes every registered step in shutdownStepOrder, each under its own
+// fresh context, then logs the completion marker. A step with a positive timeout
+// gets its own context.Background bound (canceled immediately after the step); a
+// step with no timeout (timeout <= 0) gets a bare context.Background, preserving
+// the unbounded teardown those steps had before the registry owned the bounds.
+// A step failure is logged with the structured step name and error and the
+// sequence continues, so a cleanup problem can never abort the rest of the
+// teardown or prevent process exit.
+func (r *shutdownRegistry) run(logger *slog.Logger) {
+	steps := make(map[string]shutdownStep, len(r.steps))
+	for _, step := range r.steps {
+		steps[step.name] = step
+	}
+	for _, name := range shutdownStepOrder {
+		step, ok := steps[name]
+		if !ok {
+			continue
+		}
+		ctx := context.Background()
+		cancel := func() {}
+		if step.timeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, step.timeout)
+		}
+		err := step.run(ctx)
+		cancel()
+		if err != nil {
+			logger.Warn("Shutdown: step failed", "step", step.name, "error", err)
 		}
 	}
-
-	// Bounded graceful shutdown of the cron scheduler, so an in-flight
-	// publication observes cancellation and drains within the bound (gocron's
-	// Shutdown cancels every job's context). Safe even with zero schedules.
-	//
-	// NOTE: the scheduler runs AFTER Consume returns here, so a tick racing
-	// shutdown could publish an entry during the drain window — harmless under
-	// at-least-once: the entry is consumed by another consumer if any; if the
-	// whole cluster is down it waits in the stream for the next boot (PEL/group
-	// state persists).
-	if s.stopScheduler != nil {
-		if err := s.stopScheduler(); err != nil {
-			logger.Warn("Scheduler: graceful shutdown failed", "error", err)
-		}
-	}
-
-	// Wait for the background startup housekeeping (service barrier, orphan
-	// sweep, image sweep, dependency GC) to finish or observe the cancelled
-	// lifecycle. Joining it BEFORE ShutdownCleanup guarantees no startup sweep
-	// overlaps shutdown cleanup or the closing state DB and Docker client. It is
-	// bounded so a wedged sweep can never hang shutdown, and non-fatal for the
-	// same reason. On a normal boot the goroutine has long since exited, so this
-	// is a no-op receive.
-	if s.joinHousekeeping != nil {
-		if err := s.joinHousekeeping(); err != nil {
-			logger.Warn("Startup: housekeeping did not finish before shutdown", "error", err)
-		}
-	}
-
-	// Stop and remove this worker's persistent service containers. Order:
-	// AFTER the startup housekeeping join and scheduler stop (no more schedule
-	// work can start new services), BEFORE the final stats flush (cleanup is
-	// bounded work; the flush is the last-chance telemetry write and must not
-	// wait behind it). The coordinator Join releases the workers and their
-	// waiters and drains in-flight Applys. Non-fatal: ShutdownCleanup logs
-	// internally, and a Docker problem or timeout must never fail the process.
-	if s.joinServices != nil {
-		if err := s.joinServices(); err != nil {
-			logger.Warn("Service: coordinator shutdown failed", "error", err)
-		}
-	}
-	if s.cleanupServices != nil {
-		s.cleanupServices()
-	}
-
-	// Final flush of the registry into SQLite before the state handle closes.
-	// Bounded by a short timeout so a wedged SQLite cannot hang shutdown; failure
-	// is logged by the flush and shutdown continues (telemetry, not state). No-op
-	// when metrics are disabled (nil registry).
-	if s.flushStats != nil {
-		s.flushStats()
-	}
-
-	// Bounded graceful shutdown of the metrics server, so in-flight scrapes drain
-	// rather than being cut off mid-request. No-op when metrics are disabled (the
-	// server was never created).
-	if s.stopMetrics != nil {
-		if err := s.stopMetrics(); err != nil {
-			logger.Warn("Metrics server: graceful shutdown failed", "error", err)
-		}
-	}
-
-	// Bounded graceful shutdown of the webhook server. Order is owned by Stop: the
-	// HTTP server shuts down first so no new deliveries arrive, then the scheduler
-	// it assembled waits, bounded by the same short ctx, for in-flight sync to
-	// drain. A no-op when the webhook is disabled (nil server).
-	if s.stopWebhook != nil {
-		if err := s.stopWebhook(); err != nil {
-			logger.Warn("Git webhook server: graceful shutdown failed", "error", err)
-		}
-	}
-
-	// Close the runtime manager (stops its maintenance loop, discards cached
-	// execution containers, releases the Docker client) and then the state DB and
-	// Redis client. The manager closes after the service cleanup so it still owns
-	// live container state while containers are being stopped.
-	if s.closeManager != nil {
-		if err := s.closeManager(); err != nil {
-			logger.Warn("Runtime: manager close failed", "error", err)
-		}
-	}
-	if s.closeState != nil {
-		if err := s.closeState(); err != nil {
-			logger.Warn("State: close failed", "error", err)
-		}
-	}
-	if s.closeClient != nil {
-		if err := s.closeClient(); err != nil {
-			logger.Warn("Redis: client close failed", "error", err)
-		}
-	}
-
 	logger.Info("Shutdown complete")
 }
 
 // shutdownServices stops and removes THIS worker's persistent service
-// containers during graceful shutdown, bounded by shutdownServiceTimeout.
-// Deliberately non-fatal: ShutdownCleanup logs internally, and a Docker problem
-// or timeout must never fail the process (no os.Exit anywhere on this path).
-func shutdownServices(svcCtrl *reconciler.ServiceReconciler, hostname string, logger *slog.Logger) {
-	svcCtx, svcCancel := context.WithTimeout(context.Background(), shutdownServiceTimeout)
-	defer svcCancel()
-	if _, err := svcCtrl.ShutdownCleanup(svcCtx, hostname); err != nil {
-		// ShutdownCleanup already logged the Warn; a Debug here marks the
-		// (non-fatal) failure in the shutdown trace without duplicating it.
-		logger.Debug("Service: shutdown cleanup returned error", "error", err)
-	}
+// containers during graceful shutdown. ctx is the shutdown step's fresh,
+// bounded context (the registry derives it from context.Background), so a
+// Docker problem or timeout must never fail the process (no os.Exit anywhere on
+// this path). It returns ShutdownCleanup's error so the shutdown registry can
+// surface it with the structured step name; callers may discard it. The
+// detailed per-operation logs live in ShutdownCleanup, so no duplicate logging
+// happens here.
+func shutdownServices(
+	ctx context.Context, svcCtrl *reconciler.ServiceReconciler, hostname string,
+) error {
+	_, err := svcCtrl.ShutdownCleanup(ctx, hostname)
+	return err
 }
 
 // setupMetrics constructs the optional metrics components: a registry and the
@@ -1513,20 +1472,19 @@ func statsLoop(ctx context.Context, flusher *statsFlusher, interval time.Duratio
 	}
 }
 
-// finalStatsFlush performs a bounded final flush of the registry into SQLite on
-// graceful shutdown, so the last interval of telemetry is not lost. It is
-// bounded by a short timeout so a wedged SQLite cannot hang shutdown; on
-// timeout or error it logs and returns (telemetry, not state). It is nil-safe
-// on the flusher. The metrics guard is load-bearing: Run calls this even when
+// finalStatsFlush performs a final flush of the registry into SQLite on
+// graceful shutdown, so the last interval of telemetry is not lost. ctx is the
+// shutdown step's fresh, bounded context (the registry derives it from
+// context.Background), so a wedged SQLite cannot hang shutdown; on timeout or
+// error the flush logs and returns (telemetry, not state). It is nil-safe on
+// the flusher. The metrics guard is load-bearing: Run calls this even when
 // metrics are disabled (the flusher still holds the state handle), and a
 // nil-registry flush would write zero Stats over the persisted cumulative
 // totals.
-func finalStatsFlush(flusher *statsFlusher) {
+func finalStatsFlush(ctx context.Context, flusher *statsFlusher) {
 	if flusher == nil || flusher.st == nil || flusher.metrics == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 	flusher.flush(ctx)
 }
 

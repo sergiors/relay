@@ -337,7 +337,7 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	m.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}})
 	m.IncLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "alpha"}})
 
-	finalStatsFlush(newStatsFlusher(st, m))
+	finalStatsFlush(context.Background(), newStatsFlusher(st, m))
 
 	gs, ok := st.Stats()
 	if !ok {
@@ -362,9 +362,9 @@ func TestFinalStatsFlushPersistsOnShutdown(t *testing.T) {
 	}
 
 	// Nil-safety: none of these may panic.
-	finalStatsFlush(newStatsFlusher(st, nil))
-	finalStatsFlush(newStatsFlusher(nil, m))
-	finalStatsFlush(nil)
+	finalStatsFlush(context.Background(), newStatsFlusher(st, nil))
+	finalStatsFlush(context.Background(), newStatsFlusher(nil, m))
+	finalStatsFlush(context.Background(), nil)
 }
 
 // TestRecordSnapshotsIdempotent verifies recordSnapshots is idempotent: identical

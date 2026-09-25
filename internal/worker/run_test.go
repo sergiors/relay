@@ -14,42 +14,64 @@ import (
 	"relay/internal/testutil"
 )
 
-// TestShutdownSequenceRunsInOrderAndNeverStopsOnError pins the single teardown
-// contract the refactor introduced: every step runs in the documented order, and
-// a step returning an error is logged without aborting the rest — the same
-// non-fatal policy the original inline shutdown tail had. It uses pure seams, so
-// it needs no Docker, Redis, or state DB.
-func TestShutdownSequenceRunsInOrderAndNeverStopsOnError(t *testing.T) {
+// registeredStep builds a no-op shutdownStep for the given name and timeout
+// whose run appends name to order, enabling the registry's ordering and
+// per-step bound to be observed without Docker, Redis, or a state DB.
+func registeredStep(name string, timeout time.Duration, order *[]string) shutdownStep {
+	return shutdownStep{
+		name:    name,
+		timeout: timeout,
+		run: func(context.Context) error {
+			*order = append(*order, name)
+			return nil
+		},
+	}
+}
+
+// TestShutdownRegistryRunsInExplicitOrderAndNeverStopsOnError pins the single
+// teardown contract the refactor introduced: steps run in the documented
+// shutdownStepOrder regardless of REGISTRATION order (Redis is registered first
+// yet released last), and a failing step is logged by name without aborting the
+// rest — the same non-fatal policy the original inline shutdown tail had. It
+// uses pure seams, so it needs no Docker, Redis, or state DB.
+func TestShutdownRegistryRunsInExplicitOrderAndNeverStopsOnError(t *testing.T) {
 	var order []string
-	record := func(name string, err error) func() error {
-		return func() error {
-			order = append(order, name)
-			return err
+	failing := func(name string, msg string) shutdownStep {
+		return shutdownStep{
+			name:    name,
+			timeout: time.Second,
+			run: func(context.Context) error {
+				order = append(order, name)
+				return errors.New(msg)
+			},
 		}
 	}
+	simple := func(name string) shutdownStep { return registeredStep(name, time.Second, &order) }
 
-	seq := shutdownSequence{
-		stopLifecycle:    func() { order = append(order, "lifecycle") },
-		closeSocket:      record("socket", nil),
-		stopScheduler:    record("scheduler", errors.New("scheduler boom")),
-		joinHousekeeping: record("housekeeping", nil),
-		joinServices:     record("join", errors.New("join boom")),
-		cleanupServices:  func() { order = append(order, "cleanup") },
-		flushStats:       func() { order = append(order, "flush") },
-		stopMetrics:      record("metrics", nil),
-		stopWebhook:      record("webhook", nil),
-		closeManager:     record("manager", errors.New("manager boom")),
-		closeState:       record("state", nil),
-		closeClient:      record("client", nil),
-	}
+	// Register in a deliberately scrambled order, with Redis first (as Run does
+	// when the client is acquired first). The explicit order must win.
+	reg := &shutdownRegistry{}
+	reg.register(simple(shutdownStepRedis))
+	reg.register(failing(shutdownStepManager, "manager boom"))
+	reg.register(simple(shutdownStepSocket))
+	reg.register(failing(shutdownStepScheduler, "scheduler boom"))
+	reg.register(simple(shutdownStepHousekeeping))
+	reg.register(failing(shutdownStepServicesJoin, "join boom"))
+	reg.register(simple(shutdownStepServiceCleanup))
+	reg.register(simple(shutdownStepStatsFlush))
+	reg.register(simple(shutdownStepMetrics))
+	reg.register(simple(shutdownStepWebhook))
+	reg.register(simple(shutdownStepState))
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	seq.run(logger)
+	reg.run(logger)
 
 	want := []string{
-		"lifecycle", "socket", "scheduler", "housekeeping", "join",
-		"cleanup", "flush", "metrics", "webhook", "manager", "state", "client",
+		shutdownStepSocket, shutdownStepScheduler, shutdownStepHousekeeping,
+		shutdownStepServicesJoin, shutdownStepServiceCleanup, shutdownStepStatsFlush,
+		shutdownStepMetrics, shutdownStepWebhook, shutdownStepManager,
+		shutdownStepState, shutdownStepRedis,
 	}
 	if len(order) != len(want) {
 		t.Fatalf("ran %v, want %v", order, want)
@@ -60,32 +82,223 @@ func TestShutdownSequenceRunsInOrderAndNeverStopsOnError(t *testing.T) {
 		}
 	}
 
-	// Each step failure was surfaced, not swallowed, and the teardown still
-	// reached its final marker.
-	for _, wantMsg := range []string{
-		"Scheduler: graceful shutdown failed",
-		"Service: coordinator shutdown failed",
-		"Runtime: manager close failed",
-		"Shutdown complete",
-	} {
+	// Each step failure was surfaced with its structured step name, and the
+	// teardown still reached its final marker.
+	for _, wantStep := range []string{shutdownStepScheduler, shutdownStepServicesJoin, shutdownStepManager} {
+		if !strings.Contains(logs.String(), "step="+wantStep) {
+			t.Errorf("log missing structured step=%s:\n%s", wantStep, logs.String())
+		}
+	}
+	for _, wantMsg := range []string{"scheduler boom", "join boom", "manager boom", "Shutdown complete"} {
 		if !strings.Contains(logs.String(), wantMsg) {
 			t.Errorf("log missing %q:\n%s", wantMsg, logs.String())
 		}
 	}
 }
 
-// TestShutdownSequenceNilSafe verifies a sequence with only the lifecycle cancel
-// set (the state right after the Redis client exists, before any resource was
-// constructed) is safe: no panic, no skipped final marker.
-func TestShutdownSequenceNilSafe(t *testing.T) {
-	stopCalled := false
-	seq := shutdownSequence{stopLifecycle: func() { stopCalled = true }}
+// TestShutdownRegistryFreshTimeoutPerStep proves each step gets its own fresh
+// context.Background bound: a long earlier step cannot consume a later step's
+// budget (a fresh bound is created immediately before each step, not once
+// shared), the configured timeout is honored, and the context is canceled
+// immediately after the step runs. Timeout isolation is the property that keeps
+// a wedged Docker/Redis call from starving the rest of the teardown.
+func TestShutdownRegistryFreshTimeoutPerStep(t *testing.T) {
+	const slowBound = 400 * time.Millisecond
+	const laterBound = 1500 * time.Millisecond
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	seq.run(logger)
+	type observation struct {
+		startedAt time.Time
+		deadline  time.Time
+		hasBound  bool
+		ctx       context.Context
+	}
+	seen := map[string]observation{}
+	record := func(name string, timeout time.Duration, block time.Duration) shutdownStep {
+		return shutdownStep{
+			name:    name,
+			timeout: timeout,
+			run: func(ctx context.Context) error {
+				obs := observation{startedAt: time.Now(), ctx: ctx}
+				if deadline, ok := ctx.Deadline(); ok {
+					obs.hasBound = true
+					obs.deadline = deadline
+				}
+				seen[name] = obs
+				// Block for part of the (short) bound so the earlier step holds
+				// the sequence for a measurable interval.
+				time.Sleep(block)
+				return nil
+			},
+		}
+	}
 
-	if !stopCalled {
-		t.Fatal("lifecycle cancel must run even when every other handle is nil")
+	reg := &shutdownRegistry{}
+	reg.register(record(shutdownStepScheduler, slowBound, slowBound/2))
+	reg.register(record(shutdownStepState, laterBound, 0))
+
+	reg.run(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	sched, ok := seen[shutdownStepScheduler]
+	if !ok || !sched.hasBound {
+		t.Fatalf("scheduler step missing its deadline: %+v", sched)
+	}
+	state, ok := seen[shutdownStepState]
+	if !ok || !state.hasBound {
+		t.Fatalf("state step missing its deadline: %+v", state)
+	}
+
+	// Each step's deadline is its OWN timeout measured from the instant THAT
+	// step started, not from registry.run's start. A context created once for the
+	// whole sequence would give the later step a deadline short by the earlier
+	// step's consumed budget (the scheduler blocks for slowBound/2 here), which
+	// lands far outside this slop.
+	const slop = 50 * time.Millisecond
+	assertOwnBound := func(name string, obs observation, bound time.Duration) {
+		want := obs.startedAt.Add(bound)
+		delta := obs.deadline.Sub(want)
+		if delta < -slop || delta > slop {
+			t.Errorf("%s deadline = %v, want %v (its own %v bound from its own start; delta %v)",
+				name, obs.deadline, want, bound, delta)
+		}
+	}
+	assertOwnBound(shutdownStepScheduler, sched, slowBound)
+	assertOwnBound(shutdownStepState, state, laterBound)
+
+	// The context is canceled immediately after the step executes, so a leaked
+	// step cannot keep a resource alive past its turn.
+	for name, obs := range seen {
+		if !errors.Is(obs.ctx.Err(), context.Canceled) {
+			t.Errorf("%s ctx.Err() = %v, want context.Canceled (canceled after run)", name, obs.ctx.Err())
+		}
+	}
+}
+
+// TestShutdownRegistryZeroTimeoutIsUnbounded pins the correction that a step
+// declaring no timeout (timeout <= 0) MUST run on a bare context.Background:
+// the socket/manager/state/Redis closes historically took no context, so the
+// registry must not impose a new 5s bound on them. A positive timeout still
+// yields its own deadline, while a zero-timeout step both has no deadline and
+// is NOT canceled after run (there is no bound to release), unlike a bounded
+// step whose fresh context is canceled immediately after it executes.
+func TestShutdownRegistryZeroTimeoutIsUnbounded(t *testing.T) {
+	type observation struct {
+		deadline time.Time
+		hasBound bool
+		ctx      context.Context
+	}
+	seen := map[string]*observation{}
+	record := func(name string, timeout time.Duration) shutdownStep {
+		return shutdownStep{
+			name:    name,
+			timeout: timeout,
+			run: func(ctx context.Context) error {
+				obs := &observation{ctx: ctx}
+				obs.deadline, obs.hasBound = ctx.Deadline()
+				seen[name] = obs
+				return nil
+			},
+		}
+	}
+
+	reg := &shutdownRegistry{}
+	reg.register(record(shutdownStepSocket, 0))              // historically unbounded
+	reg.register(record(shutdownStepManager, 0))             // historically unbounded
+	reg.register(record(shutdownStepState, 0))               // historically unbounded
+	reg.register(record(shutdownStepRedis, 0))               // historically unbounded
+	reg.register(record(shutdownStepScheduler, time.Second)) // bounded 5s in Run; 1s here
+
+	reg.run(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for _, name := range []string{
+		shutdownStepSocket, shutdownStepManager, shutdownStepState, shutdownStepRedis,
+	} {
+		obs, ok := seen[name]
+		if !ok {
+			t.Fatalf("zero-timeout step %q did not run", name)
+		}
+		if obs.hasBound {
+			t.Errorf("%s has a deadline %v; want an unbounded context.Background", name, obs.deadline)
+		}
+		if obs.ctx.Err() != nil {
+			t.Errorf("%s ctx.Err() = %v after run; want nil (no bound to cancel)", name, obs.ctx.Err())
+		}
+	}
+
+	bounded, ok := seen[shutdownStepScheduler]
+	if !ok || !bounded.hasBound {
+		t.Fatalf("bounded step scheduler missing its deadline: %+v", bounded)
+	}
+	if !errors.Is(bounded.ctx.Err(), context.Canceled) {
+		t.Errorf("bounded step ctx.Err() = %v, want context.Canceled (canceled after run)", bounded.ctx.Err())
+	}
+}
+
+// TestShutdownRegistryPartialRegistration verifies only registered steps run and
+// an unregistered one is silently skipped: optional resources register only
+// when they actually started, so a step that never existed must not panic or
+// emit a spurious "failed" log.
+func TestShutdownRegistryPartialRegistration(t *testing.T) {
+	var order []string
+	reg := &shutdownRegistry{}
+	reg.register(registeredStep(shutdownStepSocket, time.Second, &order))
+	reg.register(registeredStep(shutdownStepState, time.Second, &order))
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg.run(logger)
+
+	want := []string{shutdownStepSocket, shutdownStepState}
+	if len(order) != len(want) || order[0] != want[0] || order[1] != want[1] {
+		t.Fatalf("ran %v, want %v (unregistered steps skipped)", order, want)
+	}
+	if strings.Contains(logs.String(), "step failed") {
+		t.Errorf("unexpected failure log on a partial registry:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "Shutdown complete") {
+		t.Errorf("missing completion marker:\n%s", logs.String())
+	}
+}
+
+// TestShutdownRegistryOrderingInvariants pins the load-bearing sub-orderings the
+// task calls out, independent of the full order test: the coordinator join
+// precedes the service cleanup, which precedes the manager close (the manager
+// must own live container state while containers are stopped); the stats flush
+// precedes the state close (the final snapshot lands before the DB closes); and
+// Redis is released last, after every other resource.
+func TestShutdownRegistryOrderingInvariants(t *testing.T) {
+	var order []string
+	reg := &shutdownRegistry{}
+	for _, name := range []string{
+		shutdownStepRedis, shutdownStepState, shutdownStepStatsFlush,
+		shutdownStepManager, shutdownStepServiceCleanup, shutdownStepServicesJoin,
+	} {
+		reg.register(registeredStep(name, time.Second, &order))
+	}
+	reg.run(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	index := func(name string) int {
+		for i, got := range order {
+			if got == name {
+				return i
+			}
+		}
+		t.Fatalf("step %q did not run: %v", name, order)
+		return -1
+	}
+	if index(shutdownStepServicesJoin) >= index(shutdownStepServiceCleanup) {
+		t.Errorf("services-join (%d) must precede service-cleanup (%d): %v",
+			index(shutdownStepServicesJoin), index(shutdownStepServiceCleanup), order)
+	}
+	if index(shutdownStepServiceCleanup) >= index(shutdownStepManager) {
+		t.Errorf("service-cleanup (%d) must precede manager (%d): %v",
+			index(shutdownStepServiceCleanup), index(shutdownStepManager), order)
+	}
+	if index(shutdownStepStatsFlush) >= index(shutdownStepState) {
+		t.Errorf("stats-flush (%d) must precede state (%d): %v",
+			index(shutdownStepStatsFlush), index(shutdownStepState), order)
+	}
+	if last := order[len(order)-1]; last != shutdownStepRedis {
+		t.Errorf("last step = %q, want %q (Redis released last): %v", last, shutdownStepRedis, order)
 	}
 }
 
