@@ -11,22 +11,12 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"relay/internal/processlock"
-	"relay/internal/worker"
 )
 
 // errStartAlreadyRunning is the concise operator-facing error returned when
 // another process already holds the start lock. It carries no stack trace; the
 // process prints it exactly once via cmd/main.go.
 var errStartAlreadyRunning = errors.New("relay start is already running")
-
-// startRun is the hook the "start" command delegates to. It is a package-level
-// variable so tests can observe dispatch without launching the runtime. The
-// worker's Run returns any startup/runtime failure (after converging cleanup)
-// and the hook propagates it unchanged, so cmd/main.go prints it and owns the
-// process exit.
-var startRun = func(l *slog.Logger) error {
-	return worker.Run(l)
-}
 
 // startCommand builds the `relay start` subcommand. It is the only command
 // that starts the long-running Relay runtime, delegating to internal/worker in
@@ -38,6 +28,10 @@ var startRun = func(l *slog.Logger) error {
 // (released by the deferred Close, or by the kernel if the process dies), so a
 // second `relay start` against the same state directory fails fast instead of
 // racing the first. No other subcommand acquires this lock.
+//
+// Delegation goes through deps.Start, the injected long-running lifecycle, so
+// the command observes dispatch without a package-level hook and tests supply a
+// fake runner directly.
 func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "start",
@@ -69,8 +63,9 @@ func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 			defer lock.Close()
 
 			// Delegation, not implementation: the CLI only parses commands; the
-			// long-running Relay lifecycle lives in internal/worker.
-			return startRun(logger)
+			// long-running Relay lifecycle lives in internal/worker, injected as
+			// deps.Start.
+			return deps.Start(logger)
 		},
 	}
 }

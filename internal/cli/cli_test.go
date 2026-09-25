@@ -19,7 +19,9 @@ import (
 // /tmp (not t.TempDir's /var/folders on macOS) to stay inside the ~104-byte
 // Unix socket sun_path limit. It replaces the former package-level path globals
 // (statePath, runtimeSocketPath, startLockPath) with per-test values, so tests
-// never touch /var/lib/relay or /run/relay. A few unrelated seams (the CLI git
+// never touch /var/lib/relay or /run/relay. Start defaults to a no-op runner so
+// an accidental `start` never launches the real worker; tests asserting
+// dispatch override deps.Start directly. A few unrelated seams (the CLI git
 // dir globals and secretsPath) remain package vars; tests that mutate them
 // restore the previous value via t.Cleanup.
 func testDeps(t *testing.T) Dependencies {
@@ -34,6 +36,7 @@ func testDeps(t *testing.T) Dependencies {
 		StatePath:  filepath.Join(dir, "db.sqlite3"),
 		SocketPath: filepath.Join(sockDir, "relay.sock"),
 		LockPath:   filepath.Join(dir, "relay.lock"),
+		Start:      func(*slog.Logger) error { return nil },
 	}
 }
 
@@ -137,12 +140,11 @@ func TestRootHelpContainsStart(t *testing.T) {
 
 // TestStartHelp verifies `relay start --help` exits 0 without starting anything.
 func TestStartHelp(t *testing.T) {
+	deps := testDeps(t)
 	called := false
-	orig := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
-	out, _, err := runCLI(t, "", "start", "--help")
+	out, _, err := runCLIWithDeps(t, deps, "", "start", "--help")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -171,9 +173,7 @@ func TestStartCreatesRuntimeDirBeforeLock(t *testing.T) {
 	deps.LockPath = filepath.Join(t.TempDir(), "run", "relay", "relay.lock")
 
 	called := false
-	origRun := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = origRun }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
 	if _, _, err := runCLIWithDeps(t, deps, "", "start"); err != nil {
 		t.Fatalf("start: err = %v, want nil", err)
@@ -191,9 +191,7 @@ func TestStartCreatesRuntimeDirBeforeLock(t *testing.T) {
 func TestStartDelegatesToWorker(t *testing.T) {
 	deps := testDeps(t)
 	called := false
-	orig := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
 	if _, _, err := runCLIWithDeps(t, deps, "", "start"); err != nil {
 		t.Fatalf("start: err = %v, want nil", err)
@@ -206,22 +204,20 @@ func TestStartDelegatesToWorker(t *testing.T) {
 // TestStartPassesInjectedLoggerToWorker pins that `relay start` threads the
 // process logger into the worker startup path unchanged. Unlike the short-lived
 // administrative commands, start MUST preserve normal worker operational logs,
-// so the logger passed to New is the exact logger handed to startRun (never nil,
-// never a discard).
+// so the logger passed to New is the exact logger handed to the injected
+// runner (never nil, never a discard).
 func TestStartPassesInjectedLoggerToWorker(t *testing.T) {
 	deps := testDeps(t)
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	var got *slog.Logger
-	orig := startRun
-	startRun = func(l *slog.Logger) error {
+	deps.Start = func(l *slog.Logger) error {
 		got = l
 		// Emulate a worker operational log; it must land on the injected logger.
 		l.Info("worker operational log")
 		return nil
 	}
-	defer func() { startRun = orig }()
 
 	if _, _, err := runCLIWithLoggerAndDeps(t, logger, deps, "", "start"); err != nil {
 		t.Fatalf("start: err = %v, want nil", err)
@@ -237,14 +233,13 @@ func TestStartPassesInjectedLoggerToWorker(t *testing.T) {
 // TestInformationalCommandsNeverStartWorker pins that no informational CLI
 // command accidentally starts the runtime.
 func TestInformationalCommandsNeverStartWorker(t *testing.T) {
+	deps := testDeps(t)
 	called := false
-	orig := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
-	// --help and an unknown command must not reach the start hook.
-	_, _, _ = runCLI(t, "", "--help")
-	_, _, _ = runCLI(t, "", "bogus")
+	// --help and an unknown command must not reach the injected runner.
+	_, _, _ = runCLIWithDeps(t, deps, "", "--help")
+	_, _, _ = runCLIWithDeps(t, deps, "", "bogus")
 	if called {
 		t.Fatal("informational CLI commands must not start the worker")
 	}
@@ -262,9 +257,7 @@ func TestStartAlreadyRunning(t *testing.T) {
 	defer held.Close()
 
 	called := false
-	orig := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
 	_, _, err = runCLIWithDeps(t, deps, "", "start")
 	if err == nil || err.Error() != "relay start is already running" {
@@ -287,9 +280,7 @@ func TestStartRuntimeDirCreationFailure(t *testing.T) {
 	deps.LockPath = filepath.Join(blocker, "relay.lock")
 
 	called := false
-	orig := startRun
-	startRun = func(l *slog.Logger) error { called = true; return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { called = true; return nil }
 
 	_, _, err := runCLIWithDeps(t, deps, "", "start")
 	if err == nil || !strings.Contains(err.Error(), "cannot create runtime dir") {
@@ -304,9 +295,7 @@ func TestStartRuntimeDirCreationFailure(t *testing.T) {
 // returns, the lock is free again for a subsequent run.
 func TestStartReleasesLockAfterRun(t *testing.T) {
 	deps := testDeps(t)
-	orig := startRun
-	startRun = func(l *slog.Logger) error { return nil }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { return nil }
 
 	for i := 0; i < 2; i++ {
 		if _, _, err := runCLIWithDeps(t, deps, "", "start"); err != nil {
@@ -322,9 +311,7 @@ func TestStartReleasesLockAfterRun(t *testing.T) {
 func TestStartPropagatesWorkerError(t *testing.T) {
 	deps := testDeps(t)
 	workerErr := errors.New("worker failed")
-	orig := startRun
-	startRun = func(l *slog.Logger) error { return workerErr }
-	defer func() { startRun = orig }()
+	deps.Start = func(l *slog.Logger) error { return workerErr }
 
 	_, _, err := runCLIWithDeps(t, deps, "", "start")
 	if !errors.Is(err, workerErr) {

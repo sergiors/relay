@@ -40,6 +40,14 @@ type DLQStore interface {
 // config.RedisOptions conventions as `relay health`.
 type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err error)
 
+// StartRun is the narrow seam `relay start` delegates to for the long-running
+// Relay lifecycle. It blocks until the runtime stops and returns any
+// startup/runtime failure unchanged, which cmd/main.go prints (exactly once)
+// while it owns process exit. Production wires worker.Run; tests inject a fake
+// runner directly, so the command's dispatch is observed without a package-level
+// hook and without launching the runtime.
+type StartRun func(logger *slog.Logger) error
+
 // Dependencies carries the CLI's injectable process seams: the filesystem
 // locations plus the DLQ store opener the `relay dlq` commands need. Production
 // wires the immutable defaults via DefaultDependencies, while tests (and any
@@ -57,6 +65,9 @@ type Dependencies struct {
 	// lifetime; its parent directory is created before the lock is acquired.
 	// Production: processlock.DefaultPath.
 	LockPath string
+	// Start runs the long-running Relay lifecycle `relay start` delegates to.
+	// Production: worker.Run.
+	Start StartRun
 	// OpenDLQ opens the DLQ store for the `relay dlq` commands. It is called
 	// lazily, only by those commands, so every other command works with no Redis
 	// configured. Production: openRedisDLQStore (config.Load +
@@ -65,14 +76,15 @@ type Dependencies struct {
 }
 
 // DefaultDependencies returns the fixed production seams: the three filesystem
-// locations plus the config-driven DLQ store opener. The referenced constants
-// stay immutable application conventions; there are no environment overrides or
-// setters.
+// locations, the worker lifecycle, and the config-driven DLQ store opener. The
+// referenced constants stay immutable application conventions; there are no
+// environment overrides or setters.
 func DefaultDependencies() Dependencies {
 	return Dependencies{
 		StatePath:  state.DBPath,
 		SocketPath: worker.SocketPath,
 		LockPath:   processlock.DefaultPath,
+		Start:      worker.Run,
 		OpenDLQ:    openRedisDLQStore,
 	}
 }
