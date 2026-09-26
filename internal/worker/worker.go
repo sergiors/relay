@@ -671,8 +671,8 @@ func Run(logger *slog.Logger) error {
 			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
 				enqueueLiveServices(services, runWorker.Registry(), name, fnDir, tmpl, image)
 			},
-			UpdateServicesWithStatus: func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error)) {
-				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, fnDir, tmpl, image, onBuildStart, onComplete)
+			UpdateServicesWithStatus: func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, fnDir, tmpl, image, onBuildStart, onReconcileStart, onComplete)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
@@ -863,14 +863,20 @@ func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *m
 	return metricsInstance, metricsServer
 }
 
-// beginManagedRuntimeBuild publishes the building status at the managed runtime
-// image-preparation boundary. A template that needs no runtime has no function
-// image to build (Prepare is then a fast no-op), so it is deliberately left
-// untouched rather than flashing a spurious building state. It is nil-safe.
-func beginManagedRuntimeBuild(st *state.State, fn function.Function) {
-	if st != nil && fn.Template.NeedsRuntime() {
-		st.RecordReconcileBuilding(fn.Name)
+// managedRuntimeBuildContext installs the function-image build observer that
+// publishes the building status at the ACTUAL managed runtime image-build
+// boundary. It is passed to Manager.Prepare, whose runtime fires the observer
+// only when a build is really issued — after the reuse probes — so a reused
+// image never flashes building, and a template that needs no runtime (Prepare is
+// then a fast no-op) never fires it at all. It is nil-state-safe. Installed
+// unconditionally: for a no-runtime template the observer simply never runs.
+func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn function.Function) context.Context {
+	if st == nil {
+		return ctx
 	}
+	return runtime.WithFunctionBuildObserver(ctx, func() {
+		st.RecordReconcileBuilding(fn.Name)
+	})
 }
 
 // prepareFunctions builds each function's image and returns the prepared set. A
@@ -879,13 +885,15 @@ func beginManagedRuntimeBuild(st *state.State, fn function.Function) {
 // fingerprint that changed between load and build is recomputed so the state DB
 // records the final value.
 //
-// The building status is published before Prepare so a long managed runtime
-// image build is reported consistently. A successful no-service preparation
-// reaches ready below; a function whose template declares services stays
-// building through service convergence (which republishes building at its own
-// Dockerfile boundary and records the terminal outcome), and a preparation
-// failure uses the existing failure semantics (unavailable without an active
-// image, ready when a previous image is retained).
+// The building status is published at the ACTUAL managed runtime image-build
+// boundary via the observer installed by managedRuntimeBuildContext: a reused
+// image and a no-runtime template never flash building, while a real build does.
+// A successful no-service preparation reaches ready below; a function whose
+// template declares services stays building through service convergence (which
+// republishes building at its own Dockerfile boundary and records the terminal
+// outcome), and a preparation failure uses the existing failure semantics
+// (unavailable without an active image, ready when a previous image is
+// retained).
 //
 // ctx is the worker lifecycle context. It is passed to Prepare so a build (and
 // the fast reuse probes) is cancelled on shutdown; Prepare itself roots the
@@ -902,8 +910,7 @@ func prepareFunctions(
 	preparedCount := 0
 	prepared := make([]*runner.PreparedFunction, 0, len(functions))
 	for _, fn := range functions {
-		beginManagedRuntimeBuild(st, fn)
-		prep, err := manager.Prepare(ctx, fn)
+		prep, err := manager.Prepare(managedRuntimeBuildContext(ctx, st, fn), fn)
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
 			// failure: it must not record a spurious reconcile failure in the
@@ -964,14 +971,14 @@ func enqueueLiveServicesWithStatus(
 	name, fnDir string,
 	tmpl *function.Template,
 	image string,
-	onBuildStart func(),
+	onBuildStart, onReconcileStart func(),
 	onComplete func(error),
 ) {
 	var preparedEnv []string
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.EnqueueWithStatus(name, fnDir, tmpl, image, preparedEnv, onBuildStart, onComplete)
+	services.EnqueueWithStatus(name, fnDir, tmpl, image, preparedEnv, onBuildStart, onReconcileStart, onComplete)
 }
 
 // enqueueStartupServices publishes each prepared function's initial desired
@@ -1011,6 +1018,7 @@ func enqueueStartupServicesWithState(
 			if st != nil && len(fn.Template.Services) > 0 {
 				services.EnqueueWithStatus(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env,
 					func() { st.RecordReconcileBuilding(fn.Name) },
+					func() { st.RecordReconciling(fn.Name) },
 					func(err error) {
 						if err != nil {
 							st.RecordServiceFailure(fn.Name, err)

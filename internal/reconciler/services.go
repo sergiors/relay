@@ -168,7 +168,7 @@ func Reconcile(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
-	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, fnDir, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil)
+	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, fnDir, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil, nil)
 }
 
 func reconcileWithObserver(
@@ -183,6 +183,7 @@ func reconcileWithObserver(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 	buildStarted func(),
+	reconcileStarted func(),
 ) (bool, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
 	// is always positive from the worker; a non-positive value means "no
@@ -203,6 +204,22 @@ func reconcileWithObserver(
 	// attempt) was issued during this pass. It starts false and is set by the
 	// removed-service cleanup below and by the classify/start work further down.
 	changed := false
+
+	// reconcileNotified ensures the reconcileStarted callback fires at most once
+	// per pass, before the first container convergence. It is deferred until
+	// every `build` source's Dockerfile build in this pass has concluded
+	// (buildsResolved == buildsTotal), so a mixed template can never emit
+	// reconciling before building: an entrypoint service that happens to be
+	// iterated before a build service still waits for that build. A pass with no
+	// template services never fires it.
+	reconcileNotified := false
+	buildsTotal := 0
+	for _, svc := range tmpl.Services {
+		if svc.Source() == function.ServiceSourceBuild {
+			buildsTotal++
+		}
+	}
+	buildsResolved := 0
 
 	var firstErr error
 	fail := func(err error) {
@@ -353,6 +370,19 @@ func reconcileWithObserver(
 			log.Warn("Service: cannot resolve source; keeping existing containers",
 				"service", identity, "error", err)
 			continue
+		}
+		if svc.Source() == function.ServiceSourceBuild {
+			buildsResolved++
+		}
+
+		// Every `build` source's Dockerfile build in this pass has now completed
+		// (or there was none): the function is about to actually converge
+		// containers, so publish the reconciling status. Firing once per pass
+		// keeps the status write focused; the callback is generation-guarded by
+		// the caller.
+		if reconcileStarted != nil && !reconcileNotified && buildsResolved == buildsTotal {
+			reconcileNotified = true
+			reconcileStarted()
 		}
 
 		// The post-build phase runs on a FRESH normal-operation bound rooted in
@@ -632,20 +662,20 @@ func (c *ServiceReconciler) Apply(
 	image string,
 	preparedEnv []string,
 ) error {
-	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, nil)
+	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, nil, nil)
 }
 
-func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted func()) error {
-	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, buildStarted)
+func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted, reconcileStarted func()) error {
+	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, buildStarted, reconcileStarted)
 }
 
-func (c *ServiceReconciler) apply(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted func()) error {
+func (c *ServiceReconciler) apply(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted, reconcileStarted func()) error {
 	replicas := 0
 	for _, svc := range tmpl.Services {
 		replicas += svc.Replicas
 	}
 
-	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, buildStarted)
+	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, buildStarted, reconcileStarted)
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
 			"function", fnName,

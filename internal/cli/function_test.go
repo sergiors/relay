@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,11 +98,80 @@ func TestFunctionListColumns(t *testing.T) {
 			nodeRow = l
 		}
 	}
-	if !strings.Contains(userRow, "python3.14") || !strings.Contains(userRow, "ready") {
+	if !strings.Contains(userRow, "python3.14") || !strings.Contains(userRow, state.StatusReady) {
 		t.Fatalf("user row wrong: %q", userRow)
 	}
-	if !strings.Contains(nodeRow, "node24") || !strings.Contains(nodeRow, "pending") {
+	if !strings.Contains(nodeRow, "node24") || !strings.Contains(nodeRow, state.StatusPreparing) {
 		t.Fatalf("node row wrong: %q", nodeRow)
+	}
+}
+
+// TestFunctionListStatusesConsistentWithInspect pins that `ls` and `inspect`
+// render the SAME persisted status for every public lifecycle value, so the two
+// views can never disagree about a function's state. It exercises the full
+// public set — preparing, building, reconciling, ready, degraded, unavailable —
+// through the two renderers.
+func TestFunctionListStatusesConsistentWithInspect(t *testing.T) {
+	st, _ := openTempState(t)
+	tmpl, err := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\n"))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	fn := func(name string) function.Function {
+		return function.Function{Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl}
+	}
+
+	// Seed each status through its production write path.
+	st.RecordDiscovered(fn("st-preparing")) // preparing
+	prepFn := fn("st-building")
+	st.RecordDiscovered(prepFn)
+	st.RecordReconcileBuilding("st-building")
+	reconFn := fn("st-reconciling")
+	st.RecordDiscovered(reconFn)
+	st.RecordReconciling("st-reconciling")
+	st.RecordReconcileSuccess("st-ready", "img", "fp", time.Now(), fn("st-ready"))
+	degFn := fn("st-degraded")
+	st.RecordReconcileSuccess("st-degraded", "img", "fp", time.Now(), degFn)
+	st.RecordServiceFailure("st-degraded", errors.New("service failed"))
+	unavFn := fn("st-unavailable")
+	st.RecordDiscovered(unavFn)
+	st.RecordReconcileFailure("st-unavailable", errors.New("build failed"))
+
+	want := map[string]string{
+		"st-preparing":   state.StatusPreparing,
+		"st-building":    state.StatusBuilding,
+		"st-reconciling": state.StatusReconciling,
+		"st-ready":       state.StatusReady,
+		"st-degraded":    state.StatusDegraded,
+		"st-unavailable": state.StatusUnavailable,
+	}
+
+	// ls: each row carries its status column verbatim.
+	var lw bytes.Buffer
+	if err := printList(&lw, st); err != nil {
+		t.Fatalf("printList: %v", err)
+	}
+	rows := map[string]string{}
+	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
+		fields := strings.Fields(l)
+		if len(fields) >= 3 {
+			rows[fields[0]] = fields[2]
+		}
+	}
+	for name, status := range want {
+		if got := rows[name]; got != status {
+			t.Errorf("ls status for %s = %q, want %q", name, got, status)
+		}
+		// inspect: the same persisted snapshot renders the same status.
+		detail, ok := st.GetFunction(name)
+		if !ok {
+			t.Fatalf("expected function %s", name)
+		}
+		var iw bytes.Buffer
+		printInspect(&iw, st, detail)
+		if !strings.Contains(normWS(iw.String()), "Status: "+status) {
+			t.Errorf("inspect status for %s missing %q:\n%s", name, status, iw.String())
+		}
 	}
 }
 

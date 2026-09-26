@@ -21,11 +21,17 @@ import (
 // the parent so host-side runs (and tests) work without it existing first.
 const DBPath = "/var/lib/relay/db.sqlite3"
 
-// status values for the persisted function status.
+// Public persisted/CLI lifecycle statuses. The model is linear for a single
+// generation — preparing -> building -> reconciling -> ready — with degraded
+// and unavailable as terminal failure outcomes that respectively retain or lack
+// a usable active generation. There is deliberately no "pending" status: a
+// discovered function is "preparing" because both startup discovery/rebuild and
+// a live desired-generation change reset it before the current work runs.
 const (
-	StatusReady       = "ready"
-	StatusPending     = "pending"
+	StatusPreparing   = "preparing"
 	StatusBuilding    = "building"
+	StatusReconciling = "reconciling"
+	StatusReady       = "ready"
 	StatusDegraded    = "degraded"
 	StatusUnavailable = "unavailable"
 )
@@ -299,7 +305,7 @@ func (st *State) empty(ctx context.Context) (bool, error) {
 
 // RebuildFromFS populates an empty state database by scanning dir with the real
 // function loader and per-function fingerprinting. Newly loaded functions are
-// recorded as status=pending (loaded, not yet built/verified). It is a no-op
+// recorded as status=preparing (loaded, not yet built/verified). It is a no-op
 // when the state database already has rows — /functions is the source of truth,
 // but only for (re)seeding a fresh database.
 func (st *State) RebuildFromFS(dir string) error {
@@ -338,7 +344,7 @@ func (st *State) RebuildFromFS(dir string) error {
 
 	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, p := range prepared {
-			detail := functionSnapshot(p.fn.Name, p.fn.Template, StatusPending, "", p.fp, "", "", "", "")
+			detail := functionSnapshot(p.fn.Name, p.fn.Template, StatusPreparing, "", p.fp, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
 			if err := upsertFunctionTx(ctx, tx, detail); err != nil {
 				return err
@@ -349,9 +355,12 @@ func (st *State) RebuildFromFS(dir string) error {
 }
 
 // RecordDiscovered records a function discovered from /functions on a fresh
-// state database (or when no row exists). It sets runtime/status=pending, the
+// state database (or when no row exists). It sets runtime/status=preparing, the
 // fingerprint, and the full configuration snapshot, clearing any stale prior
-// state. It is an upsert keyed by name.
+// state. It is an upsert keyed by name. Startup discovery (and the RebuildFromFS
+// seed) runs it for every loaded function BEFORE any current-generation work, so
+// a stale ready/building/reconciling value left by a process that died mid-work
+// is reset to preparing rather than persisting forever.
 func (st *State) RecordDiscovered(fn function.Function) {
 	ctx := context.Background()
 	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
@@ -363,7 +372,7 @@ func (st *State) RecordDiscovered(fn function.Function) {
 		fp = ""
 	}
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		detail := functionSnapshot(fn.Name, fn.Template, StatusPending, "", fp, "", "", "", "")
+		detail := functionSnapshot(fn.Name, fn.Template, StatusPreparing, "", fp, "", "", "", "")
 		detail.UpdatedAt = st.nowString()
 		return upsertFunctionTx(ctx, tx, detail)
 	})
@@ -398,10 +407,13 @@ func (st *State) RecordReconcileSuccess(
 	}
 }
 
-// RecordReconcilePending marks the desired configuration as in progress while
-// retaining the last active image. The active image is only replaced by a
-// successful full reconcile, so a service failure never hides a healthy version.
-func (st *State) RecordReconcilePending(name string, fn function.Function) {
+// RecordPreparing marks the desired configuration as in progress while retaining
+// the last active generation. It is written when a live desired-generation change
+// is detected, before any current-generation work runs, so the public status
+// reflects that the function is preparing a new generation. The active
+// image/fingerprint/prepared_at are only replaced by a successful full
+// reconcile, so a later failure never hides a healthy version.
+func (st *State) RecordPreparing(name string, fn function.Function) {
 	ctx := context.Background()
 	ts := st.nowString()
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -411,23 +423,33 @@ func (st *State) RecordReconcilePending(name string, fn function.Function) {
 			return err
 		}
 		if !found {
-			detail = functionSnapshot(name, fn.Template, StatusPending, "", "", "", "", "", "")
+			detail = functionSnapshot(name, fn.Template, StatusPreparing, "", "", "", "", "", "")
 		} else {
 			active := detail
-			detail = functionSnapshot(name, fn.Template, StatusPending, active.Image, active.Fingerprint, active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
+			detail = functionSnapshot(name, fn.Template, StatusPreparing, active.Image, active.Fingerprint, active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
 		}
 		detail.UpdatedAt = ts
 		return upsertFunctionTx(ctx, tx, detail)
 	})
 	if err != nil {
-		st.log.Warn("State: record pending failed", "function", name, "error", err)
+		st.log.Warn("State: record preparing failed", "function", name, "error", err)
 	}
 }
 
-// RecordReconcileBuilding changes only the lifecycle status. It is called at
-// the actual Dockerfile build boundary, not when a build is merely queued.
+// RecordReconcileBuilding changes only the lifecycle status to building. It is
+// called at the actual Dockerfile build boundary, not when a build is merely
+// queued.
 func (st *State) RecordReconcileBuilding(name string) {
 	st.recordStatus(name, StatusBuilding)
+}
+
+// RecordReconciling changes only the lifecycle status to reconciling. It is
+// called immediately before a function's persistent services are actually
+// converged (image/entrypoint services) or after a Dockerfile build completes
+// (build services), so the status never claims convergence work that has not
+// started.
+func (st *State) RecordReconciling(name string) {
+	st.recordStatus(name, StatusReconciling)
 }
 
 func (st *State) recordStatus(name, status string) {

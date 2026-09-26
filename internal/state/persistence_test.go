@@ -158,14 +158,16 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 	}
 }
 
-// TestRestartResetsBuildingStatusToPending guards the restart boundary: a
+// TestRestartResetsBuildingStatusToPreparing guards the restart boundary: a
 // "building" status is an in-flight marker for a build that only this process
 // was driving. If the worker dies mid-build, that status persists; on restart
-// the startup discovery (RecordDiscovered) must re-seed the function as pending
-// rather than leaving a stale building state that would never clear. The status
-// is asserted after reopening the same DB (a simulated restart), so the guard
-// covers the persisted value, not just an in-memory write.
-func TestRestartResetsBuildingStatusToPending(t *testing.T) {
+// the startup discovery (RecordDiscovered) must re-seed the function as
+// preparing rather than leaving a stale building state that would never clear.
+// The same reset must cover stale ready/reconciling values from the crashed
+// process. The status is asserted after reopening the same DB (a simulated
+// restart), so the guard covers the persisted value, not just an in-memory
+// write.
+func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db.sqlite3")
 	c1, err := Open(path)
 	if err != nil {
@@ -181,7 +183,7 @@ func TestRestartResetsBuildingStatusToPending(t *testing.T) {
 	_ = c1.Close()
 
 	// Reopen the same path (the worker restart) and run the normal startup
-	// discovery. The stale building marker must be reset to pending.
+	// discovery. The stale building marker must be reset to preparing.
 	c2, err := Open(path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -196,8 +198,8 @@ func TestRestartResetsBuildingStatusToPending(t *testing.T) {
 	if !ok {
 		t.Fatal("expected demo function after restart discovery")
 	}
-	if got.Status != StatusPending {
-		t.Fatalf("status after rediscovery = %q, want pending", got.Status)
+	if got.Status != StatusPreparing {
+		t.Fatalf("status after rediscovery = %q, want preparing", got.Status)
 	}
 }
 

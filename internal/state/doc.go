@@ -9,8 +9,15 @@
 // Redis or Docker.
 //
 // State Model:
-//   - status: "ready" (an active version is built and serving) or "pending"
-//     (loaded but not yet built/verified)
+//   - status: the public lifecycle of the current generation. It is linear —
+//     "preparing" (a discovered or newly desired generation is being prepared) ->
+//     "building" (an actual image build is running) -> "reconciling" (persistent
+//     services are being converged) -> "ready" (the full current generation is
+//     converged and serving). "degraded" and "unavailable" are terminal failure
+//     outcomes: degraded retains a usable previous generation's image;
+//     unavailable has none. Startup discovery and live generation changes both
+//     enter "preparing", replacing any stale transient lifecycle state left by a
+//     process that died mid-work.
 //   - last_reconcile_status: "success" | "failed"
 //     (skipped periodic checks are not recorded; the snapshot reflects the last
 //     MEANINGFUL reconcile — a success or a failure — so an unchanged-function

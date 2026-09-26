@@ -1340,12 +1340,20 @@ how the last reconcile of each function went without touching Redis or Docker.
   change, and absent fields decode to zero. Secret **references** (never values)
   live inside the function snapshot. These are **current snapshots only** — no
   per-event rows, no metric history (Prometheus is the time-series source).
-- **State model**: `status` is `ready` (an active version is built and serving)
-  or `pending` (loaded but not yet built). `last_reconcile_status` is
-  `success` / `failed` (the last MEANINGFUL reconcile outcome; unchanged periodic
-  checks are not recorded). A **failed rebuild never marks a whole
-  function unavailable**: the previously active image and fingerprint are
-  retained, so the last good version keeps serving while `last reconcile` shows
+- **State model**: `status` is the public lifecycle of the current generation:
+  `preparing` (a discovered or newly desired generation is being prepared) ->
+  `building` (an actual image build is running) -> `reconciling` (persistent
+  services are being converged) -> `ready` (the full current generation is
+  converged and serving). `degraded` and `unavailable` are terminal failure
+  outcomes: `degraded` retains a usable previous generation's image,
+  `unavailable` has none.
+  Startup discovery and live generation changes both enter `preparing`, replacing
+  any stale transient lifecycle state left by a process that died mid-work.
+  `last_reconcile_status` is `success` / `failed` and represents the last
+  meaningful reconcile outcome; unchanged periodic checks are not recorded.
+  A failed rebuild never marks the whole function unavailable when a previously
+  active image still exists: the last good image and fingerprint are retained so
+  the previous generation keeps serving while `last_reconcile_status` records
   the failure. All timestamps are RFC3339.
 - **Fault-tolerance**: state errors are logged and never fatal — Relay runs
   without the state database if the DB is missing or broken (Open recreates a
@@ -1409,9 +1417,10 @@ same cron in 24-hour time and never affects scheduling. If a description cannot
 be generated, `inspect` falls back to printing just the raw `cron="..."`
 expression (no parentheses) and never fails.
 
-The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function is
-`pending` (never built); the `Last error` line is omitted when there is none. A
-failed reconcile with an active version keeps `Status: ready` and shows
+The `Image`, `Fingerprint`, and `Prepared` lines are omitted while a function has
+no active version yet (e.g. still `preparing`); the `Last error` line is omitted
+when there is none. A failed reconcile with an active version keeps the prior
+active status (`ready`, or `degraded` after a service failure) and shows
 `Last reconcile: failed (...)` — the function is never marked unavailable.
 
 `relay function inspect <name>` also includes the current per-function

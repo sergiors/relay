@@ -81,8 +81,8 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 	if !ok {
 		t.Fatal("expected row after discovered")
 	}
-	if detail.Status != StatusPending {
-		t.Fatalf("status = %s, want pending", detail.Status)
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %s, want preparing", detail.Status)
 	}
 	if len(detail.Handlers) != 2 {
 		t.Fatalf("handler count = %d, want 2", len(detail.Handlers))
@@ -116,13 +116,17 @@ func TestReconcileStatusTransitionsRetainHealthyGeneration(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	fn := fnFor(t, "fn", tmpl)
 	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
-	c.RecordReconcilePending("fn", fn)
-	if got, _ := c.GetFunction("fn"); got.Status != StatusPending || got.Image != "img-v1" {
-		t.Fatalf("pending status/image = %q/%q, want pending/img-v1", got.Status, got.Image)
+	c.RecordPreparing("fn", fn)
+	if got, _ := c.GetFunction("fn"); got.Status != StatusPreparing || got.Image != "img-v1" {
+		t.Fatalf("preparing status/image = %q/%q, want preparing/img-v1", got.Status, got.Image)
 	}
 	c.RecordReconcileBuilding("fn")
 	if got, _ := c.GetFunction("fn"); got.Status != StatusBuilding {
 		t.Fatalf("building status = %q, want building", got.Status)
+	}
+	c.RecordReconciling("fn")
+	if got, _ := c.GetFunction("fn"); got.Status != StatusReconciling {
+		t.Fatalf("reconciling status = %q, want reconciling", got.Status)
 	}
 	c.RecordServiceFailure("fn", &boomErr{})
 	got, _ := c.GetFunction("fn")
@@ -141,7 +145,7 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 	if got.Status != StatusUnavailable {
 		t.Fatalf("image failure status = %q, want unavailable", got.Status)
 	}
-	c.RecordReconcilePending("fn", fn)
+	c.RecordPreparing("fn", fn)
 	c.RecordServiceFailure("fn", &boomErr{})
 	got, _ = c.GetFunction("fn")
 	if got.Status != StatusUnavailable {
@@ -344,7 +348,7 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0].Name != "demo" || rows[0].Runtime != "python3.14" || rows[0].Status != StatusPending {
+	if rows[0].Name != "demo" || rows[0].Runtime != "python3.14" || rows[0].Status != StatusPreparing {
 		t.Fatalf("unexpected rebuild row: %+v", rows[0])
 	}
 	detail, ok := c.GetFunction("demo")

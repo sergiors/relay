@@ -584,6 +584,12 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 	// be cut off by it (while still being cancelled at Relay shutdown via the
 	// manager lifecycle). The reuse probes above deliberately keep using the
 	// caller's ctx — they are quick and must honor its cancellation.
+	//
+	// notifyFunctionBuild fires at this exact boundary — after every reuse probe,
+	// immediately before buildImage — so the caller publishes the persisted
+	// building status only when an image build is actually issued; a reused image
+	// never flashes building.
+	notifyFunctionBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
 	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), selection); err != nil {
@@ -749,7 +755,9 @@ func (m *Manager) ensureDependencyImage(
 	// independent lifecycle-rooted buildTimeout context rather than the caller's
 	// ctx, so a slow install step is never cut off by a short reconcile budget
 	// while still being cancelled at Relay shutdown. The imageExists probe above
-	// keeps the caller's ctx.
+	// keeps the caller's ctx. notifyFunctionBuild fires at this exact boundary so
+	// a dependency build also reports the building status.
+	notifyFunctionBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
 	if err := buildDependencyImage(buildCtx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {

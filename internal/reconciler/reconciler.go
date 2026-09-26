@@ -92,7 +92,7 @@ type Config struct {
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
 	UpdateServices           func(name, fnDir string, tmpl *function.Template, image string)
-	UpdateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error))
+	UpdateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error))
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveFunction and the function's images are retired. The ordering
 	// invariant: running service containers reference the function's images, so
@@ -119,7 +119,7 @@ type Reconciler struct {
 	removeFunction           func(name string)
 	updateSchedules          func(name string, tmpl *function.Template)
 	updateServices           func(name, fnDir string, tmpl *function.Template, image string)
-	updateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error))
+	updateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error))
 	removeServices           func(name string)
 
 	mu           sync.Mutex
@@ -492,12 +492,16 @@ func (r *Reconciler) reconcileFunction(name string) {
 				generation := r.generations[name]
 				r.mu.Unlock()
 				if r.st != nil {
-					r.st.RecordReconcilePending(name, fn)
+					r.st.RecordPreparing(name, fn)
 				}
 				r.updateServicesWithStatus(name, fn.Dir, fn.Template, cur.Prepared().Image,
 					func() {
 						if r.st != nil && r.currentGeneration(name, generation) {
 							r.st.RecordReconcileBuilding(name)
+						}
+					}, func() {
+						if r.st != nil && r.currentGeneration(name, generation) {
+							r.st.RecordReconciling(name)
 						}
 					}, func(err error) {
 						if r.st == nil || !r.currentGeneration(name, generation) {
@@ -523,11 +527,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 	generation := r.generations[name]
 	r.mu.Unlock()
 	if r.st != nil {
-		r.st.RecordReconcilePending(name, fn)
+		r.st.RecordPreparing(name, fn)
 	}
 
 	start := time.Now()
-	built, err := r.builder.Prepare(r.rctx(), fn)
+	built, err := r.builder.Prepare(r.prepareContext(name, generation), fn)
 	if err != nil {
 		r.log.Error(
 			"Function: reload failed; retaining previous version",
@@ -596,6 +600,10 @@ func (r *Reconciler) reconcileFunction(name string) {
 				if r.st != nil && r.currentGeneration(name, generation) {
 					r.st.RecordReconcileBuilding(name)
 				}
+			}, func() {
+				if r.st != nil && r.currentGeneration(name, generation) {
+					r.st.RecordReconciling(name)
+				}
 			}, func(err error) {
 				if err != nil {
 					failServices(err)
@@ -639,6 +647,24 @@ func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.generations[name] == generation
+}
+
+// prepareContext roots a Prepare call in the reconciler context and installs the
+// function-image build observer that publishes status=building at the ACTUAL
+// managed-runtime image build boundary (runtime.WithFunctionBuildObserver). The
+// callback is generation-guarded, so a stale in-flight completion cannot
+// overwrite a newer generation's status. When no state sink is wired, the plain
+// reconciler context is returned.
+func (r *Reconciler) prepareContext(name string, generation uint64) context.Context {
+	ctx := r.rctx()
+	if r.st == nil {
+		return ctx
+	}
+	return runtime.WithFunctionBuildObserver(ctx, func() {
+		if r.currentGeneration(name, generation) {
+			r.st.RecordReconcileBuilding(name)
+		}
+	})
 }
 
 // remove drops a function from the registry and forgets its fingerprint.

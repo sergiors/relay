@@ -21,10 +21,11 @@ type serviceRequest struct {
 	// that supersedes it before it starts, or lifecycle cancellation that drops
 	// it. It is what RemoveAndWait waits on, so the wait is tied to the actual
 	// operation rather than a caller timeout.
-	done         chan struct{}
-	id           uint64
-	onBuildStart func()
-	onComplete   func(error)
+	done             chan struct{}
+	id               uint64
+	onBuildStart     func()
+	onReconcileStart func()
+	onComplete       func(error)
 }
 
 // serviceFunctionState is one function's desired-state slot. At most one pass
@@ -126,13 +127,15 @@ func (c *ServiceCoordinator) Enqueue(
 
 // EnqueueWithStatus is the status-aware form used by the lifecycle owner. The
 // callbacks belong to this exact coalesced request, so an older operation can
-// never complete a newer generation's status transition.
+// never complete a newer generation's status transition. onBuildStart fires at
+// the actual Dockerfile build boundary; onReconcileStart fires once the source
+// is resolved and container convergence is about to begin.
 func (c *ServiceCoordinator) EnqueueWithStatus(
 	name, fnDir string, tmpl *function.Template, image string, preparedEnv []string,
-	onBuildStart func(), onComplete func(error),
+	onBuildStart, onReconcileStart func(), onComplete func(error),
 ) {
 	c.enqueue(&serviceRequest{name: name, fnDir: fnDir, tmpl: cloneServiceTemplate(tmpl), image: image,
-		preparedEnv: append([]string(nil), preparedEnv...), onBuildStart: onBuildStart, onComplete: onComplete})
+		preparedEnv: append([]string(nil), preparedEnv...), onBuildStart: onBuildStart, onReconcileStart: onReconcileStart, onComplete: onComplete})
 }
 
 // EnqueueRemove publishes a removal and returns immediately. It is the
@@ -380,7 +383,15 @@ func (c *ServiceCoordinator) run(name string) {
 				}
 			}
 		}
-		err := c.services.ApplyWithStatus(c.ctx, req.name, req.fnDir, req.tmpl, req.image, req.preparedEnv, buildStarted)
+		reconcileStarted := req.onReconcileStart
+		if reconcileStarted != nil {
+			reconcileStarted = func() {
+				if c.currentRequest(req) {
+					req.onReconcileStart()
+				}
+			}
+		}
+		err := c.services.ApplyWithStatus(c.ctx, req.name, req.fnDir, req.tmpl, req.image, req.preparedEnv, buildStarted, reconcileStarted)
 		if req.onComplete != nil && c.currentRequest(req) {
 			req.onComplete(err)
 		}

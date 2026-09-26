@@ -53,6 +53,11 @@ type fakeDocker struct {
 	resolveErr      map[string]error
 	resolveCalls    []string // identities passed to ResolveServiceImage, in order
 	resolvedImages  map[string]string
+	// buildObserver, when true, fires the runtime service-build observer carried
+	// by the resolve context for `build` sources — mirroring production's
+	// Dockerfile-build boundary so the reconciling-after-build ordering can be
+	// asserted without Docker.
+	buildObserver bool
 }
 
 func newFakeDocker() *fakeDocker {
@@ -69,7 +74,7 @@ func newFakeDocker() *fakeDocker {
 // deterministic content-addressed reference, and image sources resolve to the
 // identity (with a deterministic content ID). A resolveErr entry forces a
 // resolution failure for the matching identity.
-func (f *fakeDocker) ResolveServiceImage(_ context.Context, fnName, _ string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
+func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName, _ string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	identity := svc.SourceRef()
@@ -79,6 +84,13 @@ func (f *fakeDocker) ResolveServiceImage(_ context.Context, fnName, _ string, tm
 	}
 	switch svc.Source() {
 	case function.ServiceSourceBuild:
+		if f.buildObserver {
+			// Model production's boundary: the observer fires immediately before
+			// the Dockerfile build (and only for a genuine build).
+			if obs := runtime.ServiceBuildObserverFromContext(ctx); obs != nil {
+				obs()
+			}
+		}
 		ref := f.resolvedImages[identity]
 		if ref == "" {
 			ref = "svc-build-" + fnName + ":" + identity
