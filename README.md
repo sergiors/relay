@@ -164,24 +164,28 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 
 ## Configuration
 
-| Env var                       | Required | Description                                                                                                                                                                              |
-| ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REDIS_URI`                   | yes      | Redis address or DSN (see below).                                                                                                                                                        |
-| `REDIS_STREAM`                | yes      | Redis stream to consume.                                                                                                                                                                 |
-| `REDIS_GROUP`                 | yes      | Consumer group name.                                                                                                                                                                     |
-| `REDIS_STREAM_RETENTION`      | no       | Stream retention window; unset disables trimming.                                                                                                                                        |
-| `METRICS_ADDR`                | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                                                                  |
-| `GIT_WEBHOOK_ADDR`            | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).                                                                                                            |
-| `LOG_LEVEL`                   | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                                                   |
-| `MAX_CONCURRENCY`             | no       | Max concurrent function invocations per worker; default `8`.                                                                                                                             |
-| `MAX_BUFFERED_EVENTS`         | no       | Max events read from Redis and held locally before completion; default `16`.                                                                                                             |
-| `NETWORKS`                    | no       | Comma-separated Docker networks every execution container joins at create time; unset = no extra networks (default bridge).                                                              |
-| `WARM_CONTAINER_IDLE_TIMEOUT` | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                                                     |
-| `TRAEFIK_NETWORK`             | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                                                     |
-| `TRAEFIK_ENTRYPOINTS`         | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted.                                    |
-| `TRAEFIK_CERTRESOLVER`        | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.                                                                                                      |
-| `TRAEFIK_PRIORITY`            | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer.                                                                                                   |
-| `TRAEFIK_HOST_OVERRIDE`       | no       | Replaces the declared host's domain for local/development routing while preserving its left-most label; e.g. `issuer.example.com` → `issuer.localhost`. Unset = declared host unchanged. |
+| Env var                              | Required | Description                                                                                                                                                                              |
+| ------------------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REDIS_URI`                          | yes      | Redis address or DSN (see below).                                                                                                                                                        |
+| `REDIS_STREAM`                       | yes      | Redis stream to consume.                                                                                                                                                                 |
+| `REDIS_GROUP`                        | yes      | Consumer group name.                                                                                                                                                                     |
+| `REDIS_STREAM_RETENTION`             | no       | Stream retention window; unset disables trimming.                                                                                                                                        |
+| `METRICS_ADDR`                       | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                                                                  |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`        | no       | OTLP collector endpoint (base URL); unset (and no traces endpoint) disables tracing.                                                                                                     |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no       | OTLP collector traces endpoint; takes precedence over the generic endpoint.                                                                                                              |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`        | no       | OTLP wire protocol: `grpc` or `http/protobuf`; default `http/protobuf`. Any other non-empty value fails tracing setup.                                                                   |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | no       | Traces-specific OTLP protocol; takes precedence over `OTEL_EXPORTER_OTLP_PROTOCOL`.                                                                                                      |
+| `GIT_WEBHOOK_ADDR`                   | no       | GitHub webhook listen address; unset disables the webhook server (see _Git_).                                                                                                            |
+| `LOG_LEVEL`                          | no       | Log verbosity: `DEBUG`, `INFO`, `WARN`, or `ERROR` (case-insensitive); default `INFO`.                                                                                                   |
+| `MAX_CONCURRENCY`                    | no       | Max concurrent function invocations per worker; default `8`.                                                                                                                             |
+| `MAX_BUFFERED_EVENTS`                | no       | Max events read from Redis and held locally before completion; default `16`.                                                                                                             |
+| `NETWORKS`                           | no       | Comma-separated Docker networks every execution container joins at create time; unset = no extra networks (default bridge).                                                              |
+| `WARM_CONTAINER_IDLE_TIMEOUT`        | no       | How long a healthy idle warm execution container is kept before eviction; Go duration, default `5m`.                                                                                     |
+| `TRAEFIK_NETWORK`                    | no       | Docker network Traefik is attached to; required only when a service declares `host`.                                                                                                     |
+| `TRAEFIK_ENTRYPOINTS`                | no       | One or more comma-separated Traefik entrypoint names (e.g. `websecure` or `web,websecure`) for the router `entrypoints` label; unset = label omitted.                                    |
+| `TRAEFIK_CERTRESOLVER`               | no       | Traefik router `tls`/`tls.certresolver` labels on routed services; unset = omitted.                                                                                                      |
+| `TRAEFIK_PRIORITY`                   | no       | Traefik router `priority` label on routed services; unset = omitted. Positive integer.                                                                                                   |
+| `TRAEFIK_HOST_OVERRIDE`              | no       | Replaces the declared host's domain for local/development routing while preserving its left-most label; e.g. `issuer.example.com` → `issuer.localhost`. Unset = declared host unchanged. |
 
 The first three `REDIS_*` variables are required: Relay fails startup (exits
 immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
@@ -193,6 +197,41 @@ server is started. An unbindable address is logged and retried, never fatal.
 endpoint on that address (see _Git_), and when unset or empty the webhook
 server is not started. Unlike the metrics server, a webhook bind failure (a
 taken port) is fatal at startup.
+
+Relay's OpenTelemetry tracing is opt-in and configured entirely through the
+standard OTLP environment variables. Export is enabled only when
+`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set,
+so a default process never dials a collector. `OTEL_SDK_DISABLED=true` forces
+tracing off even with an endpoint. The wire protocol is
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` if set, otherwise
+`OTEL_EXPORTER_OTLP_PROTOCOL`, otherwise `http/protobuf`; only `grpc` and
+`http/protobuf` are supported and any other non-empty value fails setup with a
+clear error (no silent fallback, no port inference). The selected exporter reads
+the remaining standard variables itself (`OTEL_EXPORTER_OTLP_HEADERS`,
+`OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_COMPRESSION`,
+`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_INSECURE`, and their
+`OTEL_EXPORTER_OTLP_TRACES_*` overrides); `service.name` comes from
+`OTEL_SERVICE_NAME`, then `OTEL_RESOURCE_ATTRIBUTES`, then the default `relay`.
+Sampling (`OTEL_TRACES_SAMPLER`/`OTEL_TRACES_SAMPLER_ARG`) and the batch span
+processor (`OTEL_BSP_*`) are applied by the pinned SDK. For example:
+
+```sh
+# OTLP over gRPC with protobuf
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317 \
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+OTEL_SERVICE_NAME=relay \
+  relay start
+
+# OTLP over HTTP with protobuf (the default protocol)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  relay start
+```
+
+`OTEL_PROPAGATORS` is not honored: the pinned OTel core only ships the W3C
+TraceContext and Baggage propagators, so Relay always installs exactly those
+two. OpenTelemetry's own global errors are routed through Relay's `slog` as a
+structured warning and never fatal after setup.
 
 `WARM_CONTAINER_IDLE_TIMEOUT` is optional and controls warm-container idle
 eviction (see _Execution container lifecycle_): it takes a Go duration (for
@@ -1747,6 +1786,16 @@ config is corrupt.
 Relay's observability is logs plus Prometheus metrics plus the local state
 snapshot. There is no HTTP health/readiness endpoint — `relay health` (above)
 remains the health check.
+
+- **OpenTelemetry traces**: tracing is opt-in via the standard OTLP environment
+  (see _Configuration_) and propagates W3C TraceContext + Baggage. Traces are
+  exported over OTLP/gRPC or OTLP/HTTP+protobuf, selected at runtime by
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` > `OTEL_EXPORTER_OTLP_PROTOCOL` >
+  `http/protobuf`; an unsupported value is a non-fatal setup error and tracing
+  runs disabled. The exporter reads the rest of the standard OTLP variables
+  itself, so any OTLP-compatible backend works, and the batch processor flushes
+  under the worker's bounded 5s shutdown step. OpenTelemetry's own errors go to
+  `slog`.
 
 - **Structured logs**: execution, retry, failure, DLQ,
   reconciliation, and build lines carry structured `slog` attributes —
