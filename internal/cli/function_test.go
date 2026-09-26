@@ -757,6 +757,66 @@ func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 	}
 }
 
+// TestFunctionBuildingStatusAndEmptyRuntimeRendering pins the state-reporting
+// contract for a function caught mid-build: `ls` and `inspect` render the same
+// persisted "building" status verbatim, and a service-only template (which parses
+// with no runtime) renders its empty runtime as "-" rather than a blank cell in
+// both views. This is the CLI-side counterpart of the persistence test that
+// resets a stale building status on restart.
+func TestFunctionBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
+	st, _ := openTempState(t)
+
+	// A template whose only workload is an image-backed service: the runtime may
+	// be omitted entirely, so the persisted Runtime is empty.
+	tmpl, err := function.ParseTemplate([]byte(`services:
+  - image: ghcr.io/acme/api:1.2
+    port: 8080
+`))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	fn := function.Function{Name: "svc-only", Dir: filepath.Join(t.TempDir(), "svc"), Template: tmpl}
+	st.RecordDiscovered(fn)
+	st.RecordReconcileBuilding("svc-only")
+
+	// ls: the row carries the building status and the "-" runtime placeholder
+	// (columns are NAME RUNTIME STATUS UPDATED, so the placeholder is field 1).
+	var lw bytes.Buffer
+	if err := printList(&lw, st); err != nil {
+		t.Fatalf("printList: %v", err)
+	}
+	var row string
+	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
+		if strings.HasPrefix(l, "svc-only") {
+			row = l
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("ls output missing svc-only row:\n%s", lw.String())
+	}
+	fields := strings.Fields(row)
+	if len(fields) < 3 || fields[0] != "svc-only" || fields[1] != "-" || fields[2] != state.StatusBuilding {
+		t.Fatalf("ls row = %q, want runtime '-' and status %q", row, state.StatusBuilding)
+	}
+
+	// inspect: the same persisted snapshot renders the same status and the same
+	// runtime placeholder.
+	detail, ok := st.GetFunction("svc-only")
+	if !ok {
+		t.Fatal("expected svc-only function")
+	}
+	var iw bytes.Buffer
+	printInspect(&iw, st, detail)
+	out := normWS(iw.String())
+	if !strings.Contains(out, "Status: "+state.StatusBuilding) {
+		t.Errorf("inspect output missing building status:\n%s", out)
+	}
+	if !strings.Contains(out, "Runtime: -") {
+		t.Errorf("inspect output missing 'Runtime: -':\n%s", out)
+	}
+}
+
 // Services using build and image sources render with their source kind prefix,
 // so an operator can tell how each service is produced.
 func TestFunctionInspectServicesSourceKinds(t *testing.T) {

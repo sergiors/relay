@@ -21,7 +21,10 @@ type serviceRequest struct {
 	// that supersedes it before it starts, or lifecycle cancellation that drops
 	// it. It is what RemoveAndWait waits on, so the wait is tied to the actual
 	// operation rather than a caller timeout.
-	done chan struct{}
+	done         chan struct{}
+	id           uint64
+	onBuildStart func()
+	onComplete   func(error)
 }
 
 // serviceFunctionState is one function's desired-state slot. At most one pass
@@ -66,6 +69,8 @@ type ServiceCoordinator struct {
 	idle        *sync.Cond
 	paused      bool
 	stopped     bool
+	nextID      uint64
+	desiredIDs  map[string]uint64
 	wg          sync.WaitGroup
 	workersDone chan struct{}
 }
@@ -74,9 +79,10 @@ type ServiceCoordinator struct {
 // must be called before Enqueue or RemoveAndWait.
 func NewServiceCoordinator(services *ServiceReconciler) *ServiceCoordinator {
 	return &ServiceCoordinator{
-		services: services,
-		jobs:     make(chan string),
-		states:   make(map[string]*serviceFunctionState),
+		services:   services,
+		jobs:       make(chan string),
+		states:     make(map[string]*serviceFunctionState),
+		desiredIDs: make(map[string]uint64),
 	}
 }
 
@@ -116,6 +122,17 @@ func (c *ServiceCoordinator) Enqueue(
 		image:       image,
 		preparedEnv: append([]string(nil), preparedEnv...),
 	})
+}
+
+// EnqueueWithStatus is the status-aware form used by the lifecycle owner. The
+// callbacks belong to this exact coalesced request, so an older operation can
+// never complete a newer generation's status transition.
+func (c *ServiceCoordinator) EnqueueWithStatus(
+	name, fnDir string, tmpl *function.Template, image string, preparedEnv []string,
+	onBuildStart func(), onComplete func(error),
+) {
+	c.enqueue(&serviceRequest{name: name, fnDir: fnDir, tmpl: cloneServiceTemplate(tmpl), image: image,
+		preparedEnv: append([]string(nil), preparedEnv...), onBuildStart: onBuildStart, onComplete: onComplete})
 }
 
 // EnqueueRemove publishes a removal and returns immediately. It is the
@@ -260,6 +277,9 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 		state = &serviceFunctionState{}
 		c.states[req.name] = state
 	}
+	c.nextID++
+	req.id = c.nextID
+	c.desiredIDs[req.name] = req.id
 	// A newer desired state replaces an unstarted pending one; the superseded
 	// request will never run, so release its waiter now rather than leaving it
 	// open forever.
@@ -352,7 +372,18 @@ func (c *ServiceCoordinator) run(name string) {
 		// budget: Reconcile derives a fresh bound for each of its Docker
 		// operations itself, so a long build can never consume the post-build
 		// deadline.
-		c.services.Apply(c.ctx, req.name, req.fnDir, req.tmpl, req.image, req.preparedEnv)
+		buildStarted := req.onBuildStart
+		if buildStarted != nil {
+			buildStarted = func() {
+				if c.currentRequest(req) {
+					req.onBuildStart()
+				}
+			}
+		}
+		err := c.services.ApplyWithStatus(c.ctx, req.name, req.fnDir, req.tmpl, req.image, req.preparedEnv, buildStarted)
+		if req.onComplete != nil && c.currentRequest(req) {
+			req.onComplete(err)
+		}
 	}
 
 	// Operation complete: release this request's waiter only now, so
@@ -373,6 +404,12 @@ func (c *ServiceCoordinator) run(name string) {
 	state.running = false
 	c.idle.Broadcast()
 	c.mu.Unlock()
+}
+
+func (c *ServiceCoordinator) currentRequest(req *serviceRequest) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.desiredIDs[req.name] == req.id
 }
 
 // removalContext derives the bounded context a queued removal runs under: the

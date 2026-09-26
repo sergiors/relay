@@ -168,6 +168,22 @@ func Reconcile(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
+	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, fnDir, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil)
+}
+
+func reconcileWithObserver(
+	ctx context.Context,
+	reconcileTimeout time.Duration,
+	docker Docker,
+	fnName, fnDir string,
+	tmpl *function.Template,
+	functionImage string,
+	preparedEnv []string,
+	secrets SecretResolver,
+	traefik routing.TraefikConfig,
+	log *slog.Logger,
+	buildStarted func(),
+) (bool, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
 	// is always positive from the worker; a non-positive value means "no
 	// normal-operation bound", so the lifecycle context bounds it directly rather
@@ -327,6 +343,9 @@ func Reconcile(
 		// itself does not use preCtx: the runtime roots it in the manager
 		// lifecycle under buildTimeout, so a long build cannot outlive the
 		// pre-build budget here either.
+		if buildStarted != nil {
+			preCtx = runtime.WithServiceBuildObserver(preCtx, buildStarted)
+		}
 		resolved, err := docker.ResolveServiceImage(preCtx, fnName, fnDir, tmpl, svc, functionImage)
 		preCancel()
 		if err != nil {
@@ -612,20 +631,28 @@ func (c *ServiceReconciler) Apply(
 	tmpl *function.Template,
 	image string,
 	preparedEnv []string,
-) {
+) error {
+	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, nil)
+}
+
+func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted func()) error {
+	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, buildStarted)
+}
+
+func (c *ServiceReconciler) apply(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted func()) error {
 	replicas := 0
 	for _, svc := range tmpl.Services {
 		replicas += svc.Replicas
 	}
 
-	changed, err := Reconcile(ctx, c.reconcileTimeout, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log)
+	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, buildStarted)
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
 			"function", fnName,
 			"replicas", replicas,
 			"error", err,
 		)
-		return
+		return err
 	}
 	if changed {
 		c.log.Info("Service: reconciled",
@@ -633,13 +660,14 @@ func (c *ServiceReconciler) Apply(
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 		)
-		return
+		return nil
 	}
 	c.log.Debug("Service: unchanged",
 		"function", fnName,
 		"services", len(tmpl.Services),
 		"replicas", replicas,
 	)
+	return nil
 }
 
 // Remove stops and removes every service container belonging to fnName. Called

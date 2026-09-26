@@ -111,6 +111,44 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 	}
 }
 
+func TestReconcileStatusTransitionsRetainHealthyGeneration(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
+	c.RecordReconcilePending("fn", fn)
+	if got, _ := c.GetFunction("fn"); got.Status != StatusPending || got.Image != "img-v1" {
+		t.Fatalf("pending status/image = %q/%q, want pending/img-v1", got.Status, got.Image)
+	}
+	c.RecordReconcileBuilding("fn")
+	if got, _ := c.GetFunction("fn"); got.Status != StatusBuilding {
+		t.Fatalf("building status = %q, want building", got.Status)
+	}
+	c.RecordServiceFailure("fn", &boomErr{})
+	got, _ := c.GetFunction("fn")
+	if got.Status != StatusDegraded || got.Image != "img-v1" {
+		t.Fatalf("service failed status/image = %q/%q, want degraded/img-v1", got.Status, got.Image)
+	}
+}
+
+func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+	c.RecordDiscovered(fn)
+	c.RecordReconcileFailure("fn", &boomErr{})
+	got, _ := c.GetFunction("fn")
+	if got.Status != StatusUnavailable {
+		t.Fatalf("image failure status = %q, want unavailable", got.Status)
+	}
+	c.RecordReconcilePending("fn", fn)
+	c.RecordServiceFailure("fn", &boomErr{})
+	got, _ = c.GetFunction("fn")
+	if got.Status != StatusUnavailable {
+		t.Fatalf("service failure status = %q, want unavailable", got.Status)
+	}
+}
+
 // KEY: a failed reconcile keeps the prior active image/fingerprint/prepared_at
 // intact and only records the failure; status stays ready.
 func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {

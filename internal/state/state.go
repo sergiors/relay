@@ -23,8 +23,11 @@ const DBPath = "/var/lib/relay/db.sqlite3"
 
 // status values for the persisted function status.
 const (
-	StatusReady   = "ready"
-	StatusPending = "pending"
+	StatusReady       = "ready"
+	StatusPending     = "pending"
+	StatusBuilding    = "building"
+	StatusDegraded    = "degraded"
+	StatusUnavailable = "unavailable"
 )
 
 // last reconcile status values for the persisted last_reconcile_status.
@@ -395,14 +398,68 @@ func (st *State) RecordReconcileSuccess(
 	}
 }
 
+// RecordReconcilePending marks the desired configuration as in progress while
+// retaining the last active image. The active image is only replaced by a
+// successful full reconcile, so a service failure never hides a healthy version.
+func (st *State) RecordReconcilePending(name string, fn function.Function) {
+	ctx := context.Background()
+	ts := st.nowString()
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at FROM functions WHERE name = ?`, name))
+		if err != nil {
+			return err
+		}
+		if !found {
+			detail = functionSnapshot(name, fn.Template, StatusPending, "", "", "", "", "", "")
+		} else {
+			active := detail
+			detail = functionSnapshot(name, fn.Template, StatusPending, active.Image, active.Fingerprint, active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
+		}
+		detail.UpdatedAt = ts
+		return upsertFunctionTx(ctx, tx, detail)
+	})
+	if err != nil {
+		st.log.Warn("State: record pending failed", "function", name, "error", err)
+	}
+}
+
+// RecordReconcileBuilding changes only the lifecycle status. It is called at
+// the actual Dockerfile build boundary, not when a build is merely queued.
+func (st *State) RecordReconcileBuilding(name string) {
+	st.recordStatus(name, StatusBuilding)
+}
+
+func (st *State) recordStatus(name, status string) {
+	ctx := context.Background()
+	ts := st.nowString()
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at FROM functions WHERE name = ?`, name))
+		if err != nil || !found {
+			return err
+		}
+		detail.Status, detail.UpdatedAt = status, ts
+		payload, err := marshalFunction(detail)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE functions SET data = jsonb(?), updated_at = ? WHERE name = ?`, payload, ts, name)
+		return err
+	})
+	if err != nil {
+		st.log.Warn("State: record status failed", "function", name, "status", status, "error", err)
+	}
+}
+
 // RecordReconcileFailure records that a reconcile build failed.
 //
 // Key state model: the image/fingerprint/prepared_at of the PREVIOUS active
 // version are deliberately left intact so the last good build still serves;
 // only last_reconcile_at/last_reconcile_status (failed) and last_error/updated_at
 // change. The rest of the persisted snapshot is preserved by a read-modify-write
-// inside the transaction. Status stays as-is (ready if it was ready). The
-// function is never marked unavailable because of a failed rebuild.
+// inside the transaction. Status is ready when an active image remains and
+// unavailable otherwise.
 func (st *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
@@ -420,6 +477,11 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 		detail.LastReconcileAt = ts
 		detail.LastReconcileStatus = ReconcileFailed
 		detail.LastError = err2.Error()
+		// A failed attempt never displaces the last healthy generation.
+		detail.Status = StatusUnavailable
+		if detail.Image != "" {
+			detail.Status = StatusReady
+		}
 		detail.UpdatedAt = ts
 		payload, err := marshalFunction(detail)
 		if err != nil {
@@ -432,6 +494,42 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 	})
 	if err != nil {
 		st.log.Warn("State: record failure failed", "function", name, "error", err)
+	}
+}
+
+// RecordServiceFailure records a service convergence failure without hiding a
+// healthy function image. A function with an active image is degraded; one
+// without an active image is unavailable.
+func (st *State) RecordServiceFailure(name string, err2 error) {
+	ctx := context.Background()
+	ts := st.nowString()
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at
+			 FROM functions WHERE name = ?`, name))
+		if err != nil || !found {
+			return err
+		}
+		detail.LastReconcileAt = ts
+		detail.LastReconcileStatus = ReconcileFailed
+		detail.LastError = err2.Error()
+		if detail.Image != "" {
+			detail.Status = StatusDegraded
+		} else {
+			detail.Status = StatusUnavailable
+		}
+		detail.UpdatedAt = ts
+		payload, err := marshalFunction(detail)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE functions SET data = jsonb(?), updated_at = ? WHERE name = ?`,
+			payload, ts, name)
+		return err
+	})
+	if err != nil {
+		st.log.Warn("State: record service failure failed", "function", name, "error", err)
 	}
 }
 

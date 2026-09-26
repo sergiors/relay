@@ -91,7 +91,8 @@ type Config struct {
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
-	UpdateServices func(name, fnDir string, tmpl *function.Template, image string)
+	UpdateServices           func(name, fnDir string, tmpl *function.Template, image string)
+	UpdateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error))
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveFunction and the function's images are retired. The ordering
 	// invariant: running service containers reference the function's images, so
@@ -114,14 +115,16 @@ type Reconciler struct {
 	// retire/removeFunction/updateSchedules/updateServices/removeServices are
 	// optional image-lifecycle, schedule-convergence, and service-convergence
 	// hooks (see Config).
-	retire          func(name, oldImage string)
-	removeFunction  func(name string)
-	updateSchedules func(name string, tmpl *function.Template)
-	updateServices  func(name, fnDir string, tmpl *function.Template, image string)
-	removeServices  func(name string)
+	retire                   func(name, oldImage string)
+	removeFunction           func(name string)
+	updateSchedules          func(name string, tmpl *function.Template)
+	updateServices           func(name, fnDir string, tmpl *function.Template, image string)
+	updateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error))
+	removeServices           func(name string)
 
 	mu           sync.Mutex
 	fingerprints map[string]string // name -> last-reconciled fingerprint
+	generations  map[string]uint64
 	timers       map[string]*time.Timer
 
 	incoming chan string   // debounced, per-function trigger queue
@@ -143,22 +146,24 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		cfg.Interval = DefaultInterval
 	}
 	return &Reconciler{
-		root:            cfg.Root,
-		debounce:        cfg.Debounce,
-		interval:        cfg.Interval,
-		reg:             reg,
-		builder:         builder,
-		log:             logger,
-		st:              cfg.State,
-		retire:          cfg.Retire,
-		removeFunction:  cfg.RemoveFunction,
-		updateSchedules: cfg.UpdateSchedules,
-		updateServices:  cfg.UpdateServices,
-		removeServices:  cfg.RemoveServices,
-		fingerprints:    map[string]string{},
-		timers:          map[string]*time.Timer{},
-		incoming:        make(chan string, DefaultQueueSize),
-		done:            make(chan struct{}),
+		root:                     cfg.Root,
+		debounce:                 cfg.Debounce,
+		interval:                 cfg.Interval,
+		reg:                      reg,
+		builder:                  builder,
+		log:                      logger,
+		st:                       cfg.State,
+		retire:                   cfg.Retire,
+		removeFunction:           cfg.RemoveFunction,
+		updateSchedules:          cfg.UpdateSchedules,
+		updateServices:           cfg.UpdateServices,
+		updateServicesWithStatus: cfg.UpdateServicesWithStatus,
+		removeServices:           cfg.RemoveServices,
+		fingerprints:             map[string]string{},
+		generations:              map[string]uint64{},
+		timers:                   map[string]*time.Timer{},
+		incoming:                 make(chan string, DefaultQueueSize),
+		done:                     make(chan struct{}),
 	}
 }
 
@@ -478,8 +483,33 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// cur.Prepared() != nil via isAvailable). When that converge pass is a
 		// no-op (nothing to stop or start), the caller logs it at Debug rather
 		// than Info — the summary line only surfaces real state changes.
-		if r.updateServices != nil && len(fn.Template.Services) > 0 {
-			r.updateServices(name, fn.Dir, fn.Template, cur.Prepared().Image)
+		if (r.updateServices != nil || r.updateServicesWithStatus != nil) && len(fn.Template.Services) > 0 {
+			if r.updateServicesWithStatus == nil {
+				r.updateServices(name, fn.Dir, fn.Template, cur.Prepared().Image)
+			} else {
+				r.mu.Lock()
+				r.generations[name]++
+				generation := r.generations[name]
+				r.mu.Unlock()
+				if r.st != nil {
+					r.st.RecordReconcilePending(name, fn)
+				}
+				r.updateServicesWithStatus(name, fn.Dir, fn.Template, cur.Prepared().Image,
+					func() {
+						if r.st != nil && r.currentGeneration(name, generation) {
+							r.st.RecordReconcileBuilding(name)
+						}
+					}, func(err error) {
+						if r.st == nil || !r.currentGeneration(name, generation) {
+							return
+						}
+						if err != nil {
+							r.st.RecordServiceFailure(name, err)
+							return
+						}
+						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn)
+					})
+			}
 		}
 		return
 	}
@@ -488,6 +518,13 @@ func (r *Reconciler) reconcileFunction(name string) {
 		"Function: changed; rebuilding",
 		"function", name,
 	)
+	r.mu.Lock()
+	r.generations[name]++
+	generation := r.generations[name]
+	r.mu.Unlock()
+	if r.st != nil {
+		r.st.RecordReconcilePending(name, fn)
+	}
 
 	start := time.Now()
 	built, err := r.builder.Prepare(r.rctx(), fn)
@@ -523,8 +560,21 @@ func (r *Reconciler) reconcileFunction(name string) {
 	r.fingerprints[name] = fp
 	r.mu.Unlock()
 
-	if r.st != nil {
+	ready := func() {
+		if r.st == nil || !r.currentGeneration(name, generation) {
+			return
+		}
 		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
+	}
+	failServices := func(serviceErr error) {
+		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
+			r.st.RecordServiceFailure(name, serviceErr)
+		}
+	}
+	if len(fn.Template.Services) == 0 || r.updateServicesWithStatus == nil {
+		if r.st != nil {
+			ready()
+		}
 	}
 
 	// After a successful swap, converge the scheduler's cron jobs to this
@@ -540,7 +590,20 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// discovery and update paths (the registry now serves the new version), and
 	// not on the skip path above nor on a build failure (where the previous
 	// version — and its service containers — are retained).
-	if r.updateServices != nil {
+	if r.updateServicesWithStatus != nil {
+		r.updateServicesWithStatus(name, fn.Dir, fn.Template, built.Image,
+			func() {
+				if r.st != nil && r.currentGeneration(name, generation) {
+					r.st.RecordReconcileBuilding(name)
+				}
+			}, func(err error) {
+				if err != nil {
+					failServices(err)
+					return
+				}
+				ready()
+			})
+	} else if r.updateServices != nil {
 		r.updateServices(name, fn.Dir, fn.Template, built.Image)
 	}
 
@@ -570,6 +633,12 @@ func (r *Reconciler) reconcileFunction(name string) {
 			"outcome", "updated",
 		)
 	}
+}
+
+func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generations[name] == generation
 }
 
 // remove drops a function from the registry and forgets its fingerprint.

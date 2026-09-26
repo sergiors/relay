@@ -454,7 +454,7 @@ func Run(logger *slog.Logger) error {
 	// background, so startup never blocks on a service's Dockerfile build — nor
 	// on the unavailable/no-services removals, which are published the same
 	// nonblocking way (the coordinator derives their own fresh bound).
-	enqueueStartupServices(prepared, services, logger)
+	enqueueStartupServicesWithState(prepared, services, st, logger)
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
 	// barrier for the initial service attempts to settle, then runs the startup
@@ -671,6 +671,9 @@ func Run(logger *slog.Logger) error {
 			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
 				enqueueLiveServices(services, runWorker.Registry(), name, fnDir, tmpl, image)
 			},
+			UpdateServicesWithStatus: func(name, fnDir string, tmpl *function.Template, image string, onBuildStart func(), onComplete func(error)) {
+				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, fnDir, tmpl, image, onBuildStart, onComplete)
+			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
 			// running service containers reference those images. RemoveAndWait
@@ -860,11 +863,29 @@ func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *m
 	return metricsInstance, metricsServer
 }
 
+// beginManagedRuntimeBuild publishes the building status at the managed runtime
+// image-preparation boundary. A template that needs no runtime has no function
+// image to build (Prepare is then a fast no-op), so it is deliberately left
+// untouched rather than flashing a spurious building state. It is nil-safe.
+func beginManagedRuntimeBuild(st *state.State, fn function.Function) {
+	if st != nil && fn.Template.NeedsRuntime() {
+		st.RecordReconcileBuilding(fn.Name)
+	}
+}
+
 // prepareFunctions builds each function's image and returns the prepared set. A
 // function whose image cannot be built is marked unavailable (the runner skips
 // it) rather than failing startup; the rest carry their fresh image. A
 // fingerprint that changed between load and build is recomputed so the state DB
 // records the final value.
+//
+// The building status is published before Prepare so a long managed runtime
+// image build is reported consistently. A successful no-service preparation
+// reaches ready below; a function whose template declares services stays
+// building through service convergence (which republishes building at its own
+// Dockerfile boundary and records the terminal outcome), and a preparation
+// failure uses the existing failure semantics (unavailable without an active
+// image, ready when a previous image is retained).
 //
 // ctx is the worker lifecycle context. It is passed to Prepare so a build (and
 // the fast reuse probes) is cancelled on shutdown; Prepare itself roots the
@@ -881,6 +902,7 @@ func prepareFunctions(
 	preparedCount := 0
 	prepared := make([]*runner.PreparedFunction, 0, len(functions))
 	for _, fn := range functions {
+		beginManagedRuntimeBuild(st, fn)
 		prep, err := manager.Prepare(ctx, fn)
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
@@ -898,7 +920,7 @@ func prepareFunctions(
 			prepared = append(prepared, runner.NewUnavailable(fn))
 			continue
 		}
-		if st != nil {
+		if st != nil && len(fn.Template.Services) == 0 {
 			// The fingerprint may differ from discovery-time if content changed
 			// between load and build; the state DB records the final state.
 			fp, fperr := function.Fingerprint(fn.Dir)
@@ -936,6 +958,22 @@ func enqueueLiveServices(
 	services.Enqueue(name, fnDir, tmpl, image, preparedEnv)
 }
 
+func enqueueLiveServicesWithStatus(
+	services *reconciler.ServiceCoordinator,
+	reg *runner.Registry,
+	name, fnDir string,
+	tmpl *function.Template,
+	image string,
+	onBuildStart func(),
+	onComplete func(error),
+) {
+	var preparedEnv []string
+	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
+		preparedEnv = cur.Prepared().Env
+	}
+	services.EnqueueWithStatus(name, fnDir, tmpl, image, preparedEnv, onBuildStart, onComplete)
+}
+
 // enqueueStartupServices publishes each prepared function's initial desired
 // service state and returns immediately; the coordinator converges them in the
 // background, so startup never blocks on a service's Dockerfile build. The
@@ -957,15 +995,33 @@ func enqueueLiveServices(
 // definition and are removed via the nonblocking EnqueueRemove. The coordinator
 // derives the removal's own fresh reconcileTimeout bound; the housekeeping
 // barrier serializes the image sweep behind it exactly as it does for Applys.
-func enqueueStartupServices(
+func enqueueStartupServices(prepared []*runner.PreparedFunction, services *reconciler.ServiceCoordinator, logger *slog.Logger) {
+	enqueueStartupServicesWithState(prepared, services, nil, logger)
+}
+
+func enqueueStartupServicesWithState(
 	prepared []*runner.PreparedFunction,
 	services *reconciler.ServiceCoordinator,
+	st *state.State,
 	logger *slog.Logger,
 ) {
 	for _, pf := range prepared {
 		fn := pf.Function()
 		if prep := pf.Prepared(); prep != nil {
-			services.Enqueue(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env)
+			if st != nil && len(fn.Template.Services) > 0 {
+				services.EnqueueWithStatus(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env,
+					func() { st.RecordReconcileBuilding(fn.Name) },
+					func(err error) {
+						if err != nil {
+							st.RecordServiceFailure(fn.Name, err)
+							return
+						}
+						fp, _ := function.Fingerprint(fn.Dir)
+						st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
+					})
+			} else {
+				services.Enqueue(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env)
+			}
 			continue
 		}
 		if len(fn.Template.Services) == 0 {

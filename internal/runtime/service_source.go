@@ -113,6 +113,9 @@ func (m *Manager) resolveBuildServiceImage(
 	}
 
 	start := m.clock()
+	if observer := ServiceBuildObserverFromContext(ctx); observer != nil {
+		observer()
+	}
 	// Pre-build structured log: emitted once, immediately before the Dockerfile
 	// build is issued, so a slow build is visible while it runs (the completion
 	// log below only appears on success). The generated image reference is

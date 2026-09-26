@@ -158,6 +158,49 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 	}
 }
 
+// TestRestartResetsBuildingStatusToPending guards the restart boundary: a
+// "building" status is an in-flight marker for a build that only this process
+// was driving. If the worker dies mid-build, that status persists; on restart
+// the startup discovery (RecordDiscovered) must re-seed the function as pending
+// rather than leaving a stale building state that would never clear. The status
+// is asserted after reopening the same DB (a simulated restart), so the guard
+// covers the persisted value, not just an in-memory write.
+func TestRestartResetsBuildingStatusToPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	c1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "demo", tmpl)
+	c1.RecordDiscovered(fn)
+	c1.RecordReconcileBuilding("demo")
+	if got, _ := c1.GetFunction("demo"); got.Status != StatusBuilding {
+		t.Fatalf("pre-restart status = %q, want building", got.Status)
+	}
+	_ = c1.Close()
+
+	// Reopen the same path (the worker restart) and run the normal startup
+	// discovery. The stale building marker must be reset to pending.
+	c2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.Close()
+
+	if got, _ := c2.GetFunction("demo"); got.Status != StatusBuilding {
+		t.Fatalf("status after reopen = %q, want the persisted building status", got.Status)
+	}
+	c2.RecordDiscovered(fn)
+	got, ok := c2.GetFunction("demo")
+	if !ok {
+		t.Fatal("expected demo function after restart discovery")
+	}
+	if got.Status != StatusPending {
+		t.Fatalf("status after rediscovery = %q, want pending", got.Status)
+	}
+}
+
 // TestRecordDiscoveredDoesNotResetFunctionStats is a unit-level guard: recording
 // a function's discovery must not reset its persisted per-function counters or
 // updated_at.
