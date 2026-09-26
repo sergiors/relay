@@ -104,23 +104,64 @@ const (
 	MetricRuntimeContainerWaits           = metricNamespacePrefix + "runtime_container_waits_total"
 )
 
-// counterHelp carries the Prometheus HELP text for the counters whose semantics
-// are non-obvious. The three event-classification counters in particular must
-// state the exact partition and the once-per-logical-event rule, because their
-// values only make sense together. Names absent from this map are registered
-// with no explicit Help (Prometheus renders its default), preserving the
-// existing exposition for the counters that predate this map.
-var counterHelp = map[string]string{
+// metricHelp carries the Prometheus HELP text for EVERY registered metric,
+// keyed by canonical (relay_-prefixed) name. Every collector in New is
+// registered with metricHelp[name], so this map is the single place a name's
+// semantics are documented for a scrape; a name missing here would expose an
+// empty HELP. TestMetricMetadata gathers every family and fails unless each has
+// non-empty, sentence-case HELP, so adding a collector without documenting it
+// fails the build.
+//
+// The text is deliberately semantic, not tautological: it states what a value
+// counts or measures, over what unit of work, and — where the distinction
+// matters — what it deliberately excludes (redeliveries, schedule occurrences,
+// skipped protected invocations). Several families are easy to misread:
+//   - The three event-classification counters form a closed partition
+//     (received == matched + unmatched) and are claimed exactly once per
+//     logical event across redeliveries/retries, so they must be documented
+//     together.
+//   - MetricRetries counts stream MESSAGE redeliveries (reclaims), not handler
+//     retries; MetricFunctionRetries counts failed handler executions that will
+//     be retried. They answer different questions.
+//   - MetricDLQEntries counts one entry per exhausted INVOCATION (a message
+//     matching several handlers dead-letters one entry each), counted after the
+//     DLQ write succeeds.
+//   - The handler invocation counters are per rule EXECUTION, not per logical
+//     event, and span the event, schedule, and manual invocation paths.
+var metricHelp = map[string]string{
 	MetricEventsReceived:  "Logical incoming events (messages that decoded to an event object) handled by the runner, classified exactly once per logical event across redeliveries/retries. Schedule occurrences are excluded.",
 	MetricEventsMatched:   "Logical incoming events for which at least one function rule matched, classified exactly once per logical event across redeliveries/retries. A handler failure does not move an event out of this class.",
 	MetricEventsUnmatched: "Logical incoming events for which no function rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
-}
 
-// counterVecHelp is the labeled counterpart of counterHelp: the HELP text for
-// CounterVecs whose semantics need spelling out. Names absent from the map are
-// registered with no explicit Help.
-var counterVecHelp = map[string]string{
-	MetricFunctionEventsMatched: "Logical events for which at least one of this function's rules matched, counted once per logical event per function across redeliveries/retries (deduped across the function's matching rules). A handler failure does not move an event out of this class.",
+	MetricRetries:                      "Message redeliveries performed by the stream consumer when it reclaims idle pending entries; a reclaim counts once even when the message is not processed (buffer full) or every invocation is skipped as protected. Distinct from function_retries_total, which counts failed handler executions.",
+	MetricDLQEntries:                   "Dead-letter entries written when an invocation exhausts its retry budget; one entry per exhausted invocation, counted only after the DLQ write succeeds.",
+	MetricHandlerSuccess:               "Successful handler executions across event, schedule, and manual invocations, counted once per handler attempt.",
+	MetricHandlerFailure:               "Failed handler attempts across event, schedule, and manual invocations, counted once per attempt; a failed attempt that will retry is counted here too.",
+	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-function).",
+	MetricScheduleOccurrencesPublished: "Schedule occurrences newly published to the event stream by this worker after the distributed publish-if-new check.",
+	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
+	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; occurrences are retried on the next scheduling tick.",
+
+	MetricHandlerInvocations:              "Handler invocation outcomes by function and handler, counted once per handler attempt; outcome is success or failure.",
+	MetricBuildFailures:                   "Function image and dependency-image build failures by function.",
+	MetricFunctionEventsMatched:           "Logical events for which at least one of this function's rules matched, counted once per logical event per function across redeliveries/retries (deduped across the function's matching rules). A handler failure does not move an event out of this class.",
+	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the function, counted once per handler attempt across event, schedule, and manual invocations.",
+	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the function, counted once per attempt; a failed attempt that will retry is counted here too.",
+	MetricFunctionRetries:                 "Failed handler attempts attributed to the function that will be retried according to the rule's retry budget.",
+	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were routed to the dead-letter queue, counted once per exhausted invocation.",
+	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by function and outcome; warm leases an existing idle container, cold starts a fresh container.",
+	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by function and finite teardown reason.",
+	MetricRuntimeContainerWaits:           "Warm-container pool acquires that had to block at the pool's capacity bound, regardless of eventual success.",
+	MetricHandlerDuration:                 "Handler attempt duration in seconds by function and handler, observed for each success and each failure attributed to a handler attempt.",
+	MetricFunctionBuild:                   "Function image and dependency-image build duration in seconds by function.",
+	MetricRuntimeContainerAcquireDuration: "Warm-container pool acquire duration in seconds by function, observed for successful acquires only and including any capacity wait.",
+
+	MetricPendingEntries:      "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
+	MetricPendingOldestAge:    "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
+	MetricBufferedEvents:      "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
+	MetricInFlightInvocations: "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
+	MetricRuntimeContainers:   "Current number of warm-container pool containers by function and state (idle, busy, or starting).",
+	MetricRuntimePoolCapacity: "Current resolved per-function concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
 }
 
 // Runtime pool gauge label values. They are a closed set so the
@@ -332,7 +373,7 @@ func New() *Registry {
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
 	} {
-		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: counterHelp[name]})
+		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(c)
 		r.counters[name] = c
 	}
@@ -342,6 +383,7 @@ func New() *Registry {
 	// runner passes labels unsorted, so routing matches by name below.
 	handlerInvocations := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricHandlerInvocations,
+		Help: metricHelp[MetricHandlerInvocations],
 	}, []string{"outcome", "function", "handler"})
 	reg.MustRegister(handlerInvocations)
 	r.counterVecs[MetricHandlerInvocations] = &labeledCounterVec{
@@ -354,6 +396,7 @@ func New() *Registry {
 	// low-cardinality.
 	buildFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricBuildFailures,
+		Help: metricHelp[MetricBuildFailures],
 	}, []string{"function"})
 	reg.MustRegister(buildFailures)
 	r.counterVecs[MetricBuildFailures] = &labeledCounterVec{
@@ -383,7 +426,7 @@ func New() *Registry {
 		MetricFunctionRetries,
 		MetricFunctionDLQ,
 	} {
-		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: counterVecHelp[name]}, []string{"function"})
+		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: metricHelp[name]}, []string{"function"})
 		reg.MustRegister(vec)
 		r.counterVecs[name] = &labeledCounterVec{order: []string{"function"}, vec: vec}
 	}
@@ -393,6 +436,7 @@ func New() *Registry {
 	// series anymore — a histogram's bucket bounds convey the same spread.
 	handlerDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    MetricHandlerDuration,
+		Help:    metricHelp[MetricHandlerDuration],
 		Buckets: buckets,
 	}, []string{"function", "handler"})
 	reg.MustRegister(handlerDuration)
@@ -406,6 +450,7 @@ func New() *Registry {
 	// with the labeled histogram under the same name.
 	buildDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    MetricFunctionBuild,
+		Help:    metricHelp[MetricFunctionBuild],
 		Buckets: buckets,
 	}, []string{"function"})
 	reg.MustRegister(buildDuration)
@@ -419,7 +464,7 @@ func New() *Registry {
 		MetricPendingEntries,
 		MetricPendingOldestAge,
 	} {
-		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(g)
 		r.gauges[name] = g
 	}
@@ -432,7 +477,7 @@ func New() *Registry {
 		MetricBufferedEvents,
 		MetricInFlightInvocations,
 	} {
-		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name})
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(g)
 		r.gauges[name] = g
 	}
@@ -444,6 +489,7 @@ func New() *Registry {
 	// a removed function's series are deleted alongside its other series.
 	poolContainers := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: MetricRuntimeContainers,
+		Help: metricHelp[MetricRuntimeContainers],
 	}, []string{"function", "state"})
 	reg.MustRegister(poolContainers)
 	r.gaugeVecs[MetricRuntimeContainers] = &labeledGaugeVec{
@@ -453,6 +499,7 @@ func New() *Registry {
 
 	poolCapacity := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: MetricRuntimePoolCapacity,
+		Help: metricHelp[MetricRuntimePoolCapacity],
 	}, []string{"function"})
 	reg.MustRegister(poolCapacity)
 	r.gaugeVecs[MetricRuntimePoolCapacity] = &labeledGaugeVec{
@@ -462,6 +509,7 @@ func New() *Registry {
 
 	containerAcquires := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerAcquires,
+		Help: metricHelp[MetricRuntimeContainerAcquires],
 	}, []string{"function", "outcome"})
 	reg.MustRegister(containerAcquires)
 	r.counterVecs[MetricRuntimeContainerAcquires] = &labeledCounterVec{
@@ -471,6 +519,7 @@ func New() *Registry {
 
 	containerDiscards := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerDiscards,
+		Help: metricHelp[MetricRuntimeContainerDiscards],
 	}, []string{"function", "reason"})
 	reg.MustRegister(containerDiscards)
 	r.counterVecs[MetricRuntimeContainerDiscards] = &labeledCounterVec{
@@ -480,6 +529,7 @@ func New() *Registry {
 
 	containerAcquireDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    MetricRuntimeContainerAcquireDuration,
+		Help:    metricHelp[MetricRuntimeContainerAcquireDuration],
 		Buckets: buckets,
 	}, []string{"function"})
 	reg.MustRegister(containerAcquireDuration)
@@ -492,6 +542,7 @@ func New() *Registry {
 	// eventual success), mirroring concurrency_waits_total at the pool layer.
 	containerWaits := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerWaits,
+		Help: metricHelp[MetricRuntimeContainerWaits],
 	}, []string{"function"})
 	reg.MustRegister(containerWaits)
 	r.counterVecs[MetricRuntimeContainerWaits] = &labeledCounterVec{

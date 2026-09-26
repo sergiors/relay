@@ -1777,7 +1777,8 @@ remains the health check.
   `schedule_occurrences_duplicate_total`, `schedule_publish_failures_total`)
   track the distributed publish-if-new path per worker: published/duplicate
   counts converge across workers toward one published entry per logical
-  occurrence, while failures flag workers that cannot reach Redis. These are
+  occurrence, while failures flag publish attempts that could not reach Redis
+  (or whose envelope could not be encoded). These are
   Prometheus-only and not part of the SQLite snapshot. Labels are bounded to
   `function`/`handler`/`outcome` plus the small closed runtime-pool value sets
   below; IDs (message, event, container, fingerprint) are never labels. The

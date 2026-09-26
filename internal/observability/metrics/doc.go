@@ -23,26 +23,44 @@
 //     /metrics.
 //
 // Metric kinds (canonical Prometheus names carry the "relay_" namespace
-// prefix; log snapshots render without it):
+// prefix; log snapshots render without it). Every family is registered with a
+// non-empty sentence-case HELP in metricHelp (metrics.go), and the metadata
+// test gathers all of them to enforce that:
 //
 //   - Counters: relay_events_received_total, relay_events_matched_total,
 //     relay_events_unmatched_total, relay_retries_total,
 //     relay_dlq_entries_total, relay_handler_success_total,
-//     relay_handler_failure_total, plus CounterVecs
+//     relay_handler_failure_total, relay_concurrency_waits_total, the
+//     schedule-coordination counters (relay_schedule_occurrences_published_total,
+//     relay_schedule_occurrences_duplicate_total,
+//     relay_schedule_publish_failures_total), plus CounterVecs
 //     relay_handler_invocations_total{outcome,function,handler},
-//     relay_build_failures_total{function}, and the per-function
-//     relay_function_events_matched_total{function}.
-//   - Histograms: relay_handler_duration_seconds{function,handler} and
-//     relay_function_build_seconds{function} (prometheus.DefBuckets).
+//     relay_build_failures_total{function}, the per-function operational
+//     counters relay_function_events_matched_total{function},
+//     relay_function_handler_success_total{function},
+//     relay_function_handler_failure_total{function},
+//     relay_function_retries_total{function}, relay_function_dlq_total{function},
+//     and the warm-container pool acquire/discard/waits CounterVecs below.
+//   - Histograms: relay_handler_duration_seconds{function,handler},
+//     relay_function_build_seconds{function}, and
+//     relay_runtime_container_acquire_duration_seconds{function}
+//     (prometheus.DefBuckets; all observed in seconds).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
-//     (Redis backlog depth and age sampled by the stream consumer).
+//     (Redis backlog depth and age sampled by the stream consumer),
+//     relay_buffered_events (the consumer's local in-flight buffer occupancy),
+//     and relay_in_flight_invocations (the runner's current executing
+//     invocation count).
 //   - Warm-container pool (runtime, function-scoped):
 //     relay_runtime_pool_capacity{function} and
 //     relay_runtime_containers{function,state=idle|busy|starting} gauges,
-//     relay_runtime_container_acquires_total{function,outcome=warm|cold} and
-//     relay_runtime_container_discards_total{function,reason} counters,
-//     relay_runtime_container_waits_total{function}, and the successful-acquire
-//     histogram relay_runtime_container_acquire_duration_seconds{function}.
+//     relay_runtime_container_acquires_total{function,outcome=warm|cold},
+//     relay_runtime_container_discards_total{function,reason}, and
+//     relay_runtime_container_waits_total{function} counters, and the
+//     successful-acquire histogram
+//     relay_runtime_container_acquire_duration_seconds{function}.
+//
+// The schedule-coordination counters are Prometheus-only: they are deliberately
+// NOT wired into the SQLite stats snapshot.
 //
 // Event classification: the three relay_events_* counters form a closed
 // partition of the logical incoming events the runner handled
