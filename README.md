@@ -1797,6 +1797,23 @@ remains the health check.
   under the worker's bounded 5s shutdown step. OpenTelemetry's own errors go to
   `slog`.
 
+  **Distributed propagation**: the primary propagation path is the Redis event
+  stream. A schedule publication creates a `schedule.publish` span and writes
+  its W3C `traceparent`, `tracestate`, and `baggage` values as flat stream
+  metadata fields beside the unchanged `event` field. Stream consumption
+  extracts those fields before creating `stream.message`, so the message,
+  dispatch, and `runtime.invoke` spans continue the same trace. The invocation
+  frame carries the same values under its optional `trace` object. Python and
+  Node.js bootstraps attach that context only while calling the handler and
+  restore the warm runtime afterward; TypeScript handlers use the Node.js path.
+
+  Retries and redeliveries reprocess the original stream entry and therefore
+  reuse its propagation metadata, while each delivery gets its own processing
+  span. DLQ entries, manual invocations, and persistent services are not
+  propagation boundaries: DLQ records do not carry these fields, manual
+  invocations do not come from a stream message, and persistent services do not
+  use the event/schedule invocation protocol.
+
 - **Structured logs**: execution, retry, failure, DLQ,
   reconciliation, and build lines carry structured `slog` attributes —
   `function`, `handler`, `message_id`, `attempt`, `duration`, and container

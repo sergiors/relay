@@ -55,9 +55,76 @@ type invokeResult struct {
 	Frame string
 }
 
+// writeOtelStub writes a minimal stand-in for the OpenTelemetry API the runtime
+// image installs, into dir (the test PYTHONPATH). The real embedded bootstrap
+// imports `opentelemetry.context` and `opentelemetry.propagate`; this stub
+// provides just those two with the same attach/detach/extract contract backed by
+// contextvars, so the process-behavior tests can observe the managed invocation
+// context without a network OTel install. Mirrors the Node bootstrap test's stub.
+func writeOtelStub(t *testing.T, dir string) {
+	t.Helper()
+	pkg := filepath.Join(dir, "opentelemetry")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatalf("mkdir opentelemetry stub: %v", err)
+	}
+	write := func(name, contents string) {
+		if err := os.WriteFile(filepath.Join(pkg, name), []byte(contents), 0o644); err != nil {
+			t.Fatalf("write opentelemetry stub: %v", err)
+		}
+	}
+	write("__init__.py", "")
+	write("context.py", `
+import contextvars
+
+_ROOT = "root"
+_current = contextvars.ContextVar("relay_otel_context", default=_ROOT)
+
+
+def attach(ctx):
+    return _current.set(ctx)
+
+
+def detach(token):
+    _current.reset(token)
+
+
+def get_current():
+    return _current.get()
+`)
+	write("propagate.py", `
+def extract(carrier, context="root", getter=None):
+    if not carrier:
+        return context
+    return carrier.get("traceparent") or context
+`)
+}
+
 // startPython runs the real embedded bootstrap under python3 with PYTHONPATH
-// pointing at dir (which holds the handler modules).
+// pointing at dir (which holds the handler modules and the OTel API stub).
 func startPython(t *testing.T, dir string) *pyProc {
+	t.Helper()
+	writeOtelStub(t, dir)
+	return startBootstrap(t, dir)
+}
+
+// startPythonWithoutOtel runs the bootstrap in a dir whose `opentelemetry`
+// package deliberately raises on import, so the bootstrap's guarded import is
+// exercised deterministically regardless of any ambient OTel install on the
+// test host.
+func startPythonWithoutOtel(t *testing.T, dir string) *pyProc {
+	t.Helper()
+	pkg := filepath.Join(dir, "opentelemetry")
+	if err := os.MkdirAll(pkg, 0o755); err != nil {
+		t.Fatalf("mkdir opentelemetry: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "__init__.py"), []byte(`raise ImportError("otel unavailable")`), 0o644); err != nil {
+		t.Fatalf("write broken opentelemetry: %v", err)
+	}
+	return startBootstrap(t, dir)
+}
+
+// startBootstrap runs the embedded bootstrap in dir as a live process.
+func startBootstrap(t *testing.T, dir string) *pyProc {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), Bootstrap, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
@@ -108,10 +175,15 @@ func (p *pyProc) stderrString() string {
 // response line arrives, collecting any interleaved user output. It fails the
 // test on protocol EOF (the process died mid-invocation).
 func (p *pyProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
+	return p.invokeTrace(t, handler, event, env, nil)
+}
+
+// invokeTrace is invoke with the optional W3C "trace" carrier the frame carries.
+func (p *pyProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
 	t.Helper()
 	id := fmt.Sprintf("t%d", p.seq)
 	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env})
+	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace})
 	if err != nil {
 		t.Fatalf("build request frame: %v", err)
 	}
@@ -147,6 +219,7 @@ type reqFrame struct {
 	Handler string            `json:"handler"`
 	Event   json.RawMessage   `json:"event"`
 	Env     map[string]string `json:"env"`
+	Trace   map[string]string `json:"trace,omitempty"`
 }
 
 type respFrame struct {
@@ -225,6 +298,63 @@ async def async_handler(event):
 	}
 	if !strings.Contains(r.Out, "async hi") {
 		t.Errorf("out = %q, want to contain 'async hi'", r.Out)
+	}
+}
+
+// TestPythonRuntimeTraceContextIsolatedAcrossInvocations proves the managed
+// invocation context: the frame's "trace" carrier is attached for the handler
+// call only, an async handler observes it across an await, a raising handler
+// still restores the previous context, and an untraced invocation sees no
+// leaked context. The stub OTel API mirrors the real attach/detach contract.
+func TestPythonRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import asyncio
+from opentelemetry import context
+
+async def inspect(event):
+    await asyncio.sleep(0)
+    print("trace=" + str(context.get_current()))
+    if event.get("fail"):
+        raise ValueError("trace failure")
+`)
+	p := startPython(t, dir)
+
+	r1 := p.invokeTrace(t, "handler.inspect", `{"fail":false}`, nil, map[string]string{
+		"traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+	})
+	if !r1.OK || !strings.Contains(r1.Out, "trace=00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01") {
+		t.Fatalf("traced invoke = %+v, want the attached traceparent", r1)
+	}
+
+	r2 := p.invokeTrace(t, "handler.inspect", `{"fail":true}`, nil, map[string]string{
+		"traceparent": "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01",
+	})
+	if r2.OK || !strings.Contains(r2.Out, "trace=00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01") {
+		t.Fatalf("failed traced invoke = %+v, want the attached traceparent before the raise", r2)
+	}
+
+	r3 := p.invoke(t, "handler.inspect", `{}`, nil)
+	if !r3.OK || !strings.Contains(r3.Out, "trace=root") {
+		t.Fatalf("post-failure untraced invoke = %+v, want the restored root context", r3)
+	}
+}
+
+// TestPythonRuntimeTraceWithoutOtelIsBestEffort proves the guarded import: when
+// the OpenTelemetry API is unavailable the bootstrap still runs the handler with
+// the trace field present, degrading to no propagation instead of crashing.
+func TestPythonRuntimeTraceWithoutOtelIsBestEffort(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", "def f(event):\n    print('ran %s' % event['msg'])\n")
+	p := startPythonWithoutOtel(t, dir)
+
+	r := p.invokeTrace(t, "handler.f", `{"msg":"hi"}`, nil, map[string]string{
+		"traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+	})
+	if !r.OK || !strings.Contains(r.Out, "ran hi") {
+		t.Fatalf("invoke without the OTel API = %+v, want it to run best-effort", r)
 	}
 }
 

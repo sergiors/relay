@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"relay/internal/testutil"
 )
@@ -197,4 +198,77 @@ func TestIntegrationPublishFailureLeavesNoKey(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("dedup key exists (%d) after a failed script; want no key-without-entry window", n)
 	}
+}
+
+// A publish with a trace context writes the W3C fields as flat stream metadata
+// beside the untouched event envelope, so a consumer can continue the trace; a
+// publish with no trace context writes exactly the event field and nothing else.
+func TestIntegrationPublishWritesTraceFieldsBesideEvent(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	e := newPTestEnv(t, cli)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
+	ctx := context.Background()
+
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    mustTraceID(t, "4bf92f3577b34da6a3ce929d0e0e4736"),
+		SpanID:     mustSpanID(t, "00f067aa0ba902b7"),
+		TraceFlags: oteltrace.FlagsSampled,
+		Remote:     true,
+	})
+	traced := oteltrace.ContextWithRemoteSpanContext(ctx, sc)
+	tracedID := newUniqueOccurrence(e.prefix)
+	if _, err := p.PublishOccurrence(traced, tracedID); err != nil {
+		t.Fatalf("publish traced: %v", err)
+	}
+	entries, err := cli.XRange(ctx, e.stream, "-", "+").Result()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("XRange = %d entries (err %v), want 1", len(entries), err)
+	}
+	values := entries[0].Values
+	env, _ := tracedID.Envelope()
+	if values["event"] != string(env) {
+		t.Errorf("event = %v, want the untouched envelope", values["event"])
+	}
+	if values["traceparent"] == "" || values["traceparent"] == traceparent {
+		// The injected traceparent belongs to the schedule.publish child and must
+		// carry the remote TRACE id (not equal the remote span's own header).
+		t.Errorf("traceparent = %v, want the injected schedule.publish traceparent", values["traceparent"])
+	}
+
+	// A second, untraced occurrence writes only the event field.
+	plain := newUniqueOccurrence(e.prefix)
+	plain.ScheduledAt = plain.ScheduledAt.Add(time.Minute)
+	if _, err := p.PublishOccurrence(ctx, plain); err != nil {
+		t.Fatalf("publish plain: %v", err)
+	}
+	entries, err = cli.XRange(ctx, e.stream, "-", "+").Result()
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("XRange = %d entries (err %v), want 2", len(entries), err)
+	}
+	plainValues := entries[1].Values
+	if len(plainValues) != 1 {
+		t.Errorf("untraced entry has fields %v, want only event", plainValues)
+	}
+	if _, ok := plainValues["traceparent"]; ok {
+		t.Error("untraced entry carries a traceparent field")
+	}
+}
+
+func mustTraceID(t *testing.T, hex string) oteltrace.TraceID {
+	t.Helper()
+	id, err := oteltrace.TraceIDFromHex(hex)
+	if err != nil {
+		t.Fatalf("trace id %q: %v", hex, err)
+	}
+	return id
+}
+
+func mustSpanID(t *testing.T, hex string) oteltrace.SpanID {
+	t.Helper()
+	id, err := oteltrace.SpanIDFromHex(hex)
+	if err != nil {
+		t.Fatalf("span id %q: %v", hex, err)
+	}
+	return id
 }

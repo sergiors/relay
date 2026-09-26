@@ -2,13 +2,16 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"relay/internal/observability/tracing"
 )
@@ -127,4 +130,64 @@ func attrString(span tracetest.SpanStub, key string) string {
 		}
 	}
 	return ""
+}
+
+// TestEncodeInvokeRequestCarriesTraceFrame proves the request frame injects the
+// current trace context under the single optional "trace" object (the W3C
+// traceparent/tracestate/baggage keys), leaves the event payload verbatim, and
+// omits the whole object when there is no trace context. It also proves the
+// frame decodes back to the same carrier for a container-side propagator.
+func TestEncodeInvokeRequestCarriesTraceFrame(t *testing.T) {
+	withSpanRecorder(t)
+	ctx, span := tracing.Start(context.Background(), "function.invoke")
+	defer span.End()
+
+	const event = `{"event_name":"INSERT","new_image":{"id":1}}`
+	frame, err := encodeInvokeRequest(ctx, "req-1", "index.handler", []byte(event), map[string]string{"K": "V"})
+	if err != nil {
+		t.Fatalf("encodeInvokeRequest: %v", err)
+	}
+
+	var decoded struct {
+		ID      string            `json:"id"`
+		Handler string            `json:"handler"`
+		Event   json.RawMessage   `json:"event"`
+		Env     map[string]string `json:"env"`
+		Trace   map[string]string `json:"trace"`
+	}
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if decoded.ID != "req-1" || decoded.Handler != "index.handler" {
+		t.Errorf("identity = (%q, %q), want (req-1, index.handler)", decoded.ID, decoded.Handler)
+	}
+	if string(decoded.Event) != event {
+		t.Errorf("event = %s, want verbatim %s", decoded.Event, event)
+	}
+	if decoded.Env["K"] != "V" {
+		t.Errorf("env = %v, want K=V", decoded.Env)
+	}
+	// The trace object carries the invocation span's trace id as a valid
+	// traceparent, and the decoded object can be extracted by a propagator.
+	if got := decoded.Trace[tracing.TraceparentKey]; got == "" {
+		t.Fatalf("trace object missing traceparent: %v", decoded.Trace)
+	}
+	extracted := tracing.ExtractStrings(context.Background(), decoded.Trace)
+	if got := oteltrace.SpanContextFromContext(extracted).TraceID(); got != span.SpanContext().TraceID() {
+		t.Errorf("extracted trace id = %s, want %s", got, span.SpanContext().TraceID())
+	}
+}
+
+// TestEncodeInvokeRequestOmitsTraceWithoutContext proves the frame is
+// byte-compatible when tracing is disabled or the context carries no recording
+// span: the "trace" key is absent, so a bootstrap that ignores it cannot tell
+// the difference from the pre-tracing frame shape.
+func TestEncodeInvokeRequestOmitsTraceWithoutContext(t *testing.T) {
+	frame, err := encodeInvokeRequest(context.Background(), "req-2", "h", []byte(`{}`), nil)
+	if err != nil {
+		t.Fatalf("encodeInvokeRequest: %v", err)
+	}
+	if strings.Contains(string(frame), `"trace"`) {
+		t.Fatalf("frame with no trace context carries a trace field: %s", frame)
+	}
 }

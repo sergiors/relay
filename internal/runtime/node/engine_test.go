@@ -46,8 +46,8 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if !p.Deps.IsZero() {
 				t.Errorf("expected zero Deps without package files, got %+v", p.Deps)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("expected no build-step install without package files, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+				t.Errorf("expected the managed OTel API install, got %v", p.Install)
 			}
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" {
 				t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs]", p.Entrypoint)
@@ -104,8 +104,8 @@ func TestPlanWithPackageJSONOnly(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+				t.Errorf("expected the managed OTel API install, got %v", p.Install)
 			}
 			want := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
 			if !p.Deps.Equal(want) {
@@ -135,8 +135,8 @@ func TestPlanWithLock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+				t.Errorf("expected the managed OTel API install, got %v", p.Install)
 			}
 			// Both the lock and the manifest are listed so a lock change (a
 			// different pinned tree) re-fingerprints the layer even when the
@@ -229,15 +229,17 @@ func specByName(t *testing.T, name string) plan.Spec {
 	return plan.Spec{}
 }
 
-// requireInstall returns the single Install command, failing when the count is
-// not exactly one: every TypeScript function must produce exactly ONE combined
-// RUN so esbuild is installed once regardless of handler count.
+// requireInstall returns the TypeScript build command. The managed API install
+// is intentionally a separate runtime dependency step.
 func requireInstall(t *testing.T, p plan.BuildPlan) string {
 	t.Helper()
-	if len(p.Install) != 1 {
-		t.Fatalf("Install = %v, want exactly one combined command", p.Install)
+	for _, cmd := range p.Install {
+		if strings.Contains(cmd, "esbuild@") {
+			return cmd
+		}
 	}
-	return p.Install[0]
+	t.Fatalf("Install = %v, want an esbuild command", p.Install)
+	return ""
 }
 
 // TestPlanJSHandlersNoBuild asserts the JavaScript path is untouched: a .js
@@ -256,8 +258,8 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 				if err != nil {
 					t.Fatalf("plan(%v): %v", handlers, err)
 				}
-				if len(p.Install) != 0 {
-					t.Errorf("handlers %v: Install = %v, want none for JS", handlers, p.Install)
+				if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+					t.Errorf("handlers %v: Install = %v, want the managed OTel API install", handlers, p.Install)
 				}
 				if !p.Deps.IsZero() {
 					t.Errorf("handlers %v: Deps = %+v, want zero", handlers, p.Deps)
@@ -423,8 +425,8 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("JS-only resolution must produce no Install, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+				t.Errorf("JS-only resolution must produce the managed OTel API install, got %v", p.Install)
 			}
 		})
 	}

@@ -752,6 +752,17 @@ func (c *Consumer) processMessage(
 	// terminal path below by the single deferred finalizer. It never carries the
 	// event payload. outcome defaults to "pending" (left in the PEL for retry)
 	// and is set to a more specific terminal value where one applies.
+	//
+	// W3C trace context carried as flat message metadata (traceparent/
+	// tracestate/baggage, written beside the untouched event payload by the
+	// schedule publisher or any trace-aware producer) is extracted FIRST, so the
+	// message span becomes a child of the publishing span (remote parent) and
+	// the whole stream → dispatch → function.invoke chain shares one trace. An
+	// ordinary external event (no metadata fields) is unaffected: extraction is
+	// a no-op and the span is a root.
+	if carrier := traceCarrierFromMessage(msg.Values); len(carrier) != 0 {
+		ctx = tracing.ExtractStrings(ctx, carrier)
+	}
 	spanCtx, span := c.messageSpan(ctx, "stream.message", deliveryNum)
 	outcome := "pending"
 	var spanErr error

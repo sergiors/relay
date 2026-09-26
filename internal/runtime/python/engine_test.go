@@ -65,8 +65,8 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if !p.Deps.IsZero() {
 				t.Errorf("expected zero Deps without a manifest, got %+v", p.Deps)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("expected no build-step install without a manifest, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "opentelemetry-api") {
+				t.Errorf("expected the managed OTel API install, got %v", p.Install)
 			}
 			wantEntry := []string{"python", "-u", "/relay/bootstrap.py"}
 			if len(p.Entrypoint) != len(wantEntry) {
@@ -123,8 +123,8 @@ func TestPlanWithRequirements(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 0 {
-				t.Errorf("expected the dependency install to move out of Install into Deps, got %v", p.Install)
+			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "opentelemetry-api") {
+				t.Errorf("expected only the managed OTel API install, got %v", p.Install)
 			}
 			want := plan.Deps{
 				Files:   []string{"requirements.txt"},
@@ -274,5 +274,39 @@ func TestPlanRequirementsOnlyInstallUsesUv(t *testing.T) {
 	}
 	if !strings.Contains(p.Deps.Install, "--system") {
 		t.Errorf("requirements install must target the system environment, got %q", p.Deps.Install)
+	}
+}
+
+// TestPlanInstallsManagedOtelAPI pins the trace-propagation build change: every
+// Python function image installs the OpenTelemetry API with uv into the system
+// environment (where the bootstrap and any user SDK resolve it), the spec is
+// shell-safe (a range, unlike Node's exact pin, because the Python API version
+// is coupled to the user's SDK), and the install stays OUT of the reusable
+// dependency layer so it never perturbs the dependency fingerprint.
+func TestPlanInstallsManagedOtelAPI(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "requirements.txt", "six==1.16.0\n")
+
+	p, err := Engine{}.Plan(testSpecs[0], dir, nil)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.Install) != 1 {
+		t.Fatalf("Install = %v, want exactly the managed OTel API install", p.Install)
+	}
+	cmd := p.Install[0]
+	if !strings.HasPrefix(cmd, "uv pip install --system") {
+		t.Errorf("managed install must use uv --system, got %q", cmd)
+	}
+	if !strings.Contains(cmd, "opentelemetry-api") {
+		t.Errorf("managed install must install the OpenTelemetry API, got %q", cmd)
+	}
+	// The version range's < and > would be shell redirection if unquoted.
+	if !strings.Contains(cmd, "'opentelemetry-api") {
+		t.Errorf("managed install spec must be single-quoted, got %q", cmd)
+	}
+	// It is a build step, not a reusable dependency: Deps stays the user's.
+	if strings.Contains(p.Deps.Install, "opentelemetry") {
+		t.Errorf("managed OTel install must not enter the dependency layer, got %q", p.Deps.Install)
 	}
 }

@@ -48,6 +48,10 @@ const tsconfigFile = "tsconfig.json"
 // a binary from (ghcr.io/evanw/esbuild does not exist).
 const esbuildVersion = "0.28.2"
 
+// The bootstrap and user instrumentation must resolve the same API singleton
+// from /app so a user-installed SDK observes the managed invocation context.
+const otelAPIVersion = "1.9.0"
+
 // Ephemeral build-tooling paths. Both live under /tmp and are created AND
 // removed in the same RUN, so neither the pinned esbuild nor its npm cache ever
 // becomes part of the execution image.
@@ -175,8 +179,9 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		return plan.BuildPlan{}, err
 	}
 	var install []string
+	install = append(install, "npm install --omit=dev --no-save @opentelemetry/api@"+otelAPIVersion)
 	if len(tsSources) > 0 {
-		install = []string{esbuildCommand(spec.Name, tsSources, fileExists(fnDir, tsconfigFile))}
+		install = append(install, esbuildCommand(spec.Name, tsSources, fileExists(fnDir, tsconfigFile)))
 	}
 
 	return plan.BuildPlan{

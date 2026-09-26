@@ -24,6 +24,12 @@
 
 import { statSync } from "node:fs";
 import * as readline from "node:readline";
+import { createRequire } from "node:module";
+
+// Resolve from /app so the bootstrap and user modules share one API singleton.
+const { context, propagation } = createRequire("/app/package.json")(
+  "@opentelemetry/api",
+);
 
 // Must match the Relay-side constant "@@RELAY@@" (internal/runtime/protocol.go).
 const SENTINEL = "@@RELAY@@";
@@ -139,7 +145,11 @@ async function handle(line) {
       );
     }
 
-    await fn(req.event ?? null);
+    // Extract and install the remote context only for this handler promise.
+    // context.with restores the warm process's previous context on both
+    // resolution and rejection, so one invocation cannot leak into the next.
+    const parent = propagation.extract(context.active(), req.trace ?? {});
+    await context.with(parent, () => fn(req.event ?? null));
   } catch (e) {
     // Module resolution, import errors, and handler errors are all
     // invocation failures (ok:false): the container stays healthy.

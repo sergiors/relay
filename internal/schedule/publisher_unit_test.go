@@ -7,8 +7,13 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"relay/internal/observability/metrics"
+	"relay/internal/observability/tracing"
 	"relay/internal/testutil"
 )
 
@@ -136,7 +141,10 @@ func TestPublishOccurrenceEnvelopeErrorIncrementsFailure(t *testing.T) {
 
 // TestPublishOccurrencePassesExpectedScriptArgs pins the arguments handed to the
 // atomic script: KEYS = [dedupKey, stream] and ARGV = [occurrence ID, TTL ms,
-// envelope JSON]. A change here would break the Lua script's key contract.
+// envelope JSON, traceparent, tracestate, baggage]. With no trace context the
+// three carrier arguments are empty strings (the script omits empty fields), so
+// the stream entry is identical to before. A change here would break the Lua
+// script's key/arg contract.
 func TestPublishOccurrencePassesExpectedScriptArgs(t *testing.T) {
 	m := metrics.New()
 	p := newUnitPublisher(t, m, 1, nil)
@@ -162,8 +170,8 @@ func TestPublishOccurrencePassesExpectedScriptArgs(t *testing.T) {
 			t.Errorf("keys[%d] = %q, want %q", i, gotKeys[i], wantKeys[i])
 		}
 	}
-	if len(gotArgs) != 3 {
-		t.Fatalf("args = %v, want 3 (id, ttl ms, envelope)", gotArgs)
+	if len(gotArgs) != 6 {
+		t.Fatalf("args = %v, want 6 (id, ttl ms, envelope, traceparent, tracestate, baggage)", gotArgs)
 	}
 	if gotArgs[0] != o.ID() {
 		t.Errorf("args[0] = %v, want occurrence ID %q", gotArgs[0], o.ID())
@@ -178,7 +186,123 @@ func TestPublishOccurrencePassesExpectedScriptArgs(t *testing.T) {
 	if gotArgs[2] != string(env) {
 		t.Errorf("args[2] = %v, want envelope %s", gotArgs[2], env)
 	}
+	for i, want := range []any{"", "", ""} {
+		if gotArgs[3+i] != want {
+			t.Errorf("args[%d] = %v, want empty trace field with tracing disabled", 3+i, gotArgs[3+i])
+		}
+	}
 }
 
 // fixedInstant is a deterministic, second-aligned scheduled instant.
 var fixedInstant = time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+
+// withSpanRecorder installs an SDK provider backed by an in-memory exporter
+// through the production Setup seam, restoring the globals on cleanup. The
+// schedule package's tests do not run in parallel, so the global swap is
+// race-free within the package.
+func withSpanRecorder(t *testing.T) (*tracetest.InMemoryExporter, *tracing.Provider) {
+	t.Helper()
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	prev := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	exp := tracetest.NewInMemoryExporter()
+	provider, err := tracing.Setup(context.Background(), testutil.DiscardLogger(), tracing.WithExporter(exp))
+	if err != nil {
+		t.Fatalf("tracing.Setup: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(prev)
+		otel.SetTextMapPropagator(prevProp)
+	})
+	return exp, provider
+}
+
+// TestPublishOccurrenceInjectsTraceContext proves the schedule publisher starts a
+// `schedule.publish` span and renders its trace context into the flat Redis
+// fields handed to the atomic script (traceparent/tracestate/baggage), so the
+// stream consumer continues the same trace. It also proves the event envelope is
+// still passed through verbatim.
+func TestPublishOccurrenceInjectsTraceContext(t *testing.T) {
+	exp, provider := withSpanRecorder(t)
+
+	// A known remote parent so the injected traceparent is deterministic.
+	remoteTraceparent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	remoteTraceID, _ := oteltrace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	remoteSpanID, _ := oteltrace.SpanIDFromHex("00f067aa0ba902b7")
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: remoteTraceID, SpanID: remoteSpanID, TraceFlags: oteltrace.FlagsSampled, Remote: true,
+	})
+	ctx := oteltrace.ContextWithRemoteSpanContext(context.Background(), sc)
+
+	m := metrics.New()
+	p := newUnitPublisher(t, m, 1, nil)
+	o := unitOccurrence()
+	var gotArgs []any
+	p.runScript = func(_ context.Context, _ redis.Scripter, _ []string, args ...any) (int, error) {
+		gotArgs = args
+		return 1, nil
+	}
+
+	if _, err := p.PublishOccurrence(ctx, o); err != nil {
+		t.Fatalf("PublishOccurrence: %v", err)
+	}
+	if len(gotArgs) != 6 {
+		t.Fatalf("args = %v, want 6", gotArgs)
+	}
+	if gotArgs[3] == "" || gotArgs[3] == remoteTraceparent {
+		// The injected traceparent is for schedule.publish (a child of the remote
+		// parent), so it must be present and carry the remote TRACE id, not equal
+		// the remote span's own traceparent.
+		t.Errorf("args[3] (traceparent) = %v, want a schedule.publish traceparent", gotArgs[3])
+	}
+	env, _ := o.Envelope()
+	if gotArgs[2] != string(env) {
+		t.Errorf("args[2] = %v, want the verbatim envelope", gotArgs[2])
+	}
+
+	// The schedule.publish span must be exported as a child of the remote parent.
+	if err := provider.ForceFlush(context.Background()); err != nil {
+		t.Fatalf("ForceFlush: %v", err)
+	}
+	spans := exp.GetSpans()
+	var publish *tracetest.SpanStub
+	for i := range spans {
+		if spans[i].Name == "schedule.publish" {
+			publish = &spans[i]
+		}
+	}
+	if publish == nil {
+		t.Fatalf("no schedule.publish span; got %v", spans)
+	}
+	if publish.SpanContext.TraceID() != remoteTraceID {
+		t.Errorf("schedule.publish trace id = %s, want remote %s", publish.SpanContext.TraceID(), remoteTraceID)
+	}
+	if publish.Parent.SpanID() != remoteSpanID {
+		t.Errorf("schedule.publish parent = %s, want remote %s", publish.Parent.SpanID(), remoteSpanID)
+	}
+}
+
+// TestPublishOccurrenceWithoutTraceContextLeavesNoMetadata proves that with no
+// recording span the three carrier arguments are empty strings, so the script
+// omits the trace fields and the stream entry stays identical to the
+// pre-tracing shape.
+func TestPublishOccurrenceWithoutTraceContextLeavesNoMetadata(t *testing.T) {
+	prev := otel.GetTracerProvider()
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	otel.SetTracerProvider(noop.NewTracerProvider())
+
+	m := metrics.New()
+	p := newUnitPublisher(t, m, 1, nil)
+	var gotArgs []any
+	p.runScript = func(_ context.Context, _ redis.Scripter, _ []string, args ...any) (int, error) {
+		gotArgs = args
+		return 1, nil
+	}
+	if _, err := p.PublishOccurrence(context.Background(), unitOccurrence()); err != nil {
+		t.Fatalf("PublishOccurrence: %v", err)
+	}
+	if len(gotArgs) != 6 || gotArgs[3] != "" || gotArgs[4] != "" || gotArgs[5] != "" {
+		t.Fatalf("args = %v, want empty trace fields with tracing disabled", gotArgs)
+	}
+}

@@ -66,14 +66,23 @@ import (
 // is a stable, low-cardinality identifier (never a function name).
 const tracerName = "relay"
 
-// TraceparentKey is the W3C trace-context header name. It is exported so a
-// future cross-process boundary can name the exact field to carry without
-// re-deriving the convention. See InjectMap/ExtractMap for the propagation
-// seam: Relay deliberately does not add the field to the execution-container
-// invocation protocol today (the bootstraps are language-specific and would
-// ignore it), but a later revision can inject the header into a frame field and
-// extract it on the container side without touching this package.
-const TraceparentKey = "traceparent"
+// The W3C trace-context field names. They are the exact header names the
+// installed propagator reads and writes, exported so every cross-process
+// boundary in Relay names the same fields without re-deriving the convention:
+//
+//   - a Redis stream message carries them as flat, optional fields next to the
+//     untouched "event" payload (Redis stream entries are a flat string map,
+//     and flat fields stay directly inspectable with redis-cli), and
+//   - the execution-container invocation frame carries them nested under the
+//     single optional "trace" JSON object (see runtime.invokeRequest).
+//
+// See InjectMap/ExtractMap, CarrierFromContext, and ExtractStrings for the
+// propagation seam.
+const (
+	TraceparentKey = "traceparent"
+	TracestateKey  = "tracestate"
+	BaggageKey     = "baggage"
+)
 
 // DefaultServiceName is used when neither WithServiceName nor OTEL_SERVICE_NAME
 // provides a service.name.
@@ -405,10 +414,11 @@ func Start(ctx context.Context, name string, opts ...trace.SpanStartOption) (con
 }
 
 // InjectMap injects the current trace context into carrier using the global W3C
-// propagator. It is the seam for a future cross-process boundary (e.g. the
-// execution-container invocation frame): a caller renders the carrier to a
-// field and a consumer runs ExtractMap on the receiving side. It never leaks
-// payload data — only the W3C traceparent/tracestate/baggage headers.
+// propagator. It is the seam for a cross-process boundary (e.g. the
+// execution-container invocation frame or a Redis stream message): a caller
+// renders the carrier to a field and a consumer runs ExtractMap on the
+// receiving side. It never leaks payload data — only the W3C
+// traceparent/tracestate/baggage headers.
 func InjectMap(ctx context.Context, carrier propagation.MapCarrier) {
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 }
@@ -418,6 +428,36 @@ func InjectMap(ctx context.Context, carrier propagation.MapCarrier) {
 // parent. It is the counterpart of InjectMap.
 func ExtractMap(ctx context.Context, carrier propagation.MapCarrier) context.Context {
 	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
+// CarrierFromContext renders the current trace context to a plain
+// map[string]string using the global W3C propagator. It returns nil when there
+// is nothing to carry (no recording/remote span context), so a caller can omit
+// an empty carrier from a wire frame or a stream message instead of emitting an
+// empty object. An empty-but-non-nil carrier is impossible: the propagator only
+// sets a field when it has a value.
+//
+// The map is a plain map (not propagation.MapCarrier) because its consumers are
+// wire/stream field maps, not propagator carriers; convert with
+// propagation.MapCarrier when extracting.
+func CarrierFromContext(ctx context.Context) map[string]string {
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	if len(carrier) == 0 {
+		return nil
+	}
+	return carrier
+}
+
+// ExtractStrings extracts a remote trace context from a plain map[string]string
+// (a stream message's flat fields or a decoded frame field). It is the
+// counterpart of CarrierFromContext and is a no-op (returns ctx unchanged) for
+// a nil/empty map or a carrier with no valid trace context.
+func ExtractStrings(ctx context.Context, carrier map[string]string) context.Context {
+	if len(carrier) == 0 {
+		return ctx
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(carrier))
 }
 
 // sdkDisabled reports whether OTEL_SDK_DISABLED requests the standard opt-out.

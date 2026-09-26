@@ -49,15 +49,37 @@ const (
 	exportedRequirements = "/tmp/uv-requirements.txt"
 )
 
+// otelAPIFloor is the managed OpenTelemetry API installed into every Python
+// runtime image (see otelInstall). It is a floor RANGE rather than an exact pin
+// on purpose: unlike Node's standalone @opentelemetry/api, the Python API
+// version is coupled to the user's opentelemetry-sdk version, so an exact pin
+// would silently replace a matching API and leave the SDK paired with a
+// mismatched one. The floor is the first release that imports without
+// `pkg_resources` (gone from python:3.14-slim), which the bootstrap's
+// context/propagate imports need; the <2 cap refuses a future major Relay has
+// not validated. When a user SDK already installed a satisfying API, uv keeps
+// it and Relay never downgrades it.
+const otelAPIFloor = "opentelemetry-api>=1.16,<2"
+
 // install commands (run inside the dependency image, after uv has been copied
-// in). Both install into the SYSTEM site-packages (--system) so the existing
-// `python -u /relay/bootstrap.py` entrypoint sees the packages; no project-local
-// .venv is created, keeping runtime execution and the dependency image's
-// FROM-inheritance unchanged.
+// in). The dependency installs land in the SYSTEM site-packages (--system) so
+// the existing `python -u /relay/bootstrap.py` entrypoint sees the packages; no
+// project-local .venv is created, keeping runtime execution and the dependency
+// image's FROM-inheritance unchanged.
 const (
 	// requirementsInstall installs a plain requirements.txt with uv's pip
 	// interface. --no-cache keeps the layer small.
 	requirementsInstall = "uv pip install --system --no-cache -r " + requirementsFile
+
+	// otelInstall installs the managed OpenTelemetry API into the function
+	// image's system site-packages (the same environment the bootstrap and any
+	// user-installed SDK resolve from). The spec is single-quoted because the
+	// version range's < and > are shell redirection operators. It runs in the
+	// function image (not the shared dependency layer) so it never enters the
+	// content-addressed dependency fingerprint; being a build Install command,
+	// it is covered by the relay.bootstrap label, so images pick it up on the
+	// next reconcile.
+	otelInstall = "uv pip install --system --no-cache '" + otelAPIFloor + "'"
 
 	// nativeInstall exports the locked dependency set from the native uv project
 	// and installs it, without re-resolving: `--locked` asserts the committed
@@ -121,11 +143,20 @@ func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, er
 		return plan.BuildPlan{}, err
 	}
 
+	// The managed OpenTelemetry API is installed in the FUNCTION image (not the
+	// shared dependency layer): it must be present in every runtime even when
+	// the function declares no dependencies, and keeping it out of Deps leaves
+	// the content-addressed dependency fingerprint untouched. It runs after the
+	// dependency image's FROM has already provided the user's packages, so a
+	// user SDK that pinned its own matching API is not disturbed (see
+	// otelAPIFloor). uv is available: the no-deps function image copies it as a
+	// tool, and a deps function image inherits it from the dependency base.
 	return plan.BuildPlan{
 		BaseImage:  spec.BaseImage,
 		WorkDir:    workDir,
 		Files:      files,
 		Deps:       deps,
+		Install:    []string{otelInstall},
 		ToolCopies: spec.ToolCopies,
 		UserSetup:  userSetup,
 		User:       userID,

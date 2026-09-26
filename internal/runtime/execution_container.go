@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -377,12 +376,11 @@ func (c *executionContainer) Invoke(ctx context.Context, handler string, eventJS
 	c.demux.setPending(id, respCh)
 	defer c.demux.clearPending()
 
-	frame, err := json.Marshal(invokeRequest{
-		ID:      id,
-		Handler: handler,
-		Event:   json.RawMessage(eventJSON),
-		Env:     env,
-	})
+	// The request frame carries the invocation identity, the verbatim event
+	// payload, the per-invocation env, and the optional W3C trace carrier
+	// (see encodeInvokeRequest) so a container-side propagator can parent its
+	// spans to this invocation.
+	frame, err := encodeInvokeRequest(ctx, id, handler, eventJSON, env)
 	if err != nil {
 		// Event JSON is always marshalled by the runner before reaching here;
 		// a failure is a bug in the caller's contract, not container state.

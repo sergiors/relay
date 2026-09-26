@@ -208,6 +208,62 @@ func TestSetupInjectsW3CPropagator(t *testing.T) {
 	}
 }
 
+// TestCarrierFromContextAndExtractStrings proves the plain-map carrier seam used
+// at Relay's non-carrier boundaries (a Redis stream message's flat fields and the
+// invocation frame's decoded "trace" object): CarrierFromContext renders the
+// current span as a plain map, ExtractStrings reconstructs the remote parent,
+// and an empty/absent carrier is a no-op (nil map, unchanged context).
+func TestCarrierFromContextAndExtractStrings(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	if _, err := Setup(context.Background(), discard()); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	traceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	spanID, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	carrier := CarrierFromContext(ctx)
+	if carrier == nil {
+		t.Fatal("CarrierFromContext = nil, want a carrier with a valid span context")
+	}
+	if got := carrier[TraceparentKey]; got != "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" {
+		t.Fatalf("carrier traceparent = %q, want the W3C header", got)
+	}
+
+	// The plain map round-trips back to the same trace id.
+	extracted := ExtractStrings(context.Background(), carrier)
+	if got := trace.SpanContextFromContext(extracted); got.TraceID() != traceID {
+		t.Fatalf("extracted trace id = %s, want %s", got.TraceID(), traceID)
+	}
+
+	// No span context: nothing to carry, so the carrier is nil.
+	if got := CarrierFromContext(context.Background()); got != nil {
+		t.Fatalf("CarrierFromContext(no span) = %v, want nil", got)
+	}
+	// Empty carrier extraction is a no-op that preserves the incoming context.
+	if got := trace.SpanContextFromContext(ExtractStrings(ctx, nil)); got.TraceID() != traceID {
+		t.Fatalf("ExtractStrings(nil) trace id = %s, want unchanged %s", got.TraceID(), traceID)
+	}
+}
+
+// TestCarrierKeysAreTheW3CHeaderNames pins the exported field-name constants to
+// the exact W3C header strings, so a Redis field or frame key derived from them
+// can never drift from what the propagator writes.
+func TestCarrierKeysAreTheW3CHeaderNames(t *testing.T) {
+	if TraceparentKey != "traceparent" || TracestateKey != "tracestate" || BaggageKey != "baggage" {
+		t.Fatalf("carrier keys = (%q, %q, %q), want the W3C header names",
+			TraceparentKey, TracestateKey, BaggageKey)
+	}
+}
+
 // TestSetupWithExporterRecordsSpansAndParent proves the enabled path end to end:
 // an injected in-memory exporter captures spans, a parent context produces a
 // child span with the parent's trace id, and error recording sets codes.Error.

@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"relay/internal/observability/tracing"
@@ -130,6 +131,105 @@ func TestProcessMessageEmitsStreamSpanWithContext(t *testing.T) {
 	}
 	if !sawChildOfDispatch {
 		t.Error("handler context carries no recording span; trace context did not reach the handler")
+	}
+}
+
+// TestProcessMessageExtractsTraceMetadataAsRemoteParent proves that flat W3C
+// trace metadata carried beside the event payload (traceparent/tracestate/
+// baggage, as the schedule publisher writes) is extracted BEFORE the
+// stream.message span: the span becomes a child of the remote parent (same trace
+// id, remote parent span id) and the event payload is still delivered untouched.
+func TestProcessMessageExtractsTraceMetadataAsRemoteParent(t *testing.T) {
+	rec := withSpanRecorder(t)
+	c := processMessageConsumer(newFakeInvocationStore(nil))
+
+	// A known remote parent: trace id 4bf92f... / span id 00f067....
+	const remoteTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	remoteTraceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	remoteSpanID, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+
+	const payload = `{"event_name":"X","new_image":{"id":7}}`
+	var gotEvent map[string]any
+	handler := func(_ context.Context, _ string, event map[string]any) error {
+		gotEvent = event
+		return errors.New("retryable failure")
+	}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{
+		"event":       payload,
+		"traceparent": remoteTraceparent,
+		"tracestate":  "vendor=opaque",
+		"baggage":     "k=v",
+	}}
+	c.processMessage(context.Background(), msg, 1, handler)
+
+	streamSpan := spanByName(t, rec, "stream.message")
+	if streamSpan.SpanContext.TraceID() != remoteTraceID {
+		t.Errorf("stream.message trace id = %s, want remote %s", streamSpan.SpanContext.TraceID(), remoteTraceID)
+	}
+	if streamSpan.Parent.SpanID() != remoteSpanID {
+		t.Errorf("stream.message parent span id = %s, want remote %s", streamSpan.Parent.SpanID(), remoteSpanID)
+	}
+	if !streamSpan.Parent.IsRemote() {
+		t.Error("stream.message parent is not marked remote; trace metadata was not extracted")
+	}
+
+	// The event payload must be delivered verbatim; trace metadata never leaks
+	// into the handler's event map.
+	if gotEvent == nil {
+		t.Fatal("handler received no event")
+	}
+	if gotEvent["event_name"] != "X" {
+		t.Errorf("event_name = %v, want X", gotEvent["event_name"])
+	}
+	if _, leaked := gotEvent["traceparent"]; leaked {
+		t.Error("traceparent leaked into the event payload")
+	}
+}
+
+// TestProcessMessageWithoutTraceMetadataIsRoot proves an ordinary external event
+// (no trace fields) yields a root stream.message span: extraction is a no-op and
+// no remote parent is attached. This is the default path for non-schedule
+// producers (e.g. a raw `redis-cli XADD ... event '...'`).
+func TestProcessMessageWithoutTraceMetadataIsRoot(t *testing.T) {
+	rec := withSpanRecorder(t)
+	c := processMessageConsumer(newFakeInvocationStore(nil))
+
+	handler := func(context.Context, string, map[string]any) error {
+		return errors.New("retryable failure")
+	}
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{"event": `{"event_name":"X"}`}}
+	c.processMessage(context.Background(), msg, 1, handler)
+
+	streamSpan := spanByName(t, rec, "stream.message")
+	if streamSpan.Parent.IsValid() {
+		t.Errorf("stream.message has remote parent %s, want a root span", streamSpan.Parent.SpanID())
+	}
+}
+
+// TestTraceCarrierFromMessageIgnoresNonStringAndEmpty proves the field mapper
+// only takes non-empty string values under the exact W3C keys, so a malformed or
+// unrelated field can never fabricate a carrier (and the "event" payload is
+// never consulted).
+func TestTraceCarrierFromMessageIgnoresNonStringAndEmpty(t *testing.T) {
+	got := traceCarrierFromMessage(map[string]any{
+		"event":       `{"event_name":"X"}`,
+		"traceparent": 123, // non-string
+		"tracestate":  "",  // empty
+		"unrelated":   "x",
+	})
+	if got != nil {
+		t.Fatalf("traceCarrierFromMessage = %v, want nil", got)
+	}
+
+	got = traceCarrierFromMessage(map[string]any{
+		"event":       `{"event_name":"X"}`,
+		"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+	})
+	if got == nil || got[tracing.TraceparentKey] == "" {
+		t.Fatalf("traceCarrierFromMessage = %v, want the traceparent field", got)
+	}
+	if _, ok := got["event"]; ok {
+		t.Error("traceCarrierFromMessage copied the event payload into the carrier")
 	}
 }
 

@@ -1,8 +1,11 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
+
+	"relay/internal/observability/tracing"
 )
 
 // The persistent invocation protocol. Execution containers are
@@ -48,19 +51,63 @@ const (
 // single JSON line. Event is the raw event JSON passed through verbatim
 // (json.RawMessage), so Relay never re-encodes or mutates the payload.
 //
-// Future trace propagation seam: the frame deliberately carries no trace
-// context today, because the Python and Node bootstraps would ignore an unknown
-// field and adding one is a cross-language protocol change. When distribution
-// is wanted, tracing.InjectMap(ctx, carrier) renders the W3C traceparent header
-// (tracing.TraceparentKey) into a carrier; a new optional `traceparent` string
-// field here (omitempty, so the wire stays byte-compatible for existing
-// bootstraps) plus tracing.ExtractMap on the container side would carry it end
-// to end without touching span creation.
+// Trace is the optional W3C trace-context carrier (traceparent/tracestate/
+// baggage) injected from the invocation's context under the single "trace"
+// object field. It is omitempty, so a byte-compatible frame is written when
+// there is no trace context (tracing disabled, or no recording span): existing
+// bootstraps that do not read "trace" are unaffected, and the Python bootstrap
+// simply ignores the unknown field until it opts in. The Node bootstrap already
+// extracts it via propagation.extract(context.active(), req.trace ?? {}).
 type invokeRequest struct {
 	ID      string            `json:"id"`
 	Handler string            `json:"handler"`
 	Event   json.RawMessage   `json:"event"`
 	Env     map[string]string `json:"env"`
+	Trace   *traceFrame       `json:"trace,omitempty"`
+}
+
+// traceFrame is the W3C trace-context carrier nested under the request frame's
+// "trace" field. It deliberately uses the exact header names as JSON keys so the
+// container side can hand the object to its propagator directly (the Node
+// bootstrap does exactly this). It is a pointer so an absent context omits the
+// whole object rather than emitting empty fields.
+type traceFrame struct {
+	Traceparent string `json:"traceparent,omitempty"`
+	Tracestate  string `json:"tracestate,omitempty"`
+	Baggage     string `json:"baggage,omitempty"`
+}
+
+// newTraceFrame renders the current trace context into the request-frame "trace"
+// object, or returns nil when there is nothing to carry (tracing disabled, or a
+// context with no recording span). It is the Go-side injection point for the
+// execution-container boundary; the carrier convention lives in the tracing
+// package so the frame and the stream message never disagree on field names.
+func newTraceFrame(ctx context.Context) *traceFrame {
+	carrier := tracing.CarrierFromContext(ctx)
+	if len(carrier) == 0 {
+		return nil
+	}
+	return &traceFrame{
+		Traceparent: carrier[tracing.TraceparentKey],
+		Tracestate:  carrier[tracing.TracestateKey],
+		Baggage:     carrier[tracing.BaggageKey],
+	}
+}
+
+// encodeInvokeRequest renders one request frame (without the trailing newline)
+// from the invocation identity, the verbatim event payload, the per-invocation
+// env, and the trace context carried by ctx. The event JSON is passed through
+// untouched (json.RawMessage) and the trace object is omitted when ctx carries
+// no trace context, keeping the frame byte-compatible for bootstraps that never
+// read it.
+func encodeInvokeRequest(ctx context.Context, id, handler string, eventJSON []byte, env map[string]string) ([]byte, error) {
+	return json.Marshal(invokeRequest{
+		ID:      id,
+		Handler: handler,
+		Event:   json.RawMessage(eventJSON),
+		Env:     env,
+		Trace:   newTraceFrame(ctx),
+	})
 }
 
 // invokeResponse is one response frame line the bootstrap writes on stdout.

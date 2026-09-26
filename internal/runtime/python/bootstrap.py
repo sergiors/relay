@@ -4,7 +4,9 @@ One execution container per function STAYS ALIVE between invocations and serves
 a persistent, line-delimited JSON protocol on stdin/stdout (see
 internal/runtime/protocol.go in the Relay source):
 
-  Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>, "env":{"K":"V"}}
+  Relay -> stdin:  {"id":"<hex>","handler":"mod.func","event":<raw>,
+                    "env":{"K":"V"},
+                    "trace":{"traceparent":"...","tracestate":"...","baggage":"..."}}
   stdout:          @@RELAY@@{"id":"<id>","ok":true}
                    @@RELAY@@{"id":"<id>","ok":false,"error":"..."}
 
@@ -21,6 +23,19 @@ Process-model notes (intended semantics, not a bug):
     a client, a connection) persists across invocations. Per-request env values
     are applied to os.environ and likewise persist across invocations: a value
     set for one invocation remains visible to later ones unless overwritten.
+  - The optional "trace" object carries the W3C trace context Relay injected for
+    this invocation. It is extracted and attached ONLY around the one handler
+    call and always detached afterwards, so one invocation's context never leaks
+    into the next despite the warm interpreter (see invoke()).
+
+Trace propagation:
+  The runtime image installs the OpenTelemetry API (see the Python engine's
+  managed install). The bootstrap extracts the incoming carrier with the global
+  W3C propagator and attaches it for the handler call, so a user-installed OTel
+  SDK resolves the SAME global context and creates child spans under Relay's
+  invocation span. The handler signature stays func(event): the context is
+  ambient, never an argument. The import is guarded so a bare interpreter
+  without the API simply skips propagation instead of failing.
 """
 
 import asyncio
@@ -29,6 +44,16 @@ import inspect
 import json
 import os
 import sys
+
+# OpenTelemetry API: installed into the runtime image next to uv. Import is
+# guarded so running the bootstrap outside the image (or in a minimal test
+# harness) degrades to no propagation rather than crashing the container.
+try:
+    from opentelemetry import context as otel_context
+    from opentelemetry import propagate as otel_propagate
+except ImportError:  # pragma: no cover - the runtime image always ships the API
+    otel_context = None
+    otel_propagate = None
 
 # Must match the Relay-side constant @@RELAY@@ (internal/runtime/protocol.go);
 # the tests hardcode it because importing a Go constant from Python is not a
@@ -66,9 +91,39 @@ def respond(req_id, ok, error=None):
     sys.stdout.buffer.flush()
 
 
-def invoke(handler, event):
+def extract_context(trace):
+    """Extracts the invocation's W3C trace context and attaches it, returning
+    the detach token (or None when there is nothing to attach). The caller MUST
+    detach in a finally: this is the per-invocation boundary that keeps a warm
+    container's ambient context from leaking across invocations, on success and
+    on failure alike."""
+    if otel_context is None or otel_propagate is None or not isinstance(trace, dict) or not trace:
+        return None
+    # A dict carrier is exactly what the JSON "trace" object decodes to, so the
+    # global W3C propagator (TraceContext + Baggage) reads it directly.
+    parent = otel_propagate.extract(trace)
+    return otel_context.attach(parent)
+
+
+def detach_context(token):
+    """Detaches a context attached by extract_context. Safe on None and never
+    raises: a detach failure must not turn a healthy invocation into a
+    protocol failure."""
+    if token is None or otel_context is None:
+        return
+    try:
+        otel_context.detach(token)
+    except Exception:
+        pass
+
+
+def invoke(handler, event, trace=None):
     """Runs one handler. Raises SystemExit-free exceptions up to the caller for
-    protocol failure only; handler/user errors are converted here."""
+    protocol failure only; handler/user errors are converted here.
+
+    The invocation's trace context (if any) is attached for the single handler
+    call and detached in a finally, so the warm interpreter's ambient context is
+    restored whatever the handler does (return, raise, or exit)."""
     module_name, _, func_name = handler.rpartition(".")
     if not module_name or not func_name:
         return f"invalid handler {handler!r}"
@@ -82,6 +137,7 @@ def invoke(handler, event):
     if func is None:
         return f"module {module_name!r} has no function {func_name!r}"
 
+    token = extract_context(trace)
     try:
         result = func(event)
         if inspect.isawaitable(result):
@@ -95,6 +151,8 @@ def invoke(handler, event):
         # BaseException: SystemExit is hand led above, KeyboardInterrupt and
         # anything the handler raises is a failed INVOCATION, not a fatality.
         return f"handler {handler!r} failed: {exc}"
+    finally:
+        detach_context(token)
     return None
 
 
@@ -123,7 +181,7 @@ def main():
         os.environ["RELAY_HANDLER"] = str(handler)
 
         try:
-            error = invoke(handler, req.get("event"))
+            error = invoke(handler, req.get("event"), req.get("trace"))
         except SystemExit as exc:
             sys.exit(1 if exc.code not in (None, 0, True) else 0)
 

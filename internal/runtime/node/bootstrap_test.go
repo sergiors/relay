@@ -63,7 +63,32 @@ func appRoot(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(root, "relay"), 0o755); err != nil {
 		t.Fatalf("mkdir relay: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "app", "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatalf("write app package: %v", err)
+	}
+	writeOTelAPIStub(t, root)
 	return root
+}
+
+func writeOTelAPIStub(t *testing.T, root string) {
+	t.Helper()
+	dir := filepath.Join(root, "app", "node_modules", "@opentelemetry", "api")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir OTel API stub: %v", err)
+	}
+	write := func(name, contents string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatalf("write OTel API stub: %v", err)
+		}
+	}
+	write("package.json", `{"main":"index.cjs"}`)
+	write("index.cjs", `
+const { AsyncLocalStorage } = require("node:async_hooks");
+const root = {};
+const storage = new AsyncLocalStorage();
+exports.context = { active: () => storage.getStore() ?? root, with: (value, fn) => storage.run(value, fn) };
+exports.propagation = { extract: (base, carrier) => Object.keys(carrier).length ? { parent: carrier.traceparent ?? "", state: carrier.tracestate ?? "", baggage: carrier.baggage ?? "" } : base };
+`)
 }
 
 func writeModule(t *testing.T, root, modPath, src string) {
@@ -81,6 +106,7 @@ func writeModule(t *testing.T, root, modPath, src string) {
 // root/app, mirroring the in-image layout.
 func bootstrapFor(root string) string {
 	bs := string(Bootstrap)
+	bs = strings.Replace(bs, `createRequire("/app/package.json")`, fmt.Sprintf(`createRequire(%s)`, quote(filepath.Join(root, "app", "package.json"))), 1)
 	return strings.Replace(
 		bs,
 		`const base = "/app/" + parts.join("/")`,
@@ -149,6 +175,7 @@ type reqFrame struct {
 	Handler string            `json:"handler"`
 	Event   json.RawMessage   `json:"event"`
 	Env     map[string]string `json:"env"`
+	Trace   map[string]string `json:"trace,omitempty"`
 }
 
 type respFrame struct {
@@ -165,10 +192,14 @@ func quote(s string) string {
 // invoke writes one request frame and reads stdout until a sentinel protocol
 // response line arrives.
 func (p *nodeProc) invoke(t *testing.T, handler string, event string, env map[string]string) invokeResult {
+	return p.invokeTrace(t, handler, event, env, nil)
+}
+
+func (p *nodeProc) invokeTrace(t *testing.T, handler string, event string, env, trace map[string]string) invokeResult {
 	t.Helper()
 	id := fmt.Sprintf("t%d", p.seq)
 	p.seq++
-	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env})
+	frame, err := json.Marshal(reqFrame{ID: id, Handler: handler, Event: json.RawMessage(event), Env: env, Trace: trace})
 	if err != nil {
 		t.Fatalf("build request frame: %v", err)
 	}
@@ -276,6 +307,37 @@ export async function async_handler(event) {
 	}
 	if !strings.Contains(r.Out, "async hi") {
 		t.Errorf("out = %q, want to contain 'async hi'", r.Out)
+	}
+}
+
+func TestNodeRuntimeTraceContextIsolatedAcrossInvocations(t *testing.T) {
+	skipIfNoNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+import { context } from "@opentelemetry/api";
+export async function inspect(event) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  console.log("trace=" + (context.active().parent ?? "root"));
+  if (event.fail) throw new Error("trace failure");
+}
+`)
+	p := startNode(t, root)
+
+	r1 := p.invokeTrace(t, "index.inspect", `{"fail":false}`, nil, map[string]string{
+		"traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+	})
+	if !r1.OK || !strings.Contains(r1.Out, "trace=00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01") {
+		t.Fatalf("traced invoke = %+v", r1)
+	}
+	r2 := p.invokeTrace(t, "index.inspect", `{"fail":true}`, nil, map[string]string{
+		"traceparent": "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01",
+	})
+	if r2.OK || !strings.Contains(r2.Out, "trace=00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01") {
+		t.Fatalf("failed traced invoke = %+v", r2)
+	}
+	r3 := p.invoke(t, "index.inspect", `{}`, nil)
+	if !r3.OK || !strings.Contains(r3.Out, "trace=root") {
+		t.Fatalf("post-failure context = %+v, want restored root context", r3)
 	}
 }
 

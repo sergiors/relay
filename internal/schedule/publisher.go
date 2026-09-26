@@ -7,8 +7,12 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"relay/internal/observability/metrics"
+	"relay/internal/observability/tracing"
 )
 
 // occurrenceTTL is how long a schedule-occurrence dedup key survives after
@@ -42,15 +46,29 @@ func dedupKey(o Occurrence) string {
 // nor a divergent entry — exactly the invariant a "no key-without-entry window"
 // guarantees.
 //
+// The stream entry always carries the untouched "event" envelope beside the
+// optional flat trace-context fields (traceparent/tracestate/baggage). A field
+// is written only when its argument is non-empty, so a publish with tracing
+// disabled (or no recording span) writes exactly the same entry as before.
+//
 // KEYS[1] = dedup key, KEYS[2] = relay stream;
-// ARGV[1] = occurrence ID (key value), ARGV[2] = TTL ms, ARGV[3] = envelope JSON.
+// ARGV[1] = occurrence ID (key value), ARGV[2] = TTL ms, ARGV[3] = envelope JSON,
+// ARGV[4..6] = traceparent, tracestate, baggage (empty string = absent).
 // Returns 1 = published, 0 = duplicate, or an error if the XADD failed.
 var publishScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
-local ok, err = pcall(redis.call, 'XADD', KEYS[2], '*', 'event', ARGV[3])
+local fields = {'event', ARGV[3]}
+local traceKeys = {'traceparent', 'tracestate', 'baggage'}
+for i = 1, 3 do
+  if ARGV[3 + i] ~= nil and ARGV[3 + i] ~= '' then
+    fields[#fields + 1] = traceKeys[i]
+    fields[#fields + 1] = ARGV[3 + i]
+  end
+end
+local ok, err = pcall(redis.call, 'XADD', KEYS[2], '*', unpack(fields))
 if not ok then
   redis.call('DEL', KEYS[1])
   return redis.error_reply(err)
@@ -103,7 +121,27 @@ func NewPublisher(
 // neither). A duplicate (the key already exists) is a clean no-op returning
 // (false, nil) — another worker published this occurrence first. The dedup key
 // is history and expires by TTL only; it is never deleted on completion.
+//
+// A `schedule.publish` span wraps the whole operation, and the current W3C
+// trace context is injected as flat message metadata (traceparent/tracestate/
+// baggage) beside the untouched event payload, so the consumer's stream.message
+// span continues the same trace. With tracing disabled the carrier is nil and
+// the entry is identical to before.
 func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence) (published bool, err error) {
+	ctx, span := tracing.Start(ctx, "schedule.publish",
+		trace.WithAttributes(
+			attribute.String("relay.function", o.Function),
+			attribute.String("relay.handler", o.Handler),
+		),
+	)
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	id := o.ID()
 	envelope, err := p.envelopeFn(o)
 	if err != nil {
@@ -116,8 +154,12 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 		)
 		return false, fmt.Errorf("schedule publish: marshal envelope: %w", err)
 	}
+	carrier := tracing.CarrierFromContext(ctx)
 	key := dedupKey(o)
-	res, err := p.runScript(ctx, p.client, []string{key, p.stream}, id, occurrenceTTL.Milliseconds(), string(envelope))
+	res, err := p.runScript(ctx, p.client, []string{key, p.stream},
+		id, occurrenceTTL.Milliseconds(), string(envelope),
+		carrier[tracing.TraceparentKey], carrier[tracing.TracestateKey], carrier[tracing.BaggageKey],
+	)
 	if err != nil {
 		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed",
