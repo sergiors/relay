@@ -205,13 +205,19 @@ func reconcileWithObserver(
 	// removed-service cleanup below and by the classify/start work further down.
 	changed := false
 
-	// reconcileNotified ensures the reconcileStarted callback fires at most once
-	// per pass, before the first container convergence. It is deferred until
-	// every `build` source's Dockerfile build in this pass has concluded
-	// (buildsResolved == buildsTotal), so a mixed template can never emit
-	// reconciling before building: an entrypoint service that happens to be
-	// iterated before a build service still waits for that build. A pass with no
-	// template services never fires it.
+	// reconcileStarted publishes the reconciling status, but ONLY when this
+	// pass actually has corrective container work to do: a fully-converged
+	// verification pass (nothing to stop or start) must never claim
+	// convergence work that is not happening. corrective is set by every branch
+	// that is about to stop or start a container; notifyReconcile then fires
+	// reconcileStarted at most once per pass, immediately before the first such
+	// action. It is additionally deferred until every `build` source's
+	// Dockerfile build in this pass has concluded (buildsResolved ==
+	// buildsTotal), so a mixed template can never emit reconciling before
+	// building: an entrypoint service that happens to be iterated before a
+	// build service still waits for that build. A pass with no corrective work
+	// never fires it.
+	corrective := false
 	reconcileNotified := false
 	buildsTotal := 0
 	for _, svc := range tmpl.Services {
@@ -220,6 +226,13 @@ func reconcileWithObserver(
 		}
 	}
 	buildsResolved := 0
+	notifyReconcile := func() {
+		if reconcileStarted == nil || reconcileNotified || !corrective || buildsResolved < buildsTotal {
+			return
+		}
+		reconcileNotified = true
+		reconcileStarted()
+	}
 
 	var firstErr error
 	fail := func(err error) {
@@ -245,6 +258,13 @@ func reconcileWithObserver(
 		}
 		if _, ok := desired[ctr.Identity]; !ok {
 			changed = true
+			// A removed service's container is about to be stopped: this is
+			// corrective work. Publish reconciling here unless a `build` source
+			// in the template is still pending — notifyReconcile defers until
+			// every build has resolved, and the post-build call below covers
+			// that case.
+			corrective = true
+			notifyReconcile()
 			stopCtx, stopCancel := ctx, func() {}
 			if reconcileTimeout > 0 {
 				stopCtx, stopCancel = context.WithTimeout(ctx, reconcileTimeout)
@@ -376,14 +396,14 @@ func reconcileWithObserver(
 		}
 
 		// Every `build` source's Dockerfile build in this pass has now completed
-		// (or there was none): the function is about to actually converge
-		// containers, so publish the reconciling status. Firing once per pass
-		// keeps the status write focused; the callback is generation-guarded by
-		// the caller.
-		if reconcileStarted != nil && !reconcileNotified && buildsResolved == buildsTotal {
-			reconcileNotified = true
-			reconcileStarted()
-		}
+		// (or there was none). If corrective work was already identified earlier
+		// in the pass (a removed-service stop, or a prior service's stale/start
+		// work) but reconciling was deferred to keep building before reconciling,
+		// it is published now — before this service converges containers. The
+		// correction itself calls notifyReconcile at its own point, so a pass
+		// whose only corrective work is here fires once, just above. The callback
+		// is generation-guarded by the caller.
+		notifyReconcile()
 
 		// The post-build phase runs on a FRESH normal-operation bound rooted in
 		// the lifecycle context, separate from every bound above. This is the
@@ -467,6 +487,8 @@ func reconcileWithObserver(
 		// Stop every stale/excess container for this service.
 		if len(stale) > 0 {
 			changed = true
+			corrective = true
+			notifyReconcile()
 			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
 				fail(fmt.Errorf("service %q stale: %w", identity, err))
 			}
@@ -479,6 +501,8 @@ func reconcileWithObserver(
 				continue
 			}
 			changed = true
+			corrective = true
+			notifyReconcile()
 			spec := runtime.ServiceSpec{
 				Function: fnName,
 				Identity: identity,

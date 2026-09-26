@@ -444,10 +444,11 @@ func (st *State) RecordReconcileBuilding(name string) {
 }
 
 // RecordReconciling changes only the lifecycle status to reconciling. It is
-// called immediately before a function's persistent services are actually
-// converged (image/entrypoint services) or after a Dockerfile build completes
-// (build services), so the status never claims convergence work that has not
-// started.
+// called at the actual convergence seam of a pass that has corrective container
+// work to perform (image/entrypoint services) or after a Dockerfile build
+// completes (build services), so the status never claims convergence work that
+// has not started. A fully-converged no-op verification pass never calls it: an
+// unchanged function stays ready rather than flashing reconciling.
 func (st *State) RecordReconciling(name string) {
 	st.recordStatus(name, StatusReconciling)
 }

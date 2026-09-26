@@ -491,15 +491,29 @@ func (r *Reconciler) reconcileFunction(name string) {
 				r.generations[name]++
 				generation := r.generations[name]
 				r.mu.Unlock()
-				if r.st != nil {
-					r.st.RecordPreparing(name, fn)
-				}
+				// This is a periodic VERIFICATION of an unchanged, already-
+				// available function: it must not claim that a new generation is
+				// being prepared. No RecordPreparing here — the public status is
+				// only moved to preparing when an actual desired-generation change
+				// is detected (the rebuild path below).
+				//
+				// worked tracks whether the service pass actually did anything:
+				// onBuildStart fires at a real Dockerfile build boundary and
+				// onReconcileStart fires only when real corrective container work
+				// begins (see services.go). A no-op verification leaves it false,
+				// so the completion below writes NOTHING and ready,
+				// last_reconcile_status, and updated_at stay untouched. A pass that
+				// did real work (a build and/or corrective convergence) ends ready.
+				// The callbacks are per-generation and generation-guarded.
+				worked := false
 				r.updateServicesWithStatus(name, fn.Dir, fn.Template, cur.Prepared().Image,
 					func() {
+						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
 							r.st.RecordReconcileBuilding(name)
 						}
 					}, func() {
+						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
 							r.st.RecordReconciling(name)
 						}
@@ -509,6 +523,12 @@ func (r *Reconciler) reconcileFunction(name string) {
 						}
 						if err != nil {
 							r.st.RecordServiceFailure(name, err)
+							return
+						}
+						if !worked {
+							// Nothing was built or converged: a no-op verification
+							// must not rewrite last_reconcile_status/
+							// last_reconcile_at or touch updated_at.
 							return
 						}
 						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn)

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
+
 	"relay/internal/function"
 	"relay/internal/routing"
 	"relay/internal/runner"
@@ -87,6 +89,86 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 			t.Fatalf("callback order = %v, want [building reconciling] for a mixed template", order)
 		}
 	})
+}
+
+// TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling pins the
+// focused correction: a fully-converged service pass is a VERIFICATION, not
+// convergence work. It must not fire the reconciling callback (nor building),
+// so a periodic no-op tick can never publish a spurious reconciling/building
+// status for an already-ready function.
+func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["id-1"] = &fakeContainer{
+		id: "id-1", function: "fn", entrypoint: "service.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+		envHash: serviceEnvHash(80),
+	}
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	var building, reconciling int
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
+		func() { building++ },
+		func() { reconciling++ },
+	); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if building != 0 {
+		t.Fatalf("building fired %d times on a no-op verification, want 0", building)
+	}
+	if reconciling != 0 {
+		t.Fatalf("reconciling fired %d times on a no-op verification, want 0", reconciling)
+	}
+}
+
+// TestReconcileWithStatusCorrectiveStartNotifiesReconciling pins the other side:
+// a pass that actually starts a missing replica performs corrective work, so it
+// fires reconciling exactly once before converging the container.
+func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
+	f := newFakeDocker()
+	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+
+	var reconciling int
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
+		func() {},
+		func() { reconciling++ },
+	); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if reconciling != 1 {
+		t.Fatalf("reconciling fired %d times on a corrective pass, want 1", reconciling)
+	}
+	if got := f.runningCount("fn", "service.js"); got != 1 {
+		t.Fatalf("running = %d, want 1", got)
+	}
+}
+
+// TestReconcileWithStatusRemovedServiceNotifiesReconciling pins that stopping a
+// removed service's leftover container is corrective work: the pass must publish
+// reconciling (there is no per-service loop and no build in this template).
+func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
+	f := newFakeDocker()
+	f.ctrs["old-1"] = &fakeContainer{
+		id: "old-1", function: "fn", entrypoint: "old.js",
+		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
+	}
+	tmpl := serviceTemplate("node24") // old.js is no longer desired
+
+	var reconciling int
+	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
+	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
+		func() {},
+		func() { reconciling++ },
+	); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if reconciling != 1 {
+		t.Fatalf("reconciling fired %d times when stopping a removed service, want 1", reconciling)
+	}
+	if len(f.stops) != 1 || f.stops[0] != "old-1" {
+		t.Fatalf("stops = %v, want [old-1]", f.stops)
+	}
 }
 
 // TestReconcileServiceStatusPersistedPreparingReconcilingReady drives the real
