@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -261,6 +262,190 @@ func TestCarrierKeysAreTheW3CHeaderNames(t *testing.T) {
 	if TraceparentKey != "traceparent" || TracestateKey != "tracestate" || BaggageKey != "baggage" {
 		t.Fatalf("carrier keys = (%q, %q, %q), want the W3C header names",
 			TraceparentKey, TracestateKey, BaggageKey)
+	}
+}
+
+// TestSpanContextStringRoundTrip pins the compact durable-lineage seam: a valid
+// SpanContext serializes to traceparent[|tracestate] and parses back with the
+// same trace/span ids and the recorded sampled flag preserved. It exercises a
+// sampled and an unsampled context, and with and without tracestate.
+func TestSpanContextStringRoundTrip(t *testing.T) {
+	traceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	spanID, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+
+	tests := []struct {
+		name       string
+		flags      trace.TraceFlags
+		tracestate string
+		want       string
+	}{
+		{
+			name:  "sampled without tracestate",
+			flags: trace.FlagsSampled,
+			want:  "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		},
+		{
+			name:       "sampled with tracestate",
+			flags:      trace.FlagsSampled,
+			tracestate: "vendor=opaque",
+			want:       "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01|vendor=opaque",
+		},
+		{
+			name:  "unsampled preserves zero flag",
+			flags: 0,
+			want:  "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts, err := trace.ParseTraceState(tt.tracestate)
+			if err != nil {
+				t.Fatalf("ParseTraceState: %v", err)
+			}
+			sc := trace.NewSpanContext(trace.SpanContextConfig{
+				TraceID:    traceID,
+				SpanID:     spanID,
+				TraceFlags: tt.flags,
+				TraceState: ts,
+			})
+			got := SpanContextToString(sc)
+			if got != tt.want {
+				t.Fatalf("SpanContextToString = %q, want %q", got, tt.want)
+			}
+			back, ok := SpanContextFromString(got)
+			if !ok {
+				t.Fatalf("SpanContextFromString(%q) ok = false", got)
+			}
+			if back.TraceID() != traceID || back.SpanID() != spanID {
+				t.Fatalf("round-trip ids = %s/%s, want %s/%s", back.TraceID(), back.SpanID(), traceID, spanID)
+			}
+			if back.TraceFlags() != tt.flags {
+				t.Fatalf("round-trip flags = %v, want %v", back.TraceFlags(), tt.flags)
+			}
+			if back.TraceState().String() != tt.tracestate {
+				t.Fatalf("round-trip tracestate = %q, want %q", back.TraceState().String(), tt.tracestate)
+			}
+			if back.IsRemote() {
+				t.Error("round-trip context is marked Remote; persisted Relay lineage must be local (Remote=false)")
+			}
+		})
+	}
+}
+
+// TestSpanContextStringExcludesBaggage proves the durable lineage NEVER carries
+// baggage, even when the INSTALLED global propagator is the composite
+// TraceContext+Baggage propagator (as production Setup installs) and the source
+// context carries baggage. Only the traceparent/tracestate may appear, and the
+// round-tripped context carries no baggage.
+func TestSpanContextStringExcludesBaggage(t *testing.T) {
+	resetGlobals(t)
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	if _, err := Setup(context.Background(), discard()); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	traceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	spanID, _ := trace.SpanIDFromHex("00f067aa0ba902b7")
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	member, err := baggage.NewMember("k", "v")
+	if err != nil {
+		t.Fatalf("NewMember: %v", err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+
+	// The global composite propagator DOES carry baggage, proving the exclusion
+	// is not accidental.
+	globalCarrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, globalCarrier)
+	if globalCarrier.Get(BaggageKey) == "" {
+		t.Fatal("global propagator did not carry baggage; exclusion test is vacuous")
+	}
+
+	lineage := SpanContextToString(sc)
+	if lineage == "" {
+		t.Fatal("SpanContextToString returned empty for a valid span context")
+	}
+	if strings.Contains(lineage, BaggageKey) || strings.Contains(lineage, "k=v") {
+		t.Fatalf("durable lineage leaked baggage: %q", lineage)
+	}
+
+	// Parsing back yields a span context whose context carries no baggage.
+	back, ok := SpanContextFromString(lineage)
+	if !ok {
+		t.Fatalf("SpanContextFromString(%q) ok = false", lineage)
+	}
+	backCarrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(trace.ContextWithSpanContext(context.Background(), back), backCarrier)
+	if backCarrier.Get(BaggageKey) != "" {
+		t.Fatalf("round-tripped lineage carries baggage: %q", backCarrier.Get(BaggageKey))
+	}
+}
+
+// TestSpanContextFromStringMalformed proves malformed/empty stored lineage is
+// ignored gracefully (ok=false), never an error: empty, a bare separator, a
+// truncated traceparent, a bad trace id, and arbitrary garbage all fail.
+func TestSpanContextFromStringMalformed(t *testing.T) {
+	for _, s := range []string{
+		"",
+		"|vendor=x",
+		"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7", // missing version/flag byte
+		"garbage",
+		"00-00000000000000000000000000000000-00f067aa0ba902b7-01", // all-zero trace id
+	} {
+		if _, ok := SpanContextFromString(s); ok {
+			t.Errorf("SpanContextFromString(%q) ok = true, want false", s)
+		}
+	}
+}
+
+// TestSpanContextToStringInvalidIsEmpty proves an invalid SpanContext serializes
+// to "" so a caller omits an absent lineage rather than persisting garbage.
+func TestSpanContextToStringInvalidIsEmpty(t *testing.T) {
+	if got := SpanContextToString(trace.SpanContext{}); got != "" {
+		t.Fatalf("SpanContextToString(invalid) = %q, want empty", got)
+	}
+}
+
+// TestSpanContextFromStringIsLocalEvenThoughPropagatorMarksRemote pins the
+// distinction the persisted-lineage seam relies on: the W3C propagator marks an
+// extracted context Remote=true, but SpanContextFromString rebuilds it as a
+// LOCAL historical context (Remote=false) so retry links/replay links use a
+// local span reference, while still preserving the trace id, span id, sampled
+// flag, and tracestate.
+func TestSpanContextFromStringIsLocalEvenThoughPropagatorMarksRemote(t *testing.T) {
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	// The raw propagator extraction is remote (it represents an incoming hop).
+	extracted := trace.SpanContextFromContext(durablePropagator.Extract(
+		context.Background(), propagation.MapCarrier{TraceparentKey: traceparent, TracestateKey: "vendor=x"}))
+	if !extracted.IsRemote() {
+		t.Fatal("propagator extraction is not Remote; test premise is wrong")
+	}
+
+	sc, ok := SpanContextFromString(traceparent + "|vendor=x")
+	if !ok {
+		t.Fatal("SpanContextFromString returned ok=false")
+	}
+	if sc.IsRemote() {
+		t.Error("persisted lineage parsed as Remote; want a local historical context")
+	}
+	if !sc.IsValid() {
+		t.Error("persisted lineage is invalid")
+	}
+	if !sc.TraceFlags().IsSampled() {
+		t.Error("sampled flag was not preserved")
+	}
+	if got := sc.TraceState().String(); got != "vendor=x" {
+		t.Errorf("tracestate = %q, want vendor=x", got)
 	}
 }
 

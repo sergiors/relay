@@ -228,6 +228,9 @@ func dlqInspect(ctx context.Context, w io.Writer, store DLQStore, id string) err
 	fmt.Fprintf(tw, "Handler:\t%s\n", entry.Handler)
 	fmt.Fprintf(tw, "Handler attempts:\t%d\n", entry.HandlerAttempts)
 	fmt.Fprintf(tw, "Deliveries:\t%d\n", entry.Deliveries)
+	if entry.Trace != "" {
+		fmt.Fprintf(tw, "Trace:\t%s\n", entry.Trace)
+	}
 	fmt.Fprintf(tw, "Timestamp:\t%s (%s)\n", entry.Timestamp, state.RelativeAgo(entry.Timestamp))
 	fmt.Fprintf(tw, "Reason:\t%s\n", entry.Reason)
 	_ = tw.Flush()
@@ -263,7 +266,7 @@ func dlqReplay(ctx context.Context, w io.Writer, store DLQStore, socketPath, id 
 		return fmt.Errorf("DLQ entry %q is not replayable: no function/handler to re-execute (malformed-message placeholder)", id)
 	}
 
-	if err := worker.ReplayDLQ(ctx, socketPath, entry.Function, entry.Handler, []byte(entry.Event)); err != nil {
+	if err := worker.ReplayDLQ(ctx, socketPath, entry.Function, entry.Handler, []byte(entry.Event), entry.Trace); err != nil {
 		return fmt.Errorf("replay %s: %w", id, err)
 	}
 

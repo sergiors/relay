@@ -56,7 +56,7 @@ func TestDLQPayload(t *testing.T) {
 	// depending on reclaim/redelivery, so the payload must never alias them. The
 	// exact function/handler identify the exhausted invocation this entry
 	// attributes.
-	p := dlqPayload("events", "1-0", "relay", "worker-1", `{"a":1}`, "boom", "fn", "index.run", 7, 3)
+	p := dlqPayload("events", "1-0", "relay", "worker-1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, "")
 	if p["original_stream"] != "events" || p["original_id"] != "1-0" ||
 		p["group"] != "relay" || p["consumer"] != "worker-1" ||
 		p["event"] != `{"a":1}` || p["reason"] != "boom" ||
@@ -77,6 +77,27 @@ func TestDLQPayload(t *testing.T) {
 	}
 	if delta := time.Since(parsed); delta < -5*time.Second || delta > 5*time.Second {
 		t.Fatalf("timestamp %q is not near now (delta %s)", ts, delta)
+	}
+}
+
+// TestDLQPayloadTraceOptional pins that the compact lineage is OMITTED entirely
+// when empty (so every pre-tracing entry's field shape is unchanged) and present
+// verbatim when supplied.
+func TestDLQPayloadTraceOptional(t *testing.T) {
+	without := dlqPayload("events", "1-0", "relay", "w1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, "")
+	if _, ok := without["trace"]; ok {
+		t.Fatalf("empty lineage must omit the trace field: %v", without)
+	}
+
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	with := dlqPayload("events", "1-0", "relay", "w1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, lineage)
+	if got, ok := with["trace"].(string); !ok || got != lineage {
+		t.Fatalf("trace = %v, want %q", with["trace"], lineage)
+	}
+	// Baggage must never be a field of the trace lineage (the field holds the
+	// compact traceparent[|tracestate] form only).
+	if strings.Contains(lineage, "baggage") {
+		t.Fatal("test fixture is wrong")
 	}
 }
 
@@ -351,5 +372,69 @@ func TestEventStringFallback(t *testing.T) {
 	}
 	if got := eventString(redis.XMessage{ID: "1-0", Values: map[string]any{"event": 7}}); got != "-" {
 		t.Fatalf("expected fallback '-' for non-string, got %q", got)
+	}
+}
+
+// TestDLQTraceForReadsInvocationState pins the source of a DLQ entry's optional
+// lineage: it is read from the invocation-state hash's reserved trace field,
+// omitted for a placeholder invocation (empty ID), and degraded to empty (never
+// an error) when the store read fails.
+func TestDLQTraceForReadsInvocationState(t *testing.T) {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	store := newFakeInvocationStore(nil)
+	if err := store.recordTrace(context.Background(), "s", "g", "m-0", "fn/index.run", lineage); err != nil {
+		t.Fatalf("recordTrace: %v", err)
+	}
+	c := newConsumer(ConsumerConfig{
+		Stream: "s", Group: "g", Consumer: "c",
+		Log: slog.New(slog.DiscardHandler),
+	}, store)
+
+	if got := c.dlqTraceFor(context.Background(), "m-0", "fn/index.run"); got != lineage {
+		t.Fatalf("dlqTraceFor = %q, want %q", got, lineage)
+	}
+	// Unknown invocation: no lineage recorded.
+	if got := c.dlqTraceFor(context.Background(), "m-0", "other/index.run"); got != "" {
+		t.Fatalf("dlqTraceFor(unknown) = %q, want empty", got)
+	}
+	// Placeholder (no invocation): always empty, never a store read.
+	if got := c.dlqTraceFor(context.Background(), "m-0", ""); got != "" {
+		t.Fatalf("dlqTraceFor(placeholder) = %q, want empty", got)
+	}
+	// A read error degrades to empty rather than failing the DLQ write.
+	store.readErr = errors.New("redis down")
+	if got := c.dlqTraceFor(context.Background(), "m-0", "fn/index.run"); got != "" {
+		t.Fatalf("dlqTraceFor(read error) = %q, want empty (best-effort)", got)
+	}
+}
+
+// TestInvocationStoreTraceSiblingIsIndependent pins that the reserved trace
+// field is a sibling of the lifecycle value: recording lineage never changes the
+// invocation's eligibility/lifecycle marker, and reading it back ignores an
+// unrelated lifecycle value.
+func TestInvocationStoreTraceSiblingIsIndependent(t *testing.T) {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	store := newFakeInvocationStore(map[string]string{"fn/index.run": runningValue(time.Now().Add(time.Minute), 1)})
+	c := newConsumer(ConsumerConfig{
+		Stream: "s", Group: "g", Consumer: "c",
+		Log: slog.New(slog.DiscardHandler),
+	}, store)
+	state := NewInvocationState(context.Background(), c.invStateStore, "s", "g", "m-0", c.log)
+
+	before := store.fields["fn/index.run"]
+	state.RecordTrace("fn/index.run", lineage)
+	if got := store.fields["fn/index.run"]; got != before {
+		t.Fatalf("lifecycle value changed by RecordTrace: %q, want %q", got, before)
+	}
+	if got := state.TraceReference("fn/index.run"); got != lineage {
+		t.Fatalf("TraceReference = %q, want %q", got, lineage)
+	}
+	// A running marker is not terminal; the trace sibling must not affect it.
+	if state.IsTerminal("fn/index.run") {
+		t.Fatal("a running invocation must not become terminal by recording a trace")
+	}
+	kind, _, _, ok := parseInvocationState(store.fields["fn/index.run"])
+	if !ok || kind != kindRunning {
+		t.Fatalf("lifecycle value = %q, want a valid running marker", store.fields["fn/index.run"])
 	}
 }

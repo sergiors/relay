@@ -1058,6 +1058,27 @@ func (c *Consumer) unpersistedDLQSpecs(ctx context.Context, msgID string, specs 
 	return out
 }
 
+// dlqTraceFor reads the compact trace lineage persisted for one exhausted
+// invocation, to be written into its DLQ entry. It consults the invocation-state
+// hash (the "last failed attempt" reference), which the runner wrote on the
+// final attempt and which survives until the state hash is cleared after the DLQ
+// write + ACK. It is best-effort: a placeholder invocation (empty ID) or a read
+// failure yields "" (an omitted field), never a failed DLQ write. Only the
+// compact traceparent[|tracestate] form is stored, so baggage can never reach
+// the DLQ.
+func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) string {
+	if invocation == "" {
+		return ""
+	}
+	lineage, err := c.invStateStore.traceReference(ctx, c.stream, c.group, msgID, invocation)
+	if err != nil {
+		c.log.Debug("Message: DLQ trace reference read failed; writing entry without trace",
+			"message_id", msgID, "invocation", invocation, "error", err)
+		return ""
+	}
+	return lineage
+}
+
 // routeToDLQ writes one DLQ entry per exhausted invocation and only then acks
 // the original. The XADD-before-XACK ordering matters: if any DLQ write fails
 // the original stays pending so the next recovery cycle retries the remaining
@@ -1104,9 +1125,15 @@ func (c *Consumer) routeToDLQ(
 	defer dlqSpan.End()
 	ctx = dlqCtx
 	for _, spec := range specs {
+		// The compact lineage of the final failed invocation, read from the
+		// invocation-state hash just before the entry is written (best-effort:
+		// no lineage yields an omitted field). It is a sibling field, not part
+		// of the lifecycle value, so it survives until the state hash is
+		// cleared after the DLQ write + ACK.
+		spec.trace = c.dlqTraceFor(ctx, msg.ID, spec.invocation)
 		entry := dlqPayload(
 			c.stream, msg.ID, c.group, c.consumer,
-			event, spec.reason, spec.function, spec.handler, deliveries, spec.attempts,
+			event, spec.reason, spec.function, spec.handler, deliveries, spec.attempts, spec.trace,
 		)
 		if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
 			Stream: c.dlqStream,

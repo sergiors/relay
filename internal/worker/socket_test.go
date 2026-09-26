@@ -603,23 +603,25 @@ type fakeReplayer struct {
 	name    string
 	handler string
 	event   []byte
+	trace   string
 	err     error
 }
 
-func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event []byte) error {
+func (f *fakeReplayer) ReplayDLQ(_ context.Context, name, handler string, event []byte, trace string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.name = name
 	f.handler = handler
 	f.event = append([]byte(nil), event...)
+	f.trace = trace
 	return f.err
 }
 
-func (f *fakeReplayer) snapshot() (int, string, string, []byte) {
+func (f *fakeReplayer) snapshot() (int, string, string, []byte, string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls, f.name, f.handler, append([]byte(nil), f.event...)
+	return f.calls, f.name, f.handler, append([]byte(nil), f.event...), f.trace
 }
 
 // startTestSocketWithReplayer starts a SocketServer at path with the given DLQ
@@ -641,22 +643,26 @@ func startTestSocketWithReplayer(t *testing.T, path string, replayer HandlerRepl
 }
 
 // TestRuntimeSocketReplayDLQDelegates verifies the replay_dlq command forwards
-// the exact function, handler, and event bytes to the wired replayer and answers
-// with replayed=true.
+// the exact function, handler, event bytes, AND trace metadata (as a control-path
+// sibling of the event) to the wired replayer and answers with replayed=true.
 func TestRuntimeSocketReplayDLQDelegates(t *testing.T) {
 	path := testSocketPath(t)
 	rep := &fakeReplayer{}
 	startTestSocketWithReplayer(t, path, rep)
 
-	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{"a":1}`)); err != nil {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{"a":1}`), lineage); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
-	calls, name, handler, event := rep.snapshot()
+	calls, name, handler, event, trace := rep.snapshot()
 	if calls != 1 || name != "fn" || handler != "index.run" {
 		t.Fatalf("replayer calls/name/handler = %d/%q/%q", calls, name, handler)
 	}
 	if string(event) != `{"a":1}` {
 		t.Fatalf("replayer event = %q, want the replayed payload", event)
+	}
+	if trace != lineage {
+		t.Fatalf("replayer trace = %q, want the control-path lineage %q", trace, lineage)
 	}
 }
 
@@ -677,7 +683,7 @@ func TestRuntimeSocketReplayDLQErrorCodes(t *testing.T) {
 			path := testSocketPath(t)
 			startTestSocketWithReplayer(t, path, &fakeReplayer{err: tc.err})
 
-			err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`))
+			err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
 			if !errors.Is(err, ErrInvokeFailed) {
 				t.Fatalf("error = %v, want ErrInvokeFailed", err)
 			}
@@ -697,7 +703,7 @@ func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, nil)
 
-	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`))
+	err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), "")
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
@@ -726,7 +732,7 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 			t.Fatalf("line %q: malformed request must not report a replay", line)
 		}
 	}
-	if calls, _, _, _ := rep.snapshot(); calls != 0 {
+	if calls, _, _, _, _ := rep.snapshot(); calls != 0 {
 		t.Fatalf("replayer calls = %d, want 0 (malformed requests never replay)", calls)
 	}
 }
@@ -735,7 +741,7 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 // ErrInvokeUnavailable (there is no offline fallback for a replay).
 func TestReplayDLQNoSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
-	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`)); !errors.Is(err, ErrInvokeUnavailable) {
+	if err := ReplayDLQ(context.Background(), path, "fn", "index.run", []byte(`{}`), ""); !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
 }

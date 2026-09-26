@@ -446,6 +446,9 @@ type fakeInvocationState struct {
 	// failures records the backoff passed to RecordFailure, for tests to assert
 	// the retry schedule.
 	failures []time.Duration
+	// traces records the compact lineage passed to RecordTrace, keyed by
+	// invocation, so tests can assert persisted retry lineage.
+	traces map[string]string
 }
 
 func newFakeInvocationState() *fakeInvocationState {
@@ -455,6 +458,7 @@ func newFakeInvocationState() *fakeInvocationState {
 		nextAt:    map[string]time.Time{},
 		exhausted: map[string]int{},
 		attempts:  map[string]int{},
+		traces:    map[string]string{},
 		now:       time.Now,
 	}
 }
@@ -564,4 +568,23 @@ func (p *fakeInvocationState) runningDeadline(invocation string) (time.Time, boo
 	defer p.mu.Unlock()
 	dl, ok := p.running[invocation]
 	return dl, ok
+}
+
+// TraceReference returns the compact lineage recorded for the invocation by its
+// most recent attempt, mirroring the real reserved sibling field.
+func (p *fakeInvocationState) TraceReference(invocation string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.traces[invocation]
+}
+
+// RecordTrace persists the invocation's current-attempt lineage without
+// disturbing its lifecycle state, mirroring the real reserved sibling field.
+func (p *fakeInvocationState) RecordTrace(invocation, lineage string) {
+	if lineage == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.traces[invocation] = lineage
 }

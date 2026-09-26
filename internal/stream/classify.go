@@ -33,8 +33,17 @@ import (
 // matching several functions/handlers produces one precisely-attributed entry
 // each. The malformed-message path has no invocation, so it carries the "-"
 // placeholder for both.
-func dlqPayload(stream, id, group, consumer, event, reason, function, handler string, deliveries int64, handlerAttempts int) map[string]any {
-	return map[string]any{
+//
+// trace is the OPTIONAL compact lineage (traceparent[|tracestate]) of the final
+// failed invocation, read from the invocation-state hash at DLQ-write time. It is
+// omitted entirely when absent (a pre-tracing entry, the malformed-message
+// path, or tracing disabled), so every existing entry's field shape is
+// unchanged; baggage is never recorded.
+func dlqPayload(
+	stream, id, group, consumer, event, reason, function, handler string,
+	deliveries int64, handlerAttempts int, trace string,
+) map[string]any {
+	fields := map[string]any{
 		"original_stream":  stream,
 		"original_id":      id,
 		"group":            group,
@@ -47,6 +56,10 @@ func dlqPayload(stream, id, group, consumer, event, reason, function, handler st
 		"handler_attempts": handlerAttempts,
 		"timestamp":        time.Now().UTC().Format(time.RFC3339),
 	}
+	if trace != "" {
+		fields["trace"] = trace
+	}
+	return fields
 }
 
 // dlqNoHandler is the function/handler placeholder for a DLQ entry that has no
@@ -90,6 +103,11 @@ type dlqEntrySpec struct {
 	// persistence in the invocation-state hash. It is empty when there is no
 	// invocation (malformed message routed pre-handler).
 	invocation string
+	// trace is the OPTIONAL compact lineage of the final failed invocation,
+	// read from the invocation-state hash by routeToDLQ just before the write
+	// (see dlqTraceFor). Empty for the placeholder or when no lineage was
+	// recorded.
+	trace string
 }
 
 // dlqEntrySpecs expands the runner's terminal exhaustion error into one DLQ

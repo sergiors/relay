@@ -43,6 +43,13 @@ type DLQEntry struct {
 	// HandlerAttempts is the handler execution attempt that exhausted the
 	// invocation (0 for the malformed-message placeholder).
 	HandlerAttempts int
+	// Trace is the OPTIONAL compact trace lineage of the final failed
+	// invocation (traceparent[|tracestate], never baggage), read from the
+	// invocation-state hash when the entry was written. It is empty for a
+	// pre-tracing entry, the malformed-message placeholder, or when tracing was
+	// disabled. `relay dlq replay` forwards it to the worker so the replay can
+	// link back to the original failed invocation.
+	Trace string
 	// Timestamp is the RFC3339 UTC time the entry was written.
 	Timestamp string
 }
@@ -101,6 +108,17 @@ func ParseDLQEntry(id string, values map[string]any) (DLQEntry, error) {
 		return DLQEntry{}, err
 	}
 	e.HandlerAttempts = int(attempts)
+	// "trace" is OPTIONAL: it postdates the current required field set, so an
+	// entry written before tracing existed (or by a path that has no lineage)
+	// simply omits it. When present it must be a string; a malformed value is
+	// surfaced rather than silently dropped.
+	if v, ok := values["trace"]; ok {
+		s, ok := v.(string)
+		if !ok {
+			return DLQEntry{}, fmt.Errorf("DLQ entry %q field is not a string", "trace")
+		}
+		e.Trace = s
+	}
 	if e.Timestamp, err = dlqString(values, "timestamp"); err != nil {
 		return DLQEntry{}, err
 	}

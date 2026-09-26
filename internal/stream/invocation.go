@@ -115,6 +115,14 @@ type invocationStateStore interface {
 	// for this message (HSETNX on a reserved field). It returns true only for
 	// the first caller across redeliveries and replicas.
 	claimClassification(ctx context.Context, stream, group, msgID string) (bool, error)
+	// traceReference returns the compact trace lineage persisted for this
+	// invocation by its most recent attempt (see RecordTrace), or "" when none
+	// was ever recorded. redis.Nil (field absent) is ("", nil).
+	traceReference(ctx context.Context, stream, group, msgID, invocation string) (string, error)
+	// recordTrace persists the compact trace lineage of this invocation's most
+	// recent attempt under a reserved sibling field, refreshing the TTL in the
+	// same pipeline. It never disturbs the invocation's lifecycle value.
+	recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error
 	clear(ctx context.Context, stream, group, msgID string) error
 }
 
@@ -124,6 +132,22 @@ type invocationStateStore interface {
 // ID, which is always "<function>/<handler>": function names are validated to
 // start with [a-z0-9], so a leading "__" is not a legal function name.
 const classificationField = "__classification"
+
+// traceFieldPrefix is the reserved invocation-state hash field prefix under
+// which each invocation's most recent attempt trace lineage is persisted, as
+// "<prefix><invocation>" (e.g. "__trace:fn/index.run"). Like classificationField
+// it cannot collide with a real invocation ID (a leading "__" is not a legal
+// function name), and it is a SIBLING of the lifecycle value rather than part of
+// it, so recording a lineage never disturbs eligibility parsing. The value is the
+// compact traceparent[|tracestate] form (see tracing.SpanContextToString) and
+// never contains baggage.
+const traceFieldPrefix = "__trace:"
+
+// traceField returns the reserved hash field holding invocation's persisted
+// trace lineage.
+func traceField(invocation string) string {
+	return traceFieldPrefix + invocation
+}
 
 // invocationStore is a thin Redis-backed store for per-message invocation
 // state. Each key is a HASH mapping an invocation ID ("<function>/<handler>")
@@ -453,6 +477,37 @@ func (store *invocationStore) claimClassification(ctx context.Context, stream, g
 	return set.Val(), nil
 }
 
+// traceReference reads the compact trace lineage recorded for this invocation by
+// its most recent attempt, under the reserved sibling field. redis.Nil (never
+// recorded) is ("", nil). A read error returns ("", err); the caller treats it
+// as no reference (best-effort lineage must never fail an invocation).
+func (store *invocationStore) traceReference(ctx context.Context, stream, group, msgID, invocation string) (string, error) {
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), traceField(invocation)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// recordTrace persists the compact trace lineage of this invocation's most
+// recent attempt under the reserved sibling field. HSET + EXPIRE are pipelined so
+// the TTL is refreshed on the write without an extra round trip, exactly like
+// the lifecycle writes. An empty lineage is a no-op (nothing to record).
+func (store *invocationStore) recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error {
+	if lineage == "" {
+		return nil
+	}
+	key := invocationStateKey(stream, group, msgID)
+	pipe := store.client.Pipeline()
+	pipe.HSet(ctx, key, traceField(invocation), lineage)
+	pipe.Expire(ctx, key, invocationStateTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 // runningValue encodes a protected attempt's absolute deadline and attempt
 // number as the field value "running:<unixnano>#<attempts>". The "running:"
 // prefix distinguishes it from the "ok" completion sentinel; the Unix-nano
@@ -588,6 +643,18 @@ type InvocationState interface {
 	// returns false. A store error returns (false, err) so the caller counts
 	// nothing rather than risk a double count.
 	ClaimClassification() (bool, error)
+	// TraceReference returns the compact trace lineage (traceparent[|tracestate])
+	// recorded for the invocation by its most recent attempt, or "" when none
+	// was ever recorded. It is a best-effort durable reference used to link a
+	// retry's function.invoke span back to the previous attempt; a read error
+	// or an unknown/malformed value degrades to no reference, never an error.
+	TraceReference(invocation string) string
+	// RecordTrace persists the compact trace lineage of the invocation's current
+	// attempt so a later retry (even on a restarted worker) can link back to it.
+	// It is best-effort: a write error is logged and never fails the invocation,
+	// and an empty lineage is a no-op. Only the trace identity and tracestate
+	// are ever persisted — never baggage.
+	RecordTrace(invocation, lineage string)
 }
 
 // invocationStateContextKey is the context key carrying the per-message
@@ -839,6 +906,29 @@ func (state *invocationState) ClaimClassification() (bool, error) {
 		return false, err
 	}
 	return claimed, nil
+}
+
+// TraceReference returns the compact trace lineage recorded by the invocation's
+// most recent attempt, or "" when none is recorded. A read error is logged and
+// degrades to no reference (best-effort lineage must never fail an invocation).
+func (state *invocationState) TraceReference(invocation string) string {
+	lineage, err := state.store.traceReference(state.ctx, state.stream, state.group, state.msgID, invocation)
+	if err != nil {
+		state.log.Debug("Invocation state: trace reference read failed; no link",
+			"invocation", invocation, "error", err)
+		return ""
+	}
+	return lineage
+}
+
+// RecordTrace persists the invocation's current-attempt trace lineage so a later
+// retry can link back to it. A write error is logged only: lineage is diagnostic
+// and must never fail an invocation.
+func (state *invocationState) RecordTrace(invocation, lineage string) {
+	if err := state.store.recordTrace(state.ctx, state.stream, state.group, state.msgID, invocation, lineage); err != nil {
+		state.log.Debug("Invocation state: trace record failed; retry will not link",
+			"invocation", invocation, "error", err)
+	}
 }
 
 // MarkComplete logs but does not fail the handler on a write error: the message

@@ -130,6 +130,25 @@ func (f *fakeInvocationStore) claimClassification(_ context.Context, _, _, _ str
 	return true, nil
 }
 
+// traceReference/recordTrace model the reserved sibling trace field: recording
+// never disturbs the invocation's lifecycle value, and reading an absent field
+// is ("", nil). A read error is surfaced so the best-effort no-link path is
+// exercisable.
+func (f *fakeInvocationStore) traceReference(_ context.Context, _, _, _, invocation string) (string, error) {
+	if f.readErr != nil {
+		return "", f.readErr
+	}
+	return f.fields[traceField(invocation)], nil
+}
+
+func (f *fakeInvocationStore) recordTrace(_ context.Context, _, _, _, invocation, lineage string) error {
+	if lineage == "" {
+		return nil
+	}
+	f.fields[traceField(invocation)] = lineage
+	return nil
+}
+
 func (f *fakeInvocationStore) clear(_ context.Context, _, _, _ string) error {
 	f.fields = map[string]string{}
 	return nil

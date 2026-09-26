@@ -24,6 +24,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -379,6 +380,98 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 	}
 	if m.Values["deliveries"] != "1" {
 		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
+	}
+}
+
+// TestIntegrationDLQEntryCarriesFinalAttemptTrace proves the durable DLQ trace
+// path end to end against real Redis: the runner's RecordTrace persists the
+// compact lineage in the invocation-state hash, and routeToDLQ reads it back
+// (via dlqTraceFor) into the entry's optional `trace` field. Only the compact
+// traceparent[|tracestate] form is stored; baggage is never persisted.
+func TestIntegrationDLQEntryCarriesFinalAttemptTrace(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01|vendor=x"
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := invocationStateFromCtx(t, ctx)
+		if !ok {
+			return fmt.Errorf("no invocation state in ctx")
+		}
+		started, n, _ := p.TryStart("fn/h", time.Hour)
+		if !started {
+			return ErrInvocationNotEligible
+		}
+		// The runner records the attempt's span lineage immediately; the DLQ
+		// write reads it back for the final failed attempt.
+		p.RecordTrace("fn/h", lineage)
+		p.MarkExhausted("fn/h", n)
+		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
+			{Function: "fn", Handler: "h", Attempts: n, Err: ErrInvocationExhausted},
+		}}
+	})
+	testutil.WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
+		_, ok := e.dlq()[id]
+		return ok
+	})
+	e.stop(t)
+
+	m, ok := e.dlq()[id]
+	if !ok {
+		t.Fatalf("expected DLQ entry for %s", id)
+	}
+	if got := m.Values["trace"]; got != lineage {
+		t.Fatalf("DLQ entry trace = %v, want %q", got, lineage)
+	}
+}
+
+// TestIntegrationInvocationTraceLineageSurvivesRestart proves the persisted
+// lineage outlives a consumer restart: RecordTrace written by consumer A is read
+// back through the store by a fresh consumer handle on the same stream/group, so
+// a retry on a restarted worker can link to the previous attempt. The state hash
+// is cleared on completion.
+func TestIntegrationInvocationTraceLineageSurvivesRestart(t *testing.T) {
+	testutil.RequireRedis(t)
+	prefix := fmt.Sprintf("trace-restart-%d", time.Now().UnixNano())
+	stream, group := prefix+"-stream", prefix+"-group"
+
+	envA := newEnv(t, ConsumerConfig{Stream: stream, Group: group, Consumer: "trace-A"})
+	id := envA.xadd(t, `{"a":1}`)
+	key := invocationStateKey(stream, group, id)
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	delivered := make(chan struct{})
+	var once sync.Once
+	envA.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID != id {
+			return nil
+		}
+		p, ok := invocationStateFromCtx(t, ctx)
+		if !ok {
+			return fmt.Errorf("no invocation state in ctx")
+		}
+		p.RecordTrace("fn/h", lineage)
+		once.Do(func() { close(delivered) })
+		return fmt.Errorf("leave pending to persist lineage")
+	})
+	<-delivered
+	testutil.WaitFor(t, 8*time.Second, "trace lineage persisted in Redis", func() bool {
+		v, err := envA.client.HGet(context.Background(), key, traceField("fn/h")).Result()
+		return err == nil && v == lineage
+	})
+	envA.stop(t)
+
+	// Consumer B (a fresh handle on the same stream/group) reads the lineage back
+	// through the store, simulating a restarted worker linking its retry. B never
+	// starts Consume: only the store read-back is under test, so cleanup owns its
+	// client teardown.
+	envB := newEnv(t, ConsumerConfig{Stream: stream, Group: group, Consumer: "trace-B"})
+	state := NewInvocationState(context.Background(), envB.consumer.invStateStore, stream, group, id, envB.consumer.log)
+	if got := state.TraceReference("fn/h"); got != lineage {
+		t.Fatalf("restarted handle TraceReference = %q, want %q", got, lineage)
 	}
 }
 
@@ -815,7 +908,7 @@ func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 	if _, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: e.consumer.dlqStream,
 		Values: dlqPayload(e.stream, id, e.group, e.consumer.consumer, `{"a":1}`,
-			"fnA exhausted", "fnA", "h", 1, 1),
+			"fnA exhausted", "fnA", "h", 1, 1, ""),
 	}).Result(); err != nil {
 		t.Fatalf("seed DLQ entry: %v", err)
 	}
@@ -861,7 +954,7 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 		if _, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
 			Stream: e.consumer.dlqStream,
 			Values: dlqPayload(e.stream, id, e.group, e.consumer.consumer, `{"a":1}`,
-				fn+" exhausted", fn, "h", 2, 1),
+				fn+" exhausted", fn, "h", 2, 1, ""),
 		}).Result(); err != nil {
 			t.Fatalf("seed DLQ entry %s: %v", fn, err)
 		}

@@ -460,6 +460,82 @@ func ExtractStrings(ctx context.Context, carrier map[string]string) context.Cont
 	return otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(carrier))
 }
 
+// traceSeparator joins the serialized traceparent and tracestate in the compact
+// lineage form persisted by Relay. It is deliberately not a character the W3C
+// traceparent grammar can contain (that grammar is fixed-width hex + dashes);
+// a tracestate value that contains it is preserved in full because only the
+// first separator is significant.
+const traceSeparator = "|"
+
+// durablePropagator is the W3C TraceContext propagator alone (no baggage),
+// used for durable lineage serialization. Durable lineage is the trace identity
+// and tracestate only; baggage is request-scoped and must never be persisted or
+// replayed. It is a package value (not the installed global propagator) so a
+// caller cannot accidentally persist baggage via a global composite propagator.
+var durablePropagator = propagation.TraceContext{}
+
+// SpanContextToString serializes a valid SpanContext into the compact lineage
+// string Relay persists in durable state (the invocation-state hash and DLQ
+// entries): the W3C traceparent, followed by the tracestate when present, joined
+// by traceSeparator. It returns "" for an invalid SpanContext, so a caller can
+// omit an absent lineage instead of writing an unparseable value.
+//
+// It NEVER serializes baggage: durable lineage is exactly the trace identity
+// (trace id, span id, the W3C sampled flag) plus tracestate. Baggage is
+// request-scoped and must not be persisted or replayed.
+func SpanContextToString(sc trace.SpanContext) string {
+	if !sc.IsValid() {
+		return ""
+	}
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	carrier := propagation.MapCarrier{}
+	durablePropagator.Inject(ctx, carrier)
+	traceparent := carrier.Get(TraceparentKey)
+	if traceparent == "" {
+		return ""
+	}
+	if tracestate := carrier.Get(TracestateKey); tracestate != "" {
+		return traceparent + traceSeparator + tracestate
+	}
+	return traceparent
+}
+
+// SpanContextFromString parses the compact lineage form produced by
+// SpanContextToString. It returns ok=false for an empty or malformed value (an
+// unknown/garbage stored reference is ignored gracefully, never an error). The
+// traceparent and tracestate are validated with the W3C TraceContext propagator,
+// so the returned SpanContext preserves the recorded sampled flag and tracestate
+// exactly. The returned context is marked LOCAL (Remote=false): it is Relay's own
+// persisted historical attempt, used for span links and retry lineage, not an
+// incoming remote parent.
+func SpanContextFromString(s string) (trace.SpanContext, bool) {
+	if s == "" {
+		return trace.SpanContext{}, false
+	}
+	traceparent, tracestate, _ := strings.Cut(s, traceSeparator)
+	if strings.TrimSpace(traceparent) == "" {
+		return trace.SpanContext{}, false
+	}
+	carrier := propagation.MapCarrier{TraceparentKey: traceparent}
+	if tracestate != "" {
+		carrier[TracestateKey] = tracestate
+	}
+	extracted := trace.SpanContextFromContext(durablePropagator.Extract(context.Background(), carrier))
+	if !extracted.IsValid() {
+		return trace.SpanContext{}, false
+	}
+	// The propagator marks an extracted context Remote=true. Rebuild it as a
+	// local historical context (Remote=false) while preserving the validated
+	// trace id, span id, sampled flag, and tracestate.
+	return trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    extracted.TraceID(),
+		SpanID:     extracted.SpanID(),
+		TraceFlags: extracted.TraceFlags(),
+		TraceState: extracted.TraceState(),
+		Remote:     false,
+	}), true
+}
+
 // sdkDisabled reports whether OTEL_SDK_DISABLED requests the standard opt-out.
 // The specification defines the value as case-insensitive "true"; anything else
 // leaves tracing at its environment-derived state.

@@ -191,13 +191,21 @@ type InvokeResult struct {
 // required); cmdResetStats asks the worker to reset its Relay statistics;
 // cmdInvokeFunction asks the worker to run function's matching event handlers
 // synchronously (Function is required and Event carries the operator-supplied
-// JSON event object). A frame carries exactly one command, and an absent or
-// unknown command is malformed.
+// JSON event object); cmdReplayDLQ re-executes one DLQ entry's exact
+// function/handler (Function and Handler are required, Event carries the
+// replayed payload, and Trace optionally carries the entry's compact lineage so
+// the replay can link back to the original failed invocation). A frame carries
+// exactly one command, and an absent or unknown command is malformed.
+//
+// Trace is deliberately a SIBLING of Event, not part of it: the trace lineage is
+// control-path metadata, so it never reaches the handler's event map and the
+// replay's own worker-side operation span stays independent of it.
 type socketRequest struct {
 	Command  string          `json:"command,omitempty"`
 	Function string          `json:"function,omitempty"`
 	Handler  string          `json:"handler,omitempty"`
 	Event    json.RawMessage `json:"event,omitempty"`
+	Trace    string          `json:"trace,omitempty"`
 }
 
 // socketResponse is the newline-JSON response frame. Exactly one of the
@@ -259,7 +267,7 @@ type FunctionInvoker interface {
 // (ErrFunctionNotFound / ErrFunctionUnavailable / ErrHandlerNotFound) onto stable
 // wire codes; that import is for the error contract, not dispatch.
 type HandlerReplayer interface {
-	ReplayDLQ(ctx context.Context, name, handler string, event []byte) error
+	ReplayDLQ(ctx context.Context, name, handler string, event []byte, trace string) error
 }
 
 // SocketServer is the worker-owned live query socket. It accepts one request
@@ -461,7 +469,7 @@ func (s *SocketServer) handle(conn net.Conn) {
 	case cmdInvokeFunction:
 		s.handleInvokeFunction(conn, req.Function, req.Event)
 	case cmdReplayDLQ:
-		s.handleReplayDLQ(conn, req.Function, req.Handler, req.Event)
+		s.handleReplayDLQ(conn, req.Function, req.Handler, req.Event, req.Trace)
 	default:
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 	}
@@ -588,7 +596,11 @@ func (s *SocketServer) handleInvokeFunction(conn net.Conn, function string, rawE
 // The error's text is carried in Message (and logged) so the CLI can surface a
 // clear cause, while Error stays the stable code it classifies on. On success the
 // frame carries replayed=true; the CLI deletes the DLQ entry only then.
-func (s *SocketServer) handleReplayDLQ(conn net.Conn, function, handler string, rawEvent json.RawMessage) {
+//
+// trace optionally carries the entry's compact lineage (a control-path field,
+// not part of the event payload); it is forwarded so the worker can link the
+// replay's new operation span back to the original failed invocation.
+func (s *SocketServer) handleReplayDLQ(conn net.Conn, function, handler string, rawEvent json.RawMessage, trace string) {
 	if function == "" || handler == "" || len(rawEvent) == 0 {
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 		return
@@ -608,7 +620,7 @@ func (s *SocketServer) handleReplayDLQ(conn net.Conn, function, handler string, 
 
 	ctx, cancel := context.WithTimeout(s.baseCtx, invokeTimeout)
 	defer cancel()
-	if err := replayer.ReplayDLQ(ctx, function, handler, rawEvent); err != nil {
+	if err := replayer.ReplayDLQ(ctx, function, handler, rawEvent, trace); err != nil {
 		code := replayErrorCode(err)
 		s.log.Warn("DLQ replay: handler execution failed",
 			"function", function,
@@ -862,7 +874,10 @@ func InvokeFunction(ctx context.Context, path, function string, event json.RawMe
 // handler recorded by a DLQ entry, with event as the replayed payload. It is the
 // CLI's running-worker path for `relay dlq replay`; there is no offline fallback
 // (a replay must run through the live runner/runtime pool, which only the worker
-// owns). event must be the entry's payload bytes, replayed verbatim.
+// owns). event must be the entry's payload bytes, replayed verbatim. trace is the
+// entry's optional compact lineage, carried as control-path metadata (a sibling
+// of event) so the worker's replay operation can link back to the original failed
+// invocation; it is never part of the event payload.
 //
 // ctx bounds the CLI side (a cancelled ctx, e.g. Ctrl-C, closes the connection
 // so the command aborts promptly). A missing/unresponsive worker, or a worker
@@ -870,7 +885,7 @@ func InvokeFunction(ctx context.Context, path, function string, event json.RawMe
 // unknown-function / function-unavailable / handler-not-found / handler-failure
 // answers report ErrInvokeFailed with the worker's message, so the CLI surfaces
 // the real cause (including a failed handler's reason) rather than masking it.
-func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte) error {
+func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte, trace string) error {
 	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
 	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
@@ -892,6 +907,7 @@ func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte
 		Function: function,
 		Handler:  handler,
 		Event:    event,
+		Trace:    trace,
 	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvokeUnavailable, err)
 	}

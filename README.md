@@ -1809,10 +1809,23 @@ remains the health check.
 
   Retries and redeliveries reprocess the original stream entry and therefore
   reuse its propagation metadata, while each delivery gets its own processing
-  span. DLQ entries, manual invocations, and persistent services are not
-  propagation boundaries: DLQ records do not carry these fields, manual
-  invocations do not come from a stream message, and persistent services do not
-  use the event/schedule invocation protocol.
+  span. Each handler attempt is its own `function.invoke` span; a retry links
+  (via a span link, not a parent) to the invocation's prior attempt, whose
+  compact `traceparent`/`tracestate` lineage is persisted in the
+  invocation-state hash so the link survives a worker restart. Only that compact
+  lineage is persisted — never baggage. Fan-out is preserved: a message matching
+  several handlers runs them as sibling `function.invoke` spans, and only the
+  retrying handler links to its own lineage.
+
+  A DLQ entry records the final failed invocation's compact lineage in an
+  optional `trace` field. `relay dlq replay` forwards that field over the worker
+  socket as control-path metadata (separate from the event payload); the worker
+  creates a new-root `dlq.replay` operation span with a link to the original
+  failed invocation and runs `function.invoke` as its child. Manual
+  invocations (`relay function invoke`) create a new-root
+  `function.manual_invoke` operation span on the worker, so they are traced
+  without requiring the CLI to carry trace context. Persistent services do not
+  use the event/schedule invocation protocol and are not propagation boundaries.
 
 - **Structured logs**: execution, retry, failure, DLQ,
   reconciliation, and build lines carry structured `slog` attributes —

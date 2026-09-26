@@ -881,12 +881,23 @@ func (r *Runner) runInvocation(
 	handler string,
 	eventJSON []byte,
 	extraEnv []string,
+	trace invocationTrace,
 ) (panicked bool, panicValue any, err error) {
 	// The end-to-end invocation span, shared by the event-rule, schedule, and
 	// manual paths (all funnel through here). It is a child of the delivery
-	// context, and its span context is propagated into the executor so the
-	// runtime's runtime.execute/acquire/invoke children nest beneath it. RunMeta
-	// and the timeout already stamped on invokeCtx are inherited.
+	// (or replay/manual operation) context, and its span context is propagated
+	// into the executor so the runtime's runtime.execute/acquire/invoke children
+	// nest beneath it. RunMeta and the timeout already stamped on invokeCtx are
+	// inherited.
+	//
+	// Retry lineage: a new attempt links to the PREVIOUS attempt's stored span
+	// reference (when one was persisted) and then records its own span context
+	// so a later retry, even after a worker restart, can link back to it. The
+	// link is not a parent: every attempt is a distinct function.invoke span
+	// (usually sharing the original upstream trace through the delivery context)
+	// while the link records the causal retry chain across attempts. Recording
+	// only ever persists the compact traceparent/tracestate lineage, never
+	// baggage, and a state-free caller (manual/replay) records nothing.
 	var runtimeName string
 	if pf != nil && pf.fn.Template != nil {
 		runtimeName = pf.fn.Template.Runtime
@@ -895,7 +906,8 @@ func (r *Runner) runInvocation(
 	if pf != nil {
 		fnName = pf.fn.Name
 	}
-	spanCtx, span := startInvocationSpan(invokeCtx, fnName, handler, runtimeName)
+	spanCtx, span := startInvocationSpan(invokeCtx, fnName, handler, runtimeName, trace.spanOpts()...)
+	trace.record(span.SpanContext())
 	defer func() {
 		if panicked {
 			finishInvocationSpan(span, fmt.Errorf("executor panic: %v", panicValue))
@@ -1276,7 +1288,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					Image:     toImage(pf),
 				})
 				start := time.Now()
-				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
+				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
 				elapsed := time.Since(start)
 				if panicked {
 					// A panicking execution is a misbehaving handler, not a
@@ -1627,7 +1639,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 				}},
 			}
 		}
-		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation, msgID)
+		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation, handlerAttempt, msgID)
 		if err != nil {
 			// A failed attempt — resolve extra env, marshal, execution, or
 			// timeout failures all land here. recordFailure decides retry vs
@@ -1648,7 +1660,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	// No invocation state (direct callers/tests): preserve the legacy behavior
 	// exactly — execute the single handler and return the plain error (or nil on
 	// success). MarkComplete/success metrics still emit inside invokeOnce.
-	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "", msgID)
+	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "", 0, msgID)
 }
 
 // InvokeFunction executes every event rule of the named function whose pattern
@@ -1680,7 +1692,23 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 // registered but unrunnable function (its image could not be built) returns
 // ErrFunctionUnavailable. Both are wrapped with the function name so the socket
 // can map them onto stable wire codes.
-func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error) {
+//
+// Tracing: the worker-side root operation span is opened BEFORE registry and
+// match validation, so an invalid function, an unavailable function, or a
+// no-match invocation is still traced (with its error recorded) without changing
+// any return semantics.
+func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[string]any) (count int, err error) {
+	// A worker-side root operation span around the whole manual invocation, so
+	// an operator `relay function invoke` is traced on the worker without the
+	// CLI carrying any trace context. It is a NEW root regardless of the
+	// caller's context; every matching rule's function.invoke runs as its child
+	// (the root span's context is the base for each rule's invokeCtx). It is
+	// opened before validation and finalized by the deferred finalizer on every
+	// return path (success, validation error, or handler failure).
+	opCtx, opSpan := startManualInvokeSpan(ctx, name)
+	ctx = opCtx
+	defer func() { finishOperationSpan(opSpan, err) }()
+
 	pf := r.reg.GetByName(name)
 	if pf == nil {
 		return 0, fmt.Errorf("%w: %q", ErrFunctionNotFound, name)
@@ -1705,7 +1733,6 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 	}
 	eventID, eventName := eventFields(event)
 
-	count := 0
 	var firstErr error
 	for _, rule := range rules {
 		// Cap the rule timeout at the configured maximum (defense in depth;
@@ -1764,7 +1791,7 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 			})
 
 			start := time.Now()
-			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv)
+			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, invocationTrace{})
 			elapsed := time.Since(start)
 			if panicked {
 				r.log.Error("Function invoke: handler PANICKED",
@@ -1839,7 +1866,24 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 // capped by the configured maximum. Resolving the event rule is by exact handler
 // string, never event matching, so the replay still runs exactly one handler.
 // event is the entry's original payload, replayed verbatim.
-func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte) error {
+//
+// Tracing: a `dlq.replay` span wraps the whole replay as a NEW ROOT worker
+// operation (independent of the caller's context), carrying a span link to the
+// original failed invocation when lineage is supplied (the DLQ entry's optional
+// compact trace reference, forwarded by the control path — never embedded in the
+// event JSON). The replayed `function.invoke` runs as its child. An empty or
+// malformed lineage simply omits the link; the replay still runs. The operation
+// span is opened BEFORE registry/handler validation, so a removed function or
+// handler is still traced (with its error recorded) without changing any return
+// semantics.
+func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte, lineage string) (err error) {
+	// The replay operation is a new root worker span; its child function.invoke
+	// (started via InvokeHandler below) inherits this context. It is opened
+	// before validation and records the terminal outcome through the deferred
+	// finalizer on every return path.
+	opCtx, opSpan := startReplaySpan(ctx, fnName, handler, lineage)
+	defer func() { finishOperationSpan(opSpan, err) }()
+
 	pf := r.reg.GetByName(fnName)
 	if pf == nil {
 		return fmt.Errorf("%w: %q", ErrFunctionNotFound, fnName)
@@ -1854,7 +1898,7 @@ func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []
 	// TryStart/complete/retry/exhaustion, and no DLQ accounting. The opt-out
 	// makes the guarantee explicit even when the caller's context came from the
 	// stream delivery path.
-	return r.InvokeHandler(stream.WithoutInvocationState(ctx), "", fnName, handler, event)
+	return r.InvokeHandler(stream.WithoutInvocationState(opCtx), "", fnName, handler, event)
 }
 
 // templateHasHandler reports whether handler is present in the template's
@@ -1896,6 +1940,7 @@ func (r *Runner) invokeOnce(
 	timeout time.Duration,
 	invState stream.InvocationState,
 	invocation string,
+	handlerAttempt int,
 	msgID string,
 ) error {
 	// The invocation attempt has actually begun: the caller claimed it via
@@ -1933,7 +1978,8 @@ func (r *Runner) invokeOnce(
 		Image:     toImage(pf),
 	})
 	start := time.Now()
-	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv)
+	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv,
+		invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
 	elapsed := time.Since(start)
 	if panicked {
 		r.log.Error("Function handler: PANICKED for schedule",

@@ -153,6 +153,55 @@ func TestParseDLQEntryRejectsNonStringField(t *testing.T) {
 	}
 }
 
+// TestParseDLQEntryTraceOptional pins that the optional "trace" field parses
+// when present and is empty when absent (a pre-tracing entry), so an old entry
+// remains readable and a new one carries its lineage.
+func TestParseDLQEntryTraceOptional(t *testing.T) {
+	base := func() map[string]any {
+		return map[string]any{
+			"original_stream":  "events",
+			"original_id":      "1-0",
+			"group":            "relay",
+			"consumer":         "worker-1",
+			"event":            `{}`,
+			"reason":           "boom",
+			"function":         "fn",
+			"handler":          "index.run",
+			"deliveries":       "1",
+			"handler_attempts": "1",
+			"timestamp":        "2026-09-23T10:00:00Z",
+		}
+	}
+
+	// Absent: entry parses with an empty Trace (backward compatible).
+	e, err := ParseDLQEntry("1-1", base())
+	if err != nil {
+		t.Fatalf("ParseDLQEntry without trace: %v", err)
+	}
+	if e.Trace != "" {
+		t.Fatalf("Trace = %q, want empty when the field is absent", e.Trace)
+	}
+
+	// Present: parsed verbatim.
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01|vendor=x"
+	values := base()
+	values["trace"] = lineage
+	e, err = ParseDLQEntry("1-1", values)
+	if err != nil {
+		t.Fatalf("ParseDLQEntry with trace: %v", err)
+	}
+	if e.Trace != lineage {
+		t.Fatalf("Trace = %q, want %q", e.Trace, lineage)
+	}
+
+	// A non-string trace is surfaced rather than silently dropped.
+	bad := base()
+	bad["trace"] = 42
+	if _, err := ParseDLQEntry("1-1", bad); err == nil {
+		t.Fatal("a non-string trace field must be rejected")
+	}
+}
+
 // TestDLQStreamFor pins the DLQ stream naming convention the store and consumer
 // share.
 func TestDLQStreamFor(t *testing.T) {

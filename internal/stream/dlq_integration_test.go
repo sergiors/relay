@@ -53,14 +53,14 @@ func TestIntegrationDLQStoreListGetDelete(t *testing.T) {
 
 	id1, err := cli.XAdd(ctx, &redis.XAddArgs{
 		Stream: store.stream,
-		Values: dlqPayload(source, "orig-1", "relay", "w1", `{"a":1}`, "boom", "alpha", "h.a", 3, 1),
+		Values: dlqPayload(source, "orig-1", "relay", "w1", `{"a":1}`, "boom", "alpha", "h.a", 3, 1, ""),
 	}).Result()
 	if err != nil {
 		t.Fatalf("xadd 1: %v", err)
 	}
 	id2, err := cli.XAdd(ctx, &redis.XAddArgs{
 		Stream: store.stream,
-		Values: dlqPayload(source, "orig-1", "relay", "w1", `{"a":1}`, "boom", "beta", "h.b", 4, 2),
+		Values: dlqPayload(source, "orig-1", "relay", "w1", `{"a":1}`, "boom", "beta", "h.b", 4, 2, ""),
 	}).Result()
 	if err != nil {
 		t.Fatalf("xadd 2: %v", err)

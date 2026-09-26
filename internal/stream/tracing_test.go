@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
@@ -15,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"relay/internal/observability/tracing"
+	"relay/internal/schedule"
 )
 
 // withSpanRecorder installs an SDK provider backed by an in-memory exporter
@@ -253,5 +255,108 @@ func TestProcessMessageDisabledTracingStillProcesses(t *testing.T) {
 	c.processMessage(context.Background(), msg, 1, handler)
 	if !called {
 		t.Fatal("handler was not called with tracing disabled")
+	}
+}
+
+// TestProcessMessageRedeliveryDistinctSpansSameUpstreamTrace proves the
+// redelivery semantics: two deliveries of the SAME stream entry (reusing its
+// flat traceparent metadata) produce DISTINCT stream.message spans (different
+// span ids) that belong to the SAME upstream trace, and each delivery's handler
+// runs under its own delivery span. This is the core "retries reprocess the
+// original entry" behavior.
+func TestProcessMessageRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
+	rec := withSpanRecorder(t)
+	c := processMessageConsumer(newFakeInvocationStore(nil))
+
+	const remoteTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	remoteTraceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	msg := redis.XMessage{ID: "1-0", Values: map[string]any{
+		"event":       `{"event_name":"X"}`,
+		"traceparent": remoteTraceparent,
+	}}
+	handler := func(context.Context, string, map[string]any) error {
+		return errors.New("retryable failure")
+	}
+	// Delivery 1 and a redelivery (delivery 2) of the same message.
+	c.processMessage(context.Background(), msg, 1, handler)
+	c.processMessage(context.Background(), msg, 2, handler)
+
+	spans := rec.spans(t)
+	var messages []tracetest.SpanStub
+	for _, s := range spans {
+		if s.Name == "stream.message" {
+			messages = append(messages, s)
+		}
+	}
+	if len(messages) != 2 {
+		t.Fatalf("stream.message spans = %d, want 2 (one per delivery)", len(messages))
+	}
+	if messages[0].SpanContext.SpanID() == messages[1].SpanContext.SpanID() {
+		t.Fatal("redelivery reused the same stream.message span id; deliveries must be distinct spans")
+	}
+	for i, m := range messages {
+		if m.SpanContext.TraceID() != remoteTraceID {
+			t.Errorf("delivery %d trace id = %s, want the shared upstream %s", i+1, m.SpanContext.TraceID(), remoteTraceID)
+		}
+		if m.Parent.SpanID().String() != "00f067aa0ba902b7" {
+			t.Errorf("delivery %d parent = %s, want the reused upstream parent", i+1, m.Parent.SpanID())
+		}
+	}
+}
+
+// TestScheduleRedeliveryDistinctSpansSameUpstreamTrace proves schedule
+// occurrences ride the same redelivery semantics: two deliveries of one schedule
+// message produce distinct stream.message spans under the one upstream trace,
+// with the schedule runner invoked on each eligible delivery. The schedule
+// runner returns a retryable error so the message stays pending (no Redis round
+// trip) while still exercising the schedule path.
+func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
+	rec := withSpanRecorder(t)
+	occ := schedule.Occurrence{
+		Function:    "courses",
+		Handler:     "jobs.cleanup.handler",
+		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
+	}
+	envelope, err := occ.Envelope()
+	if err != nil {
+		t.Fatalf("Envelope: %v", err)
+	}
+	calls := 0
+	c := processMessageConsumer(newFakeInvocationStore(nil))
+	c.scheduleRunner = func(context.Context, string, string, string, []byte) error {
+		calls++
+		return errors.New("retryable schedule failure")
+	}
+
+	const remoteTraceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	remoteTraceID, _ := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	msg := redis.XMessage{ID: "9-0", Values: map[string]any{
+		"event":       string(envelope),
+		"traceparent": remoteTraceparent,
+	}}
+	handler := func(context.Context, string, map[string]any) error { return nil }
+
+	c.processMessage(context.Background(), msg, 1, handler)
+	c.processMessage(context.Background(), msg, 2, handler)
+	if calls != 2 {
+		t.Fatalf("schedule runner calls = %d, want 2 (both deliveries eligible)", calls)
+	}
+
+	var messages []tracetest.SpanStub
+	for _, s := range rec.spans(t) {
+		if s.Name == "stream.message" {
+			messages = append(messages, s)
+		}
+	}
+	if len(messages) != 2 {
+		t.Fatalf("stream.message spans = %d, want 2", len(messages))
+	}
+	if messages[0].SpanContext.SpanID() == messages[1].SpanContext.SpanID() {
+		t.Fatal("schedule redelivery reused the same span id; deliveries must be distinct")
+	}
+	for i, m := range messages {
+		if m.SpanContext.TraceID() != remoteTraceID {
+			t.Errorf("schedule delivery %d trace id = %s, want shared upstream %s", i+1, m.SpanContext.TraceID(), remoteTraceID)
+		}
 	}
 }

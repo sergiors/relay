@@ -260,6 +260,33 @@ func TestDLQInspectNonJSONEventVerbatim(t *testing.T) {
 	}
 }
 
+// TestDLQInspectTraceOptional verifies the optional trace lineage renders when
+// present and the Trace line is omitted entirely for a pre-tracing entry.
+func TestDLQInspectTraceOptional(t *testing.T) {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	withTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
+	withTrace.Trace = lineage
+	deps := withFakeDLQ(t, &fakeDLQStore{entries: []stream.DLQEntry{withTrace}})
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	if err != nil {
+		t.Fatalf("dlq inspect: %v", err)
+	}
+	if !strings.Contains(normWS(out), "Trace: "+lineage) {
+		t.Fatalf("inspect output missing the trace lineage:\n%s", out)
+	}
+
+	withoutTrace := dlqTestEntry("1-0", "1-0", "alpha", "h", `{}`, "2026-09-23T10:00:00Z")
+	deps = withFakeDLQ(t, &fakeDLQStore{entries: []stream.DLQEntry{withoutTrace}})
+	out, _, err = runCLIWithDeps(t, deps, "", "dlq", "inspect", "1-0")
+	if err != nil {
+		t.Fatalf("dlq inspect: %v", err)
+	}
+	if strings.Contains(out, "Trace:") {
+		t.Fatalf("a pre-tracing entry must not render a Trace line:\n%s", out)
+	}
+}
+
 // TestDLQInspectUnknownID verifies an unknown ID is a clear error.
 func TestDLQInspectUnknownID(t *testing.T) {
 	deps := withFakeDLQ(t, &fakeDLQStore{})
@@ -360,6 +387,66 @@ func TestDLQNoOpenerConfigured(t *testing.T) {
 	_, _, err := runCLIWithDeps(t, deps, "", "dlq", "ls")
 	if err == nil || !strings.Contains(err.Error(), "redis is not configured") {
 		t.Fatalf("err = %v, want a clear no-Redis error", err)
+	}
+}
+
+// recordingReplayer captures the DLQ-replay arguments the CLI forwards over the
+// socket, so a test can prove the entry's optional trace lineage travels on the
+// control path (separately from the event payload).
+type recordingReplayer struct {
+	mu    sync.Mutex
+	calls int
+	trace string
+	event []byte
+}
+
+func (r *recordingReplayer) ReplayDLQ(_ context.Context, _, _ string, event []byte, trace string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.event = append([]byte(nil), event...)
+	r.trace = trace
+	return nil
+}
+
+func (r *recordingReplayer) got() (int, []byte, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, append([]byte(nil), r.event...), r.trace
+}
+
+// TestDLQReplayForwardsTraceControlPath proves the replay sends the entry's
+// optional trace lineage to the worker as control-path metadata, separate from
+// the event payload (the payload never contains the lineage).
+func TestDLQReplayForwardsTraceControlPath(t *testing.T) {
+	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	entry := dlqTestEntry("1-0", "1-0", "user-events", "events.created.handler", `{"event_name":"INSERT"}`, "2026-09-23T10:00:00Z")
+	entry.Trace = lineage
+	store := &fakeDLQStore{entries: []stream.DLQEntry{entry}}
+	deps := withFakeDLQ(t, store)
+
+	rep := &recordingReplayer{}
+	startTestSocketWithReplayer(t, deps.SocketPath, rep)
+
+	out, _, err := runCLIWithDeps(t, deps, "", "dlq", "replay", "1-0")
+	if err != nil {
+		t.Fatalf("dlq replay: %v", err)
+	}
+	if strings.TrimSpace(out) != "Replayed handler successfully" {
+		t.Fatalf("stdout = %q", out)
+	}
+	calls, event, trace := rep.got()
+	if calls != 1 {
+		t.Fatalf("replayer calls = %d, want 1", calls)
+	}
+	if trace != lineage {
+		t.Fatalf("forwarded trace = %q, want %q", trace, lineage)
+	}
+	if strings.Contains(string(event), lineage) {
+		t.Fatalf("lineage leaked into the event payload: %q", event)
+	}
+	if len(store.entries) != 0 {
+		t.Fatalf("successful replay must delete the entry: %+v", store.entries)
 	}
 }
 
