@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )

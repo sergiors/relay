@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // TestManagerEffectiveConcurrencyClipsToGlobal pins the effective-bound rule:

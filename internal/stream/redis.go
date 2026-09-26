@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
+	"relay/internal/observability/tracing"
 	"relay/internal/schedule"
 )
 
@@ -745,6 +747,17 @@ func (c *Consumer) processMessage(
 	deliveryNum int64,
 	handler Handler,
 ) {
+	// A processing span for this delivery attempt. It is a child of the caller's
+	// context (the Consume/reclaim loop), and its outcome is recorded on every
+	// terminal path below by the single deferred finalizer. It never carries the
+	// event payload. outcome defaults to "pending" (left in the PEL for retry)
+	// and is set to a more specific terminal value where one applies.
+	spanCtx, span := c.messageSpan(ctx, "stream.message", deliveryNum)
+	outcome := "pending"
+	var spanErr error
+	defer func() { finishMessageSpan(span, outcome, spanErr) }()
+	ctx = spanCtx
+
 	// Register the panic boundary before any handler work so a panic in the
 	// handler handoff (or in classifyMessage, which is pure JSON parsing and
 	// practically cannot panic) is caught. The delivery is treated as failed:
@@ -757,6 +770,8 @@ func (c *Consumer) processMessage(
 	// a new failure class.
 	defer func() {
 		if pv := recover(); pv != nil {
+			outcome = "panic"
+			spanErr = fmt.Errorf("panic: %v", pv)
 			c.log.Error("Message: panic in handler", "message_id", msg.ID, "error", pv, "stack", string(debug.Stack()))
 		}
 	}()
@@ -769,6 +784,7 @@ func (c *Consumer) processMessage(
 			"delivery_attempt", deliveryNum,
 			"error", err,
 		)
+		outcome, spanErr = "dlq", err
 		c.routeToDLQ(ctx, msg, err, deliveryNum)
 		return
 	}
@@ -794,11 +810,21 @@ func (c *Consumer) processMessage(
 	// matching entirely. A nil ScheduleRunner falls back to treating schedule
 	// messages as normal events (the safe fallback for tests/unwired consumers).
 	if occ, ok := schedule.IsScheduleEvent(event); ok && c.scheduleRunner != nil {
-		c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
+		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
 		return
 	}
 
-	if err := handler(handlerCtx, msg.ID, event); err != nil {
+	// A child span around the handler dispatch (the runner's matching and
+	// execution) keeps the Redis bookkeeping of processMessage visibly separate
+	// from invocation execution, which the runner further instruments.
+	dispatchCtx, dispatchSpan := tracing.Start(handlerCtx, "stream.dispatch")
+	err = handler(dispatchCtx, msg.ID, event)
+	if err != nil {
+		dispatchSpan.RecordError(err)
+		dispatchSpan.SetStatus(codes.Error, err.Error())
+	}
+	dispatchSpan.End()
+	if err != nil {
 		// If we are shutting down (ctx cancelled), this is not a real attempt: do
 		// not count it nor DLQ the message — leave it pending for a live consumer.
 		if ctx.Err() != nil {
@@ -826,6 +852,7 @@ func (c *Consumer) processMessage(
 				"delivery_attempt", deliveryNum,
 				"reason", err,
 			)
+			outcome, spanErr = "dlq", err
 			c.routeToDLQ(ctx, msg, err, deliveryNum)
 			return
 		}
@@ -839,11 +866,17 @@ func (c *Consumer) processMessage(
 		return
 	}
 
-	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
+	ackCtx, ackSpan := redisSpan(ctx, "redis.ack")
+	if err := c.client.XAck(ackCtx, c.stream, c.group, msg.ID).Err(); err != nil {
+		ackSpan.RecordError(err)
+		ackSpan.SetStatus(codes.Error, err.Error())
+		ackSpan.End()
 		c.log.Warn("Message: ack failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return
 	}
+	ackSpan.End()
+	outcome = "acked"
 	// The message is fully processed and acknowledged: eagerly clear its
 	// invocation-state hash. Ordering matters — clear only AFTER a successful
 	// ACK. If the ACK failed (handled above) the message stays in the PEL and
@@ -863,12 +896,15 @@ func (c *Consumer) processMessage(
 // left pending on a retryable failure or protected skip, and routed to the DLQ
 // on exhaustion.
 //
+// It returns the terminal outcome label and an error for the caller's message
+// span, so the schedule path is traced identically to the event path.
+//
 // Schedule occurrences are deliberately NOT counted in the event-classification
 // counters (received/matched/unmatched): they bypass event matching, so they
 // have no meaningful matched/unmatched class and would otherwise break the
 // partition invariant. Schedule activity is accounted by the schedule
 // publication counters and the per-function handler counters.
-func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) {
+func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) (string, error) {
 	c.log.Debug("Schedule: executing occurrence",
 		"function", occ.Function,
 		"handler", occ.Handler,
@@ -894,7 +930,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {
 			c.log.Debug("Schedule: message canceled during shutdown; leaving pending", "message_id", msgID)
-			return
+			return "pending", nil
 		}
 		// A protected invocation (running on another replica, or waiting out its
 		// retry backoff) means the message stays pending, not a failed attempt:
@@ -904,7 +940,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				"message_id", msgID,
 				"delivery_attempt", deliveryNum,
 			)
-			return
+			return "pending", nil
 		}
 		// An obsolete invocation: the function or its schedule entry/handler was
 		// removed from the current configuration while the message was pending.
@@ -924,7 +960,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			if ackErr != nil {
 				c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", ackErr)
 				c.noteOutcome(ackErr, 0)
-				return
+				return "pending", ackErr
 			}
 			// Clear the invocation-state hash after a successful ACK, exactly
 			// like the success tail. A clear failure is logged only; the TTL is
@@ -932,7 +968,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			if cerr := c.invStateStore.clear(ctx, c.stream, c.group, msgID); cerr != nil {
 				c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", cerr)
 			}
-			return
+			return "acked", nil
 		}
 		// A terminal message: the schedule invocation is exhausted, so the message
 		// routes to the DLQ.
@@ -949,27 +985,30 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			} else {
 				c.routeToDLQ(ctx, redis.XMessage{ID: msgID}, err, deliveryNum)
 			}
-			return
+			return "dlq", err
 		}
-		// A retryable failure: leave pending for a later reclaim.
+		// A retryable failure: leave pending for a later reclaim. The
+		// invocation error is recorded by the runner's function.invoke span, so
+		// the message span only records the pending disposition.
 		c.log.Warn("Schedule: retryable failure; leaving pending for a later reclaim",
 			"message_id", msgID,
 			"delivery_attempt", deliveryNum,
 			"reason", err,
 		)
-		return
+		return "pending", nil
 	}
 
 	if err := c.client.XAck(ctx, c.stream, c.group, msgID).Err(); err != nil {
 		c.log.Warn("Schedule: message ack failed", "message_id", msgID, "error", err)
 		c.noteOutcome(err, 0)
-		return
+		return "pending", err
 	}
 	// Eagerly clear the invocation-state hash after a successful ACK, exactly
 	// like processMessage. A clear failure is logged only; the TTL is the fallback.
 	if err := c.invStateStore.clear(ctx, c.stream, c.group, msgID); err != nil {
 		c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", err)
 	}
+	return "acked", nil
 }
 
 // unpersistedDLQSpecs filters the DLQ entry specs down to those whose entry has
@@ -1047,6 +1086,12 @@ func (c *Consumer) routeToDLQ(
 		c.log.Debug("Message: all DLQ entries already persisted; acking without rewrite",
 			"message_id", msg.ID)
 	}
+	// One child span around the whole DLQ write+ack operation. It is a child of
+	// the current message span; the payload and reason text are never attached
+	// (the reason may quote handler output).
+	dlqCtx, dlqSpan := redisSpan(ctx, "redis.dlq")
+	defer dlqSpan.End()
+	ctx = dlqCtx
 	for _, spec := range specs {
 		entry := dlqPayload(
 			c.stream, msg.ID, c.group, c.consumer,
@@ -1056,6 +1101,8 @@ func (c *Consumer) routeToDLQ(
 			Stream: c.dlqStream,
 			Values: entry,
 		}).Result(); err != nil {
+			dlqSpan.RecordError(err)
+			dlqSpan.SetStatus(codes.Error, err.Error())
 			c.log.Error("Message: DLQ write failed (leaving pending)",
 				"message_id", msg.ID,
 				"delivery_attempt", deliveries,
@@ -1087,6 +1134,8 @@ func (c *Consumer) routeToDLQ(
 		)
 	}
 	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
+		dlqSpan.RecordError(err)
+		dlqSpan.SetStatus(codes.Error, err.Error())
 		c.log.Warn("Message: ack after DLQ failed", "message_id", msg.ID, "error", err)
 		c.noteOutcome(err, 0)
 		return

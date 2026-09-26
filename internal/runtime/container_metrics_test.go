@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // newMetricsCache returns a cache wired to a fresh registry plus a fake factory.

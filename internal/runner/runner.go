@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/secrets"
 	"relay/internal/stream"
@@ -882,6 +882,27 @@ func (r *Runner) runInvocation(
 	eventJSON []byte,
 	extraEnv []string,
 ) (panicked bool, panicValue any, err error) {
+	// The end-to-end invocation span, shared by the event-rule, schedule, and
+	// manual paths (all funnel through here). It is a child of the delivery
+	// context, and its span context is propagated into the executor so the
+	// runtime's runtime.execute/acquire/invoke children nest beneath it. RunMeta
+	// and the timeout already stamped on invokeCtx are inherited.
+	var runtimeName string
+	if pf != nil && pf.fn.Template != nil {
+		runtimeName = pf.fn.Template.Runtime
+	}
+	var fnName string
+	if pf != nil {
+		fnName = pf.fn.Name
+	}
+	spanCtx, span := startInvocationSpan(invokeCtx, fnName, handler, runtimeName)
+	defer func() {
+		if panicked {
+			finishInvocationSpan(span, fmt.Errorf("executor panic: %v", panicValue))
+			return
+		}
+		finishInvocationSpan(span, err)
+	}()
 	defer cancel()
 	defer func() {
 		if pv := recover(); pv != nil {
@@ -890,7 +911,7 @@ func (r *Runner) runInvocation(
 			err = fmt.Errorf("executor panic: %v", pv)
 		}
 	}()
-	return false, nil, r.executeWithRefs(pf, invokeCtx, handler, eventJSON, extraEnv)
+	return false, nil, r.executeWithRefs(pf, spanCtx, handler, eventJSON, extraEnv)
 }
 
 // Handle evaluates the event against all loaded functions and executes every

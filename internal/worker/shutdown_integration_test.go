@@ -31,7 +31,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
 	"relay/internal/runtime"

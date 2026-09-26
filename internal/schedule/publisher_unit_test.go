@@ -8,7 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
 

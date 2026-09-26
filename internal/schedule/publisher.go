@@ -8,7 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // occurrenceTTL is how long a schedule-occurrence dedup key survives after

@@ -3,7 +3,7 @@ package runtime
 import (
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // This file holds the warm-container pool's observability wiring. It is the

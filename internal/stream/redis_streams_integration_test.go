@@ -34,7 +34,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"relay/internal/config"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
 

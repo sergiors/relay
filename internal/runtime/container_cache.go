@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // reusableContainer is the seam the per-function container pool programs: the
@@ -448,16 +448,26 @@ func (cc *containerCache) execute(
 	handler string,
 	eventJSON []byte,
 	env map[string]string,
-) error {
-	lease, err := cc.acquire(ctx, fnName, image, max, start)
+) (retErr error) {
+	// A span around the pool acquire (a warm lease or a cold container start),
+	// distinct from the invocation protocol exchange below, so a slow pool wait
+	// or cold start is attributable separately.
+	acquireCtx, acquireSpan := startRuntimeSpan(ctx, "runtime.acquire", fnName, image)
+	lease, err := cc.acquire(acquireCtx, fnName, image, max, start)
 	if err != nil {
+		finishRuntimeSpan(acquireSpan, err)
 		return err
 	}
+	acquireSpan.End()
 	// The lease is always returned, even if the invocation panics: a panic
 	// must never leak capacity. invoke poisons the container first when it
 	// panics, so release discards rather than reuses a possibly-corrupt one.
 	defer lease.release()
-	return lease.invoke(ctx, handler, eventJSON, env)
+	// The invocation protocol exchange: one request/response frame over the
+	// leased container's stdin/stdout.
+	invokeCtx, invokeSpan := startRuntimeSpan(ctx, "runtime.invoke", fnName, image)
+	defer func() { finishRuntimeSpan(invokeSpan, retErr) }()
+	return lease.invoke(invokeCtx, handler, eventJSON, env)
 }
 
 // acquire leases one container for fnName's image version, blocking

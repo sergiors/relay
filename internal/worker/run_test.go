@@ -62,6 +62,7 @@ func TestShutdownRegistryRunsInExplicitOrderAndNeverStopsOnError(t *testing.T) {
 	reg.register(simple(shutdownStepMetrics))
 	reg.register(simple(shutdownStepWebhook))
 	reg.register(simple(shutdownStepState))
+	reg.register(simple(shutdownStepTracing))
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -71,7 +72,7 @@ func TestShutdownRegistryRunsInExplicitOrderAndNeverStopsOnError(t *testing.T) {
 		shutdownStepSocket, shutdownStepScheduler, shutdownStepHousekeeping,
 		shutdownStepServicesJoin, shutdownStepServiceCleanup, shutdownStepStatsFlush,
 		shutdownStepMetrics, shutdownStepWebhook, shutdownStepManager,
-		shutdownStepState, shutdownStepRedis,
+		shutdownStepState, shutdownStepTracing, shutdownStepRedis,
 	}
 	if len(order) != len(want) {
 		t.Fatalf("ran %v, want %v", order, want)
@@ -271,6 +272,7 @@ func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 	for _, name := range []string{
 		shutdownStepRedis, shutdownStepState, shutdownStepStatsFlush,
 		shutdownStepManager, shutdownStepServiceCleanup, shutdownStepServicesJoin,
+		shutdownStepTracing,
 	} {
 		reg.register(registeredStep(name, time.Second, &order))
 	}
@@ -296,6 +298,12 @@ func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 	if index(shutdownStepStatsFlush) >= index(shutdownStepState) {
 		t.Errorf("stats-flush (%d) must precede state (%d): %v",
 			index(shutdownStepStatsFlush), index(shutdownStepState), order)
+	}
+	// Tracing flushes after every span-producing resource has stopped (state,
+	// manager, servers) and immediately before Redis is released last.
+	if index(shutdownStepTracing) <= index(shutdownStepState) {
+		t.Errorf("tracing (%d) must follow state (%d): %v",
+			index(shutdownStepTracing), index(shutdownStepState), order)
 	}
 	if last := order[len(order)-1]; last != shutdownStepRedis {
 		t.Errorf("last step = %q, want %q (Redis released last): %v", last, shutdownStepRedis, order)

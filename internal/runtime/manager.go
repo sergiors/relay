@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/moby/moby/client"
+	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 	"relay/internal/runtime/python"
@@ -649,7 +650,15 @@ func (m *Manager) prepare(
 	notifyFunctionBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
+	// The actual managed image build boundary (after every reuse probe). The span
+	// is rooted in the caller's context so it nests under the preparing
+	// function's span; the build itself still runs on the lifecycle-bounded
+	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
+	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
 	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), selection); err != nil {
+		buildSpan.RecordError(err)
+		buildSpan.SetStatus(codes.Error, err.Error())
+		buildSpan.End()
 		elapsed := time.Since(start)
 		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
 			{Name: "function", Value: fn.Name},
@@ -666,6 +675,7 @@ func (m *Manager) prepare(
 		)
 		return nil, err
 	}
+	buildSpan.End()
 	elapsed := time.Since(start)
 	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
@@ -817,7 +827,13 @@ func (m *Manager) ensureDependencyImage(
 	notifyFunctionBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
+	// The dependency layer is a real build, so it is spanned like the function
+	// image build. The span nests under the preparing function's span.
+	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
 	if err := buildDependencyImage(buildCtx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
+		depBuildSpan.RecordError(err)
+		depBuildSpan.SetStatus(codes.Error, err.Error())
+		depBuildSpan.End()
 		elapsed := time.Since(start)
 		// Dependency-image build failures count as function build failures so the
 		// existing failure metric/label surface stays the single observability
@@ -833,6 +849,7 @@ func (m *Manager) ensureDependencyImage(
 		)
 		return "", err
 	}
+	depBuildSpan.End()
 	elapsed := time.Since(start)
 	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
 		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
@@ -882,7 +899,13 @@ func (m *Manager) Execute(
 	handler string,
 	eventJSON []byte,
 	extraEnv []string,
-) error {
+) (retErr error) {
+	// The top-level execution span. It is a child of the invocation's context
+	// (which the runner already instrumented with function.invoke), so the
+	// runtime's acquire/invoke children nest under it. Payload and env values
+	// are never attached.
+	ctx, span := startRuntimeSpan(ctx, "runtime.execute", prepared.Name, prepared.Image)
+	defer func() { finishRuntimeSpan(span, retErr) }()
 	meta := RunMetaFrom(ctx)
 	if meta.Hostname == "" {
 		// Fall back to the manager's worker identity so a direct caller that

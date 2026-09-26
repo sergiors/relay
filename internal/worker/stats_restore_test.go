@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/state"
 )
 

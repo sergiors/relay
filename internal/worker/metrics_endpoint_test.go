@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // TestMetricsEndpointScrapeExposesFunctionSeries boots a metrics server on a

@@ -47,6 +47,15 @@ const (
 // invokeRequest is one request frame Relay writes to the container's stdin as a
 // single JSON line. Event is the raw event JSON passed through verbatim
 // (json.RawMessage), so Relay never re-encodes or mutates the payload.
+//
+// Future trace propagation seam: the frame deliberately carries no trace
+// context today, because the Python and Node bootstraps would ignore an unknown
+// field and adding one is a cross-language protocol change. When distribution
+// is wanted, tracing.InjectMap(ctx, carrier) renders the W3C traceparent header
+// (tracing.TraceparentKey) into a carrier; a new optional `traceparent` string
+// field here (omitempty, so the wire stays byte-compatible for existing
+// bootstraps) plus tracing.ExtractMap on the container side would carry it end
+// to end without touching span creation.
 type invokeRequest struct {
 	ID      string            `json:"id"`
 	Handler string            `json:"handler"`

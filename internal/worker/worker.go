@@ -2,7 +2,8 @@
 // It loads functions, builds their images, reconciles them live, and consumes
 // the Redis stream, blocking until signalled. Configuration comes entirely
 // from the environment. It can also expose a Prometheus /metrics endpoint (see
-// internal/metrics), gated on the METRICS_ADDR environment variable, and
+// internal/observability/metrics), gated on the METRICS_ADDR environment
+// variable, and
 // flushes the registry into the local state database on a fixed 5-second
 // cadence: stats accumulate in memory (the registry is the single source of
 // truth), Prometheus reflects them immediately, and SQLite receives the current
@@ -28,12 +29,14 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/config"
 	"relay/internal/cron"
 	"relay/internal/function"
 	gitwh "relay/internal/git/webhook"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
+	"relay/internal/observability/tracing"
 	"relay/internal/reconciler"
 	"relay/internal/routing"
 	"relay/internal/runner"
@@ -83,6 +86,12 @@ const shutdownStepTimeout = 5 * time.Second
 // 2s bound the flush historically applied internally, now owned by the shutdown
 // registry so it is visible alongside every other step's bound.
 const shutdownStatsFlushTimeout = 2 * time.Second
+
+// shutdownTracingTimeout bounds the OpenTelemetry provider shutdown that flushes
+// the batch span processor. It is deliberately short: a wedged collector must
+// never hang process teardown, and dropping the last batch of telemetry is
+// preferable to delaying shutdown.
+const shutdownTracingTimeout = 5 * time.Second
 
 // effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
 // (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
@@ -188,12 +197,6 @@ func startupResult(err error) error {
 // abandoning live servers, goroutines, containers, and the state DB to process
 // exit.
 func Run(logger *slog.Logger) error {
-	// Phase 1 startup timing: runStart anchors the total ready-to-consume
-	// measurement, logged at Debug immediately before Consume. Each phase below
-	// is measured with its own local start and reported with time.Since at
-	// Debug, so the startup cost of every stage is observable without any
-	// always-on production logging.
-	runStart := time.Now()
 	cfg := config.Load(logger)
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
@@ -212,6 +215,22 @@ func Run(logger *slog.Logger) error {
 	// likewise rooted here (rather than context.Background), so shutdown cancels
 	// them too. It replaces the signal context that used to be created later.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+	// Tracing is initialized before the root startup span and rooted in the
+	// worker lifecycle. It is disabled by default (no endpoint => no exporter, no
+	// collector connection); Setup always returns a usable provider, and a setup
+	// error is non-fatal observability (the worker runs untraced).
+	tracerProvider, tracerErr := tracing.Setup(ctx, logger)
+	if tracerErr != nil {
+		logger.Warn("Tracing: setup failed; continuing without tracing", "error", tracerErr)
+	}
+
+	// The startup trace root. Its children cover each startup phase; it ends at
+	// the ready-to-consume boundary immediately before consumer.Consume. The
+	// deferred End below is a no-op after the explicit one and guarantees the
+	// span closes on every early-return path (before the provider shutdown step
+	// flushes it).
+	startupCtx, startupSpan := tracing.Start(ctx, "relay.startup")
 
 	// Metrics are opt-in, gated on METRICS_ADDR. Setup only CREATES the registry
 	// and /metrics server here (nil, nil when disabled); STARTING them happens
@@ -236,12 +255,23 @@ func Run(logger *slog.Logger) error {
 		name: shutdownStepRedis,
 		run:  func(context.Context) error { return client.Close() },
 	})
+	// Tracing is released LAST, after every other resource has stopped producing
+	// spans, under a bounded provider shutdown that flushes the batch processor.
+	// A disabled provider's Shutdown is a no-op.
+	shutdown.register(shutdownStep{
+		name:    shutdownStepTracing,
+		timeout: shutdownTracingTimeout,
+		run:     tracerProvider.Shutdown,
+	})
 
 	// Cancel the lifecycle FIRST: a startup failure returns without a signal
 	// having arrived, so background loops, the coordinator, and the manager
-	// builds observe cancellation before teardown joins them.
+	// builds observe cancellation before teardown joins them. The root span is
+	// ended BEFORE the registry (and its tracing shutdown step) runs, so an
+	// early-return startup failure still flushes its trace.
 	defer func() {
 		stop()
+		startupSpan.End()
 		shutdown.run(logger)
 	}()
 
@@ -267,17 +297,20 @@ func Run(logger *slog.Logger) error {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
 
-	loaderStart := time.Now()
+	_, loaderSpan := tracing.Start(startupCtx, "functions.load")
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
 	if err != nil {
+		loaderSpan.RecordError(err)
+		loaderSpan.SetStatus(codes.Error, err.Error())
+		loaderSpan.End()
 		// The worker cannot run without its function set. The deferred cleanup
 		// releases the Redis client and stops the servers; the error is returned
 		// for the CLI boundary to print and exit on.
 		return fmt.Errorf("load functions failed: %w", err)
 	}
+	loaderSpan.End()
 	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
-	logger.Debug("Startup: functions loaded", "duration", time.Since(loaderStart))
 
 	// Compute every loaded function's content fingerprint ONCE for the whole
 	// startup and carry it forward as the immutable startup fingerprint. It is
@@ -287,20 +320,21 @@ func Run(logger *slog.Logger) error {
 	// (see internal/state), NOT the source of truth and never drives matching or
 	// building; it is opened after the fingerprints so even a broken DB still
 	// yields fingerprints for Prepare and the reconciler.
-	fingerprintStart := time.Now()
+	_, fingerprintSpan := tracing.Start(startupCtx, "functions.fingerprint")
 	discovered := fingerprintDiscovered(functions, logger)
 	fingerprints := make(map[string]string, len(discovered))
 	for _, d := range discovered {
 		fingerprints[d.Function.Name] = d.Fingerprint
 	}
-	logger.Debug("Startup: functions fingerprinted", "duration", time.Since(fingerprintStart))
+	fingerprintSpan.End()
 
 	// All state errors are non-fatal. A nil handle is never registered, so
 	// shutdown simply skips its close.
-	stateStart := time.Now()
+	_, stateSpan := tracing.Start(startupCtx, "state.initialize")
 	st, err := state.Open(state.DBPath)
 	if err != nil {
 		logger.Warn("State: open failed; continuing without", "error", err)
+		stateSpan.RecordError(err)
 		st = nil
 	}
 	if st != nil {
@@ -315,6 +349,7 @@ func Run(logger *slog.Logger) error {
 		// re-read for state and each function's source is hashed exactly once.
 		if err := st.RebuildFromFunctions(discovered); err != nil {
 			logger.Warn("State: rebuild from functions failed; continuing", "error", err)
+			stateSpan.RecordError(err)
 		}
 		// Prune state rows for functions no longer on disk BEFORE
 		// restorePersistedStats, so a pruned function's stats row is gone before
@@ -325,14 +360,14 @@ func Run(logger *slog.Logger) error {
 			st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
 		}
 	}
-	logger.Debug("Startup: state initialized", "duration", time.Since(stateStart))
+	stateSpan.End()
 
 	// Seed the fresh registry with the persisted cumulative totals so the first
 	// snapshot writes them back instead of zeroing SQLite. Gauges are NOT
 	// restored (they are point-in-time snapshots refreshed each interval).
-	statsRestoreStart := time.Now()
+	_, statsRestoreSpan := tracing.Start(startupCtx, "state.restore_stats")
 	restorePersistedStats(metricsInstance, st)
-	logger.Debug("Startup: stats restored", "duration", time.Since(statsRestoreStart))
+	statsRestoreSpan.End()
 
 	// The stats flusher is the single owner of every write of the registry's
 	// Relay-visible totals into SQLite. It holds a mutex across BOTH the capture
@@ -350,7 +385,7 @@ func Run(logger *slog.Logger) error {
 		},
 	})
 
-	managerStart := time.Now()
+	_, managerSpan := tracing.Start(startupCtx, "runtime.initialize")
 	manager, err := runtime.NewManager(
 		logger,
 		metricsInstance,
@@ -373,17 +408,20 @@ func Run(logger *slog.Logger) error {
 		runtime.WithLifecycleContext(ctx),
 	)
 	if err != nil {
+		managerSpan.RecordError(err)
+		managerSpan.SetStatus(codes.Error, err.Error())
+		managerSpan.End()
 		// The runtime manager owns container execution, which the worker cannot
 		// serve without. The deferred cleanup closes the Redis client and state DB.
 		return fmt.Errorf("runtime: new manager failed: %w", err)
 	}
+	managerSpan.End()
 	// manager.Close took no context before the registry owned the teardown, so
 	// it declares no bound (timeout 0) and keeps running unbounded.
 	shutdown.register(shutdownStep{
 		name: shutdownStepManager,
 		run:  func(context.Context) error { return manager.Close() },
 	})
-	logger.Debug("Startup: runtime manager ready", "duration", time.Since(managerStart))
 
 	// Verify every configured NETWORKS network exists BEFORE any function is
 	// prepared or any container created. The networks are infrastructure owned
@@ -391,8 +429,11 @@ func Run(logger *slog.Logger) error {
 	// condition that must fail startup rather than silently produce containers
 	// on the wrong (or no) network. A verify error (a broken daemon) is likewise
 	// fatal. The check is skipped entirely when NETWORKS is unset.
-	networksStart := time.Now()
-	if err := verifyConfiguredNetworks(ctx, manager, cfg.Networks); err != nil {
+	networkCtx, networkSpan := tracing.Start(startupCtx, "network.verify")
+	if err := verifyConfiguredNetworks(networkCtx, manager, cfg.Networks); err != nil {
+		networkSpan.RecordError(err)
+		networkSpan.SetStatus(codes.Error, err.Error())
+		networkSpan.End()
 		// A lifecycle cancellation during verification is a shutdown, not a
 		// network failure: classify it like every other fallible startup step
 		// and return nil so the CLI does not report a graceful stop as an error.
@@ -402,7 +443,7 @@ func Run(logger *slog.Logger) error {
 		}
 		return err
 	}
-	logger.Debug("Startup: configured networks verified", "duration", time.Since(networksStart))
+	networkSpan.End()
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -412,18 +453,21 @@ func Run(logger *slog.Logger) error {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
-	socketStart := time.Now()
+	_, socketSpan := tracing.Start(startupCtx, "runtime.socket")
 	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
 	if err != nil {
+		socketSpan.RecordError(err)
+		socketSpan.SetStatus(codes.Error, err.Error())
+		socketSpan.End()
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
+	socketSpan.End()
 	// rtSocket.Close took no context before the registry owned the teardown, so
 	// it declares no bound (timeout 0) and keeps running unbounded.
 	shutdown.register(shutdownStep{
 		name: shutdownStepSocket,
 		run:  func(context.Context) error { return rtSocket.Close() },
 	})
-	logger.Debug("Startup: runtime socket ready", "duration", time.Since(socketStart))
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
 	// The service controller converges each function's persistent service
@@ -471,25 +515,26 @@ func Run(logger *slog.Logger) error {
 	// hostname-scoped, so other workers' and non-Relay containers are untouched.
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
-	orphanSweepStart := time.Now()
-	sweepCtx, sweepCancel := context.WithTimeout(ctx, reconcileTimeout)
+	orphanCtx, orphanSpan := tracing.Start(startupCtx, "orphan.sweep")
+	sweepCtx, sweepCancel := context.WithTimeout(orphanCtx, reconcileTimeout)
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
 	if sweepErr != nil {
 		// A cancelled lifecycle is a normal shutdown, not a sweep failure.
+		orphanSpan.RecordError(sweepErr)
 		logStartupCleanupFailure(ctx, logger, "Startup: orphan container sweep failed", sweepErr)
 	} else if n > 0 {
 		logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
 	}
-	logger.Debug("Startup: execution orphan sweep complete", "duration", time.Since(orphanSweepStart))
+	orphanSpan.End()
 
 	// Build every function's image. A function whose image cannot be built is
 	// marked unavailable so the runner skips it; the rest continue. The
 	// fingerprints computed once above are supplied to Prepare, so no startup
 	// build re-reads a function's source to derive an identity it already has.
-	prepareStart := time.Now()
-	prepared := prepareFunctions(ctx, manager, functions, fingerprints, st, logger)
-	logger.Debug("Startup: functions prepared", "duration", time.Since(prepareStart))
+	prepareCtx, prepareSpan := tracing.Start(startupCtx, "functions.prepare")
+	prepared := prepareFunctions(prepareCtx, manager, functions, fingerprints, st, logger)
+	prepareSpan.End()
 
 	// Publish each function's initial desired service state and return
 	// immediately. The coordinator's bounded workers converge the states in the
@@ -497,9 +542,9 @@ func Run(logger *slog.Logger) error {
 	// external image pull) — nor on the unavailable/no-services removals, which
 	// are published the same nonblocking way (the coordinator derives their own
 	// fresh bound).
-	serviceEnqueueStart := time.Now()
+	_, enqueueSpan := tracing.Start(startupCtx, "services.enqueue")
 	enqueueStartupServicesWithState(prepared, services, st, logger)
-	logger.Debug("Startup: startup services enqueued", "duration", time.Since(serviceEnqueueStart))
+	enqueueSpan.End()
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
 	// barrier for the initial service attempts to settle, then runs the startup
@@ -636,8 +681,13 @@ func Run(logger *slog.Logger) error {
 		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
 	}
 
-	ensureGroupStart := time.Now()
-	if err := ensureGroup(ctx, consumer, logger); err != nil {
+	groupCtx, groupSpan := tracing.Start(startupCtx, "redis.consumer_group")
+	if err := ensureGroup(groupCtx, consumer, logger); err != nil {
+		if !errors.Is(err, errStartupInterrupted) {
+			groupSpan.RecordError(err)
+			groupSpan.SetStatus(codes.Error, err.Error())
+		}
+		groupSpan.End()
 		// The consumer group is a hard prerequisite for consumption. Return now so
 		// the deferred cleanup stops the servers and loops; startupResult turns a
 		// lifecycle-cancelled startup into a graceful nil return (the process is
@@ -645,7 +695,7 @@ func Run(logger *slog.Logger) error {
 		// to print and exit on.
 		return startupResult(err)
 	}
-	logger.Debug("Startup: consumer group ready", "duration", time.Since(ensureGroupStart))
+	groupSpan.End()
 
 	// The schedule publisher atomically publishes one stream entry per logical
 	// occurrence cluster-wide (publish-if-new Lua script) into the same stream the
@@ -745,15 +795,15 @@ func Run(logger *slog.Logger) error {
 	// fingerprints must NOT be trusted: Seed is skipped entirely and Start logs
 	// the error and does not run the loops, so no stale seed can suppress a
 	// rebuild.
-	reconcilerSeedStart := time.Now()
+	_, reconcilerSpan := tracing.Start(startupCtx, "reconciler.start")
 	if err := rec.PrepareWatch(ctx); err != nil {
 		logger.Error("Reconciler: fsnotify error; not seeding startup fingerprints", "error", err)
+		reconcilerSpan.RecordError(err)
 	} else {
 		for _, fn := range functions {
 			rec.Seed(fn, fingerprints[fn.Name])
 		}
 	}
-	logger.Debug("Startup: reconciler seeded", "duration", time.Since(reconcilerSeedStart))
 	logger.Info("Watching functions for changes", "root", function.Dir)
 
 	// Runs in its own goroutine and stops when ctx is cancelled. Start reuses the
@@ -769,8 +819,13 @@ func Run(logger *slog.Logger) error {
 		timeout: shutdownStepTimeout,
 		run:     sched.Stop,
 	})
+	reconcilerSpan.End()
 
-	logger.Debug("Startup: ready to consume", "duration", time.Since(runStart))
+	// The startup root ends here, at the ready-to-consume boundary immediately
+	// before Consume. Everything before it is a child of the root; consumption
+	// then establishes its own per-message spans.
+	startupSpan.End()
+
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,
 		"group", cfg.RedisGroup,
@@ -810,6 +865,7 @@ const (
 	shutdownStepWebhook        = "webhook"
 	shutdownStepManager        = "manager"
 	shutdownStepState          = "state"
+	shutdownStepTracing        = "tracing"
 	shutdownStepRedis          = "redis"
 )
 
@@ -830,6 +886,7 @@ var shutdownStepOrder = []string{
 	shutdownStepWebhook,
 	shutdownStepManager,
 	shutdownStepState,
+	shutdownStepTracing,
 	shutdownStepRedis,
 }
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/runner"
 	"relay/internal/state"
 )

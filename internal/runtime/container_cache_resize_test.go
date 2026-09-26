@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 )
 
 // acquireN leases n containers for fnName/image at max and returns the leases.

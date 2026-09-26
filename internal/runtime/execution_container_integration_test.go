@@ -23,7 +23,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
-	"relay/internal/metrics"
+	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
 
