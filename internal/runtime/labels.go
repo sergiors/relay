@@ -9,7 +9,7 @@ package runtime
 //	          (runner.InvokeHandler). relay.handler is the schedule handler.
 //	service  — a persistent, long-lived service container (Manager.StartService).
 //	          relay.identity is the service identity: the configured source
-//	          descriptor (entrypoint file, Dockerfile path, or external image
+//	          descriptor (entrypoint file or external image
 //	          reference). Service containers carry relay.identity and NO
 //	          relay.handler and NO relay.service label: the source IS the
 //	          service.
@@ -46,9 +46,9 @@ const (
 	labelImage     = "relay.image"
 
 	// labelIdentity is the persistent service's identity: the configured source
-	// descriptor (entrypoint file, Dockerfile path, or external image
-	// reference). It replaces the former relay.entrypoint label so every source
-	// kind has an honest identity. labelImageID records the local content ID a
+	// descriptor (entrypoint file or external image reference). It replaces the
+	// former relay.entrypoint label so every source kind has an honest identity.
+	// labelImageID records the local content ID a
 	// service container was started from (empty for content-addressed Relay
 	// tags), so a moved external tag is detected.
 	labelIdentity = "relay.identity"

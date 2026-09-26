@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"relay/internal/source"
@@ -37,6 +38,55 @@ func Fingerprint(dir string) (string, error) {
 		return "", fmt.Errorf("select %q: %w", dir, err)
 	}
 	return FingerprintSelection(selection)
+}
+
+// FingerprintFunction returns the content fingerprint that gates a function's
+// reconciliation, choosing the narrowest input set that can actually change its
+// behavior:
+//
+//   - a template that needs a runtime (events, schedules, an explicit runtime,
+//     or an entrypoint service) builds and runs its own image, so the full
+//     selected source is fingerprinted (see Fingerprint);
+//   - a template that needs no runtime (its only services use external `image`
+//     sources) never builds an image from source, so only template.yaml — the
+//     sole file whose content affects the desired services, routing, env, and
+//     secrets — is fingerprinted. Hashing the whole tree would read files that
+//     cannot influence anything and would make an irrelevant source edit look
+//     like a desired-state change.
+//
+// A nil template falls back to the full source fingerprint, so a caller that has
+// not parsed one keeps the conservative behavior.
+//
+// It is the single fingerprint entry point the reconciler, worker, and state
+// layers share, so every layer agrees on what "changed" means for a function.
+func FingerprintFunction(dir string, tmpl *Template) (string, error) {
+	if tmpl != nil && !tmpl.NeedsRuntime() {
+		return fingerprintTemplate(dir)
+	}
+	return Fingerprint(dir)
+}
+
+// fingerprintTemplate hashes template.yaml alone, using the same per-entry
+// framing FingerprintSelection uses (path, NUL, content, NUL) but with a
+// distinct domain prefix, so a template-only fingerprint is never accidentally
+// equal to a full-source fingerprint of a single-file tree. template.yaml is read
+// directly rather than through the source selection: the loader parses it
+// regardless of .gitignore rules, and for a no-runtime template it is the only
+// input that matters.
+func fingerprintTemplate(dir string) (string, error) {
+	const name = "template.yaml"
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return "", fmt.Errorf("read %q: %w", filepath.Join(dir, name), err)
+	}
+	h := sha256.New()
+	io.WriteString(h, "template-only")
+	h.Write([]byte{0})
+	io.WriteString(h, name)
+	h.Write([]byte{0})
+	h.Write(raw)
+	h.Write([]byte{0})
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // FingerprintSelection fingerprints an already-resolved source selection. It is

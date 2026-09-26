@@ -128,11 +128,13 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	sweepCancel()
 
 	var prepared []*runner.PreparedFunction
+	fingerprints := make(map[string]string, len(functions))
 	for _, fn := range functions {
 		p, err := manager.Prepare(context.Background(), fn)
 		if err != nil {
 			t.Fatalf("prepare %s: %v", fn.Name, err)
 		}
+		fingerprints[fn.Name] = p.Fingerprint
 		st.RecordReconcileSuccess(fn.Name, p.Image, p.Fingerprint, time.Now(), fn)
 		prepared = append(prepared, runner.NewPrepared(fn, p, manager))
 	}
@@ -215,7 +217,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		logger,
 	)
 	for _, fn := range functions {
-		rec.Seed(fn)
+		rec.Seed(fn, fingerprints[fn.Name])
 	}
 	go rec.Start(ctx)
 

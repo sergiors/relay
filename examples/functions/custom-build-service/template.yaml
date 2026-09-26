@@ -1,7 +1,0 @@
-# A build-source service needs no runtime: the Dockerfile carries its own base
-# image and ENTRYPOINT. Relay builds this image from the function's selected
-# source and runs it, reconciling replicas exactly like any other service.
-services:
-  - build: Dockerfile
-    port: 3000
-    replicas: 1

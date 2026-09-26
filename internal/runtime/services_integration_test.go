@@ -667,12 +667,13 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	}
 }
 
-// TestIntegrationBuildServiceImage resolves a `build` source end to end against
-// a real daemon: it builds a service image from a user Dockerfile over the
-// function's selected source, reuses the content-addressed image on a second
-// resolve, invalidates it when a selected source file changes, and runs the
-// resulting image's own ENTRYPOINT (not an overridden one).
-func TestIntegrationBuildServiceImage(t *testing.T) {
+// TestIntegrationExternalImageService resolves an `image` source end to end
+// against a real daemon: it inspects a locally present image, reports its
+// content ID, and runs the image with its OWN entrypoint (no per-container
+// override). The image it targets is a local function image the test already
+// built, so the test needs no registry access; a recorded pull check suppresses
+// the remote freshness check, exercising the inspect path.
+func TestIntegrationExternalImageService(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -681,80 +682,51 @@ func TestIntegrationBuildServiceImage(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-build")
-		cleanupImagePrefixes(cli, "relay-fn-svc-build:")()
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-external")
 	})
 
+	// Build a small function image to serve as the external reference.
 	dir := t.TempDir()
-	// The Dockerfile builds a tiny image that prints a marker at startup and then
-	// stays alive; its own ENTRYPOINT/CMD are what a container must run.
-	writeFile(t, dir, "Dockerfile", `FROM node:24-alpine
-COPY app.js /app/app.js
-ENTRYPOINT ["node", "/app/app.js"]
-`)
-	writeFile(t, dir, "app.js", "process.on('SIGTERM', () => process.exit(0));\nconsole.log('build-service-marker');\nsetInterval(() => {}, 1 << 30);\n")
-	// A file ignored by selection must not affect the image identity.
-	writeFile(t, dir, ".gitignore", "ignored.txt\n")
-	writeFile(t, dir, "ignored.txt", "junk\n")
-
-	tmpl := &function.Template{Services: []function.Service{{Build: "Dockerfile", Port: 3000, Replicas: 1}}}
-	svc := tmpl.Services[0]
-
-	got, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
+	writeFile(t, dir, "index.js", "setInterval(() => {}, 1 << 30);\n")
+	tmpl, err := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.handler\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
-		t.Fatalf("resolve build service: %v", err)
+		t.Fatalf("parse template: %v", err)
+	}
+	fn := function.Function{Name: "svc-external", Dir: dir, Template: tmpl}
+	prep, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare host function: %v", err)
+	}
+	ref := prep.Image
+	if ref == "" {
+		t.Fatal("prepared host function has no image")
+	}
+
+	svcTmpl := &function.Template{Services: []function.Service{{Image: ref, Port: 80, Replicas: 1}}}
+	svc := svcTmpl.Services[0]
+	// Suppress the remote pull check: the image is present locally.
+	m.recordPullCheck("svc-external", ref, time.Now())
+
+	got, err := m.ResolveServiceImage(ctx, "svc-external", svcTmpl, svc, "")
+	if err != nil {
+		t.Fatalf("resolve external service: %v", err)
+	}
+	if got.Ref != ref {
+		t.Fatalf("ref = %q, want the external reference %q", got.Ref, ref)
+	}
+	if got.ID == "" {
+		t.Fatal("expected the external image's local content ID")
 	}
 	if got.Entry != nil {
 		t.Fatalf("entry = %v, want nil (preserve image ENTRYPOINT)", got.Entry)
 	}
-	if !imageExistsInDaemon(cli, ctx, got.Ref) {
-		t.Fatalf("resolved build image %q does not exist", got.Ref)
-	}
 
-	// A second resolve of an unchanged tree reuses the same content-addressed ref.
-	again, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
-	if err != nil {
-		t.Fatalf("second resolve: %v", err)
-	}
-	if again.Ref != got.Ref {
-		t.Fatalf("unchanged tree produced a new ref: %q vs %q", got.Ref, again.Ref)
-	}
-
-	// Editing an IGNORED file keeps the identity; editing a SELECTED file changes
-	// it (and rebuilds).
-	writeFile(t, dir, "ignored.txt", "different junk\n")
-	same, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
-	if err != nil {
-		t.Fatalf("resolve after ignored edit: %v", err)
-	}
-	if same.Ref != got.Ref {
-		t.Fatalf("editing an ignored file changed the build ref: %q vs %q", got.Ref, same.Ref)
-	}
-
-	writeFile(t, dir, "app.js", "process.on('SIGTERM', () => process.exit(0));\nconsole.log('build-service-marker v2');\nsetInterval(() => {}, 1 << 30);\n")
-	changed, err := m.ResolveServiceImage(ctx, "svc-build", dir, tmpl, svc, "")
-	if err != nil {
-		t.Fatalf("resolve after selected edit: %v", err)
-	}
-	if changed.Ref == got.Ref {
-		t.Fatal("editing a selected file did not change the build ref")
-	}
-
-	// The built image's own ENTRYPOINT is preserved on the container.
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-build", Identity: "Dockerfile", Port: 3000,
-		Image: changed.Ref, Env: []string{"PORT=3000"},
+		Function: "svc-external", Identity: ref, Port: 80,
+		Image: got.Ref, ImageID: got.ID, Env: []string{"PORT=80"},
 	}, 0)
 	if err != nil {
-		t.Fatalf("start build service: %v", err)
+		t.Fatalf("start external service: %v", err)
 	}
 	waitForContainerRunning(t, ctx, cli, id)
-	insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
-	if err != nil {
-		t.Fatalf("inspect: %v", err)
-	}
-	if insp.Container.Config == nil || len(insp.Container.Config.Entrypoint) != 2 ||
-		insp.Container.Config.Entrypoint[0] != "node" || insp.Container.Config.Entrypoint[1] != "/app/app.js" {
-		t.Fatalf("entrypoint = %v, want the image's own [node /app/app.js]", insp.Container.Config.Entrypoint)
-	}
 }

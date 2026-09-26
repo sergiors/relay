@@ -99,15 +99,13 @@ type Schedule struct {
 }
 
 // Service is one persistent service's effective configuration as persisted
-// from the template: its source (exactly one of the entrypoint file, the
-// Dockerfile path, or the external image reference), the optional routing host
-// and path prefix, its internal TCP port, and the desired replica count. Its
-// identity is the configured source descriptor (SourceRef), i.e. whichever of
-// Entrypoint/Build/Image is set; it is derived, never stored as a separate
-// field.
+// from the template: its source (exactly one of the entrypoint file or the
+// external image reference), the optional routing host and path prefix, its
+// internal TCP port, and the desired replica count. Its identity is the
+// configured source descriptor (SourceRef), i.e. whichever of
+// Entrypoint/Image is set; it is derived, never stored as a separate field.
 type Service struct {
 	Entrypoint string `json:"entrypoint,omitempty"`
-	Build      string `json:"build,omitempty"`
 	Image      string `json:"image,omitempty"`
 	Host       string `json:"host,omitempty"`
 	Path       string `json:"path,omitempty"`
@@ -303,11 +301,24 @@ func (st *State) empty(ctx context.Context) (bool, error) {
 	return n == 0, err
 }
 
+// DiscoveredFunction pairs a function loaded by the caller with the fingerprint
+// the caller computed for it. It is the input to the worker's startup state
+// phase: the worker hashes each loaded function once and reuses that value for
+// both the fresh-database rebuild and the per-function discovery upsert, so no
+// state write re-reads the function's source tree.
+type DiscoveredFunction struct {
+	Function    function.Function
+	Fingerprint string
+}
+
 // RebuildFromFS populates an empty state database by scanning dir with the real
 // function loader and per-function fingerprinting. Newly loaded functions are
 // recorded as status=preparing (loaded, not yet built/verified). It is a no-op
 // when the state database already has rows — /functions is the source of truth,
-// but only for (re)seeding a fresh database.
+// but only for (re)seeding a fresh database. It remains the standalone entry
+// point for callers that have not already loaded the functions (tests and other
+// standalone callers); the worker uses RebuildFromFunctions so its already-loaded
+// set is not re-read from disk.
 func (st *State) RebuildFromFS(dir string) error {
 	ctx := context.Background()
 	populated, err := st.empty(ctx)
@@ -323,28 +334,36 @@ func (st *State) RebuildFromFS(dir string) error {
 	if err != nil {
 		return fmt.Errorf("load functions for state: %w", err)
 	}
+	return st.rebuildDiscoveredTx(ctx, st.fingerprintFunctions(fns))
+}
 
-	// Compute every fingerprint BEFORE opening the write transaction: the
-	// transaction must hold no external I/O (filesystem reads) while it is open,
-	// so the tx body only writes. Fingerprint errors are logged and fall back to
-	// fp="" exactly as before.
-	type fpFn struct {
-		fn function.Function
-		fp string
+// RebuildFromFunctions populates an empty state database from functions the
+// caller already loaded, reusing the caller's per-function fingerprint instead
+// of loading the directory again. It is the worker's startup path: the same
+// loaded set and fingerprints feed this seed and the subsequent
+// RecordDiscoveredWithFingerprint upserts, so each function is hashed exactly
+// once per state phase. Like RebuildFromFS it is a no-op when the database
+// already has rows.
+func (st *State) RebuildFromFunctions(discovered []DiscoveredFunction) error {
+	ctx := context.Background()
+	populated, err := st.empty(ctx)
+	if err != nil {
+		return fmt.Errorf("check state empty: %w", err)
 	}
-	prepared := make([]fpFn, 0, len(fns))
-	for _, fn := range fns {
-		fp, ferr := function.Fingerprint(fn.Dir)
-		if ferr != nil {
-			st.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
-			fp = ""
-		}
-		prepared = append(prepared, fpFn{fn: fn, fp: fp})
+	if !populated {
+		return nil
 	}
+	return st.rebuildDiscoveredTx(ctx, discovered)
+}
 
+// rebuildDiscoveredTx writes every prepared discovery in one transaction so a
+// partial scan never leaves a half-populated database. Fingerprints are computed
+// (or supplied) BEFORE this call: the transaction must hold no external I/O
+// (filesystem reads) while it is open, so the body only writes.
+func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []DiscoveredFunction) error {
 	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		for _, p := range prepared {
-			detail := functionSnapshot(p.fn.Name, p.fn.Template, StatusPreparing, "", p.fp, "", "", "", "")
+		for _, d := range discovered {
+			detail := functionSnapshot(d.Function.Name, d.Function.Template, StatusPreparing, "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
 			if err := upsertFunctionTx(ctx, tx, detail); err != nil {
 				return err
@@ -354,25 +373,53 @@ func (st *State) RebuildFromFS(dir string) error {
 	})
 }
 
+// fingerprintFunctions computes each loaded function's fingerprint once, logging
+// and falling back to fp="" on error exactly as the discovery path always has.
+func (st *State) fingerprintFunctions(fns []function.Function) []DiscoveredFunction {
+	discovered := make([]DiscoveredFunction, 0, len(fns))
+	for _, fn := range fns {
+		discovered = append(discovered, DiscoveredFunction{Function: fn, Fingerprint: st.fingerprint(fn)})
+	}
+	return discovered
+}
+
+// fingerprint computes one function's content fingerprint, logging a warning and
+// returning "" on error. The caller computes it BEFORE the write transaction, so
+// the tx closure only writes; every state discovery path shares this fallback. It
+// uses the same narrowest-input rule as the reconciler and worker
+// (function.FingerprintFunction), so a no-runtime function is fingerprinted over
+// template.yaml alone.
+func (st *State) fingerprint(fn function.Function) string {
+	fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
+	if err != nil {
+		st.log.Warn("State: fingerprint failed", "function", fn.Name, "error", err)
+		return ""
+	}
+	return fp
+}
+
 // RecordDiscovered records a function discovered from /functions on a fresh
 // state database (or when no row exists). It sets runtime/status=preparing, the
 // fingerprint, and the full configuration snapshot, clearing any stale prior
 // state. It is an upsert keyed by name. Startup discovery (and the RebuildFromFS
 // seed) runs it for every loaded function BEFORE any current-generation work, so
 // a stale ready/building/reconciling value left by a process that died mid-work
-// is reset to preparing rather than persisting forever.
+// is reset to preparing rather than persisting forever. It computes the
+// fingerprint itself; callers that already hold one use
+// RecordDiscoveredWithFingerprint.
 func (st *State) RecordDiscovered(fn function.Function) {
+	st.RecordDiscoveredWithFingerprint(fn, st.fingerprint(fn))
+}
+
+// RecordDiscoveredWithFingerprint records a discovered function using a
+// fingerprint supplied by the caller, so a caller that already computed it (the
+// worker's startup state phase) never re-reads the function's source. The write
+// transaction holds no external I/O: the fingerprint is passed in, not computed
+// inside the closure.
+func (st *State) RecordDiscoveredWithFingerprint(fn function.Function, fingerprint string) {
 	ctx := context.Background()
-	// Compute the fingerprint BEFORE the write transaction: the tx must hold no
-	// external I/O (filesystem reads), so the closure only writes. Fingerprint
-	// errors are logged and fall back to fp="" exactly as before.
-	fp, ferr := function.Fingerprint(fn.Dir)
-	if ferr != nil {
-		st.log.Warn("State: fingerprint failed", "function", fn.Name, "error", ferr)
-		fp = ""
-	}
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		detail := functionSnapshot(fn.Name, fn.Template, StatusPreparing, "", fp, "", "", "", "")
+		detail := functionSnapshot(fn.Name, fn.Template, StatusPreparing, "", fingerprint, "", "", "", "")
 		detail.UpdatedAt = st.nowString()
 		return upsertFunctionTx(ctx, tx, detail)
 	})
@@ -437,18 +484,20 @@ func (st *State) RecordPreparing(name string, fn function.Function) {
 }
 
 // RecordReconcileBuilding changes only the lifecycle status to building. It is
-// called at the actual Dockerfile build boundary, not when a build is merely
-// queued.
+// called at the actual managed-runtime image build boundary (a function or
+// dependency image build), not when a build is merely queued. Persistent
+// services have no separate image build, so the service path never publishes
+// building.
 func (st *State) RecordReconcileBuilding(name string) {
 	st.recordStatus(name, StatusBuilding)
 }
 
 // RecordReconciling changes only the lifecycle status to reconciling. It is
 // called at the actual convergence seam of a pass that has corrective container
-// work to perform (image/entrypoint services) or after a Dockerfile build
-// completes (build services), so the status never claims convergence work that
-// has not started. A fully-converged no-op verification pass never calls it: an
-// unchanged function stays ready rather than flashing reconciling.
+// work to perform (entrypoint/image services), so the status never claims
+// convergence work that has not started. A fully-converged no-op verification
+// pass never calls it: an unchanged function stays ready rather than flashing
+// reconciling.
 func (st *State) RecordReconciling(name string) {
 	st.recordStatus(name, StatusReconciling)
 }
@@ -835,10 +884,9 @@ func snapshotSchedules(tmpl *function.Template) []Schedule {
 }
 
 // snapshotServices renders the template's persistent services with their source
-// (exactly one of entrypoint/build/image), routing host/path, effective port,
-// and desired replicas. It mirrors the former services table ordering (ORDER BY
-// entrypoint, build, image), so a source-kind service keeps a deterministic
-// position.
+// (exactly one of entrypoint/image), routing host/path, effective port, and
+// desired replicas. It mirrors the former services table ordering (ORDER BY
+// entrypoint, image), so a source-kind service keeps a deterministic position.
 func snapshotServices(tmpl *function.Template) []Service {
 	if len(tmpl.Services) == 0 {
 		return nil
@@ -847,7 +895,6 @@ func snapshotServices(tmpl *function.Template) []Service {
 	for _, s := range tmpl.Services {
 		out = append(out, Service{
 			Entrypoint: s.Entrypoint,
-			Build:      s.Build,
 			Image:      s.Image,
 			Host:       s.Host,
 			Path:       s.Path,
@@ -858,9 +905,6 @@ func snapshotServices(tmpl *function.Template) []Service {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Entrypoint != out[j].Entrypoint {
 			return out[i].Entrypoint < out[j].Entrypoint
-		}
-		if out[i].Build != out[j].Build {
-			return out[i].Build < out[j].Build
 		}
 		return out[i].Image < out[j].Image
 	})

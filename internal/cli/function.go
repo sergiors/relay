@@ -250,10 +250,7 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 		for _, svc := range detail.Services {
 			// Prefix non-entrypoint sources so their kind remains visible in CLI output.
 			source := svc.Entrypoint
-			switch {
-			case svc.Build != "":
-				source = "build:" + svc.Build
-			case svc.Image != "":
+			if svc.Image != "" {
 				source = "image:" + svc.Image
 			}
 

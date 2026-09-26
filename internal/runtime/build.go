@@ -36,11 +36,11 @@ const buildTimeout = 10 * time.Minute
 // independent buildTimeout rooted at the manager's lifecycle context. Rooting at
 // the manager lifecycle (cancelled by Close) rather than the caller's reconcile
 // context is deliberate — a build must not be cut off by a much shorter
-// reconcile budget (the worker's 30s reconcileTimeout reaches the service-build
-// path through Config.UpdateServices), yet it must still be cancelled by Relay
-// worker/reconciler shutdown. A Manager constructed directly by tests leaves
-// lifecycle nil; context.Background keeps builds bounded without leaking a
-// caller's short deadline into them.
+// reconcile budget (the worker's 30s reconcileTimeout reaches the managed
+// runtime build path through Config.UpdateServices), yet it must still be
+// cancelled by Relay worker/reconciler shutdown. A Manager constructed directly
+// by tests leaves lifecycle nil; context.Background keeps builds bounded without
+// leaking a caller's short deadline into them.
 func (m *Manager) buildContext() (context.Context, context.CancelFunc) {
 	parent := m.lifecycle
 	if parent == nil {

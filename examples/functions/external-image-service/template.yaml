@@ -1,0 +1,8 @@
+# An image-source service needs no runtime: the external image carries its own
+# ENTRYPOINT/CMD. Relay inspects the local image, pulls it from its registry when
+# needed, and reconciles replicas exactly like any other service. Relay never
+# removes an external image (it only cleans its own relay-fn-* namespace).
+services:
+  - image: nginx:1.27-alpine
+    port: 80
+    replicas: 1

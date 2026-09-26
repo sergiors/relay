@@ -12,7 +12,6 @@ const serviceReconcileWorkers = 2
 type serviceRequest struct {
 	remove      bool
 	name        string
-	fnDir       string
 	tmpl        *function.Template
 	image       string
 	preparedEnv []string
@@ -23,7 +22,6 @@ type serviceRequest struct {
 	// operation rather than a caller timeout.
 	done             chan struct{}
 	id               uint64
-	onBuildStart     func()
 	onReconcileStart func()
 	onComplete       func(error)
 }
@@ -111,14 +109,13 @@ func (c *ServiceCoordinator) Start(lifecycle context.Context) {
 // function's template cannot mutate a queued or in-flight request under a
 // worker.
 func (c *ServiceCoordinator) Enqueue(
-	name, fnDir string,
+	name string,
 	tmpl *function.Template,
 	image string,
 	preparedEnv []string,
 ) {
 	c.enqueue(&serviceRequest{
 		name:        name,
-		fnDir:       fnDir,
 		tmpl:        cloneServiceTemplate(tmpl),
 		image:       image,
 		preparedEnv: append([]string(nil), preparedEnv...),
@@ -127,15 +124,14 @@ func (c *ServiceCoordinator) Enqueue(
 
 // EnqueueWithStatus is the status-aware form used by the lifecycle owner. The
 // callbacks belong to this exact coalesced request, so an older operation can
-// never complete a newer generation's status transition. onBuildStart fires at
-// the actual Dockerfile build boundary; onReconcileStart fires once the source
-// is resolved and container convergence is about to begin.
+// never complete a newer generation's status transition. onReconcileStart fires
+// once the source is resolved and container convergence is about to begin.
 func (c *ServiceCoordinator) EnqueueWithStatus(
-	name, fnDir string, tmpl *function.Template, image string, preparedEnv []string,
-	onBuildStart, onReconcileStart func(), onComplete func(error),
+	name string, tmpl *function.Template, image string, preparedEnv []string,
+	onReconcileStart func(), onComplete func(error),
 ) {
-	c.enqueue(&serviceRequest{name: name, fnDir: fnDir, tmpl: cloneServiceTemplate(tmpl), image: image,
-		preparedEnv: append([]string(nil), preparedEnv...), onBuildStart: onBuildStart, onReconcileStart: onReconcileStart, onComplete: onComplete})
+	c.enqueue(&serviceRequest{name: name, tmpl: cloneServiceTemplate(tmpl), image: image,
+		preparedEnv: append([]string(nil), preparedEnv...), onReconcileStart: onReconcileStart, onComplete: onComplete})
 }
 
 // EnqueueRemove publishes a removal and returns immediately. It is the
@@ -364,25 +360,14 @@ func (c *ServiceCoordinator) run(name string) {
 		// here is what keeps RemoveAndWait's deterministic wait safe: the
 		// operation observes both its bound and lifecycle cancellation instead
 		// of running unbounded. Reconcile still derives its own per-operation
-		// bounds from the lifecycle context for Apply, so a Dockerfile build
-		// (bounded separately by the runtime under buildTimeout) is never cut
-		// off by this short bound.
+		// bounds from the lifecycle context for Apply.
 		opCtx, cancel := c.removalContext()
 		c.services.Remove(opCtx, req.name)
 		cancel()
 	} else {
 		// Apply receives the lifecycle context, NOT a pass-wide reconcileTimeout
 		// budget: Reconcile derives a fresh bound for each of its Docker
-		// operations itself, so a long build can never consume the post-build
-		// deadline.
-		buildStarted := req.onBuildStart
-		if buildStarted != nil {
-			buildStarted = func() {
-				if c.currentRequest(req) {
-					req.onBuildStart()
-				}
-			}
-		}
+		// operations itself.
 		reconcileStarted := req.onReconcileStart
 		if reconcileStarted != nil {
 			reconcileStarted = func() {
@@ -391,7 +376,7 @@ func (c *ServiceCoordinator) run(name string) {
 				}
 			}
 		}
-		err := c.services.ApplyWithStatus(c.ctx, req.name, req.fnDir, req.tmpl, req.image, req.preparedEnv, buildStarted, reconcileStarted)
+		err := c.services.ApplyWithStatus(c.ctx, req.name, req.tmpl, req.image, req.preparedEnv, reconcileStarted)
 		if req.onComplete != nil && c.currentRequest(req) {
 			req.onComplete(err)
 		}
@@ -428,8 +413,7 @@ func (c *ServiceCoordinator) currentRequest(req *serviceRequest) bool {
 // lets RemoveAndWait wait deterministically without hanging: the removal
 // observes both its own bound and lifecycle cancellation. A non-positive
 // reconcileTimeout leaves only the lifecycle bound. Apply deliberately does NOT
-// use this (Reconcile derives its own per-operation bounds, and a build must
-// never be cut off by the short reconcile budget).
+// use this (Reconcile derives its own per-operation bounds).
 func (c *ServiceCoordinator) removalContext() (context.Context, context.CancelFunc) {
 	if c.services.reconcileTimeout > 0 {
 		return context.WithTimeout(c.ctx, c.services.reconcileTimeout)

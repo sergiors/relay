@@ -40,7 +40,7 @@ func TestResolveEntrypointServiceUsesFunctionImage(t *testing.T) {
 	tmpl := &function.Template{Runtime: "node24"}
 	svc := function.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1}
 
-	got, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, "relay-fn-fn:abc")
+	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-fn-fn:abc")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -52,115 +52,6 @@ func TestResolveEntrypointServiceUsesFunctionImage(t *testing.T) {
 	}
 	if got.ID != "" {
 		t.Fatalf("id = %q, want empty for a Relay content-addressed image", got.ID)
-	}
-}
-
-// TestServiceBuildImageRefIdentityAndContentAddressed: the build image reference
-// folds the service identity into the source fingerprint, so two build services
-// with identical source but different Dockerfiles are distinct images, while an
-// unchanged (identity, fingerprint) pair is stable.
-func TestServiceBuildImageRefIdentityAndContentAddressed(t *testing.T) {
-	a := serviceBuildImageRef("fn", "Dockerfile", "fp")
-	b := serviceBuildImageRef("fn", "docker/Dockerfile.prod", "fp")
-	c := serviceBuildImageRef("fn", "Dockerfile", "fp2")
-	d := serviceBuildImageRef("fn", "Dockerfile", "fp")
-
-	if a == b {
-		t.Fatalf("distinct Dockerfile identities share a ref: %q", a)
-	}
-	if a == c {
-		t.Fatalf("different fingerprints share a ref: %q", a)
-	}
-	if a != d {
-		t.Fatalf("identical identity+fingerprint differ: %q vs %q", a, d)
-	}
-	if !strings.HasPrefix(a, "relay-fn-fn:") {
-		t.Fatalf("ref %q not in the function's image repo", a)
-	}
-}
-
-// TestResolveBuildServiceReusesExistingImage: when the content-addressed build
-// image already exists locally, resolution short-circuits without a build.
-func TestResolveBuildServiceReusesExistingImage(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
-		t.Fatalf("write dockerfile: %v", err)
-	}
-	svc := function.Service{Build: "Dockerfile", Port: 80, Replicas: 1}
-	fp, err := function.Fingerprint(dir)
-	if err != nil {
-		t.Fatalf("fingerprint: %v", err)
-	}
-	ref := serviceBuildImageRef("fn", "Dockerfile", fp)
-
-	// Inspect returns a present image; no build route exists, so a build attempt
-	// would fail the scripted client loudly.
-	cli := newScriptedDockerClient(t,
-		dockerRoute{method: http.MethodGet, path: "/images/", body: `{"Id":"sha256:abc"}`},
-	)
-	m := newClockManager(t, cli, time.Now)
-
-	got, err := m.ResolveServiceImage(context.Background(), "fn", dir, &function.Template{Runtime: "node24"}, svc, "")
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got.Ref != ref {
-		t.Fatalf("ref = %q, want the content-addressed build image %q", got.Ref, ref)
-	}
-	if got.Entry != nil {
-		t.Fatalf("entry = %v, want nil so the image ENTRYPOINT/CMD is preserved", got.Entry)
-	}
-}
-
-// TestResolveBuildServiceFingerprintInvalidatesOnSelectedSourceChange: editing a
-// file selected by the function's .gitignore-driven selection changes the build
-// image reference, while editing an ignored file does not — the invalidation
-// reuses the existing source/.gitignore selection policy.
-func TestResolveBuildServiceFingerprintInvalidatesOnSelectedSourceChange(t *testing.T) {
-	dir := t.TempDir()
-	write := func(name, content string) {
-		t.Helper()
-		p := filepath.Join(dir, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-			t.Fatalf("write %s: %v", name, err)
-		}
-	}
-	write("Dockerfile", "FROM scratch\n")
-	write("app.js", "v1\n")
-	write(".gitignore", "ignored.txt\n")
-	write("ignored.txt", "junk\n")
-
-	refFor := func() string {
-		t.Helper()
-		fp, err := function.Fingerprint(dir)
-		if err != nil {
-			t.Fatalf("fingerprint: %v", err)
-		}
-		return serviceBuildImageRef("fn", "Dockerfile", fp)
-	}
-
-	base := refFor()
-
-	// An edited SELECTED file invalidates.
-	write("app.js", "v2\n")
-	afterSelected := refFor()
-	if afterSelected == base {
-		t.Fatal("editing a selected source file did not invalidate the build image")
-	}
-
-	// An edited IGNORED file does not invalidate.
-	write("ignored.txt", "different junk\n")
-	if got := refFor(); got != afterSelected {
-		t.Fatalf("editing an ignored file changed the build image ref: %q -> %q", afterSelected, got)
-	}
-
-	// Editing the Dockerfile itself (selected) invalidates too.
-	write("Dockerfile", "FROM scratch\n# changed\n")
-	if got := refFor(); got == afterSelected {
-		t.Fatal("editing the selected Dockerfile did not invalidate the build image")
 	}
 }
 
@@ -213,7 +104,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 	tmpl := &function.Template{Runtime: "node24"}
 	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
-	got, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, "")
+	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err != nil {
 		t.Fatalf("first resolve: %v", err)
 	}
@@ -225,7 +116,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 	}
 
 	// Second resolve within the hour: no remote pull.
-	if _, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, ""); err != nil {
+	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err != nil {
 		t.Fatalf("second resolve: %v", err)
 	}
 	if pulls != 1 {
@@ -234,7 +125,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 
 	// A changed source identity (a different image) is checked immediately.
 	changed := function.Service{Image: "ghcr.io/acme/api:1.3", Port: 80, Replicas: 1}
-	if _, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, changed, ""); err != nil {
+	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, changed, ""); err != nil {
 		t.Fatalf("changed resolve: %v", err)
 	}
 	if pulls != 2 {
@@ -243,7 +134,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 
 	// After the interval, the original identity is checked again.
 	now = base.Add(serviceImagePullInterval)
-	if _, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, ""); err != nil {
+	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err != nil {
 		t.Fatalf("post-interval resolve: %v", err)
 	}
 	if pulls != 3 {
@@ -264,7 +155,7 @@ func TestResolveExternalServiceImageFailedPullDoesNotAdvance(t *testing.T) {
 	tmpl := &function.Template{Runtime: "node24"}
 	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
-	if _, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, ""); err == nil {
+	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err == nil {
 		t.Fatal("expected the failed pull to surface")
 	}
 	if pulls != 1 {
@@ -274,7 +165,7 @@ func TestResolveExternalServiceImageFailedPullDoesNotAdvance(t *testing.T) {
 		t.Fatal("a failed pull must not advance the freshness window")
 	}
 	// The next pass retries even though no time has advanced.
-	if _, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, ""); err == nil {
+	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err == nil {
 		t.Fatal("expected the retry to fail too")
 	}
 	if pulls != 2 {
@@ -300,7 +191,7 @@ func TestResolveExternalServiceImageMissingLocalPullsImmediately(t *testing.T) {
 	tmpl := &function.Template{Runtime: "node24"}
 	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
-	_, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, "")
+	_, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err == nil || !strings.Contains(err.Error(), "registry down") {
 		t.Fatalf("err = %v, want the pull failure surfaced", err)
 	}
@@ -323,7 +214,7 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 	tmpl := &function.Template{Runtime: "node24"}
 	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
-	got, err := m.ResolveServiceImage(context.Background(), "fn", t.TempDir(), tmpl, svc, "")
+	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -332,6 +223,38 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 	}
 	if pulls != 0 {
 		t.Fatalf("pulls = %d, want 0 for a present image within the window", pulls)
+	}
+}
+
+// TestResolveServiceImageDispatchesBySource pins the two-source dispatch: an
+// entrypoint source resolves through the runtime entry map against the function
+// image, while an image source resolves to the external reference with its
+// content ID. Both leave no spurious build.
+func TestResolveServiceImageDispatchesBySource(t *testing.T) {
+	entryTmpl := &function.Template{Runtime: "node24"}
+	entrySvc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
+	entry, err := newClockManager(t, nil, time.Now).ResolveServiceImage(context.Background(), "fn", entryTmpl, entrySvc, "relay-fn-fn:abc")
+	if err != nil {
+		t.Fatalf("entrypoint resolve: %v", err)
+	}
+	if entry.Ref != "relay-fn-fn:abc" || len(entry.Entry) != 2 {
+		t.Fatalf("entrypoint resolved = %+v, want the function image and an entry override", entry)
+	}
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cli := newScriptedDockerClient(t, dockerRoute{method: http.MethodGet, path: "/images/", body: `{"Id":"sha256:cafe"}`})
+	m := newClockManager(t, cli, func() time.Time { return now })
+	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
+	imgSvc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	img, err := m.ResolveServiceImage(context.Background(), "fn", &function.Template{}, imgSvc, "")
+	if err != nil {
+		t.Fatalf("image resolve: %v", err)
+	}
+	if img.Ref != "ghcr.io/acme/api:1.2" || img.ID != "sha256:cafe" {
+		t.Fatalf("image resolved = %+v, want the external ref with its content ID", img)
+	}
+	if img.Entry != nil {
+		t.Fatalf("image entry = %v, want nil (preserve image ENTRYPOINT/CMD)", img.Entry)
 	}
 }
 
@@ -353,15 +276,15 @@ func TestForgetServicePullChecks(t *testing.T) {
 }
 
 // TestPrepareRuntimeLessTemplateSucceeds: a template whose only services use
-// build/image sources has no runtime and no function image; Prepare still
+// external `image` sources has no runtime and no function image; Prepare still
 // succeeds (the function is available for service convergence) and carries the
-// source fingerprint, without attempting a build.
+// fingerprint, without attempting a build.
 func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
-		t.Fatalf("write dockerfile: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:1.27\n    port: 80\n"), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
 	}
-	tmpl := &function.Template{Services: []function.Service{{Build: "Dockerfile", Port: 80, Replicas: 1}}}
+	tmpl := &function.Template{Services: []function.Service{{Image: "nginx:1.27", Port: 80, Replicas: 1}}}
 	m := newClockManager(t, nil, time.Now)
 
 	got, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
@@ -373,5 +296,46 @@ func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 	}
 	if got.Fingerprint == "" {
 		t.Fatal("fingerprint must still be computed for a runtime-less template")
+	}
+}
+
+// TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly pins the narrow-input
+// optimization: an external-image-only function never builds an image from
+// source, so its fingerprint is over template.yaml ALONE. An unrelated source
+// file (even an unreadable one) must neither be read nor affect the digest, and
+// a template edit must still change it.
+func TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly(t *testing.T) {
+	dir := t.TempDir()
+	const tmplYAML = "services:\n  - image: nginx:1.27\n    port: 80\n"
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmplYAML), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	// An unreadable source file: if Prepare scanned the tree, the fingerprint
+	// would fail (or read bytes that cannot matter).
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("x\n"), 0o200); err != nil {
+		t.Fatalf("write handler: %v", err)
+	}
+	tmpl, err := function.ParseTemplate([]byte(tmplYAML))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	m := newClockManager(t, nil, time.Now)
+
+	got, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	// A template edit changes the fingerprint.
+	changed := strings.Replace(tmplYAML, "nginx:1.27", "nginx:1.28", 1)
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(changed), 0o644); err != nil {
+		t.Fatalf("rewrite template: %v", err)
+	}
+	next, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
+	if err != nil {
+		t.Fatalf("prepare after template edit: %v", err)
+	}
+	if next.Fingerprint == got.Fingerprint {
+		t.Fatal("editing template.yaml must change the runtime-less fingerprint")
 	}
 }

@@ -24,7 +24,7 @@ func rawFunctionData(t *testing.T, c *State, name string) (data, updatedAt, type
 
 // fullSnapshotTmpl exercises every persisted snapshot field: runtime, env,
 // secret references, event handlers (name + timeout), schedules
-// (handler/cron/timezone/timeout/retries), and services (all source kinds plus
+// (handler/cron/timezone/timeout/retries), and services (both source kinds plus
 // host/path/port/replicas).
 const fullSnapshotTmpl = `runtime: python3.14
 env:
@@ -54,8 +54,6 @@ services:
     path: /v2
     port: 3000
     replicas: 2
-  - build: docker/Dockerfile.prod
-    port: 8080
   - image: ghcr.io/acme/api:1.2
     port: 9090
 `
@@ -107,8 +105,8 @@ func TestFunctionSnapshotIsJSONB(t *testing.T) {
 	).Scan(&handlers, &schedules, &services, &entrypointPort); err != nil {
 		t.Fatalf("json_extract nested: %v", err)
 	}
-	if handlers != 2 || schedules != 1 || services != 3 {
-		t.Fatalf("nested counts = handlers %d schedules %d services %d; want 2/1/3", handlers, schedules, services)
+	if handlers != 2 || schedules != 1 || services != 2 {
+		t.Fatalf("nested counts = handlers %d schedules %d services %d; want 2/1/2", handlers, schedules, services)
 	}
 	if entrypointPort <= 0 {
 		t.Fatalf("services[1].port = %d, want a positive configured port", entrypointPort)
@@ -156,20 +154,17 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("schedule = %+v", s)
 	}
 
-	// Services: all three source kinds plus host/path/port/replicas.
-	if len(detail.Services) != 3 {
+	// Services: both source kinds plus host/path/port/replicas.
+	if len(detail.Services) != 2 {
 		t.Fatalf("services = %+v", detail.Services)
 	}
 	byEntry := map[string]Service{}
 	for _, svc := range detail.Services {
-		byEntry[svc.Entrypoint+svc.Build+svc.Image] = svc
+		byEntry[svc.Entrypoint+svc.Image] = svc
 	}
 	ep := byEntry["service.js"]
 	if ep.Host != "api.example.com" || ep.Path != "/v2" || ep.Port != 3000 || ep.Replicas != 2 {
 		t.Fatalf("entrypoint service = %+v", ep)
-	}
-	if b := byEntry["docker/Dockerfile.prod"]; b.Build != "docker/Dockerfile.prod" || b.Port != 8080 || b.Replicas != 1 {
-		t.Fatalf("build service = %+v", b)
 	}
 	if im := byEntry["ghcr.io/acme/api:1.2"]; im.Image != "ghcr.io/acme/api:1.2" || im.Port != 9090 {
 		t.Fatalf("image service = %+v", im)

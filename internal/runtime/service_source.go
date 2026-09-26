@@ -2,20 +2,14 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
 
 	"relay/internal/function"
-	"relay/internal/source"
 )
 
 // serviceImagePullInterval bounds how often Relay performs a REMOTE pull check
@@ -37,8 +31,8 @@ const serviceImagePullInterval = time.Hour
 // whose tag embeds the source fingerprint) or when inspection is unavailable.
 //
 // Entry is the per-container entrypoint override. A nil Entry means the
-// container preserves the image's own ENTRYPOINT/CMD — true for `build` and
-// `image` sources. Only the runtime-managed `entrypoint` source overrides it.
+// container preserves the image's own ENTRYPOINT/CMD — true for the `image`
+// source. Only the runtime-managed `entrypoint` source overrides it.
 type ServiceImage struct {
 	Ref   string
 	ID    string
@@ -48,25 +42,22 @@ type ServiceImage struct {
 // ResolveServiceImage resolves the desired image for one service from its
 // configured source. It is the single place that knows how a service's source
 // becomes a runnable image, so the service reconciler stays source-agnostic and
-// the three sources share one container lifecycle.
+// the two sources share one container lifecycle.
 //
 //	functionImage is the function's own prepared runtime image, used only by an
 //	`entrypoint` service (which overrides that image's invocation bootstrap).
 //
-// Resolution is read-only except for the two lifecycle actions a source may
-// need: building a `build` source's image (idempotent, content-addressed) and
-// pulling an `image` source's reference. A build/pull failure is returned as an
+// Resolution is read-only except for the one lifecycle action a source may
+// need: pulling an `image` source's reference. A pull failure is returned as an
 // error WITHOUT resolving, so the caller can preserve healthy containers.
 func (m *Manager) ResolveServiceImage(
 	ctx context.Context,
-	fnName, fnDir string,
+	fnName string,
 	tmpl *function.Template,
 	svc function.Service,
 	functionImage string,
 ) (ServiceImage, error) {
 	switch svc.Source() {
-	case function.ServiceSourceBuild:
-		return m.resolveBuildServiceImage(ctx, fnName, fnDir, svc)
 	case function.ServiceSourceImage:
 		return m.resolveExternalServiceImage(ctx, fnName, svc.SourceRef())
 	default:
@@ -76,115 +67,6 @@ func (m *Manager) ResolveServiceImage(
 		}
 		return ServiceImage{Ref: functionImage, Entry: entry}, nil
 	}
-}
-
-// resolveBuildServiceImage resolves a `build` source: a Relay-owned image built
-// from the user's Dockerfile over the function's SELECTED source. The image is
-// content-addressed by a fingerprint that folds the service identity (the
-// Dockerfile path) into the function's existing source fingerprint, so an edit
-// to any selected source file — the Dockerfile included — yields a new tag and
-// rebuilds, while an unchanged tree reuses the local image with no build.
-//
-// The build uses the Docker Engine API with the same .gitignore-driven selection
-// the function fingerprint uses (resolved once and shared), so ignored files
-// never enter the image and never affect its identity. The Dockerfile's own
-// ENTRYPOINT/CMD are preserved (Entry stays nil).
-func (m *Manager) resolveBuildServiceImage(
-	ctx context.Context,
-	fnName, fnDir string,
-	svc function.Service,
-) (ServiceImage, error) {
-	selection, err := source.ForDir(fnDir)
-	if err != nil {
-		return ServiceImage{}, fmt.Errorf("select sources: %w", err)
-	}
-	// The image tag is derived from the function fingerprint, so an edit to any
-	// selected source file — the Dockerfile included — yields a new tag and
-	// rebuilds, while an unchanged tree reuses the local image with no build.
-	fp, err := function.FingerprintSelection(selection)
-	if err != nil {
-		return ServiceImage{}, fmt.Errorf("fingerprint: %w", err)
-	}
-	ref := serviceBuildImageRef(fnName, svc.SourceRef(), fp)
-	if m.imageExists(ctx, ref) {
-		m.log.Debug("Service: build image exists; reusing",
-			"function", fnName, "service", svc.SourceRef(), "image", ref)
-		return ServiceImage{Ref: ref}, nil
-	}
-
-	start := m.clock()
-	if observer := ServiceBuildObserverFromContext(ctx); observer != nil {
-		observer()
-	}
-	// Pre-build structured log: emitted once, immediately before the Dockerfile
-	// build is issued, so a slow build is visible while it runs (the completion
-	// log below only appears on success). The generated image reference is
-	// content-addressed and safe to log.
-	m.log.Info("Service: building image",
-		"function", fnName,
-		"service", svc.SourceRef(),
-		"image", ref,
-	)
-	// The build runs on an independent, lifecycle-rooted buildTimeout context,
-	// NOT on the caller's ctx: ResolveServiceImage is reached from the service
-	// reconciler, whose ctx is a short reconcile budget, and a slow Dockerfile
-	// build must not be cut off by it (while still being cancelled at Relay
-	// shutdown via the manager lifecycle). The imageExists probe above keeps the
-	// caller's ctx: it is quick and must honor its cancellation.
-	buildCtx, buildCancel := m.buildContext()
-	defer buildCancel()
-	if err := m.buildServiceImage(buildCtx, fnName, svc, selection, ref); err != nil {
-		return ServiceImage{}, err
-	}
-	m.log.Info("Service: build image built",
-		"function", fnName,
-		"service", svc.SourceRef(),
-		"image", ref,
-		"duration", m.clock().Sub(start),
-		"result", "success",
-	)
-	return ServiceImage{Ref: ref}, nil
-}
-
-// buildServiceImage stages the selected source into a transient context and runs
-// a Docker Engine API build with the user's Dockerfile. The context is staged
-// read-only from the shared selection (template.yaml excluded exactly as the
-// function image build excludes it); the user's function directory is never
-// modified.
-func (m *Manager) buildServiceImage(
-	ctx context.Context,
-	fnName string,
-	svc function.Service,
-	selection *source.Selection,
-	ref string,
-) error {
-	ctxDir, err := os.MkdirTemp("", "relay-svc-build-*")
-	if err != nil {
-		return fmt.Errorf("create build context: %w", err)
-	}
-	defer os.RemoveAll(ctxDir)
-
-	if err := copySourceDir(selection, ctxDir); err != nil {
-		return fmt.Errorf("copy sources: %w", err)
-	}
-	dockerfile := filepath.ToSlash(svc.Build)
-	if _, err := os.Stat(filepath.Join(ctxDir, filepath.FromSlash(dockerfile))); err != nil {
-		return fmt.Errorf("dockerfile %q: %w", svc.Build, err)
-	}
-	contextTar, err := tarContext(ctxDir)
-	if err != nil {
-		return fmt.Errorf("tar build context: %w", err)
-	}
-	resp, err := m.cli.ImageBuild(ctx, contextTar, serviceBuildImageOptions(ref, dockerfile, fnName))
-	if err != nil {
-		return fmt.Errorf("docker build: %w", err)
-	}
-	defer resp.Body.Close()
-	out, err := drainBuildResponse(resp.Body)
-	if err != nil {
-		return fmt.Errorf("docker build: %w\n%s", err, strings.TrimSpace(out))
-	}
-	return nil
 }
 
 // resolveExternalServiceImage resolves an `image` source: inspect the local
@@ -282,33 +164,4 @@ func (m *Manager) pullImage(ctx context.Context, ref string) error {
 		return err
 	}
 	return resp.Wait(ctx)
-}
-
-// serviceBuildImageRef maps a function name, service identity, and the
-// function's source fingerprint to the Relay-owned build image reference. It
-// lives in the function's OWN image repository (relay-fn-<name>) with a
-// content tag that folds the identity into the source fingerprint, so:
-//
-//   - the function's existing image retirement (FunctionImageTags /
-//     RemoveFunctionImages / RemoveImagesExcept) covers build-service images
-//     with no separate lifecycle, and
-//   - two build services of one function never share a tag even when their
-//     selected source is identical (the Dockerfile identity differs).
-func serviceBuildImageRef(fnName, identity, fingerprint string) string {
-	sum := sha256.Sum256([]byte(identity + "\x00" + fingerprint))
-	return ImageRef(fnName, hex.EncodeToString(sum[:]))
-}
-
-// serviceBuildImageOptions is the ImageBuildOptions for a service Dockerfile
-// build: the caller-selected Dockerfile path within the context, the
-// content-addressed tag, and the managed function-image labels so the build
-// image is recognizable to image cleanup. It mirrors buildImageOptions' Remove
-// policy (prune successful intermediates) deliberately.
-func serviceBuildImageOptions(ref, dockerfile, fnName string) client.ImageBuildOptions {
-	return client.ImageBuildOptions{
-		Tags:       []string{ref},
-		Dockerfile: dockerfile,
-		Remove:     true,
-		Labels:     imageLabels(ImageTypeFunction, fnName, "", "", ""),
-	}
 }

@@ -46,9 +46,13 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 	})
 
 	t.Run("no-runtime template never fires the observer", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:alpine\n"), 0o644); err != nil {
+			t.Fatalf("write template: %v", err)
+		}
 		fn := function.Function{
 			Name:     "no-runtime",
-			Dir:      t.TempDir(),
+			Dir:      dir,
 			Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
 		}
 		if fn.Template.NeedsRuntime() {
@@ -84,23 +88,4 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 			t.Fatal("expected the scripted build failure to surface without an observer")
 		}
 	})
-}
-
-// TestServiceBuildObserverFromContextRoundTrip pins the service observer seam
-// used by the service reconciler: the callback carried on the context is
-// returned unchanged, and an absent callback reads as nil.
-func TestServiceBuildObserverFromContextRoundTrip(t *testing.T) {
-	if got := ServiceBuildObserverFromContext(context.Background()); got != nil {
-		t.Fatal("absent service build observer must read as nil")
-	}
-	called := false
-	ctx := WithServiceBuildObserver(context.Background(), func() { called = true })
-	fn := ServiceBuildObserverFromContext(ctx)
-	if fn == nil {
-		t.Fatal("expected the service build observer to round-trip")
-	}
-	fn()
-	if !called {
-		t.Fatal("service build observer did not run")
-	}
 }

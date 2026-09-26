@@ -48,7 +48,7 @@ func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
 
 	// A converged pass: the hook completes without firing reconcile-start,
 	// exactly as the coordinator does for a no-op verification.
-	r.updateServicesWithStatus = func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		onComplete(nil)
 	}
 
@@ -79,7 +79,7 @@ func TestNoOpPeriodicPassStaysReadyWithoutReconciling(t *testing.T) {
 	root := t.TempDir()
 	r, fn, st := readyServicesReconciler(t, root, "svc-noop")
 
-	r.updateServicesWithStatus = func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		// A converged pass performs no corrective work: no onReconcileStart.
 		onComplete(nil)
 	}
@@ -135,9 +135,9 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	probe := &statusProbeBuilder{st: st, name: fn.Name, image: "img-v2"}
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServices: func(string, string, *function.Template, string) {},
+		UpdateServices: func(string, *function.Template, string) {},
 	}, reg, probe, testutil.DiscardLogger())
-	r.Seed(fn)
+	seedCurrent(r, fn)
 
 	// Change content so the fingerprint changes and a rebuild is warranted.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -150,10 +150,11 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	}
 }
 
-// TestBuildReconcilingReadyOrderingOnChange pins the persisted lifecycle for a
-// real desired-generation change with services: building (at the build
-// boundary) -> reconciling (at the convergence seam) -> ready (at completion).
-func TestBuildReconcilingReadyOrderingOnChange(t *testing.T) {
+// TestReconcilingReadyOrderingOnChange pins the persisted lifecycle for a real
+// desired-generation change with services: reconciling (at the convergence
+// seam) -> ready (at completion). The reconciler writes preparing before Prepare;
+// services have no separate build boundary.
+func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-order")
 	tmpl := mustParse(servicesTemplate)
@@ -173,11 +174,7 @@ func TestBuildReconcilingReadyOrderingOnChange(t *testing.T) {
 	var seen []string
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
-			onBuildStart()
-			if d, ok := st.GetFunction(name); ok {
-				seen = append(seen, d.Status)
-			}
+		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			onReconcileStart()
 			if d, ok := st.GetFunction(name); ok {
 				seen = append(seen, d.Status)
@@ -188,14 +185,14 @@ func TestBuildReconcilingReadyOrderingOnChange(t *testing.T) {
 			}
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
-	r.Seed(fn)
+	seedCurrent(r, fn)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	r.reconcileFunction(fn.Name)
 
-	want := []string{state.StatusBuilding, state.StatusReconciling, state.StatusReady}
+	want := []string{state.StatusReconciling, state.StatusReady}
 	if len(seen) != len(want) {
 		t.Fatalf("persisted statuses = %v, want %v", seen, want)
 	}
@@ -215,7 +212,7 @@ func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
 	r, fn, st := readyServicesReconciler(t, root, "svc-heal")
 
 	var seen []string
-	r.updateServicesWithStatus = func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		onReconcileStart()
 		if d, ok := st.GetFunction(name); ok {
 			seen = append(seen, d.Status)
@@ -237,10 +234,66 @@ func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
 	}
 }
 
+// TestServiceLifecycleNeverPublishesBuilding pins the removal of the service
+// build status: a real desired-generation change for a function with only
+// services (an entrypoint service here) must never observe the persisted
+// "building" status. The service path has no Relay-owned Dockerfile build, so
+// the only transitions are the reconciler's preparing -> reconciling -> ready.
+// The status is sampled at every callback boundary.
+func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
+	root := t.TempDir()
+	dir := writeServicesDir(t, root, "svc-nobuild")
+	tmpl := mustParse(servicesTemplate)
+	fn := function.Function{Name: "svc-nobuild", Dir: dir, Template: tmpl}
+
+	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	st.RecordReconcileSuccess(fn.Name, "img-v1", "fp-v1", time.Now(), fn)
+
+	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v2"}, &fakeBuilder{})
+	reg := &runner.Registry{}
+	reg.Set([]*runner.PreparedFunction{pf})
+
+	seen := map[string]int{}
+	sample := func(name string) {
+		if d, ok := st.GetFunction(name); ok {
+			seen[d.Status]++
+		}
+	}
+	r := New(Config{
+		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
+		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+			sample(name) // observed after the reconciler wrote preparing, before the seam
+			onReconcileStart()
+			sample(name)
+			onComplete(nil)
+			sample(name)
+		},
+	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
+	seedCurrent(r, fn)
+
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	r.reconcileFunction(fn.Name)
+
+	if seen[state.StatusBuilding] != 0 {
+		t.Fatalf("service lifecycle observed building %d times, want 0 (statuses seen: %v)",
+			seen[state.StatusBuilding], seen)
+	}
+	if seen[state.StatusReconciling] == 0 || seen[state.StatusReady] == 0 {
+		t.Fatalf("service lifecycle missing reconciling/ready transitions: %v", seen)
+	}
+}
+
 // TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing pins that a periodic
-// tick for an unchanged function whose status is building (an active build's
-// status) must NOT regress the public status to preparing: the skip branch no
-// longer writes preparing, and a no-op verification writes nothing.
+// tick for an unchanged function whose status is building (an active
+// managed-runtime build's status) must NOT regress the public status to
+// preparing: the skip branch no longer writes preparing, and a no-op
+// verification writes nothing.
 func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 	root := t.TempDir()
 	r, fn, st := readyServicesReconciler(t, root, "svc-building")
@@ -254,7 +307,7 @@ func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 
 	// A periodic tick verifies an unchanged, available function with a no-op
 	// service pass.
-	r.updateServicesWithStatus = func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 	}
 
 	r.reconcileFunction(fn.Name)
@@ -281,7 +334,7 @@ func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
 		onComplete  func(error)
 	}
 	var captured []callbacks
-	r.updateServicesWithStatus = func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		captured = append(captured, callbacks{onReconcile: onReconcileStart, onComplete: onComplete})
 	}
 

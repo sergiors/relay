@@ -828,13 +828,29 @@ func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 }
 
 // TestFunctionBuildingStatusAndEmptyRuntimeRendering pins the state-reporting
-// contract for a function caught mid-build: `ls` and `inspect` render the same
-// persisted "building" status verbatim, and a service-only template (which parses
-// with no runtime) renders its empty runtime as "-" rather than a blank cell in
-// both views. This is the CLI-side counterpart of the persistence test that
-// resets a stale building status on restart.
+// contract for a function caught mid-managed-runtime-build: `ls` and `inspect`
+// render the same persisted "building" status verbatim, and a service-only
+// template (which parses with no runtime) renders its empty runtime as "-"
+// rather than a blank cell in both views. This is the CLI-side counterpart of
+// the persistence test that resets a stale building status on restart. The
+// service path never publishes building (services have no Relay-owned Dockerfile
+// build), so the persisted building status is exercised on a runtime function.
 func TestFunctionBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
 	st, _ := openTempState(t)
+
+	// A runtime function with a persisted building status (written at the
+	// managed-runtime image build boundary).
+	runtimeTmpl, err := function.ParseTemplate([]byte(`runtime: node24
+events:
+  - handler: index.hi
+    pattern:
+      event_name: [INSERT]
+`))
+	if err != nil {
+		t.Fatalf("parse runtime template: %v", err)
+	}
+	st.RecordDiscovered(function.Function{Name: "runtime-building", Dir: filepath.Join(t.TempDir(), "rb"), Template: runtimeTmpl})
+	st.RecordReconcileBuilding("runtime-building")
 
 	// A template whose only workload is an image-backed service: the runtime may
 	// be omitted entirely, so the persisted Runtime is empty.
@@ -847,34 +863,33 @@ func TestFunctionBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
 	}
 	fn := function.Function{Name: "svc-only", Dir: filepath.Join(t.TempDir(), "svc"), Template: tmpl}
 	st.RecordDiscovered(fn)
-	st.RecordReconcileBuilding("svc-only")
 
-	// ls: the row carries the building status and the "-" runtime placeholder
-	// (columns are NAME RUNTIME STATUS UPDATED, so the placeholder is field 1).
+	// ls: the building row carries the building status; the service-only row
+	// carries the "-" runtime placeholder (columns are NAME RUNTIME STATUS
+	// UPDATED, so the placeholder is field 1).
 	var lw bytes.Buffer
 	if err := printList(&lw, st); err != nil {
 		t.Fatalf("printList: %v", err)
 	}
-	var row string
+	rows := map[string][]string{}
 	for _, l := range strings.Split(strings.TrimSpace(lw.String()), "\n")[1:] {
-		if strings.HasPrefix(l, "svc-only") {
-			row = l
-			break
+		fields := strings.Fields(l)
+		if len(fields) > 0 {
+			rows[fields[0]] = fields
 		}
 	}
-	if row == "" {
-		t.Fatalf("ls output missing svc-only row:\n%s", lw.String())
+	if f := rows["runtime-building"]; len(f) < 3 || f[2] != state.StatusBuilding {
+		t.Fatalf("runtime row = %v, want status %q", f, state.StatusBuilding)
 	}
-	fields := strings.Fields(row)
-	if len(fields) < 3 || fields[0] != "svc-only" || fields[1] != "-" || fields[2] != state.StatusBuilding {
-		t.Fatalf("ls row = %q, want runtime '-' and status %q", row, state.StatusBuilding)
+	if f := rows["svc-only"]; len(f) < 3 || f[1] != "-" {
+		t.Fatalf("svc-only row = %v, want runtime placeholder '-'", f)
 	}
 
-	// inspect: the same persisted snapshot renders the same status and the same
+	// inspect: the same persisted snapshots render the same status and the same
 	// runtime placeholder.
-	detail, ok := st.GetFunction("svc-only")
+	detail, ok := st.GetFunction("runtime-building")
 	if !ok {
-		t.Fatal("expected svc-only function")
+		t.Fatal("expected runtime-building function")
 	}
 	var iw bytes.Buffer
 	printInspect(&iw, st, detail)
@@ -882,13 +897,20 @@ func TestFunctionBuildingStatusAndEmptyRuntimeRendering(t *testing.T) {
 	if !strings.Contains(out, "Status: "+state.StatusBuilding) {
 		t.Errorf("inspect output missing building status:\n%s", out)
 	}
-	if !strings.Contains(out, "Runtime: -") {
-		t.Errorf("inspect output missing 'Runtime: -':\n%s", out)
+
+	svcDetail, ok := st.GetFunction("svc-only")
+	if !ok {
+		t.Fatal("expected svc-only function")
+	}
+	var sw bytes.Buffer
+	printInspect(&sw, st, svcDetail)
+	if !strings.Contains(normWS(sw.String()), "Runtime: -") {
+		t.Errorf("inspect output missing 'Runtime: -':\n%s", sw.String())
 	}
 }
 
-// Services using build and image sources render with their source kind prefix,
-// so an operator can tell how each service is produced.
+// Services using entrypoint and image sources render with their source kind
+// prefix, so an operator can tell how each service is produced.
 func TestFunctionInspectServicesSourceKinds(t *testing.T) {
 	st, _ := openTempState(t)
 	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
@@ -899,8 +921,6 @@ events:
 services:
   - entrypoint: service.js
     port: 3000
-  - build: docker/Dockerfile.prod
-    port: 8080
   - image: ghcr.io/acme/api:1.2
     port: 9090
 `))
@@ -918,7 +938,6 @@ services:
 	out := w.String()
 	for _, want := range []string{
 		"service.js", "port=3000",
-		"build:docker/Dockerfile.prod", "port=8080",
 		"image:ghcr.io/acme/api:1.2", "port=9090",
 	} {
 		if !strings.Contains(out, want) {

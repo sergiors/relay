@@ -446,12 +446,12 @@ func decodeCreateRequest(t *testing.T, body []byte) *container.CreateRequest {
 }
 
 // TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources pins the invariant
-// that ALL THREE source kinds write the caller-assembled effective environment
-// verbatim into Docker Config.Env — entrypoint (with an entry override), build,
-// and image (both preserving the image ENTRYPOINT). The env slice is exactly
-// what the reconciler's BuildEnv produced (prepared env + template env +
-// resolved secrets + PORT), so a service actually receives its configured
-// env/secrets. The relay.env_hash label is the digest of that same slice.
+// that BOTH source kinds write the caller-assembled effective environment
+// verbatim into Docker Config.Env — entrypoint (with an entry override) and
+// image (preserving the image ENTRYPOINT). The env slice is exactly what the
+// reconciler's BuildEnv produced (prepared env + template env + resolved secrets
+// + PORT), so a service actually receives its configured env/secrets. The
+// relay.env_hash label is the digest of that same slice.
 func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 	env := []string{"PREPARED=1", "GREETING=hello", "SECRET=s3cr3t", "PORT=3000"}
 	for _, tc := range []struct {
@@ -463,13 +463,6 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 			spec: ServiceSpec{
 				Function: "fn", Identity: "service.js", Port: 3000,
 				Image: "relay-fn-fn:tag", Entry: []string{"node", "/app/service.js"}, Env: env,
-			},
-		},
-		{
-			name: "build",
-			spec: ServiceSpec{
-				Function: "fn", Identity: "Dockerfile", Port: 3000,
-				Image: "relay-fn-fn:buildtag", Env: env,
 			},
 		},
 		{
@@ -504,8 +497,8 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 }
 
 // TestStartServiceEntryOnlyForEntrypointSource pins that the entry override
-// reaches Config.Entrypoint only for an entrypoint source; build/image sources
-// leave it empty so the image's own ENTRYPOINT/CMD is preserved.
+// reaches Config.Entrypoint only for an entrypoint source; an image source
+// leaves it empty so the image's own ENTRYPOINT/CMD is preserved.
 func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	entry := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
 		Function: "fn", Identity: "service.js", Port: 3000,
@@ -515,14 +508,14 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 		t.Fatalf("entrypoint-source Entrypoint = %v, want [node /app/service.js]", entry.Entrypoint)
 	}
 
-	build := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
-		Function: "fn", Identity: "Dockerfile", Port: 3000, Image: "img", Env: []string{"PORT=3000"},
+	image := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
+		Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000, Image: "ghcr.io/acme/api:1.2", Env: []string{"PORT=3000"},
 	}))
-	if len(build.Entrypoint) != 0 {
-		t.Fatalf("build-source Entrypoint = %v, want none (preserve image ENTRYPOINT)", build.Entrypoint)
+	if len(image.Entrypoint) != 0 {
+		t.Fatalf("image-source Entrypoint = %v, want none (preserve image ENTRYPOINT)", image.Entrypoint)
 	}
-	if build.Labels[labelHostname] != "test-host" {
-		t.Fatalf("relay.hostname = %q, want test-host", build.Labels[labelHostname])
+	if image.Labels[labelHostname] != "test-host" {
+		t.Fatalf("relay.hostname = %q, want test-host", image.Labels[labelHostname])
 	}
 }
 

@@ -30,7 +30,7 @@ type svcDeadlineDocker struct {
 }
 
 func (f *svcDeadlineDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
@@ -101,7 +101,7 @@ func (f *blockingListDocker) enteredOnce() {
 }
 
 func (f *blockingListDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, _ *function.Template, _ function.Service, _ string,
+	_ context.Context, _ string, _ *function.Template, _ function.Service, _ string,
 ) (runtime.ServiceImage, error) {
 	return runtime.ServiceImage{Ref: "img"}, nil
 }
@@ -352,7 +352,7 @@ func TestStartupHousekeepingExcludesLiveUpdates(t *testing.T) {
 	// A live update arrives during the sweep: it must coalesce, not Apply. Give
 	// the scheduler ample opportunity to (wrongly) start it; the exclusive pause
 	// must keep the resolve count at zero.
-	coordinator.Enqueue("alpha", t.TempDir(), tmpl, "img-2", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-2", nil)
 	time.Sleep(50 * time.Millisecond)
 	if got := len(fake.forOp("resolve")); got != 0 {
 		t.Fatalf("a live Apply ran during the exclusive housekeeping window: resolve calls = %d, want 0", got)
@@ -405,7 +405,7 @@ func newSvcShutdownDocker() *svcShutdownDocker {
 }
 
 func (f *svcShutdownDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {

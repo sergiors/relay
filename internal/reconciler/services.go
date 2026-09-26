@@ -30,12 +30,10 @@
 //     routing validation is reported and skipped, not half-reconciled.
 //   - Reconcile takes the LIFECYCLE context and derives a FRESH normal-operation
 //     bound (the injected reconcileTimeout) for each Docker operation itself. The
-//     pre-build phase (routing validation and source resolution) and the
-//     post-build phase (env resolution, stale stops, replica starts) run on
-//     separate bounds, so a long Dockerfile build — bounded by the runtime's
-//     lifecycle-rooted buildTimeout, never by this budget — cannot consume the
-//     post-build deadline. A caller must never wrap the whole pass in one short
-//     deadline.
+//     routing/source-resolution phase and the post-resolution phase (env
+//     resolution, stale stops, replica starts) run on separate bounds, so one
+//     operation cannot consume another's budget. A caller must never wrap the
+//     whole pass in one short deadline.
 package reconciler
 
 import (
@@ -58,13 +56,13 @@ import (
 // not here.
 type Docker interface {
 	// ResolveServiceImage resolves one service's configured source to the image
-	// a container should run: the function image for an `entrypoint` source, a
-	// content-addressed Relay-built image for a `build` source, or an inspected/
-	// pulled external image for an `image` source. It is resolved BEFORE any
-	// container action, so a build or pull failure preserves healthy containers.
+	// a container should run: the function image for an `entrypoint` source, or
+	// an inspected/pulled external image for an `image` source. It is resolved
+	// BEFORE any container action, so a pull failure preserves healthy
+	// containers.
 	ResolveServiceImage(
 		ctx context.Context,
-		fnName, fnDir string,
+		fnName string,
 		tmpl *function.Template,
 		svc function.Service,
 		functionImage string,
@@ -136,14 +134,12 @@ func BuildEnv(
 //
 // ctx is the LIFECYCLE context, NOT a pre-bounded reconcile budget. Reconcile
 // derives every normal-operation bound itself from ctx and reconcileTimeout, so a
-// caller can never accidentally wrap a whole pass — a long Dockerfile build
-// included — in one short deadline. Concretely, each service's pre-build phase
-// (routing validation and source resolution) and its post-build phase
-// (environment resolution, stale stops, replica starts) run on SEPARATE fresh
-// bounds rooted in ctx: a long build issued by the runtime under its own
-// lifecycle-rooted buildTimeout can never consume the deadline of the post-build
-// work that follows. A non-positive reconcileTimeout leaves normal operations
-// bounded only by the lifecycle context.
+// caller can never accidentally wrap a whole pass in one short deadline.
+// Concretely, each service's pre-resolution phase (routing validation and source
+// resolution) and its post-resolution phase (environment resolution, stale
+// stops, replica starts) run on SEPARATE fresh bounds rooted in ctx. A
+// non-positive reconcileTimeout leaves normal operations bounded only by the
+// lifecycle context.
 //
 // The returned bool reports whether the pass performed any convergence action
 // (stopped at least one removed-service or stale container, or attempted to
@@ -160,7 +156,7 @@ func Reconcile(
 	ctx context.Context,
 	reconcileTimeout time.Duration,
 	docker Docker,
-	fnName, fnDir string,
+	fnName string,
 	tmpl *function.Template,
 	functionImage string,
 	preparedEnv []string,
@@ -168,21 +164,20 @@ func Reconcile(
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
-	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, fnDir, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil, nil)
+	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil)
 }
 
 func reconcileWithObserver(
 	ctx context.Context,
 	reconcileTimeout time.Duration,
 	docker Docker,
-	fnName, fnDir string,
+	fnName string,
 	tmpl *function.Template,
 	functionImage string,
 	preparedEnv []string,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
-	buildStarted func(),
 	reconcileStarted func(),
 ) (bool, error) {
 	// A fresh normal-operation bound for the container listing. reconcileTimeout
@@ -211,23 +206,11 @@ func reconcileWithObserver(
 	// convergence work that is not happening. corrective is set by every branch
 	// that is about to stop or start a container; notifyReconcile then fires
 	// reconcileStarted at most once per pass, immediately before the first such
-	// action. It is additionally deferred until every `build` source's
-	// Dockerfile build in this pass has concluded (buildsResolved ==
-	// buildsTotal), so a mixed template can never emit reconciling before
-	// building: an entrypoint service that happens to be iterated before a
-	// build service still waits for that build. A pass with no corrective work
-	// never fires it.
+	// action. A pass with no corrective work never fires it.
 	corrective := false
 	reconcileNotified := false
-	buildsTotal := 0
-	for _, svc := range tmpl.Services {
-		if svc.Source() == function.ServiceSourceBuild {
-			buildsTotal++
-		}
-	}
-	buildsResolved := 0
 	notifyReconcile := func() {
-		if reconcileStarted == nil || reconcileNotified || !corrective || buildsResolved < buildsTotal {
+		if reconcileStarted == nil || reconcileNotified || !corrective {
 			return
 		}
 		reconcileNotified = true
@@ -259,10 +242,7 @@ func reconcileWithObserver(
 		if _, ok := desired[ctr.Identity]; !ok {
 			changed = true
 			// A removed service's container is about to be stopped: this is
-			// corrective work. Publish reconciling here unless a `build` source
-			// in the template is still pending — notifyReconcile defers until
-			// every build has resolved, and the post-build call below covers
-			// that case.
+			// corrective work. Publish reconciling here.
 			corrective = true
 			notifyReconcile()
 			stopCtx, stopCancel := ctx, func() {}
@@ -283,14 +263,11 @@ func reconcileWithObserver(
 		identity := svc.SourceRef()
 		existing := byService[identity]
 
-		// The pre-build phase runs on its own fresh normal-operation bound rooted
-		// in the lifecycle context (never the caller's ctx), so a caller cannot
-		// wrap a whole pass in one short deadline and one operation cannot
+		// The pre-resolution phase runs on its own fresh normal-operation bound
+		// rooted in the lifecycle context (never the caller's ctx), so a caller
+		// cannot wrap a whole pass in one short deadline and one operation cannot
 		// consume another's budget. Routing validation and source resolution
-		// belong here. A `build` source's Dockerfile build does NOT run on this
-		// bound — the runtime roots it in the manager lifecycle under its own
-		// buildTimeout (see runtime.buildContext) — but the quick probes around
-		// it (network existence, image existence, inspect) do.
+		// belong here.
 		preCtx, preCancel := ctx, func() {}
 		if reconcileTimeout > 0 {
 			preCtx, preCancel = context.WithTimeout(ctx, reconcileTimeout)
@@ -372,18 +349,12 @@ func reconcileWithObserver(
 		}
 
 		// Resolve the source's image BEFORE any container action. A source that
-		// cannot be resolved — a failed build, a failed pull, a missing image, or
-		// an unlaunchable entrypoint — is reported and this service is skipped
+		// cannot be resolved — a failed pull, a missing image, or an
+		// unlaunchable entrypoint — is reported and this service is skipped
 		// entirely: its existing (healthy) containers are preserved rather than
 		// replaced on a failed resolution. This is the ordering guarantee that a
-		// transient registry outage never tears down a working service. The build
-		// itself does not use preCtx: the runtime roots it in the manager
-		// lifecycle under buildTimeout, so a long build cannot outlive the
-		// pre-build budget here either.
-		if buildStarted != nil {
-			preCtx = runtime.WithServiceBuildObserver(preCtx, buildStarted)
-		}
-		resolved, err := docker.ResolveServiceImage(preCtx, fnName, fnDir, tmpl, svc, functionImage)
+		// transient registry outage never tears down a working service.
+		resolved, err := docker.ResolveServiceImage(preCtx, fnName, tmpl, svc, functionImage)
 		preCancel()
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", identity, err))
@@ -391,26 +362,11 @@ func reconcileWithObserver(
 				"service", identity, "error", err)
 			continue
 		}
-		if svc.Source() == function.ServiceSourceBuild {
-			buildsResolved++
-		}
 
-		// Every `build` source's Dockerfile build in this pass has now completed
-		// (or there was none). If corrective work was already identified earlier
-		// in the pass (a removed-service stop, or a prior service's stale/start
-		// work) but reconciling was deferred to keep building before reconciling,
-		// it is published now — before this service converges containers. The
-		// correction itself calls notifyReconcile at its own point, so a pass
-		// whose only corrective work is here fires once, just above. The callback
-		// is generation-guarded by the caller.
-		notifyReconcile()
-
-		// The post-build phase runs on a FRESH normal-operation bound rooted in
-		// the lifecycle context, separate from every bound above. This is the
-		// core ordering guarantee: a long Dockerfile build in the pre-build
-		// phase (bounded by the runtime's buildTimeout, not by preCtx) can never
-		// consume the deadline of the environment resolution, stale stops, and
-		// replica starts that follow. A non-positive reconcileTimeout leaves
+		// The post-resolution phase runs on a FRESH normal-operation bound rooted
+		// in the lifecycle context, separate from every bound above, so the
+		// environment resolution, stale stops, and replica starts that follow
+		// each get their own budget. A non-positive reconcileTimeout leaves
 		// these operations bounded only by the lifecycle context.
 		postCtx, postCancel := ctx, func() {}
 		if reconcileTimeout > 0 {
@@ -443,8 +399,8 @@ func reconcileWithObserver(
 		// and currently configured correctly (image, image content, port,
 		// effective environment, and Docker networks all match the desired
 		// values) and carries a real replica label. Anything else —
-		// exited/dead/removing, a changed image (rebuild), a moved external tag
-		// (image content changed), a changed port, a changed env/secret (env hash
+		// exited/dead/removing, a changed image, a moved external tag (image
+		// content changed), a changed port, a changed env/secret (env hash
 		// mismatch), a changed network set, or an unlabeled legacy container
 		// (Replica == -1) — is stale and must be replaced. In addition, the
 		// container's labels must match the desired routing label set exactly: a
@@ -631,8 +587,7 @@ type ServiceReconciler struct {
 	// passes. It is injected by the worker (its reconcileTimeout) so the policy
 	// lives with the worker that owns the value; a non-positive value means
 	// "no normal-operation bound", leaving operations bounded only by the
-	// lifecycle. It deliberately does NOT bound Dockerfile builds — those are
-	// rooted in the runtime manager's lifecycle under buildTimeout.
+	// lifecycle.
 	reconcileTimeout time.Duration
 
 	mu sync.Mutex
@@ -641,9 +596,9 @@ type ServiceReconciler struct {
 // NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
 // Traefik routing config (empty = routing not configured; required only for
 // services whose template declares a host). reconcileTimeout is the worker's
-// normal-service-operation budget, applied by Reconcile to every pre-build and
-// post-build Docker operation (a non-positive value leaves them bounded only by
-// the lifecycle context; builds are never bounded by it).
+// normal-service-operation budget, applied by Reconcile to every pre-resolution
+// and post-resolution Docker operation (a non-positive value leaves them bounded
+// only by the lifecycle context).
 func NewServiceReconciler(
 	docker Docker,
 	secrets SecretResolver,
@@ -670,36 +625,31 @@ func NewServiceReconciler(
 // ctx is the LIFECYCLE context, NOT a pre-bounded pass budget: Reconcile
 // derives its own fresh per-operation bounds from it and the injected
 // reconcileTimeout, so a caller must pass a lifecycle-rooted context (not a
-// short deadline wrapped around the whole pass) and a long build can never
-// consume the post-build deadline.
-//
-// fnDir is the function's directory, needed to resolve `build` sources (their
-// Dockerfile is read relative to it) and to fingerprint their selected source.
-// image is the function's own prepared image, used only by `entrypoint`
-// sources. fnDir may be empty when the template declares no build service.
-// Callers that run Apply concurrently must provide function-level serialization
-// (ServiceCoordinator does this for the worker).
+// short deadline wrapped around the whole pass). image is the function's own
+// prepared image, used only by `entrypoint` sources. Callers that run Apply
+// concurrently must provide function-level serialization (ServiceCoordinator
+// does this for the worker).
 func (c *ServiceReconciler) Apply(
 	ctx context.Context,
-	fnName, fnDir string,
+	fnName string,
 	tmpl *function.Template,
 	image string,
 	preparedEnv []string,
 ) error {
-	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, nil, nil)
+	return c.apply(ctx, fnName, tmpl, image, preparedEnv, nil)
 }
 
-func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted, reconcileStarted func()) error {
-	return c.apply(ctx, fnName, fnDir, tmpl, image, preparedEnv, buildStarted, reconcileStarted)
+func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string, reconcileStarted func()) error {
+	return c.apply(ctx, fnName, tmpl, image, preparedEnv, reconcileStarted)
 }
 
-func (c *ServiceReconciler) apply(ctx context.Context, fnName, fnDir string, tmpl *function.Template, image string, preparedEnv []string, buildStarted, reconcileStarted func()) error {
+func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string, reconcileStarted func()) error {
 	replicas := 0
 	for _, svc := range tmpl.Services {
 		replicas += svc.Replicas
 	}
 
-	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, fnDir, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, buildStarted, reconcileStarted)
+	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, reconcileStarted)
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
 			"function", fnName,

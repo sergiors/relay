@@ -14,7 +14,12 @@
 //   - A previously-failed (unavailable) build is retried when its fingerprint
 //     is stable, so a broken function recovers without further edits
 //
-// Usage: New, then Seed the startup functions, then Start.
+// Usage: New, then PrepareWatch (establish change detection synchronously),
+// then Seed each startup function with its already-computed fingerprint, then
+// Start (which reuses the watcher). Establishing the watch BEFORE seeding is
+// what makes a supplied seed safe: a change after the watch is observed as an
+// event, and a change before it is caught by the first reconcile's rescan
+// because the seeded value is older.
 //
 // When Config.State is set, reconcile outcomes are recorded into the local
 // state database (a read-only state view) — success, failure (retaining the
@@ -29,18 +34,15 @@
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both
 // nil-safe), which the worker wires to a *ServiceReconciler constructed from the
-// runtime Manager's Docker seam. A service's source (entrypoint, build, or
-// image) is resolved to a runnable image BEFORE any container action; a source
-// that cannot be resolved leaves the service's existing healthy containers
-// untouched.
+// runtime Manager's Docker seam. A service's source (entrypoint or image) is
+// resolved to a runnable image BEFORE any container action; a source that cannot
+// be resolved leaves the service's existing healthy containers untouched.
 //
 // Reconcile owns its timeouts: it receives the LIFECYCLE context (the worker
 // passes its signal context, never a pass-wide short deadline) and a reconcile
 // timeout injected into the *ServiceReconciler, and derives a FRESH bound for
-// each normal pre-build and post-build Docker operation itself. A Dockerfile
-// build is rooted in the runtime manager lifecycle under buildTimeout, so a
-// long build can never consume the post-build deadline; lifecycle cancellation
-// still cancels builds and normal operations promptly.
+// each normal Docker operation itself. Lifecycle cancellation still cancels
+// normal operations promptly.
 //
 // Ordering on a rebuild: the new version is prepared and swapped in, schedules
 // converge, persistent services converge to the new image, and only THEN is the

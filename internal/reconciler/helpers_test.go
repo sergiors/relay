@@ -7,9 +7,19 @@ import (
 	"testing"
 	"time"
 
+	"relay/internal/function"
 	"relay/internal/runner"
 	"relay/internal/state"
 )
+
+// seedCurrent fingerprints fn as it currently exists on disk and seeds the
+// reconciler with that value, mirroring the worker's startup wiring (the
+// fingerprint is computed once and supplied to Seed). Tests that need a
+// deliberately stale seed use r.Seed directly.
+func seedCurrent(r *Reconciler, fn function.Function) {
+	fp, _ := function.FingerprintFunction(fn.Dir, fn.Template)
+	r.Seed(fn, fp)
+}
 
 // newTestReconciler builds a reconciler over a fresh registry seeded from
 // initial, with a tiny debounce and a long interval so tests drive reconciles
@@ -34,7 +44,7 @@ func newTestReconciler(
 	}
 	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	for _, pf := range initial {
-		r.Seed(pf.Function())
+		seedCurrent(r, pf.Function())
 		if cfg.State != nil {
 			cfg.State.RecordDiscovered(pf.Function())
 		}

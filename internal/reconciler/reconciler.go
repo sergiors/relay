@@ -84,15 +84,14 @@ type Config struct {
 	// prepared and swapped into the registry (discovery and update paths; never
 	// on the skip path and never on build failure), so the service reconciler
 	// (services.go) can converge the function's persistent containers to the new
-	// template+image. fnDir is the function's directory (build sources resolve
-	// their Dockerfile relative to it).
+	// template+image.
 	// It is ALSO called on the skip path (unchanged, already-available function)
 	// when the function declares services, so crashed service replicas are
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
-	UpdateServices           func(name, fnDir string, tmpl *function.Template, image string)
-	UpdateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error))
+	UpdateServices           func(name string, tmpl *function.Template, image string)
+	UpdateServicesWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveFunction and the function's images are retired. The ordering
 	// invariant: running service containers reference the function's images, so
@@ -118,8 +117,8 @@ type Reconciler struct {
 	retire                   func(name, oldImage string)
 	removeFunction           func(name string)
 	updateSchedules          func(name string, tmpl *function.Template)
-	updateServices           func(name, fnDir string, tmpl *function.Template, image string)
-	updateServicesWithStatus func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error))
+	updateServices           func(name string, tmpl *function.Template, image string)
+	updateServicesWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
 	removeServices           func(name string)
 
 	mu           sync.Mutex
@@ -167,30 +166,67 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 	}
 }
 
-// Seed records the fingerprint for each currently-loaded function so the first
-// reconcile pass does not rebuild functions that were already prepared at
-// startup. It is called once during wiring, before Start.
-func (r *Reconciler) Seed(fn function.Function) {
+// Seed records the fingerprint for a currently-loaded function so the first
+// reconcile pass does not rebuild a function that was already prepared at
+// startup. The fingerprint is SUPPLIED: the caller computed it once (the
+// startup fingerprint pass) and passes the value the prepared image was
+// actually tagged with, so Seed never re-reads the source tree. It is called
+// once during wiring, after PrepareWatch has established change detection and
+// before Start.
+//
+// A change that lands between the caller's fingerprint computation and
+// PrepareWatch is still detected: the first reconcile rescans the tree and,
+// because the supplied seed is the OLDER value, observes the change as a
+// rebuild — never a missed update. An empty value is stored as-is; because no
+// real fingerprint is empty, the first reconcile simply treats the function as
+// changed and rebuilds it (the desired behavior for an unprepared function).
+func (r *Reconciler) Seed(fn function.Function, fingerprint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if fp, err := function.Fingerprint(fn.Dir); err == nil {
-		r.fingerprints[fn.Name] = fp
+	r.fingerprints[fn.Name] = fingerprint
+}
+
+// PrepareWatch creates the fsnotify watcher and installs the recursive watches
+// SYNCHRONOUSLY, without starting the background loops. It is the ordering seam
+// the worker uses to establish change detection BEFORE trusting the supplied
+// startup fingerprints: the worker calls PrepareWatch, then Seed for each
+// startup function, then Start. Any change after the watch is installed is
+// observed as an fsnotify event; a change between the startup fingerprint scan
+// and this point is still caught by the first reconcile's own rescan because
+// the supplied seed is the older value.
+//
+// It is idempotent: a watcher already prepared (Start called after
+// PrepareWatch, or a second PrepareWatch) is reused as-is. An error creating the
+// watcher is returned and leaves the reconciler unwatched; Start logs it and
+// returns without starting the loops, matching the historical fsnotify-failure
+// behavior.
+func (r *Reconciler) PrepareWatch(ctx context.Context) error {
+	r.ctx = ctx
+	if r.w != nil {
+		return nil
 	}
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	r.w = w
+	r.addWatchRecursive(r.root)
+	return nil
 }
 
 // Start runs the watch loop, the debounce pump, and the periodic ticker in
 // background goroutines until ctx is cancelled, then returns. It is intended to
 // be called concurrently with the stream consumer.
+//
+// Start first calls PrepareWatch, so a caller that already established the
+// watch (the worker, to seed the supplied fingerprints safely) reuses it rather
+// than installing a second one; a caller that did not (tests, standalone
+// callers) gets the watcher created here.
 func (r *Reconciler) Start(ctx context.Context) {
-	r.ctx = ctx
-
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
+	if err := r.PrepareWatch(ctx); err != nil {
 		r.log.Error("Reconciler: fsnotify error", "error", err)
 		return
 	}
-	r.w = w
-	r.addWatchRecursive(r.root)
 
 	go r.pump()
 	go r.ticker()
@@ -445,7 +481,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 		return
 	}
 
-	fp, err := function.Fingerprint(dir)
+	fp, err := function.FingerprintFunction(dir, fn.Template)
 	if err != nil {
 		r.log.Warn(
 			"Function: fingerprint error; retaining previous version",
@@ -485,7 +521,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// than Info — the summary line only surfaces real state changes.
 		if (r.updateServices != nil || r.updateServicesWithStatus != nil) && len(fn.Template.Services) > 0 {
 			if r.updateServicesWithStatus == nil {
-				r.updateServices(name, fn.Dir, fn.Template, cur.Prepared().Image)
+				r.updateServices(name, fn.Template, cur.Prepared().Image)
 			} else {
 				r.mu.Lock()
 				r.generations[name]++
@@ -498,21 +534,15 @@ func (r *Reconciler) reconcileFunction(name string) {
 				// is detected (the rebuild path below).
 				//
 				// worked tracks whether the service pass actually did anything:
-				// onBuildStart fires at a real Dockerfile build boundary and
 				// onReconcileStart fires only when real corrective container work
 				// begins (see services.go). A no-op verification leaves it false,
 				// so the completion below writes NOTHING and ready,
 				// last_reconcile_status, and updated_at stay untouched. A pass that
-				// did real work (a build and/or corrective convergence) ends ready.
-				// The callbacks are per-generation and generation-guarded.
+				// did real corrective convergence ends ready. The callback is
+				// per-generation and generation-guarded.
 				worked := false
-				r.updateServicesWithStatus(name, fn.Dir, fn.Template, cur.Prepared().Image,
+				r.updateServicesWithStatus(name, fn.Template, cur.Prepared().Image,
 					func() {
-						worked = true
-						if r.st != nil && r.currentGeneration(name, generation) {
-							r.st.RecordReconcileBuilding(name)
-						}
-					}, func() {
 						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
 							r.st.RecordReconciling(name)
@@ -526,9 +556,9 @@ func (r *Reconciler) reconcileFunction(name string) {
 							return
 						}
 						if !worked {
-							// Nothing was built or converged: a no-op verification
-							// must not rewrite last_reconcile_status/
-							// last_reconcile_at or touch updated_at.
+							// Nothing was converged: a no-op verification must not
+							// rewrite last_reconcile_status/last_reconcile_at or
+							// touch updated_at.
 							return
 						}
 						r.st.RecordReconcileSuccess(name, cur.Prepared().Image, known, time.Now(), fn)
@@ -615,12 +645,8 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// not on the skip path above nor on a build failure (where the previous
 	// version — and its service containers — are retained).
 	if r.updateServicesWithStatus != nil {
-		r.updateServicesWithStatus(name, fn.Dir, fn.Template, built.Image,
+		r.updateServicesWithStatus(name, fn.Template, built.Image,
 			func() {
-				if r.st != nil && r.currentGeneration(name, generation) {
-					r.st.RecordReconcileBuilding(name)
-				}
-			}, func() {
 				if r.st != nil && r.currentGeneration(name, generation) {
 					r.st.RecordReconciling(name)
 				}
@@ -632,7 +658,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 				ready()
 			})
 	} else if r.updateServices != nil {
-		r.updateServices(name, fn.Dir, fn.Template, built.Image)
+		r.updateServices(name, fn.Template, built.Image)
 	}
 
 	// Retire the superseded version now that the registry serves the new one,

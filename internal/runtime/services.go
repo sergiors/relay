@@ -29,12 +29,12 @@ import (
 // relay.identity is stamped with it (there is no separate relay.service label,
 // and services carry no relay.handler), and it is what Reconcile uses to group a
 // function's containers by service. The identity is honest for every source —
-// an entrypoint file, a Dockerfile path, or an external image reference — never
-// a synthetic entrypoint.
+// an entrypoint file or an external image reference — never a synthetic
+// entrypoint.
 type ServiceSpec struct {
 	Function string
 	// Identity is the service's stable identity: the configured source
-	// descriptor (entrypoint file, Dockerfile path, or image reference).
+	// descriptor (entrypoint file or image reference).
 	Identity string
 	Port     int
 	Image    string
@@ -44,7 +44,7 @@ type ServiceSpec struct {
 	// replace the container.
 	ImageID string
 	// Entry is the per-container entrypoint override. Empty means preserve the
-	// image's own ENTRYPOINT/CMD (build/image sources); non-empty is the
+	// image's own ENTRYPOINT/CMD (an image source); non-empty is the
 	// runtime-resolved command for an entrypoint source.
 	Entry []string
 	Env   []string // runtime env (plan env), no RELAY_HANDLER
@@ -125,8 +125,8 @@ const serviceIdentityHashLen = 16
 
 // sanitizeContainerNamePart replaces any character outside [A-Za-z0-9_.-] with
 // '-'. Function names are already validated to a legal docker repo charset, but
-// the service identity is an arbitrary descriptor (a file path, Dockerfile
-// path, or image reference), so it is sanitized defensively.
+// the service identity is an arbitrary descriptor (a file path or image
+// reference), so it is sanitized defensively.
 func sanitizeContainerNamePart(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -143,8 +143,8 @@ func sanitizeContainerNamePart(s string) string {
 
 // serviceContainerName derives the deterministic container name for a replica:
 // relay-svc-<function>-<identity>-<hash>-<replica>. Function names are already
-// validated; the identity part (an entrypoint file, Dockerfile path, or image
-// reference) is sanitized. The name ends with a collision-resistant hash suffix
+// validated; the identity part (an entrypoint file or image reference) is
+// sanitized. The name ends with a collision-resistant hash suffix
 // derived from the FULL function name and identity, so distinct identities that
 // sanitize to the same readable base (e.g. "ghcr.io/acme/a/b:1" and
 // "ghcr.io/acme/a-b:1") or that would truncate to the same prefix still get
@@ -308,10 +308,11 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // — no host port is published this iteration. On any error after create but
 // before a successful start, the container is removed via removeContainer.
 //
-// One image serves both invocations and services: PrepareService builds the
+// One image serves both invocations and services: Manager.Prepare builds the
 // function image (its ENTRYPOINT is the invocation bootstrap), and the service
 // entrypoint is overridden per-container via spec.Entry. This keeps image
 // retirement grouped under FunctionImageTags with no separate service images.
+// An `image` source instead runs its external reference with Entry empty.
 func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica int) (string, error) {
 	cfg := &container.Config{
 		Image:  spec.Image,
@@ -324,7 +325,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	if len(spec.Entry) > 0 {
 		// An entrypoint-source service overrides the function image's
 		// invocation-bootstrap entrypoint with the long-lived service command
-		// (e.g. ["node", "/app/service.js"]). A build/image service leaves
+		// (e.g. ["node", "/app/service.js"]). An image service leaves
 		// Entry empty so the container preserves the image's own
 		// ENTRYPOINT/CMD.
 		cfg.Entrypoint = spec.Entry

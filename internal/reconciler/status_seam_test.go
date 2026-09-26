@@ -20,82 +20,51 @@ import (
 // TestReconcileWithStatusCallbackOrdering pins the focused status-callback
 // contract the reconciler wires for a function that declares services:
 //
-//	onReconcileStart -> reconciling (source resolved / build finished)
+//	onReconcileStart -> reconciling (source resolved / convergence beginning)
 //	onComplete(nil)  -> ready (only after the full generation converged)
 //
-// and, for a Dockerfile (`build`) service, the actual build boundary fires
-// onBuildStart -> building BEFORE onReconcileStart -> reconciling. This is the
-// ordering the worker maps onto the persisted lifecycle: preparing -> building
-// -> reconciling -> ready. An entrypoint/image service has no build, so
-// onBuildStart never fires.
+// There is no per-source build boundary at the service level any more: the two
+// sources (entrypoint, image) both resolve without a Relay-owned Dockerfile
+// build, so onReconcileStart is the only boundary callback.
 func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
-	t.Run("build service fires building before reconciling", func(t *testing.T) {
+	t.Run("entrypoint service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		f.buildObserver = true
-		buildTmpl := serviceTemplate("", function.Service{Build: "Dockerfile", Port: 80, Replicas: 1})
-
-		var order []string
-		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-		err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), buildTmpl, "img", nil,
-			func() { order = append(order, "building") },
-			func() { order = append(order, "reconciling") },
-		)
-		if err != nil {
-			t.Fatalf("apply: %v", err)
-		}
-		if len(order) != 2 || order[0] != "building" || order[1] != "reconciling" {
-			t.Fatalf("callback order = %v, want [building reconciling]", order)
-		}
-	})
-
-	t.Run("entrypoint service never fires building", func(t *testing.T) {
-		f := newFakeDocker()
-		f.buildObserver = true
 		entryTmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-		if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), entryTmpl, "img", nil,
-			func() { order = append(order, "building") },
+		if err := c.ApplyWithStatus(context.Background(), "fn", entryTmpl, "img", nil,
 			func() { order = append(order, "reconciling") },
 		); err != nil {
 			t.Fatalf("apply: %v", err)
 		}
 		if len(order) != 1 || order[0] != "reconciling" {
-			t.Fatalf("callback order = %v, want [reconciling] only", order)
+			t.Fatalf("callback order = %v, want [reconciling]", order)
 		}
 	})
 
-	t.Run("mixed template keeps building before reconciling", func(t *testing.T) {
+	t.Run("image service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		f.buildObserver = true
-		// The entrypoint service is iterated BEFORE the build service; the
-		// global invariant (building before reconciling) must still hold, so
-		// reconciling is deferred until the build resolves.
-		mixed := serviceTemplate("node24",
-			function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1},
-			function.Service{Build: "Dockerfile", Port: 8080, Replicas: 1},
-		)
+		imgTmpl := serviceTemplate("", function.Service{Image: "nginx:1.27", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-		if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), mixed, "img", nil,
-			func() { order = append(order, "building") },
+		if err := c.ApplyWithStatus(context.Background(), "fn", imgTmpl, "img", nil,
 			func() { order = append(order, "reconciling") },
 		); err != nil {
 			t.Fatalf("apply: %v", err)
 		}
-		if len(order) != 2 || order[0] != "building" || order[1] != "reconciling" {
-			t.Fatalf("callback order = %v, want [building reconciling] for a mixed template", order)
+		if len(order) != 1 || order[0] != "reconciling" {
+			t.Fatalf("callback order = %v, want [reconciling]", order)
 		}
 	})
 }
 
 // TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling pins the
 // focused correction: a fully-converged service pass is a VERIFICATION, not
-// convergence work. It must not fire the reconciling callback (nor building),
-// so a periodic no-op tick can never publish a spurious reconciling/building
-// status for an already-ready function.
+// convergence work. It must not fire the reconciling callback, so a periodic
+// no-op tick can never publish a spurious reconciling status for an already-ready
+// function.
 func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["id-1"] = &fakeContainer{
@@ -105,16 +74,12 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
-	var building, reconciling int
+	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
-		func() { building++ },
+	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); err != nil {
 		t.Fatalf("apply: %v", err)
-	}
-	if building != 0 {
-		t.Fatalf("building fired %d times on a no-op verification, want 0", building)
 	}
 	if reconciling != 0 {
 		t.Fatalf("reconciling fired %d times on a no-op verification, want 0", reconciling)
@@ -130,8 +95,7 @@ func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
-		func() {},
+	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); err != nil {
 		t.Fatalf("apply: %v", err)
@@ -157,8 +121,7 @@ func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
-	if err := c.ApplyWithStatus(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil,
-		func() {},
+	if err := c.ApplyWithStatus(context.Background(), "fn", tmpl, "img-1", nil,
 		func() { reconciling++ },
 	); err != nil {
 		t.Fatalf("apply: %v", err)
@@ -199,7 +162,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	var seen []string
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			// The reconciler wrote preparing before dispatching. Record the
 			// persisted state at the convergence seam and at completion.
 			onReconcileStart()
@@ -212,7 +175,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 			}
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
-	r.Seed(baseFn)
+	seedCurrent(r, baseFn)
 
 	// Change content so the rebuild path runs and the update-services hook fires.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -252,12 +215,12 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			onReconcileStart()
 			onComplete(errServiceConverge)
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
-	r.Seed(baseFn)
+	seedCurrent(r, baseFn)
 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
@@ -314,11 +277,11 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	var completions []completion
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			completions = append(completions, completion{onBegin: onReconcileStart, onFinish: onComplete})
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
-	r.Seed(baseFn)
+	seedCurrent(r, baseFn)
 
 	// Generation 1: content change triggers an update; capture its callbacks.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
@@ -365,11 +328,11 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 		reg2.Set([]*runner.PreparedFunction{runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})})
 		r2 := New(Config{
 			Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st2,
-			UpdateServicesWithStatus: func(name, fnDir string, _ *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
+			UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
 				cs = append(cs, completion{onBegin: onReconcileStart, onFinish: onComplete})
 			},
 		}, reg2, &fakeBuilder{}, testutil.DiscardLogger())
-		r2.Seed(baseFn)
+		seedCurrent(r2, baseFn)
 
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v4'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v4: %v", err)

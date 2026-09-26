@@ -112,86 +112,15 @@ func TestFunctionImageBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
 // pins the same 30s value the worker uses; the two must agree.
 const reconcileShort = 30 * time.Second
 
-// TestServiceBuildGetsIndependentTenMinuteDeadline proves the service `build`
-// source path (ResolveServiceImage for a Dockerfile service) also issues its
-// ImageBuild under buildTimeout, independently of the caller's reconcile budget.
-func TestServiceBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
-		t.Fatalf("write dockerfile: %v", err)
-	}
-	svc := function.Service{Build: "Dockerfile", Port: 80, Replicas: 1}
-
-	var got buildDeadline
-	cli := newScriptedDockerClient(t,
-		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
-		buildRoute(got.capture),
-	)
-	// The lifecycle is unbounded; only the build's own buildTimeout should apply.
-	m := newLifecycleManager(t, cli, context.Background())
-
-	// The caller passes a SHORT context (the reconcile budget); the build must
-	// not inherit it.
-	shortCtx, shortCancel := context.WithTimeout(context.Background(), reconcileShort)
-	defer shortCancel()
-	if _, err := m.ResolveServiceImage(shortCtx, "fn", dir, &function.Template{Runtime: "node24"}, svc, ""); err == nil {
-		t.Fatal("expected the scripted build failure to surface")
-	}
-	if !got.seen {
-		t.Fatal("ImageBuild was never issued; the scripted /build route did not match")
-	}
-	if !got.ok {
-		t.Fatalf("ImageBuild request carried no deadline; want %v", buildTimeout)
-	}
-	if remaining := time.Until(got.at); remaining <= reconcileShort || remaining > buildTimeout {
-		t.Fatalf("ImageBuild deadline bound = %v, want an independent 10m bound (short=%v build=%v)",
-			remaining, reconcileShort, buildTimeout)
-	}
-}
-
-// TestServiceBuildReuseKeepsCallerShortDeadline proves the non-build path does
-// NOT inherit the long build timeout: when a `build` service's image already
-// exists, the resolve short-circuits and its ImageInspect call carries the
-// caller's short reconcile deadline, not buildTimeout.
-func TestServiceBuildReuseKeepsCallerShortDeadline(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
-		t.Fatalf("write dockerfile: %v", err)
-	}
-	svc := function.Service{Build: "Dockerfile", Port: 80, Replicas: 1}
-
-	inspectDeadline := &buildDeadline{}
-	cli := newScriptedDockerClient(t,
-		dockerRoute{
-			method: http.MethodGet, path: "/images/",
-			body:      `{"Id":"sha256:abc"}`,
-			onRequest: inspectDeadline.capture,
-		},
-	)
-	m := newLifecycleManager(t, cli, context.Background())
-
-	shortCtx, shortCancel := context.WithTimeout(context.Background(), reconcileShort)
-	defer shortCancel()
-	if _, err := m.ResolveServiceImage(shortCtx, "fn", dir, &function.Template{Runtime: "node24"}, svc, ""); err != nil {
-		t.Fatalf("resolve (reuse): %v", err)
-	}
-	if !inspectDeadline.seen || !inspectDeadline.ok {
-		t.Fatal("expected the reuse ImageInspect to carry a deadline")
-	}
-	if remaining := time.Until(inspectDeadline.at); remaining > reconcileShort {
-		t.Fatalf("reuse ImageInspect deadline bound = %v, must not inherit the %v build timeout", remaining, buildTimeout)
-	}
-}
-
 // TestLifecycleCancellationCancelsActiveBuild proves an active Dockerfile build
 // is cancelled promptly when the manager lifecycle is cancelled (Relay
 // shutdown), while the build remains independently bounded by buildTimeout.
 func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
-		t.Fatalf("write dockerfile: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
 	}
-	svc := function.Service{Build: "Dockerfile", Port: 80, Replicas: 1}
+	fn := function.Function{Name: "cancel-build", Dir: dir, Template: &function.Template{Runtime: "node24"}}
 
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
@@ -215,7 +144,7 @@ func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := m.ResolveServiceImage(context.Background(), "fn", dir, &function.Template{Runtime: "node24"}, svc, "")
+		_, err := m.Prepare(context.Background(), fn)
 		done <- err
 	}()
 
@@ -240,10 +169,10 @@ func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 	}
 }
 
-// TestServiceImageSourceKeepsCallerShortDeadline proves a non-build service
-// source (`image`) does NOT inherit the long build timeout: its ImageInspect is
-// issued under the caller's short reconcile deadline, because only Dockerfile
-// builds get the independent 10m bound.
+// TestServiceImageSourceKeepsCallerShortDeadline proves the service `image`
+// source does NOT inherit the long build timeout: its ImageInspect is issued
+// under the caller's short reconcile deadline, because only managed function/
+// dependency Dockerfile builds get the independent 10m bound.
 func TestServiceImageSourceKeepsCallerShortDeadline(t *testing.T) {
 	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
@@ -261,7 +190,7 @@ func TestServiceImageSourceKeepsCallerShortDeadline(t *testing.T) {
 
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), reconcileShort)
 	defer shortCancel()
-	if _, err := m.ResolveServiceImage(shortCtx, "fn", t.TempDir(), &function.Template{Runtime: "node24"}, svc, ""); err != nil {
+	if _, err := m.ResolveServiceImage(shortCtx, "fn", &function.Template{Runtime: "node24"}, svc, ""); err != nil {
 		t.Fatalf("resolve (image source): %v", err)
 	}
 	if !inspectDeadline.seen || !inspectDeadline.ok {

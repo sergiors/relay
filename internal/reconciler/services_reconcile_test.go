@@ -53,11 +53,6 @@ type fakeDocker struct {
 	resolveErr      map[string]error
 	resolveCalls    []string // identities passed to ResolveServiceImage, in order
 	resolvedImages  map[string]string
-	// buildObserver, when true, fires the runtime service-build observer carried
-	// by the resolve context for `build` sources — mirroring production's
-	// Dockerfile-build boundary so the reconciling-after-build ordering can be
-	// asserted without Docker.
-	buildObserver bool
 }
 
 func newFakeDocker() *fakeDocker {
@@ -70,11 +65,10 @@ func newFakeDocker() *fakeDocker {
 }
 
 // ResolveServiceImage mirrors the production resolution shape without Docker:
-// entrypoint sources resolve through runtime.ServiceEntry, build sources get a
-// deterministic content-addressed reference, and image sources resolve to the
-// identity (with a deterministic content ID). A resolveErr entry forces a
-// resolution failure for the matching identity.
-func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName, _ string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
+// entrypoint sources resolve through runtime.ServiceEntry, and image sources
+// resolve to the identity (with a deterministic content ID). A resolveErr entry
+// forces a resolution failure for the matching identity.
+func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	identity := svc.SourceRef()
@@ -83,19 +77,6 @@ func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName, _ string, 
 		return runtime.ServiceImage{}, err
 	}
 	switch svc.Source() {
-	case function.ServiceSourceBuild:
-		if f.buildObserver {
-			// Model production's boundary: the observer fires immediately before
-			// the Dockerfile build (and only for a genuine build).
-			if obs := runtime.ServiceBuildObserverFromContext(ctx); obs != nil {
-				obs()
-			}
-		}
-		ref := f.resolvedImages[identity]
-		if ref == "" {
-			ref = "svc-build-" + fnName + ":" + identity
-		}
-		return runtime.ServiceImage{Ref: ref}, nil
 	case function.ServiceSourceImage:
 		id := f.resolvedImages[identity]
 		if id == "" {
@@ -284,7 +265,7 @@ const testReconcileTimeout = 30 * time.Second
 // per-operation bounds from the explicit timeout.
 func reconcile(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, t.TempDir(), tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
@@ -695,7 +676,7 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 // env/secret staleness tests.
 func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, t.TempDir(), tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
 }
 
 // TestReconcileEnvChangeReplacesContainer: changing a template env value on an
@@ -844,28 +825,26 @@ func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
 	}
 }
 
-// TestReconcileBuildSourceEnvChangeReplaces: the env/secret comparison is
-// source-agnostic — a `build` source (whose resolved image reference is
-// content-addressed and unchanged by an env edit) is replaced on an env change
-// just like an `image` source.
-func TestReconcileBuildSourceEnvChangeReplaces(t *testing.T) {
+// TestReconcileImageSourceEnvChangeReplaces: the env/secret comparison is
+// source-agnostic — an `image` source (whose resolved image reference is
+// unchanged by an env edit) is replaced on an env change.
+func TestReconcileImageSourceEnvChangeReplaces(t *testing.T) {
 	f := newFakeDocker()
-	f.resolvedImages["Dockerfile"] = "relay-fn-fn:buildtag"
-	start := serviceTemplate("", function.Service{Build: "Dockerfile", Port: 3000, Replicas: 1})
+	start := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
 	start.Env = map[string]string{"MODE": "a"}
 	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=a: %v", err)
 	}
 
-	changed := serviceTemplate("", function.Service{Build: "Dockerfile", Port: 3000, Replicas: 1})
+	changed := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=b: %v", err)
 	}
 	if len(f.stops) != 1 {
-		t.Fatalf("stops = %v, want the build-source env-stale container replaced", f.stops)
+		t.Fatalf("stops = %v, want the image-source env-stale container replaced", f.stops)
 	}
-	c := f.lastStartedFor("fn", "Dockerfile")
+	c := f.lastStartedFor("fn", "ghcr.io/acme/api:1.2")
 	if c == nil || c.envHash != runtime.EnvHash([]string{"MODE=b", "PORT=3000"}) {
 		t.Fatalf("replacement = %+v, want the env=b effective env hash", c)
 	}
@@ -1056,7 +1035,7 @@ func TestReconcileListErrorSurfaces(t *testing.T) {
 type listErrDocker struct{ err error }
 
 func (d *listErrDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
@@ -1104,7 +1083,7 @@ type startFailDocker struct {
 }
 
 func (d *startFailDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
@@ -1154,8 +1133,8 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	logger, capture := newCaptureLogger(slog.LevelDebug)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 
-	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
-	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil) // idempotent second pass
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil) // idempotent second pass
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: unchanged") {
@@ -1177,7 +1156,7 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -1201,7 +1180,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-new", nil)
+	c.Apply(context.Background(), "fn", tmpl, "img-new", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled") {
@@ -1241,7 +1220,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 
 	logger, capture := newCaptureLogger(slog.LevelWarn)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
-	c.Apply(context.Background(), "fn", t.TempDir(), tmpl, "img-1", nil)
+	c.Apply(context.Background(), "fn", tmpl, "img-1", nil)
 
 	out := capture.String()
 	if !strings.Contains(out, "Service: reconciled with errors") {
@@ -1260,30 +1239,8 @@ func newCaptureLogger(level slog.Level) (*slog.Logger, *captureLogger) {
 	return slog.New(h), c
 }
 
-// A build-source service starts with the resolved build image and NO entrypoint
-// override, so the image's own ENTRYPOINT/CMD is preserved.
-func TestReconcileBuildServiceStartPreservesImageEntrypoint(t *testing.T) {
-	f := newFakeDocker()
-	f.resolvedImages["docker/Dockerfile.prod"] = "relay-fn-fn:buildtag"
-	tmpl := serviceTemplate("", function.Service{Build: "docker/Dockerfile.prod", Port: 3000, Replicas: 1})
-
-	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	c := f.lastStartedFor("fn", "docker/Dockerfile.prod")
-	if c == nil {
-		t.Fatal("no started container for the build service")
-	}
-	if c.image != "relay-fn-fn:buildtag" {
-		t.Fatalf("image = %q, want the resolved build image", c.image)
-	}
-	if c.entry != nil {
-		t.Fatalf("entry = %v, want nil (preserve image ENTRYPOINT/CMD)", c.entry)
-	}
-}
-
 // An image-source service starts with the external reference and its content ID,
-// and no entrypoint override.
+// and no entrypoint override, so the image's own ENTRYPOINT/CMD is preserved.
 func TestReconcileImageServiceStartPreservesImageEntrypoint(t *testing.T) {
 	f := newFakeDocker()
 	f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:cafe"
@@ -1343,7 +1300,7 @@ func TestReconcileImageContentChangeReplacesContainer(t *testing.T) {
 	}
 }
 
-// A build/pull resolution failure preserves the existing healthy container: it is
+// A pull resolution failure preserves the existing healthy container: it is
 // neither stopped nor replaced, and the error surfaces.
 func TestReconcileResolveFailurePreservesHealthyContainer(t *testing.T) {
 	f := newFakeDocker()

@@ -3,6 +3,7 @@ package function
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"relay/internal/source"
@@ -27,6 +28,61 @@ func fp(t *testing.T, dir string) string {
 	return f
 }
 
+// TestFingerprintFunctionNarrowsRuntimeLessToTemplate pins the narrow-input
+// rule: a template that needs no runtime (its only services use the external
+// `image` source) fingerprints template.yaml ALONE, so an unrelated source file
+// is neither read nor hashed — even an unreadable one — while a template edit is
+// still detected. A runtime template keeps the full selected-source digest.
+func TestFingerprintFunctionNarrowsRuntimeLessToTemplate(t *testing.T) {
+	dir := t.TempDir()
+	const tmplYAML = "services:\n  - image: nginx:1.27\n    port: 80\n"
+	writeFile(t, filepath.Join(dir, "template.yaml"), tmplYAML)
+	tmpl, err := ParseTemplate([]byte(tmplYAML))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	// An unreadable source file: a full-source fingerprint would fail on it.
+	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("x\n"), 0o200); err != nil {
+		t.Fatalf("write handler: %v", err)
+	}
+
+	before, err := FingerprintFunction(dir, tmpl)
+	if err != nil {
+		t.Fatalf("FingerprintFunction (no-runtime): %v", err)
+	}
+	if before == "" {
+		t.Fatal("no-runtime fingerprint must be non-empty")
+	}
+
+	// A template edit changes it.
+	changedTmplYAML := strings.Replace(tmplYAML, "nginx:1.27", "nginx:1.28", 1)
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(changedTmplYAML), 0o644); err != nil {
+		t.Fatalf("rewrite template: %v", err)
+	}
+	tmpl2, err := ParseTemplate([]byte(changedTmplYAML))
+	if err != nil {
+		t.Fatalf("parse changed template: %v", err)
+	}
+	after, err := FingerprintFunction(dir, tmpl2)
+	if err != nil {
+		t.Fatalf("FingerprintFunction after edit: %v", err)
+	}
+	if after == before {
+		t.Fatal("a template edit must change the no-runtime fingerprint")
+	}
+
+	// A runtime template uses the full source digest: the unreadable file then
+	// makes fingerprinting fail, proving the narrow path is not being taken.
+	runtimeTmpl := &Template{Runtime: "node24"}
+	if _, err := FingerprintFunction(dir, runtimeTmpl); err == nil {
+		t.Fatal("a runtime template must fingerprint the full source (and fail on the unreadable file)")
+	}
+
+	// A nil template is conservative (full source), same as a runtime one.
+	if _, err := FingerprintFunction(dir, nil); err == nil {
+		t.Fatal("a nil template must fall back to the full-source fingerprint")
+	}
+}
 func TestFingerprintUnchangedStable(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), "runtime: python3.14\n")

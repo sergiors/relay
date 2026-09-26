@@ -197,7 +197,7 @@ services:
 }
 
 // A service declaring more than one source is rejected: exactly one of
-// entrypoint/build/image is allowed.
+// entrypoint/image is allowed.
 func TestParseServiceMultipleSourcesRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
@@ -207,10 +207,25 @@ events:
       status: [COMPLETED]
 services:
   - entrypoint: service.js
-    build: Dockerfile
+    image: nginx:1.27
 `))
 	if err == nil || !strings.Contains(err.Error(), "multiple sources") {
 		t.Fatalf("err = %v, want multiple-sources rejection", err)
+	}
+}
+
+// A `build:` key is no longer a recognized source. The YAML decoder ignores the
+// unknown field, so a build-only service has no entrypoint and no image and is
+// rejected by the existing missing-source validation rather than silently
+// running an unexpected image.
+func TestParseServiceUnknownBuildRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+services:
+  - build: Dockerfile
+    port: 3000
+`))
+	if err == nil || !strings.Contains(err.Error(), "service is missing a source") {
+		t.Fatalf("err = %v, want missing-source rejection for an unknown build source", err)
 	}
 }
 
@@ -246,7 +261,7 @@ services:
 	if err == nil || !strings.Contains(err.Error(), `duplicate service "service.js"`) {
 		t.Fatalf("err = %v, want duplicate-service rejection", err)
 	}
-	// The same applies across source kinds with the same descriptor text.
+	// The same applies to image references with identical descriptor text.
 	_, err = ParseTemplate([]byte(`
 runtime: node24
 events:
@@ -254,11 +269,11 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - build: Dockerfile
-  - build: Dockerfile
+  - image: nginx:1.27
+  - image: nginx:1.27
 `))
-	if err == nil || !strings.Contains(err.Error(), `duplicate service "Dockerfile"`) {
-		t.Fatalf("err = %v, want duplicate build-service rejection", err)
+	if err == nil || !strings.Contains(err.Error(), `duplicate service "nginx:1.27"`) {
+		t.Fatalf("err = %v, want duplicate image-service rejection", err)
 	}
 }
 
@@ -670,35 +685,8 @@ services:
 	}
 }
 
-// A `build` source parses: the Dockerfile path is the service identity, and the
-// runtime may be omitted entirely (the built image carries its own
-// ENTRYPOINT/CMD), making a build-only template valid without a runtime.
-func TestParseServiceBuildSourceNoRuntime(t *testing.T) {
-	tmpl, err := ParseTemplate([]byte(`
-services:
-  - build: docker/Dockerfile.prod
-    port: 3000
-`))
-	if err != nil {
-		t.Fatalf("build-only template must parse without a runtime: %v", err)
-	}
-	if tmpl.Runtime != "" {
-		t.Fatalf("runtime = %q, want empty", tmpl.Runtime)
-	}
-	if len(tmpl.Services) != 1 {
-		t.Fatalf("services = %d, want 1", len(tmpl.Services))
-	}
-	s := tmpl.Services[0]
-	if s.Source() != ServiceSourceBuild || s.SourceRef() != "docker/Dockerfile.prod" {
-		t.Fatalf("service = %+v, want a build source with identity docker/Dockerfile.prod", s)
-	}
-	if s.Port != 3000 || s.Replicas != DefaultServiceReplicas {
-		t.Fatalf("service defaults = %+v, want port=3000 replicas=%d", s, DefaultServiceReplicas)
-	}
-}
-
-// An `image` source parses: the reference is the service identity and, like
-// build, needs no runtime.
+// An `image` source parses: the reference is the service identity and it needs
+// no runtime (the image carries its own ENTRYPOINT/CMD).
 func TestParseServiceImageSourceNoRuntime(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
 services:
@@ -716,8 +704,32 @@ services:
 	if s.Source() != ServiceSourceImage || s.SourceRef() != "ghcr.io/acme/api:1.2" {
 		t.Fatalf("service = %+v, want an image source with identity ghcr.io/acme/api:1.2", s)
 	}
-	if s.Image != "ghcr.io/acme/api:1.2" || s.Entrypoint != "" || s.Build != "" {
+	if s.Image != "ghcr.io/acme/api:1.2" || s.Entrypoint != "" {
 		t.Fatalf("service source fields = %+v, want only Image set", s)
+	}
+}
+
+// An `entrypoint` source parses with its file as identity and requires a runtime
+// (Relay launches it with a runtime-specific command).
+func TestParseServiceEntrypointSourceWithRuntime(t *testing.T) {
+	tmpl, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - entrypoint: service.js
+    port: 3000
+`))
+	if err != nil {
+		t.Fatalf("entrypoint template must parse: %v", err)
+	}
+	s := tmpl.Services[0]
+	if s.Source() != ServiceSourceEntrypoint || s.SourceRef() != "service.js" {
+		t.Fatalf("service = %+v, want an entrypoint source with identity service.js", s)
+	}
+	if s.Entrypoint != "service.js" || s.Image != "" {
+		t.Fatalf("service source fields = %+v, want only Entrypoint set", s)
+	}
+	if s.Port != 3000 || s.Replicas != DefaultServiceReplicas {
+		t.Fatalf("service defaults = %+v, want port=3000 replicas=%d", s, DefaultServiceReplicas)
 	}
 }
 
@@ -733,8 +745,8 @@ services:
 	}
 }
 
-// A mixed template (events alongside a build/image service) still requires a
-// runtime for the event handlers.
+// A mixed template (events alongside an image service) still requires a runtime
+// for the event handlers.
 func TestParseMixedTemplateRequiresRuntime(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 events:
@@ -749,33 +761,27 @@ services:
 	}
 }
 
-// A template with no runtime and only build/image services parses; the runtime
-// is validated when explicitly present.
-func TestParseServiceBuildUnsupportedRuntimeRejected(t *testing.T) {
+// A template with no runtime and only image services parses; the runtime is
+// validated when explicitly present.
+func TestParseServiceImageUnsupportedRuntimeRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: rust
 services:
-  - build: Dockerfile
+  - image: nginx:1.27
 `))
 	if err == nil || !strings.Contains(err.Error(), `unsupported runtime "rust"`) {
 		t.Fatalf("err = %v, want unsupported-runtime rejection", err)
 	}
 }
 
-// Invalid build paths (absolute, traversal, whitespace) and invalid image
-// references are rejected.
-func TestParseServiceBuildAndImageValidation(t *testing.T) {
+// Invalid image references are rejected.
+func TestParseServiceImageValidation(t *testing.T) {
 	cases := []struct {
 		name    string
 		svc     string
 		wantErr string
 	}{
-		{"absolute build", "  - build: /etc/Dockerfile\n", "relative path inside the function directory"},
-		{"traversal build", "  - build: ../Dockerfile\n", "path elements must not start"},
-		{"dot build", "  - build: .hidden/Dockerfile\n", "path elements must not start"},
-		{"empty segment build", "  - build: docker//Dockerfile\n", "empty path elements"},
-		{"whitespace build", "  - build: \"my Dockerfile\"\n", "contains whitespace"},
-		{"invalid image", "  - image: \"bad image\"\n", "contains whitespace"},
+		{"whitespace image", "  - image: \"bad image\"\n", "contains whitespace"},
 		{"malformed image", "  - image: \"-leading\"\n", "not a valid container image reference"},
 	}
 	for _, tc := range cases {
@@ -788,13 +794,13 @@ func TestParseServiceBuildAndImageValidation(t *testing.T) {
 	}
 }
 
-// A build service's Dockerfile path is a distinct identity from an image
-// service's reference; identities (the configured source descriptors) are
-// unique across kinds.
+// Two services with distinct source descriptors (an entrypoint file and an image
+// reference) are both retained and have distinct identities.
 func TestParseServiceIdentityAcrossKinds(t *testing.T) {
 	tmpl := mustParse(t, `
+runtime: node24
 services:
-  - build: Dockerfile
+  - entrypoint: service.js
     port: 3000
   - image: nginx:1.27
     port: 8080
@@ -807,11 +813,11 @@ services:
 	}
 }
 
-// The shipped custom-build-service example is a build-source service with no
-// runtime, so this pins the runtime-optional build-source contract end to end
+// The shipped external-image-service example is an image-source service with no
+// runtime, so this pins the runtime-optional image-source contract end to end
 // from an on-disk example.
-func TestExampleCustomBuildTemplateParses(t *testing.T) {
-	data, err := os.ReadFile("../../examples/functions/custom-build-service/template.yaml")
+func TestExampleExternalImageTemplateParses(t *testing.T) {
+	data, err := os.ReadFile("../../examples/functions/external-image-service/template.yaml")
 	if err != nil {
 		t.Skipf("example not present: %v", err)
 	}
@@ -820,13 +826,13 @@ func TestExampleCustomBuildTemplateParses(t *testing.T) {
 		t.Fatalf("parse example template: %v", err)
 	}
 	if tmpl.Runtime != "" {
-		t.Fatalf("runtime = %q, want empty for a build-only example", tmpl.Runtime)
+		t.Fatalf("runtime = %q, want empty for an image-only example", tmpl.Runtime)
 	}
 	if len(tmpl.Services) != 1 {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Source() != ServiceSourceBuild || s.Build != "Dockerfile" || s.Port != 3000 || s.Replicas != 1 {
-		t.Fatalf("service = %+v, want build Dockerfile port=3000 replicas=1", s)
+	if s.Source() != ServiceSourceImage || s.Image != "nginx:1.27-alpine" || s.Port != 80 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want image nginx:1.27-alpine port=80 replicas=1", s)
 	}
 }

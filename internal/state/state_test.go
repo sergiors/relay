@@ -368,6 +368,102 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	}
 }
 
+// TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint proves the
+// caller-supplied fingerprint is persisted verbatim even when the source changes
+// AFTER the caller computed it. This is the worker's state-phase contract: the
+// fingerprint is hashed once, reused for the rebuild and the discovery upsert,
+// and a concurrent/next-moment source edit must not silently swap in a
+// recomputed value. The old RecordDiscovered recomputes (so it would persist the
+// changed value), which this test also pins as the standalone behavior.
+func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) {
+	root := t.TempDir()
+	writeFunctionsDir(t, root)
+	dir := filepath.Join(root, "demo")
+
+	fn, err := function.LoadSingle(dir, "demo")
+	if err != nil {
+		t.Fatalf("load single: %v", err)
+	}
+	computed, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+
+	// Change the source after the fingerprint was computed. A recompute would
+	// now yield a different value.
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return 999\n"), 0o644); err != nil {
+		t.Fatalf("rewrite source: %v", err)
+	}
+	changed, err := function.Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("fingerprint after change: %v", err)
+	}
+	if changed == computed {
+		t.Fatal("source edit did not change the fingerprint; test setup is broken")
+	}
+
+	c := openTestState(t)
+	c.RecordDiscoveredWithFingerprint(fn, computed)
+
+	detail, ok := c.GetFunction("demo")
+	if !ok {
+		t.Fatal("expected demo row")
+	}
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %q, want preparing", detail.Status)
+	}
+	if detail.Fingerprint != computed {
+		t.Fatalf("fingerprint = %q, want the caller-supplied %q (not a recompute %q)",
+			detail.Fingerprint, computed, changed)
+	}
+
+	// The legacy API keeps its recompute semantics for standalone callers: it
+	// observes the changed source and persists the new digest.
+	c.RecordDiscovered(fn)
+	detail, _ = c.GetFunction("demo")
+	if detail.Fingerprint != changed {
+		t.Fatalf("RecordDiscovered fingerprint = %q, want recomputed %q", detail.Fingerprint, changed)
+	}
+}
+
+// TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet proves the worker's
+// rebuild seed consumes the already-loaded set and caller fingerprints without
+// re-reading /functions: the function's Dir does not exist on disk, yet the row
+// is written with the supplied fingerprint. A second call on a now-populated DB
+// is a no-op.
+func TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	// A Dir that was never created: if the rebuild tried to load or fingerprint
+	// from it, this test would observe an error or an empty fingerprint.
+	fn := function.Function{Name: "ghost", Dir: filepath.Join(t.TempDir(), "missing"), Template: tmpl}
+	const callerFP = "caller-supplied-fingerprint"
+
+	if err := c.RebuildFromFunctions([]DiscoveredFunction{{Function: fn, Fingerprint: callerFP}}); err != nil {
+		t.Fatalf("rebuild from functions: %v", err)
+	}
+
+	detail, ok := c.GetFunction("ghost")
+	if !ok {
+		t.Fatal("expected ghost row after rebuild")
+	}
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %q, want preparing", detail.Status)
+	}
+	if detail.Fingerprint != callerFP {
+		t.Fatalf("fingerprint = %q, want the caller-supplied %q", detail.Fingerprint, callerFP)
+	}
+
+	// A populated DB is never overwritten by a second seed.
+	fn2 := function.Function{Name: "other", Dir: filepath.Join(t.TempDir(), "other"), Template: tmpl}
+	if err := c.RebuildFromFunctions([]DiscoveredFunction{{Function: fn2, Fingerprint: "other-fp"}}); err != nil {
+		t.Fatalf("second rebuild from functions: %v", err)
+	}
+	if _, ok := c.GetFunction("other"); ok {
+		t.Fatal("rebuild on a non-empty DB must be a no-op")
+	}
+}
+
 // RecordReconcileSuccess round-trips a fingerprint-versioned image reference
 // like "relay-fn-user-events:3f8a2c1d..." exactly, since the state DB is the
 // authoritative persisted holder of the full fingerprinted image.

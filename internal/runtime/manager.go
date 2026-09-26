@@ -437,12 +437,13 @@ type Prepared struct {
 
 // Prepare builds exactly ONE image for the function's current content (never per
 // handler or event), then returns a handle for executing invocations against it.
+// It computes the function's content fingerprint itself (FingerprintFunction).
 //
-// The image reference is derived from a content fingerprint computed here, so
-// the same source always maps to the same fingerprinted image. If that image is
-// already present locally (an earlier build or previous boot produced it), the
-// build is skipped and the existing image reused — restart-without-changes is
-// cheap. A fingerprint error fails Prepare: the reconciler already computes the
+// The image reference is derived from that content fingerprint, so the same
+// source always maps to the same fingerprinted image. If that image is already
+// present locally (an earlier build or previous boot produced it), the build is
+// skipped and the existing image reused — restart-without-changes is cheap. A
+// fingerprint error fails Prepare: the reconciler already computes the
 // fingerprint before calling Prepare and retains the previous version on error,
 // and for startup a fingerprint failure marks the function unavailable, which is
 // consistent with the existing build-failure handling.
@@ -453,27 +454,66 @@ type Prepared struct {
 // done up front: a failed prepare must not lift a removal, or a stale acquire
 // could warm a function the reconciler has not actually reconciled.
 func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared, error) {
-	// Resolve the source-selection policy ONCE and share it with the
-	// fingerprint and the build context: both must select exactly the same files
-	// (the function's .gitignore rules), and resolving a single Selection keeps
-	// them from disagreeing if a rule file is edited concurrently.
-	selection, err := source.ForDir(fn.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
-	}
-	fp, err := function.FingerprintSelection(selection)
-	if err != nil {
-		return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
-	}
+	return m.prepare(ctx, fn, "")
+}
 
-	// A template that needs no runtime (all of its services use build or image
-	// sources, and it has no events or schedules) has no function image to
-	// build: the services bring their own images. Prepare still succeeds so the
-	// function is available for service convergence, returning a handle with no
-	// image — no entrypoint service exists to consume it. The fingerprint is
-	// still computed (above) and recorded so content changes gate reconciliation
-	// exactly as for a runtime-backed function.
+// PrepareWithFingerprint is Prepare with a caller-supplied content fingerprint.
+// The worker's startup path computes each loaded function's fingerprint exactly
+// once (before the state phase) and passes it here, so Prepare does not rescan
+// the tree it already hashed: the supplied value is the identity the image is
+// tagged with and returned as Prepared.Fingerprint.
+//
+// An empty fingerprint means "not supplied" and falls back to computing one
+// internally, so direct and test callers that have no ready fingerprint keep the
+// exact Prepare behavior. A non-empty value is trusted as immutable: it was
+// computed from the same selection policy this call uses, so the tag stays
+// content-addressed. For a runtime-backed function the source selection must
+// still be resolved (the build context is staged from it), but the fingerprint
+// is NOT recomputed from it when one was supplied. A no-runtime function then
+// takes no filesystem walk at all: its fingerprint is template-only by
+// construction (see FingerprintFunction).
+//
+// Correctness of the supplied value at startup is preserved by the caller's
+// ordering: the reconciler's watcher is established BEFORE the supplied
+// fingerprint is seeded (see reconciler.PrepareWatch/Seed), and a change landing
+// between the fingerprint scan and the build is still caught by the first
+// reconcile's own rescan, because the supplied seed is the older value.
+func (m *Manager) PrepareWithFingerprint(
+	ctx context.Context,
+	fn function.Function,
+	fingerprint string,
+) (*Prepared, error) {
+	return m.prepare(ctx, fn, fingerprint)
+}
+
+// prepare is the shared implementation behind Prepare and
+// PrepareWithFingerprint. fingerprint is the caller-supplied content
+// fingerprint, or "" to compute one here.
+func (m *Manager) prepare(
+	ctx context.Context,
+	fn function.Function,
+	fingerprint string,
+) (*Prepared, error) {
+	// A template that needs no runtime (its services all use the external
+	// `image` source, and it has no events or schedules) has no function image
+	// to build: the services bring their own images. Prepare still succeeds so
+	// the function is available for service convergence, returning a handle with
+	// no image — no entrypoint service exists to consume it. The fingerprint is
+	// still recorded so template changes gate reconciliation exactly as for a
+	// runtime-backed function, but it is computed over template.yaml ALONE
+	// (FingerprintFunction): no function source is ever baked into an image, so
+	// scanning the tree would read files nothing depends on. A caller-supplied
+	// fingerprint (the worker's startup path) is used verbatim, so even the
+	// template read is skipped.
 	if !fn.Template.NeedsRuntime() {
+		fp := fingerprint
+		if fp == "" {
+			var err error
+			fp, err = function.FingerprintFunction(fn.Dir, fn.Template)
+			if err != nil {
+				return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
+			}
+		}
 		m.log.Debug("Function: no runtime required; services bring their own images",
 			"function", fn.Name)
 		prepared := &Prepared{
@@ -484,6 +524,23 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 		m.containers.activateFunction(fn.Name, "")
 		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
 		return prepared, nil
+	}
+
+	// Resolve the source-selection policy ONCE and share it with the
+	// fingerprint and the build context: both must select exactly the same files
+	// (the function's .gitignore rules), and resolving a single Selection keeps
+	// them from disagreeing if a rule file is edited concurrently. The selection
+	// is required for the build context even when the fingerprint is supplied.
+	selection, err := source.ForDir(fn.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
+	}
+	fp := fingerprint
+	if fp == "" {
+		fp, err = function.FingerprintSelection(selection)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
+		}
 	}
 
 	spec, err := lookup(fn.Template.Runtime)

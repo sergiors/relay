@@ -316,7 +316,7 @@ func PathMiddlewareID(functionName, identity string) string {
 //
 // Traefik router/service names appearing in labels must be identifier-safe, but
 // the service identity parts are NOT: a function name may contain dots, and an
-// identity is a file path ("app/main.py"), Dockerfile path, or image reference
+// identity is a file path ("app/main.py") or image reference
 // ("ghcr.io/acme/api:1.2") containing "/", ".", and ":" characters that would
 // break Traefik's label grammar. So every character outside [a-z0-9-] is
 // sanitized to "-" and consecutive "-" are collapsed, per part. The id must be

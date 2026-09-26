@@ -37,7 +37,7 @@
 //     (env-var name → literal value, and env-var name → secret REFERENCE, never
 //     a secret value), the event handlers (name
 //   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
-//     services (entrypoint/build/image/host/path/port/replicas) — is all part of
+//     services (entrypoint/image/host/path/port/replicas) — is all part of
 //     that one payload, so a template change replaces the snapshot atomically
 //     and there are no per-handler/schedule/service child tables.
 //   - The handler/event and schedule entries deliberately omit the template
@@ -116,5 +116,8 @@
 //     this surfaces at worst as a brief startup pause, never a failure.
 //   - Transactions are short and hold no external I/O: fingerprints are computed
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
-//     write transaction never blocks on the filesystem.
+//     write transaction never blocks on the filesystem. Callers that already
+//     hold the loaded set and a fingerprint (the worker's startup state phase)
+//     use RebuildFromFunctions + RecordDiscoveredWithFingerprint so no state
+//     write re-reads /functions.
 package state

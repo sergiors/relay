@@ -145,7 +145,7 @@ func TestReconcileRetireRunsAfterServiceConvergence(t *testing.T) {
 		Root:     root,
 		Debounce: 10 * time.Millisecond,
 		Interval: time.Hour,
-		UpdateServices: func(name, _ string, tmpl *function.Template, image string) {
+		UpdateServices: func(name string, tmpl *function.Template, image string) {
 			mu.Lock()
 			order = append(order, "update "+name+"="+strconv.Itoa(len(tmpl.Services))+"@"+image)
 			mu.Unlock()
@@ -157,7 +157,7 @@ func TestReconcileRetireRunsAfterServiceConvergence(t *testing.T) {
 		},
 	}
 	r := New(cfg, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	r.Seed(fn.Function())
+	seedCurrent(r, fn.Function())
 
 	// Change source so a rebuild (to v2) warrants retiring v1.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {

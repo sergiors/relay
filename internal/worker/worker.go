@@ -188,6 +188,12 @@ func startupResult(err error) error {
 // abandoning live servers, goroutines, containers, and the state DB to process
 // exit.
 func Run(logger *slog.Logger) error {
+	// Phase 1 startup timing: runStart anchors the total ready-to-consume
+	// measurement, logged at Debug immediately before Consume. Each phase below
+	// is measured with its own local start and reported with time.Since at
+	// Debug, so the startup cost of every stage is observable without any
+	// always-on production logging.
+	runStart := time.Now()
 	cfg := config.Load(logger)
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
@@ -261,6 +267,7 @@ func Run(logger *slog.Logger) error {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
 
+	loaderStart := time.Now()
 	loader := function.NewLoader(function.Dir, logger)
 	functions, err := loader.Load()
 	if err != nil {
@@ -270,11 +277,27 @@ func Run(logger *slog.Logger) error {
 		return fmt.Errorf("load functions failed: %w", err)
 	}
 	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
+	logger.Debug("Startup: functions loaded", "duration", time.Since(loaderStart))
 
-	// The state database is a read-only local state view (see internal/state),
-	// NOT the source of truth and never drives matching or building. All state
-	// errors are non-fatal — Relay runs without the state DB if it is broken.
-	// A nil handle is never registered, so shutdown simply skips its close.
+	// Compute every loaded function's content fingerprint ONCE for the whole
+	// startup and carry it forward as the immutable startup fingerprint. It is
+	// reused by the state phase (rebuild + discovery upserts), by Manager.Prepare
+	// (the built/reused image's tag), and by the reconciler seed — so no startup
+	// stage re-reads /functions. The state DB is a read-only local state view
+	// (see internal/state), NOT the source of truth and never drives matching or
+	// building; it is opened after the fingerprints so even a broken DB still
+	// yields fingerprints for Prepare and the reconciler.
+	fingerprintStart := time.Now()
+	discovered := fingerprintDiscovered(functions, logger)
+	fingerprints := make(map[string]string, len(discovered))
+	for _, d := range discovered {
+		fingerprints[d.Function.Name] = d.Fingerprint
+	}
+	logger.Debug("Startup: functions fingerprinted", "duration", time.Since(fingerprintStart))
+
+	// All state errors are non-fatal. A nil handle is never registered, so
+	// shutdown simply skips its close.
+	stateStart := time.Now()
 	st, err := state.Open(state.DBPath)
 	if err != nil {
 		logger.Warn("State: open failed; continuing without", "error", err)
@@ -287,23 +310,29 @@ func Run(logger *slog.Logger) error {
 			name: shutdownStepState,
 			run:  func(context.Context) error { return st.Close() },
 		})
-		if err := st.RebuildFromFS(function.Dir); err != nil {
-			logger.Warn("State: rebuild from fs failed; continuing", "error", err)
+		// The already-computed fingerprint pairs feed both the fresh-database
+		// rebuild and the per-function discovery upserts; /functions is never
+		// re-read for state and each function's source is hashed exactly once.
+		if err := st.RebuildFromFunctions(discovered); err != nil {
+			logger.Warn("State: rebuild from functions failed; continuing", "error", err)
 		}
 		// Prune state rows for functions no longer on disk BEFORE
 		// restorePersistedStats, so a pruned function's stats row is gone before
 		// the fresh registry is seeded from it (a function removed while down
 		// must not be re-seeded into metrics).
 		st.PruneRemoved(function.Dir)
-		for _, fn := range functions {
-			st.RecordDiscovered(fn)
+		for _, d := range discovered {
+			st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
 		}
 	}
+	logger.Debug("Startup: state initialized", "duration", time.Since(stateStart))
 
 	// Seed the fresh registry with the persisted cumulative totals so the first
 	// snapshot writes them back instead of zeroing SQLite. Gauges are NOT
 	// restored (they are point-in-time snapshots refreshed each interval).
+	statsRestoreStart := time.Now()
 	restorePersistedStats(metricsInstance, st)
+	logger.Debug("Startup: stats restored", "duration", time.Since(statsRestoreStart))
 
 	// The stats flusher is the single owner of every write of the registry's
 	// Relay-visible totals into SQLite. It holds a mutex across BOTH the capture
@@ -321,6 +350,7 @@ func Run(logger *slog.Logger) error {
 		},
 	})
 
+	managerStart := time.Now()
 	manager, err := runtime.NewManager(
 		logger,
 		metricsInstance,
@@ -353,6 +383,7 @@ func Run(logger *slog.Logger) error {
 		name: shutdownStepManager,
 		run:  func(context.Context) error { return manager.Close() },
 	})
+	logger.Debug("Startup: runtime manager ready", "duration", time.Since(managerStart))
 
 	// Verify every configured NETWORKS network exists BEFORE any function is
 	// prepared or any container created. The networks are infrastructure owned
@@ -360,6 +391,7 @@ func Run(logger *slog.Logger) error {
 	// condition that must fail startup rather than silently produce containers
 	// on the wrong (or no) network. A verify error (a broken daemon) is likewise
 	// fatal. The check is skipped entirely when NETWORKS is unset.
+	networksStart := time.Now()
 	if err := verifyConfiguredNetworks(ctx, manager, cfg.Networks); err != nil {
 		// A lifecycle cancellation during verification is a shutdown, not a
 		// network failure: classify it like every other fallible startup step
@@ -370,6 +402,7 @@ func Run(logger *slog.Logger) error {
 		}
 		return err
 	}
+	logger.Debug("Startup: configured networks verified", "duration", time.Since(networksStart))
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -379,6 +412,7 @@ func Run(logger *slog.Logger) error {
 	// socket here can never delete an active worker's socket. A bind failure is
 	// fatal, matching the metrics and webhook servers: a local bind error is a
 	// host/config problem that must surface at startup, not heal invisibly.
+	socketStart := time.Now()
 	rtSocket, err := NewSocketServer(SocketPath, manager, statsFlusher, logger)
 	if err != nil {
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
@@ -389,6 +423,7 @@ func Run(logger *slog.Logger) error {
 		name: shutdownStepSocket,
 		run:  func(context.Context) error { return rtSocket.Close() },
 	})
+	logger.Debug("Startup: runtime socket ready", "duration", time.Since(socketStart))
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
 	// The service controller converges each function's persistent service
@@ -397,7 +432,8 @@ func Run(logger *slog.Logger) error {
 	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
 	// hostname (cfg.ConsumerName). The coordinator runs the per-function Applys
 	// asynchronously (bounded workers, latest-desired-state coalescing), so
-	// startup never blocks on a service's Dockerfile build; the startup orphan
+	// startup never blocks on service convergence (e.g. an external image pull);
+	// the startup orphan
 	// sweep + image GC run inside the coordinator's exclusive housekeeping window
 	// in the background pass. Startup reconciliation remains the crash-recovery
 	// path when shutdown cleanup did not execute. The service reconciler itself
@@ -435,6 +471,7 @@ func Run(logger *slog.Logger) error {
 	// hostname-scoped, so other workers' and non-Relay containers are untouched.
 	// Bounded so the sweep can never hang startup; on timeout/error we log and
 	// continue, leaving the orphans for a later restart.
+	orphanSweepStart := time.Now()
 	sweepCtx, sweepCancel := context.WithTimeout(ctx, reconcileTimeout)
 	n, sweepErr := manager.SweepOrphanContainers(sweepCtx, cfg.ConsumerName)
 	sweepCancel()
@@ -444,17 +481,25 @@ func Run(logger *slog.Logger) error {
 	} else if n > 0 {
 		logger.Info("Startup: removed orphan containers from a previous relay process", "count", n)
 	}
+	logger.Debug("Startup: execution orphan sweep complete", "duration", time.Since(orphanSweepStart))
 
 	// Build every function's image. A function whose image cannot be built is
-	// marked unavailable so the runner skips it; the rest continue.
-	prepared := prepareFunctions(ctx, manager, functions, st, logger)
+	// marked unavailable so the runner skips it; the rest continue. The
+	// fingerprints computed once above are supplied to Prepare, so no startup
+	// build re-reads a function's source to derive an identity it already has.
+	prepareStart := time.Now()
+	prepared := prepareFunctions(ctx, manager, functions, fingerprints, st, logger)
+	logger.Debug("Startup: functions prepared", "duration", time.Since(prepareStart))
 
 	// Publish each function's initial desired service state and return
 	// immediately. The coordinator's bounded workers converge the states in the
-	// background, so startup never blocks on a service's Dockerfile build — nor
-	// on the unavailable/no-services removals, which are published the same
-	// nonblocking way (the coordinator derives their own fresh bound).
+	// background, so startup never blocks on service convergence (e.g. an
+	// external image pull) — nor on the unavailable/no-services removals, which
+	// are published the same nonblocking way (the coordinator derives their own
+	// fresh bound).
+	serviceEnqueueStart := time.Now()
 	enqueueStartupServicesWithState(prepared, services, st, logger)
+	logger.Debug("Startup: startup services enqueued", "duration", time.Since(serviceEnqueueStart))
 
 	// Lifecycle-aware background housekeeping. It waits behind the coordinator's
 	// barrier for the initial service attempts to settle, then runs the startup
@@ -591,6 +636,7 @@ func Run(logger *slog.Logger) error {
 		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
 	}
 
+	ensureGroupStart := time.Now()
 	if err := ensureGroup(ctx, consumer, logger); err != nil {
 		// The consumer group is a hard prerequisite for consumption. Return now so
 		// the deferred cleanup stops the servers and loops; startupResult turns a
@@ -599,6 +645,7 @@ func Run(logger *slog.Logger) error {
 		// to print and exit on.
 		return startupResult(err)
 	}
+	logger.Debug("Startup: consumer group ready", "duration", time.Since(ensureGroupStart))
 
 	// The schedule publisher atomically publishes one stream entry per logical
 	// occurrence cluster-wide (publish-if-new Lua script) into the same stream the
@@ -660,19 +707,17 @@ func Run(logger *slog.Logger) error {
 			// Apply receives the LIFECYCLE context, NOT a 30s budget wrapped
 			// around the whole pass: the ServiceReconciler injects the worker's
 			// reconcileTimeout into Reconcile, which derives a fresh bound for
-			// each normal Docker operation itself. A Dockerfile build is rooted
-			// in the runtime manager lifecycle under buildTimeout, so a long
-			// build can never consume the post-build deadline. Shutdown still
+			// each normal Docker operation itself. Shutdown still
 			// cancels the operation promptly because ctx is the signal context.
 			//
 			// The prepared env comes from the current registry entry (the runtime
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
-			UpdateServices: func(name, fnDir string, tmpl *function.Template, image string) {
-				enqueueLiveServices(services, runWorker.Registry(), name, fnDir, tmpl, image)
+			UpdateServices: func(name string, tmpl *function.Template, image string) {
+				enqueueLiveServices(services, runWorker.Registry(), name, tmpl, image)
 			},
-			UpdateServicesWithStatus: func(name, fnDir string, tmpl *function.Template, image string, onBuildStart, onReconcileStart func(), onComplete func(error)) {
-				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, fnDir, tmpl, image, onBuildStart, onReconcileStart, onComplete)
+			UpdateServicesWithStatus: func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, tmpl, image, onReconcileStart, onComplete)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
@@ -691,12 +736,28 @@ func Run(logger *slog.Logger) error {
 		manager,
 		logger,
 	)
-	for _, fn := range functions {
-		rec.Seed(fn)
+	// Establish change detection BEFORE seeding the startup fingerprints. The
+	// supplied fingerprints are the ones computed once above; a change that
+	// lands after the watch is installed is observed as an fsnotify event, and a
+	// change between the fingerprint scan and the watch installation is still
+	// caught because the seeded value is the OLDER one, so the first reconcile
+	// observes it as a rebuild. If the watcher cannot be created, the supplied
+	// fingerprints must NOT be trusted: Seed is skipped entirely and Start logs
+	// the error and does not run the loops, so no stale seed can suppress a
+	// rebuild.
+	reconcilerSeedStart := time.Now()
+	if err := rec.PrepareWatch(ctx); err != nil {
+		logger.Error("Reconciler: fsnotify error; not seeding startup fingerprints", "error", err)
+	} else {
+		for _, fn := range functions {
+			rec.Seed(fn, fingerprints[fn.Name])
+		}
 	}
+	logger.Debug("Startup: reconciler seeded", "duration", time.Since(reconcilerSeedStart))
 	logger.Info("Watching functions for changes", "root", function.Dir)
 
-	// Runs in its own goroutine and stops when ctx is cancelled.
+	// Runs in its own goroutine and stops when ctx is cancelled. Start reuses the
+	// watcher PrepareWatch already established.
 	go rec.Start(ctx)
 
 	// Start the cron scheduler right after the reconciler, so jobs added here
@@ -709,6 +770,7 @@ func Run(logger *slog.Logger) error {
 		run:     sched.Stop,
 	})
 
+	logger.Debug("Startup: ready to consume", "duration", time.Since(runStart))
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,
 		"group", cfg.RedisGroup,
@@ -879,38 +941,70 @@ func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn functio
 	})
 }
 
+// fingerprintDiscovered computes each loaded function's content fingerprint
+// exactly once for the whole startup and pairs it with the function. The worker
+// carries these pairs forward as the immutable startup fingerprint: the state
+// phase reuses them for both the fresh-database rebuild (RebuildFromFunctions)
+// and the discovery upserts (RecordDiscoveredWithFingerprint), Manager.Prepare
+// receives each value so a build/reuse does not rescan, and the reconciler is
+// seeded with the same value. /functions is therefore never re-read for an
+// identity the worker already hashed. A fingerprint error is logged and yielded
+// as "" — the same fallback the state package uses — so a transient read failure
+// never blocks discovery (the empty seed then forces a reconcile rebuild).
+func fingerprintDiscovered(functions []function.Function, logger *slog.Logger) []state.DiscoveredFunction {
+	discovered := make([]state.DiscoveredFunction, 0, len(functions))
+	for _, fn := range functions {
+		fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
+		if err != nil {
+			logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", err)
+			fp = ""
+		}
+		discovered = append(discovered, state.DiscoveredFunction{Function: fn, Fingerprint: fp})
+	}
+	return discovered
+}
+
 // prepareFunctions builds each function's image and returns the prepared set. A
 // function whose image cannot be built is marked unavailable (the runner skips
-// it) rather than failing startup; the rest carry their fresh image. A
-// fingerprint that changed between load and build is recomputed so the state DB
-// records the final value.
+// it) rather than failing startup; the rest carry their fresh image. It receives
+// the startup fingerprint map and supplies each value to Prepare, so the image
+// identity comes from the single startup hash rather than a fresh scan; only a
+// managed-runtime function (whose build can span a source edit) is rescanned
+// after the build, via startupFinalFingerprint.
 //
 // The building status is published at the ACTUAL managed runtime image-build
 // boundary via the observer installed by managedRuntimeBuildContext: a reused
 // image and a no-runtime template never flash building, while a real build does.
 // A successful no-service preparation reaches ready below; a function whose
-// template declares services stays building through service convergence (which
-// republishes building at its own Dockerfile boundary and records the terminal
-// outcome), and a preparation failure uses the existing failure semantics
-// (unavailable without an active image, ready when a previous image is
-// retained).
+// template declares services records its terminal outcome after service
+// convergence (services have no separate image build, so building is
+// published only for the managed-runtime image build itself), and a preparation
+// failure uses the existing failure semantics (unavailable without an active
+// image, ready when a previous image is retained).
 //
 // ctx is the worker lifecycle context. It is passed to Prepare so a build (and
 // the fast reuse probes) is cancelled on shutdown; Prepare itself roots the
 // Dockerfile build in the manager lifecycle with its own 10m buildTimeout, so
 // this context's lack of a short deadline is intentional and the build is never
 // bounded by the 30s reconcileTimeout.
+//
+// fingerprints is the immutable startup fingerprint computed once by
+// fingerprintDiscovered, keyed by function name. It is supplied to Prepare so a
+// build/reuse does not rescan a tree the worker already hashed. The resulting
+// image tag is exactly that supplied fingerprint, so the fingerprint returned by
+// Prepare is the value persisted below for a no-runtime function.
 func prepareFunctions(
 	ctx context.Context,
 	manager *runtime.Manager,
 	functions []function.Function,
+	fingerprints map[string]string,
 	st *state.State,
 	logger *slog.Logger,
 ) []*runner.PreparedFunction {
 	preparedCount := 0
 	prepared := make([]*runner.PreparedFunction, 0, len(functions))
 	for _, fn := range functions {
-		prep, err := manager.Prepare(managedRuntimeBuildContext(ctx, st, fn), fn)
+		prep, err := manager.PrepareWithFingerprint(managedRuntimeBuildContext(ctx, st, fn), fn, fingerprints[fn.Name])
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
 			// failure: it must not record a spurious reconcile failure in the
@@ -928,13 +1022,11 @@ func prepareFunctions(
 			continue
 		}
 		if st != nil && len(fn.Template.Services) == 0 {
-			// The fingerprint may differ from discovery-time if content changed
-			// between load and build; the state DB records the final state.
-			fp, fperr := function.Fingerprint(fn.Dir)
-			if fperr != nil {
-				logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", fperr)
-				fp = ""
-			}
+			// A managed-runtime build can run for minutes; a source edit during
+			// it is captured by a final authoritative scan so the state DB
+			// records the content currently on disk. A no-runtime function walks
+			// no tree, so the supplied (template-only) fingerprint stands.
+			fp := startupFinalFingerprint(fn, prep.Fingerprint, logger)
 			st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
 		}
 		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
@@ -944,17 +1036,35 @@ func prepareFunctions(
 	return prepared
 }
 
+// startupFinalFingerprint returns the fingerprint the startup state phase
+// persists after a successful prepare. For a managed-runtime function — whose
+// build can run for minutes — it performs one final authoritative scan so a
+// source edit during the build is reflected. For a no-runtime (external-image)
+// function there is no build and no source input, so the supplied fingerprint
+// (template-only by construction) stands and no tree is walked. A supplied ""
+// (direct callers/tests) falls back to a scan so the helper is total.
+func startupFinalFingerprint(fn function.Function, supplied string, logger *slog.Logger) string {
+	if supplied != "" && fn.Template != nil && !fn.Template.NeedsRuntime() {
+		return supplied
+	}
+	fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
+	if err != nil {
+		logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", err)
+		return ""
+	}
+	return fp
+}
+
 // enqueueLiveServices snapshots the current prepared environment and publishes
 // the desired service state without blocking the function reconciler pump. The
 // coordinator coalesces updates to the latest desired state per function and its
-// bounded workers converge it with the worker LIFECYCLE context, so a long
-// Dockerfile build for one function cannot stall the reconciler or the other
-// functions. A nil Prepared (unavailable) entry falls back to no plan env,
-// mirroring the runner's nil-safe behavior.
+// bounded workers converge it with the worker LIFECYCLE context. A nil Prepared
+// (unavailable) entry falls back to no plan env, mirroring the runner's
+// nil-safe behavior.
 func enqueueLiveServices(
 	services *reconciler.ServiceCoordinator,
 	reg *runner.Registry,
-	name, fnDir string,
+	name string,
 	tmpl *function.Template,
 	image string,
 ) {
@@ -962,28 +1072,29 @@ func enqueueLiveServices(
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.Enqueue(name, fnDir, tmpl, image, preparedEnv)
+	services.Enqueue(name, tmpl, image, preparedEnv)
 }
 
 func enqueueLiveServicesWithStatus(
 	services *reconciler.ServiceCoordinator,
 	reg *runner.Registry,
-	name, fnDir string,
+	name string,
 	tmpl *function.Template,
 	image string,
-	onBuildStart, onReconcileStart func(),
+	onReconcileStart func(),
 	onComplete func(error),
 ) {
 	var preparedEnv []string
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.EnqueueWithStatus(name, fnDir, tmpl, image, preparedEnv, onBuildStart, onReconcileStart, onComplete)
+	services.EnqueueWithStatus(name, tmpl, image, preparedEnv, onReconcileStart, onComplete)
 }
 
 // enqueueStartupServices publishes each prepared function's initial desired
 // service state and returns immediately; the coordinator converges them in the
-// background, so startup never blocks on a service's Dockerfile build. The
+// background, so startup never blocks on service convergence (e.g. an external
+// image pull). The
 // unavailable/no-services removals are published the same nonblocking way (see
 // the special case below), so startup never blocks on Docker work at all; the
 // background housekeeping pass' barrier waits for every published operation to
@@ -1016,19 +1127,22 @@ func enqueueStartupServicesWithState(
 		fn := pf.Function()
 		if prep := pf.Prepared(); prep != nil {
 			if st != nil && len(fn.Template.Services) > 0 {
-				services.EnqueueWithStatus(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env,
-					func() { st.RecordReconcileBuilding(fn.Name) },
+				services.EnqueueWithStatus(fn.Name, fn.Template, prep.Image, prep.Env,
 					func() { st.RecordReconciling(fn.Name) },
 					func(err error) {
 						if err != nil {
 							st.RecordServiceFailure(fn.Name, err)
 							return
 						}
-						fp, _ := function.Fingerprint(fn.Dir)
+						// The convergence can be long (an external image pull),
+						// so a runtime function records one final authoritative
+						// scan; a no-runtime function has no source input and
+						// reuses its supplied template-only fingerprint.
+						fp := startupFinalFingerprint(fn, prep.Fingerprint, logger)
 						st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
 					})
 			} else {
-				services.Enqueue(fn.Name, fn.Dir, fn.Template, prep.Image, prep.Env)
+				services.Enqueue(fn.Name, fn.Template, prep.Image, prep.Env)
 			}
 			continue
 		}
@@ -1188,9 +1302,16 @@ func verifyConfiguredNetworks(ctx context.Context, manager *runtime.Manager, net
 func startupImageKeepSet(functions []function.Function, serviceImages, recordedImages []string) map[string]bool {
 	keep := make(map[string]bool)
 	for _, fn := range functions {
+		// A no-runtime (external-image-only) function builds no function image,
+		// so there is no derived tag to keep. Any image a previous version built
+		// (when it had a runtime) is covered by the recorded last-active image
+		// below, so skipping here never strands a serving image.
+		if fn.Template != nil && !fn.Template.NeedsRuntime() {
+			continue
+		}
 		// The image tag is derived from the function's content fingerprint, so
 		// the keep-set names exactly the image a build/reuse would produce.
-		if fp, err := function.Fingerprint(fn.Dir); err == nil {
+		if fp, err := function.FingerprintFunction(fn.Dir, fn.Template); err == nil {
 			keep[runtime.ImageRef(fn.Name, fp)] = true
 		}
 	}

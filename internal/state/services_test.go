@@ -111,28 +111,21 @@ const sourceServicesTmpl = `runtime: node24
 services:
   - entrypoint: service.js
     port: 3000
-  - build: docker/Dockerfile.prod
-    port: 8080
-    replicas: 2
   - image: ghcr.io/acme/api:1.2
     port: 9090
 `
 
 // stateServiceIdentity derives a persisted service's identity from its source
-// fields — whichever of entrypoint/build/image is set — mirroring
+// fields — whichever of entrypoint/image is set — mirroring
 // function.Service.SourceRef.
 func stateServiceIdentity(s Service) string {
-	switch {
-	case s.Build != "":
-		return s.Build
-	case s.Image != "":
+	if s.Image != "" {
 		return s.Image
-	default:
-		return s.Entrypoint
 	}
+	return s.Entrypoint
 }
 
-// TestServiceSourceKindsRoundTrip seeds a template whose services use all three
+// TestServiceSourceKindsRoundTrip seeds a template whose services use both
 // source kinds and asserts each row round-trips its source and keyed identity.
 func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	st := openTestState(t)
@@ -143,8 +136,8 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("expected function")
 	}
-	if len(detail.Services) != 3 {
-		t.Fatalf("services = %d, want 3", len(detail.Services))
+	if len(detail.Services) != 2 {
+		t.Fatalf("services = %d, want 2", len(detail.Services))
 	}
 	// Rows are ordered by source.
 	byIdentity := map[string]Service{}
@@ -152,15 +145,11 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 		byIdentity[stateServiceIdentity(s)] = s
 	}
 	ep, ok := byIdentity["service.js"]
-	if !ok || ep.Entrypoint != "service.js" || ep.Build != "" || ep.Image != "" || ep.Port != 3000 {
+	if !ok || ep.Entrypoint != "service.js" || ep.Image != "" || ep.Port != 3000 {
 		t.Fatalf("entrypoint service = %+v", ep)
 	}
-	bd, ok := byIdentity["docker/Dockerfile.prod"]
-	if !ok || bd.Build != "docker/Dockerfile.prod" || bd.Entrypoint != "" || bd.Image != "" || bd.Port != 8080 || bd.Replicas != 2 {
-		t.Fatalf("build service = %+v", bd)
-	}
 	im, ok := byIdentity["ghcr.io/acme/api:1.2"]
-	if !ok || im.Image != "ghcr.io/acme/api:1.2" || im.Entrypoint != "" || im.Build != "" || im.Port != 9090 {
+	if !ok || im.Image != "ghcr.io/acme/api:1.2" || im.Entrypoint != "" || im.Port != 9090 {
 		t.Fatalf("image service = %+v", im)
 	}
 }

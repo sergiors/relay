@@ -8,7 +8,11 @@
 //   - Fingerprinting: a deterministic hash of a function's SELECTED source
 //     (internal/source: files included after applying the function's .gitignore
 //     rules) gates reconciler rebuilds; applicable ignore files are hashed too,
-//     so a rule edit is a source change
+//     so a rule edit is a source change. A template that needs no runtime (its
+//     only services use the external `image` source) builds no image from
+//     source, so FingerprintFunction narrows its fingerprint to template.yaml
+//     ALONE — an irrelevant source edit can never look like a desired-state
+//     change, and the tree is not scanned
 //
 // Key Features:
 //   - A rule that omits a timeout resolves to DefaultTimeout; zero, negative,

@@ -22,7 +22,7 @@ type servicesRecorder struct {
 }
 
 // update records an UpdateServices call: "update <name>=<serviceCount>@<image>".
-func (s *servicesRecorder) update(name, _ string, tmpl *function.Template, image string) {
+func (s *servicesRecorder) update(name string, tmpl *function.Template, image string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, "update "+name+"="+strconv.Itoa(len(tmpl.Services))+"@"+image)

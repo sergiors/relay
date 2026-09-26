@@ -22,7 +22,7 @@ type coordinatorDocker struct {
 	release  chan struct{}
 }
 
-func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName, _ string, _ *function.Template, _ function.Service, image string) (runtime.ServiceImage, error) {
+func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string, _ *function.Template, _ function.Service, image string) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.active++
 	if d.active > d.max {
@@ -66,12 +66,12 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 		Runtime:  "node24",
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	coordinator.Enqueue("alpha", "", tmpl, "img-1", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
-	coordinator.Enqueue("beta", "", tmpl, "img-b", nil)
+	coordinator.Enqueue("beta", tmpl, "img-b", nil)
 	<-docker.entered
 	// A third function cannot enter while both fixed workers are occupied.
-	coordinator.Enqueue("gamma", "", tmpl, "img-g", nil)
+	coordinator.Enqueue("gamma", tmpl, "img-g", nil)
 	select {
 	case <-docker.entered:
 		t.Fatal("more than two service reconciles entered concurrently")
@@ -79,8 +79,8 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 	}
 
 	// Updates while alpha is active collapse to the newest desired image.
-	coordinator.Enqueue("alpha", "", tmpl, "img-2", nil)
-	coordinator.Enqueue("alpha", "", tmpl, "img-3", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-2", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-3", nil)
 	close(docker.release)
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
@@ -149,7 +149,7 @@ func TestServiceCoordinatorWaitCancelsPromptlyWhileBusy(t *testing.T) {
 		Runtime:  "node24",
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	coordinator.Enqueue("alpha", "", tmpl, "img-1", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is now busy in ResolveServiceImage
 
 	waitCtx, waitCancel := context.WithCancel(context.Background())
@@ -179,7 +179,7 @@ func TestServiceCoordinatorJoinBoundedThenDrains(t *testing.T) {
 		Runtime:  "node24",
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	coordinator.Enqueue("alpha", "", tmpl, "img-1", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
 
 	// The worker is parked in ResolveServiceImage (which ignores ctx), so Join
@@ -241,7 +241,7 @@ type removalBlockingDocker struct {
 }
 
 func (d *removalBlockingDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, _ *function.Template, _ function.Service, image string,
+	_ context.Context, _ string, _ *function.Template, _ function.Service, image string,
 ) (runtime.ServiceImage, error) {
 	return runtime.ServiceImage{Ref: image, ID: image}, nil
 }
@@ -410,7 +410,7 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 		Secrets:  map[string]function.SecretRef{"S": "ref-1"},
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	coordinator.Enqueue("alpha", "", tmpl, "img", []string{"PLAN=1"})
+	coordinator.Enqueue("alpha", tmpl, "img", []string{"PLAN=1"})
 
 	// Mutate the caller's template while the request is queued/in flight.
 	tmpl.Env["A"] = "mutated"
@@ -456,7 +456,7 @@ type snapshotDocker struct {
 }
 
 func (d *snapshotDocker) ResolveServiceImage(
-	_ context.Context, _, _ string, tmpl *function.Template, svc function.Service, image string,
+	_ context.Context, _ string, tmpl *function.Template, svc function.Service, image string,
 ) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.seenPort = svc.Port
@@ -491,7 +491,7 @@ type pauseProbeDocker struct {
 }
 
 func (d *pauseProbeDocker) ResolveServiceImage(
-	_ context.Context, fnName, _ string, _ *function.Template, _ function.Service, image string,
+	_ context.Context, fnName string, _ *function.Template, _ function.Service, image string,
 ) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.active++
@@ -542,7 +542,7 @@ func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	// The initial desired state settles before housekeeping starts.
-	coordinator.Enqueue("alpha", "", tmpl, "img-1", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -568,7 +568,7 @@ func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 
 	// A live update arrives during housekeeping. It must coalesce as pending, not
 	// start a pass that would race the sweeps.
-	coordinator.Enqueue("alpha", "", tmpl, "img-2", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-2", nil)
 	select {
 	case got := <-docker.entered:
 		t.Fatalf("a service pass ran during housekeeping: %s", got)
@@ -621,7 +621,7 @@ func TestServiceCoordinatorRunExclusiveCancelledBarrierSkipsCallback(t *testing.
 		Runtime:  "node24",
 		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	coordinator.Enqueue("alpha", "", tmpl, "img-1", nil)
+	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is busy, so the barrier cannot clear
 
 	barrierCtx, barrierCancel := context.WithCancel(context.Background())

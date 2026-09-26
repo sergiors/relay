@@ -195,7 +195,7 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 	}
 	midFn := initialFn("midcopy", mid)
 	reg.Set([]*runner.PreparedFunction{midFn})
-	r.Seed(midFn.Function())
+	seedCurrent(r, midFn.Function())
 
 	r.reconcileFunction("midcopy")
 	if reg.GetByName("midcopy") == nil {
@@ -262,7 +262,7 @@ func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
 	reg := &runner.Registry{}
 	reg.Set([]*runner.PreparedFunction{unavail})
 	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	r.Seed(unavail.Function())
+	seedCurrent(r, unavail.Function())
 
 	// Even with an unchanged fingerprint, the unavailable function is rebuilt.
 	r.reconcileFunction("recover")
