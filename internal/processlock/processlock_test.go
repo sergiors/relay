@@ -93,6 +93,50 @@ func TestAcquireCreatesParentDirs(t *testing.T) {
 	}
 }
 
+// TestAcquireEnforcesPermissions covers the explicit runtime-directory and
+// lock-file modes: a fresh acquire leaves owner-only modes, and an existing
+// directory/lock file whose modes were widened is tightened on acquire. The
+// assertions use the exported constants so the test and implementation cannot
+// drift.
+func TestAcquireEnforcesPermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "run", "relay")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("widen dir: %v", err)
+	}
+	path := filepath.Join(dir, "relay.lock")
+	if err := os.WriteFile(path, nil, 0o666); err != nil {
+		t.Fatalf("seed lock file: %v", err)
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatalf("widen lock file: %v", err)
+	}
+
+	lock, err := Acquire(path)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer lock.Close()
+
+	lockInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat lock file: %v", err)
+	}
+	if got := lockInfo.Mode().Perm(); got != LockFilePerm {
+		t.Fatalf("lock file mode = %o, want %o", got, LockFilePerm)
+	}
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat lock dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != DirPerm {
+		t.Fatalf("lock dir mode = %o, want %o", got, DirPerm)
+	}
+}
+
 // TestUnrelatedPathsDoNotConflict covers independence: locks on different paths
 // are unrelated, so holding one never blocks acquiring another.
 func TestUnrelatedPathsDoNotConflict(t *testing.T) {

@@ -27,6 +27,20 @@ import (
 // ephemeral runtime paths stay centralized without a separate path package.
 const DefaultDir = "/run/relay"
 
+// DirPerm is the mode for Relay's ephemeral runtime directory (DefaultDir). It
+// is owner-only: the directory holds the process lock and the worker's control
+// socket, and no other user has a reason to traverse it. It is applied both at
+// creation and enforced on an existing directory, so a path created world- or
+// group-readable by a previous version (or a container base image) is tightened
+// on the next startup.
+const DirPerm = 0o700
+
+// LockFilePerm is the mode for the process lock file. It is owner-only to match
+// the runtime directory: the file carries no content, only the kernel flock, so
+// nothing beyond the owning process should read or write it. It is enforced on
+// an existing lock file as well as a freshly created one.
+const LockFilePerm = 0o600
+
 // DefaultPath is the fixed application-convention lock file for the long-running
 // Relay process. It lives under the ephemeral DefaultDir: the kernel releases
 // flock when the process exits, so a leftover lock file on tmpfs is inert, and
@@ -52,16 +66,26 @@ type Lock struct {
 // Acquire creates the lock file's parent directory, opens (creating if absent)
 // the lock file, and takes an exclusive, non-blocking flock on it.
 //
+// It also makes the runtime directory and lock file owner-only (DirPerm /
+// LockFilePerm). MkdirAll and O_CREATE apply their mode only at creation and are
+// masked by the process umask, so Acquire tightens both explicitly; that keeps
+// the directory and lock at the documented mode even when a previous version or
+// a container base image left them more permissive.
+//
 // Errors are differentiated:
 //   - ErrAlreadyLocked (detect with errors.Is) when another holder owns the
 //     lock;
 //   - an "open lock file" error when the file cannot be created or opened;
 //   - an "acquire lock" error for any other flock failure.
 func Acquire(path string) (*Lock, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, DirPerm); err != nil {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err := os.Chmod(dir, DirPerm); err != nil {
+		return nil, fmt.Errorf("set lock dir permissions: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, LockFilePerm)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
@@ -76,6 +100,13 @@ func Acquire(path string) (*Lock, error) {
 			return nil, fmt.Errorf("%w: %s", ErrAlreadyLocked, path)
 		}
 		return nil, fmt.Errorf("acquire lock %s: %w", path, err)
+	}
+	// Enforce the lock file's mode on the opened descriptor (O_CREATE's mode is
+	// masked by umask and applies only when the file is created). A failure
+	// releases the just-acquired flock by closing the descriptor.
+	if err := f.Chmod(LockFilePerm); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("set lock file permissions %s: %w", path, err)
 	}
 	return &Lock{file: f}, nil
 }

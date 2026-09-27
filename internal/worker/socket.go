@@ -45,10 +45,13 @@ import (
 // Lifecycle ownership is the worker's: it creates the runtime directory,
 // removes a STALE socket left by a SIGKILLed worker, binds, serves, stops
 // serving, closes the listener, and removes the socket file on graceful
-// shutdown. Removing a stale socket is safe ONLY because `relay start` has
-// already taken the process lock (internal/processlock) before worker.Run runs:
-// a second Relay process fails that lock and never reaches socket setup, so the
-// socket it would find cannot belong to an active worker.
+// shutdown. It additionally hardens the filesystem surface: the runtime
+// directory is owner-only and the socket file is chmod 0600 after bind. Stale
+// recovery is itself guarded — a non-socket path is never deleted and a Unix
+// socket with a live listener is refused, not stolen — so the layer is safe
+// even without the process lock; `relay start` still takes that lock
+// (internal/processlock) before worker.Run so a second process never reaches
+// socket setup in the first place.
 
 // SocketPath is the fixed live query socket `relay function inspect` dials for
 // live runtime-pool gauges, `relay stats reset` dials to reset a running
@@ -61,12 +64,27 @@ import (
 // nor be meaningfully persisted.
 const SocketPath = processlock.DefaultDir + "/relay.sock"
 
+// socketFilePerm is the mode of the bound control socket. It is owner-only, so
+// only the owning process (the worker, and the same user's CLI) can reach the
+// control surface; the wire protocol is unchanged.
+const socketFilePerm = 0o600
+
+// socketProbeTimeout bounds the liveness probe of a pre-existing Unix socket
+// before it is treated as stale, so startup cannot hang on a wedged peer.
+const socketProbeTimeout = 1 * time.Second
+
 // ensureSocketDir creates the socket's parent directory (the ephemeral runtime
-// dir) with mode 0o755. It is called BEFORE binding so a fresh container without
-// /run/relay can never fail the bind, and it is the socket file's own
+// dir) with processlock.DirPerm (owner-only) and enforces that mode on an
+// existing directory whose mode may have been widened by an earlier version or
+// a container base image. It is called BEFORE binding so a fresh container
+// without /run/relay can never fail the bind, and it is the socket file's own
 // directory-creation helper so socket.go needs no shared path package.
 func ensureSocketDir(path string) error {
-	return os.MkdirAll(filepath.Dir(path), 0o755)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, processlock.DirPerm); err != nil {
+		return err
+	}
+	return os.Chmod(dir, processlock.DirPerm)
 }
 
 const (
@@ -307,13 +325,13 @@ type SocketServer struct {
 	wg     sync.WaitGroup
 }
 
-// NewSocketServer creates path's parent directory, removes any stale socket
-// file, binds the Unix socket at path, and starts serving in a goroutine. It
-// returns an error only for an unrecoverable setup failure (directory, stale
-// removal, or bind); a later transient accept failure is logged and retried,
-// never fatal. The bound path is stored in the returned server, so every later
-// operation (serve, close, unlink) uses that instance path and never a
-// package-level one.
+// NewSocketServer creates path's parent directory (enforcing owner-only mode),
+// removes a stale socket file, binds the Unix socket at path (then enforces
+// owner-only mode on it), and starts serving in a goroutine. It returns an error
+// only for an unrecoverable setup failure (directory, stale handling, chmod, or
+// bind); a later transient accept failure is logged and retried, never fatal.
+// The bound path is stored in the returned server, so every later operation
+// (serve, close, unlink) uses that instance path and never a package-level one.
 //
 // resetter handles the semantic "reset stats" command. Run always supplies the
 // stats flusher (constructed with the state handle even when metrics are
@@ -332,12 +350,20 @@ func NewSocketServer(
 	if err := ensureSocketDir(path); err != nil {
 		return nil, fmt.Errorf("create runtime dir: %w", err)
 	}
-	if err := removeStaleSocket(path); err != nil {
+	if err := prepareSocketPath(path); err != nil {
 		return nil, err
 	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("listen %q: %w", path, err)
+	}
+	// Enforce the socket's owner-only mode explicitly: net.Listen creates it
+	// with the process umask applied, and the socket is a control surface that
+	// must stay reachable only by the owning user. A chmod failure is fatal:
+	// the listener is closed so the freshly bound path is not leaked.
+	if err := os.Chmod(path, socketFilePerm); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("set socket permissions %q: %w", path, err)
 	}
 	server := &SocketServer{
 		path:     path,
@@ -398,14 +424,51 @@ func (s *SocketServer) currentReplayer() HandlerReplayer {
 	return s.replayer
 }
 
-// removeStaleSocket unlinks a leftover socket file from a previous worker so the
-// subsequent bind cannot fail with "address already in use". A missing file is
-// not an error.
-func removeStaleSocket(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+// prepareSocketPath makes path safe to bind by clearing only a genuinely stale
+// socket left by a previous worker. A missing path is not an error, and any
+// other file kind is refused rather than deleted:
+//
+//   - a non-socket (regular file, symlink, directory, device, ...) is a path
+//     collision or misconfiguration, not leftover process state, so it is
+//     reported and left untouched;
+//   - a Unix socket that still accepts a connection belongs to a live listener,
+//     so it is reported rather than unlinked (the process lock should already
+//     prevent this, but the socket layer must not assume it);
+//   - a Unix socket that refuses a connection is stale and is removed.
+//
+// Lstat (not Stat) is used deliberately so a symlink is never followed and
+// deleted as if it were the socket.
+func prepareSocketPath(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect socket path %q: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("socket path %q exists and is not a socket (mode %v); refusing to remove it", path, info.Mode())
+	}
+	if socketIsActive(path) {
+		return fmt.Errorf("socket path %q is in use by an active listener", path)
+	}
+	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove stale socket %q: %w", path, err)
 	}
 	return nil
+}
+
+// socketIsActive reports whether a Unix socket at path accepts a connection. A
+// refused dial (nobody listening) means the socket file is stale; a successful
+// dial is closed immediately and means a live listener owns it.
+func socketIsActive(path string) bool {
+	dialer := net.Dialer{Timeout: socketProbeTimeout}
+	conn, err := dialer.Dial("unix", path)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // serve accepts and dispatches connections until Close. The listener's own

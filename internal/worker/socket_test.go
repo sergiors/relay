@@ -92,13 +92,119 @@ func TestRuntimeSocketCreatesParentAndBinds(t *testing.T) {
 	}
 }
 
-// TestRuntimeSocketRecoversStaleFile covers stale recovery: a leftover regular
-// file (what a SIGKILLed worker can leave) is removed and replaced by a working
-// socket.
-func TestRuntimeSocketRecoversStaleFile(t *testing.T) {
+// TestRuntimeSocketEnforcesPermissions covers the security hardening: the bound
+// socket is owner-only, the created runtime directory is owner-only, and an
+// existing directory whose mode was widened is tightened on startup.
+func TestRuntimeSocketEnforcesPermissions(t *testing.T) {
+	dir := shortTempDir(t)
+	// Widen the directory (what an earlier version or a base image could leave).
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("widen dir: %v", err)
+	}
+	path := filepath.Join(dir, "relay.sock")
+	startTestSocket(t, path, nil)
+
+	sockInfo, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat socket: %v", err)
+	}
+	if got := sockInfo.Mode().Perm(); got != socketFilePerm {
+		t.Fatalf("socket mode = %o, want %o", got, socketFilePerm)
+	}
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != processlock.DirPerm {
+		t.Fatalf("runtime dir mode = %o, want %o", got, processlock.DirPerm)
+	}
+}
+
+// TestRuntimeSocketRefusesRegularFile covers the path-collision guard: a
+// non-socket path (a regular file) is NOT removed and bind fails, so the socket
+// layer can never delete a path it does not own.
+func TestRuntimeSocketRefusesRegularFile(t *testing.T) {
 	path := testSocketPath(t)
-	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
-		t.Fatalf("seed stale file: %v", err)
+	if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
+		t.Fatalf("seed regular file: %v", err)
+	}
+
+	_, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err == nil {
+		t.Fatal("NewSocketServer over a regular file: want error, got nil")
+	}
+
+	// The file must still exist with its original contents.
+	got, statErr := os.ReadFile(path)
+	if statErr != nil {
+		t.Fatalf("regular file must not be removed: %v", statErr)
+	}
+	if string(got) != "not a socket" {
+		t.Fatalf("regular file contents = %q, want unchanged", got)
+	}
+}
+
+// TestRuntimeSocketRefusesSymlink covers the Lstat guard: a symlink at the
+// socket path is not followed and not deleted, even when it points at a plain
+// file, so a symlink cannot be used to make the worker unlink another path.
+func TestRuntimeSocketRefusesSymlink(t *testing.T) {
+	dir := shortTempDir(t)
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("target"), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	path := filepath.Join(dir, "relay.sock")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("seed symlink: %v", err)
+	}
+
+	_, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err == nil {
+		t.Fatal("NewSocketServer over a symlink: want error, got nil")
+	}
+
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("symlink must not be removed: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "target" {
+		t.Fatalf("symlink target must be untouched (got %q, err %v)", got, err)
+	}
+}
+
+// TestRuntimeSocketReplacesStaleUnixSocket covers stale recovery for the real
+// case: a leftover Unix socket with no listener (what a SIGKILLed worker leaves)
+// is probed, found dead, removed, and replaced by a working socket.
+func TestRuntimeSocketReplacesStaleUnixSocket(t *testing.T) {
+	path := testSocketPath(t)
+	// Bind then close the raw listener WITHOUT unlinking, emulating a killed
+	// worker: the file remains but nothing accepts on it. Go's UnixListener
+	// unlinks on Close unless told otherwise, so disable that to keep the
+	// leftover file the stale path must handle.
+	addr, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		t.Fatalf("resolve unix addr: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("seed listener: %v", err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close seeded listener: %v", err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("stale socket file should remain after raw close: %v", err)
 	}
 
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{
@@ -106,10 +212,36 @@ func TestRuntimeSocketRecoversStaleFile(t *testing.T) {
 	})
 	st, err := QueryRuntimeState(path, "fn")
 	if err != nil {
-		t.Fatalf("QueryRuntimeState after stale recovery: %v", err)
+		t.Fatalf("QueryRuntimeState after stale socket replacement: %v", err)
 	}
 	if st.Capacity != 2 {
 		t.Fatalf("capacity = %d, want 2", st.Capacity)
+	}
+}
+
+// TestRuntimeSocketRefusesActiveSocket covers the active-listener guard: a Unix
+// socket that still accepts connections is left in place and bind fails, so the
+// socket layer never steals a live worker's endpoint (the process lock normally
+// prevents reaching this, but the guard must hold on its own).
+func TestRuntimeSocketRefusesActiveSocket(t *testing.T) {
+	path := testSocketPath(t)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("seed listener: %v", err)
+	}
+	defer ln.Close()
+
+	_, err = NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err == nil {
+		t.Fatal("NewSocketServer over an active socket: want error, got nil")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("active socket must not be removed: %v", err)
 	}
 }
 
@@ -278,6 +410,27 @@ func TestRuntimeSocketGracefulRemoval(t *testing.T) {
 
 	// A fresh socket can bind the same path.
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+}
+
+// TestRuntimeSocketCloseWithAbsentFile covers absent-path cleanup: Close on a
+// server whose socket file was already removed must succeed (removal tolerates
+// ENOENT) and stay idempotent, so shutdown is never blocked by a missing file.
+func TestRuntimeSocketCloseWithAbsentFile(t *testing.T) {
+	path := testSocketPath(t)
+	s := startTestSocket(t, path, nil)
+
+	// Remove the socket out from under the server to emulate an external unlink
+	// (or a race with a previous cleanup).
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove socket: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close with absent socket file: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close with absent socket file: %v", err)
+	}
 }
 
 // TestQueryRuntimeStateUnavailableNoSocket covers the standalone no-worker case:

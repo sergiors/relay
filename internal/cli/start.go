@@ -45,9 +45,15 @@ func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 			// BEFORE taking the lock, so both the lock file and the worker's later
 			// socket bind have their parent. It is deliberately outside the
 			// persistent /var/lib/relay state volume; the injected lock's
-			// directory is the single source for it.
-			if err := os.MkdirAll(filepath.Dir(deps.LockPath), 0o755); err != nil {
+			// directory is the single source for it. The mode is owner-only and
+			// matches processlock's directory policy; Acquire re-enforces it
+			// (MkdirAll's mode is creation-only and umask-masked).
+			runtimeDir := filepath.Dir(deps.LockPath)
+			if err := os.MkdirAll(runtimeDir, processlock.DirPerm); err != nil {
 				return fmt.Errorf("relay start: cannot create runtime dir: %w", err)
+			}
+			if err := os.Chmod(runtimeDir, processlock.DirPerm); err != nil {
+				return fmt.Errorf("relay start: cannot secure runtime dir: %w", err)
 			}
 
 			// Process boundary: acquire the single-instance lock before the
