@@ -21,10 +21,14 @@ import (
 // configuration through the same config.Load + config.RedisOptions conventions
 // `relay health` and `relay start` use, then builds a Redis-backed store over
 // the DLQ stream derived from the configured source stream. config.Load is the
-// fail-fast executable boundary (a missing required REDIS_* variable exits),
-// matching the worker's startup behavior.
+// configuration boundary: a missing required REDIS_* variable (or any other
+// invalid setting) is RETURNED and propagated to cmd/main.go, which prints it
+// once and owns the process exit — matching the worker's startup behavior.
 func openRedisDLQStore(logger *slog.Logger) (DLQStore, func(), error) {
-	cfg := config.Load(logger)
+	cfg, err := config.Load(logger)
+	if err != nil {
+		return nil, nil, fmt.Errorf("config: %w", err)
+	}
 	opts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
 		return nil, nil, fmt.Errorf("redis config: %w", err)

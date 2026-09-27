@@ -27,9 +27,9 @@ func TestIntegrationHealthRealPath(t *testing.T) {
 	testutil.RequireRedis(t)
 	testutil.RequireDocker(t)
 
-	// The health command loads full config via config.Load, which exits via
-	// logger.Fatalf when a required REDIS_* variable is missing, so provide a
-	// discard logger and set all three required variables (REDIS_STREAM and
+	// The health command loads full config via config.Load, which RETURNS an
+	// error when a required REDIS_* variable is missing, so provide a discard
+	// logger and set all three required variables (REDIS_STREAM and
 	// REDIS_GROUP need only be non-empty; only REDIS_URI is pinged).
 	logger := testutil.DiscardLogger()
 	redisURI := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")

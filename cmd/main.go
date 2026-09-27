@@ -9,13 +9,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/lmittmann/tint"
+	urfavecli "github.com/urfave/cli/v3"
 
 	"relay/internal/cli"
 	"relay/internal/config"
@@ -44,8 +47,35 @@ func main() {
 	)
 	defer stop()
 
-	if err := cli.Run(ctx, os.Args, logger); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	// runCommand owns the process-boundary error policy: print the returned
+	// error exactly once to stderr and map it to an exit code. main only acts
+	// on a nonzero code, so the success path exits 0 naturally by returning.
+	if code := runCommand(func() error {
+		return cli.Run(ctx, os.Args, logger)
+	}, os.Stderr); code != 0 {
+		os.Exit(code)
 	}
+}
+
+// runCommand executes fn and maps its error to a process exit code, writing the
+// error to stderr exactly once. It is the single place that translates a
+// returned error into an exit code: nil yields 0 and writes nothing; an error
+// wrapping a urfave/cli ExitCoder (the cli.Exit(msg, 2) usage errors the command
+// tree returns) yields that explicit code; any other error yields 1. Isolating
+// this as a pure function of (func() error, io.Writer) lets tests assert the
+// boundary directly instead of spawning the process. os.Exit is deliberately
+// not called here — only main, the caller that receives code, owns the process.
+func runCommand(fn func() error, stderr io.Writer) int {
+	err := fn()
+	if err == nil {
+		return 0
+	}
+
+	fmt.Fprintln(stderr, err)
+
+	var exitErr urfavecli.ExitCoder
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return 1
 }

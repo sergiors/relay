@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +34,18 @@ func testLogger() (*slog.Logger, *bytes.Buffer) {
 // importing testutil would be an import cycle.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// mustLoad loads configuration with a discard logger and fails the test if Load
+// returns an error. Tests that assert on a returned configuration error call
+// Load directly instead.
+func mustLoad(t *testing.T) Config {
+	t.Helper()
+	cfg, err := Load(discardLogger())
+	if err != nil {
+		t.Fatalf("Load returned unexpected error: %v", err)
+	}
+	return cfg
 }
 
 // TestParseNetworks pins the NETWORKS parser contract: unset/empty/whitespace
@@ -73,12 +84,12 @@ func TestParseNetworks(t *testing.T) {
 func TestLoadNetworks(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("NETWORKS", "")
-	if got := Load(discardLogger()).Networks; got != nil {
+	if got := mustLoad(t).Networks; got != nil {
 		t.Fatalf("Networks = %v, want nil when unset", got)
 	}
 
 	t.Setenv("NETWORKS", "backend, frontend ,backend")
-	got := Load(discardLogger()).Networks
+	got := mustLoad(t).Networks
 	if len(got) != 2 || got[0] != "backend" || got[1] != "frontend" {
 		t.Fatalf("Networks = %v, want [backend frontend]", got)
 	}
@@ -94,7 +105,7 @@ func TestLoadResolvesFields(t *testing.T) {
 	t.Setenv("REDIS_STREAM_RETENTION", "6h")
 	t.Setenv("METRICS_ADDR", ":9090")
 
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.RedisURI != "redis:6379" || cfg.RedisStream != "stream" || cfg.RedisGroup != "group" {
 		t.Fatalf("redis fields = %+v, want address/stream/group sentinels", cfg)
 	}
@@ -117,7 +128,7 @@ func TestLoadResolvesFields(t *testing.T) {
 // metrics HTTP server remains opt-in (a non-empty guard in the worker decides).
 func TestLoadMetricsAddrOptIn(t *testing.T) {
 	setRequiredEnv(t)
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.MetricsAddr != "" {
 		t.Fatalf("MetricsAddr = %q, want empty (opt-in)", cfg.MetricsAddr)
 	}
@@ -128,7 +139,7 @@ func TestLoadMetricsAddrOptIn(t *testing.T) {
 func TestMetricsAddrPassthrough(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("METRICS_ADDR", ":9091")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.MetricsAddr != ":9091" {
 		t.Fatalf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9091")
 	}
@@ -139,7 +150,7 @@ func TestMetricsAddrPassthrough(t *testing.T) {
 // worker decides whether to bind it).
 func TestLoadGitWebhookAddrOptIn(t *testing.T) {
 	setRequiredEnv(t)
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.GitWebhookAddr != "" {
 		t.Fatalf("GitWebhookAddr = %q, want empty (opt-in)", cfg.GitWebhookAddr)
 	}
@@ -151,17 +162,17 @@ func TestLoadGitWebhookAddrOptIn(t *testing.T) {
 func TestLoadGitWebhookAddrPassthrough(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("GIT_WEBHOOK_ADDR", ":8080")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.GitWebhookAddr != ":8080" {
 		t.Fatalf("GitWebhookAddr = %q, want %q", cfg.GitWebhookAddr, ":8080")
 	}
 }
 
 // TestStreamRetention covers the REDIS_STREAM_RETENTION parsing contract via the
-// pure parseRetention helper now that retention is log-and-disable: unset/empty
-// disables retention (0, no log); a valid duration parses; an invalid duration
-// and a zero/negative value log a line mentioning REDIS_STREAM_RETENTION and
-// return 0 (disabled). A bad value therefore no longer fails startup.
+// pure parseRetention helper: retention is log-and-disable: unset/empty disables
+// retention (0, no log); a valid duration parses; an invalid duration and a
+// zero/negative value log a line mentioning REDIS_STREAM_RETENTION and return 0
+// (disabled). A bad value therefore never fails startup.
 func TestStreamRetention(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -192,16 +203,20 @@ func TestStreamRetention(t *testing.T) {
 	}
 }
 
-// TestLoadRetentionErrorMentionsVariable pins that a malformed REDIS_STREAM_RETENTION
-// is logged rather than fatal: Load returns a Config with retention disabled (0)
-// and the captured log mentions the offending variable so an operator can find
-// the misconfiguration. A bad retention must not fail startup.
+// TestLoadRetentionErrorMentionsVariable pins that a malformed
+// REDIS_STREAM_RETENTION is logged rather than fatal: Load returns nil error and
+// a Config with retention disabled (0), and the captured log mentions the
+// offending variable so an operator can find the misconfiguration. A bad
+// retention must not fail startup.
 func TestLoadRetentionErrorMentionsVariable(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("REDIS_STREAM_RETENTION", "bogus")
 
 	logger, buf := testLogger()
-	cfg := Load(logger)
+	cfg, err := Load(logger)
+	if err != nil {
+		t.Fatalf("Load returned error %v, want nil (retention is log-and-disable)", err)
+	}
 	if cfg.StreamRetention != 0 {
 		t.Fatalf("StreamRetention = %v, want 0 (disabled) on malformed value", cfg.StreamRetention)
 	}
@@ -210,104 +225,72 @@ func TestLoadRetentionErrorMentionsVariable(t *testing.T) {
 	}
 }
 
-// TestLoadFatalOnMissing is the subprocess-based test for the required-variable
-// path. config.Load calls logger.Fatalf (os.Exit) when a required REDIS_*
-// variable is missing, so it cannot be exercised in-process (t.Setenv cannot be
-// combined with os.Exit — the test binary would die). Instead we re-exec the
-// test binary in a subprocess (the standard Go pattern for os.Exit paths,
-// https://go.dev/blog/os-exec) and assert the child exits non-zero with output
-// naming the offending variable. Each test case sets a child-only marker env var
-// that testLoadFatalOnMissingSubprocess reads on the other side.
-func TestLoadFatalOnMissing(t *testing.T) {
-	for _, tt := range []struct {
-		missEnv string
-		wantVar string
-	}{
-		{"REDIS_URI", "REDIS_URI"},
-		{"REDIS_STREAM", "REDIS_STREAM"},
-		{"REDIS_GROUP", "REDIS_GROUP"},
-	} {
-		t.Run(tt.missEnv, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestLoadFatalOnMissingSubprocess$")
-			cmd.Env = append(os.Environ(), "RELAY_TEST_MISSING="+tt.missEnv)
-			// The child writes its fatalf log (mentioning the var) to stderr via
-			// the slog handler, so capture and assert both the exit
-			// code and the message.
-			out, err := cmd.CombinedOutput()
+// TestLoadReturnsErrorOnMissingVariable pins the required-variable contract:
+// Load RETURNS an error naming the missing REDIS_* variable (rather than exiting
+// the process), the returned Config is zero, and nothing is logged — config
+// failures are surfaced once through the returned error at the process boundary,
+// not duplicated as a fatal slog line.
+func TestLoadReturnsErrorOnMissingVariable(t *testing.T) {
+	for _, missEnv := range []string{"REDIS_URI", "REDIS_STREAM", "REDIS_GROUP"} {
+		t.Run(missEnv, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(missEnv, "")
+
+			logger, buf := testLogger()
+			cfg, err := Load(logger)
 			if err == nil {
-				t.Fatalf("subprocess exited 0; want non-zero exit for missing %s", tt.missEnv)
+				t.Fatalf("Load returned nil error for missing %s; want an error", missEnv)
 			}
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
-				t.Fatalf("subprocess error = %v, want non-zero exit", err)
+			if !strings.Contains(err.Error(), missEnv) {
+				t.Fatalf("error %q does not name %s", err, missEnv)
 			}
-			if !strings.Contains(string(out), tt.wantVar) {
-				t.Fatalf("subprocess output does not mention %s:\n%s", tt.wantVar, string(out))
+			if !strings.Contains(err.Error(), "not set") {
+				t.Fatalf("error %q missing 'not set'", err)
 			}
-			if !strings.Contains(string(out), "not set") {
-				t.Fatalf("subprocess output missing 'not set':\n%s", string(out))
+			if cfg.RedisURI != "" || cfg.RedisStream != "" || cfg.RedisGroup != "" {
+				t.Fatalf("Config = %+v, want zero value on error", cfg)
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
 			}
 		})
 	}
 }
 
-// TestLoadFatalOnMissingSubprocess is not a standalone test: it is the subprocess
-// side of TestLoadFatalOnMissing (matched by -test.run=TestLoadFatalOnMissingSubprocess$).
-// It reads RELAY_TEST_MISSING (set only in the child process), clears that required
-// variable, and calls Load — which must call logger.Fatalf (process exit) naming
-// the variable. The default os.Exit code from Fatalf is 1, so the parent asserts
-// a non-zero exit. This function itself must never be run as a normal top-level
-// test; the parent always runs it as a subprocess.
-func TestLoadFatalOnMissingSubprocess(t *testing.T) {
-	missVar := os.Getenv("RELAY_TEST_MISSING")
-	// The parent never sets this in its own environment, so running this as a
-	// plain test (not as the subprocess) has nothing to test.
-	if missVar == "" {
-		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_MISSING unset)")
-	}
-	setRequiredEnv(t)
-	// Clear the variable under test so requiredEnv sees it missing.
-	t.Setenv(missVar, "")
-	// Fatalf writes to stderr; the slog handler writing to os.Stderr routes the
-	// fatal line where the parent's CombinedOutput captures it.
-	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	// Load should have exited via Fatalf; reaching here is a failure.
-	t.Fatal("Load returned instead of calling logger.Fatalf on missing variable")
-}
-
 // TestConsumerNameResolvesToHostname proves Load() resolves the consumer name to
 // the hostname on a normal test host. We compare against os.Hostname()
 // directly; the two may legitimately differ only in weird environments where
-// the hostname is empty, in which case we fail rather than skip (an empty
-// hostname would be a fatal path in consumerNameFromHost, so a normal host must
-// resolve it).
+// the hostname is empty, in which case the test fails rather than skips (an
+// empty hostname is a returned error in consumerNameFromHost, so a normal host
+// must resolve it).
 func TestConsumerNameResolvesToHostname(t *testing.T) {
 	host, hostErr := os.Hostname()
 	if hostErr != nil || host == "" {
 		t.Fatalf("os.Hostname unavailable on this host: %v", hostErr)
 	}
 	setRequiredEnv(t)
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.ConsumerName != host {
 		t.Fatalf("ConsumerName = %q, want hostname %q", cfg.ConsumerName, host)
 	}
 }
 
-// NOTE on consumerNameFromHost failure paths: consumerNameFromHost now takes
-// only a logger and calls os.Hostname internally, calling logger.Fatalf (process
-// exit) on both a resolution error and an empty hostname. Those fatal paths are
-// not injectable (os.Hostname cannot be stubbed), so they cannot be unit-tested
-// in-process — unlike the old direct-args helper, there is no way to force the
-// failure without exiting the test binary. Load's own missing-required-var fatal
-// path is covered by the TestLoadFatalOnMissing subprocess test above; the
-// hostname-fatal paths are deliberately left untested because no environment or
-// argument can exercise them without stubbing os.Hostname.
+// NOTE on consumerNameFromHost failure paths: consumerNameFromHost calls
+// os.Hostname internally and RETURNS an error on both a resolution failure and
+// an empty hostname. Those paths are not injectable (os.Hostname cannot be
+// stubbed), so they cannot be unit-tested in-process and are deliberately left
+// untested. The returned error is what makes them non-fatal, so the caller owns
+// the process exit.
 
 // TestLoadDefaultLogLevel pins that an unset LOG_LEVEL resolves to Info.
 func TestLoadDefaultLogLevel(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("LOG_LEVEL", "")
 	logger, _ := testLogger()
-	cfg := Load(logger)
+	cfg, err := Load(logger)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("LogLevel = %v, want INFO default", cfg.LogLevel)
 	}
@@ -316,7 +299,7 @@ func TestLoadDefaultLogLevel(t *testing.T) {
 // TestLoadLogLevelParses pins that each explicit (case-insensitive, whitespace-
 // trimmed) LOG_LEVEL resolves to the correct slog level. An empty value is the
 // default (INFO). "warning" is not an alias and is covered by the invalid-value
-// subprocess test.
+// test.
 func TestLoadLogLevelParses(t *testing.T) {
 	for _, tc := range []struct {
 		value string
@@ -335,7 +318,7 @@ func TestLoadLogLevelParses(t *testing.T) {
 		t.Run(tc.value, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv("LOG_LEVEL", tc.value)
-			cfg := Load(discardLogger())
+			cfg := mustLoad(t)
 			if cfg.LogLevel != tc.want {
 				t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, tc.want)
 			}
@@ -343,43 +326,30 @@ func TestLoadLogLevelParses(t *testing.T) {
 	}
 }
 
-// TestLoadInvalidLogLevelFatal is the subprocess test for the invalid-LOG_LEVEL
-// path. config.Load calls logger.Fatalf (os.Exit) on an invalid LOG_LEVEL, so it
-// cannot be exercised in-process; the child re-exec pattern mirrors
-// TestLoadFatalOnMissing.
-func TestLoadInvalidLogLevelFatal(t *testing.T) {
+// TestLoadInvalidLogLevelReturnsError pins the invalid-LOG_LEVEL contract: Load
+// RETURNS an error naming the variable and the valid values (rather than exiting
+// the process) and logs nothing.
+func TestLoadInvalidLogLevelReturnsError(t *testing.T) {
 	for _, value := range []string{"bogus", "verbose", "warning"} {
 		t.Run(value, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidLogLevelFatalSubprocess$")
-			cmd.Env = append(os.Environ(), "RELAY_TEST_INVALID_LOGLEVEL="+value)
-			out, err := cmd.CombinedOutput()
+			setRequiredEnv(t)
+			t.Setenv("LOG_LEVEL", value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
 			if err == nil {
-				t.Fatalf("subprocess exited 0; want non-zero exit for invalid LOG_LEVEL %q", value)
-			}
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
-				t.Fatalf("subprocess error = %v, want non-zero exit", err)
+				t.Fatalf("Load returned nil error for invalid LOG_LEVEL %q; want an error", value)
 			}
 			for _, want := range []string{"LOG_LEVEL", "DEBUG", "INFO", "WARN", "ERROR"} {
-				if !strings.Contains(string(out), want) {
-					t.Fatalf("subprocess output does not mention %s:\n%s", want, string(out))
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %s", err, want)
 				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
 			}
 		})
 	}
-}
-
-// TestLoadInvalidLogLevelFatalSubprocess is the child side of
-// TestLoadInvalidLogLevelFatal. It sets an invalid LOG_LEVEL and calls Load,
-// which must exit via logger.Fatalf naming the variable and valid values.
-func TestLoadInvalidLogLevelFatalSubprocess(t *testing.T) {
-	value := os.Getenv("RELAY_TEST_INVALID_LOGLEVEL")
-	if value == "" {
-		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_INVALID_LOGLEVEL unset)")
-	}
-	setRequiredEnv(t)
-	t.Setenv("LOG_LEVEL", value)
-	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	t.Fatal("Load returned instead of calling logger.Fatalf on invalid LOG_LEVEL")
 }
 
 // TestLoadConcurrencyDefaults pins that unset MAX_CONCURRENCY and
@@ -389,7 +359,7 @@ func TestLoadConcurrencyDefaults(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("MAX_CONCURRENCY", "")
 	t.Setenv("MAX_BUFFERED_EVENTS", "")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.MaxConcurrency != DefaultMaxConcurrency {
 		t.Fatalf("MaxConcurrency = %d, want default %d", cfg.MaxConcurrency, DefaultMaxConcurrency)
 	}
@@ -404,7 +374,7 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("MAX_CONCURRENCY", "4")
 	t.Setenv("MAX_BUFFERED_EVENTS", "32")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.MaxConcurrency != 4 {
 		t.Fatalf("MaxConcurrency = %d, want 4", cfg.MaxConcurrency)
 	}
@@ -418,7 +388,7 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 // passed through as-is when set (including TRAEFIK_PRIORITY to a pointer).
 func TestLoadTraefikOptionalValues(t *testing.T) {
 	setRequiredEnv(t)
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.TraefikEntryPoints != "" || cfg.TraefikCertResolver != "" || cfg.TraefikPriority != nil {
 		t.Fatalf("Traefik optional fields = %+v, want zero/nil when unset", cfg)
 	}
@@ -426,7 +396,7 @@ func TestLoadTraefikOptionalValues(t *testing.T) {
 	t.Setenv("TRAEFIK_ENTRYPOINTS", "websecure")
 	t.Setenv("TRAEFIK_CERTRESOLVER", "letsencrypt")
 	t.Setenv("TRAEFIK_PRIORITY", "100")
-	cfg = Load(discardLogger())
+	cfg = mustLoad(t)
 	if cfg.TraefikEntryPoints != "websecure" {
 		t.Fatalf("TraefikEntryPoints = %q, want websecure", cfg.TraefikEntryPoints)
 	}
@@ -445,13 +415,13 @@ func TestLoadTraefikOptionalValues(t *testing.T) {
 // TRAEFIK_* fields.
 func TestLoadTraefikHostOverride(t *testing.T) {
 	setRequiredEnv(t)
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.TraefikHostOverride != "" {
 		t.Fatalf("TraefikHostOverride = %q, want empty when unset", cfg.TraefikHostOverride)
 	}
 
 	t.Setenv("TRAEFIK_HOST_OVERRIDE", "localhost")
-	cfg = Load(discardLogger())
+	cfg = mustLoad(t)
 	if cfg.TraefikHostOverride != "localhost" {
 		t.Fatalf("TraefikHostOverride = %q, want localhost", cfg.TraefikHostOverride)
 	}
@@ -460,9 +430,8 @@ func TestLoadTraefikHostOverride(t *testing.T) {
 // TestParseOptionalPositiveInt pins the ParseOptionalPositiveInt contract:
 // unset/empty/whitespace → (nil, nil) — the "not configured" pointer-nil state;
 // positive ints parse to a pointer; zero, negative, non-numeric, and float
-// values error naming the variable. The os.Exit path in loadOptionalPositiveInt
-// is not exercised here (it cannot run in-process); this exported helper is
-// where the validation logic lives.
+// values error naming the variable. Load surfaces that error unchanged (no
+// os.Exit); this exported helper is where the validation logic lives.
 func TestParseOptionalPositiveInt(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -515,9 +484,9 @@ func TestParseOptionalPositiveInt(t *testing.T) {
 // TestParsePositiveInt exercises the shared positive-integer parser directly.
 // Defaults are resolved at the getEnv call site (see Load), so an empty value is
 // a parse error here; whitespace-trimmed positive ints parse; and empty, zero,
-// negative, non-numeric, float, and overflow values error. The os.Exit path in
-// Load is not exercised here (it cannot run in-process); ParsePositiveInt is
-// where the actual validation logic lives.
+// negative, non-numeric, float, and overflow values error. Load surfaces that
+// error unchanged (no os.Exit); ParsePositiveInt is where the validation logic
+// lives.
 func TestParsePositiveInt(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -558,9 +527,10 @@ func TestParsePositiveInt(t *testing.T) {
 	}
 }
 
-// TestLoadInvalidConcurrencyFatal exercises the fatal path for an invalid
-// MAX_CONCURRENCY via the subprocess pattern, matching TestLoadInvalidLogLevelFatal.
-func TestLoadInvalidConcurrencyFatal(t *testing.T) {
+// TestLoadInvalidConcurrencyReturnsError pins the invalid tuning-knob contract:
+// Load RETURNS an error naming the variable and its positive-integer
+// requirement, and logs nothing.
+func TestLoadInvalidConcurrencyReturnsError(t *testing.T) {
 	for _, tt := range []struct {
 		env, value, wantVar string
 	}{
@@ -569,44 +539,32 @@ func TestLoadInvalidConcurrencyFatal(t *testing.T) {
 		{"MAX_BUFFERED_EVENTS", "-1", "MAX_BUFFERED_EVENTS"},
 	} {
 		t.Run(tt.env+"="+tt.value, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidConcurrencyFatalSubprocess$")
-			cmd.Env = append(os.Environ(), "RELAY_TEST_ENV="+tt.env, "RELAY_TEST_VALUE="+tt.value)
-			out, err := cmd.CombinedOutput()
+			setRequiredEnv(t)
+			t.Setenv(tt.env, tt.value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
 			if err == nil {
-				t.Fatalf("subprocess exited 0; want non-zero exit for invalid %s=%s", tt.env, tt.value)
+				t.Fatalf("Load returned nil error for invalid %s=%s; want an error", tt.env, tt.value)
 			}
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
-				t.Fatalf("subprocess error = %v, want non-zero exit", err)
-			}
-			for _, want := range []string{tt.wantVar, "Configuration error", "positive integer"} {
-				if !strings.Contains(string(out), want) {
-					t.Fatalf("subprocess output does not mention %q:\n%s", want, string(out))
+			for _, want := range []string{tt.wantVar, "positive integer"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %q", err, want)
 				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
 			}
 		})
 	}
 }
 
-// TestLoadInvalidConcurrencyFatalSubprocess is the child side of the fatal
-// concurrency test (see TestLoadInvalidConcurrencyFatal).
-func TestLoadInvalidConcurrencyFatalSubprocess(t *testing.T) {
-	env := os.Getenv("RELAY_TEST_ENV")
-	value := os.Getenv("RELAY_TEST_VALUE")
-	if env == "" || value == "" {
-		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_* unset)")
-	}
-	setRequiredEnv(t)
-	t.Setenv(env, value)
-	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	t.Fatal("Load returned instead of calling logger.Fatalf on invalid positive-integer value")
-}
-
 // TestParsePositiveDuration exercises the shared positive-duration parser.
 // Defaults are resolved at the getEnv call site (see Load), so an empty value is
 // a parse error here; valid Go durations parse (trimmed); and empty, zero,
-// negative, and malformed values error naming the variable. The os.Exit path in
-// Load is not exercised here (it cannot run in-process); ParsePositiveDuration is
-// where the validation logic lives.
+// negative, and malformed values error naming the variable. Load surfaces that
+// error unchanged (no os.Exit); ParsePositiveDuration is where the validation
+// logic lives.
 func TestParsePositiveDuration(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -655,7 +613,7 @@ func TestParsePositiveDuration(t *testing.T) {
 func TestLoadWarmContainerIdleTimeoutDefault(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", "")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.WarmContainerIdleTimeout != DefaultWarmContainerIdleTimeout {
 		t.Fatalf("WarmContainerIdleTimeout = %v, want default %v",
 			cfg.WarmContainerIdleTimeout, DefaultWarmContainerIdleTimeout)
@@ -670,47 +628,36 @@ func TestLoadWarmContainerIdleTimeoutDefault(t *testing.T) {
 func TestLoadWarmContainerIdleTimeoutExplicit(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", "90s")
-	cfg := Load(discardLogger())
+	cfg := mustLoad(t)
 	if cfg.WarmContainerIdleTimeout != 90*time.Second {
 		t.Fatalf("WarmContainerIdleTimeout = %v, want 90s", cfg.WarmContainerIdleTimeout)
 	}
 }
 
-// TestLoadInvalidWarmContainerIdleTimeoutFatal exercises the fatal path for an
-// invalid WARM_CONTAINER_IDLE_TIMEOUT via the subprocess pattern, matching
-// TestLoadInvalidConcurrencyFatal. A malformed or non-positive duration is a
-// configuration error that aborts startup (unlike
+// TestLoadInvalidWarmContainerIdleTimeoutReturnsError pins the invalid
+// WARM_CONTAINER_IDLE_TIMEOUT contract: Load RETURNS an error naming the
+// variable and its positive-duration requirement, and logs nothing. A malformed
+// or non-positive duration is a configuration error that fails startup (unlike
 // REDIS_STREAM_RETENTION's log-and-disable).
-func TestLoadInvalidWarmContainerIdleTimeoutFatal(t *testing.T) {
+func TestLoadInvalidWarmContainerIdleTimeoutReturnsError(t *testing.T) {
 	for _, value := range []string{"0", "-5m", "bogus", "300"} {
 		t.Run(value, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess$")
-			cmd.Env = append(os.Environ(), "RELAY_TEST_IDLE_TIMEOUT="+value)
-			out, err := cmd.CombinedOutput()
+			setRequiredEnv(t)
+			t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
 			if err == nil {
-				t.Fatalf("subprocess exited 0; want non-zero exit for invalid WARM_CONTAINER_IDLE_TIMEOUT=%q", value)
+				t.Fatalf("Load returned nil error for invalid WARM_CONTAINER_IDLE_TIMEOUT=%q; want an error", value)
 			}
-			if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() == 0 {
-				t.Fatalf("subprocess error = %v, want non-zero exit", err)
-			}
-			for _, want := range []string{"WARM_CONTAINER_IDLE_TIMEOUT", "Configuration error", "positive duration"} {
-				if !strings.Contains(string(out), want) {
-					t.Fatalf("subprocess output does not mention %q:\n%s", want, string(out))
+			for _, want := range []string{"WARM_CONTAINER_IDLE_TIMEOUT", "positive duration"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %q", err, want)
 				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
 			}
 		})
 	}
-}
-
-// TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess is the child side of
-// the fatal idle-timeout test.
-func TestLoadInvalidWarmContainerIdleTimeoutFatalSubprocess(t *testing.T) {
-	value := os.Getenv("RELAY_TEST_IDLE_TIMEOUT")
-	if value == "" {
-		t.Skip("only meaningful as a Load subprocess (RELAY_TEST_IDLE_TIMEOUT unset)")
-	}
-	setRequiredEnv(t)
-	t.Setenv("WARM_CONTAINER_IDLE_TIMEOUT", value)
-	Load(slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	t.Fatal("Load returned instead of calling logger.Fatalf on invalid WARM_CONTAINER_IDLE_TIMEOUT")
 }

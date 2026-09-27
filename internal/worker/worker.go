@@ -197,7 +197,12 @@ func startupResult(err error) error {
 // abandoning live servers, goroutines, containers, and the state DB to process
 // exit.
 func Run(logger *slog.Logger) error {
-	cfg := config.Load(logger)
+	cfg, err := config.Load(logger)
+	if err != nil {
+		// Pre-resource failure: nothing owns cleanup yet, so return the error for
+		// the CLI to print and exit on.
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
 	redisOpts, err := config.RedisOptions(cfg.RedisURI)
 	if err != nil {
 		// Pre-resource failure: nothing owns cleanup yet, so return the error for

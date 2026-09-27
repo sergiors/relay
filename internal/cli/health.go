@@ -44,16 +44,19 @@ func healthCommand(logger *slog.Logger) *cli.Command {
 func runHealthCommand(ctx context.Context, w io.Writer, logger *slog.Logger) error {
 	// The health command loads the full configuration via config.Load(logger),
 	// the same entry point the worker's `relay start` uses. A missing required
-	// variable (REDIS_URI/REDIS_STREAM/REDIS_GROUP) or an unresolvable
-	// hostname therefore exits via config's fail-fast logging, matching the
-	// worker's behavior: the healthcheck fails hard rather than probing with
-	// nothing (or half) configured. This IS a behavior change — `relay health`
-	// now requires REDIS_STREAM and REDIS_GROUP to be set too, even though the
-	// health command only pings Redis — and it is intentional, since health's
-	// job is to verify the worker's actual startup configuration, not a
-	// hand-picked subset. A malformed DSN is surfaced by RedisOptions below.
+	// variable (REDIS_URI/REDIS_STREAM/REDIS_GROUP) or an unresolvable hostname
+	// returns an error that propagates to cmd/main.go, which prints it once and
+	// exits 1: the healthcheck fails hard rather than probing with nothing (or
+	// half) configured. This IS a behavior change — `relay health` now requires
+	// REDIS_STREAM and REDIS_GROUP to be set too, even though the health command
+	// only pings Redis — and it is intentional, since health's job is to verify
+	// the worker's actual startup configuration, not a hand-picked subset. A
+	// malformed DSN is surfaced by RedisOptions below.
 	redisCheck := func() error {
-		cfg := config.Load(logger)
+		cfg, err := config.Load(logger)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
 		redisOpts, err := config.RedisOptions(cfg.RedisURI)
 		if err != nil {
 			return fmt.Errorf("redis config: %w", err)

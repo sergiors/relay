@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -112,15 +113,20 @@ const (
 	DefaultWarmContainerIdleTimeout = 5 * time.Minute
 )
 
-// Load reads Relay's configuration from the environment and returns a Config. It
-// is the single entry point for application configuration: callers get a Config
-// value instead of reading environment variables directly. It only reaches the
-// executable boundary (the CLI commands and the worker call Load at startup),
-// so the failure paths are fatal rather than returned errors: a missing required
-// REDIS_* variable, an unresolvable hostname, or an invalid LOG_LEVEL exits via
-// os.Exit, each naming what went wrong.
+// Load reads Relay's configuration from the environment and returns a Config and
+// the first configuration error, if any. It is the single entry point for
+// application configuration: callers get a Config value instead of reading
+// environment variables directly.
 //
-// The required REDIS_* variables must be non-empty or the process exits (see
+// Every failure path RETURNS a clear, variable-naming error rather than logging
+// and exiting, so Load never writes to a process boundary and never calls
+// os.Exit: a missing required REDIS_* variable, an unresolvable hostname, an
+// invalid LOG_LEVEL, or an invalid positive integer/duration tuning knob is
+// returned for the caller (the CLI command or worker startup) to propagate. The
+// process boundary — printing the error exactly once and choosing the exit code
+// — stays in cmd/main.go.
+//
+// The required REDIS_* variables must be non-empty or Load returns an error (see
 // requiredEnv); the consumer name is hostname-resolved via consumerNameFromHost.
 // The optional variables are read with os.Getenv and stay zero/empty when
 // unset: retention maps to 0 (disabled, see parseRetention) and the metrics
@@ -128,71 +134,105 @@ const (
 // server), preserving their opt-in semantics through the caller's non-zero /
 // non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
 // default to 8 and 16 respectively (see ParsePositiveInt); an invalid (zero,
-// negative, or non-integer) value is a configuration error and aborts startup,
-// matching the loadLogLevel style.
-func Load(logger *slog.Logger) Config {
-	return Config{
-		RedisURI:        requiredEnv(logger, "REDIS_URI"),
-		RedisStream:     requiredEnv(logger, "REDIS_STREAM"),
-		RedisGroup:      requiredEnv(logger, "REDIS_GROUP"),
-		ConsumerName:    consumerNameFromHost(logger),
-		StreamRetention: parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", "")),
-		MetricsAddr:     getEnv("METRICS_ADDR", ""),
-		GitWebhookAddr:  getEnv("GIT_WEBHOOK_ADDR", ""),
-		LogLevel:        loadLogLevel(logger, getEnv("LOG_LEVEL", "INFO")),
-		MaxConcurrency: loadPositiveInt(
-			logger,
-			"MAX_CONCURRENCY",
-			getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency)),
-		),
-		MaxBufferedEvents: loadPositiveInt(
-			logger,
-			"MAX_BUFFERED_EVENTS",
-			getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents)),
-		),
-		Networks:            ParseNetworks(getEnv("NETWORKS", "")),
-		TraefikNetwork:      getEnv("TRAEFIK_NETWORK", ""),
-		TraefikEntryPoints:  getEnv("TRAEFIK_ENTRYPOINTS", ""),
-		TraefikCertResolver: getEnv("TRAEFIK_CERTRESOLVER", ""),
-		TraefikPriority: loadOptionalPositiveInt(
-			logger,
-			"TRAEFIK_PRIORITY",
-			getEnv("TRAEFIK_PRIORITY", ""),
-		),
-		TraefikHostOverride: getEnv("TRAEFIK_HOST_OVERRIDE", ""),
-		WarmContainerIdleTimeout: loadPositiveDuration(
-			logger,
-			"WARM_CONTAINER_IDLE_TIMEOUT",
-			getEnv("WARM_CONTAINER_IDLE_TIMEOUT", DefaultWarmContainerIdleTimeout.String()),
-		),
-	}
+// negative, or non-integer) value is a returned configuration error. The only
+// value that still logs-and-disables rather than failing is the optional
+// REDIS_STREAM_RETENTION window.
+func Load(logger *slog.Logger) (Config, error) {
+	var cfg Config
 
+	uri, err := requiredEnv("REDIS_URI")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RedisURI = uri
+
+	stream, err := requiredEnv("REDIS_STREAM")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RedisStream = stream
+
+	group, err := requiredEnv("REDIS_GROUP")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RedisGroup = group
+
+	consumer, err := consumerNameFromHost()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ConsumerName = consumer
+
+	// REDIS_STREAM_RETENTION is the one optional knob that degrades rather than
+	// fails: parseRetention logs and returns 0 (disabled) for a bad value.
+	cfg.StreamRetention = parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", ""))
+	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
+	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
+
+	level, err := loadLogLevel(getEnv("LOG_LEVEL", "INFO"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.LogLevel = level
+
+	maxConcurrency, err := loadPositiveInt(
+		"MAX_CONCURRENCY",
+		getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency)),
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxConcurrency = maxConcurrency
+
+	maxBufferedEvents, err := loadPositiveInt(
+		"MAX_BUFFERED_EVENTS",
+		getEnv("MAX_BUFFERED_EVENTS", strconv.Itoa(DefaultMaxBufferedEvents)),
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxBufferedEvents = maxBufferedEvents
+
+	cfg.Networks = ParseNetworks(getEnv("NETWORKS", ""))
+	cfg.TraefikNetwork = getEnv("TRAEFIK_NETWORK", "")
+	cfg.TraefikEntryPoints = getEnv("TRAEFIK_ENTRYPOINTS", "")
+	cfg.TraefikCertResolver = getEnv("TRAEFIK_CERTRESOLVER", "")
+
+	priority, err := loadOptionalPositiveInt("TRAEFIK_PRIORITY", getEnv("TRAEFIK_PRIORITY", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.TraefikPriority = priority
+
+	cfg.TraefikHostOverride = getEnv("TRAEFIK_HOST_OVERRIDE", "")
+
+	warmTimeout, err := loadPositiveDuration(
+		"WARM_CONTAINER_IDLE_TIMEOUT",
+		getEnv("WARM_CONTAINER_IDLE_TIMEOUT", DefaultWarmContainerIdleTimeout.String()),
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.WarmContainerIdleTimeout = warmTimeout
+
+	return cfg, nil
 }
 
 // loadPositiveInt parses a positive-integer environment value. Defaults are
 // resolved at the getEnv call site (the env value is already non-empty), so an
-// unparseable, zero, or negative value is a configuration error: it logs and
-// aborts startup, matching loadLogLevel.
-func loadPositiveInt(logger *slog.Logger, name, value string) int {
-	n, err := ParsePositiveInt(name, value)
-	if err != nil {
-		logger.Error("Configuration error", "error", err)
-		os.Exit(1)
-	}
-	return n
+// unparseable, zero, or negative value is a returned configuration error naming
+// the variable (see ParsePositiveInt).
+func loadPositiveInt(name, value string) (int, error) {
+	return ParsePositiveInt(name, value)
 }
 
-// loadPositiveDuration wraps ParsePositiveDuration with the fatal style: an
-// invalid (malformed or non-positive) value logs a clear configuration error
-// and aborts startup, matching loadPositiveInt. Defaults are resolved at the
-// getEnv call site.
-func loadPositiveDuration(logger *slog.Logger, name, value string) time.Duration {
-	d, err := ParsePositiveDuration(name, value)
-	if err != nil {
-		logger.Error("Configuration error", "error", err)
-		os.Exit(1)
-	}
-	return d
+// loadPositiveDuration parses a positive-duration environment value. Defaults
+// are resolved at the getEnv call site, so an invalid (malformed or
+// non-positive) value is a returned configuration error naming the variable
+// (see ParsePositiveDuration).
+func loadPositiveDuration(name, value string) (time.Duration, error) {
+	return ParsePositiveDuration(name, value)
 }
 
 // ParsePositiveInt parses a positive-integer environment value. Callers resolve
@@ -275,17 +315,12 @@ func ParseOptionalPositiveInt(name, value string) (*int, error) {
 	return &n, nil
 }
 
-// loadOptionalPositiveInt wraps ParseOptionalPositiveInt with the fatal style:
-// an invalid value logs a clear configuration error and aborts startup,
-// matching loadPositiveInt. It returns nil for an unset value (see the parse
-// helper for the nil-vs-provided contract).
-func loadOptionalPositiveInt(logger *slog.Logger, name, value string) *int {
-	n, err := ParseOptionalPositiveInt(name, value)
-	if err != nil {
-		logger.Error("Configuration error", "error", err)
-		os.Exit(1)
-	}
-	return n
+// loadOptionalPositiveInt wraps ParseOptionalPositiveInt with Load's returned-
+// error style: an invalid value returns a clear configuration error naming the
+// variable. It returns nil for an unset value (see the parse helper for the
+// nil-vs-provided contract).
+func loadOptionalPositiveInt(name, value string) (*int, error) {
+	return ParseOptionalPositiveInt(name, value)
 }
 
 // logLevelNames are the documented LOG_LEVEL values, in order of increasing
@@ -320,19 +355,14 @@ func ParseLogLevel(value string) (slog.Level, error) {
 	}
 }
 
-// loadLogLevel parses LOG_LEVEL and, on an invalid value, reports a clear
-// configuration error and aborts startup. Unlike optional tuning knobs
-// (loadDuration falls back), an invalid log level is a configuration error:
-// silently running at an unintended level would obscure precisely the
-// operational feedback the operator asked for. The valid value set is small and
-// enumerated, so there is no ambiguity worth falling back on.
-func loadLogLevel(logger *slog.Logger, value string) slog.Level {
-	level, err := ParseLogLevel(value)
-	if err != nil {
-		logger.Error("Configuration error", "error", err)
-		os.Exit(1)
-	}
-	return level
+// loadLogLevel parses LOG_LEVEL and returns a clear configuration error for an
+// invalid value. Unlike optional tuning knobs (parseRetention falls back), an
+// invalid log level is an error: silently running at an unintended level would
+// obscure precisely the operational feedback the operator asked for. The valid
+// value set is small and enumerated, so there is no ambiguity worth falling back
+// on.
+func loadLogLevel(value string) (slog.Level, error) {
+	return ParseLogLevel(value)
 }
 
 // parseRetention parses a stream-retention window from REDIS_STREAM_RETENTION
@@ -360,40 +390,31 @@ func parseRetention(logger *slog.Logger, value string) time.Duration {
 	return d
 }
 
-// consumerNameFromHost resolves the hostname into a consumer name. Failures are
-// fatal: it logs and exits the process (os.Exit(1)) on both a hostname
-// resolution error and an empty hostname, keeping the two failure paths
-// distinct in their messages. It is only reached from the executable boundary's
-// Load, so the fatal exit is intentional; it is wrapped here so the two failure
-// paths stay distinguishable in the log. os.Hostname is not injectable, so
-// these fatals are not unit-testable in-process.
-func consumerNameFromHost(logger *slog.Logger) string {
+// consumerNameFromHost resolves the hostname into a consumer name. It returns a
+// clear error on both a hostname resolution failure and an empty hostname,
+// keeping the two failure paths distinct in their messages. os.Hostname is not
+// injectable, so the failure paths cannot be exercised in-process; they are
+// returned (not fatal) so Load's caller owns process exit.
+func consumerNameFromHost() (string, error) {
 	host, err := os.Hostname()
 	if err != nil {
-		logger.Error("Resolve consumer name: hostname unavailable", "error", err)
-		os.Exit(1)
-		return ""
+		return "", fmt.Errorf("resolve consumer name: hostname unavailable: %w", err)
 	}
 	if host == "" {
-		logger.Error("Resolve consumer name: hostname is empty")
-		os.Exit(1)
-		return ""
+		return "", errors.New("resolve consumer name: hostname is empty")
 	}
-	return host
+	return host, nil
 }
 
-// requiredEnv returns the value of the environment variable key, or logs a
-// clear configuration error and exits the process (os.Exit(1)) if it is empty.
-// It is only ever reached from the executable boundary (the Relay CLI commands
-// call Load), so the fatal exit is intentional and must not be converted to a
-// returned error.
-func requiredEnv(logger *slog.Logger, key string) string {
+// requiredEnv returns the value of the environment variable key, or a clear
+// configuration error if it is empty. It returns rather than exiting so Load's
+// caller (the CLI or worker startup) propagates the failure to cmd/main.go,
+// which owns error printing and process exit.
+func requiredEnv(key string) (string, error) {
 	if value := os.Getenv(key); value != "" {
-		return value
+		return value, nil
 	}
-	logger.Error("Required environment variable is not set", "variable", key)
-	os.Exit(1)
-	return ""
+	return "", fmt.Errorf("required environment variable %s is not set", key)
 }
 
 // getEnv returns the value of the environment variable key, or defaultValue if
