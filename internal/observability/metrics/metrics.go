@@ -88,6 +88,14 @@ const (
 	MetricPendingOldestAge       = metricNamespacePrefix + "pending_oldest_age_seconds"
 	MetricBufferedEvents         = metricNamespacePrefix + "buffered_events"
 	MetricInFlightInvocations    = metricNamespacePrefix + "in_flight_invocations"
+	// MetricMissingPayload counts reclaimed PEL entries whose stream body no
+	// longer exists (trimmed or XDEL'd before the entry was acknowledged). Such
+	// an entry can never be processed: there is no payload to hand to a handler,
+	// so it is neither a retry nor a DLQ entry nor a handler attempt. It is a
+	// high-signal operational anomaly (typically an unsafe external trim or a
+	// hand XDEL racing Relay's own retention), surfaced so it is never mistaken
+	// for successful processing.
+	MetricMissingPayload = metricNamespacePrefix + "missing_payload_total"
 
 	// Warm-container pool observability (Phase 4). The state gauge is labeled by
 	// function and by a fixed state set (idle/busy/starting); acquires are split
@@ -160,6 +168,7 @@ var metricHelp = map[string]string{
 	MetricPendingOldestAge:    "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
 	MetricBufferedEvents:      "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
 	MetricInFlightInvocations: "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
+	MetricMissingPayload:      "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
 	MetricRuntimeContainers:   "Current number of warm-container pool containers by function and state (idle, busy, or starting).",
 	MetricRuntimePoolCapacity: "Current resolved per-function concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
 }
@@ -372,6 +381,9 @@ func New() *Registry {
 		MetricScheduleOccurrencesPublished,
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
+		// MetricMissingPayload is a stream-layer anomaly counter fed by the
+		// consumer when it clears a dangling PEL entry (see the constant's doc).
+		MetricMissingPayload,
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(c)

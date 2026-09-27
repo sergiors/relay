@@ -169,7 +169,7 @@ healthy only while both Redis and the Docker daemon are reachable. Tear down wit
 | `REDIS_URI`                          | yes      | Redis address or DSN (see below).                                                                                                                                                        |
 | `REDIS_STREAM`                       | yes      | Redis stream to consume.                                                                                                                                                                 |
 | `REDIS_GROUP`                        | yes      | Consumer group name.                                                                                                                                                                     |
-| `REDIS_STREAM_RETENTION`             | no       | Stream retention window; unset disables trimming.                                                                                                                                        |
+| `REDIS_STREAM_RETENTION`             | no       | Stream retention window; unset disables trimming. Trimming uses `XTRIM ... ACKED` and requires Redis 8.2+ (see below).                                                                   |
 | `METRICS_ADDR`                       | no       | Metrics HTTP listen address; unset disables Prometheus.                                                                                                                                  |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`        | no       | OTLP collector endpoint (base URL); unset (and no traces endpoint) disables tracing.                                                                                                     |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | no       | OTLP collector traces endpoint; takes precedence over the generic endpoint.                                                                                                              |
@@ -341,15 +341,15 @@ filters only Relay's diagnostic and lifecycle lines.
 internal, periodic trimming of the configured `REDIS_STREAM`. Relay runs the
 retention job **internally** — there is no external cronjob and no per-message
 timer. While `relay start` runs, a single goroutine with a periodic
-`time.Ticker` trims the stream with `XTRIM <stream> MINID ~ <cutoff-id>`, where
-`cutoff-id` is `<unix-milliseconds>-0` for `now - retention`. One initial trim
-runs shortly after startup so an already-large stream does not wait a full
-interval.
+`time.Ticker` trims the stream with
+`XTRIM <stream> MINID ~ <cutoff-id> ACKED`, where `cutoff-id` is
+`<unix-milliseconds>-0` for `now - retention`. One initial trim runs shortly
+after startup so an already-large stream does not wait a full interval.
 
 The tick interval is derived automatically from the retention window
 (`retention / 24`, clamped to `[1m, 1h]`) — it is **not** another environment
-variable. For `6h` that is 15 minutes. Trim failures are logged and retried on
-the next tick; they never stop the worker.
+variable. For `6h` that is 15 minutes. Transient trim failures are logged and
+retried on the next tick; they never stop the worker.
 
 The trim is **approximate** (`~`): Redis removes whole internal stream nodes
 (listpack blocks of up to `stream-node-max-entries`, default 100), so entries
@@ -358,13 +358,28 @@ later pass rather than immediately. Repeated ticks make progress toward the
 cutoff one node at a time; an entry may linger at most about one tick interval
 plus one node past its expiry.
 
-> **Warning: retention applies to the WHOLE stream, not just Relay's consumer
-> group.** Other consumer groups on the same stream may lose unprocessed entries
-> older than the window. Fan-out is preserved for entries inside the window.
+The trim runs in **`ACKED` mode**, not Redis's default `KEEPREF`. `ACKED`
+removes an entry only when **every** consumer group on the stream has read and
+acknowledged it. This is why retention is safe on a shared stream: an entry
+still pending in Relay's own group — or in any other group, including one that
+has not read it yet — is never trimmed out from under a consumer. A group that
+never reads or acknowledges its entries therefore blocks trimming of the range
+it covers; that is the safe direction (no data loss) and the operator must drain
+or retire such a group.
+
+> **Requires Redis 8.2+.** The `ACKED` trim mode was added in Redis 8.2. On an
+> older server Relay **refuses to trim** and logs a single `Retention: disabled`
+> error rather than falling back to `KEEPREF`/default, which could evict entries
+> still pending in a consumer group. Upgrade Redis or unset
+> `REDIS_STREAM_RETENTION`.
+
+> **Note: retention applies to the WHOLE stream.** Fan-out is preserved for all
+> entries inside the window and for every unacknowledged entry in any group; an
+> entry is only removed once all groups have acked it.
 
 Unset or empty `REDIS_STREAM_RETENTION` disables retention entirely (no
-goroutine, no trims). A malformed duration or a zero/negative value fails
-startup like any other configuration error.
+goroutine, no trims). A malformed duration or a zero/negative value is logged
+and disables retention (it never fails startup).
 
 `REDIS_URI` accepts either a plain address or a Redis DSN:
 
@@ -1853,10 +1868,16 @@ remains the health check.
   Prometheus client. Counters: `events_received_total`, `events_matched_total`,
   `events_unmatched_total`, `handler_success_total`, `handler_failure_total`,
   `retries_total`,
-  `dlq_entries_total`, `handler_invocations_total{outcome,function,handler}`,
+  `dlq_entries_total`, `missing_payload_total`,
+  `handler_invocations_total{outcome,function,handler}`,
   `build_failures_total{function}`, and per-function
   `function_events_matched_total{function}` plus the other
-  `function_*_total{function}` counters. Histograms:
+  `function_*_total{function}` counters. `missing_payload_total` counts reclaimed
+  pending entries whose stream body no longer exists (trimmed or `XDEL`'d before
+  acknowledgement): such an entry can never be processed, so it is counted here
+  — never as a handler attempt, retry, or DLQ entry — and its dangling PEL
+  reference is cleared after a `WARN` log. A nonzero value signals an unsafe trim
+  or an external delete racing Relay. Histograms:
   `handler_duration_seconds{function,handler}`,
   `function_build_seconds{function}`. Gauges: `pending_entries`,
   `pending_oldest_age_seconds` — sampled from the Redis consumer group
@@ -2085,6 +2106,15 @@ handler failure — stays in the PEL.
   string, or is not a JSON object can never succeed. It is routed straight to
   the DLQ on first encounter — without running any handler — and acknowledged.
 - **Malformed input** never consumes retry cycles.
+- **Missing stream body**: if a message referenced by the PEL no longer exists in
+  the stream (it was trimmed or `XDEL`'d before acknowledgement), recovery cannot
+  process it — there is no payload. Relay does **not** treat this as success and
+  does **not** fabricate a payload or dead-letter it: it logs a `WARN`, increments
+  `missing_payload_total`, and clears the dangling PEL reference with a
+  conservative `XACK`. No handler attempt, retry, or DLQ entry is produced.
+  Relay's own `ACKED` retention never trims an unacknowledged entry, so a nonzero
+  `missing_payload_total` points at an external unsafe trim or a manual delete
+  racing the worker.
 
 These recovery defaults are a fixed part of the stream package and cannot be
 overridden by environment variables. A zero-valued `ConsumerConfig` field

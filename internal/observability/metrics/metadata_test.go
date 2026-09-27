@@ -27,6 +27,7 @@ func seedAllMetrics(r *Registry) {
 		MetricScheduleOccurrencesPublished,
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
+		MetricMissingPayload,
 	} {
 		r.Inc(name)
 	}

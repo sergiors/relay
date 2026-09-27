@@ -625,12 +625,21 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 
 	// XAUTOCLAIM atomically moves ownership of idle messages to this consumer
 	// and returns the next cursor, so we walk the cursor space until done.
+	//
+	// XAutoClaimWithDeleted runs the SAME XAUTOCLAIM command; go-redis only adds
+	// reply parsing for the third (deleted-ids) array, which the plain variant
+	// silently discards. Redis 7+ purges a PEL entry whose stream body was
+	// already trimmed/XDEL'd and reports it there instead of claiming it, so on
+	// the supported Redis that array is the ONLY place the missing-payload
+	// anomaly is observable. A pre-7 server returns a 2-element reply; the
+	// parsed deleted list is then empty, and the nil-values branch below stays
+	// the defensive fallback for any shape that claims a body-less message.
 	start := "0-0"
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		msgs, next, err := c.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		msgs, next, deletedIDs, err := c.client.XAutoClaimWithDeleted(ctx, &redis.XAutoClaimArgs{
 			Stream:   c.stream,
 			Group:    c.group,
 			Consumer: c.consumer,
@@ -642,14 +651,26 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			c.noteOutcome(err, c.backoff.peek())
 			return
 		}
+		// The server already purged these dangling PEL references as part of the
+		// scan; there is nothing to ack. Surface each as missing-payload data
+		// loss (no handler, no retry, no DLQ) exactly like the nil-values path.
+		for _, id := range deletedIDs {
+			c.clearMissingValueEntry(ctx, redis.XMessage{ID: id}, missingPayloadUnknownDeliveries, false)
+		}
 		for _, msg := range msgs {
-			// A pending entry whose message was deleted returns nil values; ack it
-			// only to clear the PEL — there is nothing to process.
+			// A pending entry whose stream body is already gone (trimmed or
+			// XDEL'd) is claimed with nil values by servers that do not purge
+			// dangling PEL entries during XAUTOCLAIM. This is NOT successful
+			// processing: there is no payload, so no handler can ever run and it
+			// must not be counted as an ACK/DLQ outcome. Surface it loudly and
+			// clear the dangling PEL reference (the server did NOT purge it, so
+			// an XACK is needed to stop the recovery loop spinning on it).
 			if msg.Values == nil {
-				c.log.Debug("Message: deleted from stream; acking to clear PEL", "message_id", msg.ID)
-				if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-					c.log.Warn("Message: ack deleted entry failed", "message_id", msg.ID, "error", err)
+				deliveries := missingPayloadUnknownDeliveries
+				if pe, ok := byID[msg.ID]; ok {
+					deliveries = pe.RetryCount
 				}
+				c.clearMissingValueEntry(ctx, msg, deliveries, true)
 				continue
 			}
 			pe, ok := byID[msg.ID]
@@ -683,6 +704,48 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			break
 		}
 		start = next
+	}
+}
+
+// missingPayloadUnknownDeliveries is the sentinel passed to clearMissingValueEntry
+// when the PEL delivery count is not known (a defensive guard that did not read
+// XPENDING); the log then omits the count rather than reporting a fabricated
+// zero.
+const missingPayloadUnknownDeliveries = int64(-1)
+
+// clearMissingValueEntry handles a message whose stream body no longer exists:
+// XAUTOCLAIM claimed it with nil values, XAUTOCLAIM reported it in its purged
+// deleted-id array, or a defensive caller observed it downstream. This is data
+// loss that surfaced at recovery time, NOT successful processing: there is no
+// payload to hand to a handler, so the entry is neither retried nor
+// dead-lettered, and no handler attempt, retry, or DLQ entry is fabricated. It
+// is surfaced explicitly with a high-signal Warn log and the missing_payload_total
+// counter, then (only when ack is true) the dangling PEL reference is cleared
+// with a single conservative XAck so the recovery loop cannot spin on it forever.
+//
+// ack is false for ids the server already purged from the PEL during the scan:
+// acking them is a no-op at best and misleading at worst, so it is skipped.
+//
+// deliveries is the Redis PEL delivery count when known
+// (missingPayloadUnknownDeliveries otherwise), reported for diagnosis only; it
+// is never converted into a handler attempt. Invocation state is deliberately
+// left alone (its TTL is the fallback cleanup): the invocation never completed,
+// and a handler on another replica may still hold the message in memory.
+func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessage, deliveries int64, ack bool) {
+	c.metrics.Inc(metrics.MetricMissingPayload)
+	attrs := []any{
+		"message_id", msg.ID,
+		"consumer", c.consumer,
+	}
+	if deliveries != missingPayloadUnknownDeliveries {
+		attrs = append(attrs, "deliveries", deliveries)
+	}
+	c.log.Warn("Message: pending entry has no stream body (trimmed or deleted); not processed", attrs...)
+	if !ack {
+		return
+	}
+	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
+		c.log.Warn("Message: ack missing-value entry failed", "message_id", msg.ID, "error", err)
 	}
 }
 
@@ -786,6 +849,20 @@ func (c *Consumer) processMessage(
 			c.log.Error("Message: panic in handler", "message_id", msg.ID, "error", pv, "stack", string(debug.Stack()))
 		}
 	}()
+	// Defensive guard: a message with no body can never be classified. It is
+	// data loss (the entry was trimmed or XDEL'd), not a malformed payload, so
+	// it must NOT fall through to classifyMessage and be dead-lettered as a
+	// malformed message. The reclaim path clears these before this point; this
+	// guard keeps any other caller (or a future one) from silently treating it
+	// as successful processing.
+	if msg.Values == nil {
+		outcome = "missing"
+		spanErr = fmt.Errorf("message body no longer exists")
+		// The message reached the processing path, so it is still in the PEL:
+		// clear it (the reclaim path normally handles these before here).
+		c.clearMissingValueEntry(ctx, msg, missingPayloadUnknownDeliveries, true)
+		return
+	}
 	event, err := classifyMessage(msg)
 	if err != nil {
 		// A malformed message can never succeed, so it goes straight to the DLQ on

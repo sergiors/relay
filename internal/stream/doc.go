@@ -14,7 +14,12 @@
 //     (complete / running-until-deadline / next-attempt-until-deadline /
 //     exhausted / eligible). MinPendingIdle defaults to DefaultReclaimInterval
 //     (1m) and is a message-level recovery-pacing backstop; it never defines
-//     retry timing.
+//     retry timing. A reclaimed entry whose stream body no longer exists
+//     (trimmed or XDEL'd before acknowledgement) is never processed as success:
+//     it is surfaced via a WARN log and the missing_payload_total counter and
+//     its dangling PEL reference is cleared; no handler attempt, retry, or DLQ
+//     entry is fabricated (Redis 7+ reports such entries in XAUTOCLAIM's purged
+//     deleted-id array; older servers return them with nil values).
 //   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
 //     before the original is acknowledged. Exhaustion is per-invocation: when
 //     every non-complete matched invocation is exhausted, the whole message is
@@ -52,6 +57,9 @@
 //     handler's side effect and its MarkComplete re-runs the handler, so handlers
 //     must remain idempotent. State read/mark/clear failures are logged and
 //     fail open (re-run) rather than becoming a new failure source.
+//   - A pending entry whose stream body no longer exists is data loss, not a
+//     success: it is counted as missing_payload_total, never run through a
+//     handler, and never turned into a fabricated payload or DLQ entry.
 //   - Transient Redis failures are logged and retried, never fatal
 //   - Redis outages are survived: the consume loop backs off with bounded,
 //     jittered exponential backoff (1s..30s cap) and the consumer exposes a

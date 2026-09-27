@@ -30,6 +30,7 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.Inc(MetricScheduleOccurrencesPublished)
 	r.Inc(MetricScheduleOccurrencesDuplicate)
 	r.Inc(MetricSchedulePublishFailures)
+	r.Inc(MetricMissingPayload)
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
 	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
 	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})

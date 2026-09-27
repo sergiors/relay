@@ -674,9 +674,12 @@ func Run(logger *slog.Logger) error {
 
 	// Optional internal stream retention (cfg.StreamRetention from
 	// REDIS_STREAM_RETENTION): a single goroutine periodically trims the
-	// configured stream (XTRIM MINID ~) so entries older than the window are
-	// removed. Completely separate from ACK/retry/DLQ semantics; a malformed or
-	// non-positive value is logged by config.Load and retention is disabled.
+	// configured stream with XTRIM MINID ~ ... ACKED so entries older than the
+	// window are removed only once every consumer group has acknowledged them.
+	// Completely separate from ACK/retry/DLQ semantics; a malformed or
+	// non-positive value is logged by config.Load and retention is disabled. On
+	// a server that does not support ACKED (pre-8.2) the loop logs and disables
+	// itself rather than trimming unsafely.
 	if cfg.StreamRetention > 0 {
 		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
 	}

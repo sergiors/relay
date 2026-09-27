@@ -803,6 +803,66 @@ func TestIntegrationDLQWriteFailureLeavesPendingAndRetainsState(t *testing.T) {
 	}
 }
 
+// TestIntegrationReclaimMissingPayloadSurfacedAndCleared pins the recovery-time
+// data-loss path against real Redis: a message is delivered into the PEL and then
+// its body is removed EXTERNALLY (an XDEL here; an unsafe out-of-band trim in
+// production). The reclaim loop must NOT run the handler, must NOT write a DLQ
+// entry, and must count the anomaly as missing_payload_total, while the dangling
+// PEL reference ends up cleared either by the server's own XAUTOCLAIM purge
+// (Redis 7+, surfaced via the deleted-id array) or by Relay's conservative XACK.
+//
+// The stream node is filled so the reclaim actually walks it; a single recent
+// entry keeps the stream alive after the deleted one.
+func TestIntegrationReclaimMissingPayloadSurfacedAndCleared(t *testing.T) {
+	testutil.RequireRedis(t)
+	m := metrics.New()
+	e := newEnv(t, ConsumerConfig{Metrics: m})
+
+	// Read one message into the PEL, then delete its body out from under the
+	// group (simulating an external unsafe trim).
+	id := e.xadd(t, `{"a":1}`)
+	e.readOneIntoPEL(t)
+	if _, err := e.client.XDel(context.Background(), e.stream, id).Result(); err != nil {
+		t.Fatalf("xdel: %v", err)
+	}
+	// A second, live entry so the stream is not empty and the reclaim loop has
+	// something to scan past.
+	liveID := e.xadd(t, `{"live":1}`)
+	e.readOneIntoPEL(t)
+
+	var handlerCalls atomic.Int64
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		// Only the live entry should ever reach a handler.
+		if msgID == id {
+			handlerCalls.Add(1)
+		}
+		return nil
+	})
+
+	testutil.WaitFor(t, 8*time.Second, "missing_payload_total recorded", func() bool {
+		return m.Counter(metrics.MetricMissingPayload) >= 1
+	})
+	// The deleted message's dangling PEL reference must clear (either the server
+	// purged it during XAUTOCLAIM or Relay XACKed it).
+	testutil.WaitFor(t, 8*time.Second, "deleted entry gone from PEL", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	// The live entry is processed and acked normally.
+	testutil.WaitFor(t, 8*time.Second, "live entry acked", func() bool {
+		_, ok := e.pending()[liveID]
+		return !ok
+	})
+	e.stop(t)
+
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("handler ran %d times for the body-less entry, want 0", got)
+	}
+	if got := len(e.dlqFor(id)); got != 0 {
+		t.Fatalf("DLQ entries for body-less entry = %d, want 0 (never dead-lettered, never fabricated)", got)
+	}
+}
+
 // readOneIntoPEL reads exactly one message from the env stream into the group's
 // PEL and returns it, so a test can drive processMessage directly.
 func (e *testEnv) readOneIntoPEL(t *testing.T) redis.XMessage {
