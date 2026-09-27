@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"time"
 
 	"relay/internal/observability/metrics"
@@ -230,13 +231,22 @@ func (p *functionPool) recordDiscard(pc *pooledContainer, fallback string) {
 // discardContainer tears pc down (idempotently) and records the discard metric
 // exactly once, using the container's own reason when it already died. It is the
 // single disposal helper every pool path funnels through, so no discard can be
-// missed or double-counted.
+// missed or double-counted. It uses detached, bounded Docker calls (the
+// historical behavior); discardContainerContext is the bound-aware form.
 func (p *functionPool) discardContainer(pc *pooledContainer, reason string) {
+	p.discardContainerContext(context.Background(), pc, reason)
+}
+
+// discardContainerContext is discardContainer with a caller-supplied bound: a
+// context-aware container (the production executionContainer) observes ctx in
+// its kill/remove, so a shutdown teardown is cancelled promptly. Metric
+// recording is identical.
+func (p *functionPool) discardContainerContext(ctx context.Context, pc *pooledContainer, reason string) {
 	if pc == nil {
 		return
 	}
 	if !pc.c.dead() {
-		pc.c.discard(reason)
+		discardOnContext(pc.c, ctx, reason)
 	}
 	p.recordDiscard(pc, reason)
 }

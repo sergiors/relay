@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,14 +175,12 @@ func TestShutdownRegistryFreshTimeoutPerStep(t *testing.T) {
 	}
 }
 
-// TestShutdownRegistryZeroTimeoutIsUnbounded pins the correction that a step
-// declaring no timeout (timeout <= 0) MUST run on a bare context.Background:
-// the socket/manager/state/Redis closes historically took no context, so the
-// registry must not impose a new 5s bound on them. A positive timeout still
-// yields its own deadline, while a zero-timeout step both has no deadline and
-// is NOT canceled after run (there is no bound to release), unlike a bounded
-// step whose fresh context is canceled immediately after it executes.
-func TestShutdownRegistryZeroTimeoutIsUnbounded(t *testing.T) {
+// TestShutdownRegistryZeroTimeoutStillBounded pins the correction that a step
+// declaring no timeout (timeout <= 0) is bounded by the AGGREGATE budget, never
+// unbounded: the registry derives a fresh context bounded by min(the step's own
+// cap, the budget remaining). A positive timeout yields its own deadline, and
+// every bounded step's fresh context is canceled immediately after it executes.
+func TestShutdownRegistryZeroTimeoutStillBounded(t *testing.T) {
 	type observation struct {
 		deadline time.Time
 		hasBound bool
@@ -202,12 +201,13 @@ func TestShutdownRegistryZeroTimeoutIsUnbounded(t *testing.T) {
 	}
 
 	reg := &shutdownRegistry{}
-	reg.register(record(shutdownStepSocket, 0))              // historically unbounded
-	reg.register(record(shutdownStepManager, 0))             // historically unbounded
-	reg.register(record(shutdownStepState, 0))               // historically unbounded
-	reg.register(record(shutdownStepRedis, 0))               // historically unbounded
-	reg.register(record(shutdownStepScheduler, time.Second)) // bounded 5s in Run; 1s here
+	reg.register(record(shutdownStepSocket, 0))              // no per-step cap
+	reg.register(record(shutdownStepManager, 0))             // no per-step cap
+	reg.register(record(shutdownStepState, 0))               // no per-step cap
+	reg.register(record(shutdownStepRedis, 0))               // no per-step cap
+	reg.register(record(shutdownStepScheduler, time.Second)) // explicit 1s cap
 
+	before := time.Now()
 	reg.run(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	for _, name := range []string{
@@ -217,17 +217,29 @@ func TestShutdownRegistryZeroTimeoutIsUnbounded(t *testing.T) {
 		if !ok {
 			t.Fatalf("zero-timeout step %q did not run", name)
 		}
-		if obs.hasBound {
-			t.Errorf("%s has a deadline %v; want an unbounded context.Background", name, obs.deadline)
+		if !obs.hasBound {
+			t.Errorf("%s has no deadline; want the aggregate bound", name)
 		}
-		if obs.ctx.Err() != nil {
-			t.Errorf("%s ctx.Err() = %v after run; want nil (no bound to cancel)", name, obs.ctx.Err())
+		// Bounded by the aggregate, measured from registry.run's start. A small
+		// slop covers the instant between `before` and the registry stamping its
+		// budget.
+		if got := obs.deadline.Sub(before); got <= 0 || got > shutdownAggregateTimeout+50*time.Millisecond {
+			t.Errorf("%s deadline is %v from run start; want within the aggregate budget %v",
+				name, got, shutdownAggregateTimeout)
+		}
+		if !errors.Is(obs.ctx.Err(), context.Canceled) {
+			t.Errorf("%s ctx.Err() = %v, want context.Canceled (canceled after run)", name, obs.ctx.Err())
 		}
 	}
 
 	bounded, ok := seen[shutdownStepScheduler]
 	if !ok || !bounded.hasBound {
 		t.Fatalf("bounded step scheduler missing its deadline: %+v", bounded)
+	}
+	// The scheduler carries its own 1s cap, which is far tighter than the
+	// aggregate, so its deadline is ~1s from its own start.
+	if got := time.Until(bounded.deadline); got > time.Second {
+		t.Errorf("scheduler deadline is %v away; want its own 1s cap", got)
 	}
 	if !errors.Is(bounded.ctx.Err(), context.Canceled) {
 		t.Errorf("bounded step ctx.Err() = %v, want context.Canceled (canceled after run)", bounded.ctx.Err())
@@ -263,16 +275,18 @@ func TestShutdownRegistryPartialRegistration(t *testing.T) {
 // TestShutdownRegistryOrderingInvariants pins the load-bearing sub-orderings the
 // task calls out, independent of the full order test: the coordinator join
 // precedes the service cleanup, which precedes the manager close (the manager
-// must own live container state while containers are stopped); the stats flush
-// precedes the state close (the final snapshot lands before the DB closes); and
-// Redis is released last, after every other resource.
+// must own live container state while containers are stopped); the reconciler
+// and loops joins precede the state close (no reconcile or loop can touch the DB
+// after it closes); the stats flush precedes the state close (the final snapshot
+// lands before the DB closes); and Redis is released last, after every other
+// resource.
 func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 	var order []string
 	reg := &shutdownRegistry{}
 	for _, name := range []string{
 		shutdownStepRedis, shutdownStepState, shutdownStepStatsFlush,
 		shutdownStepManager, shutdownStepServiceCleanup, shutdownStepServicesJoin,
-		shutdownStepTracing,
+		shutdownStepReconciler, shutdownStepLoops, shutdownStepTracing,
 	} {
 		reg.register(registeredStep(name, time.Second, &order))
 	}
@@ -299,6 +313,16 @@ func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 		t.Errorf("stats-flush (%d) must precede state (%d): %v",
 			index(shutdownStepStatsFlush), index(shutdownStepState), order)
 	}
+	// The reconciler and the worker-owned loops are joined before the state DB
+	// closes, so neither can touch it after close.
+	if index(shutdownStepReconciler) >= index(shutdownStepState) {
+		t.Errorf("reconciler (%d) must precede state (%d): %v",
+			index(shutdownStepReconciler), index(shutdownStepState), order)
+	}
+	if index(shutdownStepLoops) >= index(shutdownStepState) {
+		t.Errorf("loops (%d) must precede state (%d): %v",
+			index(shutdownStepLoops), index(shutdownStepState), order)
+	}
 	// Tracing flushes after every span-producing resource has stopped (state,
 	// manager, servers) and immediately before Redis is released last.
 	if index(shutdownStepTracing) <= index(shutdownStepState) {
@@ -307,6 +331,197 @@ func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 	}
 	if last := order[len(order)-1]; last != shutdownStepRedis {
 		t.Errorf("last step = %q, want %q (Redis released last): %v", last, shutdownStepRedis, order)
+	}
+}
+
+// TestShutdownRegistryTimedOutStepContinues proves the registry's central new
+// safety property: a step whose real operation ignores its context (blocks past
+// its bound) is surfaced as "Shutdown: step timed out" and does NOT stop the
+// sequence — later steps still run. The blocking step's goroutine is released
+// after the assertion, and its buffered result channel is never leaked.
+func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
+	release := make(chan struct{})
+	blockedEntered := make(chan struct{})
+	blockedReturned := make(chan struct{})
+	var mu sync.Mutex
+	var order []string
+	record := func(name string) {
+		mu.Lock()
+		order = append(order, name)
+		mu.Unlock()
+	}
+
+	blocker := shutdownStep{
+		name:    shutdownStepScheduler,
+		timeout: 40 * time.Millisecond,
+		run: func(context.Context) error {
+			record(shutdownStepScheduler)
+			close(blockedEntered)
+			<-release // ignores the context entirely
+			close(blockedReturned)
+			return nil
+		},
+	}
+	later := shutdownStep{
+		name:    shutdownStepState,
+		timeout: time.Second,
+		run: func(context.Context) error {
+			record(shutdownStepState)
+			return nil
+		},
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	reg := &shutdownRegistry{}
+	reg.register(blocker)
+	reg.register(later)
+
+	start := time.Now()
+	reg.run(logger)
+	elapsed := time.Since(start)
+	close(release)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("registry hung on a non-cooperative step: %v", elapsed)
+	}
+	select {
+	case <-blockedEntered:
+	default:
+		t.Fatal("blocking step never entered")
+	}
+	// The later step ran despite the timeout.
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != shutdownStepScheduler || got[1] != shutdownStepState {
+		t.Fatalf("order = %v, want [%s %s] (later step must run after a timeout)",
+			got, shutdownStepScheduler, shutdownStepState)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "Shutdown: step timed out") || !strings.Contains(out, "step="+shutdownStepScheduler) {
+		t.Errorf("missing structured timeout log:\n%s", out)
+	}
+	if !strings.Contains(out, "Shutdown complete") {
+		t.Errorf("missing completion marker after a timeout:\n%s", out)
+	}
+	// Join the timed-out goroutine so the test does not race a late write. Its
+	// buffered result channel means it never blocks on a send.
+	<-blockedReturned
+}
+
+// TestShutdownRegistryAggregateBudgetCapsTotal proves the registry bounds the
+// WHOLE teardown with one aggregate budget: a step that ignores its context and
+// blocks past the aggregate is cut off, the registry returns at (approximately)
+// the aggregate, and later steps are still attempted (with the expired budget)
+// rather than the teardown running forever.
+func TestShutdownRegistryAggregateBudgetCapsTotal(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	schedulerEntered := make(chan struct{})
+	var schedulerOnce sync.Once
+	blockForever := shutdownStep{
+		name: shutdownStepSocket,
+		// No per-step cap: only the aggregate bounds it.
+		run: func(context.Context) error {
+			<-release
+			return nil
+		},
+	}
+	later := shutdownStep{
+		name: shutdownStepScheduler,
+		run: func(context.Context) error {
+			schedulerOnce.Do(func() { close(schedulerEntered) })
+			return nil
+		},
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg := &shutdownRegistry{budget: 120 * time.Millisecond}
+	reg.register(blockForever)
+	reg.register(later)
+
+	start := time.Now()
+	reg.run(logger)
+	elapsed := time.Since(start)
+
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("aggregate budget did not cap total shutdown: took %v", elapsed)
+	}
+	// The later step is attempted even though the budget is exhausted; its
+	// goroutine may still be starting when run returns, so wait for its signal.
+	select {
+	case <-schedulerEntered:
+	case <-time.After(time.Second):
+		t.Fatal("a later step was never attempted after the aggregate budget was exhausted")
+	}
+	if !strings.Contains(logs.String(), "Shutdown: step timed out") {
+		t.Errorf("missing timeout log for the aggregate-capped step:\n%s", logs.String())
+	}
+}
+
+// TestShutdownRegistryPanickingStepContinues proves ordered continuation is a
+// core contract even for a panicking step: the registry recovers the panic at
+// the step boundary, logs it as a structured step failure with the step name and
+// duration, and still runs every later step. Without the recovery the panic would
+// crash the process (or, absent the goroutine, abort the sequence) and skip the
+// remaining teardown.
+func TestShutdownRegistryPanickingStepContinues(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	record := func(name string) {
+		mu.Lock()
+		order = append(order, name)
+		mu.Unlock()
+	}
+
+	panicker := shutdownStep{
+		name:    shutdownStepScheduler,
+		timeout: time.Second,
+		run: func(context.Context) error {
+			record(shutdownStepScheduler)
+			panic("boom")
+		},
+	}
+	later := shutdownStep{
+		name:    shutdownStepState,
+		timeout: time.Second,
+		run: func(context.Context) error {
+			record(shutdownStepState)
+			return nil
+		},
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg := &shutdownRegistry{}
+	reg.register(panicker)
+	reg.register(later)
+
+	reg.run(logger)
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != shutdownStepScheduler || got[1] != shutdownStepState {
+		t.Fatalf("order = %v, want [%s %s] (a later step must run after a panic)",
+			got, shutdownStepScheduler, shutdownStepState)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "Shutdown: step failed") || !strings.Contains(out, "step="+shutdownStepScheduler) {
+		t.Errorf("missing structured failure log for the panicking step:\n%s", out)
+	}
+	if !strings.Contains(out, "boom") {
+		t.Errorf("failure log does not surface the panic value:\n%s", out)
+	}
+	if !strings.Contains(out, "duration=") {
+		t.Errorf("failure log is missing the step duration:\n%s", out)
+	}
+	if !strings.Contains(out, "Shutdown complete") {
+		t.Errorf("missing completion marker after a panic:\n%s", out)
 	}
 }
 

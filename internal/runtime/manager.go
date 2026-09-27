@@ -61,6 +61,26 @@ const DefaultWarmContainerIdleTimeout = 5 * time.Minute
 // maxConcurrency zero (treated as this default, never "uncapped").
 const DefaultMaxConcurrency = 8
 
+// managerPingTimeout bounds the startup Docker daemon ping. The ping is rooted
+// in the manager lifecycle (the worker's signal context) so it is cancelled at
+// shutdown, but it must also be finite on its own: a wedged daemon must fail
+// startup within a bounded time rather than hanging the worker before any
+// resource exists to clean up. The bound is deliberately shorter than the
+// shutdown step caps because it is not a teardown.
+const managerPingTimeout = 10 * time.Second
+
+// pingFunc pings the Docker daemon at startup. It is the constructor's seam:
+// production uses pingDocker, while a test can inject a fake that blocks until
+// its context is done, so the ping's finite bound and lifecycle ownership are
+// unit-testable without a Docker daemon.
+type pingFunc func(ctx context.Context, cli *client.Client) error
+
+// pingDocker is the production pingFunc: one version-negotiated daemon ping.
+func pingDocker(ctx context.Context, cli *client.Client) error {
+	_, err := cli.Ping(ctx, client.PingOptions{})
+	return err
+}
+
 // Manager prepares function images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation, and a
 // per-function warm container pool: each function keeps up to its resolved
@@ -163,6 +183,10 @@ type managerOptions struct {
 	// lifecycle roots the manager's lifecycle context (see WithLifecycleContext).
 	// Nil means the manager starts its own Close-cancelled root.
 	lifecycle context.Context
+	// ping is the startup Docker-daemon ping seam. Nil means the production
+	// pingDocker. Tests inject a fake so the ping's finite bound and lifecycle
+	// ownership are exercised without a daemon.
+	ping pingFunc
 }
 
 // WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
@@ -216,6 +240,13 @@ func withClock(now func() time.Time) ManagerOption {
 	return func(o *managerOptions) { o.now = now }
 }
 
+// withPing injects the startup Docker-daemon ping seam for tests. It is
+// unexported because only in-package tests need it; production always pings the
+// real daemon.
+func withPing(ping pingFunc) ManagerOption {
+	return func(o *managerOptions) { o.ping = ping }
+}
+
 // NewManager connects to the Docker daemon so failures surface at startup
 // rather than per event. The client is configured from the environment
 // (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) and negotiates the API
@@ -241,9 +272,26 @@ func NewManager(
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
 	}
-	if _, err := cli.Ping(context.Background(), client.PingOptions{}); err != nil {
+	// Create the manager-owned lifecycle BEFORE the ping so the ping is
+	// cancelled by Close (and by the caller's signal context) as well as bounded
+	// by managerPingTimeout. A cancelled lifecycle during startup is a shutdown,
+	// not a daemon failure; the caller (worker) classifies the context error.
+	parent := resolved.lifecycle
+	if parent == nil {
+		parent = context.Background()
+	}
+	lifecycle, lifecycleCancel := context.WithCancel(parent)
+	ping := resolved.ping
+	if ping == nil {
+		ping = pingDocker
+	}
+	pingCtx, pingCancel := context.WithTimeout(lifecycle, managerPingTimeout)
+	pingErr := ping(pingCtx, cli)
+	pingCancel()
+	if pingErr != nil {
+		lifecycleCancel()
 		_ = cli.Close()
-		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", err)
+		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", pingErr)
 	}
 	mgr := &Manager{
 		log:            logger,
@@ -266,11 +314,7 @@ func NewManager(
 	// always cancels in-flight Dockerfile builds, while a cancelled parent (Relay
 	// shutdown) propagates too. Builds are bounded by buildTimeout on top of
 	// this; they are never rooted in a caller's short reconcile context.
-	parent := resolved.lifecycle
-	if parent == nil {
-		parent = context.Background()
-	}
-	mgr.lifecycle, mgr.lifecycleCancel = context.WithCancel(parent)
+	mgr.lifecycle, mgr.lifecycleCancel = lifecycle, lifecycleCancel
 	mgr.containers = newContainerCache()
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
@@ -341,28 +385,57 @@ func (m *Manager) startMaintenance(interval time.Duration) {
 
 // maintenanceLoop runs evictIdle on a single ticker until Close, then closes
 // maintDone so Close can join it before tearing the cache down. It is the only
-// eviction driver: there is no per-container goroutine or ticker.
+// eviction driver: there is no per-container goroutine or ticker. Each pass
+// runs on the manager lifecycle (not a detached context), so when Close
+// cancels the lifecycle an in-flight eviction's container teardown observes
+// cancellation and the pass — and therefore the maintDone join in CloseContext —
+// returns promptly instead of running out the per-container operation caps
+// serially. A Manager constructed directly by tests (no lifecycle) falls back to
+// context.Background, preserving the historical detached behavior.
 func (m *Manager) maintenanceLoop(interval time.Duration) {
 	defer close(m.maintDone)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	evictCtx := m.lifecycle
+	if evictCtx == nil {
+		evictCtx = context.Background()
+	}
 	for {
 		select {
 		case <-m.done:
 			return
 		case <-ticker.C:
-			m.containers.evictIdle()
+			m.containers.evictIdleContext(evictCtx)
 		}
 	}
 }
 
 // Close stops the maintenance loop, discards every cached execution container
-// (reason "shutdown"; each kill/remove runs on bounded, detached contexts so a
-// cancelled shutdown ctx cannot strand them), then releases the Docker Engine
-// client. It is idempotent and safe to call more than once during shutdown; the
-// worker defers it at startup. The loop is joined before the cache is closed so
-// a concurrent eviction can never race the shutdown discard.
+// (reason "shutdown"), then releases the Docker Engine client. It is idempotent
+// and safe to call more than once during shutdown. It is the unbounded form of
+// CloseContext; callers that own a shutdown budget (the worker) use
+// CloseContext.
 func (m *Manager) Close() error {
+	return m.CloseContext(context.Background())
+}
+
+// CloseContext is Close under a caller-supplied bound. It:
+//
+//  1. cancels the manager-owned build lifecycle (so an in-flight Dockerfile
+//     build stops promptly); because the maintenance loop's eviction also runs
+//     its teardowns on this lifecycle, an eviction pass already in flight is
+//     cancelled too, so the join below returns promptly;
+//  2. joins the maintenance loop, so no eviction races the teardown;
+//  3. tears down every cached execution container through a bounded parallel
+//     worker pool (containerShutdownConcurrency), each teardown context-aware,
+//     so a large warm pool is not discarded with O(N) serial Docker delays and
+//     an expired ctx stops waiting;
+//  4. closes the Docker Engine client only after the teardown returns.
+//
+// Idempotent: a second call returns the stored client-close result without
+// re-running the teardown, exactly like Close. Safe to call more than once
+// during shutdown and from a Manager with no Docker client (direct tests).
+func (m *Manager) CloseContext(ctx context.Context) error {
 	m.closeOnce.Do(func() {
 		// Cancel the manager-owned build lifecycle first: an in-flight
 		// Dockerfile build rooted here is cancelled promptly rather than running
@@ -379,7 +452,7 @@ func (m *Manager) Close() error {
 			}
 		}
 		if m.containers != nil {
-			m.containers.close()
+			m.containers.closeContext(ctx)
 		}
 		if m.cli == nil {
 			// A Manager constructed directly by a test (no Docker) still owns a

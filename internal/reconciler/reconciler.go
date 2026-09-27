@@ -134,6 +134,12 @@ type Reconciler struct {
 	ctx     context.Context
 	w       *fsnotify.Watcher
 	watches sync.Map // dir path -> struct{} for tracked watches
+
+	// loops tracks the pump, ticker, and eventLoop goroutines Start launches, so
+	// Start returns only after every loop has exited. This is what lets the
+	// worker join the reconciler before closing the runtime manager and the state
+	// DB: no reconcile can be pumped into a closed resource.
+	loops sync.WaitGroup
 }
 
 // New builds a Reconciler. The registry must already be populated with the
@@ -220,8 +226,10 @@ func (r *Reconciler) PrepareWatch(ctx context.Context) error {
 }
 
 // Start runs the watch loop, the debounce pump, and the periodic ticker in
-// background goroutines until ctx is cancelled, then returns. It is intended to
-// be called concurrently with the stream consumer.
+// background goroutines until ctx is cancelled, then JOINS them before
+// returning. It is intended to be called concurrently with the stream consumer;
+// the caller can therefore use Start's return (or the worker's reconciler
+// shutdown step) as a barrier that no further reconcile is in flight.
 //
 // Start first calls PrepareWatch, so a caller that already established the
 // watch (the worker, to seed the supplied fingerprints safely) reuses it rather
@@ -233,11 +241,15 @@ func (r *Reconciler) Start(ctx context.Context) {
 		return
 	}
 
+	r.loops.Add(3)
 	go r.pump()
 	go r.ticker()
 	go r.eventLoop()
 
 	<-ctx.Done()
+	// Close done FIRST: it releases a pump parked on an empty queue (or a
+	// dispatch blocked on a full queue) so the pump observes shutdown and stops.
+	close(r.done)
 	_ = r.w.Close()
 	// Stop any still-pending debounce timers so they cannot fire and dispatch a
 	// stale name after we've begun tearing down.
@@ -247,7 +259,9 @@ func (r *Reconciler) Start(ctx context.Context) {
 		delete(r.timers, name)
 	}
 	r.mu.Unlock()
-	close(r.done)
+	// Join every loop. After this, no reconcile can be dispatched into the
+	// runtime manager or the state DB, so the worker may close them.
+	r.loops.Wait()
 }
 
 // Enqueue debounces an event for name: only one reconcile fires after the
@@ -282,6 +296,7 @@ func (r *Reconciler) dispatch(name string) {
 // independently but no function is ever reconciled twice concurrently. It exits
 // when done is closed, without relying on incoming ever being closed.
 func (r *Reconciler) pump() {
+	defer r.loops.Done()
 	for {
 		select {
 		case name := <-r.incoming:
@@ -301,6 +316,7 @@ func (r *Reconciler) pump() {
 // ticker periodically reconciles every known function, catching events the
 // watcher missed.
 func (r *Reconciler) ticker() {
+	defer r.loops.Done()
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
@@ -316,6 +332,7 @@ func (r *Reconciler) ticker() {
 // eventLoop forwards fsnotify events into the debounce queue, mapping their paths
 // to function names and maintaining watches on newly created/removed directories.
 func (r *Reconciler) eventLoop() {
+	defer r.loops.Done()
 	for {
 		select {
 		case <-r.ctx.Done():

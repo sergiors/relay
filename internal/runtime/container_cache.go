@@ -29,6 +29,27 @@ type reusableContainer interface {
 	dead() bool
 }
 
+// contextDiscarder is an optional reusableContainer capability: a container that
+// can tear itself down on a caller-supplied context, so a shutdown teardown is
+// cancelled promptly (and its Docker kill/remove observe the shutdown bound)
+// instead of running on the container's own detached context. The production
+// *executionContainer implements it; test fakes that only implement the base
+// interface fall back to discard via discardOnContext.
+type contextDiscarder interface {
+	discardContext(ctx context.Context, reason string) bool
+}
+
+// discardOnContext tears c down on ctx when the container supports a
+// context-aware teardown, falling back to its detached discard otherwise. Every
+// pool teardown funnels through it so the shutdown path is context-bounded while
+// non-shutdown paths keep their historical detached behavior.
+func discardOnContext(c reusableContainer, ctx context.Context, reason string) bool {
+	if cd, ok := c.(contextDiscarder); ok {
+		return cd.discardContext(ctx, reason)
+	}
+	return c.discard(reason)
+}
+
 // Discard reasons. They are labels on the discard path (logs, metrics, tests),
 // not a control mechanism: any of them means the container must never be leased
 // again. reasonProtocolError (and timeout/process_exit) are recorded by the
@@ -1088,17 +1109,29 @@ func (p *functionPool) isEmptyLocked() bool {
 	return true
 }
 
-// evictIdle runs one maintenance pass over every pool. It always reaps idle
-// containers that are already dead (a container tore itself down while idle, so
-// its slot must be dropped and its gauges republished), plus retired idle
+// evictIdle runs one maintenance pass over every pool with a detached bound. It
+// is the unbounded convenience form of evictIdleContext used by tests and direct
+// callers; the Manager's maintenance loop uses evictIdleContext(manager
+// lifecycle) so shutdown cancellation makes an in-flight pass return promptly.
+func (cc *containerCache) evictIdle() {
+	cc.evictIdleContext(context.Background())
+}
+
+// evictIdleContext is evictIdle under a caller-supplied bound. It always reaps
+// idle containers that are already dead (a container tore itself down while idle,
+// so its slot must be dropped and its gauges republished), plus retired idle
 // containers; when timeout is positive it additionally evicts healthy idle
 // containers that have been idle at least the timeout. It is the only
 // age-eviction path and is driven by Manager's single ticker (never a ticker or
 // goroutine per container). Ownership is removed from the idle list under the
-// pool lock and the actual teardown runs outside it; a failed teardown is never
+// pool lock and the actual teardown runs outside it through
+// discardContainerContext, so a context-aware container (the production
+// executionContainer) observes ctx — the manager lifecycle on the maintenance
+// path — and a cancelled lifecycle makes the pass return promptly (each
+// teardown is still capped by containerOpTimeout). A failed teardown is never
 // reinserted (the container has already lost its idle slot), so a cleanup
 // failure can only leak the container, never resurrect it.
-func (cc *containerCache) evictIdle() {
+func (cc *containerCache) evictIdleContext(ctx context.Context) {
 	now := time.Now()
 	if cc.now != nil {
 		now = cc.now()
@@ -1110,7 +1143,7 @@ func (cc *containerCache) evictIdle() {
 	}
 	cc.mu.Unlock()
 	for _, p := range pools {
-		p.evictIdle(now, cc.idleTimeout)
+		p.evictIdle(ctx, now, cc.idleTimeout)
 	}
 }
 
@@ -1119,7 +1152,9 @@ func (cc *containerCache) evictIdle() {
 // containers are reaped even when age eviction is disabled (a non-positive
 // timeout), so a self-terminated container can never leave a stale idle gauge;
 // the pool's authoritative counts are republished whenever anything is dropped.
-func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
+// Teardown runs on ctx so a shutdown-cancelled maintenance pass returns
+// promptly.
+func (p *functionPool) evictIdle(ctx context.Context, now time.Time, timeout time.Duration) {
 	p.mu.Lock()
 	if p.closed || p.removing {
 		// A closed pool has already zeroed its gauges; a removing pool is a
@@ -1167,7 +1202,7 @@ func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
 		if reason == "" {
 			reason = reasonIdleTimeout
 		}
-		p.discardContainer(pc, reason)
+		p.discardContainerContext(ctx, pc, reason)
 	}
 }
 
@@ -1177,7 +1212,21 @@ func (p *functionPool) evictIdle(now time.Time, timeout time.Duration) {
 // retired AND discarded, so a later release is a no-op (discard is idempotent)
 // and no container survives shutdown even if a lease is never returned. It is
 // the graceful-shutdown hook the worker's defer Manager.Close() flows into.
+// It is the unbounded convenience form of closeContext; production shutdown
+// uses closeContext so the teardown observes the shutdown step's bound.
 func (cc *containerCache) close() {
+	cc.closeContext(context.Background())
+}
+
+// closeContext is close with a caller-supplied bound. It marks the cache and
+// every pool closed under their locks (so no new acquire can start a container),
+// then tears down every pooled container THROUGH A BOUNDED WORKER POOL: a large
+// warm pool is discarded in parallel batches of containerShutdownConcurrency
+// rather than O(N) serial 10s delays. Each teardown is context-aware (see
+// discardOnContext), so when ctx expires the Docker calls observe it; the method
+// returns once every container is torn down or ctx is done, whichever first.
+// The Docker client is deliberately closed by Manager only AFTER this returns.
+func (cc *containerCache) closeContext(ctx context.Context) {
 	cc.mu.Lock()
 	cc.closed = true
 	cc.lazyInit()
@@ -1186,17 +1235,85 @@ func (cc *containerCache) close() {
 		pools = append(pools, p)
 	}
 	cc.mu.Unlock()
+
+	var all []pooledDiscard
 	for _, p := range pools {
-		p.close()
+		for _, pc := range p.beginClose() {
+			all = append(all, pooledDiscard{pool: p, pc: pc})
+		}
 	}
+	discardAllContext(ctx, all, reasonShutdown)
 }
 
-// close closes the pool and tears down every container it owns.
-func (p *functionPool) close() {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+// pooledDiscard pairs a container with its owning pool, so the bounded parallel
+// teardown can still record each discard metric against the right function.
+type pooledDiscard struct {
+	pool *functionPool
+	pc   *pooledContainer
+}
+
+// containerShutdownConcurrency bounds how many container teardowns run at once
+// during closeContext. It is an internal constant (no user knob): high enough to
+// keep a large warm pool's shutdown from taking O(N) serial kill/remove calls,
+// low enough to bound the burst of Docker requests at shutdown.
+const containerShutdownConcurrency = 8
+
+// discardAllContext tears down every item through a BOUNDED worker pool of at
+// most containerShutdownConcurrency workers (never a goroutine per container),
+// and returns only after every worker has exited. Each teardown runs
+// discardContainerContext, which uses discardOnContext (so a context-aware
+// container observes ctx) and records exactly one discard metric. When ctx is
+// done the feeder stops queuing and the workers drain what they are already
+// running (bounded by that one context-aware operation each), so the call
+// returns promptly AND no worker outlives it — which is what lets Manager close
+// the Docker client only after every teardown has concluded. A caller that truly
+// cannot wait relies on the shutdown registry's outer per-step timeout (the step
+// runs in its own goroutine), not on this function abandoning its workers.
+func discardAllContext(ctx context.Context, items []pooledDiscard, reason string) {
+	if len(items) == 0 {
 		return
+	}
+	workers := containerShutdownConcurrency
+	if len(items) < workers {
+		workers = len(items)
+	}
+	work := make(chan pooledDiscard)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for it := range work {
+				it.pool.discardContainerContext(ctx, it.pc, reason)
+			}
+		}()
+	}
+	// Feed every item, stopping early if ctx is done. Closing work when the
+	// feeder returns is what lets the workers exit.
+	go func() {
+		defer close(work)
+		for _, it := range items {
+			select {
+			case work <- it:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+// beginClose marks the pool closed, wakes all waiters, and returns every
+// container it owns (idle and busy of the active and draining generations, plus
+// transients) for the caller to tear down outside the pool lock. It is
+// idempotent: a second call returns nil. The caller owns the teardown, so
+// closeContext can run it in a bounded parallel worker pool while the serial
+// close convenience form tears down in place.
+func (p *functionPool) beginClose() []*pooledContainer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
 	}
 	p.closed = true
 	close(p.notify)
@@ -1225,9 +1342,15 @@ func (p *functionPool) close() {
 	// publishPoolGaugesLocked observes p.closed == true, so it publishes all
 	// three state gauges as zero; signalLocked is a no-op on a closed pool.
 	p.publishPoolGaugesLocked()
-	p.mu.Unlock()
+	return all
+}
 
-	for _, pc := range all {
+// close closes the pool and tears down every container it owns with reason
+// "shutdown", serially with detached per-container bounds. It is the convenience
+// form used by tests and callers without a shutdown bound; production shutdown
+// uses closeContext.
+func (p *functionPool) close() {
+	for _, pc := range p.beginClose() {
 		p.discardContainer(pc, reasonShutdown)
 	}
 }

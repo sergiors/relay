@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
@@ -65,7 +64,14 @@ func benignRemovalErr(err error) bool {
 // logged as noise. Only a real (non-benign) removal failure is surfaced so the
 // caller can log it.
 func removeContainer(cli *client.Client, id string) error {
-	rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	return removeContainerContext(context.Background(), cli, id)
+}
+
+// removeContainerContext is the context-aware removal: the bound is min(ctx, the
+// containerOpTimeout cap). It preserves removeContainer's benign-error semantics
+// exactly (not-found/conflict are success).
+func removeContainerContext(ctx context.Context, cli *client.Client, id string) error {
+	rmCtx, cancel := context.WithTimeout(ctx, containerOpTimeout)
 	defer cancel()
 	_, err := cli.ContainerRemove(rmCtx, id, client.ContainerRemoveOptions{Force: true})
 	if benignRemovalErr(err) {

@@ -441,15 +441,25 @@ func newRequestID() string {
 // losers are no-ops. Removal is idempotent w.r.t. AutoRemove having already
 // deleted the container (benign not-found/conflict). A genuine removal failure
 // is logged Warn (a discard that could not remove anything is worth surfacing).
+// It runs on detached, bounded Docker calls.
 func (c *executionContainer) discard(reason string) bool {
+	return c.discardContext(context.Background(), reason)
+}
+
+// discardContext is discard with a caller-supplied bound (the pool's shutdown
+// context). The kill and remove observe ctx, so a shutdown teardown stops
+// waiting promptly when the shutdown step's bound expires instead of running on
+// the container's own detached 5s-per-call context. The CAS/reason/closed
+// bookkeeping is shared with discard and idempotent.
+func (c *executionContainer) discardContext(ctx context.Context, reason string) bool {
 	if !c.dying.CompareAndSwap(false, true) {
 		return false
 	}
 	c.reasonMu.Lock()
 	c.reason = reason
 	c.reasonMu.Unlock()
-	killContainer(c.cli, c.id)
-	if err := removeContainer(c.cli, c.id); err != nil {
+	killContainerContext(ctx, c.cli, c.id)
+	if err := removeContainerContext(ctx, c.cli, c.id); err != nil {
 		c.log.Warn("Runtime container: remove container failed",
 			"container", c.id, "reason", reason, "error", err)
 	}

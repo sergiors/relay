@@ -77,10 +77,37 @@ const shutdownServiceTimeout = 30 * time.Second
 // shutdownStepTimeout bounds the shutdown steps that gracefully stop a server
 // (scheduler, metrics, webhook). The shutdown registry derives a fresh
 // context.Background bound from it per step, so one slow step can never consume
-// another step's budget. Steps whose teardown historically took no context
-// (socket/manager/state/Redis closes) declare no bound (timeout <= 0) and keep
-// running on context.Background, preserving their pre-registry behavior.
+// another step's budget.
 const shutdownStepTimeout = 5 * time.Second
+
+// shutdownAggregateTimeout is the whole graceful-shutdown budget, an internal
+// constant with no user knob. The shutdown registry gives every step a context
+// bounded by min(its own cap, the budget remaining), and runs each step in a
+// goroutine so a step that ignores its context can never hang the registry: the
+// registry logs the timeout and moves on to the next step. The budget is
+// deliberately generous (2m) relative to the per-step caps (5-30s): with
+// cooperative steps it is never reached, and if one or more steps hang the
+// aggregate still bounds process exit. A single step can therefore never consume
+// another step's budget, but the whole teardown can never run unbounded.
+const shutdownAggregateTimeout = 2 * time.Minute
+
+// Finite per-resource shutdown bounds. Historically the socket/manager/state/
+// Redis closes declared no bound and ran on context.Background; each now gets an
+// explicit cap so every blocking shutdown resource is finite. The manager bound
+// is the largest: it joins the maintenance loop, then tears down every warm
+// execution container through a bounded worker pool (each Docker kill/remove is
+// itself capped at 5s), and only then closes the Docker client. The reconciler
+// bound covers joining the watch/pump/ticker goroutines; the loop bound covers
+// joining the worker-owned background loops (stats/park, metrics logger,
+// retention).
+const (
+	shutdownSocketTimeout     = 5 * time.Second
+	shutdownReconcilerTimeout = 10 * time.Second
+	shutdownLoopTimeout       = 5 * time.Second
+	shutdownManagerTimeout    = 30 * time.Second
+	shutdownStateTimeout      = 10 * time.Second
+	shutdownRedisTimeout      = 5 * time.Second
+)
 
 // shutdownStatsFlushTimeout bounds the final stats flush step. It preserves the
 // 2s bound the flush historically applied internally, now owned by the shutdown
@@ -249,16 +276,16 @@ func Run(logger *slog.Logger) error {
 	// resource acquired early (Redis) is released last and ordering never
 	// depends on registration/LIFO. The defer is registered BEFORE the first
 	// fallible resource-owning step, so even a secrets-provider failure releases
-	// the Redis client. A step that declares a bound gets its own fresh one (a
-	// step with no bound runs on context.Background); a step failure is logged
-	// with its name and never stops the sequence.
+	// the Redis client. Every step is bounded by min(its own cap, the remaining
+	// aggregate budget); a step failure or timeout is logged with its name and
+	// never stops the sequence.
 	shutdown := &shutdownRegistry{}
-	// Redis is acquired first and released last; register its cleanup now.
-	// client.Close took no context before the registry owned the teardown, so
-	// it declares no bound (timeout 0) and keeps running unbounded.
+	// Redis is acquired first and released last; register its cleanup now under
+	// an explicit finite bound so a wedged client close can never hang teardown.
 	shutdown.register(shutdownStep{
-		name: shutdownStepRedis,
-		run:  func(context.Context) error { return client.Close() },
+		name:    shutdownStepRedis,
+		timeout: shutdownRedisTimeout,
+		run:     func(context.Context) error { return client.Close() },
 	})
 	// Tracing is released LAST, after every other resource has stopped producing
 	// spans, under a bounded provider shutdown that flushes the batch processor.
@@ -343,11 +370,13 @@ func Run(logger *slog.Logger) error {
 		st = nil
 	}
 	if st != nil {
-		// st.Close took no context before the registry owned the teardown, so
-		// it declares no bound (timeout 0) and keeps running unbounded.
+		// st.Close takes no context; it runs in the registry's step goroutine
+		// under the finite state bound, so a wedged SQLite close is surfaced as a
+		// timeout rather than hanging teardown.
 		shutdown.register(shutdownStep{
-			name: shutdownStepState,
-			run:  func(context.Context) error { return st.Close() },
+			name:    shutdownStepState,
+			timeout: shutdownStateTimeout,
+			run:     func(context.Context) error { return st.Close() },
 		})
 		// The already-computed fingerprint pairs feed both the fresh-database
 		// rebuild and the per-function discovery upserts; /functions is never
@@ -416,16 +445,25 @@ func Run(logger *slog.Logger) error {
 		managerSpan.RecordError(err)
 		managerSpan.SetStatus(codes.Error, err.Error())
 		managerSpan.End()
+		// A lifecycle cancellation during the bounded startup ping is a
+		// shutdown, not a daemon failure: classify it like every other fallible
+		// startup step so a graceful stop is not reported as an error.
+		if startupInterrupted(ctx, err) {
+			logger.Info("Startup: runtime manager initialization interrupted by shutdown", "error", err)
+			return startupResult(errStartupInterrupted)
+		}
 		// The runtime manager owns container execution, which the worker cannot
 		// serve without. The deferred cleanup closes the Redis client and state DB.
 		return fmt.Errorf("runtime: new manager failed: %w", err)
 	}
 	managerSpan.End()
-	// manager.Close took no context before the registry owned the teardown, so
-	// it declares no bound (timeout 0) and keeps running unbounded.
+	// Manager cleanup is context-aware, so the Docker client is only closed
+	// after every worker-owned goroutine has stopped and every warm container has
+	// been torn down (in parallel, bounded) or the step's finite bound expires.
 	shutdown.register(shutdownStep{
-		name: shutdownStepManager,
-		run:  func(context.Context) error { return manager.Close() },
+		name:    shutdownStepManager,
+		timeout: shutdownManagerTimeout,
+		run:     manager.CloseContext,
 	})
 
 	// Verify every configured NETWORKS network exists BEFORE any function is
@@ -467,11 +505,13 @@ func Run(logger *slog.Logger) error {
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
 	socketSpan.End()
-	// rtSocket.Close took no context before the registry owned the teardown, so
-	// it declares no bound (timeout 0) and keeps running unbounded.
+	// rtSocket.Close takes no context; it runs in the registry's step goroutine
+	// under the finite socket bound, so a wedged connection wait is surfaced as a
+	// timeout rather than hanging teardown.
 	shutdown.register(shutdownStep{
-		name: shutdownStepSocket,
-		run:  func(context.Context) error { return rtSocket.Close() },
+		name:    shutdownStepSocket,
+		timeout: shutdownSocketTimeout,
+		run:     func(context.Context) error { return rtSocket.Close() },
 	})
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
@@ -565,7 +605,7 @@ func Run(logger *slog.Logger) error {
 	}
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
-		sweep:     func(hctx context.Context) { svcCtrl.SweepOrphans(hctx, liveNames) },
+		sweep:     func(hctx context.Context) { sweepStartupServiceOrphans(hctx, svcCtrl, liveNames) },
 		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
 		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
 	})
@@ -629,13 +669,21 @@ func Run(logger *slog.Logger) error {
 	// its own goroutine (exits on ctx); the server binds synchronously — a bind
 	// failure (a taken metrics port) is a config error that must surface now, and
 	// is FATAL. Both are nil when METRICS_ADDR is unset and simply not started.
+	// metricsLoggerDone is joined by the loops shutdown step before the state DB
+	// and Redis close, so no logger tick can touch a closed resource.
+	var metricsLoggerDone <-chan struct{}
 	if metricsInstance != nil {
 		metricsLogger := metrics.NewMetricsLogger(
 			metricsInstance,
 			metrics.DefaultLogInterval,
 			func(format string, args ...any) { logger.Debug(fmt.Sprintf(format, args...)) },
 		)
-		go metricsLogger.Start(ctx)
+		done := make(chan struct{})
+		metricsLoggerDone = done
+		go func() {
+			defer close(done)
+			metricsLogger.Start(ctx)
+		}()
 
 		if err := metricsServer.Start(); err != nil {
 			// A bind failure (taken metrics port) is a config error that must
@@ -667,14 +715,30 @@ func Run(logger *slog.Logger) error {
 		logger.Info("Webhook http server listening", "addr", cfg.GitWebhookAddr)
 	}
 
+	// Worker-owned background loops. Every loop is tracked by a done channel so
+	// the loops shutdown step can join it before the state DB, runtime manager,
+	// and Redis client close — a loop must never touch a closed resource.
+	var loopDones []<-chan struct{}
+	if metricsLoggerDone != nil {
+		loopDones = append(loopDones, metricsLoggerDone)
+	}
+
 	// Flush the registry into the state database on the fixed cadence. Gated on
 	// the metrics instance existing: with metrics disabled there is nothing to
 	// snapshot, and a nil-registry flush would clobber the persisted cumulative
 	// totals with zeros. The loop parks on ctx so shutdown ordering stays uniform.
+	statsDone := make(chan struct{})
+	loopDones = append(loopDones, statsDone)
 	if metricsInstance != nil {
-		go statsLoop(ctx, statsFlusher, statsFlushInterval)
+		go func() {
+			defer close(statsDone)
+			statsLoop(ctx, statsFlusher, statsFlushInterval)
+		}()
 	} else {
-		go parkUntilShutdown(ctx)
+		go func() {
+			defer close(statsDone)
+			parkUntilShutdown(ctx)
+		}()
 	}
 
 	// Optional internal stream retention (cfg.StreamRetention from
@@ -686,8 +750,31 @@ func Run(logger *slog.Logger) error {
 	// a server that does not support ACKED (pre-8.2) the loop logs and disables
 	// itself rather than trimming unsafely.
 	if cfg.StreamRetention > 0 {
-		go retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
+		retentionDone := make(chan struct{})
+		loopDones = append(loopDones, retentionDone)
+		go func() {
+			defer close(retentionDone)
+			retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
+		}()
 	}
+
+	// Join every worker-owned background loop before the resources they use
+	// (state DB, runtime manager, Redis client) are closed. Bounded so a loop
+	// that ignores cancellation cannot hang teardown.
+	shutdown.register(shutdownStep{
+		name:    shutdownStepLoops,
+		timeout: shutdownLoopTimeout,
+		run: func(stepCtx context.Context) error {
+			for _, done := range loopDones {
+				select {
+				case <-done:
+				case <-stepCtx.Done():
+					return stepCtx.Err()
+				}
+			}
+			return nil
+		},
+	})
 
 	groupCtx, groupSpan := tracing.Start(startupCtx, "redis.consumer_group")
 	if err := ensureGroup(groupCtx, consumer, logger); err != nil {
@@ -846,8 +933,27 @@ func Run(logger *slog.Logger) error {
 	logger.Info("Watching functions for changes", "root", function.Dir)
 
 	// Runs in its own goroutine and stops when ctx is cancelled. Start reuses the
-	// watcher PrepareWatch already established.
-	go rec.Start(ctx)
+	// watcher PrepareWatch already established, and now JOINS its pump/ticker/
+	// eventLoop before returning; reconcilerDone is the shutdown barrier that
+	// guarantees no reconcile can still be pumped into the runtime manager or
+	// state DB when those are closed.
+	reconcilerDone := make(chan struct{})
+	go func() {
+		defer close(reconcilerDone)
+		rec.Start(ctx)
+	}()
+	shutdown.register(shutdownStep{
+		name:    shutdownStepReconciler,
+		timeout: shutdownReconcilerTimeout,
+		run: func(stepCtx context.Context) error {
+			select {
+			case <-reconcilerDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		},
+	})
 
 	// Start the cron scheduler right after the reconciler, so jobs added here
 	// (seeded before Start) fire from their first cron tick and jobs the
@@ -881,10 +987,10 @@ func Run(logger *slog.Logger) error {
 		consumeErr = fmt.Errorf("consume failed: %w", err)
 	}
 
-	// The graceful shutdown (socket, scheduler, housekeeping, services, stats,
-	// servers, manager, state, Redis) is owned by the deferred shutdown registry
-	// registered at the top, so a startup failure and a normal shutdown converge
-	// on the exact same explicit order.
+	// The graceful shutdown (socket, scheduler, reconciler, housekeeping,
+	// services, loops, stats, servers, manager, state, tracing, Redis) is owned
+	// by the deferred shutdown registry registered at the top, so a startup
+	// failure and a normal shutdown converge on the exact same explicit order.
 	return consumeErr
 }
 
@@ -896,9 +1002,11 @@ func Run(logger *slog.Logger) error {
 const (
 	shutdownStepSocket         = "socket"
 	shutdownStepScheduler      = "scheduler"
+	shutdownStepReconciler     = "reconciler"
 	shutdownStepHousekeeping   = "housekeeping"
 	shutdownStepServicesJoin   = "services-join"
 	shutdownStepServiceCleanup = "service-cleanup"
+	shutdownStepLoops          = "loops"
 	shutdownStepStatsFlush     = "stats-flush"
 	shutdownStepMetrics        = "metrics"
 	shutdownStepWebhook        = "webhook"
@@ -917,9 +1025,11 @@ const (
 var shutdownStepOrder = []string{
 	shutdownStepSocket,
 	shutdownStepScheduler,
+	shutdownStepReconciler,
 	shutdownStepHousekeeping,
 	shutdownStepServicesJoin,
 	shutdownStepServiceCleanup,
+	shutdownStepLoops,
 	shutdownStepStatsFlush,
 	shutdownStepMetrics,
 	shutdownStepWebhook,
@@ -930,11 +1040,13 @@ var shutdownStepOrder = []string{
 }
 
 // shutdownStep is one teardown action. run receives a fresh context derived
-// from context.Background by the registry (so one step can never consume
-// another's budget): a positive timeout yields a bounded context, while a
-// non-positive timeout yields an unbounded context.Background for steps whose
-// teardown historically took no context. Its error, when non-nil, is logged
-// with the structured name and never aborts the remaining steps.
+// from context.Background by the registry and bounded by min(its own timeout,
+// the remaining aggregate budget): a non-positive timeout means the step is
+// bounded only by the aggregate budget (never unbounded). Its error, when
+// non-nil, is logged with the structured name and never aborts the remaining
+// steps. A step that ignores its context is surfaced as a timeout rather than
+// allowed to hang the registry (the registry runs each step in its own
+// goroutine).
 type shutdownStep struct {
 	name    string
 	timeout time.Duration
@@ -948,6 +1060,10 @@ type shutdownStep struct {
 // registration (Run registers from its single startup goroutine).
 type shutdownRegistry struct {
 	steps []shutdownStep
+	// budget overrides shutdownAggregateTimeout when > 0. It exists so tests can
+	// exercise the aggregate cap deterministically without waiting minutes;
+	// production leaves it zero.
+	budget time.Duration
 }
 
 // register adds a teardown step. Registering a name that is not in
@@ -957,36 +1073,96 @@ func (r *shutdownRegistry) register(step shutdownStep) {
 	r.steps = append(r.steps, step)
 }
 
-// run executes every registered step in shutdownStepOrder, each under its own
-// fresh context, then logs the completion marker. A step with a positive timeout
-// gets its own context.Background bound (canceled immediately after the step); a
-// step with no timeout (timeout <= 0) gets a bare context.Background, preserving
-// the unbounded teardown those steps had before the registry owned the bounds.
-// A step failure is logged with the structured step name and error and the
-// sequence continues, so a cleanup problem can never abort the rest of the
-// teardown or prevent process exit.
+// run executes every registered step in shutdownStepOrder under ONE aggregate
+// deadline (shutdownAggregateTimeout), then logs the completion marker. Each
+// step gets a fresh context bounded by min(its own timeout, the remaining
+// budget), so one slow step cannot consume another's budget while the whole
+// teardown still cannot exceed the aggregate. Every step is invoked in its own
+// goroutine and the registry selects on its result vs. the step deadline, so a
+// step whose real operation ignores context cannot hang the shutdown: the
+// timeout is observed, logged at Warn as "Shutdown: step timed out", and the
+// remaining steps still run. A step failure is logged as
+// "Shutdown: step failed" and likewise never stops the sequence. The result
+// channel is buffered so a non-cooperative step that later returns can always
+// send without leaking on a blocked send. A step that PANICS is recovered at
+// this boundary and converted into a step failure (with the step name and
+// duration), so a broken cleanup cannot crash the process and skip the
+// remaining steps: ordered continuation is a core shutdown contract.
 func (r *shutdownRegistry) run(logger *slog.Logger) {
 	steps := make(map[string]shutdownStep, len(r.steps))
 	for _, step := range r.steps {
 		steps[step.name] = step
 	}
+	started := time.Now()
+	budgetDuration := shutdownAggregateTimeout
+	if r.budget > 0 {
+		budgetDuration = r.budget
+	}
+	budget := time.Now().Add(budgetDuration)
 	for _, name := range shutdownStepOrder {
 		step, ok := steps[name]
 		if !ok {
 			continue
 		}
-		ctx := context.Background()
-		cancel := func() {}
+		// Every registered step is ATTEMPTED, even once the aggregate budget is
+		// exhausted: the step is still invoked (with an already-expired context
+		// if the budget is gone) so a cooperative cleanup gets its chance, and
+		// the registry logs it as timed out rather than silently skipping it.
+		deadline := budget
 		if step.timeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, step.timeout)
+			if own := time.Now().Add(step.timeout); own.Before(deadline) {
+				deadline = own
+			}
 		}
-		err := step.run(ctx)
-		cancel()
-		if err != nil {
-			logger.Warn("Shutdown: step failed", "step", step.name, "error", err)
+		stepCtx, cancel := context.WithDeadline(context.Background(), deadline)
+		stepStart := time.Now()
+		done := make(chan error, 1)
+		go func() {
+			// Recover at the step boundary: a panicking cleanup is converted to
+			// an error (logged as a step failure with step/duration) so it can
+			// never crash the process or abort the ordered sequence. The send is
+			// safe on the buffered channel even if the registry already moved on
+			// after a timeout.
+			defer func() {
+				if pv := recover(); pv != nil {
+					done <- fmt.Errorf("panic: %v", pv)
+				}
+			}()
+			done <- step.run(stepCtx)
+		}()
+		select {
+		case err := <-done:
+			// A cooperative step that returns exactly when its context fires is
+			// reported as the timeout it is; a step that returns a context error
+			// is likewise a timeout (its bound was reached), not a genuine
+			// failure. Any other error is a real step failure.
+			ctxErr := stepCtx.Err()
+			cancel()
+			switch {
+			case err == nil:
+			case ctxErr != nil && errors.Is(err, ctxErr):
+				logger.Warn("Shutdown: step timed out",
+					"step", step.name,
+					"error", err,
+					"duration", time.Since(stepStart),
+				)
+			default:
+				logger.Warn("Shutdown: step failed",
+					"step", step.name,
+					"error", err,
+					"duration", time.Since(stepStart),
+				)
+			}
+		case <-stepCtx.Done():
+			cancel()
+			logger.Warn("Shutdown: step timed out",
+				"step", step.name,
+				"error", stepCtx.Err(),
+				"duration", time.Since(stepStart),
+			)
 		}
 	}
-	logger.Info("Shutdown complete")
+	logger.Info("Shutdown complete", "duration", time.Since(started))
 }
 
 // shutdownServices stops and removes THIS worker's persistent service
@@ -1374,10 +1550,31 @@ func sweepStartupImages(
 
 	keep := startupImageKeepSet(functions, serviceImages, recordedImages)
 	if st != nil {
-		if _, err := manager.RemoveImagesExcept(lifecycle, keep); err != nil {
+		// The image removal pass is a Docker listing plus one removal per
+		// orphaned image; bound it with its own fresh reconcileTimeout so a slow
+		// daemon cannot make the exclusive housekeeping window — and every
+		// service update coalesced behind it — wait unbounded.
+		removeCtx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
+		_, err := manager.RemoveImagesExcept(removeCtx, keep)
+		cancel()
+		if err != nil {
 			logStartupCleanupFailure(lifecycle, logger, "Image cleanup: startup sweep failed", err)
 		}
 	}
+}
+
+// sweepStartupServiceOrphans runs the startup service-orphan sweep each under
+// its own fresh reconcileTimeout rooted in the housekeeping lifecycle, so a slow
+// daemon cannot make the exclusive housekeeping window (and every service update
+// coalesced behind it) wait unbounded. It preserves the ServiceReconciler's
+// existing behavior (list then stop stale containers); the only change is the
+// bound, matching the per-function Applys.
+func sweepStartupServiceOrphans(
+	hctx context.Context, svcCtrl *reconciler.ServiceReconciler, liveNames map[string]bool,
+) {
+	sweepCtx, cancel := context.WithTimeout(hctx, reconcileTimeout)
+	defer cancel()
+	svcCtrl.SweepOrphans(sweepCtx, liveNames)
 }
 
 // verifyConfiguredNetworks verifies every network in the worker-global NETWORKS
@@ -1451,11 +1648,14 @@ func startupImageKeepSet(functions []function.Function, serviceImages, recordedI
 // just stamped. Best-effort and single-shot: an error is logged and left for the
 // next natural lifecycle point; it never retries in a loop.
 func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Manager, logger *slog.Logger) {
-	// Rooted in the lifecycle (not context.Background) so shutdown cancels a
-	// long dependency GC. It is deliberately unbounded by reconcileTimeout: like
-	// the builds it follows, it is lifecycle-bounded rather than
-	// reconcile-bounded, and it is a single best-effort pass.
-	if _, err := manager.CleanupUnusedDependencies(lifecycle); err != nil {
+	// A fresh reconcileTimeout bound per pass, rooted in the housekeeping
+	// lifecycle: like the orphan/image sweeps it runs inside the exclusive
+	// window, so an unbounded dependency GC would hold every coalesced service
+	// update behind it. It is still rooted in the lifecycle, so shutdown cancels
+	// it promptly as well.
+	depCtx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
+	defer cancel()
+	if _, err := manager.CleanupUnusedDependencies(depCtx); err != nil {
 		logStartupCleanupFailure(lifecycle, logger, "Dependency image cleanup failed", err)
 	}
 }
