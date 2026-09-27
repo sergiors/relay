@@ -377,9 +377,8 @@ func TestRepositoryMismatchIgnored(t *testing.T) {
 // setupNilSecretProvider builds a provider with NO secrets provider but a
 // NON-EMPTY secret ref ("gh_secret"), so every request 500s: a configured ref
 // cannot be resolved without a resolver. (The empty-ref + nil-secrets
-// combination — unsigned-accepting, guarded by a 500 only as defense-in-depth —
-// is the setupUnsignedProvider helper below.) It returns the provider, a fake
-// trigger, and a capturing log buffer.
+// combination is the fail-closed setupEmptySecretProvider helper above.) It
+// returns the provider, a fake trigger, and a capturing log buffer.
 func setupNilSecretProvider(t *testing.T) (*GitHubProvider, *fakeTrigger, *bytes.Buffer) {
 	t.Helper()
 	logBuf := &bytes.Buffer{}
@@ -406,12 +405,12 @@ func TestSecretNotConfigured500(t *testing.T) {
 	}
 }
 
-// setupUnsignedProvider builds a provider with an EMPTY secret ref (and nil
-// secrets), the unsigned-delivery case: no signature verification runs, so
-// deliveries are accepted unauthenticated. It persists a git source for
-// git@github.com:acme/backend.git at the given ref. It returns the provider, a
-// fake trigger, and a capturing log buffer.
-func setupUnsignedProvider(t *testing.T, cfgRef string) (*GitHubProvider, *fakeTrigger, *bytes.Buffer) {
+// setupEmptySecretProvider builds a provider with an EMPTY secret ref (and nil
+// secrets), the misassembled case: there is nothing to verify against, so the
+// provider fails closed and no delivery (signed or not) is accepted. It
+// persists a git source for git@github.com:acme/backend.git at the given ref.
+// It returns the provider, a fake trigger, and a capturing log buffer.
+func setupEmptySecretProvider(t *testing.T, cfgRef string) (*GitHubProvider, *fakeTrigger, *bytes.Buffer) {
 	t.Helper()
 	logBuf := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -425,37 +424,121 @@ func setupUnsignedProvider(t *testing.T, cfgRef string) (*GitHubProvider, *fakeT
 	return h, tr, logBuf
 }
 
-// TestUnsignedPushAcceptedWithEmptySecret proves an empty secret ref accepts an
-// unsigned matching push: no X-Hub-Signature-256 header, no secret provider —
-// the delivery is treated as authentic and a matching push triggers a sync (202).
-func TestUnsignedPushAcceptedWithEmptySecret(t *testing.T) {
-	h, tr, _ := setupUnsignedProvider(t, "main")
+// TestEmptySecretRefFailsClosed proves an empty secret ref never accepts a
+// delivery: even a syntactically valid push (signed or unsigned) gets 500 and
+// schedules no sync, because there is no secret to verify against. NewServer
+// disables the webhook in this configuration; this guards the provider itself.
+func TestEmptySecretRefFailsClosed(t *testing.T) {
+	h, tr, _ := setupEmptySecretProvider(t, "main")
 	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
-	rec := serve(h, pushReq(body, "", "push"))
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
-	}
-	if tr.count() != 1 {
-		t.Fatalf("trigger calls = %d, want 1", tr.count())
-	}
-}
-
-// TestUnsignedNonPushEventIgnoredWithEmptySecret proves an empty secret ref
-// still runs the event filter: a non-push (e.g. ping) delivery is acknowledged
-// (200) and ignored, with no sync triggered.
-func TestUnsignedNonPushEventIgnoredWithEmptySecret(t *testing.T) {
-	h, tr, logBuf := setupUnsignedProvider(t, "main")
-	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
-	rec := serve(h, pushReq(body, "", "ping"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	for _, sig := range []string{"", testSig("test-secret", body)} {
+		rec := serve(h, pushReq(body, sig, "push"))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("sig %q status = %d, want 500 (fail closed); body=%s", sig, rec.Code, rec.Body.String())
+		}
 	}
 	if tr.count() != 0 {
 		t.Fatalf("trigger calls = %d, want 0", tr.count())
 	}
-	// The unsigned-acceptance path logs at Debug, never a per-request Warn.
-	if strings.Contains(logBuf.String(), "level=WARN") {
-		t.Fatalf("unsigned delivery produced a Warn:\n%s", logBuf.String())
+}
+
+// TestEmptySecretRefNonPushEventNotAcknowledged proves that with an empty secret
+// ref even a non-push event is not processed: authentication runs before the
+// event filter, so an irrelevant event is still 500 with no sync — the endpoint
+// never acts on an unauthenticated delivery.
+func TestEmptySecretRefNonPushEventNotAcknowledged(t *testing.T) {
+	h, tr, logBuf := setupEmptySecretProvider(t, "main")
+	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+	rec := serve(h, pushReq(body, "", "ping"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	if tr.count() != 0 {
+		t.Fatalf("trigger calls = %d, want 0", tr.count())
+	}
+	// The fail-closed path logs at Error, never leaking the (absent) secret.
+	if !strings.Contains(logBuf.String(), "webhook secret not configured") {
+		t.Fatalf("missing fail-closed log:\n%s", logBuf.String())
+	}
+}
+
+// countingReader wraps a body and counts how many bytes were read, so a test
+// can assert the fail-closed path never consumes the request body.
+type countingReader struct {
+	r     io.Reader
+	reads int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	c.reads++
+	return c.r.Read(p)
+}
+
+func (c *countingReader) Close() error { return nil }
+
+// TestFailClosedBeforeBodyRead proves the empty-secretRef/nil-resolver fail
+// closed check runs BEFORE the body is read: a misassembled provider returns 500
+// without consuming the request body. This both matches the documented order and
+// prevents an unauthenticated client from making the server buffer up to
+// maxBodyBytes.
+func TestFailClosedBeforeBodyRead(t *testing.T) {
+	cases := []struct {
+		name      string
+		secretRef string
+		secrets   secrets.Provider
+	}{
+		{"empty secret ref", "", nil},
+		{"nil resolver with non-empty ref", "gh_secret", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTrigger()
+			h := NewGitHubProvider(testutil.DiscardLogger(), tc.secretRef, tc.secrets, "", tr)
+			body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+			cr := &countingReader{r: bytes.NewReader(body)}
+			req := httptest.NewRequest(http.MethodPost, "/github", nil)
+			req.Body = cr
+			rec := serve(h, req)
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500 (fail closed)", rec.Code)
+			}
+			if cr.reads != 0 {
+				t.Fatalf("body was read %d time(s) before fail-closed; want 0", cr.reads)
+			}
+			if tr.count() != 0 {
+				t.Fatalf("trigger calls = %d, want 0", tr.count())
+			}
+			// The fail-closed response/log must not leak the secret ref value
+			// (it is a name, not a value) or any signature.
+			if strings.Contains(rec.Body.String(), "gh_secret") {
+				t.Fatalf("response leaked secret ref:\n%s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestProviderNilLoggerDoesNotPanic verifies a provider built with a nil logger
+// (custom/test construction) serves a fail-closed delivery and a valid delivery
+// without panicking, since every log call routes through the nil-safe helper.
+func TestProviderNilLoggerDoesNotPanic(t *testing.T) {
+	// Fail-closed path (empty secretRef) with a nil logger.
+	failClosed := NewGitHubProvider(nil, "", nil, "", newFakeTrigger())
+	rec := serve(failClosed, pushReq([]byte(`{}`), "", "push"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("fail-closed status = %d, want 500", rec.Code)
+	}
+
+	// Authenticated path with a nil logger: reuse the real provider but strip
+	// its logger.
+	h, tr, _ := setupHandler(t, "main")
+	h.logger = nil
+	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
+	rec = serve(h, pushReq(body, testSig("test-secret", body), "push"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("accepted status = %d, want 202", rec.Code)
+	}
+	if tr.count() != 1 {
+		t.Fatalf("trigger calls = %d, want 1", tr.count())
 	}
 }
 

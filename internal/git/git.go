@@ -188,11 +188,12 @@ func SetSource(path, repository, ref, monorepoPath, webhookSecretRef string) err
 	if err := validatePath(monorepoPath); err != nil {
 		return err
 	}
-	// An empty webhookSecretRef means the source accepts unsigned webhook
-	// deliveries (no signature verification, matching a GitHub webhook
-	// configured without a secret); a non-empty one must be a legal secret name
-	// so the webhook server can resolve it for HMAC verification later.
-	// The value is never validated as the secret's VALUE — only its store name.
+	// A non-empty webhookSecretRef must be a legal secret name so the webhook
+	// server can resolve it for HMAC verification. An empty ref is still a
+	// valid source config (it means no webhook endpoint is enabled for it —
+	// the webhook server requires a secret and never accepts unsigned
+	// deliveries); the value is never validated as the secret's VALUE, only its
+	// store name.
 	if webhookSecretRef != "" {
 		if err := secrets.ValidateName(webhookSecretRef); err != nil {
 			return err

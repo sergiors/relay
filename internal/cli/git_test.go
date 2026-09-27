@@ -121,7 +121,7 @@ func TestGitSetWebhookSecretPersistsRef(t *testing.T) {
 }
 
 // TestGitSetWebhookSecretDefaultsEmpty verifies omitting --webhook-secret leaves
-// it empty (unsigned webhook deliveries accepted) and the confirmation omits the field.
+// it empty (the webhook endpoint stays disabled) and the confirmation omits the field.
 func TestGitSetWebhookSecretDefaultsEmpty(t *testing.T) {
 	p := redirectGitDirs(t)
 	out, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git")

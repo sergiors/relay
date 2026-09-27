@@ -59,11 +59,12 @@ type pushPayload struct {
 // never logs it — and it resolves the configured source per request (via
 // git.LoadConfig) so a `relay git set` takes effect without a worker restart.
 //
-// An empty secretRef (no webhook secret configured for the source) disables
-// signature verification: deliveries are accepted unauthenticated, matching a
-// GitHub webhook configured without a secret (which sends no signature header).
-// A non-empty secretRef requires a secrets.Provider to resolve it and HMAC
-// verification of every delivery.
+// Every delivery must be authenticated: a non-empty secretRef is resolved per
+// request through a secrets.Provider and verified as an HMAC. There is no
+// unsigned mode — an empty secretRef (or a nil resolver) fails closed with 500
+// rather than accept an unauthenticated push. NewServer prevents that
+// misassembly by disabling the webhook entirely when the git source has no
+// secret reference, so this is defense in depth.
 //
 // The name says "Provider", not "Handler", because this type is a component
 // behind the Provider seam (server.go) rather than a bare HTTP handler: it is
@@ -74,7 +75,7 @@ type pushPayload struct {
 // or interface change.
 type GitHubProvider struct {
 	logger    *slog.Logger
-	secretRef string           // webhook secret name in Relay's store; empty = signature verification disabled
+	secretRef string           // webhook secret name in Relay's store; empty = misconfigured (fails closed)
 	secrets   secrets.Provider // resolves secretRef; may be nil only in tests
 	sync      SyncTrigger      // the coalescing sync scheduler
 
@@ -90,13 +91,12 @@ type SyncTrigger interface {
 }
 
 // NewGitHubProvider builds a GitHubProvider. secretRef is the name of the
-// webhook secret in Relay's store — empty
-// means signature verification is disabled and deliveries are accepted
-// unauthenticated (a GitHub webhook configured without a secret sends no
-// signature header); secrets resolves secretRef to the value (when non-empty,
-// a nil provider = "not configured" → every request 500s, which NewServer
-// prevents). configPath is the persisted git source config used to match
-// repository/ref per request; syncer is the coalescing trigger (or a test fake).
+// webhook secret in Relay's store; it must be non-empty — an empty ref (or a
+// nil secrets resolver) makes every request fail closed with 500, since there
+// is no unsigned-accept mode. NewServer disables the webhook entirely in that
+// case, so it is defense in depth. configPath is the persisted git source
+// config used to match repository/ref per request; syncer is the coalescing
+// trigger (or a test fake).
 func NewGitHubProvider(
 	logger *slog.Logger,
 	secretRef string,
@@ -113,62 +113,55 @@ func NewGitHubProvider(
 	}
 }
 
-// ServeHTTP authenticates (when a webhook secret is configured) and filters a
-// webhook delivery, then — for a matching push — schedules a sync and returns
-// 202 Accepted. It implements the http.Handler half of the Provider seam: the
-// server dispatches GitHub deliveries here. The order is deliberate:
-// authentication runs against the raw body BEFORE the payload is parsed or any
-// source lookup happens. A malformed or unsigned delivery (when a secret IS
-// configured) is rejected before any non-trivial processing, so the handler
-// never does JSON parsing, config reads, or sync scheduling unless the delivery
-// is authentic and relevant.
+// ServeHTTP authenticates and filters a webhook delivery, then — for a matching
+// push — schedules a sync and returns 202 Accepted. It implements the
+// http.Handler half of the Provider seam: the server dispatches GitHub
+// deliveries here. The order is deliberate: a misconfigured provider fails
+// closed BEFORE the body is read, and authentication runs against the raw body
+// BEFORE the payload is parsed or any source lookup happens. A malformed or
+// unsigned delivery is rejected before any non-trivial processing, so the
+// handler never reads/parses a body, does config reads, or schedules a sync
+// unless the provider is configured and the delivery is authentic and relevant.
 //
-// When no webhook secret is configured (empty secretRef), signature
-// verification is skipped entirely: deliveries are accepted unauthenticated,
-// matching a webhook configured without a secret. Only the event filter then
-// gates whether a payload is acted on.
+// There is no unsigned-accept mode: an empty secretRef or nil resolver fails
+// closed with 500 without consuming the request body. NewServer disables the
+// webhook in that case, so this is defense in depth against a misassembled
+// provider.
 //
 // The webhook secret value is NEVER logged: only its reference name and the
 // resolution error's name (which the Provider guarantees). The signature header
 // value is likewise never logged.
 func (provider *GitHubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Read the body with a hard size cap, before anything else.
+	// 1. Fail closed on a misconfigured provider BEFORE reading the body: an
+	// empty secretRef or a nil resolver cannot be verified, so reject with 500
+	// without consuming the request. NewServer prevents this combination by not
+	// binding the server at all; this is defense in depth.
+	if provider.secretRef == "" || provider.secrets == nil {
+		logAt(provider.logger, r.Context(), slog.LevelError, "webhook secret not configured")
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// 2. Read the body with a hard size cap, before any parsing or source lookup.
 	body, ok := readBody(provider.logger, w, r)
 	if !ok {
 		return
 	}
-	// 2/3. Authenticate the delivery ONLY when a webhook secret is configured.
-	// An empty secretRef means no secret is configured for the source: skip
-	// signature verification entirely (a GitHub webhook set up without a secret
-	// sends no signature header, so unsigned deliveries are valid and must be
-	// accepted). Log this at Debug — per-request — never as a per-request Warn.
-	if provider.secretRef == "" {
-		logAt(provider.logger, r.Context(), slog.LevelDebug,
-			"webhook: no webhook secret configured; accepting delivery without signature verification")
-	} else if provider.secrets == nil {
-		// A non-empty secretRef with no resolver cannot be verified. Defensive
-		// only — NewServer prevents this combination — but keep the 500 so a
-		// misassembled provider never silently accepts an unauthenticated push.
-		logAt(provider.logger, r.Context(), slog.LevelError, "webhook secret not configured")
+	// 3. Authenticate: a delivery MUST be signed and the signature MUST verify.
+	secret, err := provider.secrets.Resolve(r.Context(), provider.secretRef)
+	if err != nil {
+		// The error never carries the value (Provider guarantee); it may carry
+		// the name, which is safe to log.
+		logAt(provider.logger, r.Context(), slog.LevelError, "webhook: resolve secret",
+			"secret_ref", provider.secretRef, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
-	} else {
-		secret, err := provider.secrets.Resolve(r.Context(), provider.secretRef)
-		if err != nil {
-			// The error never carries the value (Provider guarantee); it may carry
-			// the name, which is safe to log.
-			logAt(provider.logger, r.Context(), slog.LevelError, "webhook: resolve secret",
-				"secret_ref", provider.secretRef, "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		// Verify X-Hub-Signature-256 (constant-time HMAC), never logging the
-		// header value.
-		if !verifySignature(secret, r.Header.Get("X-Hub-Signature-256"), body) {
-			logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook signature verification failed")
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	}
+	// Verify X-Hub-Signature-256 (constant-time HMAC), never logging the header
+	// value.
+	if !verifySignature(secret, r.Header.Get("X-Hub-Signature-256"), body) {
+		logAt(provider.logger, r.Context(), slog.LevelWarn, "webhook signature verification failed")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
 	}
 	// 4. Event filter: only `push` deliveries can trigger a sync. Unsupported
 	// events (ping, etc) and a missing event header are acknowledged (200) and
@@ -427,12 +420,12 @@ func (s *SyncScheduler) run() {
 			s.closeIdle()
 			return
 		}
-		s.logger.Info("Git sync triggered")
+		logServer(s.logger, slog.LevelInfo, "Git sync triggered")
 		err := s.syncFn(s.ctx, s.opts)
 		if err != nil {
-			s.logger.Error("Webhook: Git sync failed", "error", err)
+			logServer(s.logger, slog.LevelError, "Webhook: Git sync failed", "error", err)
 		} else {
-			s.logger.Info("Git sync completed")
+			logServer(s.logger, slog.LevelInfo, "Git sync completed")
 		}
 		s.mu.Lock()
 		if !s.pending {

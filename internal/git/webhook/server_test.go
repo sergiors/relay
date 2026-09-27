@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -263,6 +264,63 @@ func TestReadBodyAtSizeBoundary(t *testing.T) {
 	})
 }
 
+// TestServerNilLoggerLifecycle verifies the documented nil-logger contract:
+// a Server built with a nil logger (custom/test construction) can Start and
+// Stop without panicking. Lifecycle lines are simply dropped.
+func TestServerNilLoggerLifecycle(t *testing.T) {
+	srv := newServer(testutil.FreeAddr(t), nil, testHandler())
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start with nil logger: %v", err)
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop with nil logger: %v", err)
+	}
+}
+
+// TestServerNilLoggerStartFailsFastOnBadAddr verifies the bind-failure path also
+// honors the nil-logger contract: Start returns the error immediately without
+// panicking on a nil logger.
+func TestServerNilLoggerStartFailsFastOnBadAddr(t *testing.T) {
+	err := newServer("crap", nil, testHandler()).Start()
+	if err == nil {
+		t.Fatal("Start on bad addr with nil logger returned nil, want error")
+	}
+	if !strings.Contains(err.Error(), "webhook:") {
+		t.Fatalf("bind error missing webhook: prefix: %v", err)
+	}
+}
+
+// TestNewServerNilLoggerDisablePaths verifies NewServer's disable/reject paths
+// (which log a Warn) honor the nil-logger contract instead of panicking.
+func TestNewServerNilLoggerDisablePaths(t *testing.T) {
+	t.Run("no git source", func(t *testing.T) {
+		cfg := Config{ConfigPath: filepath.Join(t.TempDir(), "does-not-exist", "source.json")}
+		if s := NewServer("127.0.0.1:0", nil, cfg); s != nil {
+			t.Fatal("expected nil (disabled) with no git source")
+		}
+	})
+	t.Run("empty webhook secret", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "source.json")
+		if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", ""); err != nil {
+			t.Fatalf("set source: %v", err)
+		}
+		if s := NewServer("127.0.0.1:0", nil, Config{Secrets: mustProvider(t), ConfigPath: cfgPath}); s != nil {
+			t.Fatal("expected nil (disabled) with an empty webhook secret")
+		}
+	})
+	t.Run("nil secret resolver", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "source.json")
+		if err := git.SetSource(cfgPath, "git@github.com:acme/backend.git", "main", "", "gh_secret"); err != nil {
+			t.Fatalf("set source: %v", err)
+		}
+		if s := NewServer("127.0.0.1:0", nil, Config{ConfigPath: cfgPath}); s != nil {
+			t.Fatal("expected nil (disabled) with a nil resolver")
+		}
+	})
+}
+
 // subsystemConfig builds a Config with temp dirs and a real LocalProvider holding
 // the GitHub webhook secret under "gh_secret". The git source is persisted for
 // acme/backend at ref main with webhook secret reference "gh_secret".
@@ -296,9 +354,9 @@ func subsystemConfig(t *testing.T) Config {
 }
 
 // subsystemConfigNoSecret builds a Config like subsystemConfig but with an EMPTY
-// webhook secret reference in the persisted git source (unsigned deliveries). No
-// secret is stored/needed since signature verification is disabled; a resolver
-// is still supplied so NewServer's enabled path is exercised.
+// webhook secret reference in the persisted git source. There is no
+// unsigned-accept mode, so NewServer must disable the webhook (nil) even though
+// a resolver is supplied. No secret is stored or needed.
 func subsystemConfigNoSecret(t *testing.T) Config {
 	t.Helper()
 	gitDir := t.TempDir()
@@ -345,9 +403,9 @@ func mustProvider(t *testing.T) secrets.Provider {
 }
 
 // TestNewDisabledWithoutWebhookSecret verifies NewServer with a configured git
-// source but EMPTY webhook secret is now ENABLED (non-nil): unsigned deliveries
-// are accepted, so an empty ref never disables the server. The log must NOT
-// contain the old "no webhook secret configured" disable Warn.
+// source but EMPTY webhook secret is DISABLED (nil) and logs a clear Warn: there
+// is no unsigned-accept mode, so the server must never bind an endpoint that
+// would accept unauthenticated deliveries.
 func TestNewDisabledWithoutWebhookSecret(t *testing.T) {
 	logger, buf := testLogger()
 	cfgPath := filepath.Join(t.TempDir(), "source.json")
@@ -355,52 +413,30 @@ func TestNewDisabledWithoutWebhookSecret(t *testing.T) {
 		t.Fatalf("set source: %v", err)
 	}
 	cfg := Config{Secrets: mustProvider(t), ConfigPath: cfgPath}
-	if s := NewServer("127.0.0.1:0", logger, cfg); s == nil {
-		t.Fatal("NewServer returned nil with an empty webhook secret; want non-nil (enabled, unsigned deliveries)")
+	if s := NewServer("127.0.0.1:0", logger, cfg); s != nil {
+		t.Fatal("NewServer returned non-nil with an empty webhook secret; want nil (disabled)")
 	}
-	if strings.Contains(buf.String(), "no webhook secret configured") {
-		t.Fatalf("log contained the stale disable Warn:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "no webhook secret configured; webhook disabled") {
+		t.Fatalf("missing disable Warn:\n%s", buf.String())
 	}
 }
 
-// TestServerAssemblesAndServesUnsignedGitHub exercises the full assembled server
-// over real HTTP with an EMPTY webhook secret: NewServer on a free port, Start,
-// an UNSIGNED push for acme/backend refs/heads/main (no X-Hub-Signature-256
-// header), 202, then Stop. It mirrors TestServerAssemblesAndServesGitHub but
-// without signature verification.
-func TestServerAssemblesAndServesUnsignedGitHub(t *testing.T) {
+// TestEmptyWebhookSecretBindsNothing verifies the disabled webhook truly does not
+// bind: NewServer returns nil, so the caller has no server to Start and the
+// configured address is never listened on. An empty secret therefore never
+// exposes an unsigned endpoint.
+func TestEmptyWebhookSecretBindsNothing(t *testing.T) {
 	logger, _ := testLogger()
-	s := NewServer(testutil.FreeAddr(t), logger, subsystemConfigNoSecret(t))
-	if s == nil {
-		t.Fatal("NewServer returned nil for an enabled server")
+	addr := testutil.FreeAddr(t)
+	if s := NewServer(addr, logger, subsystemConfigNoSecret(t)); s != nil {
+		t.Fatalf("NewServer returned non-nil for an empty webhook secret; want nil (not bound)")
 	}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	body := pushPayloadBytes("git@github.com:acme/backend.git", "refs/heads/main")
-	// Unsigned POST over HTTP: no X-Hub-Signature-256 header.
-	req, err := http.NewRequest(http.MethodPost, "http://"+s.addr+"/github", bytes.NewReader(body))
+	// The address must be free to bind (nothing was listened on).
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("new request: %v", err)
+		t.Fatalf("address %s unexpectedly in use: %v", addr, err)
 	}
-	req.Header.Set("X-GitHub-Event", "push")
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{}).Do(req)
-	if err != nil {
-		t.Fatalf("unsigned POST: %v", err)
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, respBody)
-	}
-
-	stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := s.Stop(stopCtx); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
+	_ = ln.Close()
 }
 
 // TestNewDisabledWithoutSecretResolver verifies NewServer returns nil

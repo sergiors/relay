@@ -100,19 +100,23 @@ type Server struct {
 // only orchestrates (construct/start/stop) like it does metrics.
 //
 // It returns nil (disabled) — the documented disabled contract — when there is
-// no git source configured, the config is unreadable, or a webhook secret
-// reference is configured but no secret resolver is — logging a Warn for each
-// disable reason so the operator knows why nothing is bound. An empty webhook
-// secret reference (the common case) does NOT disable the server: it is
-// enabled-by-default with signature verification disabled, so unsigned GitHub
-// deliveries (a webhook configured without a secret sends no signature header)
-// are accepted. A nil *Server means the subsystem is disabled; callers must
-// nil-check before Start, mirroring how the worker nil-checks. addr is the
-// listen address ("" never reaches the worker path: the worker gates on
-// cfg.GitWebhookAddr before calling).
+// no git source configured, the config is unreadable, the configured webhook
+// secret reference is empty, or a secret reference is configured but no secret
+// resolver is — logging a Warn for each disable reason so the operator knows why
+// nothing is bound. An empty webhook secret reference is NOT an unsigned-accept
+// mode: a webhook source must name the secret used for HMAC verification, so an
+// empty reference disables the server rather than bind an endpoint that would
+// accept unauthenticated deliveries. Disabling the webhook never affects the
+// rest of Relay (manual sync, function serving keep working). A nil *Server
+// means the subsystem is disabled; callers must nil-check before Start,
+// mirroring how the worker nil-checks. addr is the listen address ("" never
+// reaches the worker path: the worker gates on cfg.GitWebhookAddr before
+// calling).
 //
 // logger receives disable-Warns, bind-failure, and lifecycle messages; it is
-// injected (DI) — this package never constructs its own logger. Adding a
+// injected (DI) — this package never constructs its own logger. A nil logger is
+// valid and drops those messages (matching newServer's documented contract), so
+// custom/test construction never panics. Adding a
 // provider means implementing Provider in a new file and registering its
 // constructed instance inside NewServer's assembly; the worker orchestration
 // never changes.
@@ -125,18 +129,28 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 			// No git source configured: there is nothing to sync, so do not bind
 			// the endpoint. An operator running `relay git set` later must
 			// restart the worker to enable webhook delivery again.
-			logger.Warn("Git webhook: no git source configured; webhook disabled")
+			logServer(logger, slog.LevelWarn, "Git webhook: no git source configured; webhook disabled")
 			return nil
 		}
-		logger.Warn("Git webhook: read git config; continuing without webhook", "error", err)
+		logServer(logger, slog.LevelWarn, "Git webhook: read git config; continuing without webhook", "error", err)
 		return nil
 	}
-	if gitCfg.WebhookSecretRef != "" && cfg.Secrets == nil {
+	if gitCfg.WebhookSecretRef == "" {
+		// The webhook endpoint authenticates deliveries by verifying
+		// X-Hub-Signature-256 against a per-source secret. Without a secret
+		// reference there is nothing to verify against, and binding an endpoint
+		// that accepts unsigned deliveries would let anyone trigger a sync.
+		// Disable the webhook instead (the rest of Relay is unaffected: manual
+		// sync and function serving keep working). Use `relay git set
+		// --webhook-secret <name>` and restart to enable it.
+		logServer(logger, slog.LevelWarn, "Git webhook: git source has no webhook secret configured; webhook disabled")
+		return nil
+	}
+	if cfg.Secrets == nil {
 		// A configured webhook secret reference cannot be resolved without a
-		// resolver, so the handler would 500 every delivery. Disable the server
-		// (defensive) and say so. An EMPTY secret reference needs no resolver
-		// (unsigned deliveries are accepted), so it does not reach this branch.
-		logger.Warn("Git webhook: no secret resolver configured; webhook disabled")
+		// resolver, so the handler could never verify a delivery. Disable the
+		// server (defensive) and say so.
+		logServer(logger, slog.LevelWarn, "Git webhook: no secret resolver configured; webhook disabled")
 		return nil
 	}
 
@@ -214,9 +228,13 @@ func readBody(logger *slog.Logger, w http.ResponseWriter, r *http.Request) ([]by
 
 // logAt routes a structured log line through the injected logger at the given
 // level using the request context. It is shared provider plumbing: providers
-// pass their injected logger. The webhook secret value and signature header are
-// never passed as attrs.
+// pass their injected logger. A nil logger drops the line, honoring the
+// documented nil-logger contract so custom/test construction cannot panic. The
+// webhook secret value and signature header are never passed as attrs.
 func logAt(logger *slog.Logger, ctx context.Context, lvl slog.Level, msg string, args ...any) {
+	if logger == nil {
+		return
+	}
 	switch lvl {
 	case slog.LevelDebug:
 		logger.DebugContext(ctx, msg, args...)
@@ -227,6 +245,14 @@ func logAt(logger *slog.Logger, ctx context.Context, lvl slog.Level, msg string,
 	default:
 		logger.ErrorContext(ctx, msg, args...)
 	}
+}
+
+// logServer emits a non-request-scoped lifecycle log line (assembly, Start,
+// Stop) through the injected logger at the given level. A nil logger drops the
+// line, matching logAt's nil-logger contract. It is the counterpart to logAt
+// for call sites that have no request context.
+func logServer(logger *slog.Logger, lvl slog.Level, msg string, args ...any) {
+	logAt(logger, context.Background(), lvl, msg, args...)
 }
 
 // Start binds s.addr synchronously and, on success, spawns the serving
@@ -251,7 +277,7 @@ func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		s.started.Store(false)
-		s.logger.Error("Webhook: listen failed", "addr", s.addr, "error", err)
+		logServer(s.logger, slog.LevelError, "Webhook: listen failed", "addr", s.addr, "error", err)
 		return fmt.Errorf("webhook: listen %s: %w", s.addr, err)
 	}
 	s.srv = &http.Server{
@@ -270,7 +296,7 @@ func (s *Server) Start() error {
 	go func() {
 		s.serveErr <- s.srv.Serve(ln)
 	}()
-	s.logger.Info("Webhook server started")
+	logServer(s.logger, slog.LevelInfo, "Webhook server started")
 	return nil
 }
 
@@ -306,12 +332,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		// an in-flight sync aborts at its next transport step, bounded by ctx.
 		if s.scheduler != nil {
 			if serr := s.scheduler.Stop(ctx); serr != nil {
-				s.logger.Warn("Git webhook scheduler: graceful shutdown failed", "error", serr)
+				logServer(s.logger, slog.LevelWarn, "Git webhook scheduler: graceful shutdown failed", "error", serr)
 			}
 		}
 	})
 	if err == nil {
-		s.logger.Info("Webhook server stopped")
+		logServer(s.logger, slog.LevelInfo, "Webhook server stopped")
 	}
 	return err
 }
@@ -321,11 +347,11 @@ func (s *Server) Stop(ctx context.Context) error {
 // conventions (git.ConfigPath, git.CheckoutDir, function.Dir, git.SSHDir) when
 // zero-valued so callers pass only what differs (tests).
 type Config struct {
-	// Secrets resolves the webhook secret reference(s). It is required only
-	// when a webhook secret reference is configured in the git source (so HMAC
-	// verification can resolve it); with an empty secret reference deliveries
-	// are accepted unsigned and no resolver is needed. It is a
-	// secrets.Provider, which never exposes a secret's value in an error.
+	// Secrets resolves the webhook secret reference configured in the git
+	// source so HMAC verification can resolve it per request. It is required:
+	// NewServer disables the webhook when the git source has no webhook secret
+	// reference (nothing to verify against) or when this resolver is nil. It is
+	// a secrets.Provider, which never exposes a secret's value in an error.
 	Secrets secrets.Provider
 	// Optional directory overrides (zero value = production default):
 	// git.ConfigPath, git.CheckoutDir, function.Dir, git.SSHDir.

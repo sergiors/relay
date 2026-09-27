@@ -195,8 +195,11 @@ Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
 server is started. An unbindable address is logged and retried, never fatal.
 `GIT_WEBHOOK_ADDR` is likewise opt-in: when set it starts the GitHub webhook
 endpoint on that address (see _Git_), and when unset or empty the webhook
-server is not started. Unlike the metrics server, a webhook bind failure (a
-taken port) is fatal at startup.
+server is not started. Even when it is set, the webhook is disabled unless the
+configured git source names a webhook secret (`relay git set
+--webhook-secret`), so an unsigned endpoint is never exposed (see _GitHub
+webhook_). Unlike the metrics server, a webhook bind failure (a taken port) is
+fatal at startup.
 
 Relay's OpenTelemetry tracing is opt-in and configured entirely through the
 standard OTLP environment variables. Export is enabled only when
@@ -1686,11 +1689,13 @@ name (see _GitHub webhook_ below). Calling it again overwrites the source.
 
 Relay can additionally expose a GitHub webhook endpoint that triggers the same
 sync an operator would run manually. It is **opt-in twice over**: it only starts
-when both `GIT_WEBHOOK_ADDR` is set to a non-empty listen address and a git
-source is configured. When the webhook server starts it logs
+when `GIT_WEBHOOK_ADDR` is set to a non-empty listen address **and** the git
+source names a webhook secret. When the webhook server starts it logs
 `Webhook http server listening on <addr>`; when disabled it logs the reason
-(missing address, no git source, or a configured webhook secret with no secret
-resolver) and binds nothing.
+(missing address, no git source, no webhook secret configured for the source, or
+a configured webhook secret with no secret resolver) and binds nothing.
+Disabling the webhook never affects the rest of Relay — manual `relay git sync`
+and function serving keep working.
 
 - **Endpoint**: `POST /github` on `GIT_WEBHOOK_ADDR`. Only `push` events for
   the configured repository and ref schedule a sync; anything else (pings,
@@ -1701,11 +1706,11 @@ resolver) and binds nothing.
   arriving mid-sync collapse into a single follow-up run, so a burst of pushes
   converges to the latest commit with exactly one extra sync. The HTTP handler
   returns `202 Accepted` immediately.
-- **Secret is optional**: without `relay git set --webhook-secret`, deliveries
-  are accepted **unauthenticated** (a GitHub webhook created without a secret
-  sends no signature header) — anyone who can reach the endpoint can trigger a
-  sync. With a webhook secret configured, every delivery must carry a valid
-  `X-Hub-Signature-256` HMAC; bad or missing signatures are rejected with 401.
+- **Secret is required**: the webhook is never exposed in an unsigned mode. The
+  git source must configure a webhook secret (`relay git set --webhook-secret`);
+  without one the server does not start. Every delivery must then carry a valid
+  `X-Hub-Signature-256` HMAC; a missing or invalid signature is rejected with
+  401, and a malformed payload with 400.
 - **Secret resolution**: the secret is read from Relay's local secret store by
   reference name on every delivery (so `relay secret set` rotations apply
   without a restart). The value is never logged, never persisted in the git

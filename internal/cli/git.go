@@ -69,14 +69,15 @@ func gitCommand() *cli.Command {
 					"URL (scp-like or ssh://). --ref selects the branch/tag/commit (default " + git.DefaultRef + "); " +
 					"--path selects an optional monorepo subdirectory. --webhook-secret names the secret " +
 					"(in Relay's secret store) holding the GitHub webhook secret used to verify deliveries; " +
-					"calling set again overwrites the source.",
+					"the webhook endpoint only starts when this is set, and unsigned deliveries are never " +
+					"accepted. Calling set again overwrites the source.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "ref", Usage: "branch, tag, or commit to sync (default " + git.DefaultRef + ")"},
 					&cli.StringFlag{Name: "path", Usage: "optional monorepo subdirectory within the repo"},
 					&cli.StringFlag{
 						Name: "webhook-secret",
 						Usage: "name of the secret holding the GitHub webhook secret " +
-							"(optional; when set, webhook deliveries must be signed with this secret)",
+							"(required to start the webhook endpoint; deliveries must be signed with this secret)",
 					},
 				},
 				Arguments: []cli.Argument{
