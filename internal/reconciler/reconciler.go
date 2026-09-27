@@ -90,8 +90,9 @@ type Config struct {
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
-	UpdateServices           func(name string, tmpl *function.Template, image string)
-	UpdateServicesWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	UpdateServices                      func(name string, tmpl *function.Template, image string)
+	UpdateServicesWithStatus            func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	UpdateServicesObservationWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
 	// RemoveServices, when set, is called in remove() immediately BEFORE
 	// RemoveFunction and the function's images are retired. The ordering
 	// invariant: running service containers reference the function's images, so
@@ -114,12 +115,13 @@ type Reconciler struct {
 	// retire/removeFunction/updateSchedules/updateServices/removeServices are
 	// optional image-lifecycle, schedule-convergence, and service-convergence
 	// hooks (see Config).
-	retire                   func(name, oldImage string)
-	removeFunction           func(name string)
-	updateSchedules          func(name string, tmpl *function.Template)
-	updateServices           func(name string, tmpl *function.Template, image string)
-	updateServicesWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
-	removeServices           func(name string)
+	retire                              func(name, oldImage string)
+	removeFunction                      func(name string)
+	updateSchedules                     func(name string, tmpl *function.Template)
+	updateServices                      func(name string, tmpl *function.Template, image string)
+	updateServicesWithStatus            func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	updateServicesObservationWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	removeServices                      func(name string)
 
 	mu           sync.Mutex
 	fingerprints map[string]string // name -> last-reconciled fingerprint
@@ -141,28 +143,31 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 	if cfg.Debounce == 0 {
 		cfg.Debounce = DefaultDebounce
 	}
+
 	if cfg.Interval == 0 {
 		cfg.Interval = DefaultInterval
 	}
+
 	return &Reconciler{
-		root:                     cfg.Root,
-		debounce:                 cfg.Debounce,
-		interval:                 cfg.Interval,
-		reg:                      reg,
-		builder:                  builder,
-		log:                      logger,
-		st:                       cfg.State,
-		retire:                   cfg.Retire,
-		removeFunction:           cfg.RemoveFunction,
-		updateSchedules:          cfg.UpdateSchedules,
-		updateServices:           cfg.UpdateServices,
-		updateServicesWithStatus: cfg.UpdateServicesWithStatus,
-		removeServices:           cfg.RemoveServices,
-		fingerprints:             map[string]string{},
-		generations:              map[string]uint64{},
-		timers:                   map[string]*time.Timer{},
-		incoming:                 make(chan string, DefaultQueueSize),
-		done:                     make(chan struct{}),
+		root:                                cfg.Root,
+		debounce:                            cfg.Debounce,
+		interval:                            cfg.Interval,
+		reg:                                 reg,
+		builder:                             builder,
+		log:                                 logger,
+		st:                                  cfg.State,
+		retire:                              cfg.Retire,
+		removeFunction:                      cfg.RemoveFunction,
+		updateSchedules:                     cfg.UpdateSchedules,
+		updateServices:                      cfg.UpdateServices,
+		updateServicesWithStatus:            cfg.UpdateServicesWithStatus,
+		updateServicesObservationWithStatus: cfg.UpdateServicesObservationWithStatus,
+		removeServices:                      cfg.RemoveServices,
+		fingerprints:                        map[string]string{},
+		generations:                         map[string]uint64{},
+		timers:                              map[string]*time.Timer{},
+		incoming:                            make(chan string, DefaultQueueSize),
+		done:                                make(chan struct{}),
 	}
 }
 
@@ -519,14 +524,14 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// cur.Prepared() != nil via isAvailable). When that converge pass is a
 		// no-op (nothing to stop or start), the caller logs it at Debug rather
 		// than Info — the summary line only surfaces real state changes.
-		if (r.updateServices != nil || r.updateServicesWithStatus != nil) && len(fn.Template.Services) > 0 {
-			if r.updateServicesWithStatus == nil {
+		if (r.updateServices != nil || r.updateServicesWithStatus != nil || r.updateServicesObservationWithStatus != nil) && len(fn.Template.Services) > 0 {
+			if r.updateServicesWithStatus == nil && r.updateServicesObservationWithStatus == nil {
 				r.updateServices(name, fn.Template, cur.Prepared().Image)
 			} else {
-				r.mu.Lock()
-				r.generations[name]++
-				generation := r.generations[name]
-				r.mu.Unlock()
+				// This is an observation of the current source generation, not a
+				// new desired generation. Its status callbacks must not invalidate
+				// meaningful source work that is still completing.
+				generation := r.currentGenerationNumber(name)
 				// This is a periodic VERIFICATION of an unchanged, already-
 				// available function: it must not claim that a new generation is
 				// being prepared. No RecordPreparing here — the public status is
@@ -541,7 +546,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 				// did real corrective convergence ends ready. The callback is
 				// per-generation and generation-guarded.
 				worked := false
-				r.updateServicesWithStatus(name, fn.Template, cur.Prepared().Image,
+				updateStatus := r.updateServicesObservationWithStatus
+				if updateStatus == nil {
+					updateStatus = r.updateServicesWithStatus
+				}
+				updateStatus(name, fn.Template, cur.Prepared().Image,
 					func() {
 						worked = true
 						if r.st != nil && r.currentGeneration(name, generation) {
@@ -693,6 +702,12 @@ func (r *Reconciler) currentGeneration(name string, generation uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.generations[name] == generation
+}
+
+func (r *Reconciler) currentGenerationNumber(name string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.generations[name]
 }
 
 // prepareContext roots a Prepare call in the reconciler context and installs the

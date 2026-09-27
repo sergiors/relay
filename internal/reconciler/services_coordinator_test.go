@@ -14,12 +14,13 @@ import (
 )
 
 type coordinatorDocker struct {
-	mu       sync.Mutex
-	active   int
-	max      int
-	resolves []string
-	entered  chan struct{}
-	release  chan struct{}
+	mu         sync.Mutex
+	active     int
+	max        int
+	resolves   []string
+	resolveErr error
+	entered    chan struct{}
+	release    chan struct{}
 }
 
 func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string, _ *function.Template, _ function.Service, image string) (runtime.ServiceImage, error) {
@@ -34,7 +35,11 @@ func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string
 	<-d.release
 	d.mu.Lock()
 	d.active--
+	err := d.resolveErr
 	d.mu.Unlock()
+	if err != nil {
+		return runtime.ServiceImage{}, err
+	}
 	return runtime.ServiceImage{Ref: image, ID: image}, nil
 }
 
@@ -103,6 +108,98 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 	}
 	if len(alpha) != 2 || alpha[0] != "alpha=img-1" || alpha[1] != "alpha=img-3" {
 		t.Fatalf("alpha resolves = %v, want [alpha=img-1 alpha=img-3]", alpha)
+	}
+}
+
+func TestServiceCoordinatorStatusAuthority(t *testing.T) {
+	tmpl := &function.Template{
+		Runtime:  "node24",
+		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "slow success"},
+		{name: "slow failure", err: errors.New("resolve failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			docker := &coordinatorDocker{
+				entered:    make(chan struct{}, 8),
+				release:    make(chan struct{}),
+				resolveErr: tc.err,
+			}
+			services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+			coordinator := NewServiceCoordinator(services)
+			lifecycle, cancel := context.WithCancel(context.Background())
+			coordinator.Start(lifecycle)
+			var release sync.Once
+			defer func() {
+				release.Do(func() { close(docker.release) })
+				cancel()
+				if err := coordinator.Join(context.Background()); err != nil {
+					t.Fatalf("join: %v", err)
+				}
+			}()
+
+			meaningfulDone := make(chan error, 1)
+			observationDone := make(chan error, 1)
+			coordinator.EnqueueWithStatus("alpha", tmpl, "img-1", nil, nil, func(err error) {
+				meaningfulDone <- err
+			})
+			<-docker.entered
+			// A periodic no-op/self-heal observation shares the meaningful
+			// request's authority and must not stale its slow completion.
+			coordinator.EnqueueStatusObservation("alpha", tmpl, "img-1", nil, nil, func(err error) {
+				observationDone <- err
+			})
+			release.Do(func() { close(docker.release) })
+			if err := coordinator.Wait(context.Background()); err != nil {
+				t.Fatalf("wait: %v", err)
+			}
+			select {
+			case got := <-meaningfulDone:
+				if (got != nil) != (tc.err != nil) {
+					t.Fatalf("meaningful completion error = %v, want error=%v", got, tc.err != nil)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("meaningful completion was incorrectly invalidated by observation")
+			}
+		})
+	}
+}
+
+func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
+	docker := &coordinatorDocker{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	services := NewServiceReconciler(docker, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), 0)
+	coordinator := NewServiceCoordinator(services)
+	lifecycle, cancel := context.WithCancel(context.Background())
+	coordinator.Start(lifecycle)
+	var release sync.Once
+	defer func() {
+		release.Do(func() { close(docker.release) })
+		cancel()
+		_ = coordinator.Join(context.Background())
+	}()
+	tmpl := &function.Template{Runtime: "node24", Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}}}
+	oldDone := make(chan struct{}, 1)
+	newDone := make(chan struct{}, 1)
+	coordinator.EnqueueWithStatus("alpha", tmpl, "img-1", nil, nil, func(error) { oldDone <- struct{}{} })
+	<-docker.entered
+	coordinator.EnqueueWithStatus("alpha", tmpl, "img-2", nil, nil, func(error) { newDone <- struct{}{} })
+	release.Do(func() { close(docker.release) })
+	if err := coordinator.Wait(context.Background()); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	select {
+	case <-oldDone:
+		t.Fatal("older meaningful completion was not rejected")
+	default:
+	}
+	select {
+	case <-newDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("newer meaningful completion did not run")
 	}
 }
 

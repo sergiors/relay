@@ -22,6 +22,7 @@ type serviceRequest struct {
 	// operation rather than a caller timeout.
 	done             chan struct{}
 	id               uint64
+	meaningful       bool
 	onReconcileStart func()
 	onComplete       func(error)
 }
@@ -127,6 +128,19 @@ func (c *ServiceCoordinator) Enqueue(
 // never complete a newer generation's status transition. onReconcileStart fires
 // once the source is resolved and container convergence is about to begin.
 func (c *ServiceCoordinator) EnqueueWithStatus(
+	name string, tmpl *function.Template, image string, preparedEnv []string,
+	onReconcileStart func(), onComplete func(error),
+) {
+	c.enqueue(&serviceRequest{name: name, meaningful: true, tmpl: cloneServiceTemplate(tmpl), image: image,
+		preparedEnv: append([]string(nil), preparedEnv...), onReconcileStart: onReconcileStart, onComplete: onComplete})
+}
+
+// EnqueueStatusObservation publishes a verification or self-heal pass whose
+// callbacks share the authority of the latest meaningful request. An
+// observation must not make a slow source-generation completion stale merely
+// because a periodic tick happened while it was in flight. A newer meaningful
+// request still supersedes both the observation and any older operation.
+func (c *ServiceCoordinator) EnqueueStatusObservation(
 	name string, tmpl *function.Template, image string, preparedEnv []string,
 	onReconcileStart func(), onComplete func(error),
 ) {
@@ -278,7 +292,13 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	}
 	c.nextID++
 	req.id = c.nextID
-	c.desiredIDs[req.name] = req.id
+	if req.meaningful {
+		c.desiredIDs[req.name] = req.id
+	} else {
+		// Observations do not become a new status authority. They inherit the
+		// latest meaningful token, including zero before startup publishes one.
+		req.id = c.desiredIDs[req.name]
+	}
 	// A newer desired state replaces an unstarted pending one; the superseded
 	// request will never run, so release its waiter now rather than leaving it
 	// open forever.

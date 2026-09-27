@@ -769,8 +769,39 @@ func Run(logger *slog.Logger) error {
 			UpdateServices: func(name string, tmpl *function.Template, image string) {
 				enqueueLiveServices(services, runWorker.Registry(), name, tmpl, image)
 			},
-			UpdateServicesWithStatus: func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
-				enqueueLiveServicesWithStatus(services, runWorker.Registry(), name, tmpl, image, onReconcileStart, onComplete)
+			UpdateServicesWithStatus: func(
+				name string,
+				tmpl *function.Template,
+				image string,
+				onReconcileStart func(),
+				onComplete func(error),
+			) {
+				enqueueLiveServicesWithStatus(
+					services,
+					runWorker.Registry(),
+					name,
+					tmpl,
+					image,
+					onReconcileStart,
+					onComplete,
+				)
+			},
+			UpdateServicesObservationWithStatus: func(
+				name string,
+				tmpl *function.Template,
+				image string,
+				onReconcileStart func(),
+				onComplete func(error),
+			) {
+				enqueueLiveServiceObservationWithStatus(
+					services,
+					runWorker.Registry(),
+					name,
+					tmpl,
+					image,
+					onReconcileStart,
+					onComplete,
+				)
 			},
 			// On removal, stop the function's service containers BEFORE the images
 			// are retired (reconciler calls RemoveServices before RemoveFunction):
@@ -1149,6 +1180,22 @@ func enqueueLiveServicesWithStatus(
 		preparedEnv = cur.Prepared().Env
 	}
 	services.EnqueueWithStatus(name, tmpl, image, preparedEnv, onReconcileStart, onComplete)
+}
+
+func enqueueLiveServiceObservationWithStatus(
+	services *reconciler.ServiceCoordinator,
+	reg *runner.Registry,
+	name string,
+	tmpl *function.Template,
+	image string,
+	onReconcileStart func(),
+	onComplete func(error),
+) {
+	var preparedEnv []string
+	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
+		preparedEnv = cur.Prepared().Env
+	}
+	services.EnqueueStatusObservation(name, tmpl, image, preparedEnv, onReconcileStart, onComplete)
 }
 
 // enqueueStartupServices publishes each prepared function's initial desired
