@@ -355,6 +355,22 @@ func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFuncti
 	return buildFn(fnSpec{name: name, rules: []function.EventRule{alwaysMatchRule(time.Second)}}, executor)
 }
 
+// unavailableMatchFn builds an UNAVAILABLE prepared function whose single rule
+// matches any event. Unlike a removed function (absent from the registry), it is
+// configured and matching but cannot run because its image is not built, so the
+// matched-but-unavailable event path is exercisable. The template is present so
+// matching (not a nil-template guard) drives the outcome.
+func unavailableMatchFn(t *testing.T, name string) *PreparedFunction {
+	t.Helper()
+	return NewUnavailable(function.Function{
+		Name: name,
+		Template: &function.Template{
+			Runtime: "node24",
+			Events:  []function.EventRule{alwaysMatchRule(time.Second)},
+		},
+	})
+}
+
 // fp is a valid, always-matching prepared function whose executor doubles as an
 // ImageCleaner so the runner's resolver finds it.
 func fpClean(t *testing.T, name, image string, exec Executor) *PreparedFunction {

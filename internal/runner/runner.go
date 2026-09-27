@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -969,14 +970,22 @@ func (r *Runner) runInvocation(
 //   - a plain (retryable) error when any matched invocation had a retryable
 //     failure this delivery — regardless of other invocations' outcomes — so
 //     the message stays pending and is retried. The first such error is returned.
+//   - a wrapped runner.ErrFunctionUnavailable when at least one MATCHED
+//     invocation belongs to a configured function whose image is not currently
+//     built and that invocation has not already completed. Such an event is
+//     MATCHED, never unmatched, but the invocation cannot run this delivery: the
+//     message stays pending (not ACKed, and not DLQ'd solely for
+//     unavailability). No handler attempt is claimed and no handler counter is
+//     touched, because no handler ran. A later delivery — once the function is
+//     rebuilt and available again — completes the outstanding invocation.
 //   - a wrapped stream.ErrInvocationExhausted when every invocation in the
 //     matched set is terminal (complete or exhausted), at least one of them is
-//     exhausted, and no retryable failure occurred this delivery. The whole
-//     message is terminal, so the stream layer routes it to the DLQ. This also
-//     fires on a redelivery where the exhausting invocation was already marked
-//     exhausted by an earlier delivery: the message may still be pending because
-//     its DLQ write (or the post-DLQ XACK) failed, so it must be re-routed
-//     rather than returned nil and ACKed without a DLQ entry.
+//     exhausted, and no retryable failure or unavailable match occurred this
+//     delivery. The whole message is terminal, so the stream layer routes it to
+//     the DLQ. This also fires on a redelivery where the exhausting invocation
+//     was already marked exhausted by an earlier delivery: the message may still
+//     be pending because its DLQ write (or the post-DLQ XACK) failed, so it must
+//     be re-routed rather than returned nil and ACKed without a DLQ entry.
 //   - a wrapped stream.ErrInvocationNotEligible when no retryable failure
 //     occurred and the message is not all-terminal, but at least one matched
 //     invocation was skipped because it is protected (running or waiting out a
@@ -1045,10 +1054,23 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// still see the full set of matched invocations (including ones that sort
 	// later). Matching is pure; a panic here is a programming error that escapes
 	// and no counter has been touched yet.
+	//
+	// Matching includes configured functions whose image is not currently built
+	// (available == false): an event matching ONLY such a function is MATCHED,
+	// not unmatched, so it is classified matched and the function is counted as
+	// engaged. Skipping unavailable functions here (the previous behavior) both
+	// mis-classified those events as unmatched and let a mixed message ACK
+	// without running the unavailable function's share. unavailableMatched
+	// records the invocations that matched but cannot run this delivery; an
+	// unresolved one keeps the message pending rather than ACKed or DLQ'd for
+	// unavailability alone (see the aggregate below). A nil Template (only
+	// reachable from a hand-built unavailable entry, never from the loader)
+	// cannot match and is skipped.
 	var matched []string
 	var matchedFns []string
+	var unavailableMatched []string
 	for _, pf := range snapshot {
-		if !pf.available {
+		if pf.fn.Template == nil {
 			continue
 		}
 		rules := pf.fn.Template.MatchingEventRules(event)
@@ -1057,7 +1079,40 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		}
 		matchedFns = append(matchedFns, pf.fn.Name)
 		for _, rule := range rules {
-			matched = append(matched, pf.fn.Name+"/"+rule.Handler)
+			invocation := pf.fn.Name + "/" + rule.Handler
+			matched = append(matched, invocation)
+			if !pf.available {
+				unavailableMatched = append(unavailableMatched, invocation)
+			}
+		}
+	}
+
+	// An unavailable matched invocation is UNRESOLVED unless it already COMPLETED
+	// for this message: a complete marker means the invocation's work here is
+	// settled (it ran before this worker lost/never had the function), so it does
+	// not hold the message pending. Anything else — never ran, or exhausted
+	// awaiting a DLQ re-route whose attempt count only the available path can read
+	// back — is unresolved, and the message must stay pending: it must neither be
+	// ACKed (which could drop an outstanding execution or an unpersisted DLQ
+	// entry) nor be dead-lettered solely for unavailability. The exhausted case is
+	// deliberately included: this worker cannot attribute the exhausted attempt
+	// count from an unavailable entry, and ACKing would race another replica's
+	// DLQ write, so the safe choice is to hold pending until the function is
+	// available again and the normal path surfaces the exhaustion with correct
+	// metadata. With no invocation state there is no marker to consult, so any
+	// unavailable match is treated as unresolved (the fail-safe direction). This
+	// is read-only: no attempt is claimed and no counter is touched for an
+	// unavailable function.
+	var unresolvedUnavailable []string
+	if len(unavailableMatched) > 0 {
+		if hasState {
+			for _, invocation := range unavailableMatched {
+				if !invState.IsComplete(invocation) {
+					unresolvedUnavailable = append(unresolvedUnavailable, invocation)
+				}
+			}
+		} else {
+			unresolvedUnavailable = unavailableMatched
 		}
 	}
 
@@ -1415,7 +1470,21 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if firstErr != nil {
 			return firstErr
 		}
-		// 2. Every matched invocation is terminal (complete or exhausted) AND at
+		// 2. A matched-but-unavailable invocation is unresolved (it matched and
+		//    has not already completed) → the message stays pending and is NOT
+		//    ACKed, and it is NOT dead-lettered solely for unavailability. No
+		//    handler attempt was claimed and no handler counter was touched for
+		//    it (no handler ran). Returning the retryable ErrFunctionUnavailable
+		//    makes the stream leave the message pending (an ordinary retryable
+		//    error), exactly like the schedule path's unavailable handling, so a
+		//    later delivery — after the function is rebuilt and available again —
+		//    completes the outstanding work. This is checked BEFORE the DLQ
+		//    decision so an exhausted sibling can never dead-letter a message
+		//    whose unavailable invocation is still outstanding.
+		if len(unresolvedUnavailable) > 0 {
+			return unavailableMatchError(unresolvedUnavailable)
+		}
+		// 3. Every matched invocation is terminal (complete or exhausted) AND at
 		//    least one exhausted → the message is terminal; route it to the DLQ.
 		//    allMatchedTerminal fails open to false on a read error, keeping the
 		//    message pending rather than DLQ'ing it. The aggregate error carries
@@ -1425,20 +1494,27 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if anyExhausted && allMatchedTerminal(invState, matched) {
 			return &stream.HandlerExhaustedError{Invocations: dedupeExhausted(exhaustedInvocations)}
 		}
-		// 3. Any matched invocation was protected- or slot-timeout-skipped
+		// 4. Any matched invocation was protected- or slot-timeout-skipped
 		//    (unresolved) → the message stays pending with NO retry accounting.
 		//    This fires even when other invocations executed successfully this
 		//    call: an unresolved invocation must not be ACKed away.
 		if skippedPending {
 			return stream.ErrInvocationNotEligible
 		}
-		// 4. Every matched invocation is complete (or nothing matched) → ACK.
+		// 5. Every matched invocation is complete (or nothing matched) → ACK.
 		return nil
 	}
 	// No invocation state: preserve the old fail-fast tail — nil when something
 	// executed successfully (or nothing matched); ErrInvocationNotEligible when
 	// nothing executed and at least one invocation was protected- or
-	// slot-timeout-skipped (so the stream leaves the message pending).
+	// slot-timeout-skipped (so the stream leaves the message pending). A
+	// matched-but-unavailable invocation is likewise unresolved: it is reported
+	// (never silently treated as unmatched/complete) so the caller leaves the
+	// message pending. With no state there is no terminal marker to consult, so
+	// any unavailable match counts as unresolved.
+	if len(unresolvedUnavailable) > 0 {
+		return unavailableMatchError(unresolvedUnavailable)
+	}
 	if executed {
 		return nil
 	}
@@ -1446,6 +1522,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		return stream.ErrInvocationNotEligible
 	}
 	return nil
+}
+
+// unavailableMatchError reports the matched-but-unavailable invocations of a
+// message as a retryable error wrapping ErrFunctionUnavailable. An unavailable
+// function's event is MATCHED (not unmatched) and must keep the message pending
+// without being dead-lettered for unavailability alone, so the stream layer
+// treats this exactly like any other retryable failure. The invocation IDs are
+// included so the log line names the outstanding function/handler.
+func unavailableMatchError(invocations []string) error {
+	return fmt.Errorf("%w: matched but unavailable: %s", ErrFunctionUnavailable, strings.Join(invocations, ", "))
 }
 
 // obsoleteOccurrence is the terminal error returned when a schedule occurrence

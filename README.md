@@ -414,7 +414,15 @@ which runtime to use and which events it handles.
 - An invalid `template.yaml` is logged and skipped — it never prevents Relay
   from starting.
 - A function whose image cannot be built is logged and marked unavailable; the
-  other functions continue to be served.
+  other functions continue to be served. An unavailable function is still
+  **matched**: events matching only it count as matched (not unmatched) and the
+  function is attributed as engaged, but its matched invocations stay pending
+  (retryable `function unavailable`) instead of running — so a message matching
+  both an available and an unavailable function runs the available handler to
+  completion while the unavailable one keeps the message pending. Once the
+  function is rebuilt, a redelivery completes the outstanding work; an
+  unavailable function's own event is never acknowledged away and never
+  dead-lettered for unavailability alone.
 
 ### Image lifecycle
 
@@ -1881,7 +1889,14 @@ remains the health check.
   counted, because the counters are an exact partition and a missed count is
   preferable to a double count. The class is decided from **matching alone,
   before any execution**, so a handler failure stays `matched`; `unmatched`
-  events are acknowledged and never retried. `function_events_matched_total`
+  events are acknowledged and never retried. Matching includes functions that are
+  currently unavailable (their image could not be built): an event matching only
+  an unavailable function is `matched`, and the unavailable function is
+  attributed as engaged, even though the invocation cannot run yet. A
+  matched-but-unavailable invocation keeps the message pending (retryable) with
+  no handler attempt counted, and is never dead-lettered for unavailability
+  alone; once the function becomes available the redelivered message completes
+  the outstanding work. `function_events_matched_total`
   attributes a function once per matched logical event (deduped across that
   function's multiple matching rules), so an event matching two functions counts
   once globally and once per function. Schedule occurrences bypass event

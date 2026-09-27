@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -199,5 +200,235 @@ func TestHandleWithoutInvocationStateCountsEveryCall(t *testing.T) {
 	}
 	if got := m.Counter(metrics.MetricEventsMatched); got != 3 {
 		t.Errorf("events_matched_total = %d, want 3", got)
+	}
+}
+
+// TestHandleMatchedButUnavailableIsMatchedNotUnmatched pins the core fix: an event
+// that matches ONLY a configured-but-unavailable function is classified MATCHED,
+// not unmatched, and the function is counted as engaged — even though the
+// invocation cannot run. No handler attempt is claimed (no TryStart) and no
+// handler execution counter is touched, because no handler ran.
+func TestHandleMatchedButUnavailableIsMatchedNotUnmatched(t *testing.T) {
+	m := metrics.New()
+	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (matched but unavailable is retryable)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (unavailability must not DLQ)", err)
+	}
+	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
+		t.Errorf("events_received_total = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 1 {
+		t.Errorf("events_matched_total = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
+		t.Errorf("events_unmatched_total = %d, want 0 (matched, not unmatched)", got)
+	}
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].Function != "broken" || fs[0].EventsMatchedTotal != 1 {
+		t.Fatalf("unavailable function must be engaged as matched: %+v", fs)
+	}
+	// No handler ran: no attempt claimed, no handler execution counters.
+	if len(prog.attempts) != 0 || len(prog.marks) != 0 || len(prog.failures) != 0 {
+		t.Fatalf("no handler ran, so invocation state must be untouched: attempts=%v marks=%v failures=%v",
+			prog.attempts, prog.marks, prog.failures)
+	}
+	if got := m.Counter(metrics.MetricHandlerSuccess); got != 0 {
+		t.Errorf("handler_success_total = %d, want 0 (no handler ran)", got)
+	}
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 0 {
+		t.Errorf("handler_failure_total = %d, want 0 (no handler ran)", got)
+	}
+}
+
+// TestHandleMixedFanOutAvailableCompletesUnavailablePending pins the mixed
+// fan-out contract: a message matching an AVAILABLE function (which completes)
+// and an UNAVAILABLE function (which cannot run) must run the available
+// invocation to completion while returning a retryable error for the
+// unavailable one, so the message stays pending and is not ACKed. The available
+// invocation's completion is persisted so a redelivery skips it.
+func TestHandleMixedFanOutAvailableCompletesUnavailablePending(t *testing.T) {
+	m := metrics.New()
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "available", exec),
+		unavailableMatchFn(t, "broken"),
+	}, testutil.DiscardLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (unavailable sibling unresolved)", err)
+	}
+	if exec.count() != 1 {
+		t.Fatalf("available executor calls = %d, want 1 (available invocation must still run)", exec.count())
+	}
+	if !prog.IsComplete("available/index.run") {
+		t.Fatalf("available invocation must be marked complete")
+	}
+	if prog.IsTerminal("broken/index.run") {
+		t.Fatalf("unavailable invocation must remain unresolved (not terminal)")
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 1 {
+		t.Errorf("events_matched_total = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
+		t.Errorf("events_unmatched_total = %d, want 0", got)
+	}
+
+	// Redelivery: the completed available invocation must NOT re-run; the
+	// unavailable one is still unresolved, so the message stays pending.
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("redelivery error = %v, want ErrFunctionUnavailable", err)
+	}
+	if exec.count() != 1 {
+		t.Fatalf("available executor calls after redelivery = %d, want 1 (no re-run)", exec.count())
+	}
+}
+
+// TestHandleMixedFanOutUnresolvedWorkCompletesAfterAvailable pins that a message
+// left pending for an unavailable sibling completes normally once that sibling
+// becomes available: the already-completed available invocation is skipped and
+// the now-available invocation runs, after which Handle returns nil (the stream
+// ACKs).
+func TestHandleMixedFanOutUnresolvedWorkCompletesAfterAvailable(t *testing.T) {
+	m := metrics.New()
+	availableExec := &countingExecutor{}
+	recoveredExec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "available", availableExec),
+		unavailableMatchFn(t, "broken"),
+	}, testutil.DiscardLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	// Delivery 1: available completes, broken is unresolved → pending.
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("delivery 1 error = %v, want ErrFunctionUnavailable", err)
+	}
+	if availableExec.count() != 1 {
+		t.Fatalf("available executions = %d, want 1", availableExec.count())
+	}
+
+	// The function is rebuilt and becomes available; the unavailable entry is
+	// swapped for a runnable one with the SAME name (preserving invocation-state
+	// identity/dedup).
+	r.Registry().Replace("broken", alwaysMatchFn(t, "broken", recoveredExec))
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if err != nil {
+		t.Fatalf("delivery 2 error = %v, want nil once all matched work is complete", err)
+	}
+	if availableExec.count() != 1 {
+		t.Fatalf("completed available invocation must not re-run: calls = %d, want 1", availableExec.count())
+	}
+	if recoveredExec.count() != 1 {
+		t.Fatalf("recovered invocation must run: calls = %d, want 1", recoveredExec.count())
+	}
+	if !prog.IsComplete("broken/index.run") {
+		t.Fatalf("recovered invocation must be marked complete")
+	}
+}
+
+// TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure pins that an
+// unavailable match never counts as a handler failure/attempt: the per-function
+// failure, retry, and DLQ counters stay untouched (no handler ran), while the
+// function is still engaged as matched. This is the "no handler attempt when no
+// handler ran" invariant.
+func TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure(t *testing.T) {
+	m := metrics.New()
+	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+
+	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("handle error = %v, want ErrFunctionUnavailable", err)
+	}
+	if got := m.Counter(metrics.MetricHandlerFailure); got != 0 {
+		t.Errorf("handler_failure_total = %d, want 0 (no handler ran)", got)
+	}
+	if got := m.Counter(metrics.MetricRetries); got != 0 {
+		t.Errorf("retries_total = %d, want 0 (no handler attempt)", got)
+	}
+	if got := m.Counter(metrics.MetricDLQEntries); got != 0 {
+		t.Errorf("dlq_entries_total = %d, want 0 (unavailability must not DLQ)", got)
+	}
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 ||
+		fs[0].HandlerFailureTotal != 0 || fs[0].RetriesTotal != 0 || fs[0].DLQTotal != 0 {
+		t.Fatalf("per-function stats must record engagement only: %+v", fs)
+	}
+}
+
+// TestHandleUnavailableExhaustedStaysPendingNotDLQ pins the interaction with an
+// already-exhausted unavailable invocation. An unavailable match that is not
+// complete is unresolved and holds the message pending — this worker cannot
+// attribute the exhausted attempt count from an unavailable entry, and ACKing or
+// DLQing would race another replica's write or drop metadata, so unavailability
+// alone never routes to the DLQ. Once the function becomes available again, the
+// normal path reads the persisted exhausted marker and routes the message to the
+// DLQ with the correct attempt metadata.
+func TestHandleUnavailableExhaustedStaysPendingNotDLQ(t *testing.T) {
+	m := metrics.New()
+	prog := newFakeInvocationState()
+	// broken already exhausted its attempts (retries:0 → attempt 1) on a previous
+	// delivery, before it became unavailable.
+	prog.exhausted["broken/index.run"] = 1
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	unavailable := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	err := unavailable.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, ErrFunctionUnavailable) {
+		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (unavailable stays pending)", err)
+	}
+	if errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (unavailability must not DLQ)", err)
+	}
+
+	// Once available again, the persisted exhausted marker drives the normal DLQ
+	// routing with the correct attempt count.
+	recovered := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "broken", &countingExecutor{})}, testutil.DiscardLogger(), m)
+	err = recovered.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationExhausted) {
+		t.Fatalf("recovered handle error = %v, want ErrInvocationExhausted", err)
+	}
+	var typed *stream.HandlerExhaustedError
+	if !errors.As(err, &typed) || len(typed.Invocations) != 1 || typed.Invocations[0].Attempts != 1 {
+		t.Fatalf("recovered exhaustion metadata = %+v, want one invocation with attempts 1", err)
+	}
+}
+
+// TestHandleUnavailableMatchMetricsClaimedOnceAcrossRedeliveries pins that the
+// matched classification for an unavailable match is claimed exactly once across
+// redeliveries: repeated pending deliveries do not double-count received/matched,
+// and the function-engaged counter also stays at one.
+func TestHandleUnavailableMatchMetricsClaimedOnceAcrossRedeliveries(t *testing.T) {
+	m := metrics.New()
+	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	prog := newFakeInvocationState()
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	for i := 0; i < 3; i++ {
+		if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
+			t.Fatalf("delivery %d error = %v, want ErrFunctionUnavailable", i+1, err)
+		}
+	}
+	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
+		t.Errorf("events_received_total = %d, want 1 across redeliveries", got)
+	}
+	if got := m.Counter(metrics.MetricEventsMatched); got != 1 {
+		t.Errorf("events_matched_total = %d, want 1 across redeliveries", got)
+	}
+	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
+		t.Errorf("events_unmatched_total = %d, want 0", got)
+	}
+	fs := m.FunctionStatsSnapshot()
+	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 {
+		t.Fatalf("function engagement must be claimed once: %+v", fs)
 	}
 }

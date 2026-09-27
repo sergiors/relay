@@ -469,3 +469,108 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 		t.Errorf("handler_attempts = %v, want 1 (persisted exhausted attempt)", m.Values["handler_attempts"])
 	}
 }
+
+// TestIntegrationMatchedButUnavailableStaysPendingThenCompletes is the end-to-end
+// regression for the matched-but-unavailable fix. A message matching ONLY a
+// configured-but-unavailable function must:
+//
+//   - be delivered into the PEL and STAY pending across reclaim cycles (never
+//     ACKed and never DLQ'd) while the function is unavailable — unavailability
+//     alone must not dead-letter, and it must not be treated as unmatched (which
+//     would ACK it);
+//   - once the function is rebuilt and becomes available (the registry entry is
+//     swapped for a runnable one under the SAME name, preserving invocation-state
+//     identity), a reclaim redelivery must run the handler, ACK the message, and
+//     clear the invocation-state key.
+func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T) {
+	_ = redisAvailable(t)
+	recovered := &countingExecutor{}
+	// Start with the function registered but unavailable (image not built).
+	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), nil)
+	e := newEventEnv(t)
+	id := e.xadd(`{"a":1}`)
+	e.start(r.Handle)
+
+	// The message is delivered into the PEL and stays pending across the reclaim
+	// grace window, never ACKed and never DLQ'd (matched but temporarily
+	// unavailable).
+	e.eventually("unavailable event delivered into PEL", func() bool {
+		_, ok := e.pending(id)
+		return ok
+	})
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := e.pending(id); !ok {
+			t.Fatalf("matched-but-unavailable event must stay pending, not be acked")
+		}
+		if _, ok := e.dlqEntry(id); ok {
+			t.Fatalf("matched-but-unavailable event must not be DLQ'd for unavailability alone")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if recovered.count() != 0 {
+		t.Fatalf("unavailable function must not execute: calls = %d, want 0", recovered.count())
+	}
+
+	// The function is rebuilt and becomes available under the SAME name, so the
+	// invocation identity is preserved. A reclaim redelivery runs the handler,
+	// ACKs the message, and clears the invocation-state key.
+	r.Registry().Replace("broken", alwaysMatchFn(t, "broken", recovered))
+	e.eventually("recovered function executed", func() bool {
+		return recovered.count() == 1
+	})
+	e.eventually("message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("invocation-state key cleared after ack", func() bool {
+		return !e.hasStateKey(id)
+	})
+	if _, ok := e.dlqEntry(id); ok {
+		t.Fatalf("recovered event must never be DLQ'd")
+	}
+}
+
+// TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending pins the
+// mixed fan-out contract end to end: one message matching an AVAILABLE function
+// (which succeeds and is marked complete) and an UNAVAILABLE function (which
+// cannot run) stays pending across reclaims. The available invocation runs
+// exactly once — it is NOT re-run by the reclaims — while the unavailable
+// invocation remains unresolved, so the message is never ACKed and never DLQ'd.
+func TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending(t *testing.T) {
+	_ = redisAvailable(t)
+	availableExec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{
+		alwaysMatchFn(t, "available", availableExec),
+		unavailableMatchFn(t, "broken"),
+	}, testutil.DiscardLogger(), nil)
+	e := newEventEnv(t)
+	id := e.xadd(`{"a":1}`)
+	e.start(r.Handle)
+
+	// The available invocation completes; the unavailable sibling keeps the
+	// message pending.
+	e.eventually("available invocation marked complete", func() bool {
+		v, err := e.stateField(id, "available/index.run")
+		return err == nil && v == "ok"
+	})
+	if got := availableExec.count(); got != 1 {
+		t.Fatalf("available executions = %d, want 1", got)
+	}
+
+	// Across the reclaim grace window the message stays pending (unavailable
+	// sibling unresolved) and the completed invocation is never re-run.
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := e.pending(id); !ok {
+			t.Fatalf("mixed message must stay pending while the unavailable sibling is unresolved")
+		}
+		if _, ok := e.dlqEntry(id); ok {
+			t.Fatalf("mixed message must not be DLQ'd for an unavailable sibling")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if got := availableExec.count(); got != 1 {
+		t.Fatalf("completed available invocation must not re-run: calls = %d, want 1", got)
+	}
+}

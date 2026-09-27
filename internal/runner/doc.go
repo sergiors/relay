@@ -2,8 +2,19 @@
 // the runtime.
 //
 // This package evaluates events against a snapshot-consistent function registry:
-//   - Match: each event is evaluated against every loaded function's rules
+//   - Match: each event is evaluated against every loaded function's rules,
+//     INCLUDING functions that are configured but currently unavailable (their
+//     image could not be built). An event matching only an unavailable function
+//     is still MATCHED and engages that function; it is never misclassified as
+//     unmatched
 //   - Execute: matching handlers run sequentially, bounded by their rule's timeout
+//   - Unavailable: a matched invocation of an unavailable function cannot run
+//     this delivery. It claims no handler attempt and touches no handler counter
+//     (no handler ran); Handle reports the retryable runner.ErrFunctionUnavailable
+//     so the stream leaves the message pending — never ACKed, never DLQ'd solely
+//     for unavailability. A mixed message runs its available invocations to
+//     completion and holds pending only for the unavailable one; once the
+//     function is rebuilt, a redelivery finishes the outstanding work
 //   - Skip: when the stream layer injects invocation state into the context,
 //     a matching handler whose "<function>/<rule-handler>" invocation already
 //     succeeded on a previous delivery, is protected by an active attempt
