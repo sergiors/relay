@@ -91,35 +91,6 @@ const shutdownStepTimeout = 5 * time.Second
 // another step's budget, but the whole teardown can never run unbounded.
 const shutdownAggregateTimeout = 2 * time.Minute
 
-// Finite per-resource shutdown bounds. Historically the socket/manager/state/
-// Redis closes declared no bound and ran on context.Background; each now gets an
-// explicit cap so every blocking shutdown resource is finite. The manager bound
-// is the largest: it joins the maintenance loop, then tears down every warm
-// execution container through a bounded worker pool (each Docker kill/remove is
-// itself capped at 5s), and only then closes the Docker client. The reconciler
-// bound covers joining the watch/pump/ticker goroutines; the loop bound covers
-// joining the worker-owned background loops (stats/park, metrics logger,
-// retention).
-const (
-	shutdownSocketTimeout     = 5 * time.Second
-	shutdownReconcilerTimeout = 10 * time.Second
-	shutdownLoopTimeout       = 5 * time.Second
-	shutdownManagerTimeout    = 30 * time.Second
-	shutdownStateTimeout      = 10 * time.Second
-	shutdownRedisTimeout      = 5 * time.Second
-)
-
-// shutdownStatsFlushTimeout bounds the final stats flush step. It preserves the
-// 2s bound the flush historically applied internally, now owned by the shutdown
-// registry so it is visible alongside every other step's bound.
-const shutdownStatsFlushTimeout = 2 * time.Second
-
-// shutdownTracingTimeout bounds the OpenTelemetry provider shutdown that flushes
-// the batch span processor. It is deliberately short: a wedged collector must
-// never hang process teardown, and dropping the last batch of telemetry is
-// preferable to delaying shutdown.
-const shutdownTracingTimeout = 5 * time.Second
-
 // effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
 // (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
 // the value actually enforced regardless of the configured raw value.
@@ -280,11 +251,11 @@ func Run(logger *slog.Logger) error {
 	// aggregate budget); a step failure or timeout is logged with its name and
 	// never stops the sequence.
 	shutdown := &shutdownRegistry{}
-	// Redis is acquired first and released last; register its cleanup now under
-	// an explicit finite bound so a wedged client close can never hang teardown.
+	// Redis is acquired first and released last; a wedged client close must not
+	// hang teardown.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepRedis,
-		timeout: shutdownRedisTimeout,
+		timeout: 5 * time.Second,
 		run:     func(context.Context) error { return client.Close() },
 	})
 	// Tracing is released LAST, after every other resource has stopped producing
@@ -292,7 +263,7 @@ func Run(logger *slog.Logger) error {
 	// A disabled provider's Shutdown is a no-op.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepTracing,
-		timeout: shutdownTracingTimeout,
+		timeout: 5 * time.Second,
 		run:     tracerProvider.Shutdown,
 	})
 
@@ -370,12 +341,10 @@ func Run(logger *slog.Logger) error {
 		st = nil
 	}
 	if st != nil {
-		// st.Close takes no context; it runs in the registry's step goroutine
-		// under the finite state bound, so a wedged SQLite close is surfaced as a
-		// timeout rather than hanging teardown.
+		// SQLite close has no context; the shutdown registry bounds its wait.
 		shutdown.register(shutdownStep{
 			name:    shutdownStepState,
-			timeout: shutdownStateTimeout,
+			timeout: 10 * time.Second,
 			run:     func(context.Context) error { return st.Close() },
 		})
 		// The already-computed fingerprint pairs feed both the fresh-database
@@ -412,7 +381,7 @@ func Run(logger *slog.Logger) error {
 	statsFlusher := newStatsFlusher(st, metricsInstance)
 	shutdown.register(shutdownStep{
 		name:    shutdownStepStatsFlush,
-		timeout: shutdownStatsFlushTimeout,
+		timeout: 2 * time.Second,
 		run: func(stepCtx context.Context) error {
 			finalStatsFlush(stepCtx, statsFlusher)
 			return nil
@@ -462,7 +431,7 @@ func Run(logger *slog.Logger) error {
 	// been torn down (in parallel, bounded) or the step's finite bound expires.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepManager,
-		timeout: shutdownManagerTimeout,
+		timeout: 30 * time.Second,
 		run:     manager.CloseContext,
 	})
 
@@ -505,12 +474,10 @@ func Run(logger *slog.Logger) error {
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
 	socketSpan.End()
-	// rtSocket.Close takes no context; it runs in the registry's step goroutine
-	// under the finite socket bound, so a wedged connection wait is surfaced as a
-	// timeout rather than hanging teardown.
+	// rtSocket.Close takes no context; the shutdown registry bounds its wait.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepSocket,
-		timeout: shutdownSocketTimeout,
+		timeout: 5 * time.Second,
 		run:     func(context.Context) error { return rtSocket.Close() },
 	})
 	logger.Info("Runtime state socket listening", "path", SocketPath)
@@ -763,7 +730,7 @@ func Run(logger *slog.Logger) error {
 	// that ignores cancellation cannot hang teardown.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepLoops,
-		timeout: shutdownLoopTimeout,
+		timeout: 5 * time.Second,
 		run: func(stepCtx context.Context) error {
 			for _, done := range loopDones {
 				select {
@@ -944,7 +911,7 @@ func Run(logger *slog.Logger) error {
 	}()
 	shutdown.register(shutdownStep{
 		name:    shutdownStepReconciler,
-		timeout: shutdownReconcilerTimeout,
+		timeout: 10 * time.Second,
 		run: func(stepCtx context.Context) error {
 			select {
 			case <-reconcilerDone:
