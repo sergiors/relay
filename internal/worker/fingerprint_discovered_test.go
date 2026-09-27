@@ -12,9 +12,11 @@ import (
 // TestFingerprintDiscoveredReusedAcrossStatePhase is the state-phase regression
 // for the worker's startup wiring: each loaded function is hashed exactly once
 // (fingerprintDiscovered), and that single value is persisted by both the
-// fresh-database rebuild and the per-function discovery upsert. The source is
-// changed after the fingerprint is computed, so a state write that recomputed it
-// would persist the changed digest; the caller-supplied value must win instead.
+// fresh-database rebuild and the per-function discovery upsert as the DESIRED
+// fingerprint (no usable active generation exists yet, so the active Fingerprint
+// stays empty). The source is changed after the fingerprint is computed, so a
+// state write that recomputed it would persist the changed digest; the
+// caller-supplied value must win instead.
 func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	root := t.TempDir()
 	writeWorkerFunction(t, root, "demo", "def handler(e): return 1\n")
@@ -69,9 +71,12 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	if !ok {
 		t.Fatal("expected demo row")
 	}
-	if detail.Fingerprint != computed {
-		t.Fatalf("persisted fingerprint = %q, want the once-computed %q (not recomputed %q)",
-			detail.Fingerprint, computed, changed)
+	if detail.DesiredFingerprint != computed {
+		t.Fatalf("persisted desired fingerprint = %q, want the once-computed %q (not recomputed %q)",
+			detail.DesiredFingerprint, computed, changed)
+	}
+	if detail.Fingerprint != "" {
+		t.Fatalf("active fingerprint = %q, want empty on a freshly discovered function", detail.Fingerprint)
 	}
 }
 

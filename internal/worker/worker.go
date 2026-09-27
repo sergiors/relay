@@ -1071,7 +1071,7 @@ func fingerprintDiscovered(functions []function.Function, logger *slog.Logger) [
 // convergence (services have no separate image build, so building is
 // published only for the managed-runtime image build itself), and a preparation
 // failure uses the existing failure semantics (unavailable without an active
-// image, ready when a previous image is retained).
+// image, degraded when a previous image is retained).
 //
 // ctx is the worker lifecycle context. It is passed to Prepare so a build (and
 // the fast reuse probes) is cancelled on shutdown; Prepare itself roots the

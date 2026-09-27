@@ -106,8 +106,147 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 	if detail.LastError != "" {
 		t.Fatalf("last_error = %q, want cleared", detail.LastError)
 	}
+	if detail.DesiredFingerprint != "fp-new" {
+		t.Fatalf("desired_fingerprint = %q, want fp-new (a success converges the desired generation)", detail.DesiredFingerprint)
+	}
 	if len(detail.Handlers) != 2 {
 		t.Fatalf("handler count = %d, want 2 after success", len(detail.Handlers))
+	}
+}
+
+// TestDiscoveryPreservesActiveGenerationAndOutcome pins startup rediscovery
+// semantics: a re-discovery records the new desired fingerprint and resets the
+// public status to preparing, but must NOT erase the last usable active
+// generation (image/fingerprint/prepared_at) nor the previous last-reconcile
+// outcome. This is what keeps the startup image sweep's keep reference and an
+// operator-visible failure from vanishing on every restart.
+func TestDiscoveryPreservesActiveGenerationAndOutcome(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+	prepared := time.Now().Add(-time.Hour)
+
+	c.RecordReconcileSuccess("fn", "img-active", "fp-active", prepared, fn)
+	c.RecordReconcileFailure("fn", &boomErr{}) // degraded, last reconciliation failed
+
+	c.RecordDiscoveredWithFingerprint(fn, "fp-desired-next")
+
+	detail, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after rediscovery")
+	}
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %q, want preparing after rediscovery", detail.Status)
+	}
+	if detail.Image != "img-active" || detail.Fingerprint != "fp-active" {
+		t.Fatalf("active generation = %q/%q after rediscovery, want preserved img-active/fp-active",
+			detail.Image, detail.Fingerprint)
+	}
+	if detail.PreparedAt != prepared.UTC().Format(time.RFC3339) {
+		t.Fatalf("prepared_at = %q after rediscovery, want preserved %q", detail.PreparedAt, prepared.UTC().Format(time.RFC3339))
+	}
+	if detail.DesiredFingerprint != "fp-desired-next" {
+		t.Fatalf("desired_fingerprint = %q after rediscovery, want fp-desired-next", detail.DesiredFingerprint)
+	}
+	if detail.LastReconcileStatus != ReconcileFailed || detail.LastReconcileAt == "" || detail.LastError != "boom" {
+		t.Fatalf("reconcile outcome lost on rediscovery: status=%q at=%q error=%q",
+			detail.LastReconcileStatus, detail.LastReconcileAt, detail.LastError)
+	}
+}
+
+// TestDiscoveryFreshRowRecordsDesiredFingerprintOnly pins that the first write
+// for a function (no prior row) records the desired fingerprint with an empty
+// active generation and no fabricated reconcile outcome.
+func TestDiscoveryFreshRowRecordsDesiredFingerprintOnly(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	c.RecordDiscoveredWithFingerprint(fnFor(t, "fn", tmpl), "fp-first")
+
+	detail, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after discovery")
+	}
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %q, want preparing", detail.Status)
+	}
+	if detail.DesiredFingerprint != "fp-first" {
+		t.Fatalf("desired_fingerprint = %q, want fp-first", detail.DesiredFingerprint)
+	}
+	if detail.Image != "" || detail.Fingerprint != "" || detail.PreparedAt != "" {
+		t.Fatalf("fresh row must have no active generation: image=%q fingerprint=%q prepared_at=%q",
+			detail.Image, detail.Fingerprint, detail.PreparedAt)
+	}
+	if detail.LastReconcileStatus != "" || detail.LastReconcileAt != "" || detail.LastError != "" {
+		t.Fatalf("fresh row must have no reconcile outcome: status=%q at=%q error=%q",
+			detail.LastReconcileStatus, detail.LastReconcileAt, detail.LastError)
+	}
+}
+
+// TestSuccessReplacesActiveAndConvergesDesiredGeneration pins the success
+// contract: a successful reconcile replaces the active image/fingerprint/
+// prepared_at, clears the error, and sets DesiredFingerprint to the same final
+// fingerprint (the successful generation IS the desired generation), so the next
+// reconcile is a no-op skip rather than a spurious preparation.
+func TestSuccessReplacesActiveAndConvergesDesiredGeneration(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+
+	c.RecordDiscoveredWithFingerprint(fn, "fp-v1")
+	c.RecordReconcileFailure("fn", &boomErr{}) // unavailable: no prior image
+
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
+
+	detail, ok := c.GetFunction("fn")
+	if !ok {
+		t.Fatal("expected row after success")
+	}
+	if detail.Status != StatusReady {
+		t.Fatalf("status = %q, want ready", detail.Status)
+	}
+	if detail.Image != "img-v1" || detail.Fingerprint != "fp-v1" || detail.DesiredFingerprint != "fp-v1" {
+		t.Fatalf("active/desired = %q/%q/%q, want img-v1/fp-v1/fp-v1",
+			detail.Image, detail.Fingerprint, detail.DesiredFingerprint)
+	}
+	if detail.LastError != "" || detail.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("outcome = error=%q status=%q, want cleared/success", detail.LastError, detail.LastReconcileStatus)
+	}
+}
+
+// TestPreparingRecordsDesiredFingerprintAndRetainsActive pins the live
+// desired-generation path: RecordPreparingWithFingerprint refreshes the desired
+// fingerprint and status while preserving the active generation, and a following
+// failure leaves both the active and desired generations intact but exposes the
+// failure as degraded.
+func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+	fn := fnFor(t, "fn", tmpl)
+
+	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
+	c.RecordPreparingWithFingerprint("fn", fn, "fp-v2")
+
+	detail, _ := c.GetFunction("fn")
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %q, want preparing", detail.Status)
+	}
+	if detail.DesiredFingerprint != "fp-v2" {
+		t.Fatalf("desired_fingerprint = %q, want fp-v2", detail.DesiredFingerprint)
+	}
+	if detail.Image != "img-v1" || detail.Fingerprint != "fp-v1" {
+		t.Fatalf("active generation = %q/%q, want preserved img-v1/fp-v1", detail.Image, detail.Fingerprint)
+	}
+
+	c.RecordReconcileFailure("fn", &boomErr{})
+
+	detail, _ = c.GetFunction("fn")
+	if detail.Status != StatusDegraded {
+		t.Fatalf("status = %q after failure, want degraded", detail.Status)
+	}
+	if detail.Image != "img-v1" || detail.Fingerprint != "fp-v1" || detail.DesiredFingerprint != "fp-v2" {
+		t.Fatalf("generations after failure = active %q/%q desired %q, want img-v1/fp-v1/fp-v2",
+			detail.Image, detail.Fingerprint, detail.DesiredFingerprint)
 	}
 }
 
@@ -153,8 +292,86 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 	}
 }
 
+// noRuntimeServiceTmpl is a no-runtime, external-image service-only template: it
+// has no event/schedule handlers and its single service brings its own image, so
+// a successful prepare produces NO function image (PreparedAt is the only usable
+// generation marker).
+const noRuntimeServiceTmpl = `services:
+  - image: ghcr.io/acme/api:1.2
+    port: 8080
+`
+
+// TestImageLessPreparedFunctionTransitionsToDegradedOnFailure pins the
+// no-runtime external-image service-only case: a successful generation with an
+// EMPTY function Image but a non-empty PreparedAt is still usable, so a later
+// failed prepare or service reconcile must report degraded rather than
+// unavailable. A never-successful row (discovered but never prepared) has
+// neither marker and stays unavailable.
+func TestImageLessPreparedFunctionTransitionsToDegradedOnFailure(t *testing.T) {
+	t.Run("reconcile failure", func(t *testing.T) {
+		c := openTestState(t)
+		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
+		fn := fnFor(t, "svc", tmpl)
+
+		// Successful no-runtime prepare: no function image, but prepared.
+		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
+		if got, _ := c.GetFunction("svc"); got.Image != "" || got.PreparedAt == "" {
+			t.Fatalf("precondition: image=%q prepared_at=%q, want empty image with prepared_at set",
+				got.Image, got.PreparedAt)
+		}
+
+		c.RecordReconcileFailure("svc", &boomErr{})
+		got, _ := c.GetFunction("svc")
+		if got.Status != StatusDegraded {
+			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
+		}
+		if got.PreparedAt == "" {
+			t.Fatal("prepared_at must be preserved on failure")
+		}
+	})
+
+	t.Run("service failure", func(t *testing.T) {
+		c := openTestState(t)
+		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
+		fn := fnFor(t, "svc", tmpl)
+
+		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
+		c.RecordServiceFailure("svc", &boomErr{})
+		got, _ := c.GetFunction("svc")
+		if got.Status != StatusDegraded {
+			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
+		}
+	})
+
+	t.Run("never successful stays unavailable", func(t *testing.T) {
+		c := openTestState(t)
+		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
+		fn := fnFor(t, "svc", tmpl)
+
+		// Discovered but never prepared: no image and no prepared_at.
+		c.RecordDiscovered(fn)
+		if got, _ := c.GetFunction("svc"); got.Image != "" || got.PreparedAt != "" {
+			t.Fatalf("precondition: image=%q prepared_at=%q, want both empty", got.Image, got.PreparedAt)
+		}
+
+		c.RecordReconcileFailure("svc", &boomErr{})
+		got, _ := c.GetFunction("svc")
+		if got.Status != StatusUnavailable {
+			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
+		}
+
+		c.RecordPreparing("svc", fn)
+		c.RecordServiceFailure("svc", &boomErr{})
+		got, _ = c.GetFunction("svc")
+		if got.Status != StatusUnavailable {
+			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
+		}
+	})
+}
+
 // KEY: a failed reconcile keeps the prior active image/fingerprint/prepared_at
-// intact and only records the failure; status stays ready.
+// intact — the last good version still serves — but the failure is visible as
+// degraded rather than hidden behind a ready status.
 func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
@@ -168,8 +385,8 @@ func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected row after failure")
 	}
-	if detail.Status != StatusReady {
-		t.Fatalf("status = %s, want ready (never marked unavailable)", detail.Status)
+	if detail.Status != StatusDegraded {
+		t.Fatalf("status = %s, want degraded (prior usable image retained)", detail.Status)
 	}
 	if detail.Image != "img-active" {
 		t.Fatalf("image = %q, want preserved img-active", detail.Image)
@@ -246,10 +463,12 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 }
 
 // TestLastReconcileSurvivesDiscoveredUpsert pins the full upsert contract: (i) a
-// success on an existing row persists its status and timestamp (the core fix),
-// and (ii) a subsequent re-discovery upsert resets the outcome view (the
-// excluded reconcile columns are empty), because a discovery is NOT a
-// meaningful reconcile.
+// success on an existing row persists its status and timestamp, and (ii) a
+// subsequent re-discovery upsert PRESERVES that outcome view, because a discovery
+// is not itself a meaningful reconcile but must not erase the last one. The
+// public status is reset to preparing by the discovery (a new desired
+// generation), while last_reconcile_status/last_reconcile_at and the active
+// generation stay intact.
 func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
@@ -269,17 +488,24 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 		t.Fatal("last_reconcile_at must be persisted by a success on an existing row")
 	}
 
-	// (ii) re-discovery resets the outcome view (it is not a meaningful reconcile).
+	// (ii) re-discovery preserves the outcome view and active generation, and
+	// resets the public status to preparing.
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
 	detail, ok = c.GetFunction("fn")
 	if !ok {
 		t.Fatal("expected row after re-discovery")
 	}
-	if detail.LastReconcileStatus != "" {
-		t.Fatalf("last_reconcile_status = %s after re-discovery, want empty", detail.LastReconcileStatus)
+	if detail.LastReconcileStatus != ReconcileSuccess {
+		t.Fatalf("last_reconcile_status = %s after re-discovery, want preserved %s", detail.LastReconcileStatus, ReconcileSuccess)
 	}
-	if detail.LastReconcileAt != "" {
-		t.Fatalf("last_reconcile_at = %s after re-discovery, want empty", detail.LastReconcileAt)
+	if detail.LastReconcileAt == "" {
+		t.Fatal("last_reconcile_at must survive re-discovery")
+	}
+	if detail.Status != StatusPreparing {
+		t.Fatalf("status = %s after re-discovery, want preparing", detail.Status)
+	}
+	if detail.Image != "img" || detail.Fingerprint != "fp" {
+		t.Fatalf("active generation = %q/%q after re-discovery, want preserved img/fp", detail.Image, detail.Fingerprint)
 	}
 }
 
@@ -369,12 +595,14 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 }
 
 // TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint proves the
-// caller-supplied fingerprint is persisted verbatim even when the source changes
-// AFTER the caller computed it. This is the worker's state-phase contract: the
-// fingerprint is hashed once, reused for the rebuild and the discovery upsert,
-// and a concurrent/next-moment source edit must not silently swap in a
-// recomputed value. The old RecordDiscovered recomputes (so it would persist the
-// changed value), which this test also pins as the standalone behavior.
+// caller-supplied fingerprint is persisted verbatim as the DESIRED fingerprint
+// even when the source changes AFTER the caller computed it. This is the worker's
+// state-phase contract: the fingerprint is hashed once, reused for the rebuild
+// and the discovery upsert, and a concurrent/next-moment source edit must not
+// silently swap in a recomputed value. On a fresh row there is no usable active
+// generation, so the active Fingerprint stays empty and only DesiredFingerprint is
+// set. The old RecordDiscovered recomputes (so it would persist the changed
+// value), which this test also pins as the standalone behavior.
 func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) {
 	root := t.TempDir()
 	writeFunctionsDir(t, root)
@@ -412,17 +640,20 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 	if detail.Status != StatusPreparing {
 		t.Fatalf("status = %q, want preparing", detail.Status)
 	}
-	if detail.Fingerprint != computed {
-		t.Fatalf("fingerprint = %q, want the caller-supplied %q (not a recompute %q)",
-			detail.Fingerprint, computed, changed)
+	if detail.DesiredFingerprint != computed {
+		t.Fatalf("desired_fingerprint = %q, want the caller-supplied %q (not a recompute %q)",
+			detail.DesiredFingerprint, computed, changed)
+	}
+	if detail.Fingerprint != "" {
+		t.Fatalf("active fingerprint = %q, want empty on a fresh row (no usable generation yet)", detail.Fingerprint)
 	}
 
 	// The legacy API keeps its recompute semantics for standalone callers: it
-	// observes the changed source and persists the new digest.
+	// observes the changed source and persists the new digest as the desired one.
 	c.RecordDiscovered(fn)
 	detail, _ = c.GetFunction("demo")
-	if detail.Fingerprint != changed {
-		t.Fatalf("RecordDiscovered fingerprint = %q, want recomputed %q", detail.Fingerprint, changed)
+	if detail.DesiredFingerprint != changed {
+		t.Fatalf("RecordDiscovered desired_fingerprint = %q, want recomputed %q", detail.DesiredFingerprint, changed)
 	}
 }
 
@@ -450,8 +681,8 @@ func TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet(t *testing.T) {
 	if detail.Status != StatusPreparing {
 		t.Fatalf("status = %q, want preparing", detail.Status)
 	}
-	if detail.Fingerprint != callerFP {
-		t.Fatalf("fingerprint = %q, want the caller-supplied %q", detail.Fingerprint, callerFP)
+	if detail.DesiredFingerprint != callerFP {
+		t.Fatalf("desired_fingerprint = %q, want the caller-supplied %q", detail.DesiredFingerprint, callerFP)
 	}
 
 	// A populated DB is never overwritten by a second seed.
@@ -586,6 +817,40 @@ func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 	c.PruneRemoved(root)
 	if _, ok := c.GetFunction("demo"); !ok {
 		t.Fatal("demo must survive pruning while present on disk")
+	}
+}
+
+// TestPruneRemovedNotResurrectedByDiscovery pins the removal/discovery
+// interaction at the worker startup boundary: the startup sweep prunes a
+// removed function's row (including its active generation) and the subsequent
+// discovery pass only upserts functions actually loaded from disk, so the pruned
+// row is not resurrected by the discovery-preservation behavior.
+func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	// Both have active state; only "kept" still exists on disk.
+	c.RecordReconcileSuccess("gone", "img-gone", "fp-gone", time.Now(), fnFor(t, "gone", tmpl))
+	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), fnFor(t, "kept", tmpl))
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+		t.Fatalf("mkdir kept: %v", err)
+	}
+
+	// Worker startup order: prune, then discover the loaded (on-disk) set.
+	c.PruneRemoved(root)
+	c.RecordDiscoveredWithFingerprint(fnFor(t, "kept", tmpl), "fp-kept-next")
+
+	if _, ok := c.GetFunction("gone"); ok {
+		t.Fatal("pruned function must not be resurrected by the discovery pass")
+	}
+	detail, ok := c.GetFunction("kept")
+	if !ok {
+		t.Fatal("kept function must survive")
+	}
+	if detail.Image != "img-kept" {
+		t.Fatalf("kept image = %q, want preserved img-kept", detail.Image)
 	}
 }
 

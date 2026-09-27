@@ -586,7 +586,10 @@ func (r *Reconciler) reconcileFunction(name string) {
 	generation := r.generations[name]
 	r.mu.Unlock()
 	if r.st != nil {
-		r.st.RecordPreparing(name, fn)
+		// Reuse the fingerprint computed above for this desired generation: it is
+		// recorded as DesiredFingerprint without a second filesystem scan, so the
+		// state write transaction holds no external I/O.
+		r.st.RecordPreparingWithFingerprint(name, fn, fp)
 	}
 
 	start := time.Now()

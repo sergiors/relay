@@ -23,9 +23,14 @@
 //     MEANINGFUL reconcile — a success or a failure — so an unchanged-function
 //     periodic pass never overwrites them)
 //
-// A failed reconcile never marks a whole function unavailable: the previously
-// active image/fingerprint/prepared_at are retained so the last good version
-// still serves. All timestamps are RFC3339 strings.
+// A failed reconcile never displaces the previously active
+// image/fingerprint/prepared_at, so the last good version still serves: a
+// failure for a function with a usable active image is "degraded", and only a
+// failure with no usable generation is "unavailable". The failure is always
+// visible — a failure never reports "ready". The latest desired fingerprint is
+// kept separately from the active generation (DesiredFingerprint vs
+// Fingerprint), so a prepare may target a new content digest while the old
+// generation keeps serving. All timestamps are RFC3339 strings.
 //
 // Function storage model:
 //

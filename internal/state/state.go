@@ -62,17 +62,38 @@ type Row struct {
 // through function_json.go), with only name and updated_at kept as columns. The
 // embedded Row fields and every field below — except Name, UpdatedAt, and the
 // derived HandlerCount — are part of that snapshot.
+//
+// Generation model: Image/Fingerprint/PreparedAt describe the last USABLE
+// (successfully prepared and serving) generation and are only replaced by a
+// success. DesiredFingerprint is the latest desired content fingerprint seen by
+// discovery or a live desired-generation change; it may differ from Fingerprint
+// while a new generation is being prepared, and a failure leaves both the active
+// generation and the desired fingerprint in place. LastReconcileAt/Status and
+// LastError describe the last MEANINGFUL reconcile outcome.
 type Detail struct {
 	Row
-	Image           string            `json:"image,omitempty"`
-	Fingerprint     string            `json:"fingerprint,omitempty"`
-	LastReconcileAt string            `json:"last_reconcile_at,omitempty"`
-	LastError       string            `json:"last_error,omitempty"`
-	Handlers        []Handler         `json:"handlers,omitempty"`
-	Schedules       []Schedule        `json:"schedules,omitempty"`
-	Services        []Service         `json:"services,omitempty"`
-	Env             map[string]string `json:"env,omitempty"`
-	Secrets         map[string]string `json:"secrets,omitempty"`
+	Image              string            `json:"image,omitempty"`
+	Fingerprint        string            `json:"fingerprint,omitempty"`
+	DesiredFingerprint string            `json:"desired_fingerprint,omitempty"`
+	LastReconcileAt    string            `json:"last_reconcile_at,omitempty"`
+	LastError          string            `json:"last_error,omitempty"`
+	Handlers           []Handler         `json:"handlers,omitempty"`
+	Schedules          []Schedule        `json:"schedules,omitempty"`
+	Services           []Service         `json:"services,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	Secrets            map[string]string `json:"secrets,omitempty"`
+}
+
+// hasUsableGeneration reports whether the last active generation is usable, i.e.
+// a successful reconcile produced something that can still serve. A
+// runtime-backed function signals this with a non-empty function Image. A
+// no-runtime, external-image service-only function builds no function image at
+// all, so its successful generation is signalled instead by a non-empty
+// PreparedAt (stamped only by RecordReconcileSuccess), even though its Image is
+// empty. Either marker means a failure is degraded (the prior generation is
+// retained) rather than unavailable (nothing was ever successfully prepared).
+func (d Detail) hasUsableGeneration() bool {
+	return d.Image != "" || d.PreparedAt != ""
 }
 
 // Handler is one rule's handler, its resolved timeout, and its retry count (the
@@ -363,7 +384,7 @@ func (st *State) RebuildFromFunctions(discovered []DiscoveredFunction) error {
 func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []DiscoveredFunction) error {
 	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, d := range discovered {
-			detail := functionSnapshot(d.Function.Name, d.Function.Template, StatusPreparing, "", d.Fingerprint, "", "", "", "")
+			detail := functionSnapshot(d.Function.Name, d.Function.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
 			if err := upsertFunctionTx(ctx, tx, detail); err != nil {
 				return err
@@ -400,40 +421,86 @@ func (st *State) fingerprint(fn function.Function) string {
 
 // RecordDiscovered records a function discovered from /functions on a fresh
 // state database (or when no row exists). It sets runtime/status=preparing, the
-// fingerprint, and the full configuration snapshot, clearing any stale prior
-// state. It is an upsert keyed by name. Startup discovery (and the RebuildFromFS
-// seed) runs it for every loaded function BEFORE any current-generation work, so
-// a stale ready/building/reconciling value left by a process that died mid-work
-// is reset to preparing rather than persisting forever. It computes the
-// fingerprint itself; callers that already hold one use
-// RecordDiscoveredWithFingerprint.
+// desired fingerprint, and the full configuration snapshot, while PRESERVING the
+// last usable active generation and the previous last-reconcile outcome. It is an
+// upsert keyed by name. Startup discovery (and the RebuildFromFS seed) runs it
+// for every loaded function BEFORE any current-generation work, so a transient
+// ready/building/reconciling lifecycle value left by a process that died mid-work
+// is reset to preparing rather than persisting forever, without erasing a
+// still-serving image or a recent failure outcome. It computes the fingerprint
+// itself; callers that already hold one use RecordDiscoveredWithFingerprint.
 func (st *State) RecordDiscovered(fn function.Function) {
 	st.RecordDiscoveredWithFingerprint(fn, st.fingerprint(fn))
 }
 
 // RecordDiscoveredWithFingerprint records a discovered function using a
 // fingerprint supplied by the caller, so a caller that already computed it (the
-// worker's startup state phase) never re-reads the function's source. The write
-// transaction holds no external I/O: the fingerprint is passed in, not computed
-// inside the closure.
+// worker's startup state phase) never re-reads the function's source.
+//
+// Discovery is a desired-generation event, not a reconcile: it refreshes the
+// configuration snapshot and DesiredFingerprint and resets the public status to
+// preparing, but it PRESERVES the last usable active generation
+// (image/fingerprint/prepared_at) and the previous last-reconcile outcome.
+// Startup rediscovery must not erase a still-serving image (the startup image
+// sweep keeps it) nor hide a recent failure behind an empty outcome. On a
+// function with no prior row the active generation is empty and only the desired
+// fingerprint is recorded.
+//
+// The write transaction holds no external I/O: the fingerprint is passed in, not
+// computed inside the closure.
 func (st *State) RecordDiscoveredWithFingerprint(fn function.Function, fingerprint string) {
 	ctx := context.Background()
+	ts := st.nowString()
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		detail := functionSnapshot(fn.Name, fn.Template, StatusPreparing, "", fingerprint, "", "", "", "")
-		detail.UpdatedAt = st.nowString()
-		return upsertFunctionTx(ctx, tx, detail)
+		return recordDesiredTx(ctx, tx, fn.Name, fn.Template, fingerprint, ts)
 	})
 	if err != nil {
 		st.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
 	}
 }
 
+// recordDesiredTx is the shared body of the desired-generation writes (startup
+// discovery and live desired-change detection): it refreshes the whole
+// configuration snapshot and the desired fingerprint and sets status=preparing
+// while preserving the last usable active generation
+// (image/fingerprint/prepared_at) and the previous last-reconcile outcome. Only
+// a successful full reconcile replaces the active generation. An absent row is
+// created with no active generation and the supplied desired fingerprint.
+func recordDesiredTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	name string,
+	tmpl *function.Template,
+	fingerprint,
+	ts string,
+) error {
+	detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+		`SELECT `+jsonPayloadExpr+`, updated_at FROM functions WHERE name = ?`, name))
+	if err != nil {
+		return err
+	}
+	if !found {
+		detail = functionSnapshot(name, tmpl, StatusPreparing, "", "", fingerprint, "", "", "", "")
+	} else {
+		active := detail
+		detail = functionSnapshot(name, tmpl, StatusPreparing,
+			active.Image, active.Fingerprint, fingerprint,
+			active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
+	}
+	detail.UpdatedAt = ts
+	return upsertFunctionTx(ctx, tx, detail)
+}
+
 // RecordReconcileSuccess records that a function built and serves an active
 // version: status=ready, the new image/fingerprint/prepared_at,
 // last_reconcile_status=success AND last_reconcile_at=now (the last meaningful
-// reconcile), cleared last_error, and the full configuration snapshot. On
-// conflict (existing row) the upsert replaces the whole snapshot, so a success
-// on a previously-discovered row records its own outcome and timestamp.
+// reconcile), cleared last_error, and the full configuration snapshot. Because
+// the successful generation IS the desired generation, both the active
+// Fingerprint and DesiredFingerprint are set to the successful final
+// fingerprint, so the next discovery/desired-change starts from a converged
+// desired value. On conflict (existing row) the upsert replaces the whole
+// snapshot, so a success on a previously-discovered row records its own outcome
+// and timestamp.
 func (st *State) RecordReconcileSuccess(
 	name,
 	image,
@@ -445,7 +512,7 @@ func (st *State) RecordReconcileSuccess(
 	ts := st.nowString()
 	prepared := preparedAt.UTC().Format(time.RFC3339)
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		detail := functionSnapshot(name, fn.Template, StatusReady, image, fingerprint, prepared, ts, ReconcileSuccess, "")
+		detail := functionSnapshot(name, fn.Template, StatusReady, image, fingerprint, fingerprint, prepared, ts, ReconcileSuccess, "")
 		detail.UpdatedAt = ts
 		return upsertFunctionTx(ctx, tx, detail)
 	})
@@ -455,28 +522,32 @@ func (st *State) RecordReconcileSuccess(
 }
 
 // RecordPreparing marks the desired configuration as in progress while retaining
-// the last active generation. It is written when a live desired-generation change
-// is detected, before any current-generation work runs, so the public status
-// reflects that the function is preparing a new generation. The active
-// image/fingerprint/prepared_at are only replaced by a successful full
-// reconcile, so a later failure never hides a healthy version.
+// the last active generation and the previous reconcile outcome. It is written
+// when a live desired-generation change is detected, before any current-generation
+// work runs, so the public status reflects that the function is preparing a new
+// generation. The active image/fingerprint/prepared_at are only replaced by a
+// successful full reconcile, so a later failure never hides a healthy version.
+//
+// It is the standalone entry point for callers that do not already hold the
+// fingerprint; the fingerprint is computed BEFORE the write transaction opens so
+// the transaction holds no filesystem I/O. Callers that already computed it (the
+// reconciler's rebuild path) use RecordPreparingWithFingerprint.
 func (st *State) RecordPreparing(name string, fn function.Function) {
+	st.RecordPreparingWithFingerprint(name, fn, st.fingerprint(fn))
+}
+
+// RecordPreparingWithFingerprint records a live desired-generation change using a
+// fingerprint supplied by the caller, so a caller that already computed it (the
+// reconciler's rebuild path) never re-reads the function's source and the write
+// transaction holds no external I/O. Like RecordDiscoveredWithFingerprint it is a
+// desired-generation write: it refreshes the configuration snapshot and the
+// desired fingerprint and sets status=preparing while preserving the last usable
+// active generation and the previous last-reconcile outcome.
+func (st *State) RecordPreparingWithFingerprint(name string, fn function.Function, fingerprint string) {
 	ctx := context.Background()
 	ts := st.nowString()
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
-			`SELECT `+jsonPayloadExpr+`, updated_at FROM functions WHERE name = ?`, name))
-		if err != nil {
-			return err
-		}
-		if !found {
-			detail = functionSnapshot(name, fn.Template, StatusPreparing, "", "", "", "", "", "")
-		} else {
-			active := detail
-			detail = functionSnapshot(name, fn.Template, StatusPreparing, active.Image, active.Fingerprint, active.PreparedAt, active.LastReconcileAt, active.LastReconcileStatus, active.LastError)
-		}
-		detail.UpdatedAt = ts
-		return upsertFunctionTx(ctx, tx, detail)
+		return recordDesiredTx(ctx, tx, name, fn.Template, fingerprint, ts)
 	})
 	if err != nil {
 		st.log.Warn("State: record preparing failed", "function", name, "error", err)
@@ -527,11 +598,15 @@ func (st *State) recordStatus(name, status string) {
 // RecordReconcileFailure records that a reconcile build failed.
 //
 // Key state model: the image/fingerprint/prepared_at of the PREVIOUS active
-// version are deliberately left intact so the last good build still serves;
-// only last_reconcile_at/last_reconcile_status (failed) and last_error/updated_at
+// version are deliberately left intact so the last good build still serves, and
+// the desired fingerprint is preserved too (the failed generation is still the
+// desired one, so a later pass can retry it). Only
+// last_reconcile_at/last_reconcile_status (failed) and last_error/updated_at
 // change. The rest of the persisted snapshot is preserved by a read-modify-write
-// inside the transaction. Status is ready when an active image remains and
-// unavailable otherwise.
+// inside the transaction. Status is degraded when a prior usable active
+// generation exists — the function still serves but the desired generation did
+// not converge — and unavailable otherwise; a failure never claims ready, so the
+// failed outcome is always visible to an operator.
 func (st *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
@@ -549,10 +624,14 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 		detail.LastReconcileAt = ts
 		detail.LastReconcileStatus = ReconcileFailed
 		detail.LastError = err2.Error()
-		// A failed attempt never displaces the last healthy generation.
-		detail.Status = StatusUnavailable
-		if detail.Image != "" {
-			detail.Status = StatusReady
+		// A failed attempt never displaces the last healthy generation: it keeps
+		// serving as degraded when a prior usable generation exists, and the
+		// function is unavailable when there is none. The failure outcome is never
+		// hidden behind a ready status.
+		if detail.hasUsableGeneration() {
+			detail.Status = StatusDegraded
+		} else {
+			detail.Status = StatusUnavailable
 		}
 		detail.UpdatedAt = ts
 		payload, err := marshalFunction(detail)
@@ -570,8 +649,10 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 }
 
 // RecordServiceFailure records a service convergence failure without hiding a
-// healthy function image. A function with an active image is degraded; one
-// without an active image is unavailable.
+// healthy function image. A function with a usable active generation is
+// degraded; one without an active generation is unavailable. A no-runtime
+// external-image service-only function has no function image but a
+// successfully-prepared generation, so it is degraded, not unavailable.
 func (st *State) RecordServiceFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
@@ -585,7 +666,7 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 		detail.LastReconcileAt = ts
 		detail.LastReconcileStatus = ReconcileFailed
 		detail.LastError = err2.Error()
-		if detail.Image != "" {
+		if detail.hasUsableGeneration() {
 			detail.Status = StatusDegraded
 		} else {
 			detail.Status = StatusUnavailable
@@ -793,6 +874,7 @@ func functionSnapshot(
 	status,
 	image,
 	fingerprint,
+	desiredFingerprint,
 	prepared,
 	reconcileAt,
 	reconcileStatus,
@@ -807,15 +889,16 @@ func functionSnapshot(
 			LastReconcileStatus: reconcileStatus,
 			PreparedAt:          prepared,
 		},
-		Image:           image,
-		Fingerprint:     fingerprint,
-		LastReconcileAt: reconcileAt,
-		LastError:       lastError,
-		Handlers:        snapshotHandlers(tmpl),
-		Schedules:       snapshotSchedules(tmpl),
-		Services:        snapshotServices(tmpl),
-		Env:             env,
-		Secrets:         secrets,
+		Image:              image,
+		Fingerprint:        fingerprint,
+		DesiredFingerprint: desiredFingerprint,
+		LastReconcileAt:    reconcileAt,
+		LastError:          lastError,
+		Handlers:           snapshotHandlers(tmpl),
+		Schedules:          snapshotSchedules(tmpl),
+		Services:           snapshotServices(tmpl),
+		Env:                env,
+		Secrets:            secrets,
 	}
 }
 

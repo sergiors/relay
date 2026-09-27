@@ -71,8 +71,8 @@ func TestReconcileStateFailureKeepsActiveAndMarksFailed(t *testing.T) {
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if detail.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready after failure", detail.Status)
+	if detail.Status != state.StatusDegraded {
+		t.Fatalf("status = %s, want degraded after failure with a prior image", detail.Status)
 	}
 	if detail.LastReconcileStatus != state.ReconcileFailed {
 		t.Fatalf("last_reconcile_status = %s, want failed", detail.LastReconcileStatus)
@@ -340,13 +340,14 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 	b.fail = true
 	r.reconcileFunction("flaky") // fails -> retained + failed
 
-	// Function row still exists, still ready, marked failed (not removed).
+	// Function row still exists, degraded (prior image retained), marked failed
+	// (not removed).
 	detail, ok := st.GetFunction("flaky")
 	if !ok {
 		t.Fatal("flaky row must survive a failed rebuild")
 	}
-	if detail.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready after failure", detail.Status)
+	if detail.Status != state.StatusDegraded {
+		t.Fatalf("status = %s, want degraded after failure with a prior image", detail.Status)
 	}
 	if detail.LastReconcileStatus != state.ReconcileFailed {
 		t.Fatalf("last_reconcile_status = %s, want failed (no removal)", detail.LastReconcileStatus)

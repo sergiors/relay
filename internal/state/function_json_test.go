@@ -330,7 +330,7 @@ func TestReconcileFailurePreservesNestedSnapshot(t *testing.T) {
 	if !ok {
 		t.Fatal("row must survive a failed reconcile")
 	}
-	if after.Status != StatusReady || after.Image != "img-active" || after.Fingerprint != "fp-active" {
+	if after.Status != StatusDegraded || after.Image != "img-active" || after.Fingerprint != "fp-active" {
 		t.Fatalf("active fields changed: %+v", after)
 	}
 	if after.LastReconcileStatus != ReconcileFailed || after.LastError != "boom" {
