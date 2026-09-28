@@ -2,6 +2,8 @@ package stream
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,16 +20,348 @@ import (
 // so a message that is abandoned or deleted from the stream is eventually
 // cleaned up by Redis even if the eager clear on completion never runs. The
 // eager clear (see processMessage/routeToDLQ) is the primary cleanup; the TTL
-// is the safety net.
+// is the safety net for TERMINAL markers.
+//
+// It is a FLOOR for active markers, never a ceiling: an active
+// running/next_attempt_at marker is written with a TTL of at least
+// activeTTL(now, deadline), i.e. max(invocationStateTTL,
+// (deadline-now)+invocationSafetyMargin). The key can therefore live longer
+// than deadline+margin, but can never expire before the marker's protected
+// deadline — so a reclaim always observes the expired marker (carrying the
+// attempt forward) instead of an absent field that would reset the attempt
+// count to 1 and silently discard the retry/exhaustion accounting.
 const invocationStateTTL = 7 * 24 * time.Hour
 
-// clockSkewTolerance widens the expiry evaluation of a running marker by this
-// much: deadline comparisons across replicas depend on synchronized clocks, and
-// treating a marker as expired slightly early costs at most one extra attempt of
-// overlap (allowed under at-least-once) while never lengthening the protected
-// window by unbounded skew. It must stay far smaller than the minimum sensible
+// invocationSafetyMargin is the positive margin by which an active marker's key
+// expiry must exceed its protected deadline: keyTTL >= (deadline-now) +
+// invocationSafetyMargin for every running/next_attempt_at write. It is the
+// window in which a reclaim can still read the just-expired marker and carry its
+// attempt/token forward. It must stay far smaller than the minimum sensible
 // handler timeout.
-const clockSkewTolerance = time.Second
+const invocationSafetyMargin = time.Minute
+
+// claimTokenBytes is the size of the crypto-random per-claim nonce. 16 bytes
+// (128 bits) makes a token collision between two independent claims
+// computationally impossible, which is what lets the token — not the attempt
+// number — be the authoritative claim identity. The token is opaque: it is never
+// logged, metricked, or written to the DLQ.
+const claimTokenBytes = 16
+
+// InvocationClaim identifies ONE successful claim of an invocation's execution
+// slot. It is the compare-and-set identity every active-claim-originated
+// transition must present:
+//
+//   - Attempt is the 1-based handler attempt of this claim (the count that
+//     drives retry/exhaustion, persisted as handler_attempts).
+//   - Token is a crypto-random, opaque nonce generated immediately before the
+//     claim's EVAL. The script writes it only when the claim wins, so it is a
+//     unique per-claim identity that cannot be guessed or shared.
+//
+// Token is deliberately opaque: it must never be logged, used as a metric
+// label, or persisted to the DLQ. It exists only so the store can reject a
+// stale owner whose attempt number happens to coincide with the live marker
+// (e.g. an attempt whose lease was reclaimed by a flow that re-used the count);
+// the attempt number alone is not a sufficient CAS key.
+type InvocationClaim struct {
+	Attempt int
+	Token   string
+}
+
+// valid reports whether the claim carries a usable attempt and token. A zero
+// claim (no confirmed claim) is rejected by every CAS transition rather than
+// reaching Redis.
+func (c InvocationClaim) valid() bool {
+	return c.Attempt >= 1 && c.Token != ""
+}
+
+// newClaimToken returns a fresh crypto-random claim token (lowercase hex). A
+// failure is returned (never a panic) so the caller can fail the claim closed:
+// the runner must leave the message pending and must NOT execute the handler on
+// an unverifiable claim.
+func newClaimToken() (string, error) {
+	var b [claimTokenBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate invocation claim token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// activeTTL returns the key TTL to apply alongside an active
+// running/next_attempt_at marker with the given protected deadline: the larger
+// of the normal terminal TTL and (deadline-now)+invocationSafetyMargin. It is
+// computed in Go from integer times, so it is exact; the script never does
+// timestamp arithmetic. The safety margin guarantees keyTTL > deadline, closing
+// the window in which an expired marker could vanish before a reclaim reads it.
+func activeTTL(now, deadline time.Time) time.Duration {
+	window := deadline.Sub(now)
+	if window < 0 {
+		window = 0
+	}
+	ttl := window + invocationSafetyMargin
+	if ttl < invocationStateTTL {
+		ttl = invocationStateTTL
+	}
+	return ttl
+}
+
+// ttlMillis converts a TTL to integer milliseconds for the PEXPIRE argument.
+func ttlMillis(d time.Duration) int64 {
+	return int64(d / time.Millisecond)
+}
+
+// toInt64 coerces a value returned from a Lua EVAL reply (an int64 by default,
+// but possibly a string or float depending on the go-redis decoder) to int64.
+// It is defensive: a reply that cannot be represented yields 0, which the
+// callers treat as a script-protocol violation (caught by length/position
+// checks) rather than a valid result.
+func toInt64(v any) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case uint64:
+		return int64(n)
+	case float64:
+		return int64(n)
+	case string:
+		parsed, err := strconv.ParseInt(n, 10, 64)
+		if err != nil {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
+	}
+}
+
+// The lifecycle transitions below are implemented as atomic Lua scripts (EVAL)
+// rather than read-then-write pipelines. A pipeline is not atomic: two replicas
+// can both HGET "absent"/"expired" and both HSET a running marker, permitting a
+// dual start, and a stale owner's failure can overwrite a newer attempt's marker
+// after the stale attempt's lease expired. Redis executes a script atomically
+// (single-threaded), so at most one concurrent EVAL observes an absent/expired
+// marker and claims it; every other caller observes the new marker and is
+// protected.
+//
+// Timestamps are integer Unix MILLISECONDS passed as decimal STRINGS end to end.
+// The eligibility comparison is a length-then-lexicographic compare of those
+// strings (lt_uint), which is mathematically exact for canonical non-negative
+// decimal integers and uses no tonumber at all. No timestamp arithmetic happens
+// in Lua: Go computes the TTL, the wait, and the deadline. This removes the
+// IEEE-754 double comparison hazard entirely — a running marker is protected iff
+// now_ms < deadline_ms and eligible iff now_ms >= deadline_ms, with no skew
+// fudge.
+
+// luaInvocationHelpers is the shared Lua preamble for every invocation-state
+// script. It parses the marker grammar WITHOUT any timestamp arithmetic:
+// deadlines stay decimal strings and eligibility is a length-then-lexicographic
+// compare of canonical non-negative decimal integers (lt_uint), which is exact
+// for any magnitude. Attempt numbers are tiny and may be converted with tonumber;
+// claim tokens are opaque hex strings and are NEVER converted.
+const luaInvocationHelpers = `
+local function lt_uint(a, b)
+  -- Both a, b are canonical non-negative decimal strings (no leading zeros):
+  -- fewer digits => smaller; equal length => lexicographic compare. A
+  -- non-canonical deadline is rejected by parse_active below, so this stays
+  -- exact.
+  if #a ~= #b then return #a < #b end
+  return a < b
+end
+
+local function parse_active(v, prefix)
+  -- "prefix:<deadline_ms>:<attempt>:<token>" -> deadline, attempt, token.
+  -- The deadline must be canonical ([1-9]%d*): Unix-ms is always positive with
+  -- no leading zeros, so a leading-zero value is corrupt and is treated as
+  -- eligible rather than compared inexactly.
+  local rest = string.match(v, '^'..prefix..':(.*)$')
+  if not rest then return nil end
+  local dl, a, tok = string.match(rest, '^([1-9]%d*):(%d+):([0-9a-f]+)$')
+  if not dl then return nil end
+  if tonumber(a) < 1 then return nil end
+  return dl, a, tok
+end
+
+local function parse_exhausted(v)
+  -- "exhausted:<attempt>:<token>[:dlq]" -> attempt, token, dlq
+  local body = string.match(v, '^exhausted:(.*)$')
+  if not body then return nil end
+  local dlq = false
+  if string.sub(body, -4) == ':dlq' then
+    dlq = true
+    body = string.sub(body, 1, #body - 4)
+  end
+  local a, tok = string.match(body, '^([1-9]%d*):([0-9a-f]+)$')
+  if not a then return nil end
+  return a, tok, dlq
+end
+`
+
+var (
+	// tryStartScript atomically claims an invocation for a new attempt when
+	// eligible, or reports why it is not (protected by an active deadline, or
+	// terminal). The claim token is generated by Go and supplied here; it is
+	// written only on a winning claim, so the token identifies exactly one
+	// confirmed claim. See invocationStore.tryStart for the full contract.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field, ARGV[2] = now (unix-ms string),
+	// ARGV[3] = new running deadline (unix-ms string), ARGV[4] = new claim
+	// token, ARGV[5] = TTL ms.
+	// Returns {started, attempt, deadline_or_0}: started 1 when claimed and
+	// attempt is the new 1-based attempt; otherwise attempt describes the
+	// existing marker (0 for "ok") and the third element is the existing
+	// deadline string when protected (so Go computes the exact wait in ms), or
+	// "0" when terminal.
+	tryStartScript = redis.NewScript(luaInvocationHelpers + `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+local now = ARGV[2]
+if v then
+  if v == 'ok' then
+    return {0, 0, '0'}
+  end
+  local ea = parse_exhausted(v)
+  if ea then
+    return {0, tonumber(ea), '0'}
+  end
+  local dl, a = parse_active(v, 'running')
+  if not dl then dl, a = parse_active(v, 'next_attempt_at') end
+  if dl then
+    -- Protected strictly while now < deadline (exact integer-ms compare).
+    if lt_uint(now, dl) then
+      return {0, tonumber(a), dl}
+    end
+    -- Deadline reached (now >= deadline): eligible. Carry the attempt forward.
+    local na = tonumber(a) + 1
+    redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':'..na..':'..ARGV[4])
+    redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+    return {1, na, '0'}
+  end
+end
+-- Absent/unparseable: a fresh claim starts at attempt 1.
+redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':1:'..ARGV[4])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+return {1, 1, '0'}
+`)
+
+	// finishFailureScript atomically records a failed attempt's retry backoff,
+	// but only when the current ACTIVE marker is STILL owned by the caller's
+	// exact claim (both attempt AND token). A stale owner is a no-op, so it can
+	// never overwrite a newer attempt's marker; a terminal "ok"/exhausted marker
+	// or an absent marker is likewise a no-op (the caller gets recorded=0).
+	// There is deliberately no "preserve the failure anyway" branch: a transition
+	// with no matching live claim is not ours to write.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
+	// ARGV[4] = next-attempt deadline (unix-ms string), ARGV[5] = TTL ms.
+	// Returns 1 when the marker was written, 0 otherwise.
+	finishFailureScript = redis.NewScript(luaInvocationHelpers + `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then return 0 end
+local dl, a, tok = parse_active(v, 'running')
+if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
+if not dl then return 0 end
+if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'next_attempt_at:'..ARGV[4]..':'..a..':'..tok)
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+return 1
+`)
+
+	// markCompleteScript atomically records success, but only when the current
+	// ACTIVE marker is owned by the caller's exact claim (attempt + token).
+	// An already-"ok" marker is an idempotent success (returns 1). A terminal
+	// exhausted marker is preserved (returns 0: success must never downgrade an
+	// exhaustion) and an absent/stale marker is refused (returns 0).
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
+	// ARGV[4] = TTL ms.
+	// Returns 1 when complete (written or already ok), 0 when preserved/refused.
+	markCompleteScript = redis.NewScript(luaInvocationHelpers + `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if v == 'ok' then return 1 end
+if not v then return 0 end
+local dl, a, tok = parse_active(v, 'running')
+if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
+if not dl then return 0 end
+if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'ok')
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`)
+
+	// markExhaustedScript atomically writes the terminal exhausted marker, but
+	// only when the current ACTIVE marker is owned by the caller's exact claim
+	// (attempt + token). The written value retains the claim identity
+	// ("exhausted:<attempt>:<token>") so the later DLQ-persistence upgrade can
+	// CAS the same exhausted claim. "ok"/exhausted/absent markers are preserved
+	// (returns 0).
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
+	// ARGV[4] = TTL ms.
+	// Returns 1 when written, 0 otherwise.
+	markExhaustedScript = redis.NewScript(luaInvocationHelpers + `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then return 0 end
+local dl, a, tok = parse_active(v, 'running')
+if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
+if not dl then return 0 end
+if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
+redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok)
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`)
+
+	// markExhaustedDLQScript upgrades an EXISTING exhausted marker to the
+	// ":dlq" form, but only when its retained identity matches the exhausted
+	// claim (attempt + token). An existing ":dlq" marker is monotonic (returns
+	// 1); "ok"/active/absent markers or a different (newer) exhausted identity
+	// are preserved (returns 0), so a stale XADD outcome can never downgrade a
+	// newer exhausted marker or a success.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field, ARGV[2] = exhausted attempt, ARGV[3] =
+	// exhausted token, ARGV[4] = TTL ms.
+	// Returns 1 when the exhausted marker already/now records the DLQ, 0 else.
+	markExhaustedDLQScript = redis.NewScript(luaInvocationHelpers + `
+local v = redis.call('HGET', KEYS[1], ARGV[1])
+if not v then return 0 end
+local a, tok, dlq = parse_exhausted(v)
+if not a then return 0 end
+if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
+if dlq then return 1 end
+redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok..':dlq')
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+return 1
+`)
+
+	// claimClassificationScript atomically claims the one-time event
+	// classification with HSETNX and refreshes the TTL only when it actually
+	// wrote the field.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = classification field, ARGV[2] = TTL ms.
+	claimClassificationScript = redis.NewScript(`
+local set = redis.call('HSETNX', KEYS[1], ARGV[1], '1')
+if set == 1 then
+  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return set
+`)
+
+	// recordTraceScript atomically persists the compact trace lineage sibling
+	// field and refreshes the TTL in the same step.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = trace field, ARGV[2] = lineage, ARGV[3] = TTL ms.
+	recordTraceScript = redis.NewScript(`
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
+return 1
+`)
+)
 
 // invocationStateKey returns the Redis key holding a message's invocation-state
 // hash. The key is scoped by stream and group so multiple groups/consumers
@@ -82,46 +416,71 @@ const (
 
 // invocationStateStore is the per-message invocation-state persistence seam:
 // the concrete *invocationStore implements it against Redis; tests may
-// substitute a fake.
+// substitute a fake. Every active-claim-originated transition takes the
+// InvocationClaim returned by tryStart and CASes attempt+token against the
+// current ACTIVE marker; a mismatch is returned as an explicit stale result
+// (false), never a Redis error.
 type invocationStateStore interface {
 	completed(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
-	markComplete(ctx context.Context, stream, group, msgID, invocation string) error
+	// tryStart atomically claims the invocation for a new execution when
+	// eligible. On success it returns (started=true, claim) where claim carries
+	// the confirmed attempt and a fresh opaque token. When not started, claim is
+	// the existing marker's attempt (0 for "ok", the exhausted attempt for an
+	// exhausted marker) and wait>0 while the invocation is protected by an active
+	// deadline (0 when terminal).
 	tryStart(
 		ctx context.Context,
 		stream, group, msgID, invocation string,
 		now, deadline time.Time,
-	) (started bool, attempt int, wait time.Duration, err error)
+	) (started bool, claim InvocationClaim, wait time.Duration, err error)
+	// finishFailure CASes the caller's claim against the current active marker
+	// and, on a match, writes the retry backoff marker at now+backoff. It returns
+	// ok=false (an explicit stale/terminal result, never an error) when the claim
+	// no longer owns the marker.
 	finishFailure(
 		ctx context.Context,
 		stream, group, msgID, invocation string,
+		claim InvocationClaim,
 		backoff time.Duration,
 		now time.Time,
-	) (time.Time, error)
-	markExhausted(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
-	// markExhaustedDLQ upgrades an exhausted invocation's marker to the
-	// terminal "exhausted:<attempts>:dlq" form, recording that this
-	// invocation's DLQ entry has been persisted. It is written only after a
-	// successful XADD so a redelivery (e.g. after an XACK failure) can skip the
-	// write idempotently instead of duplicating the entry.
-	markExhaustedDLQ(ctx context.Context, stream, group, msgID, invocation string, attempts int) error
-	// exhaustedPersisted reports whether the invocation's marker already records
-	// a persisted DLQ entry ("exhausted:<attempts>:dlq"). It lets routeToDLQ
-	// skip an invocation whose entry was already written on a previous delivery,
-	// so a partial multi-entry write is completed without duplicating the
-	// entries that succeeded.
-	exhaustedPersisted(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
+	) (ok bool, err error)
+	// markComplete CASes the caller's claim against the current active marker
+	// and, on a match, writes the terminal "ok". It returns false (an explicit
+	// stale/refused result, never an error) when the marker is no longer owned
+	// by the claim or is already exhausted.
+	markComplete(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
+	// markExhausted CASes the caller's claim against the current active marker
+	// and, on a match, writes "exhausted:<attempt>:<token>" (the claim identity
+	// is retained so the later DLQ upgrade can CAS it). It returns false when the
+	// marker is not owned by the claim.
+	markExhausted(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
+	// markExhaustedDLQ upgrades an EXISTING exhausted marker matching the given
+	// exhausted claim (attempt+token) to the terminal "...:dlq" form, recording
+	// that this invocation's DLQ entry has been persisted. It is written only
+	// after a successful XADD so a redelivery (e.g. after an XACK failure) can
+	// skip the write idempotently. It never downgrades a newer exhausted marker
+	// or a success.
+	markExhaustedDLQ(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
+	// exhaustedState reads the invocation's exhausted marker, returning its
+	// retained claim identity and whether its DLQ entry is already persisted. It
+	// lets routeToDLQ skip an invocation whose entry was already written AND
+	// supply the exact claim identity to the DLQ-upgrade CAS, so a partial
+	// multi-entry write is completed without duplicating the entries that
+	// succeeded and without downgrading a newer state.
+	exhaustedState(ctx context.Context, stream, group, msgID, invocation string) (claim InvocationClaim, dlq bool, ok bool, err error)
 	terminal(ctx context.Context, stream, group, msgID, invocation string) (bool, error)
 	// claimClassification atomically claims the one-time event classification
-	// for this message (HSETNX on a reserved field). It returns true only for
-	// the first caller across redeliveries and replicas.
+	// for this message (an atomic Lua HSETNX on a reserved field). It returns
+	// true only for the first caller across redeliveries and replicas.
 	claimClassification(ctx context.Context, stream, group, msgID string) (bool, error)
 	// traceReference returns the compact trace lineage persisted for this
 	// invocation by its most recent attempt (see RecordTrace), or "" when none
 	// was ever recorded. redis.Nil (field absent) is ("", nil).
 	traceReference(ctx context.Context, stream, group, msgID, invocation string) (string, error)
-	// recordTrace persists the compact trace lineage of this invocation's most
-	// recent attempt under a reserved sibling field, refreshing the TTL in the
-	// same pipeline. It never disturbs the invocation's lifecycle value.
+	// recordTrace atomically persists the compact trace lineage of this
+	// invocation's most recent attempt under a reserved sibling field,
+	// refreshing the TTL in the same script. It never disturbs the invocation's
+	// lifecycle value.
 	recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error
 	clear(ctx context.Context, stream, group, msgID string) error
 }
@@ -154,26 +513,36 @@ func traceField(invocation string) string {
 // to a short value describing that invocation's lifecycle for this message.
 //
 // The value grammar (a single string, so the same field convention stays
-// greppable and forward-compatible):
+// greppable and forward-compatible). Deadlines are integer Unix MILLISECONDS;
+// tokens are opaque crypto-random hex and are never logged, metricked, or
+// written to the DLQ:
 //
-//	"ok"                          → completed on a previous delivery
-//	"running:<dl>#<attempts>"     → an attempt is (or was) executing, protected
-//	                                until the absolute Unix-nano deadline <dl>;
-//	                                <attempts> is the 1-based attempt number
-//	"next_attempt_at:<dl>#<attempts>" → a failed attempt is waiting out its retry
-//	                                backoff, protected until <dl>
-//	"exhausted:<attempts>"         → attempts exhausted; terminal, never eligible,
-//	                                DLQ entry NOT yet persisted
-//	"exhausted:<attempts>:dlq"     → attempts exhausted AND this invocation's DLQ
-//	                                entry has been persisted; terminal, never
-//	                                eligible, and never re-written to the DLQ
-//	(absent)                      → eligible to execute
+//	"ok"                                        → completed on a previous delivery
+//	"running:<deadline_ms>:<attempt>:<token>"   → an attempt is (or was)
+//	                                executing, protected until the absolute
+//	                                Unix-ms deadline <deadline_ms>; <attempt> is
+//	                                the 1-based handler attempt; <token> is the
+//	                                opaque claim identity
+//	"next_attempt_at:<deadline_ms>:<attempt>:<token>" → a failed attempt is
+//	                                waiting out its retry backoff, protected
+//	                                until <deadline_ms>; <token> is retained so
+//	                                only this claim may write the next state
+//	"exhausted:<attempt>:<token>"               → attempts exhausted; terminal,
+//	                                never eligible, DLQ entry NOT yet persisted;
+//	                                the claim identity is retained so the DLQ
+//	                                upgrade can CAS it
+//	"exhausted:<attempt>:<token>:dlq"           → attempts exhausted AND this
+//	                                invocation's DLQ entry has been persisted;
+//	                                terminal, never eligible, and never re-written
+//	                                to the DLQ
+//	(absent)                                    → eligible to execute
 //
-// "ok" stays bare because attempts are no longer needed after completion. Any
-// value that does not parse under this grammar is treated as eligible.
+// "ok" stays bare because attempts/identity are no longer needed after
+// completion. Any value that does not parse under this grammar is treated as
+// eligible.
 //
 // The ":dlq" suffix records per-invocation DLQ persistence without scanning the
-// DLQ stream: routeToDLQ consults it (exhaustedPersisted) to skip an invocation
+// DLQ stream: routeToDLQ consults it (exhaustedState) to skip an invocation
 // whose entry was already written, which makes retrying a partially-written
 // multi-entry DLQ (after an XACK failure or crash) idempotent.
 //
@@ -226,52 +595,69 @@ func (store *invocationStore) terminal(
 	return kind == kindComplete || kind == kindExhausted, nil
 }
 
-// markComplete records that the invocation completed for this message. HSET and
-// EXPIRE are pipelined so the TTL is refreshed on every write without an extra
-// round trip. Writing "ok" overwrites any "running:<...>" or
-// "next_attempt_at:<...>" marker the same invocation carried, so a successful
-// attempt atomically transitions the field from protected to complete.
+// markComplete records that the invocation completed for this message via an
+// atomic Lua script, CASed against the caller's claim (attempt + token). It
+// writes "ok" only when the current ACTIVE marker is still owned by that exact
+// claim, and treats an already-"ok" marker as an idempotent success. It
+// deliberately PRESERVES an exhausted marker (":dlq" or not) and refuses a stale
+// claim: success must never downgrade an exhaustion (that would re-open a
+// terminal invocation and could resurrect a message already routed to the DLQ)
+// and a stale owner must never overwrite a newer attempt. It returns false for
+// both refusals (an explicit stale result, never a Redis error). The HSET and
+// PEXPIRE happen in the same script, so the field is never mutated without
+// refreshing the TTL.
 func (store *invocationStore) markComplete(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
-) error {
+	claim InvocationClaim,
+) (bool, error) {
+	if !claim.valid() {
+		return false, nil
+	}
 	key := invocationStateKey(stream, group, msgID)
-	pipe := store.client.Pipeline()
-	pipe.HSet(ctx, key, invocation, "ok")
-	pipe.Expire(ctx, key, invocationStateTTL)
-	_, err := pipe.Exec(ctx)
-	return err
+	ok, err := markCompleteScript.Run(ctx, store.client, []string{key},
+		invocation,
+		claim.Attempt,
+		claim.Token,
+		ttlMillis(invocationStateTTL),
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return ok == 1, nil
 }
 
-// tryStart attempts to claim the invocation for a new execution. It reads the
-// current field value and decides eligibility:
+// tryStart attempts to claim the invocation for a new execution via one atomic
+// Lua script. Go generates a crypto-random claim token BEFORE the EVAL; the
+// script checks eligibility, then writes "running:<deadline_ms>:<n>:<token>" and
+// PEXPIREs with a TTL that covers the deadline, all in the SAME script. So
+// concurrent callers cannot both observe an absent/expired marker: exactly one
+// EVAL claims it (with its unique token), and every other caller sees the new
+// running marker and is protected (started=false, wait>0). There is no separate
+// TTL command, so a claim can never be left without a TTL.
 //
-//	"ok"            → already complete; not started (attempt 0, no wait)
-//	"exhausted:<n>" → attempts exhausted; not started (attempt n, no wait)
-//	"running:<dl>#<n>" with now < dl → a protected attempt is in flight (this or
-//	                  another replica); not started, wait = dl - now
-//	"next_attempt_at:<dl>#<n>" with now < dl → a failed attempt is waiting out its
-//	                  backoff; not started, wait = dl - now
-//	absent, expired, or unparseable → eligible: HSET "running:<deadline>#<n+1>"
-//	                  and report started with attempt n+1
+// Eligibility is exact integer-millisecond: a running/next_attempt_at marker is
+// protected iff now_ms < deadline_ms and eligible iff now_ms >= deadline_ms,
+// compared as decimal strings in Lua (no floating point, no clock-skew fudge).
 //
-// The decision is read-then-write (atomic-ish): two replicas can both read
-// "absent" and both start, which is safe under at-least-once (duplicates are
-// allowed; handlers must be idempotent). The deadline is the absolute time at
-// which the attempt is considered abandoned, so a crashed worker's marker
-// self-expires and recovery waits it out rather than racing the live attempt.
+// The decision outcomes:
 //
-// An attempt is protected until the deadline minus clockSkewTolerance: the
-// tolerance absorbs cross-replica clock skew in the safe direction. A slightly
-// fast replica writes an inflated deadline; a slower replica evaluating later
-// would otherwise see it still-active longer than intended. Treating a marker
-// as expired slightly early costs at most one extra attempt of overlap within
-// the tolerance (allowed under at-least-once, and handlers are idempotent),
-// while never lengthening the protected window by unbounded skew. The
-// tolerance must stay far smaller than the minimum sensible handler timeout.
+//	"ok"                         → already complete; not started (attempt 0, no wait)
+//	"exhausted:<n>:<token>"      → attempts exhausted; not started (attempt n, no wait)
+//	"running|next_attempt_at:<dl_ms>:<n>:<token>" with now < dl
+//	                             → a protected attempt is in flight or waiting
+//	                               out its backoff; not started, wait = dl-now (ms)
+//	absent, expired, or unparseable → eligible: claim with a fresh token at
+//	                               attempt n+1 (or 1) and report started
+//
+// A new claim token is generated with crypto/rand; a generation failure is
+// returned (NOT failed open) so the runner leaves the message pending rather
+// than execute under an unverifiable claim. A transport error is likewise
+// returned: the claim outcome is genuinely unknown, so the runner must leave the
+// message pending rather than run an ambiguous duplicate.
 func (store *invocationStore) tryStart(
 	ctx context.Context,
 	stream,
@@ -280,162 +666,195 @@ func (store *invocationStore) tryStart(
 	invocation string,
 	now,
 	deadline time.Time,
-) (started bool, attempt int, wait time.Duration, err error) {
+) (started bool, claim InvocationClaim, wait time.Duration, err error) {
+	token, err := newClaimToken()
+	if err != nil {
+		return false, InvocationClaim{}, 0, err
+	}
 	key := invocationStateKey(stream, group, msgID)
-	value, err := store.client.HGet(ctx, key, invocation).Result()
-	if err == redis.Nil {
-		// Field absent: eligible.
-	} else if err != nil {
-		return false, 0, 0, err
-	} else {
-		kind, dl, n, ok := parseInvocationState(value)
-		if !ok {
-			// Unparseable: eligible.
-		} else {
-			switch kind {
-			case kindComplete:
-				return false, 0, 0, nil
-			case kindExhausted:
-				return false, n, 0, nil
-			case kindRunning, kindNextAttempt:
-				if now.Add(-clockSkewTolerance).Before(dl) {
-					// Protected until dl (minus the clock-skew tolerance, so a
-					// slightly-fast replica's inflated deadline does not block a
-					// slower replica beyond the intended window).
-					return false, n, dl.Sub(now), nil
-				}
-				// Expired: eligible, carrying the attempt count forward.
-				attempt = n
-			default:
-				// kindEligible: eligible.
-			}
+	res, err := tryStartScript.Run(ctx, store.client, []string{key},
+		invocation,
+		strconv.FormatInt(now.UnixMilli(), 10),
+		strconv.FormatInt(deadline.UnixMilli(), 10),
+		token,
+		ttlMillis(activeTTL(now, deadline)),
+	).Slice()
+	if err != nil {
+		return false, InvocationClaim{}, 0, err
+	}
+	if len(res) < 3 {
+		// The script always returns three elements; a short reply is a protocol
+		// violation, so treat the claim as unconfirmed rather than guess.
+		return false, InvocationClaim{}, 0, fmt.Errorf("tryStart: unexpected script reply of length %d", len(res))
+	}
+	started = toInt64(res[0]) == 1
+	attempt := int(toInt64(res[1]))
+	if started {
+		claim = InvocationClaim{Attempt: attempt, Token: token}
+		return true, claim, 0, nil
+	}
+	// Not started: the reply carries the existing marker's attempt and, when
+	// protected, its deadline (as a millisecond string) for the exact wait.
+	claim = InvocationClaim{Attempt: attempt}
+	dlStr, ok := res[2].(string)
+	if !ok {
+		return false, claim, 0, fmt.Errorf("tryStart: unexpected deadline reply type %T", res[2])
+	}
+	if dlStr != "0" {
+		dlMs, perr := strconv.ParseInt(dlStr, 10, 64)
+		if perr != nil {
+			return false, claim, 0, fmt.Errorf("tryStart: bad deadline reply %q: %w", dlStr, perr)
+		}
+		wait = time.Duration(dlMs-now.UnixMilli()) * time.Millisecond
+		if wait < time.Millisecond {
+			wait = time.Millisecond
 		}
 	}
-	// Absent, expired, or unparseable: start a new attempt. HSET + EXPIRE are
-	// pipelined so the TTL is refreshed on the write without an extra round trip.
-	attempt++
-	pipe := store.client.Pipeline()
-	pipe.HSet(ctx, key, invocation, runningValue(deadline, attempt))
-	pipe.Expire(ctx, key, invocationStateTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return false, 0, 0, err
-	}
-	return true, attempt, 0, nil
+	return false, claim, wait, nil
 }
 
-// finishFailure records a failed attempt by persisting a "next_attempt_at"
-// marker so the invocation is gated by its retry backoff until the returned
-// deadline. It reads the current field to preserve the attempt count (the
-// attempt that just failed), then HSETs the next-attempt marker and refreshes
-// the TTL in a pipeline. If the field went missing (a race), attempts defaults
-// to 1. On a read error it returns the error so the caller can fail open (leave
-// the field as-is, making the invocation eligible immediately — at-least-once).
+// finishFailure records a failed attempt by CASing the caller's claim against
+// the current active marker and, on a match, atomically persisting a
+// "next_attempt_at" marker so the invocation is gated by its retry backoff until
+// now+backoff. The script reads the current marker and:
+//
+//   - writes next_attempt_at ONLY when the current running/next-attempt marker
+//     is owned by the caller's exact claim (attempt AND token). A stale owner
+//     whose running lease expired and whose invocation was re-claimed by a newer
+//     claim CASes against a different attempt/token and is a no-op, so it can
+//     never overwrite the newer marker;
+//   - preserves a terminal "ok" or exhausted marker, and an absent/unparseable
+//     marker, as a no-op (returns false);
+//
+// The returned bool reports whether the transition was applied. A false is an
+// explicit stale/terminal result, NOT a Redis error. The HSET and PEXPIRE happen
+// in the same script, and the TTL covers the retry deadline, so the marker is
+// never left without a TTL and can never expire before its deadline. A transport
+// error is returned so the caller can leave the field as-is (immediately
+// eligible — at-least-once).
 func (store *invocationStore) finishFailure(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
+	claim InvocationClaim,
 	backoff time.Duration,
 	now time.Time,
-) (nextDeadline time.Time, err error) {
+) (bool, error) {
+	if !claim.valid() {
+		return false, nil
+	}
 	key := invocationStateKey(stream, group, msgID)
-	value, err := store.client.HGet(ctx, key, invocation).Result()
-	if err == redis.Nil {
-		// Field missing (race): treat as attempt 1.
-		value = ""
-	} else if err != nil {
-		return time.Time{}, err
+	next := now.Add(backoff)
+	ok, err := finishFailureScript.Run(ctx, store.client, []string{key},
+		invocation,
+		claim.Attempt,
+		claim.Token,
+		strconv.FormatInt(next.UnixMilli(), 10),
+		ttlMillis(activeTTL(now, next)),
+	).Int64()
+	if err != nil {
+		return false, err
 	}
-	attempts := 1
-	if kind, _, n, ok := parseInvocationState(value); ok && kind != kindComplete {
-		attempts = n
-	}
-	nextDeadline = now.Add(backoff)
-	pipe := store.client.Pipeline()
-	pipe.HSet(ctx, key, invocation, nextAttemptValue(nextDeadline, attempts))
-	pipe.Expire(ctx, key, invocationStateTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return time.Time{}, err
-	}
-	return nextDeadline, nil
+	return ok == 1, nil
 }
 
-// markExhausted records that the invocation's attempts are exhausted, writing
-// the terminal "exhausted:<attempts>" marker so a redelivery skips it without
-// re-running. HSET + EXPIRE are pipelined. It deliberately does NOT set the
-// ":dlq" suffix: the DLQ entry has not been persisted yet. If this write
-// overwrites a marker that already carried ":dlq" (e.g. a concurrent
-// redelivery raced a completed DLQ write), the suffix is lost and the entry is
-// re-written on redelivery; that is the at-least-once duplicate window, not a
-// correctness loss.
+// markExhausted records that the invocation's attempts are exhausted via the
+// atomic markExhausted script, CASed against the caller's claim (attempt +
+// token). It writes the terminal "exhausted:<attempt>:<token>" marker (retaining
+// the claim identity for the later DLQ upgrade) so a redelivery skips it without
+// re-running, but deliberately does NOT add the ":dlq" suffix: the DLQ entry has
+// not been persisted yet. A terminal/already-ok/absent marker, or a stale claim,
+// is a no-op (returns false). It returns false for those refusals (an explicit
+// stale result, never a Redis error).
 func (store *invocationStore) markExhausted(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
-	attempts int,
-) error {
-	return store.writeExhausted(ctx, stream, group, msgID, invocation, attempts, false)
+	claim InvocationClaim,
+) (bool, error) {
+	if !claim.valid() {
+		return false, nil
+	}
+	key := invocationStateKey(stream, group, msgID)
+	ok, err := markExhaustedScript.Run(ctx, store.client, []string{key},
+		invocation,
+		claim.Attempt,
+		claim.Token,
+		ttlMillis(invocationStateTTL),
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return ok == 1, nil
 }
 
 // markExhaustedDLQ upgrades the invocation's exhausted marker to
-// "exhausted:<attempts>:dlq", recording that its DLQ entry has been persisted.
-// HSET + EXPIRE are pipelined. It is called only AFTER a successful XADD, so a
-// later redelivery can skip the (already-written) entry without scanning the
-// DLQ stream.
+// "exhausted:<attempt>:<token>:dlq" via the atomic markExhaustedDLQ script,
+// recording that its DLQ entry has been persisted. It CASes the retained
+// exhausted identity (attempt + token) so a stale XADD outcome can never
+// downgrade a newer exhausted marker or a success: only the exact exhausted
+// claim that owns the marker is upgraded. It is called only AFTER a successful
+// XADD, so a later redelivery can skip the (already-written) entry without
+// scanning the DLQ stream. An existing ":dlq" marker returns true (monotonic);
+// "ok"/active/absent/other-identity markers return false.
 func (store *invocationStore) markExhaustedDLQ(
 	ctx context.Context,
 	stream,
 	group,
 	msgID,
 	invocation string,
-	attempts int,
-) error {
-	return store.writeExhausted(ctx, stream, group, msgID, invocation, attempts, true)
-}
-
-// writeExhausted writes the terminal exhausted marker, optionally with the
-// ":dlq" persistence suffix, refreshing the TTL in the same pipeline.
-func (store *invocationStore) writeExhausted(
-	ctx context.Context,
-	stream,
-	group,
-	msgID,
-	invocation string,
-	attempts int,
-	dlqPersisted bool,
-) error {
-	key := invocationStateKey(stream, group, msgID)
-	pipe := store.client.Pipeline()
-	pipe.HSet(ctx, key, invocation, exhaustedValue(attempts, dlqPersisted))
-	pipe.Expire(ctx, key, invocationStateTTL)
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
-// exhaustedPersisted reports whether the invocation's marker already records a
-// persisted DLQ entry ("exhausted:<attempts>:dlq"). redis.Nil (field absent)
-// and any other exhausted marker (without the suffix) return false, so the
-// entry is (re-)written. A read error returns (false, err); the caller fails
-// safe by treating the entry as not persisted (a duplicate is allowed under
-// at-least-once, while skipping a required write would lose the entry).
-func (store *invocationStore) exhaustedPersisted(
-	ctx context.Context,
-	stream,
-	group,
-	msgID,
-	invocation string,
+	claim InvocationClaim,
 ) (bool, error) {
-	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
-	if err == redis.Nil {
+	if !claim.valid() {
 		return false, nil
 	}
+	key := invocationStateKey(stream, group, msgID)
+	ok, err := markExhaustedDLQScript.Run(ctx, store.client, []string{key},
+		invocation,
+		claim.Attempt,
+		claim.Token,
+		ttlMillis(invocationStateTTL),
+	).Int64()
 	if err != nil {
 		return false, err
 	}
-	return isExhaustedDLQValue(value), nil
+	return ok == 1, nil
+}
+
+// exhaustedState reads the invocation's exhausted marker, returning its retained
+// claim identity (attempt + token), whether its DLQ entry is already persisted
+// (the ":dlq" suffix), and whether a well-formed exhausted marker was present.
+// redis.Nil (field absent) and any non-exhausted marker return ok=false.
+//
+// It serves routeToDLQ twice: the dlq flag lets it skip an invocation whose
+// entry was already written, and the retained claim identity is the exact CAS
+// key for the subsequent markExhaustedDLQ upgrade, so a stale/foreign marker can
+// never be upgraded. A read error returns (zero, false, false, err); the caller
+// fails safe by treating the entry as not persisted (a duplicate is allowed
+// under at-least-once, while skipping a required write would lose the entry).
+func (store *invocationStore) exhaustedState(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+) (claim InvocationClaim, dlq bool, ok bool, err error) {
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), invocation).Result()
+	if err == redis.Nil {
+		return InvocationClaim{}, false, false, nil
+	}
+	if err != nil {
+		return InvocationClaim{}, false, false, err
+	}
+	exClaim, dlq, ok := parseExhaustedValue(value)
+	if !ok {
+		return InvocationClaim{}, false, false, nil
+	}
+	return exClaim, dlq, true, nil
 }
 
 // clear deletes the message's invocation-state hash entirely. It is called
@@ -446,14 +865,14 @@ func (store *invocationStore) clear(ctx context.Context, stream, group, msgID st
 }
 
 // claimClassification atomically claims this message's one-time logical-event
-// classification. It uses HSETNX on the reserved classificationField, which is
-// atomic in Redis: exactly one caller (across redeliveries, reclaims, and
+// classification. It uses an atomic Lua script around HSETNX on the reserved
+// classificationField: exactly one caller (across redeliveries, reclaims, and
 // replicas) receives true and therefore counts the event once; every later
 // delivery of the same message sees the field present and receives false. The
 // claim is written before the runner classifies, so a crash between the claim
 // and the metric increment can only LOSE a count for that event — it can never
-// double-count one. The TTL is refreshed alongside the write so the claim is
-// cleaned up with the rest of the message's invocation state.
+// double-count one. The TTL is refreshed in the same script, but only when the
+// claim actually wrote the field, so repeated losers add no writes.
 //
 // The claim lives and dies with the message's invocation-state hash: terminal
 // paths (successful ACK or DLQ routing) clear that hash only after the message
@@ -468,13 +887,14 @@ func (store *invocationStore) clear(ctx context.Context, stream, group, msgID st
 // partition counts, not at-least-once accounting.
 func (store *invocationStore) claimClassification(ctx context.Context, stream, group, msgID string) (bool, error) {
 	key := invocationStateKey(stream, group, msgID)
-	pipe := store.client.Pipeline()
-	set := pipe.HSetNX(ctx, key, classificationField, "1")
-	pipe.Expire(ctx, key, invocationStateTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
+	set, err := claimClassificationScript.Run(ctx, store.client, []string{key},
+		classificationField,
+		int64(invocationStateTTL/time.Millisecond),
+	).Int()
+	if err != nil {
 		return false, err
 	}
-	return set.Val(), nil
+	return set == 1, nil
 }
 
 // traceReference reads the compact trace lineage recorded for this invocation by
@@ -493,62 +913,151 @@ func (store *invocationStore) traceReference(ctx context.Context, stream, group,
 }
 
 // recordTrace persists the compact trace lineage of this invocation's most
-// recent attempt under the reserved sibling field. HSET + EXPIRE are pipelined so
-// the TTL is refreshed on the write without an extra round trip, exactly like
-// the lifecycle writes. An empty lineage is a no-op (nothing to record).
+// recent attempt under the reserved sibling field, via one atomic Lua script
+// that also refreshes the TTL. Only the lifecycle hash field is touched; the
+// invocation's lifecycle value is never disturbed. An empty lineage is a no-op
+// (nothing to record).
 func (store *invocationStore) recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error {
 	if lineage == "" {
 		return nil
 	}
 	key := invocationStateKey(stream, group, msgID)
-	pipe := store.client.Pipeline()
-	pipe.HSet(ctx, key, traceField(invocation), lineage)
-	pipe.Expire(ctx, key, invocationStateTTL)
-	_, err := pipe.Exec(ctx)
+	_, err := recordTraceScript.Run(ctx, store.client, []string{key},
+		traceField(invocation),
+		lineage,
+		int64(invocationStateTTL/time.Millisecond),
+	).Int64()
 	return err
 }
 
-// runningValue encodes a protected attempt's absolute deadline and attempt
-// number as the field value "running:<unixnano>#<attempts>". The "running:"
-// prefix distinguishes it from the "ok" completion sentinel; the Unix-nano
-// suffix is the deadline at which the attempt is considered abandoned.
-func runningValue(deadline time.Time, attempts int) string {
-	return "running:" + strconv.FormatInt(deadline.UnixNano(), 10) + "#" + strconv.Itoa(attempts)
+// runningValue encodes a protected attempt as the field value
+// "running:<deadline_ms>:<attempt>:<token>". The "running:" prefix distinguishes
+// it from the "ok" completion sentinel; the deadline is the integer Unix-ms at
+// which the attempt is considered abandoned; the token is the opaque claim
+// identity.
+func runningValue(deadline time.Time, claim InvocationClaim) string {
+	return "running:" + strconv.FormatInt(deadline.UnixMilli(), 10) + ":" +
+		strconv.Itoa(claim.Attempt) + ":" + claim.Token
 }
 
-// nextAttemptValue encodes a failed attempt's retry deadline and attempt number
-// as "next_attempt_at:<unixnano>#<attempts>".
-func nextAttemptValue(deadline time.Time, attempts int) string {
-	return "next_attempt_at:" + strconv.FormatInt(deadline.UnixNano(), 10) + "#" + strconv.Itoa(attempts)
+// nextAttemptValue encodes a failed attempt's retry deadline and claim as
+// "next_attempt_at:<deadline_ms>:<attempt>:<token>".
+func nextAttemptValue(deadline time.Time, claim InvocationClaim) string {
+	return "next_attempt_at:" + strconv.FormatInt(deadline.UnixMilli(), 10) + ":" +
+		strconv.Itoa(claim.Attempt) + ":" + claim.Token
 }
 
-// exhaustedValue encodes the terminal exhausted state. With dlqPersisted false
-// it is "exhausted:<attempts>"; with true it appends the ":dlq" suffix
-// ("exhausted:<attempts>:dlq") to record that the invocation's DLQ entry has
-// been persisted.
-func exhaustedValue(attempts int, dlqPersisted bool) string {
-	value := "exhausted:" + strconv.Itoa(attempts)
+// exhaustedValue encodes the terminal exhausted state, retaining the exhausted
+// claim's attempt and token so the later DLQ upgrade can CAS it. With
+// dlqPersisted false it is "exhausted:<attempt>:<token>"; with true it appends
+// the ":dlq" suffix.
+func exhaustedValue(claim InvocationClaim, dlqPersisted bool) string {
+	value := "exhausted:" + strconv.Itoa(claim.Attempt) + ":" + claim.Token
 	if dlqPersisted {
 		value += ":dlq"
 	}
 	return value
 }
 
-// isExhaustedDLQValue reports whether v is exactly the valid
-// "exhausted:<attempts>:dlq" marker (attempts >= 1), i.e. the invocation's DLQ
-// entry has been persisted. It is strict so a corrupt or near-miss marker can
-// never be mistaken for a persisted entry and cause a required DLQ write to be
-// skipped.
-func isExhaustedDLQValue(v string) bool {
-	if !strings.HasPrefix(v, "exhausted:") || !strings.HasSuffix(v, ":dlq") {
+// validClaimToken reports whether tok is a well-formed claim token: a non-empty
+// run of lowercase hex digits, matching the Lua parser's [0-9a-f]+ (tokens are
+// generated by newClaimToken). It is strict so a corrupt token can never be
+// mistaken for a real claim.
+func validClaimToken(tok string) bool {
+	if tok == "" {
 		return false
 	}
-	n, err := strconv.Atoi(strings.TrimSuffix(v[len("exhausted:"):], ":dlq"))
-	return err == nil && n >= 1
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return len(tok) <= 64
+}
+
+// isExhaustedDLQValue reports whether v is a valid "exhausted:<attempt>:<token>:dlq"
+// marker (attempt >= 1, well-formed token), i.e. the invocation's DLQ entry has
+// been persisted. It is strict so a corrupt or near-miss marker can never be
+// mistaken for a persisted entry and cause a required DLQ write to be skipped.
+func isExhaustedDLQValue(v string) bool {
+	_, dlq, ok := parseExhaustedValue(v)
+	return ok && dlq
+}
+
+// parseExhaustedValue parses "exhausted:<attempt>:<token>[:dlq]" into its claim
+// and DLQ-persistence flag. ok=false for any malformed value.
+func parseExhaustedValue(v string) (claim InvocationClaim, dlq bool, ok bool) {
+	rest, found := strings.CutPrefix(v, "exhausted:")
+	if !found {
+		return InvocationClaim{}, false, false
+	}
+	if suffix, trimmed := strings.CutSuffix(rest, ":dlq"); trimmed {
+		rest = suffix
+		dlq = true
+	}
+	attemptStr, token, found := strings.Cut(rest, ":")
+	if !found {
+		return InvocationClaim{}, false, false
+	}
+	if !canonicalUint(attemptStr) {
+		return InvocationClaim{}, false, false
+	}
+	n, err := strconv.Atoi(attemptStr)
+	if err != nil || n < 1 || !validClaimToken(token) {
+		return InvocationClaim{}, false, false
+	}
+	return InvocationClaim{Attempt: n, Token: token}, dlq, true
+}
+
+// parseActiveValue parses "<deadline_ms>:<attempt>:<token>" (the suffix after a
+// "running:"/"next_attempt_at:" prefix) into its deadline and claim. ok=false
+// for any malformed value.
+func parseActiveValue(s string) (deadline time.Time, claim InvocationClaim, ok bool) {
+	dlStr, rest, found := strings.Cut(s, ":")
+	if !found {
+		return time.Time{}, InvocationClaim{}, false
+	}
+	attemptStr, token, found := strings.Cut(rest, ":")
+	if !found {
+		return time.Time{}, InvocationClaim{}, false
+	}
+	if !canonicalUint(dlStr) {
+		return time.Time{}, InvocationClaim{}, false
+	}
+	dlMs, err := strconv.ParseInt(dlStr, 10, 64)
+	if err != nil {
+		return time.Time{}, InvocationClaim{}, false
+	}
+	n, err := strconv.Atoi(attemptStr)
+	if err != nil || n < 1 || !validClaimToken(token) {
+		return time.Time{}, InvocationClaim{}, false
+	}
+	return time.UnixMilli(dlMs), InvocationClaim{Attempt: n, Token: token}, true
+}
+
+// canonicalUint reports whether s is a canonical non-negative decimal integer:
+// a non-empty run of digits with no leading zero (so "0" is canonical, "01" is
+// not). The Lua eligibility compare (lt_uint) is exact only for canonical
+// values, so the Go parser rejects non-canonical deadlines too, keeping the two
+// sides consistent and treating a corrupt deadline as eligible.
+func canonicalUint(s string) bool {
+	if s == "" {
+		return false
+	}
+	if len(s) > 1 && s[0] == '0' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseInvocationState decodes a field value into its kind, deadline (for
-// running/next-attempt markers), and attempt count. It returns ok=false for any
+// active markers), and the claim's attempt count. It returns ok=false for any
 // value that is not a well-formed marker (e.g. a corrupt marker), which the
 // caller treats as eligible.
 func parseInvocationState(v string) (kind invocationKind, deadline time.Time, attempts int, ok bool) {
@@ -556,45 +1065,26 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 	case v == "ok":
 		return kindComplete, time.Time{}, 0, true
 	case strings.HasPrefix(v, "running:"):
-		dl, n, ok := parseDeadlineAttempts(v[len("running:"):])
+		dl, claim, ok := parseActiveValue(v[len("running:"):])
 		if !ok {
 			return kindEligible, time.Time{}, 0, false
 		}
-		return kindRunning, dl, n, true
+		return kindRunning, dl, claim.Attempt, true
 	case strings.HasPrefix(v, "next_attempt_at:"):
-		dl, n, ok := parseDeadlineAttempts(v[len("next_attempt_at:"):])
+		dl, claim, ok := parseActiveValue(v[len("next_attempt_at:"):])
 		if !ok {
 			return kindEligible, time.Time{}, 0, false
 		}
-		return kindNextAttempt, dl, n, true
+		return kindNextAttempt, dl, claim.Attempt, true
 	case strings.HasPrefix(v, "exhausted:"):
-		// The attempts part is mandatory; an optional ":dlq" suffix records
-		// that the invocation's DLQ entry has been persisted. Both forms parse
-		// to kindExhausted with the same attempt count.
-		attemptsStr := strings.TrimSuffix(v[len("exhausted:"):], ":dlq")
-		n, err := strconv.Atoi(attemptsStr)
-		if err != nil || n < 1 {
+		claim, _, ok := parseExhaustedValue(v)
+		if !ok {
 			return kindEligible, time.Time{}, 0, false
 		}
-		return kindExhausted, time.Time{}, n, true
+		return kindExhausted, time.Time{}, claim.Attempt, true
 	default:
 		return kindEligible, time.Time{}, 0, false
 	}
-}
-
-// parseDeadlineAttempts parses "<unixnano>#<attempts>". The attempt count is
-// mandatory: a marker without it does not parse (treated as eligible).
-func parseDeadlineAttempts(s string) (time.Time, int, bool) {
-	dlStr, attemptsStr, hasHash := strings.Cut(s, "#")
-	n, err := strconv.ParseInt(dlStr, 10, 64)
-	if err != nil || !hasHash {
-		return time.Time{}, 0, false
-	}
-	a, err := strconv.Atoi(attemptsStr)
-	if err != nil || a < 1 {
-		return time.Time{}, 0, false
-	}
-	return time.Unix(0, n), a, true
 }
 
 // InvocationState is the read/write view of a single message's invocation
@@ -602,34 +1092,66 @@ func parseDeadlineAttempts(s string) (time.Time, int, bool) {
 // execute an invocation. The invocation argument is the full
 // "<function>/<handler>" ID; the stream layer never parses it.
 //
-// The lifecycle of a single invocation's field value:
+// The lifecycle of a single invocation's field value (deadlines are integer
+// Unix milliseconds; tokens are opaque claim identities):
 //
-//	attempt starts  → "running:<deadline>#<n>"        (TryStart)
-//	completes       → "ok"                            (MarkComplete, overwrites)
-//	fails (retry)   → "next_attempt_at:<deadline>#<n>" (RecordFailure)
-//	exhausted       → "exhausted:<n>"                 (MarkExhausted)
+//	attempt starts  → "running:<deadline_ms>:<n>:<token>"   (TryStart, atomic claim)
+//	completes       → "ok"                                  (MarkComplete, CASed on the claim)
+//	fails (retry)   → "next_attempt_at:<deadline_ms>:<n>:<token>" (RecordFailure, same claim)
+//	exhausted       → "exhausted:<n>:<token>"               (MarkExhausted, CASed on the claim)
+//	DLQ persisted   → "exhausted:<n>:<token>:dlq"           (MarkExhaustedDLQ, CASed on the exhausted claim)
 //
-// A crash mid-attempt leaves "running:<deadline>#<n>", which self-expires at
-// its deadline; recovery waits it out (bounded staleness of at most one
-// timeout). A failed attempt's "next_attempt_at" marker similarly self-expires
-// if the worker crashes before the message is reclaimed.
+// A crash mid-attempt leaves "running:<deadline_ms>:<n>:<token>", which
+// self-expires at its deadline; recovery waits it out (bounded staleness of at
+// most one timeout) and then reclaims it as attempt n+1 with a FRESH token. A
+// failed attempt's "next_attempt_at" marker similarly self-expires if the worker
+// crashes before the message is reclaimed. Terminal "ok" and exhausted markers
+// are never re-opened, and every transition that originates from an active claim
+// CASes BOTH the attempt and the token, so a stale owner can never overwrite a
+// newer claim's marker even if the attempt count happens to match.
 type InvocationState interface {
 	IsComplete(invocation string) bool
-	MarkComplete(invocation string)
+	// MarkComplete records the invocation complete, CASed on the claim returned
+	// by the successful TryStart. It returns true when the invocation is
+	// complete (written, or already "ok"), false when the claim is stale (a newer
+	// claim owns the marker) or the marker is terminal exhausted (success must
+	// never downgrade an exhaustion). A false result is NOT an error: the caller
+	// treats the invocation as unresolved (leave the message pending) rather than
+	// resolve it on a superseded claim's behalf.
+	MarkComplete(invocation string, claim InvocationClaim) bool
 	// TryStart claims the invocation for a new execution. It returns started
-	// true (with the 1-based attempt number) when the caller should execute,
-	// false otherwise. When not started, wait is the duration until the
-	// invocation becomes eligible again: wait > 0 means it is protected by an
-	// active running deadline or a retry backoff (this or another replica), and
-	// wait == 0 means it is terminal (complete or exhausted) and will never be
-	// eligible again.
-	TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration)
+	// true (with the confirmed InvocationClaim) when the caller should execute,
+	// false otherwise. When not started, claim.Attempt is the existing marker's
+	// attempt (0 for complete, the exhausted attempt for exhausted) and wait is
+	// the duration until the invocation becomes eligible again: wait > 0 means it
+	// is protected by an active running deadline or a retry backoff (this or
+	// another replica), and wait == 0 means it is terminal (complete or
+	// exhausted) and will never be eligible again.
+	//
+	// An error means the claim outcome is UNKNOWN (a Redis/transport error, or a
+	// failure to generate the claim token): the caller MUST leave the message
+	// pending and MUST NOT execute the handler on this delivery. It is
+	// deliberately not failed open, because an ambiguous claim could run a
+	// duplicate of an invocation another replica just claimed.
+	TryStart(invocation string, timeout time.Duration) (started bool, claim InvocationClaim, wait time.Duration, err error)
 	// RecordFailure persists a failed attempt's retry backoff so the invocation
-	// is gated until now+backoff. The attempt count is read from the store.
-	RecordFailure(invocation string, backoff time.Duration)
-	// MarkExhausted records that the invocation's attempts are exhausted,
-	// making it terminal (skipped like complete on redelivery).
-	MarkExhausted(invocation string, attempts int)
+	// is gated until now+backoff. The claim is the one this caller confirmed via
+	// TryStart; the store CASes attempt+token against the active marker so a
+	// stale owner cannot overwrite a newer claim's marker. It returns true when
+	// the backoff marker was written; a false result means the claim is stale or
+	// the marker is terminal (an explicit result, NOT an error), in which case the
+	// message still stays pending for a later delivery to resolve. A write error
+	// is logged only: if the marker is lost, the invocation becomes eligible
+	// immediately (at-least-once).
+	RecordFailure(invocation string, claim InvocationClaim, backoff time.Duration) bool
+	// MarkExhausted records that the invocation's attempts are exhausted, making
+	// it terminal (skipped like complete on redelivery), CASed on the claim
+	// confirmed by the successful TryStart. It returns true when the terminal
+	// marker was written; false when the claim is stale or the marker is already
+	// terminal (an explicit result, NOT an error), so the caller can refuse a
+	// superseded exhaustion and wait for a later delivery instead of
+	// dead-lettering on a stale claim's behalf.
+	MarkExhausted(invocation string, claim InvocationClaim) bool
 	// IsTerminal reports whether the invocation is terminal: complete or
 	// exhausted (never eligible again). It is a read-only check the runner uses
 	// to decide whether a message whose last failing invocation just exhausted
@@ -672,6 +1194,15 @@ type invocationStateContextKey struct{}
 // message whose invocation is still in flight on another replica must not ACK
 // it.
 var ErrInvocationNotEligible = errors.New("invocation not eligible")
+
+// ErrInvocationClaimUnconfirmed is returned (wrapped together with
+// ErrInvocationNotEligible) by the runner when an invocation's claim could not
+// be confirmed because the invocation-state store failed: the claim outcome is
+// genuinely unknown, so the message must stay pending and the handler must NOT
+// run on that delivery. It exists to make a claim failure distinguishable (for
+// logs and tests) from the ordinary protected-skip signal, while preserving the
+// exact same pending/no-ACK contract via the wrapped ErrInvocationNotEligible.
+var ErrInvocationClaimUnconfirmed = errors.New("invocation claim unconfirmed")
 
 // ErrInvocationExhausted is returned (wrapped) by the runner's Handle when a
 // failing invocation's attempts are exhausted AND every other matched invocation
@@ -931,65 +1462,93 @@ func (state *invocationState) RecordTrace(invocation, lineage string) {
 	}
 }
 
-// MarkComplete logs but does not fail the handler on a write error: the message
+// MarkComplete CASes the caller's claim (attempt + token) against the active
+// marker and records completion. It returns true when the invocation is
+// complete (written, or already "ok"), false when the claim is stale or the
+// marker is terminal exhausted. A false result is an explicit stale/refused
+// outcome, not an error. A write error is logged and returns false: the message
 // will simply be re-run later, preserving at-least-once semantics. State
 // bookkeeping must never become a new failure source.
-func (state *invocationState) MarkComplete(invocation string) {
-	if err := state.store.markComplete(state.ctx, state.stream, state.group, state.msgID, invocation); err != nil {
+func (state *invocationState) MarkComplete(invocation string, claim InvocationClaim) bool {
+	ok, err := state.store.markComplete(state.ctx, state.stream, state.group, state.msgID, invocation, claim)
+	if err != nil {
 		state.log.Warn("Invocation state: mark failed; message will be re-run later", "invocation", invocation, "error", err)
+		return false
 	}
+	if !ok {
+		state.log.Debug("Invocation state: completion refused; claim stale or exhausted",
+			"invocation", invocation, "attempt", claim.Attempt)
+	}
+	return ok
 }
 
 // TryStart attempts to claim the invocation for a new execution, persisting the
-// attempt's absolute deadline (now + timeout) as the running marker. It returns
-// started true (with the 1-based attempt number) when the caller should execute,
-// false when the invocation is already complete, exhausted, or protected by an
-// active attempt deadline or retry backoff (this or another replica). When not
-// started, wait is the duration until the invocation becomes eligible again
-// (0 for terminal complete/exhausted).
+// claim's absolute deadline (now + timeout), attempt, and fresh opaque token as
+// the running marker via one atomic script. It returns started true (with the
+// confirmed InvocationClaim) when the caller should execute, false when the
+// invocation is already complete, exhausted, or protected by an active attempt
+// deadline or retry backoff (this or another replica). When not started,
+// claim.Attempt is the existing marker's attempt (0 for complete) and wait is
+// the duration until the invocation becomes eligible again (0 for terminal
+// complete/exhausted).
 //
-// On a Redis error it fails OPEN (returns started=true, no wait): bookkeeping
-// being down must not break at-least-once delivery, and running a duplicate is
-// safe (handlers are idempotent) while never blocking recovery. The attempt
-// number on the fail-open path is best-effort: when the read succeeded but the
-// write failed, the would-be attempt number is returned so the runner's
-// exhaustion decision still advances during a partial outage; when even the
-// read failed, attempt 1 is returned (nothing was known). The persisted
-// deadline matches the local timer by construction: the runner passes the same
-// capped timeout to TryStart and to context.WithTimeout.
-func (state *invocationState) TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration) {
+// On a Redis error it returns the error (NOT failed open): the claim outcome is
+// unknown, so the runner must leave the message pending and not run the handler
+// on this delivery. Running an ambiguous duplicate could race another replica
+// that won the same claim. The returned claim is the zero value on the error
+// path and must not be used to advance handler-attempt accounting.
+func (state *invocationState) TryStart(invocation string, timeout time.Duration) (started bool, claim InvocationClaim, wait time.Duration, err error) {
 	now := state.now()
-	started, attempt, wait, err := state.store.tryStart(state.ctx, state.stream, state.group, state.msgID, invocation, now, now.Add(timeout))
+	started, claim, wait, err = state.store.tryStart(state.ctx, state.stream, state.group, state.msgID, invocation, now, now.Add(timeout))
 	if err != nil {
-		state.log.Debug("Invocation state: try-start failed; failing open (running)", "invocation", invocation, "error", err)
-		if attempt < 1 {
-			attempt = 1
-		}
-		return true, attempt, 0
+		state.log.Debug("Invocation state: try-start failed; claim not confirmed; leaving pending",
+			"invocation", invocation, "error", err)
+		return false, InvocationClaim{}, 0, err
 	}
-	return started, attempt, wait
+	return started, claim, wait, nil
 }
 
 // RecordFailure persists a failed attempt's retry backoff so a later delivery
-// is gated until now+backoff. The attempt count is read from the store. A write
-// error is logged only: if the marker is lost, the invocation becomes eligible
-// immediately (at-least-once), and the message stays pending for a later
-// delivery regardless.
-func (state *invocationState) RecordFailure(invocation string, backoff time.Duration) {
-	next, err := state.store.finishFailure(state.ctx, state.stream, state.group, state.msgID, invocation, backoff, state.now())
+// is gated until now+backoff, returning whether the transition applied. The
+// claim is the one this caller confirmed via TryStart; the store CASes
+// attempt+token against the active marker so a stale owner cannot overwrite a
+// newer claim's marker. A refused (stale/terminal) result is logged at debug and
+// is not an error. A write error is logged and returns false: if the marker is
+// lost, the invocation becomes eligible immediately (at-least-once), and the
+// message stays pending for a later delivery regardless.
+func (state *invocationState) RecordFailure(invocation string, claim InvocationClaim, backoff time.Duration) bool {
+	ok, err := state.store.finishFailure(state.ctx, state.stream, state.group, state.msgID, invocation, claim, backoff, state.now())
 	if err != nil {
 		state.log.Warn("Invocation state: record failure failed; leaving field as-is (eligible immediately)",
 			"invocation", invocation, "error", err)
-		return
+		return false
 	}
-	state.log.Debug("Invocation state: failure recorded; next attempt eligible", "invocation", invocation, "next", next)
+	if !ok {
+		// The marker was terminal (ok/exhausted) or owned by a newer claim: no
+		// state was written (correctly), so nothing to schedule.
+		state.log.Debug("Invocation state: failure not recorded; invocation terminal or superseded",
+			"invocation", invocation, "attempt", claim.Attempt)
+		return false
+	}
+	state.log.Debug("Invocation state: failure recorded; next attempt eligible",
+		"invocation", invocation, "next", state.now().Add(backoff))
+	return true
 }
 
-// MarkExhausted records that the invocation's attempts are exhausted, making
-// it terminal. A write error is logged only: if the marker is lost, a later
+// MarkExhausted records that the invocation's attempts are exhausted, making it
+// terminal, CASed on the caller's claim (attempt + token), returning whether the
+// transition applied. A refused (stale/terminal) result is logged at debug. A
+// write error is logged and returns false: if the marker is lost, a later
 // delivery may re-run the invocation once (at-least-once), which is safe.
-func (state *invocationState) MarkExhausted(invocation string, attempts int) {
-	if err := state.store.markExhausted(state.ctx, state.stream, state.group, state.msgID, invocation, attempts); err != nil {
+func (state *invocationState) MarkExhausted(invocation string, claim InvocationClaim) bool {
+	ok, err := state.store.markExhausted(state.ctx, state.stream, state.group, state.msgID, invocation, claim)
+	if err != nil {
 		state.log.Warn("Invocation state: mark exhausted failed", "invocation", invocation, "error", err)
+		return false
 	}
+	if !ok {
+		state.log.Debug("Invocation state: exhaustion refused; claim stale or terminal",
+			"invocation", invocation, "attempt", claim.Attempt)
+	}
+	return ok
 }

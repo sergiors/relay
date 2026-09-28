@@ -12,6 +12,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,48 @@ import (
 
 const scheduleFnName = "courses"
 const scheduleHandler = "jobs.cleanup.handler"
+
+// markerAttempt extracts the attempt number from a well-formed active/exhausted
+// marker:
+//
+//	"running:<deadline_ms>:<attempt>:<token>"
+//	"next_attempt_at:<deadline_ms>:<attempt>:<token>"
+//	"exhausted:<attempt>:<token>[:dlq]"
+//
+// It returns 0 for a marker it cannot parse, so a test can assert the exact
+// attempt in the value grammar.
+func markerAttempt(v string) int {
+	var rest string
+	switch {
+	case strings.HasPrefix(v, "running:"):
+		rest = strings.TrimPrefix(v, "running:")
+		// <deadline>:<attempt>:<token>
+		_, rest, _ = strings.Cut(rest, ":")
+	case strings.HasPrefix(v, "next_attempt_at:"):
+		rest = strings.TrimPrefix(v, "next_attempt_at:")
+		_, rest, _ = strings.Cut(rest, ":")
+	case strings.HasPrefix(v, "exhausted:"):
+		// <attempt>:<token>[:dlq]
+		rest = strings.TrimPrefix(v, "exhausted:")
+		attempt, _, _ := strings.Cut(rest, ":")
+		n, err := strconv.Atoi(attempt)
+		if err != nil {
+			return 0
+		}
+		return n
+	default:
+		return 0
+	}
+	attempt, _, found := strings.Cut(rest, ":")
+	if !found {
+		return 0
+	}
+	n, err := strconv.Atoi(attempt)
+	if err != nil {
+		return 0
+	}
+	return n
+}
 
 // scheduleOcc builds a schedule occurrence under the fixed function/handler the
 // runner test functions register.
@@ -333,9 +376,9 @@ func redisAvailable(t *testing.T) *redis.Client {
 
 // TestIntegrationScheduleInvocationStateLifecycle drives a schedule message whose
 // first execution fails and the second succeeds. It asserts the lifecycle
-// deterministically: the failure records a next_attempt_at:#1 marker; the
-// redelivery's running marker is made observable by blocking the executor inside
-// the second attempt; and once released, the message is ACKed and its
+// deterministically: the failure records a next_attempt_at marker at attempt 1;
+// the redelivery's running marker is made observable by blocking the executor
+// inside the second attempt; and once released, the message is ACKed and its
 // invocation-state key cleared (the clear only runs after a successful ACK).
 func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 	_ = redisAvailable(t)
@@ -349,9 +392,9 @@ func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 
 	// Delivery 1 fails (attempt 1); the failure is recorded as a next_attempt_at
 	// marker carrying attempt number 1.
-	e.eventually("failure recorded (next_attempt_at marker #1)", func() bool {
+	e.eventually("failure recorded (next_attempt_at marker at attempt 1)", func() bool {
 		v, err := e.stateField(id)
-		return err == nil && strings.HasPrefix(v, "next_attempt_at:") && strings.HasSuffix(v, "#1")
+		return err == nil && strings.HasPrefix(v, "next_attempt_at:") && markerAttempt(v) == 1
 	})
 
 	// Force eligibility by removing the backoff marker so a reclaim redelivers
@@ -363,9 +406,9 @@ func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 	// Delivery 2 starts: the second execution blocks inside the executor, so a
 	// persisted running marker is observable in Redis BEFORE the attempt
 	// completes or the message is acked. (Note: HDEL above reset the Redis
-	// store's attempt counter, so the marker is `running:<deadline>#1`, not #2 —
-	// the exhaustion decision is what matters, and it is pinned by the unit
-	// tests; here we assert the marker's `running:` shape.)
+	// store's attempt counter, so the marker is `running:<deadline>:1:<token>`,
+	// not attempt 2 — the exhaustion decision is what matters, and it is pinned
+	// by the unit tests; here we assert the marker's `running:` shape.)
 	e.eventually("running marker persisted while attempt in flight", func() bool {
 		v, err := e.stateField(id)
 		return err == nil && strings.HasPrefix(v, "running:")

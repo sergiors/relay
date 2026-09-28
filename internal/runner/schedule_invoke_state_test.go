@@ -318,6 +318,33 @@ func TestInvokeHandlerUnavailableFunctionStillRetryable(t *testing.T) {
 	}
 }
 
+// TestInvokeHandlerClaimErrorLeavesPendingAndSkipsHandler pins the schedule
+// path's ambiguous-claim contract: a TryStart error returns
+// ErrInvocationNotEligible (the stream leaves the message pending) and never
+// executes the handler, with no retry/exhaustion accounting.
+func TestInvokeHandlerClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	prog := newFakeInvocationState()
+	prog.startErr = errors.New("redis down")
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.InvokeHandler(ctx, "1-0", "fn", "index.run", []byte(`{}`))
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("err = %v, want ErrInvocationNotEligible (pending, no ACK/DLQ)", err)
+	}
+	if !errors.Is(err, stream.ErrInvocationClaimUnconfirmed) {
+		t.Fatalf("err = %v, want a distinguishable ErrInvocationClaimUnconfirmed", err)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (ambiguous claim must not execute)", exec.count())
+	}
+	if len(prog.marks) != 0 || len(prog.failures) != 0 || len(prog.exhausted) != 0 {
+		t.Fatalf("no handler attempt was confirmed, so state must be untouched: marks=%v failures=%v exhausted=%v",
+			prog.marks, prog.failures, prog.exhausted)
+	}
+}
+
 // TestInvokeHandlerWithoutStateStillExecutes verifies that with no invocation
 // state in ctx, the legacy behavior is preserved: the executor runs, a success
 // returns nil, and no state methods are touched.

@@ -29,22 +29,78 @@
 //     reached a handler produces a single entry with the "-" placeholder and an
 //     explicit handler_attempts of 0.
 //   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
-//     successfully XADD'd its marker becomes "exhausted:<attempts>:dlq"; a
+//     successfully XADD'd its marker becomes "exhausted:<attempt>:<token>:dlq"; a
 //     redelivery (after an XACK failure, a crash, or a partially-written
 //     multi-entry DLQ) skips the already-persisted entries and writes only the
 //     missing ones. The original is ACKed only after all required entries are
 //     persisted, so a write failure leaves the message pending.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
 //     (relay:invocation:{stream}:{group}:{msgID}, field "<function>/<handler>" →
-//     "ok" when complete, "running:<deadline>#<attempts>" while an attempt is
-//     protected, "next_attempt_at:<deadline>#<attempts>" while a failed attempt
-//     waits out its retry backoff, "exhausted:<attempts>" when terminal, or
-//     "exhausted:<attempts>:dlq" when terminal AND its DLQ entry is persisted;
-//     TTL'd; stream/group names are percent-encoded in the key) so a
-//     redelivered message skips handlers that already completed, are still
-//     within an active attempt deadline or retry backoff, or are exhausted; the
-//     message is acknowledged when all matching invocations are complete, and
-//     the invocation state key is eagerly cleared on completion or DLQ
+//     "ok" when complete, "running:<deadline_ms>:<attempt>:<token>" while an
+//     attempt is protected, "next_attempt_at:<deadline_ms>:<attempt>:<token>"
+//     while a failed attempt waits out its retry backoff, "exhausted:<attempt>:<token>"
+//     when terminal, or "exhausted:<attempt>:<token>:dlq" when terminal AND its
+//     DLQ entry is persisted; TTL'd; stream/group names are percent-encoded in
+//     the key) so a redelivered message skips handlers that already completed,
+//     are still within an active attempt deadline or retry backoff, or are
+//     exhausted; the message is acknowledged when all matching invocations are
+//     complete, and the invocation state key is eagerly cleared on completion or
+//     DLQ
+//
+// Deadlines are integer Unix MILLISECONDS end to end. An active
+// running/next_attempt_at marker is protected iff now_ms < deadline_ms and
+// eligible iff now_ms >= deadline_ms: the comparison is exact (a
+// length-then-lexicographic compare of decimal strings inside the Lua script),
+// with no clock-skew fudge and no Lua floating point.
+//
+// Each successful claim generates a crypto-random, opaque token BEFORE the EVAL
+// and persists it only on a win, so "<attempt>:<token>" is the claim identity.
+// Every transition that originates from an active claim (fail/retry, complete,
+// exhaust, and the DLQ marker upgrade) CASes BOTH attempt and token against the
+// current active marker; a mismatch is an explicit stale/refused result (false),
+// never a Redis error. Terminal exhausted markers retain their claim identity
+// ("exhausted:<attempt>:<token>") so the DLQ-persistence upgrade can CAS the
+// same exhausted claim and can never downgrade a newer exhausted marker or a
+// success. Tokens are never logged, used as metric labels, or written to the DLQ.
+//
+// Invocation-state transitions are atomic: every lifecycle write (claim,
+// failure, completion, exhaustion, classification, trace) is a single Lua
+// script, so concurrent replicas cannot both start the same invocation and a
+// stale claim can never overwrite a newer claim's or a terminal marker.
+//
+// The per-invocation state machine is:
+//
+//	unseen (absent) --TryStart--> running:<deadline_ms>:<n>:<token>
+//	running --RecordFailure--> next_attempt_at:<deadline_ms>:<n>:<token>   (same claim)
+//	running/next_attempt_at --(now_ms >= deadline_ms)--> eligible --> running:<...#<n+1>:<new token>>
+//	running/next_attempt_at --MarkComplete--> ok                (terminal success, CASed on the claim)
+//	running/next_attempt_at --MarkExhausted--> exhausted:<n>:<token>    (terminal, CASed on the claim)
+//	exhausted:<n>:<token> --MarkExhaustedDLQ--> exhausted:<n>:<token>:dlq (terminal, entry persisted, CASed on the exhausted claim)
+//
+// "ok" and the exhausted forms are terminal: TryStart never re-opens them, and
+// MarkComplete never downgrades an exhausted marker (success must not resurrect
+// a message already routed to the DLQ). `handler_attempts` is the runner's
+// persisted attempt count (incremented only on a CONFIRMED TryStart claim),
+// distinct from the Redis stream delivery count. The trace lineage is a sibling
+// hash field (never part of the lifecycle value). Every mutation refreshes the
+// hash TTL atomically, and an active marker's TTL is at least
+// (deadline-now)+invocationSafetyMargin (and never less than the normal TTL), so
+// a key can never expire before its protected deadline — a reclaim therefore
+// always observes the just-expired marker and carries its attempt forward
+// instead of resetting the attempt count. A running marker that is not renewed
+// (a crash) simply expires at its deadline: reclaim then starts attempt n+1 with
+// a fresh token, so there is no permanent lock. Race ordering is defined by
+// Redis's single-threaded script execution: among simultaneous claims exactly
+// one sees the absent/expired marker and starts, and every later claim observes
+// the new marker.
+//
+// A Redis/transport error on TryStart is NOT failed open: the claim outcome is
+// unknown, so the runner leaves the message pending and does not execute the
+// handler on that delivery (an ambiguous claim could race a replica that won).
+//
+// A refused (stale/terminal) transition result is likewise not an ACK: the
+// runner treats it as unresolved and leaves the message pending, so a superseded
+// claim's outcome can never acknowledge or dead-letter a newer claim's message.
 //
 // Key Guarantees:
 //   - A message is acknowledged only after the handler succeeds or the DLQ
@@ -55,8 +111,11 @@
 //     could ack a message another replica is still processing
 //   - Invocation state is at-least-once, not exactly-once: a crash between a
 //     handler's side effect and its MarkComplete re-runs the handler, so handlers
-//     must remain idempotent. State read/mark/clear failures are logged and
-//     fail open (re-run) rather than becoming a new failure source.
+//     must remain idempotent. Other state read/mark/clear failures are logged and
+//     fail open (re-run) rather than becoming a new failure source. The one
+//     exception is TryStart: an ambiguous claim (Redis/transport error) is NOT
+//     failed open — the message is left pending and the handler is not executed,
+//     because running a duplicate could race a replica that won the same claim.
 //   - A pending entry whose stream body no longer exists is data loss, not a
 //     success: it is counted as missing_payload_total, never run through a
 //     handler, and never turned into a fabricated payload or DLQ entry.

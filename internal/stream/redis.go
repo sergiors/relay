@@ -1101,11 +1101,17 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 
 // unpersistedDLQSpecs filters the DLQ entry specs down to those whose entry has
 // not already been persisted, consulting each invocation's per-invocation
-// persistence marker ("exhausted:<n>:dlq") rather than scanning the DLQ stream.
-// Skipping already-persisted entries is what makes retrying a partially-written
-// multi-entry DLQ (after a failed XACK, a crash, or a partial write) idempotent:
-// the retry writes only the missing entries and never duplicates the ones that
-// succeeded.
+// persistence marker ("exhausted:<attempt>:<token>:dlq") rather than scanning
+// the DLQ stream. Skipping already-persisted entries is what makes retrying a
+// partially-written multi-entry DLQ (after a failed XACK, a crash, or a partial
+// write) idempotent: the retry writes only the missing entries and never
+// duplicates the ones that succeeded.
+//
+// It also returns each retained spec's exact exhausted claim identity (from the
+// marker) so the subsequent DLQ-persistence upgrade CASes that identity, never a
+// guessed one. A spec with no well-formed exhausted marker carries a zero claim;
+// the upgrade then refuses (a marker-less invocation cannot be upgraded, and its
+// entry is still written because it was not marked persisted).
 //
 // A store read error fails safe: the spec is kept so the entry is rewritten (a
 // duplicate is allowed under at-least-once, while skipping a required write
@@ -1118,12 +1124,15 @@ func (c *Consumer) unpersistedDLQSpecs(ctx context.Context, msgID string, specs 
 			out = append(out, spec)
 			continue
 		}
-		persisted, err := c.invStateStore.exhaustedPersisted(ctx, c.stream, c.group, msgID, spec.invocation)
+		claim, persisted, ok, err := c.invStateStore.exhaustedState(ctx, c.stream, c.group, msgID, spec.invocation)
 		if err != nil {
 			c.log.Warn("Message: DLQ persistence check failed; rewriting entry",
 				"message_id", msgID, "invocation", spec.invocation, "error", err)
 			out = append(out, spec)
 			continue
+		}
+		if ok {
+			spec.claim = claim
 		}
 		if persisted {
 			c.log.Debug("Message: DLQ entry already persisted; skipping write",
@@ -1170,11 +1179,13 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 // from the delivery count.
 //
 // Idempotent retry without scanning the DLQ: each invocation's exhausted marker
-// records whether its entry has already been persisted ("exhausted:<n>:dlq").
+// records whether its entry has already been persisted
+// ("exhausted:<attempt>:<token>:dlq") and retains the exhausted claim identity.
 // On a redelivery after an XACK failure or a crash — or after a partial
 // multi-entry write — invocations whose entry already exists are skipped, so the
 // retry writes only the missing entries and can never duplicate (or lose) the
-// ones that succeeded.
+// ones that succeeded. The upgrade CASes the retained exhausted identity, so a
+// stale XADD outcome can never downgrade a newer exhausted marker or a success.
 //
 // deliveryAttempts is the authoritative Redis Stream/PEL delivery count passed
 // through the consumer/reclaim flow (the DLQ `deliveries` field, diagnostic
@@ -1230,10 +1241,13 @@ func (c *Consumer) routeToDLQ(
 		c.metrics.Inc(metrics.MetricDLQEntries)
 		// Record per-invocation DLQ persistence ONLY after the XADD succeeded,
 		// so a failed write is retried on redelivery while a successful one is
-		// skipped. A mark failure is logged only: the entry is already written
-		// and the worst case is a duplicate on the next redelivery.
+		// skipped. The marker is upgraded CASed on the exact exhausted claim
+		// identity read from the marker (spec.claim), so a stale XADD outcome can
+		// never downgrade a newer exhausted marker or a success. A mark failure is
+		// logged only: the entry is already written and the worst case is a
+		// duplicate on the next redelivery.
 		if spec.invocation != "" {
-			if err := c.invStateStore.markExhaustedDLQ(ctx, c.stream, c.group, msg.ID, spec.invocation, spec.attempts); err != nil {
+			if _, err := c.invStateStore.markExhaustedDLQ(ctx, c.stream, c.group, msg.ID, spec.invocation, spec.claim); err != nil {
 				c.log.Warn("Message: mark DLQ persisted failed",
 					"message_id", msg.ID, "invocation", spec.invocation, "error", err)
 			}

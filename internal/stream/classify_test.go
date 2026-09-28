@@ -281,8 +281,8 @@ func TestHandlerExhaustedErrorReasonConsistent(t *testing.T) {
 // complete only the missing entries.
 func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 	store := newFakeInvocationStore(map[string]string{
-		"fnA/index.run": exhaustedValue(2, true),  // already persisted → skip
-		"fnC/index.run": exhaustedValue(2, false), // not persisted → keep
+		"fnA/index.run": exhaustedValue(InvocationClaim{Attempt: 2, Token: "aa"}, true),  // already persisted → skip
+		"fnC/index.run": exhaustedValue(InvocationClaim{Attempt: 2, Token: "cc"}, false), // not persisted → keep
 	})
 	c := newConsumer(ConsumerConfig{
 		Stream: "s", Group: "g", Consumer: "c",
@@ -303,7 +303,7 @@ func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 	}
 
 	// Once fnC is marked persisted too, only the absent fnB remains.
-	if err := store.markExhaustedDLQ(context.Background(), "s", "g", "m-0", "fnC/index.run", 2); err != nil {
+	if _, err := store.markExhaustedDLQ(context.Background(), "s", "g", "m-0", "fnC/index.run", InvocationClaim{Attempt: 2, Token: "cc"}); err != nil {
 		t.Fatalf("markExhaustedDLQ: %v", err)
 	}
 	got = c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
@@ -329,10 +329,10 @@ func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 // TestExhaustedValueGrammar pins the two exhausted marker forms and that only
 // the ":dlq" form reports persisted.
 func TestExhaustedValueGrammar(t *testing.T) {
-	if v := exhaustedValue(3, false); v != "exhausted:3" {
+	if v := exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab12"}, false); v != "exhausted:3:ab12" {
 		t.Fatalf("exhaustedValue(3,false) = %q", v)
 	}
-	if v := exhaustedValue(3, true); v != "exhausted:3:dlq" {
+	if v := exhaustedValue(InvocationClaim{Attempt: 3, Token: "ab12"}, true); v != "exhausted:3:ab12:dlq" {
 		t.Fatalf("exhaustedValue(3,true) = %q", v)
 	}
 	// Both parse to kindExhausted with the attempt count; only the suffixed form
@@ -342,8 +342,8 @@ func TestExhaustedValueGrammar(t *testing.T) {
 		attempts  int
 		persisted bool
 	}{
-		{"exhausted:3", 3, false},
-		{"exhausted:3:dlq", 3, true},
+		{"exhausted:3:ab12", 3, false},
+		{"exhausted:3:ab12:dlq", 3, true},
 	} {
 		kind, _, n, ok := parseInvocationState(tc.v)
 		if !ok || kind != kindExhausted || n != tc.attempts {
@@ -353,8 +353,16 @@ func TestExhaustedValueGrammar(t *testing.T) {
 			t.Fatalf("isExhaustedDLQValue(%q) = %v, want %v", tc.v, got, tc.persisted)
 		}
 	}
-	// A malformed suffixed marker does not parse.
-	for _, v := range []string{"exhausted::dlq", "exhausted:0:dlq", "exhausted:abc:dlq"} {
+	// A malformed suffixed marker does not parse (a missing/short token, a
+	// non-numeric attempt, or a non-hex token).
+	for _, v := range []string{
+		"exhausted::dlq",
+		"exhausted:0:ab12:dlq",
+		"exhausted:abc:ab12:dlq",
+		"exhausted:3::dlq",
+		"exhausted:3:ZZZZ:dlq",
+		"exhausted:3:ab12:extra:dlq",
+	} {
 		if _, _, _, ok := parseInvocationState(v); ok {
 			t.Errorf("parseInvocationState(%q) ok = true, want false", v)
 		}
@@ -414,7 +422,7 @@ func TestDLQTraceForReadsInvocationState(t *testing.T) {
 // unrelated lifecycle value.
 func TestInvocationStoreTraceSiblingIsIndependent(t *testing.T) {
 	const lineage = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	store := newFakeInvocationStore(map[string]string{"fn/index.run": runningValue(time.Now().Add(time.Minute), 1)})
+	store := newFakeInvocationStore(map[string]string{"fn/index.run": runningValue(time.Now().Add(time.Minute), InvocationClaim{Attempt: 1, Token: "aa"})})
 	c := newConsumer(ConsumerConfig{
 		Stream: "s", Group: "g", Consumer: "c",
 		Log: slog.New(slog.DiscardHandler),

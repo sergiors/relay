@@ -11,6 +11,7 @@ import (
 
 	"relay/internal/function"
 	"relay/internal/runtime"
+	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
@@ -469,7 +470,8 @@ func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeou
 // avoiding a Redis dependency. It records which invocations have completed,
 // which are protected by an active running deadline or a retry backoff, and
 // which are exhausted, mirroring the real stream.invocationState semantics
-// (TryStart/RecordFailure/MarkComplete/MarkExhausted/IsTerminal).
+// (TryStart/RecordFailure/MarkComplete/MarkExhausted/IsTerminal) including the
+// per-claim (attempt + token) compare-and-set identity.
 type fakeInvocationState struct {
 	mu        sync.Mutex
 	done      map[string]bool
@@ -478,13 +480,22 @@ type fakeInvocationState struct {
 	nextAt    map[string]time.Time // invocation -> next-attempt deadline
 	exhausted map[string]int       // invocation -> attempts
 	attempts  map[string]int       // invocation -> highest attempt started
+	// claimTokens records the token of the claim currently owning each
+	// invocation's active marker, so a stale transition can be refused exactly
+	// like the real store's token CAS.
+	claimTokens map[string]string
+	// tokenSeq makes each generated claim token unique within a test.
+	tokenSeq int
 	// classified records whether the one-time logical-event classification has
 	// been claimed (the fake is bound to one message per test).
 	classified bool
 	// classifyErr, when non-nil, is returned by ClaimClassification so the
 	// fail-closed classification path is exercisable.
 	classifyErr error
-	now         func() time.Time
+	// startErr, when non-nil, is returned by TryStart so the ambiguous-claim
+	// (leave pending, no handler execution) path is exercisable.
+	startErr error
+	now      func() time.Time
 	// failures records the backoff passed to RecordFailure, for tests to assert
 	// the retry schedule.
 	failures []time.Duration
@@ -495,13 +506,14 @@ type fakeInvocationState struct {
 
 func newFakeInvocationState() *fakeInvocationState {
 	return &fakeInvocationState{
-		done:      map[string]bool{},
-		running:   map[string]time.Time{},
-		nextAt:    map[string]time.Time{},
-		exhausted: map[string]int{},
-		attempts:  map[string]int{},
-		traces:    map[string]string{},
-		now:       time.Now,
+		done:        map[string]bool{},
+		running:     map[string]time.Time{},
+		nextAt:      map[string]time.Time{},
+		exhausted:   map[string]int{},
+		attempts:    map[string]int{},
+		claimTokens: map[string]string{},
+		traces:      map[string]string{},
+		now:         time.Now,
 	}
 }
 
@@ -528,56 +540,102 @@ func (p *fakeInvocationState) IsComplete(invocation string) bool {
 	return p.done[invocation]
 }
 
-func (p *fakeInvocationState) MarkComplete(invocation string) {
+func (p *fakeInvocationState) MarkComplete(invocation string, claim stream.InvocationClaim) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Exhaustion is terminal and is never downgraded by a completion.
+	if p.exhausted[invocation] > 0 {
+		return false
+	}
+	// Idempotent: an already-complete invocation is a successful no-op.
+	if p.done[invocation] {
+		return true
+	}
+	// CAS on the claim identity: only the current claim owner may complete.
+	if p.claimTokens[invocation] != claim.Token {
+		return false
+	}
 	p.done[invocation] = true
 	delete(p.running, invocation)
 	delete(p.nextAt, invocation)
-	delete(p.exhausted, invocation)
+	delete(p.claimTokens, invocation)
 	p.marks = append(p.marks, invocation)
+	return true
 }
 
 // TryStart claims the invocation for a new execution unless it is complete,
-// exhausted, or protected by an active running deadline or retry backoff.
-func (p *fakeInvocationState) TryStart(invocation string, timeout time.Duration) (started bool, attempt int, wait time.Duration) {
+// exhausted, or protected by an active running deadline or retry backoff. It
+// generates a fresh claim token on a winning claim so a later stale attempt can
+// be refused by the token CAS. A configured startErr models an ambiguous claim
+// (Redis/transport error): the call reports the error and claims nothing.
+func (p *fakeInvocationState) TryStart(invocation string, timeout time.Duration) (started bool, claim stream.InvocationClaim, wait time.Duration, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.startErr != nil {
+		return false, stream.InvocationClaim{}, 0, p.startErr
+	}
 	if p.done[invocation] {
-		return false, 0, 0
+		return false, stream.InvocationClaim{}, 0, nil
 	}
 	if n, ok := p.exhausted[invocation]; ok {
-		return false, n, 0
+		return false, stream.InvocationClaim{Attempt: n}, 0, nil
 	}
 	if dl, ok := p.running[invocation]; ok && p.now().Before(dl) {
-		return false, p.attempts[invocation], dl.Sub(p.now())
+		return false, stream.InvocationClaim{Attempt: p.attempts[invocation]}, dl.Sub(p.now()), nil
 	}
 	if dl, ok := p.nextAt[invocation]; ok && p.now().Before(dl) {
-		return false, p.attempts[invocation], dl.Sub(p.now())
+		return false, stream.InvocationClaim{Attempt: p.attempts[invocation]}, dl.Sub(p.now()), nil
 	}
-	attempt = p.attempts[invocation] + 1
+	attempt := p.attempts[invocation] + 1
 	p.attempts[invocation] = attempt
+	p.tokenSeq++
+	token := fmt.Sprintf("tok-%d", p.tokenSeq)
+	p.claimTokens[invocation] = token
 	p.running[invocation] = p.now().Add(timeout)
-	return true, attempt, 0
+	return true, stream.InvocationClaim{Attempt: attempt, Token: token}, 0, nil
 }
 
 // RecordFailure records the retry backoff for a failed attempt, gating the
-// invocation until now+backoff.
-func (p *fakeInvocationState) RecordFailure(invocation string, backoff time.Duration) {
+// invocation until now+backoff. The claim is accepted as a compare-and-set
+// guard mirroring the real store: a terminal invocation (complete/exhausted) or
+// a stale owner (a token other than the one currently owning the active marker)
+// is a no-op returning false.
+func (p *fakeInvocationState) RecordFailure(invocation string, claim stream.InvocationClaim, backoff time.Duration) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Terminal invocations are never re-opened by a stale failure.
+	if p.done[invocation] || p.exhausted[invocation] > 0 {
+		return false
+	}
+	// Only the token owner of the current claim may record a failure; a stale
+	// owner (a newer claim already owns the marker) is a no-op, mirroring the
+	// script's attempt+token CAS.
+	if p.claimTokens[invocation] != claim.Token {
+		return false
+	}
 	p.failures = append(p.failures, backoff)
 	delete(p.running, invocation)
 	p.nextAt[invocation] = p.now().Add(backoff)
+	return true
 }
 
-// MarkExhausted records that the invocation's attempts are exhausted.
-func (p *fakeInvocationState) MarkExhausted(invocation string, attempts int) {
+// MarkExhausted records that the invocation's attempts are exhausted, CASed on
+// the claim identity. It returns false when the claim is stale or the marker is
+// already terminal.
+func (p *fakeInvocationState) MarkExhausted(invocation string, claim stream.InvocationClaim) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.done[invocation] || p.exhausted[invocation] > 0 {
+		return false
+	}
+	if p.claimTokens[invocation] != claim.Token {
+		return false
+	}
 	delete(p.running, invocation)
 	delete(p.nextAt, invocation)
-	p.exhausted[invocation] = attempts
+	delete(p.claimTokens, invocation)
+	p.exhausted[invocation] = claim.Attempt
+	return true
 }
 
 // IsTerminal reports whether the invocation is complete or exhausted.

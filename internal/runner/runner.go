@@ -69,7 +69,8 @@ const (
 	outcomeExecuted invocationOutcome = iota
 	// outcomeTerminalSkip means the invocation was skipped because it is already
 	// terminal: complete or exhausted (never eligible again). Exhausted skips are
-	// distinguishable from complete skips by the TryStart attempt number (>0).
+	// distinguishable from complete skips by the existing marker's attempt
+	// count (>0).
 	outcomeTerminalSkip
 	// outcomePendingSkip means the invocation was skipped because it is protected
 	// (running or waiting out a retry backoff) or its concurrency slot timed out:
@@ -1255,6 +1256,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// hasState is true.
 	skippedPending := false
 	var firstErr error
+	// claimErr records the first ambiguous-claim failure (a TryStart store
+	// error) seen this delivery. It is kept separate from firstErr because a
+	// claim failure is NOT a failed attempt (no handler ran, no retry/exhaustion
+	// accounting); it must stay pending, and it is surfaced (wrapping
+	// ErrInvocationNotEligible) so the cause is distinguishable from an ordinary
+	// protected skip.
+	var claimErr error
 	var exhaustedInvocations []stream.ExhaustedInvocation
 	anyExhausted := false
 	// executed tracks whether any invocation actually executed, for the
@@ -1427,15 +1435,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// loop can aggregate AFTER iterating every matching rule — a failure in
 			// one handler never prevents later handlers from running.
 			executeRule := func() (invocationOutcome, error) {
-				// The per-invocation handler attempt number. With invocation
+				// The per-invocation handler attempt/claim. With invocation
 				// state it comes from TryStart (Redis-backed, incremented per
-				// actual execution). Without invocation state there is no
-				// persisted handler attempt, so it stays 0 (explicitly not
-				// attributed): the delivery count is NOT reused as a handler
-				// attempt count, because deliveries count redeliveries, not
-				// executions. The no-state path never calls recordFailure, so it
-				// never fabricates an exhaustion/DLQ attribution either.
-				handlerAttempt := 0
+				// actual execution, with a fresh opaque token). Without
+				// invocation state there is no persisted handler attempt, so it
+				// stays the zero claim (explicitly not attributed): the delivery
+				// count is NOT reused as a handler attempt count, because
+				// deliveries count redeliveries, not executions. The no-state path
+				// never calls recordFailure, so it never fabricates an
+				// exhaustion/DLQ attribution either.
+				var claim stream.InvocationClaim
 				// Reserve the worker-global and per-function concurrency slots
 				// BEFORE TryStart, so a blocked invocation is never counted as an
 				// attempt and does not persist state. If no slot frees within
@@ -1468,17 +1477,41 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				}
 				defer releaseSlots()
 				// Claim the invocation for this execution before running it.
-				// TryStart persists an absolute running deadline (now + timeout)
-				// and returns started=false when the invocation is already
-				// complete (handled above), exhausted, or protected by an active
-				// attempt deadline or a retry backoff — this or another replica
-				// may be executing it, or it is waiting out its backoff, so we
-				// must not run it concurrently. The IsComplete check above is the
-				// fast path that avoids an HSET on completed invocations;
-				// TryStart's own HGET also reads "ok" and covers the same case,
-				// so the two are consistent.
+				// TryStart atomically persists an absolute running deadline
+				// (now + timeout), the attempt, and a fresh claim token, and
+				// returns started=false when the invocation is already complete
+				// (handled above), exhausted, or protected by an active attempt
+				// deadline or a retry backoff — this or another replica may be
+				// executing it, or it is waiting out its backoff, so we must not
+				// run it concurrently. The IsComplete check above is the fast path
+				// that avoids a script call on completed invocations; TryStart's
+				// own read also covers "ok" and the same case, so the two are
+				// consistent.
 				if hasState {
-					started, n, wait := invState.TryStart(invocation, timeout)
+					started, startClaim, wait, startErr := invState.TryStart(invocation, timeout)
+					if startErr != nil {
+						// The claim outcome is unknown (Redis/transport or
+						// token-generation error): do NOT run the handler (an
+						// ambiguous claim could race a replica that won the same
+						// claim) and leave the message pending so a later delivery
+						// retries the claim. No handler attempt was confirmed, so
+						// the claim stays zero and no retry/exhaustion accounting
+						// happens here. The returned error wraps
+						// ErrInvocationNotEligible (the stream's pending/no-ACK
+						// contract) plus the distinct ErrInvocationClaimUnconfirmed
+						// sentinel so the aggregate can surface a claim failure
+						// separately from an ordinary protected skip.
+						skippedPending = true
+						r.log.Warn("Function handler: claim failed (outcome unknown); leaving pending without executing",
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"error", startErr,
+						)
+						return outcomePendingSkip, fmt.Errorf("%w: %v: %w: %w",
+							stream.ErrInvocationNotEligible, invocation,
+							stream.ErrInvocationClaimUnconfirmed, startErr)
+					}
 					if !started {
 						// The slot is released by the deferred releaseSlots before
 						// the next rule acquires.
@@ -1492,7 +1525,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 								"function", pf.fn.Name,
 								"handler", rule.Handler,
 								"message_id", msgID,
-								"handler_attempt", n,
+								"handler_attempt", startClaim.Attempt,
 								"next_attempt_in", wait,
 							)
 							return outcomePendingSkip, nil
@@ -1501,24 +1534,25 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						// invocation must still drive the message-level DLQ decision, so a redelivery
 						// after a failed DLQ write or XACK routes to the DLQ again instead of being
 						// acknowledged as complete.
-						if n > 0 {
+						if startClaim.Attempt > 0 {
 							anyExhausted = true
 							exhaustedInvocations = append(exhaustedInvocations, stream.ExhaustedInvocation{
 								Function: pf.fn.Name,
 								Handler:  rule.Handler,
-								Attempts: n,
+								Attempts: startClaim.Attempt,
 							})
 						}
 						r.log.Debug("Function handler: terminal for event; skipping",
 							"function", pf.fn.Name,
 							"handler", rule.Handler,
 							"message_id", msgID,
-							"handler_attempt", n,
+							"handler_attempt", startClaim.Attempt,
 						)
 						return outcomeTerminalSkip, nil
 					}
-					handlerAttempt = n
+					claim = startClaim
 				}
+				handlerAttempt := claim.Attempt
 				// The invocation attempt has actually begun: the TryStart above
 				// (or the absence of invocation state, for direct callers)
 				// claimed it and the slots are held. This is the
@@ -1537,7 +1571,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// next matching rule so each independent invocation gets its own
 					// failed attempt.
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -1554,7 +1588,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -1626,7 +1660,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// end-of-loop aggregate, so an invocation may exhaust while
 					// others still run.
 					if hasState {
-						return r.recordFailure(invState, invocation, handlerAttempt, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -1641,10 +1675,24 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// Record the invocation as completed so a redelivery skips it.
 				// This happens BEFORE the success metrics so a crash between the
 				// side effect and MarkComplete re-runs the handler (at-least-once;
-				// the handler must remain idempotent). A mark failure is logged by
-				// the handle and does not fail the invocation.
+				// the handler must remain idempotent). The completion is CASed on
+				// this attempt's claim; a refusal (the marker was re-claimed by a
+				// newer token, or is already terminal exhausted) means this
+				// delivery does not own the invocation's resolution, so treat it
+				// as unresolved: leave the message pending (never ACK a
+				// superseded claim's outcome) and let the newer claim or terminal
+				// state drive the decision on a later delivery.
 				if hasState {
-					invState.MarkComplete(invocation)
+					if !invState.MarkComplete(invocation, claim) {
+						skippedPending = true
+						r.log.Warn("Function handler: completion superseded; leaving pending",
+							"function", pf.fn.Name,
+							"handler", rule.Handler,
+							"message_id", msgID,
+							"handler_attempt", handlerAttempt,
+						)
+						return outcomePendingSkip, nil
+					}
 				}
 				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, elapsed)
 				r.log.Info("Function handler: executed for event",
@@ -1673,6 +1721,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// decided only after the whole loop (see Handle's doc comment). Keep
 			// iterating regardless: each matching invocation gets its own attempt.
 			switch outcome {
+			case outcomePendingSkip:
+				// Every pending skip (protected invocation, slot timeout, claim
+				// failure, or a superseded stale transition) leaves the message
+				// unresolved: it must never be ACKed. A claim failure is
+				// additionally remembered via its distinguishable error so the
+				// aggregate can surface its cause.
+				skippedPending = true
+				if err != nil && errors.Is(err, stream.ErrInvocationClaimUnconfirmed) && claimErr == nil {
+					claimErr = err
+				}
 			case outcomeRetryable:
 				if firstErr == nil {
 					firstErr = err
@@ -1695,6 +1753,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// Aggregate: decide the single message-level error from the per-invocation
 	// outcomes collected across the whole rule loop.
 	if hasState {
+		// 0. An ambiguous claim failure (a TryStart store error) is surfaced
+		//    first: the claim outcome is unknown, so the message stays pending
+		//    with no handler execution and no retry accounting, and the distinct
+		//    sentinel keeps the cause visible even when another invocation also
+		//    failed this delivery.
+		if claimErr != nil {
+			return claimErr
+		}
 		// 1. Any retryable failure this delivery → the message stays pending
 		//    (retryable): return the first such failure, even if other
 		//    invocations succeeded or are otherwise still running.
@@ -1728,7 +1794,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		// 4. Any matched invocation was protected- or slot-timeout-skipped
 		//    (unresolved) → the message stays pending with NO retry accounting.
 		//    This fires even when other invocations executed successfully this
-		//    call: an unresolved invocation must not be ACKed away.
+		//    call: an unresolved invocation must not be ACKed away. A claim
+		//    failure was already surfaced at step 0.
 		if skippedPending {
 			return stream.ErrInvocationNotEligible
 		}
@@ -1927,11 +1994,28 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 			return nil
 		}
 		// Claim the invocation for this execution before running it. TryStart
-		// persists an absolute running deadline (now + the capped timeout) and
-		// returns started=false when the invocation is already exhausted or
-		// protected by an active attempt deadline or a retry backoff (this or
-		// another replica may be executing it, or it is waiting out its backoff).
-		started, handlerAttempt, wait := invState.TryStart(invocation, timeout)
+		// atomically persists an absolute running deadline (now + the capped
+		// timeout), the attempt, and a fresh claim token, and returns
+		// started=false when the invocation is already exhausted or protected by
+		// an active attempt deadline or a retry backoff (this or another replica
+		// may be executing it, or it is waiting out its backoff).
+		started, claim, wait, startErr := invState.TryStart(invocation, timeout)
+		if startErr != nil {
+			// The claim outcome is unknown (Redis/transport or token-generation
+			// error): do NOT run the handler and leave the message pending so a
+			// later delivery retries the claim. No handler attempt was confirmed.
+			// The error wraps ErrInvocationNotEligible (the stream's pending/no-ACK
+			// contract) plus ErrInvocationClaimUnconfirmed so the cause is
+			// distinguishable.
+			r.log.Warn("Schedule: claim failed (outcome unknown); leaving pending without executing",
+				"function", fnName,
+				"handler", handler,
+				"error", startErr,
+			)
+			return fmt.Errorf("%w: %v: %w: %w",
+				stream.ErrInvocationNotEligible, invocation,
+				stream.ErrInvocationClaimUnconfirmed, startErr)
+		}
 		if !started {
 			if wait > 0 {
 				// Protected by an active running deadline or a retry backoff. The
@@ -1941,31 +2025,38 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 				r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
 					"function", fnName,
 					"handler", handler,
-					"handler_attempt", handlerAttempt,
+					"handler_attempt", claim.Attempt,
 					"next_attempt_in", wait,
 				)
 				return stream.ErrInvocationNotEligible
 			}
 			// Terminal skip: the invocation is already exhausted. A schedule has
 			// exactly ONE invocation, so a terminal skip means the message is
-			// terminal and must route to the DLQ. handlerAttempt is the exhausted
+			// terminal and must route to the DLQ. claim.Attempt is the exhausted
 			// count read back from the invocation state (TryStart), so it is
 			// carried on the typed error for the stream layer's DLQ attribution.
 			r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
 				"function", fnName,
 				"handler", handler,
-				"handler_attempt", handlerAttempt,
+				"handler_attempt", claim.Attempt,
 			)
 			return &stream.HandlerExhaustedError{
 				Invocations: []stream.ExhaustedInvocation{{
 					Function: fnName,
 					Handler:  handler,
-					Attempts: handlerAttempt,
+					Attempts: claim.Attempt,
 				}},
 			}
 		}
-		err := r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, handlerAttempt, msgID)
+		err := r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, claim, msgID)
 		if err != nil {
+			// A stale completion (the claim was superseded or the marker is
+			// already terminal) is not a handler failure: do NOT ACK a superseded
+			// claim's outcome — leave the message pending so a later delivery
+			// resolves it.
+			if errors.Is(err, stream.ErrInvocationNotEligible) {
+				return err
+			}
 			// A failed attempt — resolve extra env, marshal, execution, or
 			// timeout failures all land here. recordFailure decides retry vs
 			// exhaustion using the template's schedule Retries: a retryable
@@ -1976,7 +2067,13 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 			// stream.ErrInvocationExhausted and carries the exhausted handler
 			// attempt). A schedule has exactly ONE invocation (this one), so the
 			// message is terminal and the stream routes it to the DLQ.
-			_, retErr := r.recordFailure(invState, invocation, handlerAttempt, retries, fnName, handler, msgID, err)
+			outcome, retErr := r.recordFailure(invState, invocation, claim, retries, fnName, handler, msgID, err)
+			if outcome == outcomePendingSkip {
+				// A stale transition (the claim was superseded, or the marker is
+				// already terminal): do NOT ACK a superseded claim's outcome —
+				// leave the message pending so a later delivery resolves it.
+				return stream.ErrInvocationNotEligible
+			}
 			return retErr
 		}
 		return nil
@@ -1985,7 +2082,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	// No invocation state (direct callers/tests): preserve the legacy behavior
 	// exactly — execute the single handler and return the plain error (or nil on
 	// success). MarkComplete/success metrics still emit inside invokeOnce.
-	return r.invokeOnce(ctx, pf, handler, payload, timeout, pin, nil, "", 0, msgID)
+	return r.invokeOnce(ctx, pf, handler, payload, timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
 }
 
 // InvokeFunction executes every event rule of the named function whose pattern
@@ -2269,7 +2366,7 @@ func (r *Runner) invokeOnce(
 	lease *runtime.ImageLease,
 	invState stream.InvocationState,
 	invocation string,
-	handlerAttempt int,
+	claim stream.InvocationClaim,
 	msgID string,
 ) error {
 	// The invocation attempt has actually begun: the caller claimed it via
@@ -2308,7 +2405,7 @@ func (r *Runner) invokeOnce(
 	})
 	start := time.Now()
 	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv, lease,
-		invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
+		invocationTrace{state: invState, invocation: invocation, attempt: claim.Attempt})
 	elapsed := time.Since(start)
 	if panicked {
 		r.log.Error("Function handler: PANICKED for schedule",
@@ -2332,10 +2429,15 @@ func (r *Runner) invokeOnce(
 	}
 	// Mark the invocation complete on success BEFORE the success metrics so a
 	// crash between the side effect and MarkComplete re-runs the handler
-	// (at-least-once; the handler must remain idempotent). A mark failure is
-	// logged by the handle and does not fail the invocation.
+	// (at-least-once; the handler must remain idempotent). The completion is
+	// CASed on this attempt's claim; a refusal means the marker was re-claimed by
+	// a newer claim or is already terminal exhausted, so this delivery does not
+	// own the resolution: return the not-eligible sentinel so the stream leaves
+	// the message pending rather than ACK a superseded claim's outcome.
 	if invState != nil {
-		invState.MarkComplete(invocation)
+		if !invState.MarkComplete(invocation, claim) {
+			return fmt.Errorf("%w: completion superseded for %v", stream.ErrInvocationNotEligible, invocation)
+		}
 	}
 	r.recordHandlerSuccess(pf.fn.Name, handler, elapsed)
 	r.log.Info("Function handler: executed for schedule",
@@ -2425,14 +2527,17 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, duration time.Dura
 // should aggregate. It is used for execution, marshal, secret-resolution, and
 // timeout failures (all are failed attempts).
 //
-// A retryable handler attempt (handlerAttempt < 1+retries) schedules a retry
-// backoff via RecordFailure, counts function_retries_total, and returns
-// (outcomeRetryable, err). An exhausted handler attempt (handlerAttempt >=
-// 1+retries) marks the invocation terminal via MarkExhausted, counts
-// function_dlq_total, and returns (outcomeExhausted, err). The message-level
-// DLQ decision (whether EVERY matched invocation is terminal) is NOT made
-// here; it is deferred to Handle's end-of-loop aggregation, so an invocation
-// can exhaust while others still run without short-circuiting them.
+// A retryable handler attempt (attempt < 1+retries) schedules a retry backoff
+// via RecordFailure, counts function_retries_total, and returns
+// (outcomeRetryable, err). An exhausted handler attempt (attempt >= 1+retries)
+// marks the invocation terminal via MarkExhausted, counts function_dlq_total, and
+// returns (outcomeExhausted, err). Both transitions are CASed on the claim
+// (attempt + token): a refusal (the claim is stale, or the marker is already
+// terminal) returns (outcomePendingSkip, nil) so the message stays pending and a
+// superseded claim never ACKs or dead-letters a newer claim's message. The
+// message-level DLQ decision (whether EVERY matched invocation is terminal) is
+// NOT made here; it is deferred to Handle's end-of-loop aggregation, so an
+// invocation can exhaust while others still run without short-circuiting them.
 //
 // The retryable error is returned plain. The exhausted error is a
 // *stream.HandlerExhaustedError carrying the exhausted handler attempt, so the
@@ -2443,19 +2548,34 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, duration time.Dura
 func (r *Runner) recordFailure(
 	invState stream.InvocationState,
 	invocation string,
-	handlerAttempt int,
+	claim stream.InvocationClaim,
 	retries int,
 	fnName, handler, msgID string,
 	origErr error,
 ) (invocationOutcome, error) {
+	handlerAttempt := claim.Attempt
 	maxAttempts := 1 + retries
 	if handlerAttempt >= maxAttempts {
-		// Exhausted: mark the invocation terminal. This is the DLQ attribution
-		// point: the invocation exhausted its retries and the message is being
-		// routed to the DLQ, so last_dlq_at is stamped HERE — not on every
-		// failure, and not again on the later terminal-skip redeliveries of the
-		// same invocation.
-		invState.MarkExhausted(invocation, handlerAttempt)
+		// Exhausted: mark the invocation terminal, CASed on this attempt's claim
+		// (attempt + token). If the store refuses (the claim is stale — a newer
+		// token now owns the marker — or the marker is already terminal), this
+		// delivery does not own the invocation's resolution: do NOT report
+		// exhaustion (which would dead-letter a message whose newer claim may
+		// still resolve), leave the message pending, and let the newer claim or a
+		// later terminal-skip delivery drive the DLQ decision. This is the DLQ
+		// attribution point: the invocation exhausted its retries and the message
+		// is being routed to the DLQ, so last_dlq_at is stamped HERE — not on
+		// every failure, and not again on the later terminal-skip redeliveries of
+		// the same invocation.
+		if !invState.MarkExhausted(invocation, claim) {
+			r.log.Warn("Function handler: exhaustion superseded; leaving pending",
+				"function", fnName,
+				"handler", handler,
+				"message_id", msgID,
+				"handler_attempt", handlerAttempt,
+			)
+			return outcomePendingSkip, nil
+		}
 		r.metrics.IncLabels(metrics.MetricFunctionDLQ,
 			[]metrics.Label{{Name: "function", Value: fnName}})
 		r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampDLQ, time.Now().Unix())
@@ -2475,9 +2595,23 @@ func (r *Runner) recordFailure(
 			}},
 		}
 	}
-	// Retryable: schedule a retry backoff and count the retry.
+	// Retryable: schedule a retry backoff and count the retry. The claim
+	// (attempt + token) is passed as a compare-and-set guard so a stale owner
+	// (whose running lease expired and whose invocation was re-claimed by a
+	// newer claim) cannot overwrite the newer claim's marker. If the store
+	// refuses (stale claim or terminal marker), this delivery does not own the
+	// invocation: leave the message pending rather than schedule a retry on a
+	// superseded claim's behalf.
 	backoff := retryBackoff(handlerAttempt)
-	invState.RecordFailure(invocation, backoff)
+	if !invState.RecordFailure(invocation, claim, backoff) {
+		r.log.Warn("Function handler: retry superseded; leaving pending",
+			"function", fnName,
+			"handler", handler,
+			"message_id", msgID,
+			"handler_attempt", handlerAttempt,
+		)
+		return outcomePendingSkip, nil
+	}
 	r.metrics.IncLabels(metrics.MetricFunctionRetries,
 		[]metrics.Label{{Name: "function", Value: fnName}})
 	r.log.Warn("Function handler: failed attempt; retrying later",

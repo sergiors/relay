@@ -84,6 +84,36 @@ func TestHandleWithoutInvocationStateStillExecutes(t *testing.T) {
 	}
 }
 
+// TestHandleClaimErrorLeavesPendingAndSkipsHandler pins the ambiguous-claim
+// contract: when TryStart cannot confirm the claim (a Redis/transport error),
+// Handle must NOT execute the handler and must return ErrInvocationNotEligible
+// so the stream leaves the message pending (no ACK, no DLQ, no retry
+// accounting). No handler attempt is claimed, so no RecordFailure/MarkComplete
+// happens and the executor is never called.
+func TestHandleClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+
+	prog := newFakeInvocationState()
+	prog.startErr = errors.New("redis down")
+	ctx := stream.WithInvocationState(context.Background(), prog)
+
+	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
+	if !errors.Is(err, stream.ErrInvocationNotEligible) {
+		t.Fatalf("handle error = %v, want ErrInvocationNotEligible (pending, no ACK/DLQ)", err)
+	}
+	if !errors.Is(err, stream.ErrInvocationClaimUnconfirmed) {
+		t.Fatalf("handle error = %v, want a distinguishable ErrInvocationClaimUnconfirmed", err)
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (ambiguous claim must not execute)", exec.count())
+	}
+	if len(prog.marks) != 0 || len(prog.failures) != 0 || len(prog.exhausted) != 0 {
+		t.Fatalf("no handler attempt was confirmed, so invocation state must be untouched: marks=%v failures=%v exhausted=%v",
+			prog.marks, prog.failures, prog.exhausted)
+	}
+}
+
 // TestSetMaxHandlerTimeoutCapsRuleTimeout verifies that a configured max
 // handler timeout caps a rule's (larger) timeout: the executor observes the
 // capped deadline and Handle returns a deadline error.

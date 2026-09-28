@@ -61,16 +61,17 @@ func TestInvocationStateContextRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRunningValueRoundTrip pins the "running:<unixnano>#<attempts>" field-value
-// encoding: runningValue encodes an absolute deadline and attempt number and
-// parseInvocationState decodes it back. The "running:" prefix distinguishes the
-// marker from the "ok" completion sentinel; the Unix-nano suffix is the deadline
-// at which the attempt is considered abandoned.
+// TestRunningValueRoundTrip pins the "running:<deadline_ms>:<attempt>:<token>"
+// field-value encoding: runningValue encodes an absolute millisecond deadline
+// and claim and parseInvocationState decodes it back. The "running:" prefix
+// distinguishes the marker from the "ok" completion sentinel; the deadline is
+// the integer Unix-ms at which the attempt is considered abandoned.
 func TestRunningValueRoundTrip(t *testing.T) {
-	dl := time.Unix(0, 1757000000000000000)
-	v := runningValue(dl, 3)
-	if v != "running:1757000000000000000#3" {
-		t.Fatalf("runningValue = %q, want %q", v, "running:1757000000000000000#3")
+	dl := time.UnixMilli(1757000000000)
+	claim := InvocationClaim{Attempt: 3, Token: "0a1b2c3d"}
+	v := runningValue(dl, claim)
+	if v != "running:1757000000000:3:0a1b2c3d" {
+		t.Fatalf("runningValue = %q, want %q", v, "running:1757000000000:3:0a1b2c3d")
 	}
 	kind, got, attempts, ok := parseInvocationState(v)
 	if !ok {
@@ -89,60 +90,69 @@ func TestRunningValueRoundTrip(t *testing.T) {
 
 // TestParseInvocationStateValueGrammar pins the full value grammar: ok, running,
 // next_attempt_at, exhausted, and unparseable values (treated as eligible). The
-// attempt count is mandatory in deadline markers: a bare "<prefix>:<deadline>"
-// without "#<attempts>" does not parse.
+// attempt and token parts are mandatory in every active/exhausted marker: a
+// marker missing either does not parse.
 func TestParseInvocationStateValueGrammar(t *testing.T) {
-	dl := time.Unix(0, 1757000000000000000)
+	dl := time.UnixMilli(1757000000000)
 
 	// ok → complete.
 	if kind, _, _, ok := parseInvocationState("ok"); !ok || kind != kindComplete {
 		t.Fatalf("parseInvocationState(\"ok\") = kind %v ok %v, want kindComplete true", kind, ok)
 	}
 
-	// running with attempts.
-	if kind, got, n, ok := parseInvocationState("running:1757000000000000000#2"); !ok || kind != kindRunning || !got.Equal(dl) || n != 2 {
+	// running with attempts and token.
+	if kind, got, n, ok := parseInvocationState("running:1757000000000:2:ab12"); !ok || kind != kindRunning || !got.Equal(dl) || n != 2 {
 		t.Fatalf("running#2 = kind %v dl %v n %d ok %v", kind, got, n, ok)
 	}
 
-	// next_attempt_at with attempts.
-	if kind, got, n, ok := parseInvocationState("next_attempt_at:1757000000000000000#4"); !ok || kind != kindNextAttempt || !got.Equal(dl) || n != 4 {
+	// next_attempt_at with attempts and token.
+	if kind, got, n, ok := parseInvocationState("next_attempt_at:1757000000000:4:cd34"); !ok || kind != kindNextAttempt || !got.Equal(dl) || n != 4 {
 		t.Fatalf("next_attempt_at#4 = kind %v dl %v n %d ok %v", kind, got, n, ok)
 	}
 
 	// exhausted.
-	if kind, _, n, ok := parseInvocationState("exhausted:5"); !ok || kind != kindExhausted || n != 5 {
+	if kind, _, n, ok := parseInvocationState("exhausted:5:ef56"); !ok || kind != kindExhausted || n != 5 {
 		t.Fatalf("exhausted:5 = kind %v n %d ok %v", kind, n, ok)
 	}
 
 	// exhausted with the persisted-DLQ suffix parses identically (same kind and
 	// attempt count); the suffix records only DLQ persistence, not a distinct
 	// lifecycle state.
-	if kind, _, n, ok := parseInvocationState("exhausted:5:dlq"); !ok || kind != kindExhausted || n != 5 {
+	if kind, _, n, ok := parseInvocationState("exhausted:5:ef56:dlq"); !ok || kind != kindExhausted || n != 5 {
 		t.Fatalf("exhausted:5:dlq = kind %v n %d ok %v", kind, n, ok)
 	}
-	if !isExhaustedDLQValue("exhausted:5:dlq") {
-		t.Fatalf("isExhaustedDLQValue(exhausted:5:dlq) = false, want true")
+	if !isExhaustedDLQValue("exhausted:5:ef56:dlq") {
+		t.Fatalf("isExhaustedDLQValue(exhausted:5:ef56:dlq) = false, want true")
 	}
-	if isExhaustedDLQValue("exhausted:5") {
-		t.Fatalf("isExhaustedDLQValue(exhausted:5) = true, want false")
+	if isExhaustedDLQValue("exhausted:5:ef56") {
+		t.Fatalf("isExhaustedDLQValue(exhausted:5:ef56) = true, want false")
 	}
 
-	// Unparseable values → eligible (ok=false). A deadline marker without the
-	// mandatory "#<attempts>" part also does not parse.
+	// Unparseable values → eligible (ok=false). A marker missing the mandatory
+	// "<attempt>:<token>" part also does not parse.
 	for _, v := range []string{
 		"",
 		"running:",
 		"running:notanumber",
-		"running:1757000000000000000",
-		"running:123#",
-		"running:123#0",
-		"running:123#abc",
+		"running:1757000000000",
+		"running:1757000000000:",
+		"running:1757000000000:2",
+		"running:1757000000000:2:",
+		"running:1757000000000:0:ab12",
+		"running:1757000000000:2:NOTHEX",
+		"running:#2:ab12",
+		"running:01757000000000:2:ab12", // non-canonical deadline (leading zero)
 		"next_attempt_at:",
 		"next_attempt_at:notanumber",
-		"next_attempt_at:1757000000000000000",
+		"next_attempt_at:1757000000000",
+		"next_attempt_at:1757000000000:2",
+		"next_attempt_at:01757000000000:2:ab12", // non-canonical deadline
 		"exhausted:",
-		"exhausted:0",
-		"exhausted:abc",
+		"exhausted:0:ab12",
+		"exhausted:5",
+		"exhausted:abc:ab12",
+		"exhausted:5:",
+		"exhausted:05:ab12", // non-canonical attempt (leading zero)
 		"bogus",
 	} {
 		if _, _, _, ok := parseInvocationState(v); ok {
@@ -154,15 +164,45 @@ func TestParseInvocationStateValueGrammar(t *testing.T) {
 // TestNextAttemptAndExhaustedValueRoundTrip pins the next_attempt_at and
 // exhausted encodings.
 func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
-	dl := time.Unix(0, 1757000000000000000)
-	if v := nextAttemptValue(dl, 2); v != "next_attempt_at:1757000000000000000#2" {
+	dl := time.UnixMilli(1757000000000)
+	if v := nextAttemptValue(dl, InvocationClaim{Attempt: 2, Token: "ab12"}); v != "next_attempt_at:1757000000000:2:ab12" {
 		t.Fatalf("nextAttemptValue = %q", v)
 	}
-	if v := exhaustedValue(5, false); v != "exhausted:5" {
-		t.Fatalf("exhaustedValue(5, false) = %q, want exhausted:5", v)
+	claim := InvocationClaim{Attempt: 5, Token: "ef56"}
+	if v := exhaustedValue(claim, false); v != "exhausted:5:ef56" {
+		t.Fatalf("exhaustedValue(5, false) = %q, want exhausted:5:ef56", v)
 	}
-	if v := exhaustedValue(5, true); v != "exhausted:5:dlq" {
-		t.Fatalf("exhaustedValue(5, true) = %q, want exhausted:5:dlq", v)
+	if v := exhaustedValue(claim, true); v != "exhausted:5:ef56:dlq" {
+		t.Fatalf("exhaustedValue(5, true) = %q, want exhausted:5:ef56:dlq", v)
+	}
+}
+
+// TestActiveTTL pins the TTL floor: an active marker's key TTL is the larger of
+// the normal terminal TTL and (deadline-now)+safety margin, so a key can never
+// expire before its protected deadline (which would reset the attempt count).
+func TestActiveTTL(t *testing.T) {
+	now := time.UnixMilli(1757000000000)
+
+	// A short deadline is dominated by the normal TTL.
+	if got := activeTTL(now, now.Add(time.Minute)); got != invocationStateTTL {
+		t.Fatalf("activeTTL(short deadline) = %s, want the normal TTL %s", got, invocationStateTTL)
+	}
+
+	// A deadline beyond the normal TTL yields deadline+margin, strictly greater
+	// than the deadline itself.
+	deadline := now.Add(invocationStateTTL + 48*time.Hour)
+	got := activeTTL(now, deadline)
+	want := deadline.Sub(now) + invocationSafetyMargin
+	if got != want {
+		t.Fatalf("activeTTL(long deadline) = %s, want %s", got, want)
+	}
+	if got <= deadline.Sub(now) {
+		t.Fatalf("activeTTL = %s, must exceed the protected window %s", got, deadline.Sub(now))
+	}
+
+	// A past deadline clamps to the normal TTL (never negative).
+	if got := activeTTL(now, now.Add(-time.Hour)); got != invocationStateTTL {
+		t.Fatalf("activeTTL(past deadline) = %s, want %s", got, invocationStateTTL)
 	}
 }
 

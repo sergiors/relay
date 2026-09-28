@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,10 +209,12 @@ func (e *eventEnv) eventually(what string, pred func() bool) {
 }
 
 // pastNextAttempt encodes an already-elapsed next_attempt_at marker carrying the
-// given persisted attempt count, so a protected invocation becomes eligible on
-// the next delivery without waiting out the real (1m+) retry backoff.
+// given persisted attempt count and a valid claim token, so a protected
+// invocation becomes eligible on the next delivery without waiting out the real
+// (1m+) retry backoff.
 func pastNextAttempt(attempt int) string {
-	return "next_attempt_at:" + strconv.FormatInt(time.Now().Add(-time.Hour).UnixNano(), 10) + "#" + strconv.Itoa(attempt)
+	return "next_attempt_at:" + strconv.FormatInt(time.Now().Add(-time.Hour).UnixMilli(), 10) +
+		":" + strconv.Itoa(attempt) + ":" + strings.Repeat("a", 32)
 }
 
 // TestIntegrationEventSuccessAndExhaustionRoutesToDLQ is the primary end-to-end

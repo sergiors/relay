@@ -315,17 +315,26 @@ func (n *noopInvocationState) count() int {
 }
 
 func (n *noopInvocationState) IsComplete(string) bool { n.touch(); return false }
-func (n *noopInvocationState) MarkComplete(string)    { n.touch() }
-func (n *noopInvocationState) TryStart(string, time.Duration) (bool, int, time.Duration) {
+func (n *noopInvocationState) MarkComplete(string, stream.InvocationClaim) bool {
 	n.touch()
-	return true, 1, 0
+	return true
 }
-func (n *noopInvocationState) RecordFailure(string, time.Duration) { n.touch() }
-func (n *noopInvocationState) MarkExhausted(string, int)           { n.touch() }
-func (n *noopInvocationState) IsTerminal(string) bool              { n.touch(); return false }
-func (n *noopInvocationState) ClaimClassification() (bool, error)  { n.touch(); return true, nil }
-func (n *noopInvocationState) TraceReference(string) string        { n.touch(); return "" }
-func (n *noopInvocationState) RecordTrace(string, string)          { n.touch() }
+func (n *noopInvocationState) TryStart(string, time.Duration) (bool, stream.InvocationClaim, time.Duration, error) {
+	n.touch()
+	return true, stream.InvocationClaim{Attempt: 1, Token: "noop"}, 0, nil
+}
+func (n *noopInvocationState) RecordFailure(string, stream.InvocationClaim, time.Duration) bool {
+	n.touch()
+	return true
+}
+func (n *noopInvocationState) MarkExhausted(string, stream.InvocationClaim) bool {
+	n.touch()
+	return true
+}
+func (n *noopInvocationState) IsTerminal(string) bool             { n.touch(); return false }
+func (n *noopInvocationState) ClaimClassification() (bool, error) { n.touch(); return true, nil }
+func (n *noopInvocationState) TraceReference(string) string       { n.touch(); return "" }
+func (n *noopInvocationState) RecordTrace(string, string)         { n.touch() }
 
 // TestReplayDLQWritesNoBrokerState pins that ReplayDLQ never consults the
 // invocation-state machinery: even when a context carries an InvocationState

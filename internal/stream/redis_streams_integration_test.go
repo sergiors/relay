@@ -324,19 +324,19 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		started, n, _ := p.TryStart("fn/h", time.Hour)
+		started, claim, _, _ := p.TryStart("fn/h", time.Hour)
 		if !started {
 			return ErrInvocationNotEligible
 		}
-		attempts.Store(int64(n))
+		attempts.Store(int64(claim.Attempt))
 		// Simulate the runner's exhaustion: mark the invocation terminal and
 		// return the typed HandlerExhaustedError (which wraps
 		// ErrInvocationExhausted and carries the exhausted handler attempt) so the
 		// message routes to the DLQ with handler metadata attributed from the
 		// handler retry state.
-		p.MarkExhausted("fn/h", n)
+		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: n, Err: ErrInvocationExhausted},
+			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 	// The message is routed to the DLQ (and acked) on the first delivery, so it
@@ -402,16 +402,16 @@ func TestIntegrationDLQEntryCarriesFinalAttemptTrace(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		started, n, _ := p.TryStart("fn/h", time.Hour)
+		started, claim, _, _ := p.TryStart("fn/h", time.Hour)
 		if !started {
 			return ErrInvocationNotEligible
 		}
 		// The runner records the attempt's span lineage immediately; the DLQ
 		// write reads it back for the final failed attempt.
 		p.RecordTrace("fn/h", lineage)
-		p.MarkExhausted("fn/h", n)
+		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: n, Err: ErrInvocationExhausted},
+			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 	testutil.WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
@@ -494,23 +494,23 @@ func TestIntegrationDLQDeliveriesExceedHandlerAttempts(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		started, n, _ := p.TryStart("fn/h", time.Hour)
+		started, claim, _, _ := p.TryStart("fn/h", time.Hour)
 		if !started {
 			// Protected: the prior failed attempt is waiting out its (long)
 			// backoff. Stay pending so reclaim keeps redelivering the message,
 			// growing `deliveries` without advancing the handler attempt.
 			return ErrInvocationNotEligible
 		}
-		if n < 2 {
+		if claim.Attempt < 2 {
 			// Attempt 1: retryable failure with a long backoff, so subsequent
 			// reclaims are skipped as protected.
-			p.RecordFailure("fn/h", time.Hour)
+			p.RecordFailure("fn/h", claim, time.Hour)
 			return fmt.Errorf("retryable failure")
 		}
 		// Attempt 2: exhaust (retries:1 → maxAttempts=2).
-		p.MarkExhausted("fn/h", n)
+		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: n, Err: ErrInvocationExhausted},
+			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 
@@ -522,7 +522,7 @@ func TestIntegrationDLQDeliveriesExceedHandlerAttempts(t *testing.T) {
 	// Expire the retry backoff by rewriting the marker with a past deadline and
 	// the persisted attempt count (1), so the next delivery carries the attempt
 	// forward and executes handler attempt 2, which exhausts.
-	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(time.Now().Add(-time.Hour), 1)).Err(); err != nil {
+	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(time.Now().Add(-time.Hour), InvocationClaim{Attempt: 1, Token: "aabbccdd"})).Err(); err != nil {
 		t.Fatalf("expire retry marker: %v", err)
 	}
 
@@ -636,7 +636,10 @@ func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 			return nil
 		}
 		if p, ok := InvocationStateFrom(ctx); ok {
-			p.MarkComplete("fn/h")
+			started, claim, _, _ := p.TryStart("fn/h", time.Hour)
+			if started {
+				p.MarkComplete("fn/h", claim)
+			}
 		}
 		if !first.Swap(true) {
 			return fmt.Errorf("fail first delivery")
@@ -673,7 +676,9 @@ func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID == id {
 			if p, ok := InvocationStateFrom(ctx); ok {
-				p.MarkExhausted("fn/h", 1)
+				if started, claim, _, _ := p.TryStart("fn/h", time.Hour); started {
+					p.MarkExhausted("fn/h", claim)
+				}
 			}
 		}
 		return ErrInvocationExhausted
@@ -908,13 +913,13 @@ func TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries(t *testi
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		// Two independent invocations: each claims attempt 2 and exhausts.
+		// Two independent invocations: each claims attempt 1 and exhausts.
 		for _, inv := range []string{"fnA/h", "fnB/h"} {
-			started, n, _ := p.TryStart(inv, time.Hour)
+			started, claim, _, _ := p.TryStart(inv, time.Hour)
 			if !started {
 				return ErrInvocationNotEligible
 			}
-			p.MarkExhausted(inv, n)
+			p.MarkExhausted(inv, claim)
 		}
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
 			{Function: "fnA", Handler: "h", Attempts: 1},
@@ -973,8 +978,8 @@ func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 		t.Fatalf("seed DLQ entry: %v", err)
 	}
 	if err := e.client.HSet(context.Background(), key,
-		"fnA/h", exhaustedValue(1, true),
-		"fnB/h", exhaustedValue(1, false),
+		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}, true),
+		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}, false),
 	).Err(); err != nil {
 		t.Fatalf("seed invocation state: %v", err)
 	}
@@ -1020,8 +1025,8 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 		}
 	}
 	if err := e.client.HSet(context.Background(), key,
-		"fnA/h", exhaustedValue(1, true),
-		"fnB/h", exhaustedValue(1, true),
+		"fnA/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "aa"}, true),
+		"fnB/h", exhaustedValue(InvocationClaim{Attempt: 1, Token: "bb"}, true),
 	).Err(); err != nil {
 		t.Fatalf("seed invocation state: %v", err)
 	}
@@ -1303,7 +1308,7 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", 2*time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", 2*time.Second); !started {
 			// Protected by an active attempt deadline: skip (no execution) and
 			// keep the message pending (the protected invocation may still
 			// complete or fail on its own).
@@ -1367,7 +1372,7 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	})
 	// Mark running with a deadline ~1s in the future, then stop A.
 	deadline := time.Now().Add(time.Second)
-	if err := envA.client.HSet(context.Background(), key, "fn/h", runningValue(deadline, 1)).Err(); err != nil {
+	if err := envA.client.HSet(context.Background(), key, "fn/h", runningValue(deadline, InvocationClaim{Attempt: 1, Token: "aabbccdd"})).Err(); err != nil {
 		t.Fatalf("hset running marker: %v", err)
 	}
 	envA.stop(t)
@@ -1386,7 +1391,7 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", time.Second); !started {
 			// Protected by the persisted deadline: skip execution but keep the
 			// message pending (return ErrInvocationNotEligible) so a later
 			// reclaim can run it once the deadline expires. This mirrors the
@@ -1508,17 +1513,17 @@ func TestIntegrationFailureSchedulesRetryBackoff(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		started, _, _ := p.TryStart("fn/h", time.Hour)
+		started, n, _, _ := p.TryStart("fn/h", time.Hour)
 		if !started {
 			// Gated by the retry backoff: skip and keep pending.
 			return ErrInvocationNotEligible
 		}
-		n := attempts.Add(1)
-		if n >= 2 {
+		attempt := attempts.Add(1)
+		if attempt >= 2 {
 			return nil
 		}
 		// Simulate the runner's failure path: record a retry backoff.
-		p.RecordFailure("fn/h", time.Minute)
+		p.RecordFailure("fn/h", n, time.Minute)
 		return fmt.Errorf("fail first delivery")
 	})
 	e.waitDelivered(t, id)
@@ -1564,7 +1569,7 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
 			return ErrInvocationNotEligible
 		}
 		aCalls.Add(1)
@@ -1591,7 +1596,7 @@ func TestIntegrationConcurrentReplicasNoDuplicate(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
 			return ErrInvocationNotEligible
 		}
 		bCalls.Add(1)
@@ -1647,7 +1652,7 @@ func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
 			return ErrInvocationNotEligible
 		}
 		close(deliveredA)
@@ -1672,7 +1677,7 @@ func TestIntegrationCrossReplicaNotEligibleKeepsPending(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", 5*time.Second); !started {
 			return ErrInvocationNotEligible
 		}
 		return nil
@@ -1708,7 +1713,7 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 
 	// Pre-write a next_attempt_at marker ~1s in the future.
 	future := time.Now().Add(time.Second)
-	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(future, 2)).Err(); err != nil {
+	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(future, InvocationClaim{Attempt: 2, Token: "aabbccdd"})).Err(); err != nil {
 		t.Fatalf("hset next_attempt_at marker: %v", err)
 	}
 
@@ -1721,7 +1726,7 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		if started, _, _ := p.TryStart("fn/h", time.Second); !started {
+		if started, _, _, _ := p.TryStart("fn/h", time.Second); !started {
 			// Gated by the retry backoff: skip and keep pending.
 			return ErrInvocationNotEligible
 		}
@@ -1754,7 +1759,7 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 	key := invocationStateKey(e.stream, e.group, id)
 
 	// Pre-write an exhausted marker.
-	if err := e.client.HSet(context.Background(), key, "fn/h", exhaustedValue(5, false)).Err(); err != nil {
+	if err := e.client.HSet(context.Background(), key, "fn/h", exhaustedValue(InvocationClaim{Attempt: 5, Token: "aabbccdd"}, false)).Err(); err != nil {
 		t.Fatalf("hset exhausted marker: %v", err)
 	}
 
@@ -1773,7 +1778,7 @@ func TestIntegrationExhaustedSkipsWithoutRerun(t *testing.T) {
 		if !ok {
 			return fmt.Errorf("no invocation state in ctx")
 		}
-		started, _, _ := p.TryStart("fn/h", time.Second)
+		started, _, _, _ := p.TryStart("fn/h", time.Second)
 		if started {
 			calls.Add(1)
 		}
@@ -1885,18 +1890,18 @@ func TestIntegrationMultiHandlerIndependence(t *testing.T) {
 		}
 		// fnB: always succeeds, claimed once and completed (skipped on redelivery
 		// via its "ok" field).
-		if started, _, _ := p.TryStart("fnB/h", time.Hour); started {
+		if started, claimB, _, _ := p.TryStart("fnB/h", time.Hour); started {
 			fnBExec.Add(1)
-			p.MarkComplete("fnB/h")
+			p.MarkComplete("fnB/h", claimB)
 		}
 		// fnA: fails the first delivery (records a retry backoff), succeeds later.
 		// If a redelivery arrives before the backoff elapses, TryStart is gated:
 		// mirror the runner by leaving the message pending rather than ACKing an
 		// unresolved invocation.
-		startedA, _, _ := p.TryStart("fnA/h", time.Hour)
+		startedA, claimA, _, _ := p.TryStart("fnA/h", time.Hour)
 		if startedA {
 			if fnAExec.Add(1) == 1 {
-				p.RecordFailure("fnA/h", time.Millisecond) // simulate the runner's retry backoff
+				p.RecordFailure("fnA/h", claimA, time.Millisecond) // simulate the runner's retry backoff
 				return fmt.Errorf("fnA first delivery failed")
 			}
 		} else if !p.IsTerminal("fnA/h") {

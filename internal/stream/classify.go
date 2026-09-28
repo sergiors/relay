@@ -108,6 +108,12 @@ type dlqEntrySpec struct {
 	// (see dlqTraceFor). Empty for the placeholder or when no lineage was
 	// recorded.
 	trace string
+	// claim is the exhausted claim identity (attempt + token) retained by the
+	// invocation's exhausted marker at DLQ-write time. routeToDLQ CASes the
+	// markExhaustedDLQ upgrade on it, so a stale XADD outcome can never upgrade a
+	// newer/foreign marker. It is the zero claim when there is no well-formed
+	// exhausted marker (the placeholder, or a marker-less invocation).
+	claim InvocationClaim
 }
 
 // dlqEntrySpecs expands the runner's terminal exhaustion error into one DLQ
