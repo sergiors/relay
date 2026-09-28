@@ -45,6 +45,10 @@ func seedTestState(t *testing.T) (*state.State, Dependencies) {
 	st, deps := openTempState(t)
 
 	tmpl, _ := function.ParseTemplate([]byte(`runtime: python3.14
+resources:
+  memory: 256MiB
+  cpus: 0.5
+  pids: 64
 events:
   - handler: events.created.handler
     pattern:
@@ -195,6 +199,7 @@ func TestFunctionInspectDetail(t *testing.T) {
 		"Fingerprint: abc123hash",
 		"Prepared:",
 		"Last reconcile:",
+		"Resources: memory=256MiB cpus=0.5 pids=64",
 		"events.created.handler",
 		"timeout=6s",
 		"events.updated.handler",

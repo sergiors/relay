@@ -349,7 +349,119 @@ func TestFingerprintNestedIgnoreRuleChangeDetected(t *testing.T) {
 	}
 }
 
-// TestFingerprintTracksTypeScriptSources pins that TypeScript handlers are
+// TestFingerprintIgnoresResources pins the central contract for hot resource
+// changes: the top-level `resources` mapping is INTENTIONALLY excluded from the
+// content fingerprint, in BOTH the full-source (runtime) path and the
+// template-only (no-runtime) path. Editing only resources must NOT change the
+// digest — so the reconciler does not rebuild an image — while editing any other
+// field still must. Container rotation is driven by the separate resource
+// fingerprint, not by this digest.
+func TestFingerprintIgnoresResources(t *testing.T) {
+	const baseTmpl = `runtime: node24
+resources:
+  memory: 128MiB
+  cpus: 1
+  pids: 128
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`
+	changedResources := `runtime: node24
+resources:
+  memory: 512MiB
+  cpus: 0.5
+  pids: 64
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`
+	withoutResources := `runtime: node24
+events:
+  - handler: index.run
+    pattern:
+      event_name: [INSERT]
+`
+
+	// Full-source (runtime) path.
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "template.yaml"), baseTmpl)
+	writeFile(t, filepath.Join(dir, "index.js"), "export function run(e){}\n")
+	base := fp(t, dir)
+
+	writeFile(t, filepath.Join(dir, "template.yaml"), changedResources)
+	if got := fp(t, dir); got != base {
+		t.Fatalf("a resource-only edit changed the full-source fingerprint:\n base=%s\n got =%s", base, got)
+	}
+	writeFile(t, filepath.Join(dir, "template.yaml"), withoutResources)
+	if got := fp(t, dir); got != base {
+		t.Fatalf("removing resources changed the full-source fingerprint: %s != %s", got, base)
+	}
+	// A NON-resource edit still changes it.
+	writeFile(t, filepath.Join(dir, "template.yaml"), strings.Replace(baseTmpl, "INSERT", "MODIFY", 1))
+	if got := fp(t, dir); got == base {
+		t.Fatal("a non-resource template edit must change the fingerprint")
+	}
+
+	// Template-only (no-runtime) path.
+	noRuntimeDir := t.TempDir()
+	noRuntimeBase := `services:
+  - image: nginx:1.27
+resources:
+  memory: 128MiB
+`
+	writeFile(t, filepath.Join(noRuntimeDir, "template.yaml"), noRuntimeBase)
+	tmpl, err := ParseTemplate([]byte(noRuntimeBase))
+	if err != nil {
+		t.Fatalf("parse no-runtime: %v", err)
+	}
+	before, err := FingerprintFunction(noRuntimeDir, tmpl)
+	if err != nil {
+		t.Fatalf("fingerprint no-runtime: %v", err)
+	}
+	noRuntimeChanged := strings.Replace(noRuntimeBase, "128MiB", "1GiB", 1)
+	writeFile(t, filepath.Join(noRuntimeDir, "template.yaml"), noRuntimeChanged)
+	tmpl2, err := ParseTemplate([]byte(noRuntimeChanged))
+	if err != nil {
+		t.Fatalf("parse changed no-runtime: %v", err)
+	}
+	after, err := FingerprintFunction(noRuntimeDir, tmpl2)
+	if err != nil {
+		t.Fatalf("fingerprint changed no-runtime: %v", err)
+	}
+	if after != before {
+		t.Fatalf("a resource-only edit changed the template-only fingerprint: %s != %s", after, before)
+	}
+}
+
+// TestStripTemplateResourcesPreservesRest pins that stripping resources is
+// byte-stable for the rest of the document (comments, key order, and inline
+// style survive) and a no-op when there is no resources key.
+func TestStripTemplateResourcesPreservesRest(t *testing.T) {
+	withResources := []byte("# head\nruntime: node24\nconcurrency: 2\nresources:\n  memory: 1GiB\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
+	without := []byte("# head\nruntime: node24\nconcurrency: 2\nevents:\n  - handler: index.run\n    pattern: {a: [1]}\n")
+	if string(stripTemplateResources(withResources)) != string(stripTemplateResources(without)) {
+		t.Fatalf("strip must yield identical bytes with and without a resources key:\n with=%q\n without=%q",
+			stripTemplateResources(withResources), stripTemplateResources(without))
+	}
+	// Stable across repeated application.
+	once := stripTemplateResources(withResources)
+	if string(once) != string(stripTemplateResources(once)) {
+		t.Fatal("strip must be idempotent")
+	}
+	// A document that fails to parse is returned unchanged.
+	raw := []byte("a: [b\n")
+	if string(stripTemplateResources(raw)) != string(raw) {
+		t.Fatal("an unparseable document must be returned unchanged")
+	}
+	// A non-mapping document (a list) is returned unchanged too.
+	list := []byte("- a\n- b\n")
+	if string(stripTemplateResources(list)) != string(list) {
+		t.Fatal("a non-mapping document must be returned unchanged")
+	}
+}
+
 // ordinary selected source: editing a .ts file, editing the tsconfig.json, and
 // editing a locally imported .ts module each change the digest, so the function
 // artifact is rebuilt. Relay runs no type-checker, but the transpiled output is

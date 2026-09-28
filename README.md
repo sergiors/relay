@@ -567,15 +567,75 @@ other workers and non-Relay containers are never touched, and Relay performs no
 global Docker pruning.
 
 Every execution container is hardened: it runs as a non-root user (uid 10001),
-is limited to 128 MiB memory / 1 CPU / 128 PIDs, drops all Linux capabilities,
-has a read-only root filesystem with a bounded `/tmp` tmpfs, and keeps outbound
-networking enabled.
+drops all Linux capabilities, has a read-only root filesystem with a bounded
+`/tmp` tmpfs, and keeps outbound networking enabled. Memory, CPU, and PID limits
+are **per-container configuration** (see _Resource limits_ below); their defaults
+are 128 MiB memory / 1 CPU / 128 PIDs.
+
+### Resource limits
+
+A function may declare per-container resource limits in its template:
+
+```yaml
+runtime: python3.14
+
+resources:
+  memory: 256MiB # binary suffix: KiB, MiB, or GiB
+  cpus: 0.5 # numeric and finite, > 0 (fractional CPUs allowed)
+  pids: 256 # positive integer
+
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+```
+
+- All three keys are optional and resolved **independently**: a partial override
+  keeps the default for the fields it omits. Omitted or empty `resources` yields
+  the defaults: `128MiB`, `1` CPU, `128` PIDs.
+- `memory` must be a **binary size string** with exactly one of the suffixes
+  `KiB`, `MiB`, or `GiB` (for example `256MiB`). Decimal suffixes (`KB`, `MB`,
+  `GB`), a bare number, zero, a negative, a fractional size, and a non-string
+  value are all rejected at template validation. The value is converted to bytes.
+- `cpus` must be a **finite number greater than zero**. Integers and fractional
+  cores are accepted (for example `2` or `0.5`); a string, a boolean, zero, a
+  negative, `NaN`, and `Inf` are rejected. It is mapped to Docker's `NanoCPUs`
+  (billionths of a CPU).
+- `pids` must be a **positive integer**. A float, a string, a boolean, zero, and
+  a negative are rejected. It is mapped to Docker's `PidsLimit` (the maximum
+  number of processes/threads in the container).
+- Limits are **per container**, not per function. A function with concurrency `N`
+  runs up to `N` warm containers at once, each bounded by these values, so the
+  function's aggregate ceiling is the configured limit **multiplied by** the
+  number of concurrently running containers (bounded by the function's effective
+  concurrency). For example `memory: 256MiB` with effective concurrency `4` caps
+  the function at roughly `1GiB` across all four containers.
+- The limits apply uniformly to **every** container the function runs: event,
+  schedule, and manual invocations (all share the runtime execution path) and
+  both `entrypoint` and external-`image` services.
+- **Image reuse vs. container recreation.** Resource limits are deliberately
+  **excluded from the function's image fingerprint**: editing only `resources`
+  does **not** rebuild or retag the image. Instead, the running containers are
+  rotated to the new limits — idle warm containers are discarded immediately and
+  busy ones finish their current invocation before being discarded, exactly like
+  an image change. So a resource edit is a fast, code-preserving change: the
+  image is reused, only containers are recreated. For persistent services, a
+  changed resource configuration also replaces the running service container (the
+  replicas converge to the new limits) without touching the image.
+- The limits are shown by `relay function inspect` and are applied only at
+  container create time; there is no in-place resize of a running container.
+
 
 ## Template format
 
 ```yaml
 runtime: python3.14
 concurrency: 2
+
+resources:
+  memory: 256MiB
+  cpus: 1
+  pids: 128
 
 events:
   - handler: events.created.handler
@@ -670,6 +730,11 @@ hour day-of-month month day-of-week`. The exact expression is shown by
   `1`–`65535`) and `replicas` (default `1`, positive integer). The configured
   source is the service identity. The template example above shows a service
   alongside events and schedules.
+- `resources` (optional) declares per-container memory/CPU/PID limits applied to
+  every container the function runs (see _Resource limits_). Fields are optional
+  and resolved independently; omitted fields keep the defaults (128 MiB, 1 CPU,
+  128 PIDs). A resource-only edit reuses the image and rotates containers instead
+  of rebuilding.
 
 ### Schedules
 
@@ -1023,15 +1088,18 @@ unlaunchable entrypoint, an unresolved secret), the pass reports the failure and
 down. A transient registry outage therefore never degrades a working service.
 
 - Containers whose image (or, for an external tag, image **content**), port,
-  effective **environment** (`relay.env_hash`), or routing labels no longer match
+  effective **environment** (`relay.env_hash`), per-container **resources**
+  (`relay.resources`), or routing labels no longer match
   the current version are **replaced** (stop + remove, then start fresh
-  replicas). Containers whose image, port, and environment are unchanged are
-  **preserved** — no unnecessary restarts. The environment comparison is what
-  makes a changed template `env` value or a **rotated secret value** replace a
-  service's container: the image reference and source fingerprint do not change
-  for either, but a long-lived container would otherwise keep serving its old
-  environment forever. A container created before `relay.env_hash` existed
-  carries no label and is replaced once.
+  replicas). Containers whose image, port, environment, and resources are
+  unchanged are **preserved** — no unnecessary restarts. The environment
+  comparison is what makes a changed template `env` value or a **rotated secret
+  value** replace a service's container: the image reference and source
+  fingerprint do not change for either, but a long-lived container would
+  otherwise keep serving its old environment forever. The resource comparison is
+  what makes a resource-only edit replace the container even though the image (and
+  its fingerprint) are unchanged. A container created before `relay.env_hash` (or
+  `relay.resources`) existed carries no label and is replaced once.
 - Scaling up starts the missing replica slots; scaling down stops and removes
   exactly the excess containers (the lowest-numbered replicas are kept).
 - A replica whose process **exits** (a crash) is detected by the same
@@ -1447,6 +1515,7 @@ Fingerprint:       <sha256>
 Prepared:          2026-09-08T12:00:00Z (12s ago)
 Last reconcile:    success (12s ago)
 Last error:        <error>
+Resources:         memory=256MiB cpus=0.5 pids=256
 
 Events:
   events.created.handler   timeout=6s
@@ -1937,7 +2006,8 @@ remains the health check.
   a fresh container was started),
   `runtime_container_discards_total{function,reason}` where `reason` is one of
   the finite teardown causes (`timeout`, `process_exit`, `protocol_error`,
-  `image_changed`, `idle_timeout`, `concurrency_shrink`, `shutdown`;
+  `image_changed`, `resources_changed`, `idle_timeout`, `concurrency_shrink`,
+  `shutdown`;
   removal-time discards are tombstoned, see below) — the reason label is strictly
   causal, never a synthetic value,
   `runtime_container_acquire_duration_seconds{function}` (a histogram observed
@@ -2225,6 +2295,12 @@ get_settings` and serves `GET /health` (started via `uvicorn.run` in user
   **image-source service** — a `template.yaml` that declares
   `image: nginx:1.27-alpine` and no `runtime` at all. Relay inspects the image,
   pulls it when due, and runs it with the image's own `ENTRYPOINT`/`CMD`.
+
+- `examples/functions/resource-limits-node/` (node24): a single rule like
+  `welcome-email-node`, plus an explicit `resources:` block
+  (`memory: 256MiB`, `cpus: 0.5`, `pids: 256`) demonstrating per-container
+  memory/CPU/PID limits. Editing only this block reuses the image and rotates
+  containers instead of rebuilding.
 
 A single generic, cross-engine event matches both functions:
 

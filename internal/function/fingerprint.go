@@ -15,8 +15,10 @@ import (
 
 // Fingerprint returns a deterministic SHA-256 over the complete contents of the
 // function's SELECTED source: every included file's slash-separated relative path
-// plus its bytes, sorted by path. template.yaml is hashed VERBATIM, so any
-// template edit is visible to the reconciler as a content change.
+// plus its bytes, sorted by path. template.yaml is hashed with its top-level
+// `resources` mapping removed, so a resource-only edit is deliberately invisible
+// to the digest (a resource change is applied to containers, not baked into the
+// image; see stripTemplateResources).
 //
 // Selection is the shared source policy (internal/source): the function's own
 // .gitignore rules decide which files under dir are source. A file the rules
@@ -107,6 +109,13 @@ func SelectAndFingerprintFunction(dir string, tmpl *Template) (*source.Selection
 // directly rather than through the source selection: the loader parses it
 // regardless of .gitignore rules, and for a no-runtime template it is the only
 // input that matters.
+//
+// The top-level `resources` mapping is stripped before hashing (see
+// stripTemplateResources), so a resource-only edit never changes the digest. The
+// strip re-serializes the YAML node tree, which means the FIRST fingerprint
+// computed after this behavior was introduced may differ from one computed by an
+// older Relay (a one-time rebuild per function on upgrade); subsequent
+// fingerprints are stable and resource edits are invisible.
 func fingerprintTemplate(dir string) (string, error) {
 	const name = "template.yaml"
 	raw, err := os.ReadFile(filepath.Join(dir, name))
@@ -118,7 +127,10 @@ func fingerprintTemplate(dir string) (string, error) {
 	h.Write([]byte{0})
 	io.WriteString(h, name)
 	h.Write([]byte{0})
-	h.Write(raw)
+	// Strip the top-level `resources` mapping before hashing: resource limits are
+	// per-container runtime configuration, not image inputs, so a resource-only
+	// edit must not change the fingerprint (and must not trigger a rebuild).
+	h.Write(stripTemplateResources(raw))
 	h.Write([]byte{0})
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -167,6 +179,13 @@ func FingerprintSelection(selection *source.Selection) (string, error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 
+	// The function's own template.yaml is hashed with its top-level `resources`
+	// mapping removed, so a resource-only edit does not change the full-source
+	// fingerprint (matching FingerprintFunction's no-runtime path and
+	// stripTemplateResources). A nested template.yaml elsewhere in the tree (a
+	// monorepo) is an ordinary source file and is hashed verbatim.
+	templatePath := filepath.Join(selection.Dir(), "template.yaml")
+
 	h := sha256.New()
 	for _, e := range entries {
 		io.WriteString(h, e.rel)
@@ -182,6 +201,9 @@ func FingerprintSelection(selection *source.Selection) (string, error) {
 		}
 		if err := f.Close(); err != nil {
 			return "", fmt.Errorf("close %q: %w", e.rel, err)
+		}
+		if e.path == templatePath {
+			raw = stripTemplateResources(raw)
 		}
 		h.Write(raw)
 		h.Write([]byte{0})

@@ -60,6 +60,18 @@ type selectionPreparer interface {
 	) (*runtime.Prepared, error)
 }
 
+// resourceSetter is the OPTIONAL extension of Builder implemented by the runtime
+// Manager (but not by the test fakes). Resource limits deliberately do not
+// participate in the image fingerprint, so a resource-only template change does
+// NOT trigger a rebuild and therefore never reaches Prepare. The reconciler
+// calls SetFunctionResources on its unchanged-fingerprint skip path so the live
+// warm pool rotates containers to the new limits (idle ones discarded, busy ones
+// drained) without touching the image. A Builder that does not implement it
+// (fakes, non-Manager builders) ignores the change, exactly as before.
+type resourceSetter interface {
+	SetFunctionResources(name string, limits function.ResourceLimits)
+}
+
 // Config tunes the reconciler. A zero value applies the package defaults.
 type Config struct {
 	// Root is the functions root. Required.
@@ -585,6 +597,15 @@ func (r *Reconciler) reconcileFunction(name string) {
 			"Function: unchanged; reconcile skipped",
 			"function", name,
 		)
+		// Resource limits do not participate in the image fingerprint, so a
+		// resource-only template change lands on this skip path. Publish the
+		// current effective limits to the live warm pool so containers rotate to
+		// them (idle discarded, busy drained) without a rebuild. The runtime
+		// no-ops an unchanged value, so a truly-unchanged periodic tick does not
+		// churn. Non-Manager builders ignore it.
+		if rs, ok := r.builder.(resourceSetter); ok {
+			rs.SetFunctionResources(name, fn.Template.ResourceLimits())
+		}
 		// A skip path is NOT a full no-op when the function declares services:
 		// without converging here, a crashed service replica would only be
 		// repaired on the next content change. Reconcile is idempotent — when

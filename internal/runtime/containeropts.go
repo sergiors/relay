@@ -7,6 +7,8 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+
+	"relay/internal/function"
 )
 
 // ptr returns a pointer to v. It is a tiny helper for the pointer-typed fields
@@ -14,22 +16,37 @@ import (
 // literals rather than requiring a local variable.
 func ptr[T any](v T) *T { return &v }
 
+// resourceHostConfig maps a function's EFFECTIVE resource limits onto Docker's
+// HostConfig resource fields. It is the single conversion point for every Relay
+// container kind (event/schedule/manual invocation containers and both service
+// source kinds), so the Docker field mapping (bytes → Memory, cores → NanoCPUs,
+// count → PidsLimit) lives in exactly one place. The limits are per container.
+//
+// A zero/partial ResourceLimits is normalized to the package defaults via
+// OrDefault before mapping, so a hand-built value can never produce a Docker
+// HostConfig with a zero limit (which would mean "unlimited" to the daemon).
+func resourceHostConfig(limits function.ResourceLimits) container.Resources {
+	limits = limits.OrDefault()
+	return container.Resources{
+		Memory:    limits.MemoryBytes,
+		NanoCPUs:  limits.NanoCPUs,
+		PidsLimit: ptr(limits.PidsLimit),
+	}
+}
+
 // hardenedHostConfig returns the shared security/resource baseline HostConfig
-// every Relay container is created with: all capabilities dropped, memory/
-// CPU/pids-limited, a read-only rootfs, and a bounded /tmp tmpfs as the only
-// writable path. These are internal defaults, not configuration. Networking is
-// left enabled (outbound access is a legitimate function need). autoRemove is
-// true for one-shot invocation containers (the daemon removes them the moment
-// they exit) and false for persistent service containers (the reconciler owns
-// their removal).
-func hardenedHostConfig(autoRemove bool) *container.HostConfig {
+// every Relay container is created with: all capabilities dropped, the resolved
+// memory/CPU/pids limits, a read-only rootfs, and a bounded /tmp tmpfs as the
+// only writable path. The security baseline is internal and not configuration;
+// the resource limits are per-function configuration mapped by
+// resourceHostConfig. Networking is left enabled (outbound access is a
+// legitimate function need). autoRemove is true for one-shot invocation
+// containers (the daemon removes them the moment they exit) and false for
+// persistent service containers (the reconciler owns their removal).
+func hardenedHostConfig(autoRemove bool, limits function.ResourceLimits) *container.HostConfig {
 	return &container.HostConfig{
-		AutoRemove: autoRemove,
-		Resources: container.Resources{
-			Memory:    128 << 20,     // 128 MiB
-			NanoCPUs:  1_000_000_000, // 1 CPU
-			PidsLimit: ptr(int64(128)),
-		},
+		AutoRemove:     autoRemove,
+		Resources:      resourceHostConfig(limits),
 		CapDrop:        []string{"ALL"},
 		ReadonlyRootfs: true,
 		Tmpfs:          map[string]string{"/tmp": "rw,nosuid,noexec,size=64m"},

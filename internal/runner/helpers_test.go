@@ -106,16 +106,28 @@ type captureExecutor struct {
 	handler  string
 	payload  []byte
 	extraEnv []string
+	prepared *runtime.Prepared
 }
 
-func (e *captureExecutor) Execute(ctx context.Context, _ *runtime.Prepared, handler string, eventJSON []byte, extraEnv []string) error {
+func (e *captureExecutor) Execute(ctx context.Context, prepared *runtime.Prepared, handler string, eventJSON []byte, extraEnv []string) error {
 	e.mu.Lock()
 	e.meta = runtime.RunMetaFrom(ctx)
 	e.handler = handler
 	e.payload = append([]byte(nil), eventJSON...)
 	e.extraEnv = append([]string(nil), extraEnv...)
+	e.prepared = prepared
 	e.mu.Unlock()
 	return nil
+}
+
+// gotPrepared returns the Prepared handle the executor was invoked with. The
+// runner forwards the function's published handle unchanged, so the runtime's
+// Execute (the single resource-resolution point) receives the same handle from
+// every entry path.
+func (e *captureExecutor) gotPrepared() *runtime.Prepared {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.prepared
 }
 
 func (e *captureExecutor) gotMeta() runtime.RunMeta {

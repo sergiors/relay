@@ -11,6 +11,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
+	"relay/internal/function"
 	"relay/internal/testutil"
 )
 
@@ -34,6 +35,10 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		// with no effective env still carries its content hash so discovery can
 		// compare it).
 		labelEnvHash: EnvHash(nil),
+		// No spec.Resources -> the default limits' fingerprint (a container
+		// created without explicit resources still carries the effective
+		// default config's hash so discovery can compare it).
+		labelResources: function.DefaultResourceLimits().Fingerprint(),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -396,6 +401,78 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	}
 	if got[labelIdentity] != "service.js" || got[labelHostname] != "worker-1" || got[labelReplica] != "0" {
 		t.Fatalf("ownership labels corrupted: %v", got)
+	}
+}
+
+// TestStartServiceAppliesResourceLimitsForAllSources pins that BOTH source kinds
+// (entrypoint and external image) map the spec's effective resource limits onto
+// the Docker HostConfig, and stamp the same limits' fingerprint as
+// relay.resources so the reconciler can detect a resource-only change. It drives
+// the real StartService client path against the scripted daemon.
+func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
+	limits := function.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 250_000_000, PidsLimit: 48}
+	for _, tc := range []struct {
+		name string
+		spec ServiceSpec
+	}{
+		{
+			name: "entrypoint",
+			spec: ServiceSpec{
+				Function: "fn", Identity: "service.js", Port: 3000, Image: "relay-fn-fn:tag",
+				Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"}, Resources: limits,
+			},
+		},
+		{
+			name: "image",
+			spec: ServiceSpec{
+				Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000,
+				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: []string{"PORT=3000"}, Resources: limits,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := decodeCreateRequest(t, captureServiceCreate(t, tc.spec))
+			hc := req.HostConfig
+			if hc == nil {
+				t.Fatal("create request has no HostConfig")
+			}
+			if hc.Memory != limits.MemoryBytes || hc.NanoCPUs != limits.NanoCPUs ||
+				hc.PidsLimit == nil || *hc.PidsLimit != limits.PidsLimit {
+				t.Fatalf("HostConfig resources = mem %d nano %d pids %v; want %+v",
+					hc.Memory, hc.NanoCPUs, hc.PidsLimit, limits)
+			}
+			// Hardening baseline preserved.
+			if !hc.ReadonlyRootfs || len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" {
+				t.Fatalf("hardening baseline lost: %+v", hc)
+			}
+			if hc.AutoRemove {
+				t.Fatal("service container must not AutoRemove")
+			}
+			if req.Config.Labels[labelResources] != limits.Fingerprint() {
+				t.Fatalf("relay.resources = %q, want %q", req.Config.Labels[labelResources], limits.Fingerprint())
+			}
+		})
+	}
+}
+
+// TestServiceLabelsResourcesFingerprint pins the relay.resources label's
+// contract: it is value-free (fixed hex length, no raw byte/cpu numbers), it
+// changes when any resource field changes, and a zero value fingerprints as the
+// defaults so a legacy/unlabeled container is replaced once.
+func TestServiceLabelsResourcesFingerprint(t *testing.T) {
+	spec := func(r function.ResourceLimits) ServiceSpec {
+		return ServiceSpec{Function: "fn", Identity: "svc", Image: "img", Port: 80, Resources: r}
+	}
+	a := serviceLabels(spec(function.DefaultResourceLimits()), "h", 0)[labelResources]
+	b := serviceLabels(spec(function.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}), "h", 0)[labelResources]
+	if a == "" || len(a) != serviceIdentityHashLen {
+		t.Fatalf("relay.resources = %q, want %d hex chars", a, serviceIdentityHashLen)
+	}
+	if a == b {
+		t.Fatal("a changed memory limit must change relay.resources")
+	}
+	if serviceLabels(spec(function.ResourceLimits{}), "h", 0)[labelResources] != a {
+		t.Fatal("a zero value must fingerprint as the defaults")
 	}
 }
 

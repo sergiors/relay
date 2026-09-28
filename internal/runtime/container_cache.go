@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"relay/internal/function"
 	"relay/internal/observability/metrics"
 )
 
@@ -56,6 +57,7 @@ func discardOnContext(c reusableContainer, ctx context.Context, reason string) b
 // container itself on self-initiated teardown; the others are pool-initiated.
 const (
 	reasonImageChanged      = "image_changed"
+	reasonResourcesChanged  = "resources_changed"
 	reasonShutdown          = "shutdown"
 	reasonFunctionRemove    = "function_removed"
 	reasonIdleTimeout       = "idle_timeout"
@@ -125,7 +127,14 @@ type containerCache struct {
 	// always created at the current effective bound. It is deleted with the
 	// function on removal. Guarded by mu.
 	capacity map[string]int
-	closed   bool
+	// resources records the last effective per-function resource limits published
+	// by a successful Prepare or a resource-only reconcile
+	// (see setFunctionResources). poolFor seeds a newly created pool from it, and
+	// Execute reads it so a resource-only hot change takes effect on the next
+	// container create without a Prepared rebuild. It is deleted with the
+	// function on removal. Guarded by mu.
+	resources map[string]function.ResourceLimits
+	closed    bool
 
 	// idleTimeout is how long a healthy idle pooled container may stay before
 	// the maintenance sweep evicts it (see evictIdle). Set once at construction;
@@ -141,28 +150,37 @@ type containerCache struct {
 	metrics *metrics.Registry
 }
 
-// generation is one image version's set inside a function pool. A version is
-// the image reference. A pool has exactly one active generation (the version
-// new acquires serve) plus zero or more draining generations: superseded or
-// invalidated versions whose busy containers are still completing. Idle
-// containers of a non-active generation are never kept — they are discarded the
-// moment the generation is superseded — and a draining generation is dropped as
-// soon as its last busy container releases. Grouping by generation makes "no
-// new acquires of an old version" structural: acquire only ever leases from or
-// appends to p.active.
+// generation is one container VERSION's set inside a function pool. A version is
+// the pair (image reference, resource config fingerprint): the image determines
+// the code, and the config fingerprint (`relay.resources`, see
+// function.ResourceLimits.Fingerprint) determines the per-container resource
+// limits. A pool has exactly one active generation (the version new acquires
+// serve) plus zero or more draining generations: superseded or invalidated
+// versions whose busy containers are still completing. Idle containers of a
+// non-active generation are never kept — they are discarded the moment the
+// generation is superseded — and a draining generation is dropped as soon as its
+// last busy container releases. Grouping by generation makes "no new acquires of
+// an old version" structural: acquire only ever leases from or appends to
+// p.active.
+//
+// A resource-only change (same image, new config) is therefore a version change:
+// it supersedes the active generation and drains it exactly like an image change,
+// WITHOUT retiring the image itself (leases/GC and relay.image are untouched).
 type generation struct {
-	image string
-	idle  []*pooledContainer
-	busy  map[*pooledContainer]struct{}
+	image  string
+	config string
+	idle   []*pooledContainer
+	busy   map[*pooledContainer]struct{}
 }
 
-func newGeneration(image string) *generation {
-	return &generation{image: image, busy: map[*pooledContainer]struct{}{}}
+func newGeneration(image, config string) *generation {
+	return &generation{image: image, config: config, busy: map[*pooledContainer]struct{}{}}
 }
 
-// matches reports whether this generation serves the requested image.
-func (g *generation) matches(image string) bool {
-	return g.image == image
+// matches reports whether this generation serves the requested image + config
+// version.
+func (g *generation) matches(image, config string) bool {
+	return g.image == image && g.config == config
 }
 
 // functionPool is one function's bounded warm container pool.
@@ -214,6 +232,17 @@ type functionPool struct {
 	// discarded with the pool on function removal). Guarded by mu.
 	retiredImages map[string]bool
 
+	// retiredConfigs holds resource-config fingerprints whose containers must
+	// never be pooled again because a newer effective resource config superseded
+	// them (setFunctionResources). It parallels retiredImages for the config
+	// half of the version identity: a stale request carrying an old config
+	// fingerprint (same image) must be served on a throwaway transient rather
+	// than re-pooling the old limits, and must not supersede the new active
+	// generation. Re-publishing a config (setFunctionResources, after a revert to
+	// a previously-retired fingerprint) clears the entry via replaceConfig so it
+	// warms again. Guarded by mu.
+	retiredConfigs map[string]bool
+
 	// creating is the number of in-progress lazy starts holding a capacity
 	// reservation. Guarded by mu.
 	creating int
@@ -235,14 +264,18 @@ type functionPool struct {
 }
 
 // pooledContainer is one reusable container in a function pool, with its image
-// version, owning generation, and retirement state.
+// version, resource-config fingerprint, owning generation, and retirement state.
 // retired/retireReason/idleSince are guarded by the owning functionPool.mu;
 // membership in a generation's idle/busy set (or the pool's transient set) is
 // the lease state. gen is nil for transient containers.
 type pooledContainer struct {
-	c     reusableContainer
-	image string
-	gen   *generation
+	c reusableContainer
+	// image and config are the container's version identity: the image
+	// reference it was created from and the resource-config fingerprint it was
+	// created with (see generation). Both participate in the generation match.
+	image  string
+	config string
+	gen    *generation
 	// retired marks a container that must not be leased again and must be
 	// discarded as soon as it is not busy (busy ones are discarded on release).
 	retired      bool
@@ -258,9 +291,9 @@ type pooledContainer struct {
 }
 
 // matchesVersion reports whether the wrapper's container was created for the
-// requested image.
-func (pc *pooledContainer) matchesVersion(image string) bool {
-	return pc.image == image
+// requested image AND resource-config version.
+func (pc *pooledContainer) matchesVersion(image, config string) bool {
+	return pc.image == image && pc.config == config
 }
 
 func newContainerCache() *containerCache {
@@ -269,6 +302,7 @@ func newContainerCache() *containerCache {
 		retiredImages:    map[string]bool{},
 		removedFunctions: map[string]bool{},
 		capacity:         map[string]int{},
+		resources:        map[string]function.ResourceLimits{},
 	}
 }
 
@@ -277,12 +311,13 @@ func newFunctionPool(name string, max int, cache *containerCache) *functionPool 
 		max = 1
 	}
 	return &functionPool{
-		name:          name,
-		cache:         cache,
-		max:           max,
-		transient:     map[*pooledContainer]struct{}{},
-		retiredImages: map[string]bool{},
-		notify:        make(chan struct{}),
+		name:           name,
+		cache:          cache,
+		max:            max,
+		transient:      map[*pooledContainer]struct{}{},
+		retiredImages:  map[string]bool{},
+		retiredConfigs: map[string]bool{},
+		notify:         make(chan struct{}),
 	}
 }
 
@@ -310,6 +345,9 @@ func (cc *containerCache) lazyInit() {
 	}
 	if cc.capacity == nil {
 		cc.capacity = map[string]int{}
+	}
+	if cc.resources == nil {
+		cc.resources = map[string]function.ResourceLimits{}
 	}
 }
 
@@ -364,6 +402,104 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	// Prepare reconciles a changed concurrency.
 	p.publishPoolCapacity()
 	return p
+}
+
+// setFunctionResources updates fnName's effective per-container resource limits
+// and retires any warm containers created under the previous limits, so a
+// resource-only template change takes effect on the next container create
+// WITHOUT a rebuild. It is how the reconciler's skip path (a resource-only
+// change does not move the image fingerprint) propagates resources to the live
+// pool.
+//
+// A pool that does not exist yet needs no action beyond recording (the next
+// acquire creates it seeded with the current limits). On a changed value the
+// active generation is superseded: idle old-config containers are discarded now,
+// busy ones drain on release, and the next acquire opens a new generation. A
+// no-op (equal limits) touches nothing, so an unchanged template never churns.
+func (cc *containerCache) setFunctionResources(fnName string, limits function.ResourceLimits) {
+	limits = limits.OrDefault()
+	cc.mu.Lock()
+	cc.lazyInit()
+	previous, had := cc.resources[fnName]
+	cc.resources[fnName] = limits
+	p := cc.pools[fnName]
+	cc.mu.Unlock()
+	if p == nil || (had && previous == limits) {
+		return
+	}
+	// The pool's generation identity changes with the resource fingerprint, so
+	// retire the current active generation now rather than waiting for a lazy
+	// acquire: idle old-config containers must not be served, and the drain
+	// begins immediately.
+	for _, pc := range p.replaceConfig(limits.Fingerprint()) {
+		p.discardContainer(pc, reasonResourcesChanged)
+	}
+}
+
+// replaceConfig supersedes the active generation's resource config with
+// newConfig. It un-retires newConfig (a revert to a previously-retired config
+// must warm again), retires the currently-active config, discards its idle
+// containers immediately, and moves its busy ones to a draining generation. It
+// returns the idle containers to discard outside the lock, and must not be called
+// with p.mu held.
+func (p *functionPool) replaceConfig(newConfig string) []*pooledContainer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.retiredConfigs, newConfig)
+	if p.closed || p.removing {
+		return nil
+	}
+	if p.active == nil || p.active.config == newConfig {
+		return nil
+	}
+	old := p.active
+	p.retiredConfigs[old.config] = true
+	var discard []*pooledContainer
+	for _, pc := range old.idle {
+		if !pc.retired {
+			pc.retired = true
+			pc.retireReason = reasonResourcesChanged
+		}
+	}
+	discard = append(discard, old.idle...)
+	old.idle = nil
+	for pc := range old.busy {
+		if !pc.retired {
+			pc.retired = true
+			pc.retireReason = reasonResourcesChanged
+		}
+	}
+	if len(old.busy) > 0 {
+		p.draining = append(p.draining, old)
+	}
+	// Drop the active generation entirely: the next acquire opens a fresh
+	// generation for the new config, so no old-config container can be leased.
+	p.active = nil
+	p.publishPoolGaugesLocked()
+	p.signalLocked()
+	return discard
+}
+
+// functionResources returns fnName's current effective per-container resource
+// limits as recorded by the last successful Prepare or resource reconcile,
+// defaulting to the package defaults for a function that never published any
+// (a direct/integration caller). It is the single read path for both the cache's
+// generation identity and the Manager's container create, so the limits a
+// container is created with and the generation it is pooled under always agree.
+func (cc *containerCache) functionResources(fnName string) function.ResourceLimits {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.lazyInit()
+	if limits, ok := cc.resources[fnName]; ok {
+		return limits.OrDefault()
+	}
+	return function.DefaultResourceLimits()
+}
+
+// functionConfig is shorthand for the resource fingerprint of fnName's current
+// effective limits: the config half of the cache's generation identity.
+func (cc *containerCache) functionConfig(fnName string) string {
+	return cc.functionResources(fnName).Fingerprint()
 }
 
 // setFunctionConcurrency updates fnName's live warm pool bound to max. It is how
@@ -461,9 +597,32 @@ func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
 // A container that the invocation poisoned (timeout/process exit/protocol
 // error/panic) is dropped on release so a later call starts fresh; a plain
 // handler error keeps the container.
+//
+// This compatibility form takes only the image and derives the resource-config
+// half of the version identity from the cache's last published effective limits
+// (functionConfig), so a direct caller that never went through
+// setFunctionResources still pools under a consistent config. The Manager's
+// production path uses executeVersion, which passes the config it resolved for
+// the create so the HostConfig and the generation identity cannot disagree.
 func (cc *containerCache) execute(
 	ctx context.Context,
 	fnName, image string,
+	max int,
+	start func() (reusableContainer, error),
+	handler string,
+	eventJSON []byte,
+	env map[string]string,
+) (retErr error) {
+	return cc.executeVersion(ctx, fnName, image, cc.functionConfig(fnName), max, start, handler, eventJSON, env)
+}
+
+// executeVersion is execute with an explicit resource-config fingerprint: the
+// caller resolved fnName's effective limits for the container create and passes
+// their fingerprint so the container is pooled under exactly the configuration
+// it was created with. It is the production path (Manager.Execute).
+func (cc *containerCache) executeVersion(
+	ctx context.Context,
+	fnName, image, config string,
 	max int,
 	start func() (reusableContainer, error),
 	handler string,
@@ -474,7 +633,7 @@ func (cc *containerCache) execute(
 	// distinct from the invocation protocol exchange below, so a slow pool wait
 	// or cold start is attributable separately.
 	acquireCtx, acquireSpan := startRuntimeSpan(ctx, "runtime.acquire", fnName, image)
-	lease, err := cc.acquire(acquireCtx, fnName, image, max, start)
+	lease, err := cc.acquireVersion(acquireCtx, fnName, image, config, max, start)
 	if err != nil {
 		finishRuntimeSpan(acquireSpan, err)
 		return err
@@ -491,23 +650,36 @@ func (cc *containerCache) execute(
 	return lease.invoke(invokeCtx, handler, eventJSON, env)
 }
 
-// acquire leases one container for fnName's image version, blocking
-// (context-aware) when the pool is at capacity until a
-// release/close/eviction/transition/removal notifies it. It:
+// acquire leases one container for fnName's version, blocking (context-aware)
+// when the pool is at capacity until a release/close/eviction/transition/removal
+// notifies it. It is the compatibility form that derives the resource-config
+// fingerprint from the cache's last published limits; the Manager uses
+// acquireVersion with the explicit config it also maps into the create.
+func (cc *containerCache) acquire(
+	ctx context.Context,
+	fnName, image string,
+	max int,
+	start func() (reusableContainer, error),
+) (*containerLease, error) {
+	return cc.acquireVersion(ctx, fnName, image, cc.functionConfig(fnName), max, start)
+}
+
+// acquireVersion leases one container for fnName's (image, config) version. It:
 //
 //   - refuses to serve a REMOVED or CLOSED pool, returning errPoolClosed;
-//   - refuses to POOL containers for an image that has been invalidated: a
-//     stale request for a RETIRED image is served at-least-once on a throwaway
-//     (transient) container that is never pooled and is discarded on release
-//     ("no new acquires old image"), without reaping, rewinding, or waiting on
-//     the current (newer) version. The runner's per-function semaphore keeps
-//     the number of such in-flight stale requests bounded in production;
-//   - on a request for a NEW version (a different image), supersedes the active
-//     generation: idle containers of the old version are discarded immediately,
-//     its busy ones are moved to a draining generation and discarded on release,
-//     and the new version becomes the sole active generation. No further acquire
-//     can lease an old-version container, and no new old-version generation is
-//     created;
+//   - refuses to POOL containers for a version that has been retired: a stale
+//     request for a RETIRED image OR a superseded resource config is served
+//     at-least-once on a throwaway (transient) container that is never pooled
+//     and is discarded on release ("no new acquires old version"), without
+//     reaping, rewinding, or waiting on the current (newer) version. The
+//     runner's per-function semaphore keeps the number of such in-flight stale
+//     requests bounded in production;
+//   - on a request for a NEW version (a different image or resource config),
+//     supersedes the active generation: idle containers of the old version are
+//     discarded immediately, its busy ones are moved to a draining generation
+//     and discarded on release, and the new version becomes the sole active
+//     generation. No further acquire can lease an old-version container, and no
+//     new old-version generation is created;
 //   - leases an idle matching container from the active generation, or lazily
 //     starts a new one while capacity remains (reserving the slot before start
 //     so concurrent waiters account for it, and rolling the reservation back on
@@ -516,9 +688,9 @@ func (cc *containerCache) execute(
 // invalidateImage (the runner's image-retirement path) is what retires a
 // known-dead image's busy containers; the forward transition above covers
 // direct callers that switch Prepared without an explicit invalidation.
-func (cc *containerCache) acquire(
+func (cc *containerCache) acquireVersion(
 	ctx context.Context,
-	fnName, image string,
+	fnName, image, config string,
 	max int,
 	start func() (reusableContainer, error),
 ) (*containerLease, error) {
@@ -566,12 +738,13 @@ func (cc *containerCache) acquire(
 			return nil, errPoolClosed
 		}
 
-		// A stale request for an already-invalidated image is served on a
-		// throwaway container that is never pooled ("no new acquires old
-		// image"). Transients are bounded by max among themselves but do NOT
-		// consume the regular pool capacity, so a stale request can neither be
-		// blocked by nor evict the current version's idle containers.
-		if p.retiredImages[image] {
+		// A stale request for an already-retired version (a retired image or a
+		// superseded resource config) is served on a throwaway container that is
+		// never pooled ("no new acquires old version"). Transients are bounded by
+		// max among themselves but do NOT consume the regular pool capacity, so a
+		// stale request can neither be blocked by nor evict the current version's
+		// idle containers.
+		if p.versionRetired(image, config) {
 			if len(p.transient)+p.transientCreating >= p.max {
 				recordWait(p)
 				notify := p.notify
@@ -601,7 +774,7 @@ func (cc *containerCache) acquire(
 				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
+				p.discardContainer(&pooledContainer{c: c, image: image, config: config}, reason)
 				if removing {
 					// The removal may have run while this transient was starting,
 					// when the pool was not yet empty; it can be deleted now.
@@ -609,7 +782,7 @@ func (cc *containerCache) acquire(
 				}
 				return nil, errPoolClosed
 			}
-			pc := &pooledContainer{c: c, image: image, retired: true, retireReason: reasonImageChanged}
+			pc := &pooledContainer{c: c, image: image, config: config, retired: true, retireReason: p.retiredReasonLocked(image, config)}
 			p.transient[pc] = struct{}{}
 			p.publishPoolGaugesLocked()
 			p.recordAcquireLocked(metrics.RuntimeOutcomeCold, time.Since(acquiredAt))
@@ -617,23 +790,34 @@ func (cc *containerCache) acquire(
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
-		// Forward version transition: a request for a new image supersedes the
-		// active generation. The old version's idle containers are discarded now
-		// and its busy ones on release, and it can never be pooled again. This
-		// also covers direct callers that use a new Prepared without a runner
-		// InvalidateImage call.
+		// Forward version transition: a request for a new (image, config)
+		// supersedes the active generation. The old version's idle containers are
+		// discarded now and its busy ones on release, and it can never be pooled
+		// again. This also covers direct callers that use a new Prepared without a
+		// runner InvalidateImage call.
 		var transitioned []*pooledContainer
 		switch {
 		case p.active == nil:
-			p.active = newGeneration(image)
-		case !p.active.matches(image):
+			p.active = newGeneration(image, config)
+		case !p.active.matches(image, config):
 			old := p.active
-			// A retired IMAGE must not be repooled by any later acquire.
-			p.retiredImages[old.image] = true
+			// A superseded version must not be repooled by any later acquire.
+			// Each half is retired ONLY when it actually changed: an image-only
+			// change must keep the (still-current) resource config poolable, and
+			// a config-only change must keep the (still-current) image alive and
+			// warm. Retiring both halves unconditionally would make the next
+			// acquire for the SAME unchanged half a transient, destroying warm
+			// pooling on every image or resource edit.
+			if old.image != image {
+				p.retiredImages[old.image] = true
+			}
+			if old.config != config {
+				p.retiredConfigs[old.config] = true
+			}
 			for _, pc := range old.idle {
 				if !pc.retired {
 					pc.retired = true
-					pc.retireReason = reasonImageChanged
+					pc.retireReason = versionReason(old.image, image)
 				}
 			}
 			transitioned = append(transitioned, old.idle...)
@@ -641,13 +825,13 @@ func (cc *containerCache) acquire(
 			for pc := range old.busy {
 				if !pc.retired {
 					pc.retired = true
-					pc.retireReason = reasonImageChanged
+					pc.retireReason = versionReason(old.image, image)
 				}
 			}
 			if len(old.busy) > 0 {
 				p.draining = append(p.draining, old)
 			}
-			p.active = newGeneration(image)
+			p.active = newGeneration(image, config)
 		}
 
 		// Reap idle containers that may not be leased, before the capacity check
@@ -662,10 +846,10 @@ func (cc *containerCache) acquire(
 				reaped = append(reaped, pc)
 				continue
 			}
-			if pc.retired || !pc.matchesVersion(image) {
+			if pc.retired || !pc.matchesVersion(image, config) {
 				pc.retired = true
 				if pc.retireReason == "" {
-					pc.retireReason = reasonImageChanged
+					pc.retireReason = versionReason(pc.image, image)
 				}
 				reaped = append(reaped, pc)
 				continue
@@ -687,7 +871,7 @@ func (cc *containerCache) acquire(
 		// Prefer an idle matching container.
 		for i := len(p.active.idle) - 1; i >= 0; i-- {
 			pc := p.active.idle[i]
-			if !pc.matchesVersion(image) || pc.retired {
+			if !pc.matchesVersion(image, config) || pc.retired {
 				continue
 			}
 			p.active.idle = append(p.active.idle[:i], p.active.idle[i+1:]...)
@@ -726,7 +910,7 @@ func (cc *containerCache) acquire(
 				p.publishPoolGaugesLocked()
 				p.signalLocked()
 				p.mu.Unlock()
-				p.discardContainer(&pooledContainer{c: c, image: image}, reason)
+				p.discardContainer(&pooledContainer{c: c, image: image, config: config}, reason)
 				if removing {
 					// The removal may have run while this start was in flight,
 					// when the pool still held the reservation; it can be
@@ -735,14 +919,14 @@ func (cc *containerCache) acquire(
 				}
 				return nil, errPoolClosed
 			}
-			pc := &pooledContainer{c: c, image: image}
+			pc := &pooledContainer{c: c, image: image, config: config}
 			// Invalidation or transition landed while this start was in flight:
 			// serve the invocation, but never pool the container. The active
 			// generation serves the requested version only when no transition
 			// occurred; if it was superseded, this start still loses its slot.
-			if p.active == nil || !p.active.matches(image) || p.retiredImages[image] {
+			if p.active == nil || !p.active.matches(image, config) || p.versionRetired(image, config) {
 				pc.retired = true
-				pc.retireReason = reasonImageChanged
+				pc.retireReason = p.retiredReasonLocked(image, config)
 				p.transient[pc] = struct{}{}
 			} else {
 				pc.gen = p.active
@@ -769,6 +953,38 @@ func (cc *containerCache) acquire(
 			return nil, fmt.Errorf("docker run: %w", ctx.Err())
 		}
 	}
+}
+
+// versionReason picks the discard reason for a superseded version: an image
+// change keeps the historical reason (metrics and tests depend on it), while a
+// resource-only change (same image, different config) reports
+// reasonResourcesChanged.
+func versionReason(oldImage, newImage string) string {
+	if oldImage != newImage {
+		return reasonImageChanged
+	}
+	return reasonResourcesChanged
+}
+
+// versionRetired reports whether the (image, config) version is currently
+// retired in this pool: either the image was invalidated/superseded or the
+// resource config was superseded. It must be called with p.mu held.
+func (p *functionPool) versionRetired(image, config string) bool {
+	return p.retiredImages[image] || p.retiredConfigs[config]
+}
+
+// retiredReasonLocked picks the discard reason for a stale (image, config)
+// request: an image retirement reports reasonImageChanged, otherwise the config
+// was superseded and it reports reasonResourcesChanged. It must be called with
+// p.mu held, after versionRetired has confirmed the version is retired.
+func (p *functionPool) retiredReasonLocked(image, config string) string {
+	if p.retiredImages[image] {
+		return reasonImageChanged
+	}
+	if p.retiredConfigs[config] {
+		return reasonResourcesChanged
+	}
+	return reasonImageChanged
 }
 
 // usedLocked returns the number of regular capacity slots currently consumed:

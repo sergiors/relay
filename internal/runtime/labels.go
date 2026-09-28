@@ -82,6 +82,15 @@ const (
 	// matches the desired hash, so it is replaced once.
 	labelEnvHash = "relay.env_hash"
 
+	// labelResources pins the effective per-container resource configuration a
+	// service replica was created with: a short digest over the resolved
+	// memory/CPU/pids limits (function.ResourceLimits.Fingerprint). It is how a
+	// resource-only template change replaces a running service even though the
+	// image reference (and image fingerprint) are unchanged, and it holds no raw
+	// values. A container created before the label carries none, so it is
+	// replaced once.
+	labelResources = "relay.resources"
+
 	// Managed-image labels. These pin the identity and wiring of a managed
 	// image (function or dependency) so the dependency GC can classify images
 	// and resolve function→dependency ownership without inferring anything

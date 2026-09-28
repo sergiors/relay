@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	cerrdefs "github.com/containerd/errdefs"
+
+	"relay/internal/function"
 )
 
 // TestRemoveContainerErrorsTreatedAsBenign verifies the benign-error decision
@@ -48,7 +50,7 @@ func TestRemoveContainerErrorsTreatedAsBenign(t *testing.T) {
 // daemon applies it). autoRemove is the only field that differs between
 // one-shot invocation containers (true) and persistent services (false).
 func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
-	hc := hardenedHostConfig(true)
+	hc := hardenedHostConfig(true, function.DefaultResourceLimits())
 	if hc == nil {
 		t.Fatal("hardenedHostConfig returned nil")
 	}
@@ -75,7 +77,7 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 	}
 
 	// The persistent-service variant differs ONLY in AutoRemove.
-	svc := hardenedHostConfig(false)
+	svc := hardenedHostConfig(false, function.DefaultResourceLimits())
 	if svc.AutoRemove {
 		t.Error("AutoRemove = true for a service container, want false (reconciler-owned)")
 	}
@@ -83,5 +85,31 @@ func TestHardenedHostConfigSecurityBaseline(t *testing.T) {
 		svc.ReadonlyRootfs != hc.ReadonlyRootfs || svc.PidsLimit == nil ||
 		*svc.PidsLimit != *hc.PidsLimit {
 		t.Errorf("service HostConfig = %+v; want the same baseline as the invocation variant except AutoRemove", svc)
+	}
+}
+
+// TestResourceHostConfigMapsEffectiveLimits pins the single Docker mapping point:
+// a function's effective limits map exactly onto HostConfig.Resources (bytes to
+// Memory, NanoCPUs through, PidsLimit as a pointer), and a zero/partial value is
+// normalized to the defaults so a hand-built value can never create an
+// "unlimited" container. The rest of the hardening baseline is untouched.
+func TestResourceHostConfigMapsEffectiveLimits(t *testing.T) {
+	limits := function.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 500_000_000, PidsLimit: 64}
+	hc := hardenedHostConfig(true, limits)
+	if hc.Memory != 256<<20 || hc.NanoCPUs != 500_000_000 || hc.PidsLimit == nil || *hc.PidsLimit != 64 {
+		t.Fatalf("HostConfig resources = mem %d nano %d pids %v; want 256MiB/0.5CPU/64",
+			hc.Memory, hc.NanoCPUs, hc.PidsLimit)
+	}
+	if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" || !hc.ReadonlyRootfs ||
+		hc.Tmpfs["/tmp"] != "rw,nosuid,noexec,size=64m" {
+		t.Fatalf("hardening baseline must be preserved, got %+v", hc)
+	}
+
+	// A zero value normalizes field-by-field to the defaults.
+	zero := resourceHostConfig(function.ResourceLimits{})
+	def := function.DefaultResourceLimits()
+	if zero.Memory != def.MemoryBytes || zero.NanoCPUs != def.NanoCPUs ||
+		zero.PidsLimit == nil || *zero.PidsLimit != def.PidsLimit {
+		t.Fatalf("zero limits = %+v; want the defaults %+v mapped", zero, def)
 	}
 }

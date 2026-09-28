@@ -63,6 +63,12 @@ func (a dockerManagerAdapter) Execute(
 	return a.m.Execute(ctx, prepared, handler, eventJSON, extraEnv)
 }
 
+// SetFunctionResources implements the optional resourceSetter seam so the
+// adapter exercises the same resource-only hot-change path production uses.
+func (a dockerManagerAdapter) SetFunctionResources(name string, limits function.ResourceLimits) {
+	a.m.SetFunctionResources(name, limits)
+}
+
 // writeFn writes a node function directory: template + handler.
 func writeNodeFn(t *testing.T, root, name, output string) {
 	t.Helper()

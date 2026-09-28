@@ -16,6 +16,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 
+	"relay/internal/function"
 	"relay/internal/runtime/python"
 )
 
@@ -48,6 +49,13 @@ type ServiceSpec struct {
 	// runtime-resolved command for an entrypoint source.
 	Entry []string
 	Env   []string // runtime env (plan env), no RELAY_HANDLER
+	// Resources are the function's EFFECTIVE per-container resource limits,
+	// applied to this service container exactly as to an invocation container.
+	// A zero value is normalized to the package defaults, so a hand-built spec
+	// never creates a container with a zero (unlimited) limit. The reconciler
+	// stamps their fingerprint as relay.resources so a changed spec is detected
+	// and the container replaced.
+	Resources function.ResourceLimits
 	// Labels are EXTRA labels the caller wants on the container (routing
 	// labels supplied by the service reconciler). They are merged onto the
 	// relay ownership set, with Relay ownership keys always winning: a caller
@@ -94,6 +102,11 @@ type ServiceContainer struct {
 	// never equals a desired hash, so such a container is replaced once —
 	// exactly like a missing relay.image_id or relay.port.
 	EnvHash string
+	// Resources is the effective resource configuration's fingerprint the
+	// container was created with, parsed from relay.resources. It is "" for a
+	// container created before the label existed, which never equals a desired
+	// fingerprint, so such a container is replaced once.
+	Resources string
 	// Networks is the canonical, sorted, comma-separated set of extra Docker
 	// networks the container was created attached to, parsed from
 	// relay.networks. It is "" for a container with no extra networks (or one
@@ -253,15 +266,17 @@ func EnvHash(env []string) string {
 // clobber or spoof a relay.* key.
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
 	envHash := EnvHash(spec.Env)
+	resourceHash := spec.Resources.OrDefault().Fingerprint()
 	labels := map[string]string{
-		labelType:     ContainerTypeService,
-		labelFunction: spec.Function,
-		labelIdentity: spec.Identity,
-		labelImage:    spec.Image,
-		labelHostname: hostname,
-		labelPort:     strconv.Itoa(spec.Port),
-		labelReplica:  strconv.Itoa(replica),
-		labelEnvHash:  envHash,
+		labelType:      ContainerTypeService,
+		labelFunction:  spec.Function,
+		labelIdentity:  spec.Identity,
+		labelImage:     spec.Image,
+		labelHostname:  hostname,
+		labelPort:      strconv.Itoa(spec.Port),
+		labelReplica:   strconv.Itoa(replica),
+		labelEnvHash:   envHash,
+		labelResources: resourceHash,
 	}
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
@@ -280,6 +295,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	labels[labelPort] = strconv.Itoa(spec.Port)
 	labels[labelReplica] = strconv.Itoa(replica)
 	labels[labelEnvHash] = envHash
+	labels[labelResources] = resourceHash
 	// The image content ID is an ownership key too; a caller can never spoof it,
 	// and an empty ID (a content-addressed Relay tag) clears any spoofed value.
 	if spec.ImageID != "" {
@@ -307,6 +323,17 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // port is exposed as metadata only (ExposedPorts) with NO HostConfig.PortBindings
 // — no host port is published this iteration. On any error after create but
 // before a successful start, the container is removed via removeContainer.
+//
+// Service containers deliberately do NOT go through the per-function execution
+// containerCache: they are not leased, pooled, warmed, or generation-drained.
+// The cache exists for one-shot invocation containers (Execute), each leased for
+// one event and reused across invocations; a persistent service container is
+// owned and reconciled by the service reconciler (see internal/reconciler), which
+// starts one container per replica and replaces it when its labels (image
+// content, env, resources, networks) go stale. A resource-only service change
+// therefore replaces the container at the reconciler's label-comparison layer,
+// not via a cache generation. This applies equally to external-image and
+// entrypoint sources.
 //
 // One image serves both invocations and services: Manager.Prepare builds the
 // function image (its ENTRYPOINT is the invocation bootstrap), and the service
@@ -359,8 +386,10 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	createOps := client.ContainerCreateOptions{
 		Config: cfg,
-		// No AutoRemove: persistent, reconciler-owned (see doc comment).
-		HostConfig: hardenedHostConfig(false),
+		// No AutoRemove: persistent, reconciler-owned (see doc comment). The
+		// resolved resource limits apply exactly as they do to an invocation
+		// container.
+		HostConfig: hardenedHostConfig(false, spec.Resources),
 		Name:       serviceContainerName(spec.Function, spec.Identity, replica),
 	}
 	if endpoints := serviceEndpoints(spec.Network); len(endpoints) > 0 {
@@ -436,18 +465,19 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			}
 		}
 		out = append(out, ServiceContainer{
-			ID:       c.ID,
-			Function: c.Labels[labelFunction],
-			Identity: c.Labels[labelIdentity],
-			Image:    c.Labels[labelImage],
-			ImageID:  c.Labels[labelImageID],
-			Hostname: c.Labels[labelHostname],
-			State:    c.State,
-			Replica:  replica,
-			Port:     port,
-			EnvHash:  c.Labels[labelEnvHash],
-			Networks: c.Labels[labelNetworks],
-			Labels:   labelsCopy,
+			ID:        c.ID,
+			Function:  c.Labels[labelFunction],
+			Identity:  c.Labels[labelIdentity],
+			Image:     c.Labels[labelImage],
+			ImageID:   c.Labels[labelImageID],
+			Hostname:  c.Labels[labelHostname],
+			State:     c.State,
+			Replica:   replica,
+			Port:      port,
+			EnvHash:   c.Labels[labelEnvHash],
+			Resources: c.Labels[labelResources],
+			Networks:  c.Labels[labelNetworks],
+			Labels:    labelsCopy,
 		})
 	}
 	return out, nil

@@ -388,6 +388,12 @@ func reconcileWithObserver(
 		// serving its old env/secrets indefinitely. The hash is order-sensitive
 		// and covers the exact slice StartService applies.
 		envHash := runtime.EnvHash(env)
+		// resources are the function's effective per-container limits; their
+		// fingerprint is compared against each container's relay.resources label
+		// below, so a resource-only template change replaces the running service
+		// even though the image reference (and image fingerprint) are unchanged.
+		resources := tmpl.ResourceLimits()
+		resourceHash := resources.Fingerprint()
 		// desiredNetworks is the canonical relay.networks value the container
 		// must carry: the routing network (if routed) — service networking is
 		// owned by the routing layer and is independent of any worker-global
@@ -414,6 +420,7 @@ func reconcileWithObserver(
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
 				ctr.EnvHash == envHash &&
+				ctr.Resources == resourceHash &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels) {
@@ -460,15 +467,16 @@ func reconcileWithObserver(
 			corrective = true
 			notifyReconcile()
 			spec := runtime.ServiceSpec{
-				Function: fnName,
-				Identity: identity,
-				Port:     svc.Port,
-				Image:    resolved.Ref,
-				ImageID:  resolved.ID,
-				Entry:    resolved.Entry,
-				Env:      env,
-				Labels:   routeLabels,
-				Network:  routeNetwork,
+				Function:  fnName,
+				Identity:  identity,
+				Port:      svc.Port,
+				Image:     resolved.Ref,
+				ImageID:   resolved.ID,
+				Entry:     resolved.Entry,
+				Env:       env,
+				Resources: resources,
+				Labels:    routeLabels,
+				Network:   routeNetwork,
 			}
 			if _, err := docker.StartService(postCtx, spec, slot); err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))

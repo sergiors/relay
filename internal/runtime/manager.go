@@ -187,6 +187,12 @@ type Manager struct {
 	// is used) and set only by tests, whose injected counter proves the digest is
 	// computed exactly once per prepare.
 	depFingerprint dependencyFingerprintFunc
+	// startContainerFn creates a fresh execution container. It is nil in
+	// production (startContainer is used) and set only by in-package tests so the
+	// Execute path's resource resolution and generation identity can be exercised
+	// without a Docker daemon. It receives exactly the arguments Execute would
+	// pass to startContainer.
+	startContainerFn func(ctx context.Context, fnName, image string, env []string, limits function.ResourceLimits, meta RunMeta) (reusableContainer, error)
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -535,7 +541,8 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 // startContainer builds one fresh execution container for a function version.
 // It is the containerCache factory, called with the creating invocation's
 // parameters: env is the function's plan env (per-function, applied at
-// container create), and meta is the creation-time identity RunMeta stamped as
+// container create), limits is the function's effective per-container resource
+// configuration, and meta is the creation-time identity RunMeta stamped as
 // labels (per-invocation fields left empty — labels are immutable while the
 // container outlives invocations). Every container joins the worker-global
 // network set (WithNetworks).
@@ -543,9 +550,13 @@ func (m *Manager) startContainer(
 	ctx context.Context,
 	fnName, image string,
 	env []string,
+	limits function.ResourceLimits,
 	meta RunMeta,
 ) (reusableContainer, error) {
-	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, m.networks, meta)
+	if m.startContainerFn != nil {
+		return m.startContainerFn(ctx, fnName, image, env, limits, meta)
+	}
+	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, m.networks, limits, meta)
 }
 
 // Prepared is a function whose image has been built.
@@ -730,6 +741,7 @@ func (m *Manager) prepare(
 		}
 		m.containers.activateFunction(fn.Name, "")
 		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
 		return prepared, nil
 	}
 
@@ -883,6 +895,10 @@ func (m *Manager) prepare(
 		// bound must follow a successful Prepare even when the image was reused
 		// (a concurrency-only change rebuilds the same fingerprinted image).
 		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		// Propagate the reconciled resource limits too: they never affect the
+		// image fingerprint, so a resource-only change reaches the live pool
+		// here (or via SetFunctionResources on the reconciler's skip path).
+		m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
 		leaseTransferred = true
 		return prepared, nil
 	}
@@ -976,6 +992,7 @@ func (m *Manager) prepare(
 	// concurrency takes effect without a worker restart).
 	m.containers.activateFunction(fn.Name, image)
 	m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+	m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
 	leaseTransferred = true
 	prepared.Dependency = depRef
 	return prepared, nil
@@ -1253,12 +1270,20 @@ func (m *Manager) Execute(
 	idMeta.MessageID = ""
 	idMeta.EventID = ""
 	idMeta.EventName = ""
+	// Resolve the function's effective per-container resource limits ONCE for
+	// this execution, from the cache's last published configuration, and derive
+	// the config fingerprint from exactly those limits. Passing the same pair to
+	// the create and to the pool means the HostConfig a container is created
+	// with and the generation it is pooled under always agree, so a resource-only
+	// hot change rotates containers without a rebuild.
+	limits := m.containers.functionResources(prepared.Name)
+	config := limits.Fingerprint()
 	start := func() (reusableContainer, error) {
 		// Every execution container joins the worker-global network set
 		// (WithNetworks), which the worker has already verified exists at
 		// startup. A network that disappears between verification and create
 		// surfaces as a create error here; Relay never creates networks.
-		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, idMeta)
+		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, limits, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound
 	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
@@ -1268,8 +1293,8 @@ func (m *Manager) Execute(
 	// semaphore uses is what the pool enforces, keeping the pool from ever being
 	// a stricter limiter than the runner's per-function semaphore.
 	max := m.clipConcurrency(prepared.Concurrency)
-	return m.containers.execute(
-		ctx, prepared.Name, prepared.Image, max, start, handler, eventJSON, envMap(extraEnv),
+	return m.containers.executeVersion(
+		ctx, prepared.Name, prepared.Image, config, max, start, handler, eventJSON, envMap(extraEnv),
 	)
 }
 
@@ -1281,6 +1306,22 @@ func (m *Manager) Execute(
 // ErrImageInUse container-reference guard clears promptly.
 func (m *Manager) InvalidateImage(image string) {
 	m.containers.invalidateImage(image)
+}
+
+// SetFunctionResources publishes a function's effective per-container resource
+// limits to the live warm pool WITHOUT a rebuild. It is the resource half of a
+// hot template change: resource limits intentionally do not participate in the
+// image fingerprint, so the reconciler's unchanged-fingerprint skip path calls
+// this (through the Builder's optional resourceSetter capability) when only the
+// function's `resources` changed. A changed value supersedes the current
+// container generation so old-config idle containers are discarded and busy ones
+// drain, exactly like an image change but without touching the image reference
+// or its ownership lease. It is idempotent for an unchanged value.
+func (m *Manager) SetFunctionResources(name string, limits function.ResourceLimits) {
+	if name == "" {
+		return
+	}
+	m.containers.setFunctionResources(name, limits)
 }
 
 // PoolSnapshot returns a point-in-time view of name's live warm-container pool:

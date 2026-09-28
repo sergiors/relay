@@ -12,7 +12,23 @@
 //     only services use the external `image` source) builds no image from
 //     source, so FingerprintFunction narrows its fingerprint to template.yaml
 //     ALONE — an irrelevant source edit can never look like a desired-state
-//     change, and the tree is not scanned
+//     change, and the tree is not scanned. The top-level `resources` mapping is
+//     excluded from BOTH fingerprint paths (stripTemplateResources), so a
+//     resource-only edit never changes the digest and never triggers a rebuild.
+//
+// Resource limits:
+//   - `resources` (optional) declares per-container memory/CPU/PID limits for
+//     every container the function runs (event/schedule/manual invocations and
+//     both service source kinds). Memory uses binary suffixes (KiB/MiB/GiB)
+//     only; cpus is a finite number > 0 (fractional allowed); pids is a positive
+//     integer. Each field is optional and resolved independently, defaulting to
+//     128MiB / 1 CPU / 128 PIDs; malformed, zero, or negative values are
+//     rejected. Limits are per container, so a function's aggregate ceiling is
+//     the configured limit times its concurrently running containers. The
+//     effective limits are exposed via Template.ResourceLimits /
+//     ResourceLimits.Fingerprint; the runtime maps them onto Docker's HostConfig
+//     and keys its warm-container generation on the fingerprint, so a
+//     resource-only change rotates containers without a rebuild.
 //
 // Key Features:
 //   - A rule that omits a timeout resolves to DefaultTimeout; zero, negative,

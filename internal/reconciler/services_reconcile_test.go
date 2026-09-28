@@ -30,6 +30,7 @@ type fakeContainer struct {
 	state      container.ContainerState
 	entry      []string // the long-lived process command passed to StartService
 	envHash    string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
+	resources  string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
 	labels     map[string]string
 	network    string // spec.Network passed to StartService (the routing network)
 	hostname   string // the worker identity (relay.hostname) that owns the container
@@ -111,11 +112,14 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// the effective env's content hash (relay.env_hash), even for an empty
 		// env. Directly seeded fakeContainers omit it to model a legacy/unlabeled
 		// container. It also carries the canonical relay.networks label (the
-		// routing network), so a converged pass sees the networks match.
-		envHash:  runtime.EnvHash(spec.Env),
-		labels:   spec.Labels,
-		network:  spec.Network,
-		hostname: defaultFakeHostname,
+		// routing network), so a converged pass sees the networks match. The
+		// effective resource limits' fingerprint (relay.resources) is stamped
+		// too, so a resource-only change replaces the container.
+		envHash:   runtime.EnvHash(spec.Env),
+		resources: spec.Resources.OrDefault().Fingerprint(),
+		labels:    spec.Labels,
+		network:   spec.Network,
+		hostname:  defaultFakeHostname,
 	}
 	return id, nil
 }
@@ -133,18 +137,19 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	var out []runtime.ServiceContainer
 	for _, c := range f.ctrs {
 		out = append(out, runtime.ServiceContainer{
-			ID:       c.id,
-			Function: c.function,
-			Identity: c.entrypoint,
-			Image:    c.image,
-			ImageID:  c.imageID,
-			State:    c.state,
-			Replica:  c.replica,
-			Port:     c.port,
-			Hostname: c.hostname,
-			EnvHash:  c.envHash,
-			Networks: runtime.NetworksLabel(c.network),
-			Labels:   c.labels,
+			ID:        c.id,
+			Function:  c.function,
+			Identity:  c.entrypoint,
+			Image:     c.image,
+			ImageID:   c.imageID,
+			State:     c.state,
+			Replica:   c.replica,
+			Port:      c.port,
+			Hostname:  c.hostname,
+			EnvHash:   c.envHash,
+			Resources: c.resources,
+			Networks:  runtime.NetworksLabel(c.network),
+			Labels:    c.labels,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -251,6 +256,14 @@ func serviceTemplate(runtimeName string, services ...function.Service) *function
 // a container Relay itself created; omitting it models a legacy/unlabeled one.
 func serviceEnvHash(port int) string {
 	return runtime.EnvHash([]string{fmt.Sprintf("PORT=%d", port)})
+}
+
+// serviceResources is the relay.resources label a started container carries for
+// a template that omits `resources` — the default limits' fingerprint. Directly
+// seeded fakeContainers in converged-state tests set this so they model a
+// container Relay itself created; omitting it models a legacy/unlabeled one.
+func serviceResources() string {
+	return function.DefaultResourceLimits().Fingerprint()
 }
 
 // testReconcileTimeout is the normal-operation budget the service tests pass to
@@ -995,7 +1008,7 @@ func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", function: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80),
+		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 
@@ -1126,7 +1139,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	f.ctrs["id-1"] = &fakeContainer{
 		id: "id-1", function: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
-		envHash: serviceEnvHash(80),
+		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
 	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
 

@@ -82,6 +82,22 @@ type Detail struct {
 	Services           []Service         `json:"services,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
 	Secrets            map[string]string `json:"secrets,omitempty"`
+	// Resources is the function's EFFECTIVE per-container resource configuration
+	// (memory/cpus/pids), resolved with defaults. It is part of the persisted
+	// snapshot so `relay function inspect` can render it; the values are
+	// configuration (never secrets), so storing them adds no sensitivity.
+	Resources *Resources `json:"resources,omitempty"`
+}
+
+// Resources is a function's effective per-container resource configuration as
+// persisted from the template: memory in bytes, cpus as a floating-point core
+// count, and the PID limit. It is a derived, read-only view of the template; the
+// parser's exact byte/nano-CPU representation is preserved so no precision is
+// lost, and the CLI renders a human-readable form.
+type Resources struct {
+	MemoryBytes int64   `json:"memory_bytes"`
+	CPUs        float64 `json:"cpus"`
+	Pids        int64   `json:"pids"`
 }
 
 // hasUsableGeneration reports whether the last active generation is usable, i.e.
@@ -899,6 +915,21 @@ func functionSnapshot(
 		Services:           snapshotServices(tmpl),
 		Env:                env,
 		Secrets:            secrets,
+		Resources:          snapshotResources(tmpl),
+	}
+}
+
+// snapshotResources renders the template's EFFECTIVE per-container resource
+// limits as the persisted view: memory in bytes, cpus as a core count, and the
+// PID limit. It always returns a value (the defaults apply when the template
+// omits `resources`), because the effective limits are what the runtime applies.
+// The values are configuration, never secrets.
+func snapshotResources(tmpl *function.Template) *Resources {
+	limits := tmpl.ResourceLimits()
+	return &Resources{
+		MemoryBytes: limits.MemoryBytes,
+		CPUs:        limits.CPUs(),
+		Pids:        limits.PidsLimit,
 	}
 }
 

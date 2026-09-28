@@ -15,6 +15,8 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
+
+	"relay/internal/function"
 )
 
 // executionEndpoints builds the Docker NetworkingConfig EndpointsConfig for an
@@ -119,6 +121,7 @@ func startExecutionContainer(
 	fn, image string,
 	env []string,
 	networks []string,
+	limits function.ResourceLimits,
 	meta RunMeta,
 ) (*executionContainer, error) {
 	createOps := client.ContainerCreateOptions{
@@ -137,13 +140,14 @@ func startExecutionContainer(
 			Tty:          false,
 			Labels:       runLabels(meta),
 		},
-		// hardenedHostConfig(true) unchanged: AutoRemove still removes the
-		// container the moment it exits (crash recovery is free), and during
-		// its idle lifetime it simply stays running. The hardening baseline
-		// (read-only rootfs, dropped caps, resource limits, bounded /tmp
-		// tmpfs, non-root user baked into the image) is identical to the
-		// one-shot containers.
-		HostConfig: hardenedHostConfig(true),
+		// hardenedHostConfig(true, limits) unchanged in its SECURITY baseline:
+		// AutoRemove still removes the container the moment it exits (crash
+		// recovery is free), and during its idle lifetime it simply stays
+		// running. The read-only rootfs, dropped caps, bounded /tmp tmpfs, and
+		// non-root user baked into the image are identical to the one-shot
+		// containers; only the memory/CPU/pids limits follow the function's
+		// effective resource configuration.
+		HostConfig: hardenedHostConfig(true, limits),
 	}
 	if endpoints := executionEndpoints(networks); len(endpoints) > 0 {
 		createOps.NetworkingConfig = &network.NetworkingConfig{EndpointsConfig: endpoints}

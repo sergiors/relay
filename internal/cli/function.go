@@ -186,6 +186,10 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 	if detail.LastError != "" {
 		fmt.Fprintf(tw, "Last error:\t%s\n", detail.LastError)
 	}
+	if detail.Resources != nil {
+		fmt.Fprintf(tw, "Resources:\tmemory=%s cpus=%g pids=%d\n",
+			formatMemoryBytes(detail.Resources.MemoryBytes), detail.Resources.CPUs, detail.Resources.Pids)
+	}
 	tw.Flush()
 
 	fmt.Fprintln(w, "")
@@ -292,6 +296,22 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 	}
 
 	return fs
+}
+
+// formatMemoryBytes renders a container memory limit using the same binary units
+// the template accepts (KiB/MiB/GiB), choosing the largest unit that divides the
+// value exactly so the output round-trips to the configured size. A value that
+// is not a whole binary unit falls back to plain bytes.
+func formatMemoryBytes(n int64) string {
+	for _, unit := range []struct {
+		suffix string
+		scale  int64
+	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}} {
+		if n > 0 && n%unit.scale == 0 {
+			return fmt.Sprintf("%d%s", n/unit.scale, unit.suffix)
+		}
+	}
+	return fmt.Sprintf("%dB", n)
 }
 
 // sortedKeys returns the map's keys sorted, for deterministic inspect output.

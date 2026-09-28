@@ -1,0 +1,18 @@
+runtime: node24
+concurrency: 2
+
+# Per-container resource limits. Optional and resolved independently; omitted
+# fields keep their defaults (128MiB / 1 CPU / 128 PIDs). Editing ONLY this
+# block does not rebuild the image: Relay rotates containers to the new limits
+# instead (idle ones discarded, busy ones drained after their current
+# invocation), reusing the same image.
+resources:
+  memory: 256MiB # binary suffix required: KiB, MiB, or GiB
+  cpus: 0.5      # finite number > 0; fractional CPUs allowed
+  pids: 256      # positive integer
+
+events:
+  - handler: handler.handler
+    pattern:
+      event_name: [INSERT]
+      table_name: [users]

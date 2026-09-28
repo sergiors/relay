@@ -115,6 +115,14 @@ type Template struct {
 	// resolved defaults (never zero) after ParseTemplate, and Path is
 	// canonicalized (see Service.Path).
 	Services []Service
+	// Resources is the function's EFFECTIVE per-container resource configuration
+	// (memory/cpus/pids), with defaults resolved for every omitted field. Limits
+	// are per container, so a function running N concurrent invocations has N
+	// containers each bounded by these values. Resources intentionally do NOT
+	// participate in the function's image fingerprint: a resource-only change is
+	// applied to new/rotated containers without a rebuild (see
+	// ResourceLimits.Fingerprint for the separate runtime generation identity).
+	Resources ResourceLimits
 }
 
 // Schedule is one cron schedule from the template's `schedules` list: the
@@ -467,6 +475,12 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		Runtime string            `yaml:"runtime"`
 		Env     map[string]string `yaml:"env"`
 		Secrets map[string]string `yaml:"secrets"`
+		// Resources is the optional per-container memory/cpus/pids mapping.
+		// Decoded into a pointer-to-struct so an omitted key (nil) is
+		// distinguishable from a present-but-empty mapping, and each field is
+		// `any` so a malformed value is rejected with a clear message (see
+		// resolveResourceLimits).
+		Resources *rawResourceLimits `yaml:"resources"`
 		// Concurrency is decoded as `any` (not `*int`) so a non-integer value
 		// (e.g. "abc", "1.5", true) is distinguishable from an omitted one and
 		// rejected with a clear message instead of being silently truncated or
@@ -516,6 +530,15 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	}
 
 	t := &Template{Runtime: raw.Runtime}
+
+	// Parse and validate the optional per-container resource limits. Every
+	// omitted field resolves to its default; a present but malformed field is a
+	// template error.
+	resources, err := resolveResourceLimits(raw.Resources)
+	if err != nil {
+		return nil, err
+	}
+	t.Resources = resources
 
 	// Parse and validate concurrency. It is optional; when non-nil it must be a
 	// positive integer (see resolveConcurrency).
