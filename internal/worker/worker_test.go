@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -50,6 +52,13 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 		Name:     "no-runtime-fn",
 		Dir:      t.TempDir(),
 		Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
+	}
+	if err := os.WriteFile(
+		filepath.Join(noRuntimeFn.Dir, "template.yaml"),
+		[]byte("services:\n  - image: nginx:alpine\n    port: 80\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write no-runtime template: %v", err)
 	}
 	if noRuntimeFn.Template.NeedsRuntime() {
 		t.Fatal("fixture precondition: no-runtime template must not need a runtime")

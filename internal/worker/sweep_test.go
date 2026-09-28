@@ -5,37 +5,25 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"relay/internal/function"
-	"relay/internal/runtime"
 )
 
 // TestStartupImageKeepSet pins the startup sweep's keep-set policy without
-// Docker: each on-disk function's fingerprinted image, every running service
-// container's image, and every recorded last-active image are kept; blanks are
-// ignored.
+// Docker: the exact image each function was prepared with this boot, every
+// running service container's image, and every recorded last-active image are
+// kept; blanks are ignored. It takes prepared refs verbatim, so no source tree
+// is re-hashed to reconstruct an expected tag.
 func TestStartupImageKeepSet(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "fn")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	fp, err := function.Fingerprint(dir)
-	if err != nil {
-		t.Fatalf("fingerprint: %v", err)
-	}
-	wantFn := runtime.ImageRef("fn", fp)
-
+	// An image ref that is deliberately NOT derivable by hashing a tree: the
+	// keep-set must retain exactly what it is given rather than recomputing a
+	// tag.
+	const preparedImg = "relay-fn-fn:deadbeefdeadbeef"
 	keep := startupImageKeepSet(
-		[]function.Function{{Name: "fn", Dir: dir}},
+		[]string{preparedImg, ""},
 		[]string{"svc-img", ""},
 		[]string{"recorded-img", ""},
 	)
 
-	for _, want := range []string{wantFn, "svc-img", "recorded-img"} {
+	for _, want := range []string{preparedImg, "svc-img", "recorded-img"} {
 		if !keep[want] {
 			t.Errorf("keep set missing %q: %v", want, keep)
 		}
@@ -45,6 +33,29 @@ func TestStartupImageKeepSet(t *testing.T) {
 	}
 	if len(keep) != 3 {
 		t.Errorf("keep set = %v, want exactly 3 entries", keep)
+	}
+}
+
+// TestStartupImageKeepSetDoesNotRehashSource is the regression for the
+// startup-sweep optimization: the keep-set takes the ACTUAL prepared image
+// references and never touches the filesystem, so it stays correct even for a
+// function whose directory has since vanished. A function that failed to build
+// contributes no prepared image (its still-serving version is covered by the
+// recorded state image instead).
+func TestStartupImageKeepSetDoesNotRehashSource(t *testing.T) {
+	keep := startupImageKeepSet(
+		[]string{"relay-fn-gone:0123456789abcdef"},
+		nil,
+		[]string{"relay-fn-gone:previousserving"},
+	)
+	if !keep["relay-fn-gone:0123456789abcdef"] {
+		t.Fatalf("prepared image not kept: %v", keep)
+	}
+	if !keep["relay-fn-gone:previousserving"] {
+		t.Fatalf("recorded image not kept: %v", keep)
+	}
+	if len(keep) != 2 {
+		t.Fatalf("keep set = %v, want exactly the two supplied refs", keep)
 	}
 }
 
@@ -81,27 +92,24 @@ func TestStartupImageKeepSetRetainsRecordedImageAfterRediscovery(t *testing.T) {
 	}
 
 	// The production gather (sweepStartupImages) collects Detail.Image for each
-	// function still on disk; feed it to the pure keep-set policy.
+	// function still on disk; feed it to the pure keep-set policy. The
+	// rediscovered function was not prepared this boot, so it contributes no
+	// prepared image and only the recorded active image is kept.
 	var recordedImages []string
 	if detail.Image != "" {
 		recordedImages = append(recordedImages, detail.Image)
 	}
-	keep := startupImageKeepSet([]function.Function{fn}, nil, recordedImages)
+	keep := startupImageKeepSet(nil, nil, recordedImages)
 	if !keep["recorded-active-img"] {
 		t.Fatalf("keep set = %v, want the preserved recorded image retained", keep)
 	}
 }
 
-// TestStartupImageKeepSetFingerprintErrorSkipsFunction verifies a function whose
-// directory cannot be fingerprinted contributes no keep entry (the sweep falls
-// back to the service/recorded images only).
-func TestStartupImageKeepSetFingerprintErrorSkipsFunction(t *testing.T) {
-	keep := startupImageKeepSet(
-		[]function.Function{{Name: "missing", Dir: filepath.Join(t.TempDir(), "nope")}},
-		nil,
-		nil,
-	)
+// TestStartupImageKeepSetEmptyInputs verifies an unavailable/no-runtime boot
+// with no services and no recorded state contributes no keep entry.
+func TestStartupImageKeepSetEmptyInputs(t *testing.T) {
+	keep := startupImageKeepSet(nil, nil, nil)
 	if len(keep) != 0 {
-		t.Fatalf("keep set = %v, want empty for an unfingerprintable function", keep)
+		t.Fatalf("keep set = %v, want empty", keep)
 	}
 }

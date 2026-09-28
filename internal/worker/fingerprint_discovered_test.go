@@ -11,12 +11,13 @@ import (
 
 // TestFingerprintDiscoveredReusedAcrossStatePhase is the state-phase regression
 // for the worker's startup wiring: each loaded function is hashed exactly once
-// (fingerprintDiscovered), and that single value is persisted by both the
+// (selectAndFingerprintFunctions), and that single value is persisted by both the
 // fresh-database rebuild and the per-function discovery upsert as the DESIRED
 // fingerprint (no usable active generation exists yet, so the active Fingerprint
 // stays empty). The source is changed after the fingerprint is computed, so a
 // state write that recomputed it would persist the changed digest; the
-// caller-supplied value must win instead.
+// caller-supplied value must win instead. The resolved selection is also carried
+// on the record so Prepare can stage the exact policy the hash came from.
 func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	root := t.TempDir()
 	writeWorkerFunction(t, root, "demo", "def handler(e): return 1\n")
@@ -30,13 +31,20 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 		t.Fatalf("loaded %d functions, want 1", len(fns))
 	}
 
-	discovered := fingerprintDiscovered(fns, discardLogger())
+	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	if len(startup) != 1 {
+		t.Fatalf("startup records = %d, want 1", len(startup))
+	}
+	computed := startup[0].Fingerprint
+	if computed == "" {
+		t.Fatal("selectAndFingerprintFunctions returned an empty fingerprint")
+	}
+	if startup[0].Selection == nil {
+		t.Fatal("a runtime-backed function must carry its resolved selection")
+	}
+	discovered := discoveredFromStartup(startup)
 	if len(discovered) != 1 {
 		t.Fatalf("discovered %d functions, want 1", len(discovered))
-	}
-	computed := discovered[0].Fingerprint
-	if computed == "" {
-		t.Fatal("fingerprintDiscovered returned an empty fingerprint")
 	}
 
 	// Mutate the source after the fingerprint was computed: any recompute now
@@ -93,13 +101,13 @@ func TestFingerprintDiscoveredNamespacedByFunction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	discovered := fingerprintDiscovered(fns, discardLogger())
-	if len(discovered) != 2 {
-		t.Fatalf("discovered %d functions, want 2", len(discovered))
+	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	if len(startup) != 2 {
+		t.Fatalf("startup records = %d, want 2", len(startup))
 	}
-	byName := make(map[string]string, len(discovered))
-	for _, d := range discovered {
-		byName[d.Function.Name] = d.Fingerprint
+	byName := make(map[string]string, len(startup))
+	for _, s := range startup {
+		byName[s.Function.Name] = s.Fingerprint
 	}
 	for _, name := range []string{"alpha", "beta"} {
 		fp, ok := byName[name]
@@ -109,6 +117,57 @@ func TestFingerprintDiscoveredNamespacedByFunction(t *testing.T) {
 	}
 	if byName["alpha"] == byName["beta"] {
 		t.Fatal("distinct functions must not share a fingerprint")
+	}
+}
+
+// TestDiscoveredFromStartupDropsSelection pins the package boundary: the state
+// phase receives the narrow (function, fingerprint) pair and never sees the
+// filesystem selection, which stays worker-local. The fingerprint is carried
+// verbatim.
+func TestDiscoveredFromStartupDropsSelection(t *testing.T) {
+	root := t.TempDir()
+	writeWorkerFunction(t, root, "demo", "def handler(e): return 1\n")
+	fns, err := function.NewLoader(root, discardLogger()).Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	discovered := discoveredFromStartup(startup)
+	if len(discovered) != 1 {
+		t.Fatalf("discovered = %d, want 1", len(discovered))
+	}
+	if discovered[0].Function.Name != "demo" || discovered[0].Fingerprint != startup[0].Fingerprint {
+		t.Fatalf("conversion lost identity: %+v vs %+v", discovered[0], startup[0])
+	}
+}
+
+// TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection pins that a
+// no-runtime function carries a nil selection (it builds no image) while a
+// runtime-backed one carries the selection it hashed.
+func TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection(t *testing.T) {
+	root := t.TempDir()
+	writeWorkerFunction(t, root, "runtime-fn", "def handler(e): return 1\n")
+	writeWorkerFunction(t, root, "external-fn", "def handler(e): return 1\n")
+	fns, err := function.NewLoader(root, discardLogger()).Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for i := range fns {
+		if fns[i].Name == "external-fn" {
+			fns[i].Template.Runtime = ""
+			fns[i].Template.Events = nil
+		}
+	}
+	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	byName := make(map[string]startupFunction, len(startup))
+	for _, s := range startup {
+		byName[s.Function.Name] = s
+	}
+	if ext := byName["external-fn"]; ext.Selection != nil {
+		t.Fatalf("no-runtime function must carry no selection, got %v", ext.Selection)
+	}
+	if rt := byName["runtime-fn"]; rt.Selection == nil {
+		t.Fatal("runtime-backed function must carry its resolved selection")
 	}
 }
 

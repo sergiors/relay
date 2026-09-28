@@ -33,11 +33,29 @@ import (
 // An unreadable included file — or an unreadable .gitignore — is surfaced as an
 // error so the reconciler can retain the previous version rather than guessing.
 func Fingerprint(dir string) (string, error) {
+	_, fp, err := SelectAndFingerprint(dir)
+	return fp, err
+}
+
+// SelectAndFingerprint resolves dir's source-selection policy and computes the
+// full-source fingerprint in one call, returning BOTH the resolved Selection and
+// the digest. It exists so a caller that must hash a function AND stage its build
+// context (the runtime Manager) resolves the selection once and shares it: the
+// policy is not re-derived between the hash and the build, so a concurrent
+// .gitignore edit cannot make the tag and the staged bytes disagree.
+//
+// On error the Selection is nil; callers that only need the digest call
+// Fingerprint, which discards it.
+func SelectAndFingerprint(dir string) (*source.Selection, string, error) {
 	selection, err := source.ForDir(dir)
 	if err != nil {
-		return "", fmt.Errorf("select %q: %w", dir, err)
+		return nil, "", fmt.Errorf("select %q: %w", dir, err)
 	}
-	return FingerprintSelection(selection)
+	fp, err := FingerprintSelection(selection)
+	if err != nil {
+		return nil, "", err
+	}
+	return selection, fp, nil
 }
 
 // FingerprintFunction returns the content fingerprint that gates a function's
@@ -60,10 +78,26 @@ func Fingerprint(dir string) (string, error) {
 // It is the single fingerprint entry point the reconciler, worker, and state
 // layers share, so every layer agrees on what "changed" means for a function.
 func FingerprintFunction(dir string, tmpl *Template) (string, error) {
+	_, fp, err := SelectAndFingerprintFunction(dir, tmpl)
+	return fp, err
+}
+
+// SelectAndFingerprintFunction is FingerprintFunction plus the resolved source
+// selection when one is needed. It applies the same narrow-input rule as
+// FingerprintFunction: a no-runtime template is hashed over template.yaml alone
+// and returns a nil Selection (no source is ever staged into an image); a
+// runtime-backed (or nil) template resolves the full selection once and returns
+// it alongside the digest, so a caller that will also build the function's image
+// (the runtime Manager) shares one policy for both the tag and the staged files.
+func SelectAndFingerprintFunction(dir string, tmpl *Template) (*source.Selection, string, error) {
 	if tmpl != nil && !tmpl.NeedsRuntime() {
-		return fingerprintTemplate(dir)
+		fp, err := fingerprintTemplate(dir)
+		if err != nil {
+			return nil, "", err
+		}
+		return nil, fp, nil
 	}
-	return Fingerprint(dir)
+	return SelectAndFingerprint(dir)
 }
 
 // fingerprintTemplate hashes template.yaml alone, using the same per-entry

@@ -28,11 +28,14 @@ import (
 	"relay/internal/function"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/source"
 	"relay/internal/testutil"
 )
 
 // dockerManagerAdapter wraps a runtime.Manager to satisfy the reconciler's
-// Builder interface (the Manager already has both methods).
+// Builder interface (the Manager already has the methods). It also implements
+// the optional selectionPreparer seam so the integration test exercises the same
+// fingerprint + selection handoff production uses.
 type dockerManagerAdapter struct{ m *runtime.Manager }
 
 func (a dockerManagerAdapter) Prepare(
@@ -40,6 +43,15 @@ func (a dockerManagerAdapter) Prepare(
 	fn function.Function,
 ) (*runtime.Prepared, error) {
 	return a.m.Prepare(ctx, fn)
+}
+
+func (a dockerManagerAdapter) PrepareWithFingerprintAndSelection(
+	ctx context.Context,
+	fn function.Function,
+	fingerprint string,
+	selection *source.Selection,
+) (*runtime.Prepared, error) {
+	return a.m.PrepareWithFingerprintAndSelection(ctx, fn, fingerprint, selection)
 }
 func (a dockerManagerAdapter) Execute(
 	ctx context.Context,

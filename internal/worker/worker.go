@@ -43,6 +43,7 @@ import (
 	"relay/internal/runtime"
 	"relay/internal/schedule"
 	"relay/internal/secrets"
+	"relay/internal/source"
 	"relay/internal/state"
 	"relay/internal/stream"
 )
@@ -315,21 +316,33 @@ func Run(logger *slog.Logger) error {
 	loaderSpan.End()
 	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
 
-	// Compute every loaded function's content fingerprint ONCE for the whole
-	// startup and carry it forward as the immutable startup fingerprint. It is
-	// reused by the state phase (rebuild + discovery upserts), by Manager.Prepare
-	// (the built/reused image's tag), and by the reconciler seed — so no startup
-	// stage re-reads /functions. The state DB is a read-only local state view
-	// (see internal/state), NOT the source of truth and never drives matching or
+	// Compute every loaded function's content fingerprint — and, for a
+	// runtime-backed function, the source selection it was computed from — ONCE
+	// for the whole startup, carrying both forward as the immutable startup
+	// records. The fingerprint feeds the state phase (rebuild + discovery
+	// upserts), Manager.Prepare (the built/reused image's tag), and the
+	// reconciler seed; the selection additionally feeds Manager.Prepare so a
+	// startup build stages the exact policy the tag came from — no stage
+	// re-reads /functions. The state DB is a read-only local state view (see
+	// internal/state), NOT the source of truth and never drives matching or
 	// building; it is opened after the fingerprints so even a broken DB still
 	// yields fingerprints for Prepare and the reconciler.
 	_, fingerprintSpan := tracing.Start(startupCtx, "functions.fingerprint")
-	discovered := fingerprintDiscovered(functions, logger)
-	fingerprints := make(map[string]string, len(discovered))
-	for _, d := range discovered {
-		fingerprints[d.Function.Name] = d.Fingerprint
+	fingerprintStart := time.Now()
+	startup := selectAndFingerprintFunctions(functions, logger)
+	fingerprints := make(map[string]string, len(startup))
+	for _, s := range startup {
+		fingerprints[s.Function.Name] = s.Fingerprint
 	}
+	// The state package consumes the narrow (function, fingerprint) pair; the
+	// selection stays worker-local because it is a filesystem concern the state
+	// layer must not own.
+	discovered := discoveredFromStartup(startup)
 	fingerprintSpan.End()
+	logger.Debug("Startup: fingerprints computed",
+		"count", len(startup),
+		"duration", time.Since(fingerprintStart),
+	)
 
 	// All state errors are non-fatal. A nil handle is never registered, so
 	// shutdown simply skips its close.
@@ -542,10 +555,13 @@ func Run(logger *slog.Logger) error {
 
 	// Build every function's image. A function whose image cannot be built is
 	// marked unavailable so the runner skips it; the rest continue. The
-	// fingerprints computed once above are supplied to Prepare, so no startup
-	// build re-reads a function's source to derive an identity it already has.
+	// fingerprints computed once above (and the selections they came from) are
+	// supplied to Prepare, so no startup build re-reads a function's source to
+	// derive an identity it already has, nor re-derives the selection policy.
 	prepareCtx, prepareSpan := tracing.Start(startupCtx, "functions.prepare")
-	prepared := prepareFunctions(prepareCtx, manager, functions, fingerprints, st, logger)
+	prepareStart := time.Now()
+	prepared := prepareFunctions(prepareCtx, manager, startup, st, logger)
+	logger.Debug("Startup: prepared functions", "count", len(prepared), "duration", time.Since(prepareStart))
 	prepareSpan.End()
 
 	// Publish each function's initial desired service state and return
@@ -573,7 +589,7 @@ func Run(logger *slog.Logger) error {
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
 		sweep:     func(hctx context.Context) { sweepStartupServiceOrphans(hctx, svcCtrl, liveNames) },
-		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, functions, st, logger) },
+		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, startup, prepared, st, logger) },
 		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
 	})
 	shutdown.register(shutdownStep{
@@ -902,9 +918,14 @@ func Run(logger *slog.Logger) error {
 		logger.Error("Reconciler: fsnotify error; not seeding startup fingerprints", "error", err)
 		reconcilerSpan.RecordError(err)
 	} else {
+		seedStart := time.Now()
 		for _, fn := range functions {
 			rec.Seed(fn, fingerprints[fn.Name])
 		}
+		logger.Debug("Startup: seeded startup fingerprints",
+			"count", len(functions),
+			"duration", time.Since(seedStart),
+		)
 	}
 	logger.Info("Watching functions for changes", "root", function.Dir)
 
@@ -1189,36 +1210,97 @@ func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn functio
 	})
 }
 
-// fingerprintDiscovered computes each loaded function's content fingerprint
-// exactly once for the whole startup and pairs it with the function. The worker
-// carries these pairs forward as the immutable startup fingerprint: the state
-// phase reuses them for both the fresh-database rebuild (RebuildFromFunctions)
-// and the discovery upserts (RecordDiscoveredWithFingerprint), Manager.Prepare
-// receives each value so a build/reuse does not rescan, and the reconciler is
-// seeded with the same value. /functions is therefore never re-read for an
-// identity the worker already hashed. A fingerprint error is logged and yielded
-// as "" — the same fallback the state package uses — so a transient read failure
-// never blocks discovery (the empty seed then forces a reconcile rebuild).
-func fingerprintDiscovered(functions []function.Function, logger *slog.Logger) []state.DiscoveredFunction {
-	discovered := make([]state.DiscoveredFunction, 0, len(functions))
+// startupFunction is one loaded function's immutable startup identity: the
+// function, the content fingerprint computed for it exactly once, and — for a
+// runtime-backed function — the source selection that fingerprint was computed
+// from. Carrying the selection alongside the digest lets every later startup
+// stage (state writes, Manager.Prepare, the reconciler seed, and the image
+// keep-set) reuse one traversal instead of re-reading /functions. It is
+// worker-local on purpose: the selection is a filesystem concern the state
+// package must not own, so state only ever sees the narrow
+// (function, fingerprint) conversion below.
+//
+// Selection is nil for a no-runtime (external-image-only) function, which builds
+// no function image; its Fingerprint is then template-only by construction.
+type startupFunction struct {
+	Function    function.Function
+	Fingerprint string
+	Selection   *source.Selection
+}
+
+// selectAndFingerprintFunctions computes each loaded function's fingerprint —
+// and, for a runtime-backed function, resolves its source selection in the SAME
+// traversal — exactly once for the whole startup. The returned records are the
+// immutable startup identity reused by the state phase, Manager.Prepare, the
+// reconciler seed, and the startup image keep-set. A fingerprint error is logged
+// and yielded as "" with a nil selection — the same fallback the state package
+// uses — so a transient read failure never blocks discovery (the empty seed then
+// forces a reconcile rebuild).
+func selectAndFingerprintFunctions(functions []function.Function, logger *slog.Logger) []startupFunction {
+	return selectAndFingerprintFunctionsWith(functions, logger, function.SelectAndFingerprintFunction)
+}
+
+// selectAndFingerprintFunctionsWith is selectAndFingerprintFunctions with the
+// identity resolver injected. Production passes
+// function.SelectAndFingerprintFunction (the wrapper above); a test passes a
+// counting/spying resolver so it can prove the helper resolves each loaded
+// function's selection+fingerprint EXACTLY once and carries the SAME values into
+// the returned records (which feed the state phase, Prepare, and the reconciler
+// seed) without rehashing.
+func selectAndFingerprintFunctionsWith(
+	functions []function.Function,
+	logger *slog.Logger,
+	resolve func(dir string, tmpl *function.Template) (*source.Selection, string, error),
+) []startupFunction {
+	startup := make([]startupFunction, 0, len(functions))
 	for _, fn := range functions {
-		fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
+		selection, fp, err := resolve(fn.Dir, fn.Template)
 		if err != nil {
 			logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", err)
-			fp = ""
+			selection, fp = nil, ""
 		}
-		discovered = append(discovered, state.DiscoveredFunction{Function: fn, Fingerprint: fp})
+		startup = append(startup, startupFunction{Function: fn, Fingerprint: fp, Selection: selection})
+	}
+	return startup
+}
+
+// discoveredFromStartup converts the worker-local startup records to the narrow
+// (function, fingerprint) pairs the state package consumes, so state never sees
+// — or owns — the filesystem selection.
+func discoveredFromStartup(startup []startupFunction) []state.DiscoveredFunction {
+	discovered := make([]state.DiscoveredFunction, 0, len(startup))
+	for _, s := range startup {
+		discovered = append(discovered, state.DiscoveredFunction{Function: s.Function, Fingerprint: s.Fingerprint})
 	}
 	return discovered
+}
+
+// functionPreparer is the narrow view of the runtime Manager that startup
+// preparation needs: the selection-aware Prepare, plus (via runner.Executor) the
+// Execute used to pair each returned handle with its executor for the runner.
+// *runtime.Manager satisfies it; a test spy can implement it, so the startup
+// handoff (the resolved fingerprint+selection must reach Prepare, not be
+// recomputed) is unit-testable without Docker.
+type functionPreparer interface {
+	PrepareWithFingerprintAndSelection(
+		ctx context.Context,
+		fn function.Function,
+		fingerprint string,
+		selection *source.Selection,
+	) (*runtime.Prepared, error)
+	runner.Executor
 }
 
 // prepareFunctions builds each function's image and returns the prepared set. A
 // function whose image cannot be built is marked unavailable (the runner skips
 // it) rather than failing startup; the rest carry their fresh image. It receives
-// the startup fingerprint map and supplies each value to Prepare, so the image
-// identity comes from the single startup hash rather than a fresh scan; only a
-// managed-runtime function (whose build can span a source edit) is rescanned
-// after the build, via startupFinalFingerprint.
+// the startup records — each function with the fingerprint resolved exactly once
+// and (for a runtime-backed function) the source selection that fingerprint was
+// derived from — and supplies BOTH to the selection-aware Prepare, so the image
+// identity comes from the single startup hash rather than a fresh scan, and the
+// build stages exactly the policy the hash came from. Only a managed-runtime
+// function (whose build can span a source edit) is rescanned after the build,
+// via startupFinalFingerprint.
 //
 // The building status is published at the ACTUAL managed runtime image-build
 // boundary via the observer installed by managedRuntimeBuildContext: a reused
@@ -1235,24 +1317,20 @@ func fingerprintDiscovered(functions []function.Function, logger *slog.Logger) [
 // Dockerfile build in the manager lifecycle with its own 10m buildTimeout, so
 // this context's lack of a short deadline is intentional and the build is never
 // bounded by the 30s reconcileTimeout.
-//
-// fingerprints is the immutable startup fingerprint computed once by
-// fingerprintDiscovered, keyed by function name. It is supplied to Prepare so a
-// build/reuse does not rescan a tree the worker already hashed. The resulting
-// image tag is exactly that supplied fingerprint, so the fingerprint returned by
-// Prepare is the value persisted below for a no-runtime function.
 func prepareFunctions(
 	ctx context.Context,
-	manager *runtime.Manager,
-	functions []function.Function,
-	fingerprints map[string]string,
+	manager functionPreparer,
+	startup []startupFunction,
 	st *state.State,
 	logger *slog.Logger,
 ) []*runner.PreparedFunction {
 	preparedCount := 0
-	prepared := make([]*runner.PreparedFunction, 0, len(functions))
-	for _, fn := range functions {
-		prep, err := manager.PrepareWithFingerprint(managedRuntimeBuildContext(ctx, st, fn), fn, fingerprints[fn.Name])
+	prepared := make([]*runner.PreparedFunction, 0, len(startup))
+	for _, s := range startup {
+		fn := s.Function
+		prep, err := manager.PrepareWithFingerprintAndSelection(
+			managedRuntimeBuildContext(ctx, st, fn), fn, s.Fingerprint, s.Selection,
+		)
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
 			// failure: it must not record a spurious reconcile failure in the
@@ -1287,10 +1365,14 @@ func prepareFunctions(
 // startupFinalFingerprint returns the fingerprint the startup state phase
 // persists after a successful prepare. For a managed-runtime function — whose
 // build can run for minutes — it performs one final authoritative scan so a
-// source edit during the build is reflected. For a no-runtime (external-image)
-// function there is no build and no source input, so the supplied fingerprint
-// (template-only by construction) stands and no tree is walked. A supplied ""
-// (direct callers/tests) falls back to a scan so the helper is total.
+// source edit that landed DURING the build (or during the later service
+// convergence) is reflected; the reconciler's watcher window does not yet cover
+// this phase, so this post-build observation is deliberately retained and is a
+// distinct, stronger check than the pre-build supplied fingerprint. For a
+// no-runtime (external-image) function there is no build and no source input,
+// so the supplied fingerprint (template-only by construction) stands and no
+// tree is walked. A supplied "" (direct callers/tests) falls back to a scan so
+// the helper is total.
 func startupFinalFingerprint(fn function.Function, supplied string, logger *slog.Logger) string {
 	if supplied != "" && fn.Template != nil && !fn.Template.NeedsRuntime() {
 		return supplied
@@ -1531,24 +1613,44 @@ func startStartupHousekeeping(
 
 // sweepStartupImages removes Relay-owned images that no longer correspond to a
 // live function version, after every current image is built (reused if
-// unchanged) and services are converged. The keep-set holds (a) each function's
-// expected fingerprinted image and (b) images the running service containers
+// unchanged) and services are converged. The keep-set holds (a) the exact image
+// each function was actually prepared with this boot (Prepared.Image, not a
+// re-derived expected tag), (b) images the running service containers
 // reference. It also keeps (c) any last-active image state recorded for a
 // function still on disk — the crash guard for a swap that started but whose
 // RecordReconcileSuccess never landed, where the recorded image may still be the
 // one serving.
 //
-// When state is nil (DB failed to open) we cannot distinguish a removed function
-// from a mis-fingerprinted one, so orphan removal is skipped entirely — only the
-// self-evidently-current prepared images are kept. Conservative: nothing that
-// might still serve is ever removed.
+// Keeping Prepared.Image is deliberate: the image each function is actually
+// serving this boot is the authoritative answer, and it needs no tree scan — a
+// function whose build failed (unavailable) contributes no prepared image, and
+// its previous serving image is covered by the recorded state image. This
+// replaces a re-hash of every function tree purely to reconstruct an expected
+// tag, so a build that reused an image or a no-runtime function costs nothing
+// here.
+//
+// When state is nil (DB failed to open) the recorded images are unavailable, so
+// the sweep below is skipped entirely: we cannot distinguish a removed function
+// from a live one, and orphan removal must never run against an unknown world.
+// Conservative: nothing that might still serve is ever removed.
 func sweepStartupImages(
 	lifecycle context.Context,
 	manager *runtime.Manager,
-	functions []function.Function,
+	startup []startupFunction,
+	prepared []*runner.PreparedFunction,
 	st *state.State,
 	logger *slog.Logger,
 ) {
+	// The exact image each prepared function is serving this boot. This is the
+	// authoritative keep input: no fingerprint re-scan, no expected-tag
+	// reconstruction.
+	preparedImages := make([]string, 0, len(prepared))
+	for _, pf := range prepared {
+		if p := pf.Prepared(); p != nil && p.Image != "" {
+			preparedImages = append(preparedImages, p.Image)
+		}
+	}
+
 	// Images referenced by any Relay-owned service container are kept too: a
 	// container kept by the Applys above (unchanged image) or left over from a
 	// previous boot that this boot has not yet replaced references its image by
@@ -1568,18 +1670,18 @@ func sweepStartupImages(
 		logStartupCleanupFailure(lifecycle, logger, "Service: keep-set list failed; continuing without", err)
 	}
 	// The state keep-set is only armed when the DB was available. When st is
-	// nil recordedImages stays empty, so the keep-set falls back to the function
+	// nil recordedImages stays empty, so the keep-set falls back to the prepared
 	// and service images alone (and the sweep below is skipped entirely).
 	var recordedImages []string
 	if st != nil {
-		for _, fn := range functions {
-			if detail, ok := st.GetFunction(fn.Name); ok && detail.Image != "" {
+		for _, s := range startup {
+			if detail, ok := st.GetFunction(s.Function.Name); ok && detail.Image != "" {
 				recordedImages = append(recordedImages, detail.Image)
 			}
 		}
 	}
 
-	keep := startupImageKeepSet(functions, serviceImages, recordedImages)
+	keep := startupImageKeepSet(preparedImages, serviceImages, recordedImages)
 	if st != nil {
 		// The image removal pass is a Docker listing plus one removal per
 		// orphaned image; bound it with its own fresh reconcileTimeout so a slow
@@ -1633,26 +1735,27 @@ func verifyConfiguredNetworks(ctx context.Context, manager *runtime.Manager, net
 }
 
 // startupImageKeepSet computes the set of image references the startup sweep
-// must keep: (a) each function's expected fingerprinted image, (b) every image a
-// running service container references, and (c) every last-active image recorded
-// for a function still on disk — the crash guard for a swap that started but
-// whose RecordReconcileSuccess never landed, where the recorded image may still
-// be the one serving. It is a pure function so the keep-set policy is unit
-// testable without Docker or a state DB; blank image entries are ignored.
-func startupImageKeepSet(functions []function.Function, serviceImages, recordedImages []string) map[string]bool {
+// must keep: (a) the exact image each function was actually prepared with this
+// boot (Prepared.Image), (b) every image a running service container
+// references, and (c) every last-active image recorded for a function still on
+// disk — the crash guard for a swap that started but whose
+// RecordReconcileSuccess never landed, where the recorded image may still be the
+// one serving.
+//
+// It takes the ALREADY-RESOLVED prepared image references rather than
+// re-hashing each function tree to reconstruct an expected tag: the prepared
+// refs are the authoritative "what is live right now" and cost no filesystem
+// work, whereas a fingerprint re-scan would duplicate the startup hash and could
+// even disagree with what was actually built. A no-runtime function has no
+// prepared image and is naturally absent; any image a previous (runtime) version
+// built is covered by its recorded last-active image. It is a pure function so
+// the keep-set policy is unit testable without Docker or a state DB; blank image
+// entries are ignored.
+func startupImageKeepSet(preparedImages, serviceImages, recordedImages []string) map[string]bool {
 	keep := make(map[string]bool)
-	for _, fn := range functions {
-		// A no-runtime (external-image-only) function builds no function image,
-		// so there is no derived tag to keep. Any image a previous version built
-		// (when it had a runtime) is covered by the recorded last-active image
-		// below, so skipping here never strands a serving image.
-		if fn.Template != nil && !fn.Template.NeedsRuntime() {
-			continue
-		}
-		// The image tag is derived from the function's content fingerprint, so
-		// the keep-set names exactly the image a build/reuse would produce.
-		if fp, err := function.FingerprintFunction(fn.Dir, fn.Template); err == nil {
-			keep[runtime.ImageRef(fn.Name, fp)] = true
+	for _, img := range preparedImages {
+		if img != "" {
+			keep[img] = true
 		}
 	}
 

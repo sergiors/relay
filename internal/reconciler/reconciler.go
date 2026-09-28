@@ -15,6 +15,7 @@ import (
 	"relay/internal/function"
 	"relay/internal/runner"
 	"relay/internal/runtime"
+	"relay/internal/source"
 	"relay/internal/state"
 )
 
@@ -43,6 +44,22 @@ type Builder interface {
 	) error
 }
 
+// selectionPreparer is the OPTIONAL extension of Builder implemented by the
+// runtime Manager (but not by the test fakes). Its method accepts the source
+// selection the reconciler already resolved to compute the function's
+// fingerprint, so a rebuild does not re-derive the selection between the hash
+// and the build: the tag the reconciler compared and the bytes the build stages
+// come from one policy read. A Builder that does not implement it keeps the
+// plain Prepare behavior; the reconciler falls back to Prepare for those.
+type selectionPreparer interface {
+	PrepareWithFingerprintAndSelection(
+		ctx context.Context,
+		fn function.Function,
+		fingerprint string,
+		selection *source.Selection,
+	) (*runtime.Prepared, error)
+}
+
 // Config tunes the reconciler. A zero value applies the package defaults.
 type Config struct {
 	// Root is the functions root. Required.
@@ -53,6 +70,12 @@ type Config struct {
 	// Interval is the periodic reconciliation period, a backstop for watches that
 	// miss events. Defaults to DefaultInterval.
 	Interval time.Duration
+	// Fingerprint, when non-nil, replaces the package-level
+	// function.SelectAndFingerprintFunction that reconcileFunction uses to derive
+	// a function's source selection and content fingerprint. It is a narrow test
+	// seam (production leaves it nil) so a test can count how many times ONE
+	// reconcile resolves a function's identity without touching the filesystem.
+	Fingerprint func(dir string, tmpl *function.Template) (*source.Selection, string, error)
 	// State is an optional state-view sink. When non-nil, reconcile outcomes
 	// (discovered/updated/removed/failed/skipped) are recorded in it; when nil
 	// the reconciler behaves exactly as before (no state writes). Errors from
@@ -112,6 +135,11 @@ type Reconciler struct {
 	builder Builder
 	log     *slog.Logger
 	st      *state.State
+	// fingerprint resolves a function's selection and content fingerprint. It
+	// defaults to function.SelectAndFingerprintFunction and is overridden by
+	// Config.Fingerprint for tests that need to observe (or count) the ONE
+	// resolution per reconcile.
+	fingerprint func(dir string, tmpl *function.Template) (*source.Selection, string, error)
 	// retire/removeFunction/updateSchedules/updateServices/removeServices are
 	// optional image-lifecycle, schedule-convergence, and service-convergence
 	// hooks (see Config).
@@ -154,6 +182,13 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		cfg.Interval = DefaultInterval
 	}
 
+	// The identity seam defaults to the package fingerprint entry point; a test
+	// may inject one to observe the single per-reconcile resolution.
+	fingerprint := cfg.Fingerprint
+	if fingerprint == nil {
+		fingerprint = function.SelectAndFingerprintFunction
+	}
+
 	return &Reconciler{
 		root:                                cfg.Root,
 		debounce:                            cfg.Debounce,
@@ -162,6 +197,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		builder:                             builder,
 		log:                                 logger,
 		st:                                  cfg.State,
+		fingerprint:                         fingerprint,
 		retire:                              cfg.Retire,
 		removeFunction:                      cfg.RemoveFunction,
 		updateSchedules:                     cfg.UpdateSchedules,
@@ -314,7 +350,17 @@ func (r *Reconciler) pump() {
 }
 
 // ticker periodically reconciles every known function, catching events the
-// watcher missed.
+// watcher missed. This periodic audit INTENTIONALLY re-hashes each function's
+// selected content (reconcileFunction's SelectAndFingerprintFunction) even when
+// no fsnotify event fired: it is the backstop for a missed create/add/remove,
+// an fsnotify overflow, or a transient "unavailable" retry, and it is what makes
+// change detection correct on Docker Desktop bind mounts, where fsnotify
+// delivery is unreliable and stat-metadata-only schemes (mtime/size) miss
+// same-size rapid edits. Every optimization in this file leaves that periodic
+// hash in place; a no-event or metadata-only assumption would weaken
+// correctness, so it is deliberately retained. An unchanged audit finds the
+// same fingerprint and skips (no build), so the cost is the single read the
+// backstop exists to perform.
 func (r *Reconciler) ticker() {
 	defer r.loops.Done()
 	ticker := time.NewTicker(r.interval)
@@ -503,7 +549,16 @@ func (r *Reconciler) reconcileFunction(name string) {
 		return
 	}
 
-	fp, err := function.FingerprintFunction(dir, fn.Template)
+	// Compute the fingerprint AND (for a runtime-backed function) the resolved
+	// source selection in ONE traversal, then carry BOTH into the rebuild below.
+	// The selection is handed to the Manager's selection-aware Prepare so the
+	// build stages exactly the source this hash was derived from, with no second
+	// policy read that a concurrent .gitignore edit could diverge. For a
+	// no-runtime template the selection is nil (no image is built) and the
+	// template-only fingerprint is passed through untouched. The resolver is the
+	// injected seam (production: function.SelectAndFingerprintFunction), invoked
+	// exactly once per reconcile.
+	selection, fp, err := r.fingerprint(dir, fn.Template)
 	if err != nil {
 		r.log.Warn(
 			"Function: fingerprint error; retaining previous version",
@@ -610,7 +665,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	start := time.Now()
-	built, err := r.builder.Prepare(r.prepareContext(name, generation), fn)
+	built, err := r.prepareImage(r.prepareContext(name, generation), fn, fp, selection)
 	if err != nil {
 		r.log.Error(
 			"Function: reload failed; retaining previous version",
@@ -728,6 +783,28 @@ func (r *Reconciler) currentGenerationNumber(name string) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.generations[name]
+}
+
+// prepareImage builds the function's image, passing the fingerprint the
+// reconciler already computed (and, for a runtime-backed function, the source
+// selection it was computed from) when the builder supports it. The runtime
+// Manager does, so a live rebuild hands it BOTH the tag identity and the exact
+// policy to stage: the selection is never re-derived and the fingerprint is
+// never re-hashed. A test or non-Manager Builder that only implements Builder
+// falls back to Prepare, which computes them itself; those fakes do not care
+// about the identity anyway. fp is "" only for a function the reconciler could
+// not hash (which then never reaches here: a fingerprint error retains the
+// previous version), so the value supplied is always the one just compared.
+func (r *Reconciler) prepareImage(
+	ctx context.Context,
+	fn function.Function,
+	fp string,
+	selection *source.Selection,
+) (*runtime.Prepared, error) {
+	if sp, ok := r.builder.(selectionPreparer); ok {
+		return sp.PrepareWithFingerprintAndSelection(ctx, fn, fp, selection)
+	}
+	return r.builder.Prepare(ctx, fn)
 }
 
 // prepareContext roots a Prepare call in the reconciler context and installs the

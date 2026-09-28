@@ -81,6 +81,13 @@ type pingFunc func(ctx context.Context, cli *client.Client) error
 // it can prove no Docker operation runs after the client closes.
 type closeClientFunc func(cli *client.Client) error
 
+// dependencyFingerprintFunc computes a dependency layer's content address from
+// the immutable manifest snapshot Prepare captured. It is the Manager's seam
+// (default: dependencyFingerprintFrom) so a test can inject a counter and prove
+// Prepare computes the dependency digest exactly once and threads that single
+// value through the tag, the label, and the staged bytes.
+type dependencyFingerprintFunc func(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) string
+
 // pingDocker is the production pingFunc: one version-negotiated daemon ping.
 func pingDocker(ctx context.Context, cli *client.Client) error {
 	_, err := cli.Ping(ctx, client.PingOptions{})
@@ -175,6 +182,11 @@ type Manager struct {
 	// the close instant so they can prove no Docker operation runs after close.
 	// It is read once and never mutated after construction.
 	closeClient closeClientFunc
+	// depFingerprint computes a dependency layer's content address from the
+	// snapshot Prepare captured. It is nil in production (dependencyFingerprintFrom
+	// is used) and set only by tests, whose injected counter proves the digest is
+	// computed exactly once per prepare.
+	depFingerprint dependencyFingerprintFunc
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -625,7 +637,7 @@ func (p *Prepared) TakeLease() *ImageLease {
 // done up front: a failed prepare must not lift a removal, or a stale acquire
 // could warm a function the reconciler has not actually reconciled.
 func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared, error) {
-	return m.prepare(ctx, fn, "")
+	return m.prepare(ctx, fn, "", nil)
 }
 
 // PrepareWithFingerprint is Prepare with a caller-supplied content fingerprint.
@@ -654,16 +666,40 @@ func (m *Manager) PrepareWithFingerprint(
 	fn function.Function,
 	fingerprint string,
 ) (*Prepared, error) {
-	return m.prepare(ctx, fn, fingerprint)
+	return m.prepare(ctx, fn, fingerprint, nil)
 }
 
-// prepare is the shared implementation behind Prepare and
-// PrepareWithFingerprint. fingerprint is the caller-supplied content
-// fingerprint, or "" to compute one here.
+// PrepareWithFingerprintAndSelection is Prepare with BOTH a caller-supplied
+// content fingerprint and the already-resolved source selection that fingerprint
+// was computed from. The reconciler computes the fingerprint to decide whether a
+// rebuild is needed, resolving the selection once (function.SelectAndFingerprintFunction),
+// and passes BOTH here so the build stages the exact source the tag was derived
+// from: the policy is not re-derived, so a concurrent .gitignore edit cannot make
+// the tag and the baked bytes disagree, and the tree is not re-selected.
+//
+// A nil selection falls back to resolving one here (matching PrepareWithFingerprint);
+// an empty fingerprint falls back to computing one from the selection. A
+// no-runtime function ignores both: it builds no image and its template-only
+// fingerprint is used verbatim when supplied.
+func (m *Manager) PrepareWithFingerprintAndSelection(
+	ctx context.Context,
+	fn function.Function,
+	fingerprint string,
+	selection *source.Selection,
+) (*Prepared, error) {
+	return m.prepare(ctx, fn, fingerprint, selection)
+}
+
+// prepare is the shared implementation behind Prepare,
+// PrepareWithFingerprint, and PrepareWithFingerprintAndSelection. fingerprint is
+// the caller-supplied content fingerprint, or "" to compute one here.
+// suppliedSelection is the caller's already-resolved source selection for a
+// runtime-backed function, or nil to resolve one here.
 func (m *Manager) prepare(
 	ctx context.Context,
 	fn function.Function,
 	fingerprint string,
+	suppliedSelection *source.Selection,
 ) (*Prepared, error) {
 	// A template that needs no runtime (its services all use the external
 	// `image` source, and it has no events or schedules) has no function image
@@ -701,13 +737,20 @@ func (m *Manager) prepare(
 	// fingerprint and the build context: both must select exactly the same files
 	// (the function's .gitignore rules), and resolving a single Selection keeps
 	// them from disagreeing if a rule file is edited concurrently. The selection
-	// is required for the build context even when the fingerprint is supplied.
-	selection, err := source.ForDir(fn.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
+	// is required for the build context even when the fingerprint is supplied. A
+	// caller that already resolved it for the fingerprint it supplies (the
+	// reconciler) passes it in rather than making us re-read the policy.
+	selection := suppliedSelection
+	if selection == nil {
+		var err error
+		selection, err = source.ForDir(fn.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
+		}
 	}
 	fp := fingerprint
 	if fp == "" {
+		var err error
 		fp, err = function.FingerprintSelection(selection)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
@@ -779,6 +822,11 @@ func (m *Manager) prepare(
 	// daemon.
 	var depSnap dependencySnapshot
 	var depLease *ImageLease
+	// depFingerprint is the content address computed ONCE from the immutable
+	// snapshot below. It names the tag (depRef) and is stamped as the image's
+	// label, so computing it once and passing it to ensureDependencyImage keeps
+	// the tag, the label, and the staged bytes from ever disagreeing.
+	var depFingerprint string
 	releaseDep := func() {
 		if depLease != nil {
 			depLease.Release()
@@ -800,7 +848,8 @@ func (m *Manager) prepare(
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
-		prepared.Dependency = depImageRef(dependencyFingerprintFrom(arch, platform, spec, planResult.Deps, depSnap))
+		depFingerprint = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
+		prepared.Dependency = depImageRef(depFingerprint)
 		// Admit the dependency layer BEFORE its own reuse/existence probe, the
 		// dependency image build, and the function image build below, so
 		// dependency GC's retirement gate cannot remove the layer between the
@@ -814,12 +863,17 @@ func (m *Manager) prepare(
 	// Reuse an existing local image when present. The fingerprinted reference is
 	// the identity: an image carrying this exact tag was necessarily built from
 	// identical source (the tag embeds the fingerprint prefix), so no content
-	// comparison is needed.
+	// comparison is needed. The inspect duration is logged at Debug on BOTH
+	// outcomes below, so the reuse-probe cost (up to two daemon round trips) is
+	// visible during startup triage whether the function reuses or builds,
+	// without a benchmark and without a line per content file.
+	reuseStart := time.Now()
 	if m.imageExists(ctx, image) && m.bootstrapLabelMatches(ctx, image, bootstrapLabelHash) {
 		m.log.Debug(
 			"Function: image exists; reusing",
 			"function", fn.Name,
 			"image", image,
+			"inspect_duration", time.Since(reuseStart),
 		)
 		// The prepare succeeded (the image is present and current), so activate
 		// the exact image: a previously removed function warms again, and a
@@ -832,6 +886,17 @@ func (m *Manager) prepare(
 		leaseTransferred = true
 		return prepared, nil
 	}
+	// The reuse probe missed: the tag is absent locally or its bootstrap label is
+	// stale, so Prepare will (re)build. Log the miss with the SAME inspection
+	// timing shape as the hit so both branches make the daemon probe cost
+	// observable during startup triage; the following build has its own
+	// duration/result logging.
+	m.log.Debug(
+		"Function: image absent or stale; building",
+		"function", fn.Name,
+		"image", image,
+		"inspect_duration", time.Since(reuseStart),
+	)
 
 	// When the function declares a dependency layer, ensure the dependency image
 	// exists first and build the function image FROM it. The dependency image is
@@ -841,7 +906,7 @@ func (m *Manager) prepare(
 	// existing layer with no rebuild (even when the function's source changed).
 	depRef := prepared.Dependency
 	if !planResult.Deps.IsZero() {
-		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depSnap, depRef)
+		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 		}
@@ -996,6 +1061,17 @@ func (m *Manager) clipConcurrency(n int) int {
 	return n
 }
 
+// dependencyFingerprint computes a dependency layer's content address from the
+// snapshot Prepare captured, using the injected seam when set (tests) and the
+// production dependencyFingerprintFrom otherwise. Prepare calls it exactly once
+// per dependency-bearing prepare.
+func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) string {
+	if m.depFingerprint != nil {
+		return m.depFingerprint(arch, platform, spec, deps, snap)
+	}
+	return dependencyFingerprintFrom(arch, platform, spec, deps, snap)
+}
+
 // ensureDependencyImage builds the dependency image for the function's
 // dependency manifest set, returning the dependency image reference. It is a
 // no-op (returns the existing reference) when the dependency image is already
@@ -1005,31 +1081,42 @@ func (m *Manager) clipConcurrency(n int) int {
 // single-stage build, because the function image's Dockerfile inherits its
 // dependency layers via FROM and cannot be built without them.
 //
-// depRef is the reference the caller already derived for the dependency
-// fingerprint (so a build failure is attributable, and the caller has it in hand
-// even for the reuse case). It must be the reference for depFingerprint; the
-// two travel together to keep "which dependency was this built for" exact.
+// depFingerprint is the content address the caller already computed from snap;
+// it names the tag and is stamped as the image's label. depRef is the reference
+// derived from it (so a build failure is attributable, and the caller has it in
+// hand even for the reuse case). Both are passed in so this method never
+// rehashes the snapshot: the tag, the label, and the staged bytes all come from
+// the ONE immutable read.
 func (m *Manager) ensureDependencyImage(
 	ctx context.Context,
 	fn function.Function,
 	spec plan.Spec,
 	deps plan.Deps,
 	snap dependencySnapshot,
+	depFingerprint string,
 	depRef string,
 ) (string, error) {
-	// Derive the dependency fingerprint from the SAME snapshot the build stages,
-	// so the built image is stamped with the exact content address it encodes
-	// (see dependencyImageLabels). The caller already captured the snapshot and
-	// computed the reference; recomputing from it here keeps this method
-	// self-contained without a second, potentially divergent, manifest read.
-	fp := dependencyFingerprintFrom(arch, platform, spec, deps, snap)
 	if depRef == "" {
-		depRef = depImageRef(fp)
+		depRef = depImageRef(depFingerprint)
 	}
+	// The inspect duration is logged at Debug on BOTH outcomes below, mirroring
+	// Prepare's function-image reuse probe, so the dependency probe's daemon
+	// round trip is visible during startup triage whether the layer is reused
+	// or built — without a line per staged manifest.
+	depReuseStart := time.Now()
 	if m.imageExists(ctx, depRef) {
-		m.log.Debug("Dependency image exists; reusing", "dep_image", depRef)
+		m.log.Debug(
+			"Dependency image exists; reusing",
+			"dep_image", depRef,
+			"inspect_duration", time.Since(depReuseStart),
+		)
 		return depRef, nil
 	}
+	m.log.Debug(
+		"Dependency image absent; building",
+		"dep_image", depRef,
+		"inspect_duration", time.Since(depReuseStart),
+	)
 
 	start := time.Now()
 	// As in Prepare's function-image build, the dependency build uses an
@@ -1044,7 +1131,7 @@ func (m *Manager) ensureDependencyImage(
 	// The dependency layer is a real build, so it is spanned like the function
 	// image build. The span nests under the preparing function's span.
 	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
-	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, fp); err != nil {
+	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint); err != nil {
 		depBuildSpan.RecordError(err)
 		depBuildSpan.SetStatus(codes.Error, err.Error())
 		depBuildSpan.End()
