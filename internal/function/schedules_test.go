@@ -148,10 +148,57 @@ schedules:
 	}
 }
 
-// Seconds (6-field) cron is accepted alongside the standard 5-field form, with
-// defaults intact (UTC location, default timeout/retries).
-func TestParseScheduleAcceptsSeconds(t *testing.T) {
-	for _, cron := range []string{"30 0 0 * * *", "*/10 * * * * *"} {
+// Second-granularity (6-field) cron is rejected at validation: gocron's
+// callback exposes no scheduled-due instant, so a per-second occurrence cannot
+// be identified deterministically across workers. The error is clear and names
+// the seconds form.
+func TestParseScheduleRejectsSeconds(t *testing.T) {
+	for _, cron := range []string{"30 0 0 * * *", "*/10 * * * * *", "0 0 12 * * ?"} {
+		_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "` + cron + `"
+`))
+		if err == nil {
+			t.Fatalf("cron %q: expected rejection", cron)
+		}
+		if !strings.Contains(err.Error(), "jobs.cleanup.handler") ||
+			!strings.Contains(err.Error(), "6-field (seconds) cron is not supported") {
+			t.Fatalf("cron %q: err = %v, want a clear seconds-unsupported error naming the handler", cron, err)
+		}
+	}
+}
+
+// The `@every` relative-delay descriptor is rejected: it anchors to each
+// worker's own job start, so workers do not agree on an occurrence.
+func TestParseScheduleRejectsEveryDescriptor(t *testing.T) {
+	for _, cron := range []string{"@every 30s", "@every 1h", "  @every 5m"} {
+		_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "` + cron + `"
+`))
+		if err == nil || !strings.Contains(err.Error(), "jobs.cleanup.handler") ||
+			!strings.Contains(err.Error(), "`@every` relative schedules are not supported") {
+			t.Fatalf("cron %q: err = %v, want a clear @every-unsupported error", cron, err)
+		}
+	}
+}
+
+// Calendar descriptors remain accepted at minute granularity and default to UTC
+// with the standard timeout/retries.
+func TestParseScheduleAcceptsCalendarDescriptors(t *testing.T) {
+	for _, cron := range []string{"@hourly", "@daily", "@midnight", "@weekly", "@monthly", "@yearly", "@annually"} {
 		tmpl := mustParse(t, `
 runtime: python3.14
 events:

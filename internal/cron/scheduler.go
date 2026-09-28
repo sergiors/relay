@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,8 @@ type Scheduler struct {
 	g       gocron.Scheduler
 	mu      sync.Mutex
 	stopped bool
+	// now provides the current time used to identify schedule occurrences.
+	now func() time.Time
 }
 
 // New constructs a Scheduler over the given publisher. The gocron scheduler is
@@ -44,7 +47,7 @@ func New(pub Publisher, logger *slog.Logger) *Scheduler {
 		// (mirroring the webhook provider-name panic style).
 		panic(fmt.Sprintf("cron: construct gocron scheduler: %v", err))
 	}
-	return &Scheduler{log: logger, pub: pub, g: g}
+	return &Scheduler{log: logger, pub: pub, g: g, now: time.Now}
 }
 
 // functionTag is the tag that identifies every job belonging to a function, so
@@ -74,16 +77,27 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// Copy the loop variable into a local so the closure captures this
 		// iteration's schedule, not the loop variable.
 		sch := sch
+		// `@every` is a relative-delay schedule anchored to each worker's own
+		// job start; workers would not agree on an occurrence, so it is rejected
+		// here as it is in template validation. gocron would otherwise accept it
+		// even with withSeconds=false.
+		if trimmed := strings.TrimSpace(sch.Cron); trimmed == "@every" || strings.HasPrefix(trimmed, "@every ") {
+			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler,
+				"error", "`@every` relative schedules are not supported")
+			continue
+		}
 		// Always prepend the zone (UTC included explicitly) so the job runs in
 		// the schedule's effective timezone while the scheduler stays pinned to
 		// UTC; NextRun returns a UTC instant regardless.
 		spec := "CRON_TZ=" + sch.Location.String() + " " + sch.Cron
 		jobName := name + "/" + sch.Handler + "#" + strconv.Itoa(i)
-		// withSeconds=true so runtime execution accepts the same 5-field and
-		// 6-field (seconds) expressions that template validation permits,
-		// keeping the two sides exactly consistent.
+		// withSeconds=false pins registration to the 5-field minute form (plus
+		// calendar descriptors), exactly matching template validation. Seconds
+		// schedules are rejected at parse time because gocron's callback exposes
+		// no scheduled-due instant, so a per-second occurrence could not be
+		// identified deterministically across workers.
 		_, err := s.g.NewJob(
-			gocron.CronJob(spec, true),
+			gocron.CronJob(spec, false),
 			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Handler) }),
 			gocron.WithTags(functionTag(name), jobTag(name, sch.Handler, i)),
 			gocron.WithName(jobName),
@@ -170,14 +184,16 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 // still publish the same occurrence (per-worker evaluation makes publication
 // best-effort across the fleet).
 func (s *Scheduler) fire(ctx context.Context, fnName, handler string) {
-	// The scheduled instant is minute-truncated UTC. 5-field cron granularity is
-	// minutes, so every worker evaluating the same tick arrives at the same
-	// minute-level instant; minute-truncation is robust to second-boundary
-	// jitter between workers and is what keeps their occurrence IDs identical.
-	// (The gocron Job's NextRun() is not used: under RunNow it returns the
-	// FUTURE cron instant, not the due one, so it is not deterministic here.)
+	// The scheduled instant is the minute-truncated UTC wall clock. Only
+	// minute-granularity schedules are accepted (see ReplaceFunction and
+	// function.validateCron), so every worker evaluating the same tick arrives
+	// at the same minute-level instant; minute-truncation is robust to
+	// second-boundary jitter between workers and is what keeps their occurrence
+	// IDs identical. (The gocron Job's NextRun() is not used: under RunNow it
+	// returns the FUTURE cron instant, not the due one, so it is not
+	// deterministic here, and gocron's task callback exposes no due instant.)
 	// The payload's scheduled_at is thus the honest due instant to the minute.
-	due := time.Now().UTC().Truncate(time.Minute)
+	due := s.now().UTC().Truncate(time.Minute)
 	o := schedule.Occurrence{Function: fnName, Handler: handler, ScheduledAt: due}
 	published, err := s.pub.PublishOccurrence(ctx, o)
 	if err != nil {

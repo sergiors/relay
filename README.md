@@ -680,11 +680,17 @@ services:
   `module.function`), a required `pattern`, and optional `timeout` and `retries`.
 - `schedules` (optional) is a list of cron-triggered handlers; each entry
   requires `handler` (module.function) and `cron`.
-- `cron` is a cron expression in either the standard 5-field form `minute hour
-day-of-month month day-of-week` or the 6-field (seconds) form `second minute
-hour day-of-month month day-of-week`. The exact expression is shown by
-  `relay function inspect`, alongside a human-readable description in 24-hour
-  time.
+- `cron` is a cron expression in the standard 5-field form `minute hour
+day-of-month month day-of-week`, or a calendar descriptor (`@hourly`,
+  `@daily`/`@midnight`, `@weekly`, `@monthly`, `@yearly`/`@annually`). The exact
+  expression is shown by `relay function inspect`, alongside a human-readable
+  description in 24-hour time. **Sub-minute (6-field / seconds) expressions are
+  not supported** and fail template validation: gocron's callback does not expose
+  the scheduled-due instant, so a per-second occurrence could not be identified
+  deterministically across workers and the cluster-wide publish-if-new dedup
+  would be broken. The `@every <duration>` descriptor is likewise rejected
+  (it is a relative delay anchored to each worker's own job start, and a
+  sub-minute duration has the same ambiguity).
 - `timezone` (optional) is an IANA timezone (e.g. `Europe/Rome`,
   `America/Sao_Paulo`) resolved with Go's `time.LoadLocation`; omitted means
   UTC. Scheduling respects DST and offset changes of the configured zone. An

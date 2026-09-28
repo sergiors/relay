@@ -80,6 +80,24 @@ func TestOccurrenceIDDistinct(t *testing.T) {
 	}
 }
 
+// Identity is second-aligned: two occurrences in the SAME minute but different
+// seconds are DISTINCT (the ID truncates only sub-second jitter, never whole
+// seconds), so if a seconds schedule were ever admitted it could not collapse
+// several per-minute firings onto one key.
+func TestOccurrenceIDSecondsDistinct(t *testing.T) {
+	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	a := Occurrence{Function: "fn", Handler: "h", ScheduledAt: base}
+	b := Occurrence{Function: "fn", Handler: "h", ScheduledAt: base.Add(30 * time.Second)}
+	if a.ID() == b.ID() {
+		t.Fatalf("occurrences 30s apart collided: %q", a.ID())
+	}
+	// Sub-second jitter within the same whole second still collapses.
+	jitter := Occurrence{Function: "fn", Handler: "h", ScheduledAt: base.Add(500 * time.Millisecond)}
+	if a.ID() != jitter.ID() {
+		t.Fatalf("sub-second jitter split one occurrence: %q vs %q", a.ID(), jitter.ID())
+	}
+}
+
 // Envelope round-trip: ParseEnvelope(o.Envelope()) reconstructs the same
 // Occurrence, with the ID recomputed from the fields.
 func TestEnvelopeRoundTrip(t *testing.T) {

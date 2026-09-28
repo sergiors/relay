@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"relay/internal/function"
@@ -161,10 +163,23 @@ var ErrRuntimeStateUnavailable = errors.New("runtime state unavailable")
 // the requested function (it was never warmed, or was already removed).
 var ErrUnknownFunction = errors.New("unknown function")
 
-// ErrRuntimeStatsUnavailable reports that the worker socket could not reset
-// Relay's statistics because no worker answered — it is unreachable, the socket
-// is stale, or the exchange failed. The CLI treats it as "no worker reset; fall
-// back to resetting the state database directly".
+// ErrRuntimeStatsNoWorker reports that the worker socket positively does not
+// exist or is refusing connections, so no worker can have received the reset
+// request. It is the ONLY reset outcome that permits the CLI's direct state-DB
+// fallback: the absence is unambiguous (connection refused / no such file), so
+// there is no live worker whose authority could be violated. A transient dial
+// timeout is deliberately NOT this error (see ErrRuntimeStatsUnavailable).
+var ErrRuntimeStatsNoWorker = errors.New("runtime stats: no running worker")
+
+// ErrRuntimeStatsUnavailable reports that the worker socket exchange could not
+// be completed and it is UNKNOWN whether a live worker received (or is still
+// processing) the reset — a dial timeout, a request write failure, or a
+// missing/malformed response. Because a live worker may have reset or may reset
+// after the CLI gives up, the CLI must NOT fall back to a direct state-DB reset
+// on this error; it surfaces it instead, preserving the live worker as the
+// authority. It is also reported when a live worker answers that it has no
+// stats source (stats_unavailable): the worker is authoritative and explicitly
+// cannot reset, so a silent direct write would mask that.
 var ErrRuntimeStatsUnavailable = errors.New("runtime stats unavailable")
 
 // ErrRuntimeStatsFailed reports that a worker DID answer the reset command but
@@ -334,10 +349,11 @@ type SocketServer struct {
 // (serve, close, unlink) uses that instance path and never a package-level one.
 //
 // resetter handles the semantic "reset stats" command. Run always supplies the
-// stats flusher (constructed with the state handle even when metrics are
-// disabled), so production always has a resetter; a nil resetter answers
-// stats_unavailable and the CLI falls back to resetting the state database
-// directly.
+// stats flusher (constructed with the state handle and the always-present
+// accounting registry), so production always has a resetter; a nil resetter
+// answers stats_unavailable, which the CLI surfaces (a live worker with no stats
+// source is authoritative — it deliberately does NOT fall back to a direct
+// state-DB write that would mask it).
 //
 // The stale removal is safe because the caller (`relay start` via worker.Run)
 // holds the process lock: see the file comment.
@@ -539,8 +555,9 @@ func (s *SocketServer) handle(conn net.Conn) {
 }
 
 // handleResetStats resets the worker's accumulated Relay statistics through the
-// StatsResetter. A nil resetter answers stats_unavailable so the CLI falls back
-// to the state database; a reset error answers stats_reset_failed so the CLI
+// StatsResetter. A nil resetter answers stats_unavailable; the CLI surfaces that
+// (the worker is authoritative and cannot reset), it does not fall back to a
+// direct state-DB write. A reset error answers stats_reset_failed so the CLI
 // surfaces it instead of masking a failed worker reset. On success the frame
 // carries reset_stats.
 func (s *SocketServer) handleResetStats(conn net.Conn) {
@@ -835,17 +852,24 @@ func QueryRuntimeState(path, function string) (RuntimeState, error) {
 // ResetRuntimeStats asks the live worker at path to reset its accumulated Relay
 // statistics through the socket's semantic "reset stats" command, so the
 // worker's in-memory snapshot source and persisted stats both continue from
-// zero without losing the flush race. It is the CLI's running-worker path. A
-// missing/unresponsive worker (or one with no stats source) reports
-// ErrRuntimeStatsUnavailable, and the CLI falls back to resetting the state
-// database directly; a worker that answered but failed the reset reports
-// ErrRuntimeStatsFailed so the CLI surfaces it. The worker's Prometheus counters
-// are deliberately left monotonic (the worker resets its Relay-side baseline
-// only).
+// zero without losing the flush race. It is the CLI's running-worker path.
+//
+// Only a POSITIVELY absent worker permits the CLI's direct state-DB fallback:
+// a refused dial (no socket / nothing listening) reports ErrRuntimeStatsNoWorker.
+// Every ambiguous outcome — a dial timeout, a write failure, a missing or
+// malformed response — reports ErrRuntimeStatsUnavailable, because a live
+// worker may have reset or may do so after the CLI gives up, and the live
+// worker must stay the authority; the CLI does not fall back on this error. A
+// worker that answered but failed the reset reports ErrRuntimeStatsFailed so the
+// CLI surfaces it. The worker's Prometheus counters are deliberately left
+// monotonic (the worker resets its Relay-side baseline only).
 func ResetRuntimeStats(path string) error {
 	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
 	conn, err := dialer.Dial("unix", path)
 	if err != nil {
+		if socketPositivelyAbsent(err) {
+			return fmt.Errorf("%w: %v", ErrRuntimeStatsNoWorker, err)
+		}
 		return fmt.Errorf("%w: %v", ErrRuntimeStatsUnavailable, err)
 	}
 	defer conn.Close()
@@ -868,6 +892,21 @@ func ResetRuntimeStats(path string) error {
 		return fmt.Errorf("%w: empty response", ErrRuntimeStatsFailed)
 	}
 	return nil
+}
+
+// socketPositivelyAbsent reports whether a dial failed because there is
+// definitively no worker listening, as opposed to an ambiguous failure.
+// The unambiguous cases are:
+//
+//   - the socket file does not exist (a stopped worker removed it on shutdown),
+//     reported as fs.ErrNotExist; or
+//   - nothing is listening on an existing socket, reported as
+//     syscall.ECONNREFUSED (a stale file left by a SIGKILLed worker).
+//
+// A timeout or any other error is NOT positively absent: a live worker may be
+// slow to accept, so the caller must treat the outcome as unknown.
+func socketPositivelyAbsent(dialErr error) bool {
+	return errors.Is(dialErr, fs.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED)
 }
 
 // InvokeFunction asks the live worker at path to run the named function's

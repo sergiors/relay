@@ -406,14 +406,20 @@ schedules:
 	return w.String()
 }
 
-// A 6-field (seconds) cron renders a human-readable description in the same
-// format as 5-field ones.
-func TestFunctionInspectSchedulesSixFieldDescription(t *testing.T) {
-	out := inspectSchedules(t, `  - handler: jobs.cleanup.handler
+// A 6-field (seconds) cron is rejected at template parse, so it can never be
+// rendered by inspect (and never registered by the scheduler).
+func TestFunctionInspectSchedulesRejectsSixField(t *testing.T) {
+	_, err := function.ParseTemplate([]byte(`runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+schedules:
+  - handler: jobs.cleanup.handler
     cron: "30 0 0 * * *"
-`)
-	if !strings.Contains(out, `cron="30 0 0 * * *" (At 00:00:30) timezone=UTC`) {
-		t.Errorf("inspect output missing 6-field description:\n%s", out)
+`))
+	if err == nil || !strings.Contains(err.Error(), "6-field (seconds) cron is not supported") {
+		t.Fatalf("err = %v, want a clear six-field rejection", err)
 	}
 }
 

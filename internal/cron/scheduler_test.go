@@ -181,42 +181,63 @@ func TestReplaceFunctionSkipsUnregisterableSchedule(t *testing.T) {
 	}
 }
 
-// A 6-field (seconds) schedule registers alongside a 5-field one, matching the
-// seconds-optional validation in template. Both forms are accepted by the
-// runtime scheduler.
-func TestReplaceFunctionRegistersSixFieldSecondsSchedule(t *testing.T) {
-	fp := newFakePublisher(2)
-	s := New(fp, testLogger())
+// A hand-built template carrying a 6-field (seconds) schedule cannot register:
+// template validation rejects seconds, so registration is pinned to the 5-field
+// form and this defensive path skips the bad entry while keeping valid ones.
+func TestReplaceFunctionSkipsSixFieldSchedule(t *testing.T) {
+	fp := newFakePublisher(1)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := New(fp, logger)
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
 		{Handler: "jobs.five", Cron: "0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
 		{Handler: "jobs.six", Cron: "30 0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
 	}})
-	if n := s.JobCount(); n != 2 {
-		t.Fatalf("jobs = %d, want 2 (5-field and 6-field)", n)
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs = %d, want 1 (seconds schedule skipped, five-field kept)", n)
 	}
-
-	// Both names must be present.
 	names := map[string]bool{}
 	for _, j := range s.g.Jobs() {
 		names[j.Name()] = true
 	}
-	if !names["fn/jobs.five#0"] || !names["fn/jobs.six#1"] {
-		t.Fatalf("registered jobs = %v, want both five-field and six-field", names)
+	if !names["fn/jobs.five#0"] || names["fn/jobs.six#1"] {
+		t.Fatalf("registered jobs = %v, want only fn/jobs.five#0", names)
+	}
+	if !strings.Contains(logBuf.String(), "register schedule failed") {
+		t.Fatalf("expected a Warn about the unregisterable six-field schedule:\n%s", logBuf.String())
+	}
+}
+
+// A hand-built template carrying an `@every` relative schedule is likewise
+// skipped defensively at registration (validation rejects it).
+func TestReplaceFunctionSkipsEverySchedule(t *testing.T) {
+	fp := newFakePublisher(1)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Handler: "jobs.every", Cron: "@every 30s", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+	if n := s.JobCount(); n != 0 {
+		t.Fatalf("jobs = %d, want 0 (@every must not register)", n)
 	}
 }
 
 // Firing a registered job publishes a schedule occurrence for the function and
-// handler with a scheduled instant within a minute-truncation window.
+// handler with the exact minute-truncated due instant stamped by the clock.
 func TestFireSendsPayload(t *testing.T) {
 	fp := newFakePublisher(1)
 	s := New(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
+	// Pin the clock just past a minute boundary so the expected due instant is
+	// unambiguous regardless of when the test actually runs.
+	frozen := time.Date(2026, 7, 1, 8, 0, 42, 123456789, time.UTC)
+	s.now = func() time.Time { return frozen }
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
-	before := time.Now()
 	fireNow(t, s, "fn/jobs.a#0")
 	if !fp.waitFired(1) {
 		t.Fatal("occurrence not published")
@@ -233,11 +254,138 @@ func TestFireSendsPayload(t *testing.T) {
 	if o.Handler != "jobs.a" {
 		t.Fatalf("handler = %q, want jobs.a", o.Handler)
 	}
-	// The due instant is minute-truncated UTC (cron granularity): it must be
-	// within the minute-truncated window around the fire time.
-	wantMinute := before.UTC().Truncate(time.Minute)
-	if !o.ScheduledAt.Equal(wantMinute) && !o.ScheduledAt.Equal(time.Now().UTC().Truncate(time.Minute)) {
-		t.Fatalf("scheduled_at %v not minute-truncated near now", o.ScheduledAt)
+	// The due instant is the minute-truncated clock instant (cron granularity).
+	wantMinute := frozen.Truncate(time.Minute)
+	if !o.ScheduledAt.Equal(wantMinute) {
+		t.Fatalf("scheduled_at = %v, want %v", o.ScheduledAt, wantMinute)
+	}
+	// The occurrence identity carries the minute, never the seconds/clock jitter.
+	wantID := "schedule:fn:jobs.a:" + wantMinute.Format(time.RFC3339)
+	if o.ID() != wantID {
+		t.Fatalf("occurrence ID = %q, want %q", o.ID(), wantID)
+	}
+}
+
+// dedupPublisher emulates the cluster-wide publish-if-new contract in-memory:
+// the first occurrence ID wins, every later publish of that ID is a clean
+// duplicate. It is shared by two Scheduler instances to model two Relay
+// workers racing the same tick.
+type dedupPublisher struct {
+	mu   sync.Mutex
+	seen map[string]bool
+	wins int
+	dups int
+}
+
+func newDedupPublisher() *dedupPublisher { return &dedupPublisher{seen: map[string]bool{}} }
+
+func (d *dedupPublisher) PublishOccurrence(_ context.Context, o schedule.Occurrence) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.seen[o.ID()] {
+		d.dups++
+		return false, nil
+	}
+	d.seen[o.ID()] = true
+	d.wins++
+	return true, nil
+}
+
+// Two workers evaluating the same tick derive the same occurrence and contend
+// on exactly one publish; the loser is a clean duplicate no-op. Both callbacks
+// are triggered before either is awaited, so the publish-if-new contention is
+// exercised concurrently under -race.
+func TestTwoWorkersDedupSameTick(t *testing.T) {
+	pub := newDedupPublisher()
+	frozen := time.Date(2026, 7, 1, 8, 0, 30, 0, time.UTC)
+	var workers []*Scheduler
+	for i := 0; i < 2; i++ {
+		s := New(pub, testLogger())
+		s.now = func() time.Time { return frozen }
+		s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+		s.Start()
+		workers = append(workers, s)
+	}
+	// Fire both workers' jobs for the same logical tick before awaiting either,
+	// so they genuinely race on the shared dedup set.
+	for _, s := range workers {
+		fireNow(t, s, "fn/jobs.a#0")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for pub.total() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	for i, s := range workers {
+		if err := s.Stop(context.Background()); err != nil {
+			t.Fatalf("worker %d Stop: %v", i, err)
+		}
+	}
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if pub.wins != 1 || pub.dups != 1 {
+		t.Fatalf("publish outcomes = wins %d, dups %d; want exactly 1 win and 1 duplicate", pub.wins, pub.dups)
+	}
+}
+
+// total reports how many publish attempts (wins + duplicates) have completed.
+func (d *dedupPublisher) total() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.wins + d.dups
+}
+
+// Callback jitter must not distort occurrence identity: two schedulers firing
+// the "same" tick at different sub-minute wall-clock instants (e.g. worker-side
+// scheduling latency) stamp the SAME minute-truncated due instant and therefore
+// derive the same occurrence ID.
+func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
+	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	pins := []time.Time{
+		base.Add(50 * time.Millisecond),                 // worker A fires a hair late
+		base.Add(59*time.Second + 999*time.Millisecond), // worker B fires near the minute edge
+	}
+	var ids []string
+	for i, pin := range pins {
+		fp := newFakePublisher(1)
+		s := New(fp, testLogger())
+		s.now = func() time.Time { return pin }
+		s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+		s.Start()
+		fireNow(t, s, "fn/jobs.a#0")
+		if !fp.waitFired(1) {
+			t.Fatalf("worker %d: occurrence not published", i)
+		}
+		ids = append(ids, fp.got()[0].ID())
+		if err := s.Stop(context.Background()); err != nil {
+			t.Fatalf("worker %d: Stop: %v", i, err)
+		}
+	}
+	if ids[0] != ids[1] {
+		t.Fatalf("jitter split one occurrence into two IDs: %q vs %q", ids[0], ids[1])
+	}
+}
+
+// A five-field schedule's next run is exactly once per minute at second 0: the
+// next two runs are a minute apart and both land on second 0.
+func TestFiveFieldNextRunsOncePerMinute(t *testing.T) {
+	fp := newFakePublisher(1)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
+	s.Start()
+
+	runs, err := s.g.Jobs()[0].NextRuns(2)
+	if err != nil {
+		t.Fatalf("NextRuns: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("runs = %d, want 2", len(runs))
+	}
+	if runs[0].Second() != 0 || runs[1].Second() != 0 {
+		t.Fatalf("runs = %v, %v, want both at second 0", runs[0], runs[1])
+	}
+	if d := runs[1].Sub(runs[0]); d != time.Minute {
+		t.Fatalf("gap between runs = %s, want exactly 1m", d)
 	}
 }
 

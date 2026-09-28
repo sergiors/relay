@@ -552,11 +552,81 @@ func TestRuntimeSocketResetStatsResetterError(t *testing.T) {
 }
 
 // TestResetRuntimeStatsNoSocket verifies the standalone no-worker case reports
-// ErrRuntimeStatsUnavailable so the CLI resets the state database directly.
+// ErrRuntimeStatsNoWorker (positively absent: the socket file does not exist),
+// which is the ONLY outcome that lets the CLI reset the state database directly.
 func TestResetRuntimeStatsNoSocket(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "missing.sock")
-	if err := ResetRuntimeStats(path); !errors.Is(err, ErrRuntimeStatsUnavailable) {
-		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable", err)
+	path := filepath.Join(shortTempDir(t), "missing.sock")
+	err := ResetRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsNoWorker) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsNoWorker", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("positively absent worker must not be ambiguous: %v", err)
+	}
+}
+
+// TestResetRuntimeStatsRefusedSocketIsNoWorker verifies a stale socket file with
+// nothing listening (connection refused) is positively absent, so the CLI may
+// safely reset the state database directly.
+func TestResetRuntimeStatsRefusedSocketIsNoWorker(t *testing.T) {
+	path := testSocketPath(t)
+	// Bind then close WITHOUT unlinking, leaving the path as a stale socket with
+	// no listener.
+	addr, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	ln, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ln.SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	if err := ResetRuntimeStats(path); !errors.Is(err, ErrRuntimeStatsNoWorker) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsNoWorker (refused)", err)
+	}
+}
+
+// TestResetRuntimeStatsTimeoutIsAmbiguous verifies a live socket that accepts
+// but never answers (so the reset may have been applied) is reported as
+// ErrRuntimeStatsUnavailable — NOT ErrRuntimeStatsNoWorker — so the CLI never
+// falls back to an unsafe direct state-DB write while the worker might still
+// reset. The unresponsive listener holds the connection open past the client's
+// request deadline.
+func TestResetRuntimeStatsTimeoutIsAmbiguous(t *testing.T) {
+	path := testSocketPath(t)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release
+	}()
+	t.Cleanup(func() {
+		close(release)
+		_ = ln.Close()
+		wg.Wait()
+	})
+
+	err = ResetRuntimeStats(path)
+	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
+		t.Fatalf("error = %v, want ErrRuntimeStatsUnavailable (ambiguous timeout)", err)
+	}
+	if errors.Is(err, ErrRuntimeStatsNoWorker) {
+		t.Fatalf("a timed-out live request must not look positively absent: %v", err)
 	}
 }
 

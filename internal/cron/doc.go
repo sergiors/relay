@@ -26,6 +26,14 @@
 // a UTC instant. DST and offset changes are delegated to Go's time.Location and
 // the cron parser — the cron scheduler itself never does timezone math.
 //
+// Granularity: only minute-precision schedules are accepted — the 5-field form
+// and the calendar descriptors. gocron's task callback exposes no scheduled-due
+// instant (only the job's context), so a tick's due instant is stamped as the
+// minute-truncated wall clock. The 6-field (seconds) form and the `@every`
+// relative descriptor are rejected at template validation: seconds could not be
+// identified deterministically across workers, which would break the atomic
+// publish-if-new dedup, and `@every` is anchored to each worker's own start.
+//
 // The publisher interface (Publisher.PublishOccurrence) is the only seam out
 // of this package: the cron scheduler never touches Redis or the invocation
 // internals. It fires each due tick to the Publisher, which owns occurrence

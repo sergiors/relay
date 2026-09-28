@@ -1,14 +1,16 @@
 // Package worker is the long-running Relay runtime, started via `relay start`.
 // It loads functions, builds their images, reconciles them live, and consumes
 // the Redis stream, blocking until signalled. Configuration comes entirely
-// from the environment. It can also expose a Prometheus /metrics endpoint (see
-// internal/observability/metrics), gated on the METRICS_ADDR environment
-// variable, and
-// flushes the registry into the local state database on a fixed 5-second
-// cadence: stats accumulate in memory (the registry is the single source of
-// truth), Prometheus reflects them immediately, and SQLite receives the current
-// absolute snapshot every interval. The stats flusher (which serializes the
-// flush and the reset) lets the socket's `reset stats` command restart the
+// from the environment. Its in-memory accounting registry is always created and
+// is the single source of truth for the operational counters; the Prometheus
+// /metrics HTTP endpoint (see internal/observability/metrics) is an optional
+// exposition of that same registry, gated on the METRICS_ADDR environment
+// variable. The worker flushes the registry into the local state database on a
+// fixed 5-second cadence independent of METRICS_ADDR: stats accumulate in
+// memory, Prometheus (when exposed) reflects them immediately, and SQLite
+// receives the current absolute snapshot every interval. The stats flusher
+// (which serializes the flush and the reset) lets the socket's `reset stats`
+// command restart the
 // persisted totals from zero by capturing a worker-owned baseline, without ever
 // mutating the monotonic Prometheus counters. The cron scheduler (internal/cron)
 // joins the same lifecycle: constructed, seeded from the loaded schedules,
@@ -236,9 +238,12 @@ func Run(logger *slog.Logger) error {
 	// flushes it).
 	startupCtx, startupSpan := tracing.Start(ctx, "relay.startup")
 
-	// Metrics are opt-in, gated on METRICS_ADDR. Setup only CREATES the registry
-	// and /metrics server here (nil, nil when disabled); STARTING them happens
-	// later, once the startup wiring is complete.
+	// The accounting registry is ALWAYS created; only the /metrics HTTP
+	// exposition (and its periodic snapshot logger) is opt-in, gated on
+	// METRICS_ADDR. Setup only CREATES them here (server nil when disabled);
+	// STARTING the server happens later, once the startup wiring is complete.
+	// Because the registry exists even with exposition disabled, the persistent
+	// SQLite stats flush is independent of the HTTP listener.
 	metricsInstance, metricsServer := setupMetrics(cfg, logger)
 
 	// The graceful shutdown registry converges here on every return path —
@@ -648,14 +653,18 @@ func Run(logger *slog.Logger) error {
 		ScheduleRunner: runWorker.InvokeHandler,
 	})
 
-	// Start the metrics components created earlier. The snapshot logger runs in
-	// its own goroutine (exits on ctx); the server binds synchronously — a bind
-	// failure (a taken metrics port) is a config error that must surface now, and
-	// is FATAL. Both are nil when METRICS_ADDR is unset and simply not started.
-	// metricsLoggerDone is joined by the loops shutdown step before the state DB
-	// and Redis close, so no logger tick can touch a closed resource.
+	// Start the metrics components created earlier. The snapshot logger and the
+	// /metrics HTTP server are BOTH opt-in (gated on METRICS_ADDR): the registry
+	// always exists for the persistent stats flush, but with exposition disabled
+	// there is no server to bind (and the periodic logger would only duplicate
+	// the stats it already persists). metricsServer is nil exactly when
+	// METRICS_ADDR is unset. The logger runs in its own goroutine (exits on ctx);
+	// the server binds synchronously — a bind failure (a taken metrics port) is
+	// a config error that must surface now, and is FATAL. metricsLoggerDone is
+	// joined by the loops shutdown step before the state DB and Redis close, so
+	// no logger tick can touch a closed resource.
 	var metricsLoggerDone <-chan struct{}
-	if metricsInstance != nil {
+	if metricsServer != nil {
 		metricsLogger := metrics.NewMetricsLogger(
 			metricsInstance,
 			metrics.DefaultLogInterval,
@@ -706,23 +715,17 @@ func Run(logger *slog.Logger) error {
 		loopDones = append(loopDones, metricsLoggerDone)
 	}
 
-	// Flush the registry into the state database on the fixed cadence. Gated on
-	// the metrics instance existing: with metrics disabled there is nothing to
-	// snapshot, and a nil-registry flush would clobber the persisted cumulative
-	// totals with zeros. The loop parks on ctx so shutdown ordering stays uniform.
+	// Flush the registry into the state database on the fixed cadence. The
+	// registry always exists, so the loop runs unconditionally: persistent stats
+	// must keep flushing when METRICS_ADDR is unset (there is simply no HTTP
+	// exposition alongside them). A nil state handle parks the loop until
+	// shutdown (nothing to snapshot), keeping shutdown ordering uniform.
 	statsDone := make(chan struct{})
 	loopDones = append(loopDones, statsDone)
-	if metricsInstance != nil {
-		go func() {
-			defer close(statsDone)
-			statsLoop(ctx, statsFlusher, statsFlushInterval)
-		}()
-	} else {
-		go func() {
-			defer close(statsDone)
-			parkUntilShutdown(ctx)
-		}()
-	}
+	go func() {
+		defer close(statsDone)
+		statsLoop(ctx, statsFlusher, statsFlushInterval)
+	}()
 
 	// Optional internal stream retention (cfg.StreamRetention from
 	// REDIS_STREAM_RETENTION): a single goroutine periodically trims the
@@ -1177,19 +1180,20 @@ func shutdownServices(
 	return err
 }
 
-// setupMetrics constructs the optional metrics components: a registry and the
-// /metrics HTTP server, both nil when METRICS_ADDR is unset. It only CREATES
-// them; STARTING happens later in Run once the startup wiring is complete (the
-// server binds synchronously, well after ctx setup). The nil-safety contract
-// that makes this gating safe: every consumer of the registry is nil-safe, AND
-// the stats flush is gated alongside it — a nil registry must never feed
-// snapshotStats, or the 5s flush loop would clobber the persisted cumulative
-// totals with zeros.
+// setupMetrics constructs the metrics components. The accounting registry is
+// ALWAYS constructed — it is the single source of truth for the counters the
+// persistent SQLite snapshot flushes, so it must exist even when HTTP
+// exposition is disabled. Only the /metrics HTTP server is opt-in: it is nil
+// when METRICS_ADDR is unset. It only CREATES them; STARTING the server happens
+// later in Run once the startup wiring is complete (the server binds
+// synchronously, well after ctx setup). When the address is configured the
+// returned server is non-nil, which is also the gate for the periodic snapshot
+// logger; the registry itself is never nil.
 func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *metrics.Server) {
-	if cfg.MetricsAddr == "" {
-		return nil, nil
-	}
 	metricsInstance := metrics.New()
+	if cfg.MetricsAddr == "" {
+		return metricsInstance, nil
+	}
 	metricsServer := metrics.NewServer(cfg.MetricsAddr, metricsInstance.Handler(), logger)
 	return metricsInstance, metricsServer
 }
@@ -1794,14 +1798,6 @@ func cleanupStartupDependencies(lifecycle context.Context, manager *runtime.Mana
 	}
 }
 
-// parkUntilShutdown blocks until ctx is cancelled, then returns. It stands in
-// for the stats flush goroutine when metrics are disabled (there is nothing to
-// snapshot), keeping shutdown ordering uniform: every background loop the
-// worker starts either exits on ctx.Done or is explicitly stopped.
-func parkUntilShutdown(ctx context.Context) {
-	<-ctx.Done()
-}
-
 // restorePersistedStats seeds the fresh process-lifetime metrics registry with
 // the cumulative counters persisted in the state database, so the first
 // snapshot never resets them. The registry only knows this process's lifetime,
@@ -2054,11 +2050,10 @@ func snapshotFunctionStats(metricsInstance *metrics.Registry, base *relayBaselin
 type statsFlusher struct {
 	mu sync.Mutex
 	st *state.State
-	// metrics is nil exactly when METRICS_ADDR is unset. The flush paths are
-	// gated on a non-nil registry (statsLoop is not started, finalStatsFlush
-	// returns early), so a snapshot never runs against nil, which would clobber
-	// the persisted cumulative totals with zeros. ResetStats tolerates nil
-	// (capturing an empty baseline) so the socket can still reset the state DB.
+	// metrics is the accounting registry the worker always constructs; it is
+	// nil only when a caller deliberately passes nil (tests), in which case the
+	// snapshot mappers yield zero values. Production always supplies the
+	// registry, so a flush never clobbers the persisted cumulative totals.
 	metrics *metrics.Registry
 	// baseline is the worker-owned reset point captured by ResetStats. It is
 	// read and replaced under mu, so a concurrent flush always sees a coherent
@@ -2152,10 +2147,12 @@ func statsLoop(ctx context.Context, flusher *statsFlusher, interval time.Duratio
 // shutdown step's fresh, bounded context (the registry derives it from
 // context.Background), so a wedged SQLite cannot hang shutdown; on timeout or
 // error the flush logs and returns (telemetry, not state). It is nil-safe on
-// the flusher. The metrics guard is load-bearing: Run calls this even when
-// metrics are disabled (the flusher still holds the state handle), and a
-// nil-registry flush would write zero Stats over the persisted cumulative
-// totals.
+// the flusher. The metrics guard is defensive only for direct test callers that
+// deliberately build a flusher over a nil registry: in production the registry
+// is ALWAYS constructed (see setupMetrics), independent of METRICS_ADDR, so the
+// final flush runs whether or not HTTP exposition is enabled, and a nil
+// registry (which would write zero Stats over the persisted totals) never
+// occurs.
 func finalStatsFlush(ctx context.Context, flusher *statsFlusher) {
 	if flusher == nil || flusher.st == nil || flusher.metrics == nil {
 		return

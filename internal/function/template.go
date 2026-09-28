@@ -126,10 +126,13 @@ type Template struct {
 }
 
 // Schedule is one cron schedule from the template's `schedules` list: the
-// handler it invokes, the standard 5-field cron expression (verbatim), the
+// handler it invokes, a MINUTE-granularity cron expression (verbatim), the
 // effective IANA timezone (always non-nil after ParseTemplate; omitted
 // timezones resolve to UTC), and the resolved per-invocation timeout and retry
-// count (same rules as event rules).
+// count (same rules as event rules). The expression is either the standard
+// 5-field `minute hour day-of-month month day-of-week` form or a calendar
+// descriptor (@hourly/@daily/@weekly/@monthly/@yearly); the 6-field (seconds)
+// form and `@every` relative schedules are rejected (see validateCron).
 type Schedule struct {
 	Handler  string
 	Cron     string
@@ -616,10 +619,11 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	}
 
 	// Parse and validate the optional cron schedules. Each entry requires a
-	// handler (module.function) and a 5-field cron expression. The timezone is
-	// optional (defaults to UTC); the timeout follows the same rules as event
-	// rules. Schedules are optional — a template with events and no schedules
-	// key parses exactly as before.
+	// handler (module.function) and a minute-granularity cron expression
+	// (5-field or calendar descriptor; seconds/`@every` rejected — see
+	// validateCron). The timezone is optional (defaults to UTC); the timeout
+	// follows the same rules as event rules. Schedules are optional — a template
+	// with events and no schedules key parses exactly as before.
 	for _, s := range raw.Schedules {
 		if s.Handler == "" {
 			return nil, fmt.Errorf("schedule is missing a handler")
@@ -748,18 +752,50 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 
 // validateCron reports whether cronExpr is a valid cron expression evaluated in
 // loc, delegating parsing/validation to gocron/v2 (no Relay-specific cron
-// regexes). Accepted forms are the 5-field `minute hour day-of-month month
-// day-of-week` and the 6-field `second minute hour day-of-month month
-// day-of-week`; gocron/robfig's seconds-optional parser handles both. A
-// throwaway scheduler is created per validation because gocron exposes
+// regexes). Only MINUTE-granularity, calendar-aligned expressions are accepted:
+//
+//   - the standard 5-field `minute hour day-of-month month day-of-week`
+//   - the calendar descriptors `@yearly`/`@annually`/`@monthly`/`@weekly`/
+//     `@daily`/`@midnight`/`@hourly`
+//
+// Two forms are REJECTED by design:
+//
+//   - The 6-field (seconds) form `second minute hour day-of-month month
+//     day-of-week`. gocron's task callback exposes no scheduled-due instant
+//     (only the job's context), and its due time is not reachable through any
+//     public API. Relay therefore cannot identify a per-second occurrence
+//     deterministically across workers; stamping the callback's wall clock
+//     would collapse several per-minute occurrences onto one identity and let
+//     worker jitter split them, breaking cluster-wide dedup.
+//   - The `@every <duration>` descriptor: it is a relative-delay schedule
+//     anchored to each worker's own job start, so workers do not agree on an
+//     occurrence; a sub-minute duration also cannot be identified at minute
+//     granularity.
+//
+// A throwaway scheduler is created per validation because gocron exposes
 // validation through NewJob.
 func validateCron(cronExpr string, loc *time.Location) error {
+	// Reject the 6-field form with a precise message; a bare gocron error would
+	// only say "expected exactly 5 fields" without explaining that seconds are
+	// unsupported by design. Only a real 6-field expression is singled out here;
+	// any other malformed count still falls through to gocron.
+	if len(strings.Fields(cronExpr)) == 6 {
+		return fmt.Errorf("6-field (seconds) cron is not supported; use a 5-field minute-precision expression")
+	}
+	// `@every` is a relative-delay schedule (see the doc comment); calendar
+	// descriptors remain valid. Match the exact descriptor form (`@every` alone
+	// or `@every <duration>`), never a lookalike such as `@everyfoo`.
+	if trimmed := strings.TrimSpace(cronExpr); trimmed == "@every" || strings.HasPrefix(trimmed, "@every ") {
+		return fmt.Errorf("`@every` relative schedules are not supported; use a calendar cron expression")
+	}
 	sch, err := gocron.NewScheduler(gocron.WithLocation(loc))
 	if err != nil {
 		return err
 	}
 	defer func() { _ = sch.Shutdown() }()
-	if _, err := sch.NewJob(gocron.CronJob(cronExpr, true), gocron.NewTask(func() {})); err != nil {
+	// withSeconds=false pins validation to the 5-field form (plus calendar
+	// descriptors), matching the scheduler's registration exactly.
+	if _, err := sch.NewJob(gocron.CronJob(cronExpr, false), gocron.NewTask(func() {})); err != nil {
 		return err
 	}
 	return nil

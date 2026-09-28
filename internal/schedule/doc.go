@@ -25,12 +25,15 @@
 // function, the handler it invokes, and the scheduled instant (UTC). Its ID —
 // "schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>" — is derived from
 // the absolute instant, never from a timezone representation: ScheduledAt is
-// normalized to UTC and truncated to the second (5-field cron granularity), so
-// DST offsets and timezone encoding never change the ID. The configured
-// timezone affects when a schedule fires (its gocron evaluation), never the
-// identity. Two workers evaluating the same cron tick produce the same
-// Occurrence (and therefore the same ID), so they contend on exactly one
-// publish-if-new.
+// normalized to UTC and truncated to the second, so DST offsets and timezone
+// encoding never change the ID. Sub-second truncation absorbs worker-side
+// callback jitter (the scheduler stamps a minute-truncated due instant, since
+// only minute-precision schedules are admitted — see internal/function's
+// schedule validation).
+// The configured timezone affects when a schedule fires (its gocron
+// evaluation), never the identity. Two workers evaluating the same cron tick
+// produce the same Occurrence (and therefore the same ID), so they contend on
+// exactly one publish-if-new.
 //
 // # Atomicity invariant
 //

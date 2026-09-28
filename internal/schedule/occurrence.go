@@ -18,16 +18,19 @@ type Occurrence struct {
 
 // ID returns the deterministic occurrence identity:
 // "schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>".
-// ScheduledAt is normalized to UTC (truncated to the second — 5-field cron
-// granularity) so DST offsets and timezone representation never change the ID:
-// the configured timezone affects when the schedule fires, never the identity.
+// ScheduledAt is normalized to UTC and truncated to the second so DST offsets
+// and timezone representation never change the ID: the configured timezone
+// affects when the schedule fires, never the identity.
 func (o Occurrence) ID() string {
 	// Normalize to UTC and truncate to the second. Truncate works on the
 	// absolute instant since the epoch, so it is stable across workers; the
 	// timezone the cron was evaluated in is deliberately dropped here. Dropping
 	// sub-second components means worker-side evaluation jitter (whether two
 	// workers read the due instant a few milliseconds apart) never splits an
-	// occurrence into two IDs.
+	// occurrence into two IDs. Seconds themselves are NOT truncated: schedules
+	// are minute-granularity by construction (the scheduler stamps a
+	// minute-truncated due instant — seconds schedules are rejected at template
+	// validation), so two distinct whole seconds would still be distinct.
 	t := o.ScheduledAt.UTC().Truncate(time.Second)
 	return "schedule:" + o.Function + ":" + o.Handler + ":" + t.Format(time.RFC3339)
 }

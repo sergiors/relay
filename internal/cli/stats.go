@@ -54,11 +54,16 @@ func statsCommand(deps Dependencies) *cli.Command {
 // accumulated statistics, so the worker's in-memory snapshot source and
 // persisted stats both continue from zero and a captured pre-reset snapshot
 // cannot be written after the reset (the worker performs both under its flush
-// mutex). When no worker answers, it falls back to state.ResetStats, which
+// mutex). Only when the socket POSITIVELY reports no worker (the socket file is
+// gone or refusing connections) does it fall back to state.ResetStats, which
 // rewrites the persisted global counters and every per-function stats row to
-// zero in one transaction. It deliberately does not touch pending
-// events/backlog, Redis, containers/runtime pools/schedules/services, or the
-// worker's Prometheus counters (monotonic for the process lifetime).
+// zero in one transaction. An ambiguous outcome — a timeout, a failed exchange,
+// or a worker that answered but could not reset — is surfaced, never silently
+// masked by a direct write: a live worker may have received the reset (or reset
+// concurrently), and the live worker stays the authority. It deliberately does
+// not touch pending events/backlog, Redis, containers/runtime
+// pools/schedules/services, or the worker's Prometheus counters (monotonic for
+// the process lifetime).
 func statsResetCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:        "reset",
@@ -70,13 +75,14 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 				return cli.Exit("stats reset: too many arguments", 2)
 			}
 			// A running worker owns the in-memory source of the persisted
-			// totals, so reset through its socket first; only when no worker
-			// answers do we reset the state database directly (the stopped-worker
-			// path).
+			// totals, so reset through its socket first. Only a positively
+			// absent worker (no socket / connection refused) permits the direct
+			// state-DB write; every ambiguous outcome is surfaced so a live
+			// worker is never second-guessed.
 			if err := worker.ResetRuntimeStats(deps.SocketPath); err == nil {
 				fmt.Fprintln(cmd.Writer, "Stats reset")
 				return nil
-			} else if !errors.Is(err, worker.ErrRuntimeStatsUnavailable) {
+			} else if !errors.Is(err, worker.ErrRuntimeStatsNoWorker) {
 				return fmt.Errorf("stats reset: %w", err)
 			}
 			st, cleanup, err := openState(deps.StatePath)

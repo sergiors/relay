@@ -62,6 +62,14 @@
 //     identical to event rules. Cron validation is delegated to gocron/v2 (no
 //     Relay cron regexes); an invalid cron expression, timezone, or timeout
 //     fails template validation. An embedded TZ=/CRON_TZ= prefix is rejected.
+//   - Only minute-granularity schedules are accepted: the standard 5-field form
+//     and the calendar descriptors (@hourly, @daily/@midnight, @weekly,
+//     @monthly, @yearly/@annually).
+//     The 6-field (seconds) form is rejected because gocron's callback exposes
+//     no scheduled-due instant, so a per-second occurrence could not be
+//     identified deterministically across workers (breaking cluster-wide dedup);
+//     the `@every <duration>` descriptor is rejected because it is anchored to
+//     each worker's own job start rather than a shared calendar instant.
 //
 // The package has no side effects beyond reading the filesystem; building,
 // execution, and Redis are owned elsewhere.

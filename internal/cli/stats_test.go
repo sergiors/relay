@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -291,6 +292,50 @@ func TestStatsResetCommandRunningWorker(t *testing.T) {
 	s, _ := st.Stats()
 	if s.EventsReceivedTotal != 153000 {
 		t.Fatalf("CLI must not reset the state DB when a worker answered: %+v", s)
+	}
+}
+
+// `relay stats reset` must NOT fall back to a direct state-DB write when a live
+// socket accepts but never answers: the request is ambiguous (the worker may
+// have received, or may still process, the reset), so the CLI surfaces the
+// error and leaves the persisted totals alone. This preserves the live worker
+// as the authority and avoids a second, racing reset.
+func TestStatsResetCommandAmbiguousTimeoutNoFallback(t *testing.T) {
+	st, deps := seedStatsState(t)
+
+	// A live listener that accepts and then hangs, so the client's read blocks
+	// past its request deadline. The CLI must classify this as unavailable and
+	// NOT write the state DB directly.
+	ln, err := net.Listen("unix", deps.SocketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release
+	}()
+	t.Cleanup(func() {
+		close(release)
+		_ = ln.Close()
+		wg.Wait()
+	})
+
+	_, _, err = runCLIWithDeps(t, deps, "", "stats", "reset")
+	if err == nil || !strings.Contains(err.Error(), "stats reset") {
+		t.Fatalf("ambiguous timeout must surface as an error, got %v", err)
+	}
+	// The CLI must not have reset the state DB directly.
+	s, _ := st.Stats()
+	if s.EventsReceivedTotal != 153000 {
+		t.Fatalf("ambiguous timeout must not trigger a direct state write: %+v", s)
 	}
 }
 
