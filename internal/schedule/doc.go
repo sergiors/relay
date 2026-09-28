@@ -1,67 +1,35 @@
 // Package schedule owns the identity and cluster-wide publication of cron
 // schedule occurrences.
 //
-// Every Relay worker evaluates a function's cron schedules locally (see
-// internal/cron, which wraps gocron). Previously each worker executed the
-// scheduled handler itself, so N workers meant N executions per occurrence.
-// Now every worker still evaluates the cron locally, but instead of executing
-// it publishes the occurrence to a shared Relay event stream with an atomic
+// Every Relay worker evaluates schedules locally through internal/cron, but a
+// logical occurrence is published to the shared Redis stream at most once
+// cluster-wide:
 //
-//	publish-if-new    (one stream entry per occurrence, exactly once cluster-wide)
+//	gocron -> schedule.Publisher -> Redis stream -> consumer group -> runner
 //
-// and the existing consumer-group / PEL / recovery machinery delivers that one
-// entry to exactly one worker for execution:
+// Publication is deduplicated atomically before the stream entry is admitted.
+// No leader election or execution lock is required; once published, the
+// occurrence follows Relay's normal at-least-once delivery, retry, invocation
+// state, and DLQ semantics.
 //
-//	gocron (every worker) → atomic publish-if-new (Lua) → Redis Stream
-//	→ existing consumer group → one worker → runner.InvokeHandler → container
+// An Occurrence identifies one logical firing by function, handler, and
+// scheduled instant. ScheduledAt is normalized to UTC before its deterministic
+// ID is derived, so workers evaluating the same logical tick produce the same
+// identity regardless of timezone representation or callback timing.
 //
-// No leader election and no lock is held during execution: the deduplication is
-// at publication time (the atomic SET NX + XADD script), and after the single
-// entry is in the stream, delivery is Relay's normal at-least-once model.
+// Deduplication and stream publication happen in one Redis Lua script. The
+// dedup key and XADD therefore succeed or fail as one atomic operation: Relay
+// never records an occurrence as published without also admitting its stream
+// entry. Dedup keys remain for a bounded TTL so retries, other workers, and
+// startup catch-up cannot republish the same occurrence during the recovery
+// window.
 //
-// # Identity semantics
+// A duplicate publication is a successful no-op. The cron scheduler retries
+// transient publication failures and may republish the latest missed occurrence
+// during startup catch-up; both paths reuse the same occurrence identity, so an
+// occurrence already published by another worker remains a harmless duplicate.
 //
-// An Occurrence is the deterministic identity of one logical firing: the
-// function, the handler it invokes, and the scheduled instant (UTC). Its ID —
-// "schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>" — is derived from
-// the absolute instant, never from a timezone representation: ScheduledAt is
-// normalized to UTC and truncated to the second, so DST offsets and timezone
-// encoding never change the ID. Sub-second truncation absorbs worker-side
-// callback jitter (the scheduler stamps a minute-truncated due instant, since
-// only minute-precision schedules are admitted — see internal/function's
-// schedule validation).
-// The configured timezone affects when a schedule fires (its gocron
-// evaluation), never the identity. Two workers evaluating the same cron tick
-// produce the same Occurrence (and therefore the same ID), so they contend on
-// exactly one publish-if-new.
-//
-// # Atomicity invariant
-//
-// The SET NX (dedup key) and the XADD (stream entry) run in one Lua script, so
-// there is no window where a dedup key exists without its stream entry (a
-// worker that "wins" the key always writes the entry in the same atomic step),
-// and no window where an entry exists without its key (a failed script leaves
-// neither). The dedup key is the history of what has been published; it expires
-// only via its TTL (7 days — far longer than any realistic scheduling/recovery
-// window, matching the invocation-state TTL) and is never deleted on completion,
-// so a later worker evaluating the same (now-stale) tick cannot republish it.
-//
-// # Failure semantics
-//
-// One schedule occurrence is published once cluster-wide, while handler
-// execution remains at-least-once. A duplicate publication (the key already
-// exists) is a clean no-op: another worker published the occurrence first, and
-// the single entry routes through the stream to exactly one worker. Publication
-// is best-effort across the fleet because every worker evaluates the cron — a
-// publish failure on one worker loses that worker's tick, but other workers'
-// callbacks still publish the same occurrence. After publication the entry is a
-// normal stream message and enjoys the full at-least-once delivery, retry,
-// DLQ, and invocation-state semantics of any other message.
-//
-// # Reconciliation notes
-//
-// Editing a function's schedules converges its gocron jobs (future occurrences
-// use the current cron/timezone/handler) but deliberately does NOT purge dedup
-// keys or stream entries: an already-published entry represents an occurrence
-// that was valid when published and expires via the key TTL / stream retention.
+// Updating a function's schedules affects future occurrences only. Existing
+// dedup keys and already-published stream entries are left intact and expire
+// through their normal retention policies.
 package schedule

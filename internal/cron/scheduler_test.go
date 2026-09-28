@@ -11,56 +11,116 @@ import (
 	"testing"
 	"time"
 
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"relay/internal/function"
+	"relay/internal/observability/metrics"
 	"relay/internal/schedule"
 )
 
 // errBoom is a sentinel publish error used to exercise the non-fatal error path.
 var errBoom = errors.New("boom")
 
+// pubResult is one scripted PublishOccurrence outcome.
+type pubResult struct {
+	published bool
+	err       error
+}
+
 // fakePublisher records the (function, handler, due instant) of each published
-// occurrence along with a configurable result. When block is non-nil, a publish
-// blocks until the job's ctx is cancelled OR block is closed, and then observes
-// whether the ctx was cancelled.
+// occurrence along with a scripted result. Results are consumed in order from
+// script; once exhausted the last entry repeats. With an empty script the
+// default published/err fields are used (the original behavior). When block is
+// non-nil, a publish blocks until the job's ctx is cancelled OR block is closed,
+// and then observes whether the ctx was cancelled. Every publish also signals
+// fired and observes ctx cancellation while signaling, so a retry loop is
+// released by cancellation rather than leaking.
 type fakePublisher struct {
 	mu        sync.Mutex
 	calls     []schedule.Occurrence
+	ids       map[string]int
+	script    []pubResult
+	next      int
 	published bool
 	err       error
 	fired     chan struct{} // signals a completed publish
 	block     chan struct{}
 	cancel    chan struct{} // closed when a publish observed ctx cancellation
 	cancels   int
+	ctxSpans  []oteltrace.SpanContext // span context observed on each publish call
 }
 
 func newFakePublisher(n int) *fakePublisher {
-	return &fakePublisher{published: true, fired: make(chan struct{}, n), cancel: make(chan struct{}, n)}
+	return &fakePublisher{published: true, fired: make(chan struct{}, n), cancel: make(chan struct{}, n), ids: map[string]int{}}
 }
 
 func (f *fakePublisher) PublishOccurrence(ctx context.Context, o schedule.Occurrence) (bool, error) {
 	if f.block != nil {
 		select {
 		case <-ctx.Done():
-			f.mu.Lock()
-			f.cancels++
-			f.mu.Unlock()
-			f.cancel <- struct{}{}
+			f.observeCancel()
 			return false, ctx.Err()
 		case <-f.block:
 		}
 	}
 	f.mu.Lock()
-	f.calls = append(f.calls, o)
 	pub, err := f.published, f.err
+	if len(f.script) > 0 {
+		s := f.script[min(f.next, len(f.script)-1)]
+		f.next++
+		pub, err = s.published, s.err
+	}
+	f.calls = append(f.calls, o)
+	if f.ids == nil {
+		f.ids = map[string]int{}
+	}
+	f.ids[o.ID()]++
+	f.ctxSpans = append(f.ctxSpans, oteltrace.SpanContextFromContext(ctx))
 	f.mu.Unlock()
-	f.fired <- struct{}{}
+	select {
+	case <-ctx.Done():
+		f.observeCancel()
+		return false, ctx.Err()
+	case f.fired <- struct{}{}:
+	}
 	return pub, err
+}
+
+func (f *fakePublisher) observeCancel() {
+	f.mu.Lock()
+	f.cancels++
+	f.mu.Unlock()
+	select {
+	case f.cancel <- struct{}{}:
+	default:
+	}
 }
 
 func (f *fakePublisher) got() []schedule.Occurrence {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]schedule.Occurrence(nil), f.calls...)
+}
+
+// callCount returns how many publish attempts were recorded.
+func (f *fakePublisher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// callsFor returns how many attempts recorded exactly the given occurrence ID.
+func (f *fakePublisher) callsFor(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ids[id]
+}
+
+// spans returns the span context observed on each publish call.
+func (f *fakePublisher) spans() []oteltrace.SpanContext {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]oteltrace.SpanContext(nil), f.ctxSpans...)
 }
 
 func (f *fakePublisher) waitFired(n int) bool {
@@ -226,16 +286,17 @@ func TestReplaceFunctionSkipsEverySchedule(t *testing.T) {
 }
 
 // Firing a registered job publishes a schedule occurrence for the function and
-// handler with the exact minute-truncated due instant stamped by the clock.
+// handler stamped with the schedule's most recent occurrence at or before the
+// callback's clock (not the raw wall clock).
 func TestFireSendsPayload(t *testing.T) {
 	fp := newFakePublisher(1)
 	s := New(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
-	// Pin the clock just past a minute boundary so the expected due instant is
-	// unambiguous regardless of when the test actually runs.
+	// Pin the clock just past the 08:00 matching boundary so the expected due
+	// instant is unambiguous regardless of when the test actually runs.
 	frozen := time.Date(2026, 7, 1, 8, 0, 42, 123456789, time.UTC)
 	s.now = func() time.Time { return frozen }
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 8 * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a#0")
@@ -254,13 +315,14 @@ func TestFireSendsPayload(t *testing.T) {
 	if o.Handler != "jobs.a" {
 		t.Fatalf("handler = %q, want jobs.a", o.Handler)
 	}
-	// The due instant is the minute-truncated clock instant (cron granularity).
-	wantMinute := frozen.Truncate(time.Minute)
-	if !o.ScheduledAt.Equal(wantMinute) {
-		t.Fatalf("scheduled_at = %v, want %v", o.ScheduledAt, wantMinute)
+	// The due instant is the schedule's occurrence at or before now (the 08:00
+	// boundary), NOT the callback's 08:00:42 wall clock.
+	wantDue := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	if !o.ScheduledAt.Equal(wantDue) {
+		t.Fatalf("scheduled_at = %v, want %v", o.ScheduledAt, wantDue)
 	}
-	// The occurrence identity carries the minute, never the seconds/clock jitter.
-	wantID := "schedule:fn:jobs.a:" + wantMinute.Format(time.RFC3339)
+	// The occurrence identity carries that occurrence, never the callback jitter.
+	wantID := "schedule:fn:jobs.a:" + wantDue.Format(time.RFC3339)
 	if o.ID() != wantID {
 		t.Fatalf("occurrence ID = %q, want %q", o.ID(), wantID)
 	}
@@ -336,8 +398,8 @@ func (d *dedupPublisher) total() int {
 
 // Callback jitter must not distort occurrence identity: two schedulers firing
 // the "same" tick at different sub-minute wall-clock instants (e.g. worker-side
-// scheduling latency) stamp the SAME minute-truncated due instant and therefore
-// derive the same occurrence ID.
+// scheduling latency) derive the same schedule occurrence and therefore the same
+// occurrence ID.
 func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
 	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	pins := []time.Time{
@@ -349,7 +411,7 @@ func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
 		fp := newFakePublisher(1)
 		s := New(fp, testLogger())
 		s.now = func() time.Time { return pin }
-		s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+		s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 		s.Start()
 		fireNow(t, s, "fn/jobs.a#0")
 		if !fp.waitFired(1) {
@@ -412,29 +474,45 @@ func TestMultipleSchedulesFireIndependently(t *testing.T) {
 	}
 }
 
-// A publish error is logged, not fatal: the scheduler keeps running and the
-// tick is simply lost for this worker (other workers still publish it).
+// A publish failure is retried within the bounded budget and never fatal: the
+// scheduler keeps running, and an exhausted budget is logged without failing the
+// scheduler. A duplicate publication is a clean terminal no-op (no retry).
 func TestPublishErrorLoggedNotFatal(t *testing.T) {
-	fp := newFakePublisher(1)
+	m := metrics.New()
+	fp := newFakePublisher(16)
 	fp.err = errBoom
-	s := New(fp, testLogger())
+	s := NewWithMetrics(fp, testLogger(), m)
+	s.wait = func(context.Context, time.Duration) bool { return true } // bounded policy, no real backoff
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a#0")
-	// The publisher is called (once) even though it errors; the fire path must
-	// not panic or otherwise fail the scheduler.
-	if !fp.waitFired(1) {
-		t.Fatal("occurrence not attempted")
+	// The publisher is called with bounded retries even though every attempt
+	// errors; the fire path must not panic or otherwise fail the scheduler. The
+	// budget is attempt(1) + len(publishRetryDelays) retries.
+	wantAttempts := 1 + len(publishRetryDelays)
+	deadline := time.Now().Add(3 * time.Second)
+	for fp.callCount() < wantAttempts && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := fp.callCount(); got != wantAttempts {
+		t.Fatalf("publish attempts = %d, want %d (one attempt plus the bounded retries)", got, wantAttempts)
 	}
 	if n := s.JobCount(); n != 1 {
 		t.Fatalf("jobs after publish error = %d, want 1 (scheduler keeps running)", n)
 	}
+	if got := m.Counter(metrics.MetricSchedulePublishExhausted); got != 1 {
+		t.Fatalf("exhausted counter = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricSchedulePublishRetries); got != int64(len(publishRetryDelays)) {
+		t.Fatalf("retries counter = %d, want %d", got, len(publishRetryDelays))
+	}
 	s.Stop(context.Background())
 
-	// A duplicate publication is a clean no-op: only one logical occurrence.
-	fp2 := newFakePublisher(1)
+	// A duplicate publication is a clean terminal no-op: the first attempt
+	// returns (false, nil), so no retry is scheduled.
+	fp2 := newFakePublisher(4)
 	fp2.published = false
 	s2 := New(fp2, testLogger())
 	defer func() { _ = s2.Stop(context.Background()) }()
@@ -443,6 +521,12 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 	fireNow(t, s2, "fn/jobs.a#0")
 	if !fp2.waitFired(1) {
 		t.Fatal("occurrence not attempted")
+	}
+	// Give any (incorrect) retry a chance to be observed, then require exactly
+	// one attempt.
+	time.Sleep(50 * time.Millisecond)
+	if got := fp2.callCount(); got != 1 {
+		t.Fatalf("duplicate publish attempts = %d, want 1 (no retry on duplicate)", got)
 	}
 }
 

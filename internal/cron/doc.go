@@ -1,43 +1,44 @@
-// Package cron owns the WHEN of a function template's schedules: it maps each
-// cron schedule into a gocron/v2 job that, when due, hands the tick to the
-// schedule package's Publisher for cluster-wide publication. It is a thin
-// wrapper around gocron; it knows nothing about Docker or Redis.
+// Package cron owns when function schedules fire. It maps each template schedule
+// to a gocron job and hands due occurrences to internal/schedule for
+// cluster-wide publication. It does not depend on Docker or Redis directly.
 //
-// Execution model: the event path is `Redis -> matcher -> handler -> runner`;
-// the schedule path is `gocron -> cron tick -> Publisher -> Redis stream ->
-// consumer -> runner`. The cron package only decides when an occurrence is due
-// and publishes the tick; every worker evaluates the same cron locally, so they
-// contend on one atomic publish-if-new (see internal/schedule) and the stream's
-// consumer group delivers the single entry to exactly one worker. Both funnel
-// into the same runner boundary (runner.InvokeHandler), so scheduled executions
-// reuse the runtime's image lifecycle, secrets, timeout cap, concurrency slots,
-// and metrics.
+// Scheduled execution flows through:
 //
-// Lifecycle: New constructs the scheduler (no goroutines yet); ReplaceFunction /
-// RemoveFunction register or converge a function's jobs by tag; Start begins
-// firing; Stop performs a bounded graceful shutdown. ReplaceFunction is the
-// single reconcile entry point: it removes and re-creates a function's jobs so
-// added/changed/removed schedules converge, and a skipped tick during the swap
-// is acceptable.
+//	gocron -> cron -> schedule.Publisher -> Redis stream -> consumer -> runner
 //
-// Timezone semantics: each schedule carries an effective IANA timezone. The
-// cron scheduler is pinned to UTC and the per-job timezone is encoded into the
-// cron spec as a `CRON_TZ=<zone>` prefix, so every computed next-run instant is
-// a UTC instant. DST and offset changes are delegated to Go's time.Location and
-// the cron parser — the cron scheduler itself never does timezone math.
+// Every worker evaluates the same schedules locally. Publication is
+// deduplicated atomically by logical occurrence, so only one stream entry is
+// admitted cluster-wide and the consumer group delivers it to one worker.
+// Scheduled invocations therefore reuse the same runner/runtime path as normal
+// event-driven execution.
 //
-// Granularity: only minute-precision schedules are accepted — the 5-field form
-// and the calendar descriptors. gocron's task callback exposes no scheduled-due
-// instant (only the job's context), so a tick's due instant is stamped as the
-// minute-truncated wall clock. The 6-field (seconds) form and the `@every`
-// relative descriptor are rejected at template validation: seconds could not be
-// identified deterministically across workers, which would break the atomic
-// publish-if-new dedup, and `@every` is anchored to each worker's own start.
+// New constructs the scheduler without starting it. ReplaceFunction converges a
+// function's jobs, RemoveFunction removes them, Start begins firing, and Stop
+// performs bounded shutdown.
 //
-// The publisher interface (Publisher.PublishOccurrence) is the only seam out
-// of this package: the cron scheduler never touches Redis or the invocation
-// internals. It fires each due tick to the Publisher, which owns occurrence
-// identity and deduplicated publication; distribution is therefore best-effort
-// across the fleet, because every worker fires the same tick and the atomic
-// publish-if-new admits exactly one entry cluster-wide.
+// Publication retries always reuse the same logical occurrence and therefore the
+// same deduplication identity. Retries are bounded and stop on success, a clean
+// duplicate, or lifecycle cancellation. On startup, CatchUp may republish the
+// latest missed occurrence for each schedule within a bounded recovery horizon;
+// older occurrences are not replayed and future occurrences are never
+// synthesized.
+//
+// gocron callbacks do not expose the scheduled due instant, so Relay derives the
+// latest occurrence at or before the callback time using the same cron parsing
+// semantics used for registration. This keeps delayed callbacks and startup
+// catch-up aligned on the same occurrence identity. If no occurrence exists
+// within the recovery horizon, the callback time is normalized to minute
+// precision as a bounded fallback.
+//
+// Each schedule has an effective IANA timezone. The scheduler runs in UTC and
+// encodes the schedule timezone in the cron expression, leaving DST and offset
+// handling to Go's time.Location and the cron parser.
+//
+// Relay accepts minute-precision cron schedules only. Six-field schedules and
+// relative @every expressions are rejected because their occurrence identity is
+// not deterministic across workers under the current scheduling model.
+//
+// Publisher.PublishOccurrence is the package boundary: cron decides when an
+// occurrence is due; internal/schedule owns occurrence identity,
+// deduplication, and publication.
 package cron

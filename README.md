@@ -783,6 +783,31 @@ follows the full consumer-group model: one worker receives it, the PEL and
 `XAUTOCLAIM` recovery hand it to another worker if that one crashes, and
 retries/exhaustion route failures to the DLQ like any other message.
 
+**Publication recovery (bounded).** A tick is not a single best-effort publish.
+When a worker's publish attempt fails (Redis unreachable, script error), it
+retries the **same logical occurrence** — the occurrence ID is computed once and
+never recomputed — with a bounded exponential backoff (100ms, 500ms, 2s, 5s;
+five attempts total) that observes the worker lifecycle, so shutdown aborts
+promptly. A success or a clean duplicate ends the retry loop; a duplicate is
+never retried. One `schedule.publish` logical span covers all attempts, so a
+recovered occurrence keeps a single trace.
+
+Restart cannot retry in memory, so on startup each worker performs a bounded
+**catch-up** before its jobs start: for each schedule it republishes the latest
+missed occurrence within a 24-hour horizon, using the same bounded retry
+routine. Only the latest occurrence per schedule is recovered — older misses are
+intentionally dropped (this is bounded recovery, not an unbounded backlog
+replay), and future occurrences are never synthesized. The catch-up runs once,
+on the initial loaded schedule set; later live schedule edits converge future
+occurrences only. Because publication is the atomic publish-if-new, a catch-up
+another worker already published is a harmless duplicate.
+
+The due instant itself is derived from the schedule (parsed with the same parser
+gocron uses) as the latest occurrence at or before the callback, not from
+truncating the callback's wall clock. A delayed 03:00 callback observed at 03:01
+still stamps 03:00, so on-time and delayed callbacks — and the catch-up — agree
+on one occurrence ID.
+
 The guarantee is therefore:
 
 > **One schedule occurrence is published once cluster-wide, while handler
@@ -790,10 +815,13 @@ The guarantee is therefore:
 > claimed (a crash between a handler's side effect and its completion re-runs
 > the handler, so handlers must stay idempotent).
 
-Publication is best-effort across the fleet: every worker evaluates the cron
-independently, so a publish failure on one worker only loses that worker's
-tick — other workers still publish the same occurrence. Scheduled handlers do
-not advance the event-classification counters (`events_received_total`,
+Publication recovery is bounded per worker: a publish failure is retried up to
+the budget and, on restart, the latest missed occurrence per schedule within 24h
+is recovered. Beyond that, older misses are dropped, and the fleet-level
+single-publication guarantee always rests on the atomic publish-if-new — a
+retry or catch-up that finds the key already present is a clean duplicate.
+Scheduled handlers do not advance the event-classification counters
+(`events_received_total`,
 `events_matched_total`, `events_unmatched_total`) or
 `function_events_matched_total`: schedule occurrences bypass event matching
 entirely, so they have no matched/unmatched class. Schedule coordination has its
@@ -1906,8 +1934,10 @@ remains the health check.
   `slog`.
 
   **Distributed propagation**: the primary propagation path is the Redis event
-  stream. A schedule publication creates a `schedule.publish` span and writes
-  its W3C `traceparent`, `tracestate`, and `baggage` values as flat stream
+  stream. A schedule publication creates a `schedule.publish` logical span
+  (wrapping all bounded retries of one occurrence) with a
+  `schedule.publish.attempt` child per publish attempt, and writes the attempt's
+  W3C `traceparent`, `tracestate`, and `baggage` values as flat stream
   metadata fields beside the unchanged `event` field. Stream consumption
   extracts those fields before creating `stream.message`, so the message,
   dispatch, and `runtime.invoke` spans continue the same trace. The invocation
@@ -1967,11 +1997,16 @@ remains the health check.
   worker), and the `concurrency_waits_total` counter (each time an invocation's
   concurrency-slot acquisition had to block). Schedule coordination counters
   (`schedule_occurrences_published_total`,
-  `schedule_occurrences_duplicate_total`, `schedule_publish_failures_total`)
+  `schedule_occurrences_duplicate_total`, `schedule_publish_failures_total`,
+  `schedule_publish_retries_total`, `schedule_publish_exhausted_total`,
+  `schedule_catchup_total`)
   track the distributed publish-if-new path per worker: published/duplicate
   counts converge across workers toward one published entry per logical
-  occurrence, while failures flag publish attempts that could not reach Redis
-  (or whose envelope could not be encoded). These are
+  occurrence, failures flag publish attempts that could not reach Redis (or
+  whose envelope could not be encoded), retries count the bounded re-attempts
+  after a failure, exhausted counts occurrences whose retry budget ran out, and
+  catch-up counts occurrences republished by the startup recovery scan. These
+  are
   Prometheus-only and not part of the SQLite snapshot. Labels are bounded to
   `function`/`handler`/`outcome` plus the small closed runtime-pool value sets
   below; IDs (message, event, container, fingerprint) are never labels. The

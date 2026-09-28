@@ -219,10 +219,10 @@ func withSpanRecorder(t *testing.T) (*tracetest.InMemoryExporter, *tracing.Provi
 }
 
 // TestPublishOccurrenceInjectsTraceContext proves the schedule publisher starts a
-// `schedule.publish` span and renders its trace context into the flat Redis
-// fields handed to the atomic script (traceparent/tracestate/baggage), so the
-// stream consumer continues the same trace. It also proves the event envelope is
-// still passed through verbatim.
+// `schedule.publish.attempt` span and renders its trace context into the flat
+// Redis fields handed to the atomic script (traceparent/tracestate/baggage), so
+// the stream consumer continues the same trace. It also proves the event
+// envelope is still passed through verbatim.
 func TestPublishOccurrenceInjectsTraceContext(t *testing.T) {
 	exp, provider := withSpanRecorder(t)
 
@@ -268,12 +268,12 @@ func TestPublishOccurrenceInjectsTraceContext(t *testing.T) {
 	spans := exp.GetSpans()
 	var publish *tracetest.SpanStub
 	for i := range spans {
-		if spans[i].Name == "schedule.publish" {
+		if spans[i].Name == "schedule.publish.attempt" {
 			publish = &spans[i]
 		}
 	}
 	if publish == nil {
-		t.Fatalf("no schedule.publish span; got %v", spans)
+		t.Fatalf("no schedule.publish.attempt span; got %v", spans)
 	}
 	if publish.SpanContext.TraceID() != remoteTraceID {
 		t.Errorf("schedule.publish trace id = %s, want remote %s", publish.SpanContext.TraceID(), remoteTraceID)

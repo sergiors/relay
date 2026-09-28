@@ -122,13 +122,16 @@ func NewPublisher(
 // (false, nil) — another worker published this occurrence first. The dedup key
 // is history and expires by TTL only; it is never deleted on completion.
 //
-// A `schedule.publish` span wraps the whole operation, and the current W3C
-// trace context is injected as flat message metadata (traceparent/tracestate/
-// baggage) beside the untouched event payload, so the consumer's stream.message
-// span continues the same trace. With tracing disabled the carrier is nil and
-// the entry is identical to before.
+// A `schedule.publish.attempt` span wraps ONE attempt, and the current W3C trace
+// context is injected as flat message metadata (traceparent/tracestate/baggage)
+// beside the untouched event payload, so the consumer's stream.message span
+// continues the same trace. Callers that retry a single logical occurrence (the
+// cron scheduler's bounded publication recovery) start a `schedule.publish`
+// logical span around the whole retry loop; these attempt spans are its
+// children, so every attempt of one occurrence shares one trace. With tracing
+// disabled the carrier is nil and the entry is identical to before.
 func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence) (published bool, err error) {
-	ctx, span := tracing.Start(ctx, "schedule.publish",
+	ctx, span := tracing.Start(ctx, "schedule.publish.attempt",
 		trace.WithAttributes(
 			attribute.String("relay.function", o.Function),
 			attribute.String("relay.handler", o.Handler),

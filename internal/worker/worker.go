@@ -787,11 +787,25 @@ func Run(logger *slog.Logger) error {
 	// publish schedule occurrences through the publisher, seeded from the loaded
 	// function set before Start, then converges live via the reconciler's
 	// UpdateSchedules/RemoveFunction hooks.
-	sched := cron.New(publisher, logger)
+	sched := cron.NewWithMetrics(publisher, logger, metricsInstance)
 	for _, fn := range functions {
 		sched.ReplaceFunction(fn.Name, fn.Template)
 	}
 	logger.Info("Scheduler: schedule jobs registered", "count", sched.JobCount())
+
+	// Bounded startup catch-up: republish the latest missed occurrence per
+	// schedule (within the 24h horizon) that this worker may have missed while
+	// it was down. It runs once, on the initial loaded schedule set, BEFORE the
+	// reconciler can converge live changes and before Start; the existing atomic
+	// publish-if-new makes a catch-up that another worker already published a
+	// harmless duplicate. Older misses are intentionally dropped (bounded
+	// recovery, not backlog replay).
+	catchUpCtx, catchUpSpan := tracing.Start(startupCtx, "schedule.catchup")
+	if n := sched.CatchUp(catchUpCtx); n > 0 {
+		logger.Info("Scheduler: startup catch-up published missed occurrences", "count", n)
+	}
+	catchUpSpan.End()
+
 	logger.Info(
 		"Concurrency limits",
 		"max_concurrency", effectiveMaxConcurrency(cfg.MaxConcurrency),

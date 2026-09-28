@@ -69,8 +69,20 @@ const (
 	MetricScheduleOccurrencesPublished = metricNamespacePrefix + "schedule_occurrences_published_total"
 	MetricScheduleOccurrencesDuplicate = metricNamespacePrefix + "schedule_occurrences_duplicate_total"
 	MetricSchedulePublishFailures      = metricNamespacePrefix + "schedule_publish_failures_total"
-	MetricHandlerInvocations           = metricNamespacePrefix + "handler_invocations_total"
-	MetricBuildFailures                = metricNamespacePrefix + "build_failures_total"
+	// Bounded publication-recovery counters. MetricSchedulePublishRetries counts
+	// each RETRY of a failed schedule publication within the bounded backoff
+	// budget (the initial failed attempt is NOT a retry; it is already counted
+	// by MetricSchedulePublishFailures). MetricSchedulePublishExhausted counts
+	// occurrences whose retry budget was exhausted (a permanently lost
+	// occurrence on this worker). MetricScheduleCatchUp counts occurrences
+	// republished by the startup catch-up scan (each is subject to the same
+	// atomic dedup, so a catch-up that another worker already published shows as
+	// a duplicate, not here).
+	MetricSchedulePublishRetries   = metricNamespacePrefix + "schedule_publish_retries_total"
+	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
+	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
+	MetricHandlerInvocations       = metricNamespacePrefix + "handler_invocations_total"
+	MetricBuildFailures            = metricNamespacePrefix + "build_failures_total"
 	// MetricFunctionEventsMatched counts a function once per logical event for
 	// which at least one of its rules matched — a functions-engaged counter,
 	// distinct from the message-level MetricEventsMatched (an event matching two
@@ -148,7 +160,10 @@ var metricHelp = map[string]string{
 	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-function).",
 	MetricScheduleOccurrencesPublished: "Schedule occurrences newly published to the event stream by this worker after the distributed publish-if-new check.",
 	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
-	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; occurrences are retried on the next scheduling tick.",
+	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; a failed attempt is counted here before any bounded retry.",
+	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
+	MetricSchedulePublishExhausted:     "Schedule occurrences whose bounded publication retry budget was exhausted without a success or duplicate; the occurrence is lost on this worker (other workers may still publish it).",
+	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
 
 	MetricHandlerInvocations:              "Handler invocation outcomes by function and handler, counted once per handler attempt; outcome is success or failure.",
 	MetricBuildFailures:                   "Function image and dependency-image build failures by function.",
@@ -381,6 +396,9 @@ func New() *Registry {
 		MetricScheduleOccurrencesPublished,
 		MetricScheduleOccurrencesDuplicate,
 		MetricSchedulePublishFailures,
+		MetricSchedulePublishRetries,
+		MetricSchedulePublishExhausted,
+		MetricScheduleCatchUp,
 		// MetricMissingPayload is a stream-layer anomaly counter fed by the
 		// consumer when it clears a dangling PEL entry (see the constant's doc).
 		MetricMissingPayload,

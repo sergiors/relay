@@ -33,7 +33,9 @@
 //     relay_handler_failure_total, relay_concurrency_waits_total, the
 //     schedule-coordination counters (relay_schedule_occurrences_published_total,
 //     relay_schedule_occurrences_duplicate_total,
-//     relay_schedule_publish_failures_total), plus CounterVecs
+//     relay_schedule_publish_failures_total, the bounded-retry counters
+//     relay_schedule_publish_retries_total / relay_schedule_publish_exhausted_total,
+//     and relay_schedule_catchup_total), plus CounterVecs
 //     relay_handler_invocations_total{outcome,function,handler},
 //     relay_build_failures_total{function}, the per-function operational
 //     counters relay_function_events_matched_total{function},

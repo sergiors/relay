@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
+	robfigcron "github.com/robfig/cron/v3"
 
 	"relay/internal/function"
+	"relay/internal/observability/metrics"
 	"relay/internal/schedule"
 )
 
@@ -22,21 +24,57 @@ type Publisher interface {
 	PublishOccurrence(ctx context.Context, o schedule.Occurrence) (published bool, err error)
 }
 
-// Scheduler wraps a gocron scheduler to run a function's template schedules.
-type Scheduler struct {
-	log     *slog.Logger
-	pub     Publisher
-	g       gocron.Scheduler
-	mu      sync.Mutex
-	stopped bool
-	// now provides the current time used to identify schedule occurrences.
-	now func() time.Time
+// registeredSchedule is one function schedule Relay has registered: the
+// function and handler it invokes plus the schedule parsed with the SAME
+// parser gocron uses, so occurrence derivation (both the callback path and the
+// startup catch-up) matches gocron's firing exactly. Entries are recorded by
+// ReplaceFunction (mutex-protected) and read by CatchUp; they never drive the
+// live gocron jobs (those remain gocron's responsibility).
+type registeredSchedule struct {
+	fn      string
+	handler string
+	parsed  robfigcron.Schedule
 }
 
-// New constructs a Scheduler over the given publisher. The gocron scheduler is
-// pinned to UTC (per-job timezones are encoded as CRON_TZ prefixes) and its
-// shutdown is bounded by WithStopTimeout.
+// Scheduler wraps a gocron scheduler to run a function's template schedules.
+type Scheduler struct {
+	log *slog.Logger
+	pub Publisher
+	g   gocron.Scheduler
+	// metrics is the bounded publication-recovery counters sink; nil is
+	// nil-safe (every metric call is a no-op), matching the publisher's
+	// registry.
+	metrics *metrics.Registry
+	mu      sync.Mutex
+	stopped bool
+	// schedules records the parsed schedules registered so far, used only by
+	// the once-per-Scheduler startup CatchUp. It is replaced per function by
+	// ReplaceFunction so it converges alongside the gocron jobs.
+	schedules []registeredSchedule
+	// catchUpDone guards the once-only startup catch-up: live ReplaceFunction
+	// calls must never synthesize additional catch-up.
+	catchUpDone bool
+	// now provides the current time used to identify schedule occurrences.
+	now func() time.Time
+	// wait blocks for d or until ctx is cancelled, reporting whether the delay
+	// elapsed (true) or ctx was cancelled first (false). Production uses a
+	// timer; tests substitute a fake so the retry backoff is deterministic and
+	// sleep-free.
+	wait func(ctx context.Context, d time.Duration) bool
+}
+
+// New constructs a Scheduler over the given publisher with a nil metrics
+// registry. The gocron scheduler is pinned to UTC (per-job timezones are encoded
+// as CRON_TZ prefixes) and its shutdown is bounded by WithStopTimeout.
 func New(pub Publisher, logger *slog.Logger) *Scheduler {
+	return NewWithMetrics(pub, logger, nil)
+}
+
+// NewWithMetrics constructs a Scheduler that also records the bounded
+// publication-recovery counters. It mirrors runner.NewWithMetrics: New is the
+// nil-metrics convenience, and the worker wires the registry through this
+// constructor. A nil registry is nil-safe.
+func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics.Registry) *Scheduler {
 	g, err := gocron.NewScheduler(
 		gocron.WithLocation(time.UTC),
 		gocron.WithStopTimeout(5*time.Second),
@@ -47,7 +85,28 @@ func New(pub Publisher, logger *slog.Logger) *Scheduler {
 		// (mirroring the webhook provider-name panic style).
 		panic(fmt.Sprintf("cron: construct gocron scheduler: %v", err))
 	}
-	return &Scheduler{log: logger, pub: pub, g: g, now: time.Now}
+	return &Scheduler{
+		log:     logger,
+		pub:     pub,
+		g:       g,
+		metrics: metricsRegistry,
+		now:     time.Now,
+		wait:    waitContext,
+	}
+}
+
+// waitContext blocks for d or until ctx is cancelled, reporting whether the
+// delay elapsed. It is the production Scheduler.wait: a single timer per retry
+// (no polling), released promptly by lifecycle cancellation.
+func waitContext(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // functionTag is the tag that identifies every job belonging to a function, so
@@ -73,6 +132,10 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		return
 	}
 	s.g.RemoveByTags(functionTag(name))
+	// Converge the parsed-schedule record for this function alongside the
+	// gocron jobs, so the startup catch-up sees exactly the schedules registered
+	// before Start. Entries are dropped for skipped/invalid schedules below.
+	s.schedules = dropFunctionSchedules(s.schedules, name)
 	for i, sch := range tmpl.Schedules {
 		// Copy the loop variable into a local so the closure captures this
 		// iteration's schedule, not the loop variable.
@@ -86,6 +149,13 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 				"error", "`@every` relative schedules are not supported")
 			continue
 		}
+		// Parse with gocron's own parser configuration (5-field/descriptor via
+		// CRON_TZ-aware ParseStandard) so occurrence derivation matches firing.
+		parsed, err := parseSchedule(sch.Cron, sch.Location)
+		if err != nil {
+			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler, "error", err)
+			continue
+		}
 		// Always prepend the zone (UTC included explicitly) so the job runs in
 		// the schedule's effective timezone while the scheduler stays pinned to
 		// UTC; NextRun returns a UTC instant regardless.
@@ -96,9 +166,9 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// schedules are rejected at parse time because gocron's callback exposes
 		// no scheduled-due instant, so a per-second occurrence could not be
 		// identified deterministically across workers.
-		_, err := s.g.NewJob(
+		_, err = s.g.NewJob(
 			gocron.CronJob(spec, false),
-			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Handler) }),
+			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Handler, parsed) }),
 			gocron.WithTags(functionTag(name), jobTag(name, sch.Handler, i)),
 			gocron.WithName(jobName),
 			gocron.WithSingletonMode(gocron.LimitModeReschedule),
@@ -107,8 +177,22 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler, "error", err)
 			continue
 		}
+		s.schedules = append(s.schedules, registeredSchedule{fn: name, handler: sch.Handler, parsed: parsed})
 	}
 	s.log.Debug("Cron: registered schedules", "function", name, "count", len(tmpl.Schedules))
+}
+
+// dropFunctionSchedules returns schedules with every entry for fn removed,
+// preserving the relative order of the rest. It is the record-side twin of
+// gocron's RemoveByTags(functionTag(fn)).
+func dropFunctionSchedules(schedules []registeredSchedule, fn string) []registeredSchedule {
+	kept := schedules[:0]
+	for _, e := range schedules {
+		if e.fn != fn {
+			kept = append(kept, e)
+		}
+	}
+	return kept
 }
 
 // RemoveFunction removes every schedule job belonging to name, so stale gocron
@@ -120,6 +204,7 @@ func (s *Scheduler) RemoveFunction(name string) {
 		return
 	}
 	s.g.RemoveByTags(functionTag(name))
+	s.schedules = dropFunctionSchedules(s.schedules, name)
 }
 
 // Start begins firing scheduled jobs. Jobs added before Start fire from their
@@ -176,50 +261,47 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 }
 
 // fire computes the scheduled instant for this tick and publishes the occurrence
-// cluster-wide through the Publisher. It is the gocron task body (a
-// func(ctx context.Context) so gocron injects and cancels the job context on
-// shutdown). There is no local retry: after publication, the stream layer drives
-// at-least-once delivery and per-invocation retry/backoff/DLQ; if publication
-// itself fails, the tick is lost for THIS worker but other workers' callbacks
-// still publish the same occurrence (per-worker evaluation makes publication
-// best-effort across the fleet).
-func (s *Scheduler) fire(ctx context.Context, fnName, handler string) {
-	// The scheduled instant is the minute-truncated UTC wall clock. Only
-	// minute-granularity schedules are accepted (see ReplaceFunction and
-	// function.validateCron), so every worker evaluating the same tick arrives
-	// at the same minute-level instant; minute-truncation is robust to
-	// second-boundary jitter between workers and is what keeps their occurrence
-	// IDs identical. (The gocron Job's NextRun() is not used: under RunNow it
-	// returns the FUTURE cron instant, not the due one, so it is not
-	// deterministic here, and gocron's task callback exposes no due instant.)
-	// The payload's scheduled_at is thus the honest due instant to the minute.
-	due := s.now().UTC().Truncate(time.Minute)
+// cluster-wide through the Publisher's bounded retry routine. It is the gocron
+// task body (a func(ctx context.Context) so gocron injects and cancels the job
+// context on shutdown).
+//
+// The due instant is derived from the schedule itself, NOT from truncating the
+// callback's wall clock: gocron's callback exposes no scheduled-due instant, and
+// minute-truncating "now" would stamp the WRONG occurrence if the callback were
+// ever delayed across a matching boundary (e.g. a delayed 03:00 tick observed at
+// 03:01). latestOccurrence finds the most recent occurrence at or before now, so
+// an on-time and a delayed callback for the same tick both stamp the SAME due
+// instant (and therefore the same occurrence ID), keeping cluster-wide dedup
+// intact. The occurrence is computed once and never recomputed across retries
+// (see publishOccurrence). A callback with no occurrence inside the horizon is
+// dropped rather than stamped with a fabricated instant; that only happens for a
+// tick stale by more than the bounded recovery horizon.
+//
+// The gocron Job's NextRun is deliberately NOT used: it requires a round trip
+// to the scheduler goroutine and returns the FIRST element of a nextScheduled
+// slice that the rescheduling/completion messages may not have pruned yet, so
+// during a callback it can be the just-fired due (not the next future run) —
+// nondeterministic across workers and racy with the scheduler loop.
+//
+// Retries are bounded (see publishRetryDelays) and observe ctx, so a shutdown
+// aborts promptly. The schedule-path at-least-once contract after publication is
+// unchanged: the stream layer drives delivery, per-invocation retry, and DLQ.
+func (s *Scheduler) fire(ctx context.Context, fnName, handler string, parsed robfigcron.Schedule) {
+	now := s.now()
+	due, ok := latestOccurrence(parsed, now, occurrenceHorizon)
+	if !ok {
+		// No occurrence in (now-horizon, now]: this callback is stale by more
+		// than the bounded recovery horizon (a callback delayed >24h, e.g. a
+		// machine suspended that long), or the schedule's gap exceeds the
+		// horizon. Relay never fabricates a non-occurrence: the stale tick is
+		// dropped, exactly like a missed occurrence older than the startup
+		// catch-up horizon. It cannot happen for a normal on-time callback.
+		s.log.Warn("Schedule: tick has no occurrence within the recovery horizon; dropping",
+			"function", fnName, "handler", handler,
+			"now", now.UTC().Format(time.RFC3339),
+		)
+		return
+	}
 	o := schedule.Occurrence{Function: fnName, Handler: handler, ScheduledAt: due}
-	published, err := s.pub.PublishOccurrence(ctx, o)
-	if err != nil {
-		s.log.Warn("Schedule: publish failed",
-			"function", fnName,
-			"handler", handler,
-			"scheduled_at", due.Format(time.RFC3339),
-			"occurrence_id", o.ID(),
-			"reason", err,
-		)
-		return
-	}
-	if published {
-		s.log.Info("Schedule: occurrence published",
-			"function", fnName,
-			"handler", handler,
-			"scheduled_at", due.Format(time.RFC3339),
-			"occurrence_id", o.ID(),
-		)
-		return
-	}
-	// Another worker already published this occurrence (clean duplicate no-op).
-	s.log.Debug("Schedule: occurrence already published",
-		"function", fnName,
-		"handler", handler,
-		"scheduled_at", due.Format(time.RFC3339),
-		"occurrence_id", o.ID(),
-	)
+	_, _ = s.publishOccurrence(ctx, o, false)
 }

@@ -200,6 +200,55 @@ func TestIntegrationPublishFailureLeavesNoKey(t *testing.T) {
 	}
 }
 
+// Bounded-recovery retry: the cron publisher retries the SAME occurrence after a
+// transient failure. Because a failed script leaves NEITHER the dedup key nor an
+// entry, the retry must succeed and write exactly one entry (and a further
+// retry/recovery is a clean duplicate). This is the atomicity invariant the
+// bounded publication recovery depends on.
+func TestIntegrationPublishFailureThenRetryPublishesOnce(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	e := newPTestEnv(t, cli)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
+	ctx := context.Background()
+	o := newUniqueOccurrence(e.prefix)
+
+	// First attempt fails (wrong-type stream), leaving no dedup key.
+	if r := e.client.Set(ctx, e.stream, "not-a-stream", 0); r.Err() != nil {
+		t.Fatalf("set wrong-type key: %v", r.Err())
+	}
+	if _, err := p.PublishOccurrence(ctx, o); err == nil {
+		t.Fatal("first attempt should fail against a wrong-type stream")
+	}
+	// The transient fault clears; the retry of the SAME occurrence succeeds.
+	if err := e.client.Del(ctx, e.stream).Err(); err != nil {
+		t.Fatalf("clear wrong-type key: %v", err)
+	}
+	published, err := p.PublishOccurrence(ctx, o)
+	if err != nil {
+		t.Fatalf("retry publish: %v", err)
+	}
+	if !published {
+		t.Fatal("retry after a failed attempt should publish")
+	}
+	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
+		t.Fatalf("stream length after retry = %d, want 1", n)
+	}
+	if n := e.client.Exists(ctx, dedupKey(o)).Val(); n != 1 {
+		t.Fatalf("dedup key after retry = %d, want 1", n)
+	}
+	// A later recovery of the same occurrence is a clean duplicate no-op.
+	dup, err := p.PublishOccurrence(ctx, o)
+	if err != nil {
+		t.Fatalf("duplicate publish: %v", err)
+	}
+	if dup {
+		t.Fatal("a repeated recovery of an already-published occurrence must be a duplicate")
+	}
+	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
+		t.Fatalf("stream length after repeated recovery = %d, want 1", n)
+	}
+}
+
 // A publish with a trace context writes the W3C fields as flat stream metadata
 // beside the untouched event envelope, so a consumer can continue the trace; a
 // publish with no trace context writes exactly the event field and nothing else.
