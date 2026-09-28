@@ -1114,9 +1114,15 @@ func validateHandler(handler string) error {
 }
 
 // parseFieldCondition converts a decoded YAML node into a FieldCondition.
+//   - a plain scalar -> implicit equality
 //   - a plain list -> implicit equality (OR across the values)
-//   - a map with only operator keys (equals/prefix/suffix/exists) -> operators
-//   - a map with other keys -> nested field conditions (AND with siblings)
+//   - a map with condition operator keys -> validated operators
+//   - a map with nested field keys -> child conditions (AND with siblings)
+//
+// Empty maps, unknown operator-like keys, and mixed operator/child maps are
+// rejected. A malformed operator must never silently become an empty condition:
+// FieldCondition.match treats no operators and no children as true, which would
+// widen a typo into a match-all predicate.
 //
 // path is the dotted field path (e.g. "new_image.cnpj") used to give errors from
 // strict operator validation (exists) enough context to locate the offending
@@ -1129,8 +1135,21 @@ func parseFieldCondition(path string, v any, now func() time.Time) (FieldConditi
 	case []any:
 		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: val}}}, nil
 	case map[string]any:
+		if len(val) == 0 {
+			return FieldCondition{}, fmt.Errorf("%s: condition map is empty; use an explicit operator such as exists", path)
+		}
 		if isOperatorMap(val) {
 			return buildOperators(val, path, now)
+		}
+		// Preserve the established nested-object syntax: a map with ordinary
+		// child fields (including fields literally named "exists" or "equals")
+		// is a nested condition, not an operator map. But reject an operator-like
+		// unknown key such as `prefx` rather than interpreting an operator typo as
+		// a child field and silently widening the rule.
+		for field := range val {
+			if looksLikeConditionOperator(field) {
+				return FieldCondition{}, fmt.Errorf("%s: unknown condition operator %q", path, field)
+			}
 		}
 		children := make(map[string]FieldCondition, len(val))
 		for field, child := range val {
@@ -1147,14 +1166,10 @@ func parseFieldCondition(path string, v any, now func() time.Time) (FieldConditi
 	}
 }
 
-// buildOperators converts an operator-only map into a FieldCondition of
-// operators. equals/prefix/suffix reuse the legacy silent-skip convention: a
-// malformed value (e.g. prefix: "x" instead of a list) is dropped, never an
-// error. exists is validated strictly instead: its value must be a YAML boolean
-// (a Go bool after yaml.v3 decode — YAML true/false), and anything else is
-// rejected with a pointing error rather than silently ignored. This asymmetry is
-// deliberate: a missing operator key is a legitimate "this operator not used";
-// a non-boolean exists value is almost certainly a template authoring mistake.
+// buildOperators converts a condition-operator map into a FieldCondition.
+// Unknown keys, mixed operator/nested-field maps, and malformed operators are
+// rejected: silently dropping one can leave an empty condition that matches
+// every event, widening a rule on typo.
 //
 // gt/gte/lt/lte are NEW operators with no legacy convention to preserve, so they
 // are validated strictly like exists. Each operand must be either a number (any
@@ -1165,15 +1180,40 @@ func parseFieldCondition(path string, v any, now func() time.Time) (FieldConditi
 // treated as a date; only the exact `now()`/`now()±duration` syntax triggers
 // temporal comparison, so rejecting anything-but is the honest, fail-fast choice.
 func buildOperators(m map[string]any, path string, now func() time.Time) (FieldCondition, error) {
+	for key := range m {
+		if !isKnownConditionOperator(key) {
+			return FieldCondition{}, fmt.Errorf("%s: unknown condition operator %q", path, key)
+		}
+	}
 	var matchers []ValueMatcher
-	if vals, ok := m["equals"].([]any); ok {
+	if raw, ok := m["equals"]; ok {
+		vals, ok := raw.([]any)
+		if !ok || len(vals) == 0 {
+			return FieldCondition{}, fmt.Errorf("%s: equals must be a non-empty list", path)
+		}
 		matchers = append(matchers, equalityMatcher{values: vals})
 	}
-	if vals, ok := m["prefix"].([]any); ok {
-		matchers = append(matchers, prefixMatcher{prefixes: toStrings(vals)})
+	if raw, ok := m["prefix"]; ok {
+		vals, ok := raw.([]any)
+		if !ok || len(vals) == 0 {
+			return FieldCondition{}, fmt.Errorf("%s: prefix must be a non-empty list of strings", path)
+		}
+		prefixes := toStrings(vals)
+		if len(prefixes) != len(vals) {
+			return FieldCondition{}, fmt.Errorf("%s: prefix must contain only strings", path)
+		}
+		matchers = append(matchers, prefixMatcher{prefixes: prefixes})
 	}
-	if vals, ok := m["suffix"].([]any); ok {
-		matchers = append(matchers, suffixMatcher{suffixes: toStrings(vals)})
+	if raw, ok := m["suffix"]; ok {
+		vals, ok := raw.([]any)
+		if !ok || len(vals) == 0 {
+			return FieldCondition{}, fmt.Errorf("%s: suffix must be a non-empty list of strings", path)
+		}
+		suffixes := toStrings(vals)
+		if len(suffixes) != len(vals) {
+			return FieldCondition{}, fmt.Errorf("%s: suffix must contain only strings", path)
+		}
+		matchers = append(matchers, suffixMatcher{suffixes: suffixes})
 	}
 	if raw, ok := m["exists"]; ok {
 		want, ok := raw.(bool)
@@ -1196,7 +1236,74 @@ func buildOperators(m map[string]any, path string, now func() time.Time) (FieldC
 			matchers = append(matchers, built...)
 		}
 	}
+	if len(matchers) == 0 {
+		return FieldCondition{}, fmt.Errorf("%s: condition has no valid operators", path)
+	}
 	return FieldCondition{Operators: matchers}, nil
+}
+
+var conditionOperatorNames = map[string]struct{}{
+	"equals": {}, "prefix": {}, "suffix": {}, "exists": {},
+	"gt": {}, "gte": {}, "lt": {}, "lte": {},
+}
+
+func isKnownConditionOperator(key string) bool {
+	_, ok := conditionOperatorNames[key]
+	return ok
+}
+
+// looksLikeConditionOperator distinguishes a typo in an operator map from a
+// legitimate nested-field map. All supported operators and their common prefix
+// misspellings use lower-case operator-like identifiers; ordinary event field
+// names remain valid nested children.
+func looksLikeConditionOperator(key string) bool {
+	if _, known := conditionOperatorNames[key]; known {
+		return false
+	}
+	for op := range conditionOperatorNames {
+		if strings.HasPrefix(op, key) || strings.HasPrefix(key, op) || editDistanceAtMostOne(key, op) {
+			return true
+		}
+	}
+	return false
+}
+
+// editDistanceAtMostOne identifies a likely typo of an operator without
+// claiming arbitrary nested event fields (for example "status") as unknown
+// operators. Operator-like keys one insertion, deletion, or substitution away
+// from a supported name are treated as typos and rejected.
+func editDistanceAtMostOne(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a)-len(b) > 1 || len(b)-len(a) > 1 {
+		return false
+	}
+	i, j, edits := 0, 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i] == b[j] {
+			i++
+			j++
+			continue
+		}
+		edits++
+		if edits > 1 {
+			return false
+		}
+		switch {
+		case len(a) > len(b):
+			i++
+		case len(b) > len(a):
+			j++
+		default:
+			i++
+			j++
+		}
+	}
+	if i < len(a) || j < len(b) {
+		edits++
+	}
+	return edits <= 1
 }
 
 // buildComparison converts a gt/gte/lt/lte operand into one comparisonMatcher per

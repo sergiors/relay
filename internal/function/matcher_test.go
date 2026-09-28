@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func mustParse(t *testing.T, yaml string) *Template {
@@ -910,6 +911,95 @@ events:
 	for i, yaml := range templates {
 		if _, err := ParseTemplate([]byte(yaml)); err != nil {
 			t.Errorf("template %d should parse: %v", i, err)
+		}
+	}
+}
+
+func TestMalformedOperatorMapsRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		condition string
+		wantError string
+		wantPath  string
+	}{
+		{"unknown only", "equalz: [\"12\"]", "unknown condition operator", "cnpj"},
+		{"empty map", "{}", "condition map is empty", "cnpj"},
+		{"prefix typo", "prefx: [\"12\"]", "unknown condition operator", "cnpj"},
+		{"mixed valid and unknown", "prefix: [\"12\"]\n        prefx: [\"34\"]", "unknown condition operator", "cnpj"},
+		{"malformed prefix value", "prefix: \"12\"", "prefix must be a non-empty list", "cnpj"},
+		{"empty equality list", "equals: []", "equals must be a non-empty list", "cnpj"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      cnpj:
+        ` + tc.condition + "\n"))
+			if err == nil {
+				t.Fatalf("expected malformed condition to fail parsing")
+			}
+			if !strings.Contains(err.Error(), tc.wantError) || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("error = %q, want %q and field path %q", err, tc.wantError, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestValidConditionOperatorMapFormsStillParseAndMatch(t *testing.T) {
+	tests := []struct {
+		name      string
+		condition string
+		event     map[string]any
+	}{
+		{"equals", "equals: [\"x\"]", map[string]any{"field": "x"}},
+		{"prefix", "prefix: [\"x\"]", map[string]any{"field": "xyz"}},
+		{"suffix", "suffix: [\"z\"]", map[string]any{"field": "xyz"}},
+		{"exists true", "exists: true", map[string]any{"field": nil}},
+		{"exists false", "exists: false", map[string]any{}},
+		{"gt", "gt: 1", map[string]any{"field": 2}},
+		{"gte", "gte: 2", map[string]any{"field": 2}},
+		{"lt", "lt: 3", map[string]any{"field": 2}},
+		{"lte", "lte: 2", map[string]any{"field": 2}},
+		{"temporal", "gt: \"now()-5m\"", map[string]any{"field": time.Now().UTC().Format(time.RFC3339)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpl, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      field:
+        ` + tc.condition + "\n"))
+			if err != nil {
+				t.Fatalf("valid condition rejected: %v", err)
+			}
+			if !matches(t, tmpl, tc.event) {
+				t.Fatalf("expected event %v to match", tc.event)
+			}
+		})
+	}
+}
+
+func TestMalformedOperatorRuleNeverMatches(t *testing.T) {
+	for _, condition := range []string{"prefx: [\"x\"]", "{}"} {
+		_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      field:
+        ` + condition + "\n"))
+		if err == nil {
+			t.Fatalf("condition %q unexpectedly parsed", condition)
+		}
+		// The parser must reject the malformed condition before a Template can be
+		// constructed; otherwise a zero FieldCondition would match broadly.
+		if (FieldCondition{}).match(nil, false) != true {
+			t.Fatal("test precondition changed: empty FieldCondition no longer matches broadly")
 		}
 	}
 }
