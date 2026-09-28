@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,9 +109,10 @@ type containerCache struct {
 	// (it is created after the retirement was recorded).
 	//
 	// Like the per-pool set, retirements persist for the process UNLESS a
-	// function is successfully re-activated for the same image
-	// (activateFunction deletes it), and are bounded by the number of distinct
-	// image versions retired in a worker's lifetime. Guarded by mu.
+	// function is successfully re-activated for the same image reference
+	// (activateFunction clears the reference and every content identity sharing
+	// it), and are bounded by the number of distinct image versions retired in a
+	// worker's lifetime. Guarded by mu.
 	retiredImages map[string]bool
 	// removedFunctions holds function names whose removal has been requested and
 	// whose pool may still be draining (busy containers completing) or may
@@ -151,22 +153,33 @@ type containerCache struct {
 }
 
 // generation is one container VERSION's set inside a function pool. A version is
-// the pair (image reference, resource config fingerprint): the image determines
-// the code, and the config fingerprint (`relay.resources`, see
+// the triple (image CONTENT identity, resource config fingerprint): the image
+// content determines the code, and the config fingerprint (`relay.resources`, see
 // function.ResourceLimits.Fingerprint) determines the per-container resource
-// limits. A pool has exactly one active generation (the version new acquires
-// serve) plus zero or more draining generations: superseded or invalidated
-// versions whose busy containers are still completing. Idle containers of a
-// non-active generation are never kept — they are discarded the moment the
-// generation is superseded — and a draining generation is dropped as soon as its
-// last busy container releases. Grouping by generation makes "no new acquires of
-// an old version" structural: acquire only ever leases from or appends to
-// p.active.
+// limits. The image half is the IMMUTABLE content identity resolved before the
+// lease (see resolvedImage.identity) — the reference plus the Docker image ID and
+// the Relay fingerprint metadata — so the same tag whose content changed is a NEW
+// version that rotates the generation, while identical content keeps warming. A
+// pool has exactly one active generation (the version new acquires serve) plus
+// zero or more draining generations: superseded or invalidated versions whose
+// busy containers are still completing. Idle containers of a non-active
+// generation are never kept — they are discarded the moment the generation is
+// superseded — and a draining generation is dropped as soon as its last busy
+// container releases. Grouping by generation makes "no new acquires of an old
+// version" structural: acquire only ever leases from or appends to p.active.
 //
 // A resource-only change (same image, new config) is therefore a version change:
 // it supersedes the active generation and drains it exactly like an image change,
 // WITHOUT retiring the image itself (leases/GC and relay.image are untouched).
+//
+// The image field holds the resolved content IDENTITY, not the bare reference.
+// Retirement is scoped to the mutable REFERENCE, which identityRef recovers from
+// the identity key (the key always begins with "<ref>\x00"), so
+// InvalidateImage/RemoveImage and Prepare's re-activation keep working on the
+// function's own tag regardless of which content identity is currently warm.
 type generation struct {
+	// image is the immutable content identity (see resolvedImage.identity) that
+	// keys generation matching.
 	image  string
 	config string
 	idle   []*pooledContainer
@@ -181,6 +194,56 @@ func newGeneration(image, config string) *generation {
 // version.
 func (g *generation) matches(image, config string) bool {
 	return g.image == image && g.config == config
+}
+
+// identityRef recovers the mutable image reference from a content identity key
+// built by imageIdentityKey. A key always begins with the reference followed by a
+// NUL separator (or is the bare reference itself), so the first NUL is the
+// boundary. It lets reference-scoped retirement (invalidateImage, activation)
+// match every content identity of a tag without threading the reference
+// separately through the pool.
+func identityRef(identity string) string {
+	if i := strings.IndexByte(identity, 0); i >= 0 {
+		return identity[:i]
+	}
+	return identity
+}
+
+// imageRetired reports whether a requested content identity is retired in the
+// set: either the exact identity (a forward transition's superseded content) or
+// its bare reference (invalidateImage/RemoveImage retirement of the whole tag).
+// A request that carries no content suffix (a Docker-less caller) additionally
+// matches ANY retired content identity of the same reference, since a retirement
+// of a tag's content retires the tag for such a caller.
+func imageRetired(set map[string]bool, identity string) bool {
+	if set[identity] {
+		return true
+	}
+	ref := identityRef(identity)
+	if set[ref] {
+		return true
+	}
+	if ref != identity {
+		return false
+	}
+	for k := range set {
+		if identityRef(k) == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// clearImageRetirement un-retires every key belonging to ref: the bare reference
+// and every content identity sharing it. It is how activation re-warms a reverted
+// content address as well as the reference itself.
+func clearImageRetirement(set map[string]bool, ref string) {
+	delete(set, ref)
+	for k := range set {
+		if identityRef(k) == ref {
+			delete(set, k)
+		}
+	}
 }
 
 // functionPool is one function's bounded warm container pool.
@@ -216,20 +279,26 @@ type functionPool struct {
 	transient         map[*pooledContainer]struct{}
 	transientCreating int
 
-	// retiredImages holds image references whose containers must never be
-	// pooled again (image retirement/invalidation or a superseded active
-	// image). A container created for a retired image is marked retired at
+	// retiredImages holds image identities and references whose containers must
+	// never be pooled again (image retirement/invalidation or a superseded active
+	// image). A container created for a retired identity is marked retired at
 	// creation: it serves its invocation at-least-once and is discarded on
 	// release, so no later acquire can reuse it ("no new acquires old image").
 	//
+	// Keys are either a full content identity ("<ref>\x00<id>\x00<fingerprint>",
+	// see imageIdentityKey) recorded by a forward version transition — which must
+	// retire only the OLD content of a shared tag, not the tag itself — or a bare
+	// reference (no NUL) recorded by invalidateImage/retireOwned, which retires
+	// every content identity of that tag. versionRetired matches BOTH the exact
+	// identity and its reference prefix, so a retagged image whose content moved
+	// is served on a throwaway and a dead tag never warms.
+	//
 	// Retirements are permanent for the pool's lifetime UNLESS the image is
-	// re-activated: a content-addressed image whose source is reverted to a
-	// previously-retired fingerprint is treated as retired, so its invocations
-	// run on throwaway containers (correct, just not warm), until a successful
-	// Prepare for that exact image re-activates it (activateFunction clears the
-	// entry), at which point it warms again. The set is bounded by the number of
-	// distinct function versions retired in a worker's lifetime (and is
-	// discarded with the pool on function removal). Guarded by mu.
+	// re-activated: activateFunction clears both the bare reference and every
+	// identity key sharing its reference, so a reverted content address warms
+	// again. The set is bounded by the number of distinct function versions
+	// retired in a worker's lifetime (and is discarded with the pool on function
+	// removal). Guarded by mu.
 	retiredImages map[string]bool
 
 	// retiredConfigs holds resource-config fingerprints whose containers must
@@ -270,9 +339,11 @@ type functionPool struct {
 // the lease state. gen is nil for transient containers.
 type pooledContainer struct {
 	c reusableContainer
-	// image and config are the container's version identity: the image
-	// reference it was created from and the resource-config fingerprint it was
-	// created with (see generation). Both participate in the generation match.
+	// image and config are the container's version identity: image is the
+	// immutable content identity (resolvedImage.identity) it was created from,
+	// and config is the resource-config fingerprint it was created with (see
+	// generation). Both participate in the generation match; the mutable
+	// reference for retirement is identityRef(image).
 	image  string
 	config string
 	gen    *generation
@@ -291,7 +362,7 @@ type pooledContainer struct {
 }
 
 // matchesVersion reports whether the wrapper's container was created for the
-// requested image AND resource-config version.
+// requested image content identity AND resource-config version.
 func (pc *pooledContainer) matchesVersion(image, config string) bool {
 	return pc.image == image && pc.config == config
 }
@@ -592,11 +663,14 @@ func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
 }
 
 // execute runs one invocation through a leased container for fnName's image
-// version. start creates a fresh container when the pool has no idle one and
-// capacity remains (lazily); it returns the caller's error verbatim on failure.
-// A container that the invocation poisoned (timeout/process exit/protocol
-// error/panic) is dropped on release so a later call starts fresh; a plain
-// handler error keeps the container.
+// version. image is the version's image identity: production passes the resolved
+// content identity (see resolvedImage.identity) from Manager.Execute, while the
+// compatibility form below and direct callers may pass a bare reference (a valid
+// identity key with no content suffix). start creates a fresh container when the
+// pool has no idle one and capacity remains (lazily); it returns the caller's
+// error verbatim on failure. A container that the invocation poisoned
+// (timeout/process exit/protocol error/panic) is dropped on release so a later
+// call starts fresh; a plain handler error keeps the container.
 //
 // This compatibility form takes only the image and derives the resource-config
 // half of the version identity from the cache's last published effective limits
@@ -619,7 +693,9 @@ func (cc *containerCache) execute(
 // executeVersion is execute with an explicit resource-config fingerprint: the
 // caller resolved fnName's effective limits for the container create and passes
 // their fingerprint so the container is pooled under exactly the configuration
-// it was created with. It is the production path (Manager.Execute).
+// it was created with. image is the version's image identity (the resolved
+// content identity in production; a bare reference from direct callers). It is
+// the production path (Manager.Execute).
 func (cc *containerCache) executeVersion(
 	ctx context.Context,
 	fnName, image, config string,
@@ -631,8 +707,11 @@ func (cc *containerCache) executeVersion(
 ) (retErr error) {
 	// A span around the pool acquire (a warm lease or a cold container start),
 	// distinct from the invocation protocol exchange below, so a slow pool wait
-	// or cold start is attributable separately.
-	acquireCtx, acquireSpan := startRuntimeSpan(ctx, "runtime.acquire", fnName, image)
+	// or cold start is attributable separately. Spans carry the stable mutable
+	// reference (identityRef), not the content key's NUL-separated identity, so
+	// the attribute stays low-cardinality and greppable.
+	spanImage := identityRef(image)
+	acquireCtx, acquireSpan := startRuntimeSpan(ctx, "runtime.acquire", fnName, spanImage)
 	lease, err := cc.acquireVersion(acquireCtx, fnName, image, config, max, start)
 	if err != nil {
 		finishRuntimeSpan(acquireSpan, err)
@@ -645,7 +724,7 @@ func (cc *containerCache) executeVersion(
 	defer lease.release()
 	// The invocation protocol exchange: one request/response frame over the
 	// leased container's stdin/stdout.
-	invokeCtx, invokeSpan := startRuntimeSpan(ctx, "runtime.invoke", fnName, image)
+	invokeCtx, invokeSpan := startRuntimeSpan(ctx, "runtime.invoke", fnName, spanImage)
 	defer func() { finishRuntimeSpan(invokeSpan, retErr) }()
 	return lease.invoke(invokeCtx, handler, eventJSON, env)
 }
@@ -808,8 +887,18 @@ func (cc *containerCache) acquireVersion(
 			// warm. Retiring both halves unconditionally would make the next
 			// acquire for the SAME unchanged half a transient, destroying warm
 			// pooling on every image or resource edit.
+			//
+			// The image half is retired by REFERENCE when the tag moved to a
+			// different tag (every content of the old tag is stale) and by exact
+			// CONTENT identity when the same tag was retagged to new bytes (only
+			// the old bytes are stale, so a later acquire that resolves the tag
+			// back to those bytes is served transiently, never pooled).
 			if old.image != image {
-				p.retiredImages[old.image] = true
+				if oldRef := identityRef(old.image); oldRef != identityRef(image) {
+					p.retiredImages[oldRef] = true
+				} else {
+					p.retiredImages[old.image] = true
+				}
 			}
 			if old.config != config {
 				p.retiredConfigs[old.config] = true
@@ -956,9 +1045,10 @@ func (cc *containerCache) acquireVersion(
 }
 
 // versionReason picks the discard reason for a superseded version: an image
-// change keeps the historical reason (metrics and tests depend on it), while a
-// resource-only change (same image, different config) reports
-// reasonResourcesChanged.
+// content change keeps the historical reason (metrics and tests depend on it),
+// while a resource-only change (same image identity, different config) reports
+// reasonResourcesChanged. A retag of the same reference to new content is an
+// image change (the code differs) even though the reference string is unchanged.
 func versionReason(oldImage, newImage string) string {
 	if oldImage != newImage {
 		return reasonImageChanged
@@ -967,10 +1057,11 @@ func versionReason(oldImage, newImage string) string {
 }
 
 // versionRetired reports whether the (image, config) version is currently
-// retired in this pool: either the image was invalidated/superseded or the
-// resource config was superseded. It must be called with p.mu held.
+// retired in this pool: either the image (by exact content identity or by its
+// whole reference) was invalidated/superseded, or the resource config was
+// superseded. It must be called with p.mu held.
 func (p *functionPool) versionRetired(image, config string) bool {
-	return p.retiredImages[image] || p.retiredConfigs[config]
+	return imageRetired(p.retiredImages, image) || p.retiredConfigs[config]
 }
 
 // retiredReasonLocked picks the discard reason for a stale (image, config)
@@ -978,7 +1069,7 @@ func (p *functionPool) versionRetired(image, config string) bool {
 // was superseded and it reports reasonResourcesChanged. It must be called with
 // p.mu held, after versionRetired has confirmed the version is retired.
 func (p *functionPool) retiredReasonLocked(image, config string) string {
-	if p.retiredImages[image] {
+	if imageRetired(p.retiredImages, image) {
 		return reasonImageChanged
 	}
 	if p.retiredConfigs[config] {
@@ -1060,12 +1151,12 @@ func (cc *containerCache) invalidateImage(image string) {
 // notified because discarding idle containers frees capacity.
 func (p *functionPool) invalidateImage(image string) {
 	p.mu.Lock()
-	// Remember the retirement so any start already in flight (or any later
-	// stale acquire for this image) produces a throwaway container that is
-	// discarded on release rather than pooled.
+	// Remember the retirement by REFERENCE so any start already in flight (or
+	// any later stale acquire resolving this tag to any content) produces a
+	// throwaway container that is discarded on release rather than pooled.
 	p.retiredImages[image] = true
 	var discard []*pooledContainer
-	if p.active != nil && p.active.image == image {
+	if p.active != nil && identityRef(p.active.image) == image {
 		discard = append(discard, p.active.idle...)
 		p.active.idle = nil
 		for pc := range p.active.busy {
@@ -1076,7 +1167,7 @@ func (p *functionPool) invalidateImage(image string) {
 		}
 	}
 	for _, g := range p.draining {
-		if g.image != image {
+		if identityRef(g.image) != image {
 			continue
 		}
 		discard = append(discard, g.idle...)
@@ -1185,7 +1276,9 @@ func (cc *containerCache) activateFunction(fnName, image string) {
 		// The image is fnName's own: its same-image recreation must warm.
 		// Retirements of OTHER versions of this function stay in place so a
 		// stale old-version request can never supersede the active version.
-		delete(cc.retiredImages, image)
+		// Every content identity sharing this reference is cleared too, so a
+		// reverted content address warms again.
+		clearImageRetirement(cc.retiredImages, image)
 	} else {
 		// A foreign or unparseable reference is never un-retired, so a caller
 		// cannot clear another function's (or an arbitrary) retirement.
@@ -1213,7 +1306,7 @@ func (p *functionPool) activate(image string) (detach bool) {
 		return true
 	}
 	if image != "" {
-		delete(p.retiredImages, image)
+		clearImageRetirement(p.retiredImages, image)
 	}
 	return false
 }

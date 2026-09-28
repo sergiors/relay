@@ -165,6 +165,137 @@ func (m *Manager) imageExists(ctx context.Context, ref string) bool {
 	return true
 }
 
+// resolvedImage is the immutable content identity Relay resolves for a managed
+// function image before leasing or creating an execution container. It pairs the
+// mutable reference (used for labels, spans, and image retirement, which is
+// scoped to references) with the immutable content identity (the Docker image ID
+// plus the Relay fingerprint metadata label). Warm container generations key on
+// the identity, so a tag whose content changes — the same reference resolving to
+// a new image ID — rotates its containers instead of reusing stale ones.
+//
+// It is deliberately label-agnostic: the Relay fingerprint is OPTIONAL metadata,
+// so an image without Relay labels (e.g. an external service image) simply
+// contributes no fingerprint and is still identified by its content ID.
+type resolvedImage struct {
+	// ref is the mutable image reference (e.g. "relay-fn-fn:abc"). It scopes
+	// image retirement (InvalidateImage/RemoveImage) and stays the relay.image
+	// label and the span attribute; it is NOT the generation identity.
+	ref string
+	// id is the Docker image ID (content digest) resolved by inspecting ref.
+	// Empty when resolution is unavailable (a Docker-less direct/test caller or
+	// a daemon hiccup); the identity then degrades to the reference.
+	id string
+	// fingerprint is the Relay fingerprint metadata (relay.fingerprint) carried
+	// by a managed function image, or the prepared content fingerprint when the
+	// label is absent. It is never required.
+	fingerprint string
+}
+
+// identity returns the immutable generation-key half of the image identity. Two
+// resolutions with the same reference but different content (a moved/retagged
+// image) produce different identities, which is what makes a generation rotate;
+// two resolutions of identical content produce the same identity, which is what
+// lets a warm container be reused.
+func (r resolvedImage) identity() string {
+	return imageIdentityKey(r.ref, r.id, r.fingerprint)
+}
+
+// createImage returns the reference to hand to Docker's container create. When
+// the content ID is known it is used directly, so the container is created from
+// exactly the bytes that were resolved and the inspect-then-create TOCTOU window
+// is closed; otherwise the mutable reference is used.
+func (r resolvedImage) createImage() string {
+	if r.id != "" {
+		return r.id
+	}
+	return r.ref
+}
+
+// imageIdentityKey builds the immutable content-identity key for a resolved
+// managed image. It embeds the reference first so identity retirement and
+// re-activation stay scoped to a function's own tag, then the Docker image ID
+// and the Relay fingerprint when known. A fallback to the reference keeps a
+// Docker-less caller (direct tests) and a transient inspect failure pooling under
+// the historical reference identity rather than rotating spuriously. An empty
+// reference (a no-runtime function) yields an empty identity, matching the
+// historical "no image" key.
+func imageIdentityKey(ref, id, fingerprint string) string {
+	if ref == "" {
+		return ""
+	}
+	switch {
+	case id != "":
+		return ref + "\x00" + id + "\x00" + fingerprint
+	case fingerprint != "":
+		return ref + "\x00" + fingerprint
+	default:
+		return ref
+	}
+}
+
+// imageInspectContent inspects ref and returns its immutable content ID and the
+// Relay fingerprint metadata label when present. present is false (with a nil
+// error) when no local image carries the reference; a non-not-found inspect
+// failure is returned so the caller never decides on unknown daemon state. Relay
+// labels are OPTIONAL: an image without them still yields its content ID, so an
+// external service image is never required to carry Relay metadata.
+func (m *Manager) imageInspectContent(ctx context.Context, ref string) (id, fingerprint string, present bool, err error) {
+	insp, err := m.cli.ImageInspect(ctx, ref)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	id = insp.ID
+	if insp.Config != nil {
+		fingerprint = insp.Config.Labels[labelFingerprint]
+	}
+	return id, fingerprint, true, nil
+}
+
+// resolveImageIdentity resolves ref to its immutable content identity. It uses
+// the injected seam when set (tests), the real Docker inspect otherwise, and
+// degrades to the reference-only identity when the image cannot be resolved (a
+// Docker-less direct/test caller, or a daemon hiccup) so an invocation is never
+// failed merely because identity resolution was unavailable. The function's
+// prepared fingerprint is the fallback metadata when the image carries no
+// relay.fingerprint label.
+func (m *Manager) resolveImageIdentity(ctx context.Context, ref, fingerprint string) resolvedImage {
+	img := resolvedImage{ref: ref, fingerprint: fingerprint}
+	if ref == "" {
+		return img
+	}
+	if m.resolveImageIdentityFn != nil {
+		resolved, err := m.resolveImageIdentityFn(ctx, ref, fingerprint)
+		if err != nil {
+			return img
+		}
+		resolved.ref = ref
+		if resolved.fingerprint == "" {
+			resolved.fingerprint = fingerprint
+		}
+		return resolved
+	}
+	if m.cli == nil {
+		return img
+	}
+	id, labelFingerprint, present, err := m.imageInspectContent(ctx, ref)
+	if err != nil {
+		m.Logger().Debug("Runtime: image identity inspect failed; using reference identity",
+			"image", ref, "error", err)
+		return img
+	}
+	if !present {
+		return img
+	}
+	img.id = id
+	if labelFingerprint != "" {
+		img.fingerprint = labelFingerprint
+	}
+	return img
+}
+
 // ErrImageInUse is returned (wrapped) by RemoveImage when the image is still
 // referenced by a Relay-owned container. It marks a normal transitional state —
 // a service container on the old image that the reconcile has not yet replaced —

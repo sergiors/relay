@@ -21,11 +21,13 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 	var mu sync.Mutex
 	var started []*fakeContainer
 	var seenLimits []function.ResourceLimits
-	m.startContainerFn = func(_ context.Context, _, _ string, _ []string, limits function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	var seenImages []string
+	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, limits function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		c := &fakeContainer{}
 		mu.Lock()
 		started = append(started, c)
 		seenLimits = append(seenLimits, limits)
+		seenImages = append(seenImages, img.createImage())
 		mu.Unlock()
 		return c, nil
 	}

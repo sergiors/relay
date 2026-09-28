@@ -520,11 +520,16 @@ A container is returned to the idle pool only while it remains healthy.
 Timeouts, process exits, protocol errors, image changes, and shutdown invalidate
 the container and it is discarded instead of reused.
 
-A container's **version** is its image. On an image change, the old version
-enters a draining state. Idle old-version containers are discarded immediately,
-while busy containers are allowed to finish their current invocation and are
-discarded when released. No new invocation is leased to a draining version, and
-all new invocations use the current version.
+A container's **version** is its **image content**, resolved before the container
+is leased or created: the same tag whose content changed (a moved reference that
+now resolves to a different Docker image ID) is a *new* version, while the same
+content reuses its warm containers. On a version change, the old version enters a
+draining state. Idle old-version containers are discarded immediately, while busy
+containers are allowed to finish their current invocation and are discarded when
+released. No new invocation is leased to a draining version, and all new
+invocations use the current version. A stale request whose tag resolves back to a
+retired version's content is served on a throwaway container that is never
+pooled, so it can never reacquire the retired generation.
 
 Idle containers are not kept forever. A healthy container is evicted once it
 has remained idle longer than `WARM_CONTAINER_IDLE_TIMEOUT`; eviction never

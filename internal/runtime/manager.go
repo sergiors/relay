@@ -191,8 +191,15 @@ type Manager struct {
 	// production (startContainer is used) and set only by in-package tests so the
 	// Execute path's resource resolution and generation identity can be exercised
 	// without a Docker daemon. It receives exactly the arguments Execute would
-	// pass to startContainer.
-	startContainerFn func(ctx context.Context, fnName, image string, env []string, limits function.ResourceLimits, meta RunMeta) (reusableContainer, error)
+	// pass to startContainer, including the resolved image identity so a test can
+	// assert the container is created from the exact content that was leased.
+	startContainerFn func(ctx context.Context, fnName string, img resolvedImage, env []string, limits function.ResourceLimits, meta RunMeta) (reusableContainer, error)
+	// resolveImageIdentityFn resolves a managed image reference to its immutable
+	// content identity. It is nil in production (resolveImageIdentity inspects
+	// the daemon) and set only by in-package tests so the Execute path's
+	// generation keying on image content can be exercised without a Docker
+	// daemon. A returned zero value falls back to the reference identity.
+	resolveImageIdentityFn func(ctx context.Context, ref, fingerprint string) (resolvedImage, error)
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -540,23 +547,26 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 
 // startContainer builds one fresh execution container for a function version.
 // It is the containerCache factory, called with the creating invocation's
-// parameters: env is the function's plan env (per-function, applied at
-// container create), limits is the function's effective per-container resource
-// configuration, and meta is the creation-time identity RunMeta stamped as
-// labels (per-invocation fields left empty — labels are immutable while the
-// container outlives invocations). Every container joins the worker-global
-// network set (WithNetworks).
+// parameters: img is the resolved immutable image identity (its createImage is
+// handed to Docker so the container is created from exactly the resolved bytes),
+// env is the function's plan env (per-function, applied at container create),
+// limits is the function's effective per-container resource configuration, and
+// meta is the creation-time identity RunMeta stamped as labels (per-invocation
+// fields left empty — labels are immutable while the container outlives
+// invocations). Every container joins the worker-global network set
+// (WithNetworks).
 func (m *Manager) startContainer(
 	ctx context.Context,
-	fnName, image string,
+	fnName string,
+	img resolvedImage,
 	env []string,
 	limits function.ResourceLimits,
 	meta RunMeta,
 ) (reusableContainer, error) {
 	if m.startContainerFn != nil {
-		return m.startContainerFn(ctx, fnName, image, env, limits, meta)
+		return m.startContainerFn(ctx, fnName, img, env, limits, meta)
 	}
-	return startExecutionContainer(ctx, m.cli, m.log, fnName, image, env, m.networks, limits, meta)
+	return startExecutionContainer(ctx, m.cli, m.log, fnName, img.createImage(), env, m.networks, limits, meta)
 }
 
 // Prepared is a function whose image has been built.
@@ -1278,12 +1288,24 @@ func (m *Manager) Execute(
 	// hot change rotates containers without a rebuild.
 	limits := m.containers.functionResources(prepared.Name)
 	config := limits.Fingerprint()
+	// Resolve the managed image's IMMUTABLE content identity ONCE for this
+	// execution, after the image lease above and BEFORE the pool lease and the
+	// container create. The lease pins the reference for the whole inspection, so
+	// a concurrent retirement/removal cannot delete the image between the
+	// resolution and the create; the generation key uses this identity (reference
+	// + content ID + fingerprint metadata), so the same tag resolving to new
+	// bytes rotates its warm generation; and the create uses the resolved content
+	// ID so the container runs exactly the bytes that were resolved, closing the
+	// inspect-then-create TOCTOU window. The mutable reference stays
+	// prepared.Image for labels, spans, and image retirement. Resolution failure
+	// degrades to the reference identity, never failing the invocation.
+	img := m.resolveImageIdentity(ctx, prepared.Image, prepared.Fingerprint)
 	start := func() (reusableContainer, error) {
 		// Every execution container joins the worker-global network set
 		// (WithNetworks), which the worker has already verified exists at
 		// startup. A network that disappears between verification and create
 		// surfaces as a create error here; Relay never creates networks.
-		return m.startContainer(ctx, prepared.Name, prepared.Image, prepared.Env, limits, idMeta)
+		return m.startContainer(ctx, prepared.Name, img, prepared.Env, limits, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound
 	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
@@ -1294,7 +1316,7 @@ func (m *Manager) Execute(
 	// a stricter limiter than the runner's per-function semaphore.
 	max := m.clipConcurrency(prepared.Concurrency)
 	return m.containers.executeVersion(
-		ctx, prepared.Name, prepared.Image, config, max, start, handler, eventJSON, envMap(extraEnv),
+		ctx, prepared.Name, img.identity(), config, max, start, handler, eventJSON, envMap(extraEnv),
 	)
 }
 

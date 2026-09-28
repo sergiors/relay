@@ -50,8 +50,11 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 			},
 			fail: func(*http.Request) error { return createErr },
 		},
-		// RemoveImage's container-reference guard lists no containers.
+		// RemoveImage's container-reference guard lists no containers, and the
+		// pre-create identity resolution inspects the image (absent here, so it
+		// degrades to the reference identity and the create proceeds).
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
+		dockerRoute{method: http.MethodGet, path: "/images/relay-fn-a:v1/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 

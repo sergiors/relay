@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -79,10 +78,14 @@ func (m *Manager) ResolveServiceImage(
 // restart (the map is in-memory only) — is checked immediately. A pull failure
 // is always surfaced so the caller preserves whatever containers it already has;
 // a missing local image with no successful pull cannot start a replica at all.
+//
+// It reuses the shared imageInspectContent helper, so the external path never
+// requires Relay labels: an image whose inspect response carries none still
+// yields its local content ID (relay.image_id), which is what the reconciler uses
+// to detect a moved tag.
 func (m *Manager) resolveExternalServiceImage(ctx context.Context, fnName, identity string) (ServiceImage, error) {
-	insp, err := m.cli.ImageInspect(ctx, identity)
-	present := err == nil
-	if err != nil && !errors.Is(err, cerrdefs.ErrNotFound) {
+	id, _, present, err := m.imageInspectContent(ctx, identity)
+	if err != nil {
 		// Any non-not-found inspect failure is inconclusive: surface it rather
 		// than guessing, so a broken daemon never leads to a spurious pull or a
 		// container decision on unknown state.
@@ -100,11 +103,15 @@ func (m *Manager) resolveExternalServiceImage(ctx context.Context, fnName, ident
 		m.recordPullCheck(fnName, identity, m.clock())
 		// Re-inspect after a successful pull: a moved tag may now point at
 		// different bytes, and the container must be replaced when it does.
-		if insp, err = m.cli.ImageInspect(ctx, identity); err != nil {
+		id, _, present, err = m.imageInspectContent(ctx, identity)
+		if err != nil {
 			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", identity, err)
 		}
+		if !present {
+			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", identity, cerrdefs.ErrNotFound)
+		}
 	}
-	return ServiceImage{Ref: identity, ID: insp.ID}, nil
+	return ServiceImage{Ref: identity, ID: id}, nil
 }
 
 // pullDue reports whether a remote pull check is due for fnName's service image
