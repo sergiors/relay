@@ -75,6 +75,12 @@ const managerPingTimeout = 10 * time.Second
 // unit-testable without a Docker daemon.
 type pingFunc func(ctx context.Context, cli *client.Client) error
 
+// closeClientFunc closes the manager's Docker client. It is the shutdown seam
+// (analogous to pingFunc): production leaves it nil and CloseContext calls
+// cli.Close, while a test can inject a wrapper that records the close instant so
+// it can prove no Docker operation runs after the client closes.
+type closeClientFunc func(cli *client.Client) error
+
 // pingDocker is the production pingFunc: one version-negotiated daemon ping.
 func pingDocker(ctx context.Context, cli *client.Client) error {
 	_, err := cli.Ping(ctx, client.PingOptions{})
@@ -124,6 +130,13 @@ type Manager struct {
 	networks []string
 	// containers caches the per-function reusable execution containers.
 	containers *containerCache
+	// leases is the single ownership authority for Relay-owned images: it
+	// admits references (builds, executions, services, registry publication)
+	// and gates removal, so no new use can slip between a reference check and
+	// ImageRemove. It is created by NewManager; a Manager constructed directly
+	// by tests lazily initializes it on first use (leaseInit).
+	leases    *imageCoordinator
+	leaseInit sync.Once
 	// lifecycle is the manager's lifecycle context: Dockerfile builds are
 	// rooted here (see buildContext), so a long build is bounded by buildTimeout
 	// but still cancelled when Relay shuts down, without ever inheriting a
@@ -157,6 +170,11 @@ type Manager struct {
 	// closeErr stores the client-close result so repeated Close calls are
 	// idempotent.
 	closeErr error
+	// closeClient closes the Docker client. It is nil in production (CloseContext
+	// calls cli.Close directly) and set only by tests, which wrap it to record
+	// the close instant so they can prove no Docker operation runs after close.
+	// It is read once and never mutated after construction.
+	closeClient closeClientFunc
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -319,6 +337,7 @@ func NewManager(
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
 	mgr.containers.metrics = registry
+	mgr.leases = newImageCoordinator()
 	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
 	return mgr, nil
 }
@@ -332,6 +351,15 @@ func (m *Manager) clock() time.Time {
 		return time.Now()
 	}
 	return m.now()
+}
+
+// Logger returns the manager's structured logger, defaulting to slog.Default
+// when a Manager was constructed directly (tests) without one.
+func (m *Manager) Logger() *slog.Logger {
+	if m == nil || m.log == nil {
+		return slog.Default()
+	}
+	return m.log
 }
 
 // resolveManagerOptions applies the options in order and normalizes a
@@ -426,11 +454,21 @@ func (m *Manager) Close() error {
 //     its teardowns on this lifecycle, an eviction pass already in flight is
 //     cancelled too, so the join below returns promptly;
 //  2. joins the maintenance loop, so no eviction races the teardown;
-//  3. tears down every cached execution container through a bounded parallel
+//  3. closes the image-removal gate (beginShutdown): after this point no NEW
+//     manager-owned removal may begin (a runner async cleanup that fires after
+//     lifecycle cancellation is refused with ErrManagerShuttingDown), and every
+//     in-flight removal's derived context is cancelled;
+//  4. joins every in-progress manager-owned removal (waitRetirements) — the
+//     join is prompt because step 3 cancelled their contexts — so no removal can
+//     still issue a Docker request after this point;
+//  5. tears down every cached execution container through a bounded parallel
 //     worker pool (containerShutdownConcurrency), each teardown context-aware,
 //     so a large warm pool is not discarded with O(N) serial Docker delays and
 //     an expired ctx stops waiting;
-//  4. closes the Docker Engine client only after the teardown returns.
+//  6. drops any outstanding image leases (reset); it no longer wakes removal
+//     waiters (they were already joined, and waking them would let a remover
+//     race the close);
+//  7. closes the Docker Engine client only after every step above returns.
 //
 // Idempotent: a second call returns the stored client-close result without
 // re-running the teardown, exactly like Close. Safe to call more than once
@@ -451,15 +489,33 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 				<-m.maintDone
 			}
 		}
+		// Make retirement/removal lifecycle-owned: close the removal gate BEFORE
+		// joining, so no new manager-owned removal can begin once shutdown has
+		// started and every in-flight one is cancelled. Then join them, so the
+		// Docker client is only closed once no removal is still using it.
+		// leaseCoord() (not a raw field read) is used so a coordinator lazily
+		// created by a concurrent removal is the exact one gated and joined.
+		coord := m.leaseCoord()
+		coord.beginShutdown()
+		coord.waitRetirements(ctx)
 		if m.containers != nil {
 			m.containers.closeContext(ctx)
 		}
+		// Drop any outstanding image leases: the manager is shutting down, so
+		// every admitted reference ends here. This is defense against a caller
+		// that never released a Prepared handle it did not publish. It does not
+		// wake retirement waiters; those operations were already joined above.
+		coord.reset()
 		if m.cli == nil {
 			// A Manager constructed directly by a test (no Docker) still owns a
 			// cache and maintenance loop, so Close must be safe without a client.
 			return
 		}
-		m.closeErr = m.cli.Close()
+		if m.closeClient != nil {
+			m.closeErr = m.closeClient(m.cli)
+		} else {
+			m.closeErr = m.cli.Close()
+		}
 	})
 	return m.closeErr
 }
@@ -507,6 +563,47 @@ type Prepared struct {
 	// to dependency garbage collection. It is populated on BOTH the build and
 	// reuse paths.
 	Dependency string
+	// lease is the admitted reference to the function image (or dependency
+	// image for a dependency-only handle) that Prepare acquired. It is the
+	// ownership authority for the image: the caller must transfer it to the
+	// registry publication (runner.NewPrepared → Registry) or release it. It is
+	// nil for a no-runtime function and for hand-built Prepared values.
+	lease *ImageLease
+}
+
+// Lease returns the admitted image lease Prepare acquired for this handle, or
+// nil for a no-runtime function and hand-built handles. Ownership transfers to
+// whoever publishes the handle (the runner registry); an unpublished handle
+// must be released by calling ReleaseLease.
+func (p *Prepared) Lease() *ImageLease {
+	if p == nil {
+		return nil
+	}
+	return p.lease
+}
+
+// ReleaseLease drops the handle's owned image lease, if any. It is idempotent
+// and nil-safe, so a caller that discards a Prepared without publishing it
+// (or publishes it and later supersedes it) never strands the image.
+func (p *Prepared) ReleaseLease() {
+	if p == nil || p.lease == nil {
+		return
+	}
+	p.lease.Release()
+}
+
+// TakeLease transfers ownership of the handle's image lease to the caller and
+// clears the handle's own reference, so the handle can no longer release it.
+// It is the seam runner.NewPrepared uses to move the build's admitted reference
+// into the registry publication without a double release. It returns nil for a
+// no-runtime function or an already-transferred handle.
+func (p *Prepared) TakeLease() *ImageLease {
+	if p == nil || p.lease == nil {
+		return nil
+	}
+	lease := p.lease
+	p.lease = nil
+	return lease
 }
 
 // Prepare builds exactly ONE image for the function's current content (never per
@@ -654,14 +751,64 @@ func (m *Manager) prepare(
 		Env:         planResult.Env,
 		Concurrency: m.effectiveConcurrency(fn),
 	}
+
+	// Admit the function image reference BEFORE any probe or build. Holding this
+	// lease from here until the handle is published (or discarded) closes the
+	// TOCTOU window where an image could be committed to removal between the
+	// existence probe and its use. A retirement in progress rejects the new
+	// lease with ErrImageRetiring, which the caller retries.
+	funcLease, err := m.AcquireImageLease(image)
+	if err != nil {
+		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+	}
+	// The function lease is transferred to the returned Prepared on success;
+	// until then every failure path releases it so a failed Prepare never pins
+	// the image.
+	leaseTransferred := false
+	defer func() {
+		if !leaseTransferred {
+			funcLease.Release()
+		}
+	}()
+	prepared.lease = funcLease
+
+	// The dependency manifest snapshot is captured ONCE when the function
+	// declares deps, so the dependency fingerprint (and thus the tag) and the
+	// bytes staged into the dependency image come from the same read. It is also
+	// used on the reuse path merely to name the dependency without touching the
+	// daemon.
+	var depSnap dependencySnapshot
+	var depLease *ImageLease
+	releaseDep := func() {
+		if depLease != nil {
+			depLease.Release()
+			depLease = nil
+		}
+	}
+	// The dependency lease is held from its admission below through the ACTUAL
+	// dependency build (ensureDependencyImage, when the layer is absent) and the
+	// function image build that consumes the layer via FROM, so dependency GC
+	// cannot remove the layer between its existence probe and its consumption.
+	// The lease therefore spans the whole dependency use in Prepare, not merely
+	// the probe. See TestPrepareDependencyLeaseSpansBuildVsGC.
+	defer releaseDep()
 	if !planResult.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
-		// name the function image's dependency without touching the daemon.
-		depFP, err := DependencyFingerprint(arch, platform, spec, fn.Dir, planResult.Deps)
+		// name the function image's dependency without touching the daemon; the
+		// snapshot is the single read shared with the build path.
+		depSnap, err = snapshotDependency(fn.Dir, planResult.Deps)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
-		prepared.Dependency = depImageRef(depFP)
+		prepared.Dependency = depImageRef(dependencyFingerprintFrom(arch, platform, spec, planResult.Deps, depSnap))
+		// Admit the dependency layer BEFORE its own reuse/existence probe, the
+		// dependency image build, and the function image build below, so
+		// dependency GC's retirement gate cannot remove the layer between the
+		// probe and the FROM consumption.
+		depLease, err = m.AcquireImageLease(prepared.Dependency)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: dependency %s: %w", fn.Name, prepared.Dependency, err)
+		}
 	}
 
 	// Reuse an existing local image when present. The fingerprinted reference is
@@ -682,6 +829,7 @@ func (m *Manager) prepare(
 		// bound must follow a successful Prepare even when the image was reused
 		// (a concurrency-only change rebuilds the same fingerprinted image).
 		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		leaseTransferred = true
 		return prepared, nil
 	}
 
@@ -693,7 +841,7 @@ func (m *Manager) prepare(
 	// existing layer with no rebuild (even when the function's source changed).
 	depRef := prepared.Dependency
 	if !planResult.Deps.IsZero() {
-		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depRef)
+		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depSnap, depRef)
 		if err != nil {
 			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
 		}
@@ -763,14 +911,9 @@ func (m *Manager) prepare(
 	// concurrency takes effect without a worker restart).
 	m.containers.activateFunction(fn.Name, image)
 	m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
-	return &Prepared{
-		Name:        fn.Name,
-		Image:       image,
-		Fingerprint: fp,
-		Env:         planResult.Env,
-		Concurrency: prepared.Concurrency,
-		Dependency:  prepared.Dependency,
-	}, nil
+	leaseTransferred = true
+	prepared.Dependency = depRef
+	return prepared, nil
 }
 
 // templateHandlers returns the function's handler MODULE parts (the portion of
@@ -871,17 +1014,15 @@ func (m *Manager) ensureDependencyImage(
 	fn function.Function,
 	spec plan.Spec,
 	deps plan.Deps,
+	snap dependencySnapshot,
 	depRef string,
 ) (string, error) {
-	// Derive the dependency fingerprint so the built image is stamped with the
-	// exact content address it encodes (see dependencyImageLabels). The
-	// fingerprint has already been computed by Prepare's split above, but
-	// recomputing here keeps this method self-contained and cheap (the same
-	// manifest reads); the reference passed in is what identifies the image.
-	fp, err := DependencyFingerprint(arch, platform, spec, fn.Dir, deps)
-	if err != nil {
-		return "", fmt.Errorf("dependency fingerprint: %w", err)
-	}
+	// Derive the dependency fingerprint from the SAME snapshot the build stages,
+	// so the built image is stamped with the exact content address it encodes
+	// (see dependencyImageLabels). The caller already captured the snapshot and
+	// computed the reference; recomputing from it here keeps this method
+	// self-contained without a second, potentially divergent, manifest read.
+	fp := dependencyFingerprintFrom(arch, platform, spec, deps, snap)
 	if depRef == "" {
 		depRef = depImageRef(fp)
 	}
@@ -903,7 +1044,7 @@ func (m *Manager) ensureDependencyImage(
 	// The dependency layer is a real build, so it is spanned like the function
 	// image build. The span nests under the preparing function's span.
 	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
-	if err := buildDependencyImage(buildCtx, m.cli, spec, fn.Dir, deps, depRef, fp); err != nil {
+	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, fp); err != nil {
 		depBuildSpan.RecordError(err)
 		depBuildSpan.SetStatus(codes.Error, err.Error())
 		depBuildSpan.End()
@@ -996,6 +1137,23 @@ func (m *Manager) Execute(
 	}
 	if meta.Function == "" {
 		meta.Function = prepared.Name
+	}
+
+	// Pin the image for the whole execution. An execution admitted before the
+	// image's retirement carries that admitted lease on ctx (the runner passes a
+	// registry snapshot's publication lease), so it holds admitted authority
+	// even while retirement drains. A direct caller that carries no lease
+	// acquires its own independent one, which a retirement in progress rejects
+	// with a retryable ErrImageRetiring rather than letting the execution race
+	// ImageRemove. A nil lease (no-runtime image, fake executor) is transparent.
+	if ImageLeaseFrom(ctx) == nil {
+		owned, err := m.AcquireImageLease(prepared.Image)
+		if err != nil {
+			return fmt.Errorf("execute %s: %w", prepared.Name, err)
+		}
+		if owned != nil {
+			defer owned.Release()
+		}
 	}
 
 	// Creation-time identity meta: per-invocation fields (Handler, MessageID,

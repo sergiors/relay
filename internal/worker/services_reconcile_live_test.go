@@ -227,7 +227,7 @@ func TestEnqueueLiveServicesBoundsEachOperationToReconcileTimeout(t *testing.T) 
 	reg := &runner.Registry{}
 	reg.Set(nil)
 
-	enqueueLiveServices(coordinator, reg, "fn", applyServiceTemplate(), "img")
+	enqueueLiveServices(coordinator, nil, reg, "fn", applyServiceTemplate(), "img")
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestEnqueueLiveServicesRootedInLifecycle(t *testing.T) {
 
 	reg := &runner.Registry{}
 	reg.Set(nil)
-	enqueueLiveServices(coordinator, reg, "fn", applyServiceTemplate(), "img")
+	enqueueLiveServices(coordinator, nil, reg, "fn", applyServiceTemplate(), "img")
 
 	fake.waitEntered(t, "list")
 	start := time.Now()
@@ -298,7 +298,7 @@ func TestEnqueueLiveServicesUsesRegistryPreparedEnv(t *testing.T) {
 		nil,
 	)})
 
-	enqueueLiveServices(coordinator, reg, "fn", applyServiceTemplate(), "img")
+	enqueueLiveServices(coordinator, nil, reg, "fn", applyServiceTemplate(), "img")
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestEnqueueLiveServicesUsesRegistryPreparedEnv(t *testing.T) {
 	fake2 := newCtxRecordDocker()
 	svcCtrl2 := reconciler.NewServiceReconciler(fake2, nil, routing.TraefikConfig{}, discardLogger(), reconcileTimeout)
 	coordinator2, stop2 := startCoordinatorFixture(t, svcCtrl2)
-	enqueueLiveServices(coordinator2, reg, "missing", applyServiceTemplate(), "img")
+	enqueueLiveServices(coordinator2, nil, reg, "missing", applyServiceTemplate(), "img")
 	if err := coordinator2.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
 	}

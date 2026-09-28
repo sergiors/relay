@@ -48,7 +48,7 @@ import (
 // for the next natural pass — never force-removed. A genuine listing error is
 // propagated (do not assume orphaned).
 func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
-	list, err := m.cli.ImageList(ctx, client.ImageListOptions{})
+	list, err := m.listImagesForRemoval(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("cleanup unused dependencies: list images: %w", err)
 	}
@@ -70,6 +70,14 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 			continue
 		}
 		if err := m.removeUnreferencedDependencyImage(ctx, dep); err != nil {
+			// An admitted lease (an active Prepare consuming this layer via FROM)
+			// or an in-progress manager shutdown is the normal transitional
+			// state, not a failure: skip at debug and retry at the next natural
+			// lifecycle point.
+			if errors.Is(err, ErrImageRetiring) || errors.Is(err, ErrManagerShuttingDown) {
+				m.log.Debug("Dependency image still in use; keeping", "dep_image", dep)
+				continue
+			}
 			// The daemon refused (a function image — labeled or legacy — still
 			// inherits this dependency's layers, or another worker is mid-build
 			// FROM it). Treat it as still referenced and keep it; the next
@@ -91,22 +99,65 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 }
 
 // removeUnreferencedDependencyImage is the FORCE-FREE removal of one already
-// decision-unreferenced dependency image. It deliberately does NOT go through
-// Manager.RemoveImage: that path guards against containers via
-// ImageReferencedByManagedContainer, which is irrelevant for a dependency image
-// (no container ever references a dependency image) and would add a container
-// listing round trip per removal. The label-based ownership decision above is
-// the guard; the daemon refuses a force-free removal of an image that is still
-// a parent of any other image. An already-gone image is a success
-// (ErrNotFound→nil), matching RemoveImage.
+// decision-unreferenced dependency image. It commits the image to retirement
+// through the SAME lease coordinator that gates function images and, when every
+// admitted lease has drained, performs the ImageRemove.
+//
+// An active Prepare holds a dependency lease through its FROM consumption, so
+// this call must not remove the layer between the probe and the build. It
+// therefore does NOT block waiting for that build: if any admitted lease is
+// still held it clears the gate and returns a wrapped ErrImageRetiring so the
+// caller keeps the layer and retries at the next natural lifecycle point. This
+// keeps the GC pass bounded (it runs inside a fixed reconcile budget) while
+// still making the TOCTOU window unremovable.
+//
+// It deliberately does NOT go through Manager.RemoveImage: that path guards
+// against containers via ImageReferencedByManagedContainer, which is irrelevant
+// for a dependency image (no container ever references a dependency image) and
+// would add a container listing round trip per removal. The label-based
+// ownership decision above is the guard; the lease gate is the TOCTOU guard;
+// the daemon refuses a force-free removal of an image that is still a parent of
+// any other image. An already-gone image is a success (ErrNotFound→nil),
+// matching RemoveImage. A concurrent retirement of the same dependency reports
+// a wrapped ErrImageRetiring so the caller keeps it and retries later.
 func (m *Manager) removeUnreferencedDependencyImage(ctx context.Context, dep string) error {
-	_, err := m.cli.ImageRemove(ctx, dep, client.ImageRemoveOptions{})
-	if errors.Is(err, cerrdefs.ErrNotFound) {
-		return nil
-	}
+	rmCtx, stop := m.removalContext(ctx)
+	defer stop()
+	coord := m.leaseCoord()
+	drained, owner, err := coord.beginRemoval(dep)
 	if err != nil {
 		return fmt.Errorf("remove dependency image %s: %w", dep, err)
 	}
+	if !owner {
+		return fmt.Errorf("remove dependency image %s: %w", dep, ErrImageRetiring)
+	}
+	concluded := false
+	defer func() {
+		if !concluded {
+			coord.finishRemoval(dep, false)
+		}
+	}()
+	select {
+	case <-drained:
+	default:
+		// An admitted lease still holds the layer (an active Prepare consuming it
+		// via FROM). Clear the gate so the layer stays usable and retry later.
+		// The removal is non-blocking by design: the dependency GC pass runs
+		// inside a fixed reconcile budget.
+		return fmt.Errorf("remove dependency image %s: %w", dep, ErrImageRetiring)
+	}
+	// The drain and shutdown may race: re-check the removal context so a
+	// dependency removal that won the drain still aborts rather than racing a
+	// closing client.
+	if rmCtx.Err() != nil {
+		return fmt.Errorf("remove dependency image %s: %w", dep, ErrManagerShuttingDown)
+	}
+	_, err = m.cli.ImageRemove(rmCtx, dep, client.ImageRemoveOptions{})
+	if err != nil && !errors.Is(err, cerrdefs.ErrNotFound) {
+		return fmt.Errorf("remove dependency image %s: %w", dep, coord.shutdownErr(ctx, err))
+	}
+	coord.finishRemoval(dep, true)
+	concluded = true
 	return nil
 }
 

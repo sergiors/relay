@@ -125,6 +125,11 @@ CMD []
 		t.Fatalf("new manager: %v", err)
 	}
 	defer m1.Close()
+	// p1 is a direct (unpublished) Prepare handle from a DIFFERENT manager that
+	// owns an admitted lease on ref1. Release it so the removal below is not
+	// held by a stale reference (in production the registry publication owns the
+	// lease and releases it on supersede).
+	p1.ReleaseLease()
 	if err := m1.RemoveImage(ctx, ref1); err != nil {
 		t.Fatalf("remove image %s: %v", ref1, err)
 	}

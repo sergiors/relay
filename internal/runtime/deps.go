@@ -14,6 +14,49 @@ import (
 	"relay/internal/runtime/plan"
 )
 
+// dependencySnapshot is an immutable, in-memory snapshot of a dependency
+// layer's manifest inputs: every declared manifest file's relative name and its
+// exact bytes, read exactly once. It is the single source for BOTH the
+// dependency fingerprint and the staged dependency build context, so the
+// resulting hash/tag always corresponds to the bytes actually baked into the
+// dependency image even if a manifest is edited concurrently.
+type dependencySnapshot struct {
+	files []dependencyManifest
+}
+
+// dependencyManifest is one staged manifest: its relative name (as declared by
+// the engine) and its content bytes.
+type dependencyManifest struct {
+	name    string
+	content []byte
+}
+
+// snapshotDependency reads the manifest files declared by deps from fnDir into
+// an immutable snapshot sorted by name, so the serialization is canonical and a
+// later edit to the on-disk manifest cannot make the fingerprint and the staged
+// bytes disagree. A missing/unreadable manifest is an error: the engine only
+// declares Deps when the manifests exist, so an absent one means a race /
+// mid-reconcile state and must not be silently hashed as empty (that would
+// poison the shared layer cache).
+func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error) {
+	if len(deps.Files) == 0 {
+		return dependencySnapshot{}, fmt.Errorf("fingerprint deps: no manifest files")
+	}
+
+	files := append([]string(nil), deps.Files...)
+	sort.Strings(files)
+	snap := dependencySnapshot{files: make([]dependencyManifest, 0, len(files))}
+	for _, name := range files {
+		content, err := os.ReadFile(filepath.Join(fnDir, filepath.FromSlash(name)))
+		if err != nil {
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: read manifest %q: %w", name, err)
+		}
+
+		snap.files = append(snap.files, dependencyManifest{name: name, content: content})
+	}
+	return snap, nil
+}
+
 // DependencyFingerprint computes the content address for a dependency layer:
 // a deterministic SHA-256 over every input that shapes the installed payload.
 // The same inputs always yield the same 64-hex digest, so a dependency image
@@ -45,16 +88,31 @@ import (
 //
 // Field boundaries are length-prefixed so two distinct concatenations (e.g.
 // "ab"+"c" vs "a"+"bc") can never collide under the flat hash.
-func DependencyFingerprint(arch, platform string, spec plan.Spec, fnDir string, deps plan.Deps) (string, error) {
-	if len(deps.Files) == 0 {
-		return "", fmt.Errorf("fingerprint deps: no manifest files")
+func DependencyFingerprint(
+	arch,
+	platform string,
+	spec plan.Spec,
+	fnDir string,
+	deps plan.Deps,
+) (string, error) {
+	snap, err := snapshotDependency(fnDir, deps)
+	if err != nil {
+		return "", err
 	}
+	return dependencyFingerprintFrom(arch, platform, spec, deps, snap), nil
+}
 
-	// Sort the file names so the serialization is canonical: the order the
-	// engine listed the manifests must not change the digest.
-	files := append([]string(nil), deps.Files...)
-	sort.Strings(files)
-
+// dependencyFingerprintFrom hashes an already-captured manifest snapshot. It is
+// the single fingerprint implementation, shared by DependencyFingerprint and
+// the Manager's prepare path, so the fingerprint and the bytes staged into the
+// dependency image come from the exact same read.
+func dependencyFingerprintFrom(
+	arch,
+	platform string,
+	spec plan.Spec,
+	deps plan.Deps,
+	snap dependencySnapshot,
+) string {
 	h := sha256.New()
 
 	// Runtime identity.
@@ -79,20 +137,14 @@ func DependencyFingerprint(arch, platform string, spec plan.Spec, fnDir string, 
 	hashField(h, deps.Dir)
 
 	// Each manifest file: its relative name then its bytes, so a rename (name
-	// change) or an edit (bytes change) both alter the digest. A missing file is
-	// an error: the engine only declares Deps when the manifests exist, so an
-	// absent manifest here means a race / mid-reconcile state and must not be
-	// silently hashed as empty (that would poison the shared layer cache).
-	for _, name := range files {
-		hashField(h, name)
-		content, err := os.ReadFile(filepath.Join(fnDir, filepath.FromSlash(name)))
-		if err != nil {
-			return "", fmt.Errorf("fingerprint deps: read manifest %q: %w", name, err)
-		}
-		hashFieldBytes(h, content)
+	// change) or an edit (bytes change) both alter the digest. The snapshot is
+	// already name-sorted by snapshotDependency.
+	for _, f := range snap.files {
+		hashField(h, f.name)
+		hashFieldBytes(h, f.content)
 	}
 
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // hashField writes a length-prefixed string field into the digest.

@@ -225,6 +225,9 @@ events:
 	if pa2.Image == pa.Image {
 		t.Fatalf("A v1 and v2 must be different images, both %s", pa2.Image)
 	}
+	// A's v1 handle is never published in this test; release its admitted image
+	// lease so the removal below is not held by a stale reference.
+	pa.ReleaseLease()
 	if err := mgr.RemoveImage(ctx, pa.Image); err != nil {
 		t.Fatalf("remove A v1 image: %v", err)
 	}
@@ -264,6 +267,9 @@ events:
 	if bOld == "" {
 		t.Fatalf("could not find B's old function image")
 	}
+	// B's v1 handle is never published in this test; release its admitted lease
+	// so the removal (and the subsequent GC of depX) is not held by it.
+	pb.ReleaseLease()
 	if err := mgr.RemoveImage(ctx, bOld); err != nil {
 		t.Fatalf("remove B v1 image: %v", err)
 	}

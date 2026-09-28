@@ -178,6 +178,14 @@ type blockingExecutor struct {
 	// succeeds before a removal and fails on the post-failure re-consult.
 	referenceCheckErrAfter int
 	referenceChecks        int
+	// removeErrIsShutdown, when true, makes RemoveImage and
+	// ImageReferencedByManagedContainer fail with runtime.ErrManagerShuttingDown,
+	// modelling a manager that has begun shutting down.
+	removeErrIsShutdown bool
+	// removeErrShutdownOnly makes ONLY RemoveImage fail with
+	// runtime.ErrManagerShuttingDown while the reference check succeeds, so a test
+	// can exercise the removal boundary's shutdown classification.
+	removeErrShutdownOnly bool
 	// gcCalls counts CleanupUnusedDependencies invocations.
 	gcCalls int
 	// gcErr makes CleanupUnusedDependencies fail.
@@ -224,6 +232,9 @@ func (f *blockingExecutor) callCount() int {
 func (f *blockingExecutor) RemoveImage(_ context.Context, image string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.removeErrIsShutdown || f.removeErrShutdownOnly {
+		return runtime.ErrManagerShuttingDown
+	}
 	if f.removeErr {
 		return errRemoveBoom
 	}
@@ -243,6 +254,9 @@ func (f *blockingExecutor) ImageReferencedByManagedContainer(_ context.Context, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.referenceChecks++
+	if f.removeErrIsShutdown {
+		return false, runtime.ErrManagerShuttingDown
+	}
 	if f.referenceCheckErr != nil && f.referenceChecks > f.referenceCheckErrAfter {
 		return false, f.referenceCheckErr
 	}

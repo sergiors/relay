@@ -408,6 +408,12 @@ events:
 		t.Fatalf("remove function containers: %v", err)
 	}
 
+	// p1/p2 are direct (unpublished) Prepare handles; in production the registry
+	// publication owns these leases and releases them on supersede. Release them
+	// here so the retirement below is governed by container references alone.
+	p1.ReleaseLease()
+	p2.ReleaseLease()
+
 	// Retire with NO containers present -> v1 (and v2, since v2 isn't referenced
 	// by any container either) gets removed. But v1 must be removed and v2 too
 	// if unreferenced. To assert "never remove an image a running service

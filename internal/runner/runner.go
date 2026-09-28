@@ -114,34 +114,140 @@ func (r *Registry) snapshot() []*PreparedFunction {
 	return append([]*PreparedFunction(nil), r.fns...)
 }
 
+// pinnedSnapshot is a snapshot of the registry whose published images are
+// individually pinned by a shared publication lease acquired WHILE the registry
+// lock protected the current entry. The pins are held until release is called,
+// so an image published at snapshot time cannot be removed out from under the
+// snapshot even if the entry is superseded immediately after. The pins are
+// SHARES of each entry's publication lease (see PreparedFunction.lease), so
+// admitting them is always allowed — even while the image is retiring — because
+// the work was admitted before retirement.
+type pinnedSnapshot struct {
+	fns  []*PreparedFunction
+	pins map[*PreparedFunction]*runtime.ImageLease
+}
+
+// pinFor returns the shared publication lease pinning pf's image for this
+// snapshot, or nil (an unavailable function, a no-runtime function, or a
+// hand-built test value).
+func (s *pinnedSnapshot) pinFor(pf *PreparedFunction) *runtime.ImageLease {
+	if s == nil {
+		return nil
+	}
+	return s.pins[pf]
+}
+
+// release drops every pin acquired for the snapshot. It is idempotent-safe per
+// lease (ImageLease.Release is idempotent) and must be called exactly once when
+// the snapshot's work is done.
+func (s *pinnedSnapshot) release() {
+	if s == nil {
+		return
+	}
+	for _, l := range s.pins {
+		l.Release()
+	}
+}
+
+// snapshotPinned takes a consistent snapshot AND shares each published entry's
+// image publication lease while the read lock still protects the entry, so no
+// concurrent Replace can release a lease between the copy and the share. The
+// caller must call the returned snapshot's release when its execution work is
+// done.
+func (r *Registry) snapshotPinned() *pinnedSnapshot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := &pinnedSnapshot{
+		fns:  append([]*PreparedFunction(nil), r.fns...),
+		pins: make(map[*PreparedFunction]*runtime.ImageLease, len(r.fns)),
+	}
+	for _, pf := range out.fns {
+		if lease := pf.sharePublication(); lease != nil {
+			out.pins[pf] = lease
+		}
+	}
+	return out
+}
+
+// getByNamePinned returns the prepared function for name PLUS a shared pin of
+// its published image, acquired while the registry lock protects the entry. The
+// caller must release the returned lease (nil-safe) when done. It is the
+// execution-path lookup (schedule/manual) so those paths hold the image pin
+// through matching, slot waits, and handler completion.
+func (r *Registry) getByNamePinned(name string) (*PreparedFunction, *runtime.ImageLease) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, pf := range r.fns {
+		if pf.fn.Name == name {
+			return pf, pf.sharePublication()
+		}
+	}
+	return nil, nil
+}
+
 // Set replaces the entire registry contents in one atomic step. Functions are
-// kept sorted by name so iteration order (and Names) is deterministic.
+// kept sorted by name so iteration order (and Names) is deterministic. The
+// publication lease of every superseded entry is released AFTER the swap, once
+// the new set is visible, so a snapshot taken before the swap still holds the
+// old entry's pin and a snapshot taken after holds the new entry's.
 func (r *Registry) Set(fns []*PreparedFunction) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	old := r.fns
 	r.fns = append([]*PreparedFunction(nil), fns...)
 	sortFn(r.fns)
+	r.mu.Unlock()
+	releaseSuperseded(old, fns)
 }
 
 // Replace swaps the entry for name, adding it if absent. A nil pf removes the
 // entry (used when a function directory disappears). The slice stays name-sorted.
+// The superseded entry's publication lease is released AFTER the swap, so any
+// snapshot that pinned it before the swap keeps the image admitted until that
+// snapshot's work drains.
 func (r *Registry) Replace(name string, pf *PreparedFunction) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var superseded *PreparedFunction
+	replaced := false
 	for i, cur := range r.fns {
 		if cur.fn.Name == name {
+			superseded = cur
 			if pf == nil {
 				r.fns = append(r.fns[:i], r.fns[i+1:]...)
 			} else {
 				r.fns[i] = pf
 			}
 			sortFn(r.fns)
-			return
+			replaced = true
+			break
 		}
 	}
-	if pf != nil {
+	if !replaced && pf != nil {
 		r.fns = append(r.fns, pf)
 		sortFn(r.fns)
+	}
+	r.mu.Unlock()
+	// A function replacement supersedes only the old entry; an add/remove
+	// supersedes only the removed entry.
+	if superseded != nil && superseded != pf {
+		superseded.ReleasePublication()
+	}
+}
+
+// releaseSuperseded releases the publication leases of the old entries that are
+// not present in the new set. An entry kept by pointer (unchanged) is not
+// released; a replaced entry is released by Replace directly.
+func releaseSuperseded(old, next []*PreparedFunction) {
+	if len(old) == 0 {
+		return
+	}
+	keep := make(map[*PreparedFunction]bool, len(next))
+	for _, pf := range next {
+		keep[pf] = true
+	}
+	for _, pf := range old {
+		if !keep[pf] {
+			pf.ReleasePublication()
+		}
 	}
 }
 
@@ -256,6 +362,15 @@ type Runner struct {
 	// after New/NewWithMetrics: tests must set it before use and never mutate it
 	// while the runner is running.
 	imageCleanupRetryDelays []time.Duration
+	// imageCleanupAttemptDone, when non-nil, is called at the end of every async
+	// image-cleanup attempt (the goroutine retryImageCleanupAttempt starts),
+	// whether the attempt removed the image or deferred it. It is the test-only
+	// synchronization seam: production leaves it nil, and tests install it to
+	// wait for an attempt's terminal classification deterministically instead of
+	// sleeping. Like imageCleanupRetryDelays it is read-only after
+	// New/NewWithMetrics: tests must set it before the retirement that starts the
+	// attempt. It runs on the cleanup goroutine and must not block.
+	imageCleanupAttemptDone func(image string)
 }
 
 // defaultImageCleanupRetryDelays is the production backoff schedule for image
@@ -317,6 +432,14 @@ type PreparedFunction struct {
 	prepared  *runtime.Prepared
 	executor  Executor
 	available bool
+	// lease is the publication lease for this function's image: the admitted
+	// reference transferred from Prepared when the function is published into
+	// the registry. It is owned by the registry entry and released when the
+	// entry is superseded or removed (after the swap), so a published image
+	// stays admitted for as long as it is published and can never be removed
+	// while the registry still serves it. Nil for unavailable functions,
+	// hand-built test values, and no-runtime functions.
+	lease *runtime.ImageLease
 }
 
 func (p *PreparedFunction) Name() string {
@@ -332,17 +455,59 @@ func (p *PreparedFunction) Prepared() *runtime.Prepared {
 	return p.prepared
 }
 
+// ReleasePublication drops this function's publication lease, if any. It is
+// idempotent and nil-safe. The registry calls it when the entry is superseded;
+// a caller that builds a PreparedFunction but never publishes it must call it
+// to avoid stranding the image.
+func (p *PreparedFunction) ReleasePublication() {
+	if p == nil || p.lease == nil {
+		return
+	}
+	p.lease.Release()
+}
+
+// sharePublication returns a SHARED lease of this entry's publication lease, so
+// a registry snapshot can pin the published image for the duration of its work
+// even if the entry is superseded concurrently. It is nil when the entry has no
+// publication lease (unavailable/no-runtime/test values).
+func (p *PreparedFunction) sharePublication() *runtime.ImageLease {
+	if p == nil || p.lease == nil {
+		return nil
+	}
+	return p.lease.Share()
+}
+
+// SharePublication is the exported form of sharePublication: it admits a
+// shared reference to this function's published image, held until the caller
+// releases it. It is used by the worker's startup service enqueue, which
+// publishes a function's initial desired service state with the function's own
+// publication lease shared so a concurrent retirement cannot remove the image
+// while the service pass converges. A nil result means no Relay-owned image
+// (unavailable/no-runtime function, or a hand-built test value).
+func (p *PreparedFunction) SharePublication() *runtime.ImageLease {
+	return p.sharePublication()
+}
+
 func NewPrepared(
 	fn function.Function,
 	prepared *runtime.Prepared,
 	executor Executor,
 ) *PreparedFunction {
-	return &PreparedFunction{
+	pf := &PreparedFunction{
 		fn:        fn,
 		prepared:  prepared,
 		executor:  executor,
 		available: true,
 	}
+	// Transfer the prepared handle's admitted image lease into the publication:
+	// ownership moves from the build to the registry entry, which releases it
+	// when the entry is superseded. This closes the Prepare→Registry gap — the
+	// image stays admitted across the swap. TakeLease clears the handle's own
+	// reference so a later Prepared.ReleaseLease cannot double-release.
+	if prepared != nil {
+		pf.lease = prepared.TakeLease()
+	}
+	return pf
 }
 
 // NewUnavailable wraps a function whose image could not be built so the runner
@@ -516,6 +681,13 @@ func (r *Runner) RemoveFunctionImages(name string) {
 	defer cancel()
 	tags, err := cleaner.FunctionImageTags(ctx, name)
 	if err != nil {
+		// Manager shutdown is a terminal deferral for this worker: the images are
+		// left for the next boot's natural cleanup pass. It is not a genuine
+		// failure, so it is a debug deferral, not a Warn.
+		if errors.Is(err, runtime.ErrManagerShuttingDown) {
+			r.log.Debug("Image cleanup: manager shutting down; deferring function image listing", "function", name)
+			return
+		}
 		r.log.Warn("Image cleanup: list function versions failed", "function", name, "error", err)
 		return
 	}
@@ -556,6 +728,12 @@ func (r *Runner) removeImageAsync(image string) {
 // image to a later natural cleanup pass.
 func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, delays []time.Duration, attempt *int) {
 	go func() {
+		// The attempt reached a terminal classification (removed, deferred, or
+		// rescheduled) when this goroutine returns. Signal it to the test-only
+		// seam so a test can assert the decision without sleeping.
+		if done := r.imageCleanupAttemptDone; done != nil {
+			defer done(image)
+		}
 		// A retirement that is superseded by a new execution must not remove an
 		// image a container is about to start; skip removal if it became in-use.
 		// The in-flight execution's release path re-owns the removal when it
@@ -567,6 +745,15 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 		defer cancel()
 		referenced, err := cleaner.ImageReferencedByManagedContainer(ctx, image)
 		if err != nil {
+			// Manager shutdown is a terminal deferral for this worker: the image
+			// is left for the next boot's natural cleanup pass, and retrying
+			// would only hammer a closing Docker client. It is NOT a genuine
+			// failure, so it is a debug deferral, not a Warn, and it never
+			// reschedules.
+			if errors.Is(err, runtime.ErrManagerShuttingDown) {
+				r.log.Debug("Image cleanup: manager shutting down; deferring to next boot", "image", image)
+				return
+			}
 			// Never remove on unknown state: treat the reference check failure as
 			// conservatively referenced and retry.
 			r.skipAndRetryImageCleanup(image, delays, "reference check failed", attempt)
@@ -578,12 +765,30 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 		}
 
 		if err := cleaner.RemoveImage(ctx, image); err != nil {
+			// Manager shutdown mid-attempt: terminal deferral, never a second
+			// removal against a closing client, never rescheduled.
+			if errors.Is(err, runtime.ErrManagerShuttingDown) {
+				r.log.Debug("Image cleanup: manager shutting down; deferring to next boot", "image", image)
+				return
+			}
 			// A removal that fails while a container references the image is a
 			// guard-skip (the daemon refused, or the reference appeared mid-call),
 			// not a genuine failure. Re-consult the reference to classify the
 			// error: referenced -> debug skip + retry; otherwise the genuine Warn.
 			if again, aerr := cleaner.ImageReferencedByManagedContainer(ctx, image); aerr == nil && again {
 				r.skipAndRetryImageCleanup(image, delays, "relay-owned container references it", attempt)
+				return
+			} else if errors.Is(aerr, runtime.ErrManagerShuttingDown) {
+				r.log.Debug("Image cleanup: manager shutting down; deferring to next boot", "image", image)
+				return
+			}
+			// A retirement still draining an admitted lease (a registry snapshot
+			// or a service pass) or a drain bound that expired is a retryable
+			// transitional state, not a failure: defer and retry rather than
+			// warning. The runtime's lease coordinator keeps the image committed
+			// to removal, so the next attempt resumes the drain.
+			if errors.Is(err, runtime.ErrImageRetiring) || errors.Is(err, context.DeadlineExceeded) {
+				r.skipAndRetryImageCleanup(image, delays, "image retirement still draining", attempt)
 				return
 			}
 			r.log.Warn("Image cleanup: remove retired failed", "image", image, "error", err)
@@ -602,6 +807,12 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 		// reconciler pump is serial with this retire hook, so this cannot race a
 		// build that FROM the dependency.
 		if _, err := cleaner.CleanupUnusedDependencies(ctx); err != nil {
+			// Manager shutdown is a terminal deferral for this worker (the next
+			// boot's startup GC prunes the layer), not a failure.
+			if errors.Is(err, runtime.ErrManagerShuttingDown) {
+				r.log.Debug("Image cleanup: manager shutting down; deferring dependency GC", "image", image)
+				return
+			}
 			r.log.Warn("Dependency image cleanup failed", "error", err)
 		}
 	}()
@@ -642,16 +853,26 @@ func toImage(pf *PreparedFunction) string {
 // executor panics; the helper is called per rule so the defer scope is
 // per-invocation rather than accumulating across a long rule loop. extraEnv are
 // the per-invocation env vars (template env values + resolved secrets).
+//
+// lease is the snapshot's admitted publication lease pinning the image; it is
+// attached to the execution context so Manager.Execute executes under that
+// admitted authority rather than acquiring a fresh (possibly rejected) lease. A
+// nil lease (fake executors, no-runtime functions, test values) leaves the
+// context unchanged and lets Execute acquire its own.
 func (r *Runner) executeWithRefs(
 	pf *PreparedFunction,
 	invokeCtx context.Context,
 	handler string,
 	eventJSON []byte,
 	extraEnv []string,
+	lease *runtime.ImageLease,
 ) error {
 	image := toImage(pf)
 	r.refs.acquire(image)
 	defer r.refs.release(image)
+	if lease != nil {
+		invokeCtx = runtime.WithSnapshotLease(invokeCtx, lease)
+	}
 	return pf.executor.Execute(invokeCtx, pf.prepared, handler, eventJSON, extraEnv)
 }
 
@@ -882,6 +1103,7 @@ func (r *Runner) runInvocation(
 	handler string,
 	eventJSON []byte,
 	extraEnv []string,
+	lease *runtime.ImageLease,
 	trace invocationTrace,
 ) (panicked bool, panicValue any, err error) {
 	// The end-to-end invocation span, shared by the event-rule, schedule, and
@@ -924,7 +1146,7 @@ func (r *Runner) runInvocation(
 			err = fmt.Errorf("executor panic: %v", pv)
 		}
 	}()
-	return false, nil, r.executeWithRefs(pf, spanCtx, handler, eventJSON, extraEnv)
+	return false, nil, r.executeWithRefs(pf, spanCtx, handler, eventJSON, extraEnv, lease)
 }
 
 // Handle evaluates the event against all loaded functions and executes every
@@ -1042,8 +1264,17 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	executed := false
 
 	// Take one consistent snapshot for the whole call so a concurrent registry
-	// swap mid-execution cannot reorder or drop functions under us.
-	snapshot := r.reg.snapshot()
+	// swap mid-execution cannot reorder or drop functions under us, and PIN each
+	// published function's image while the registry lock still protects its
+	// entry. The pins are held until Handle returns, so an image published at
+	// snapshot time cannot be removed out from under this delivery even if the
+	// entry is superseded concurrently; each matching execution carries its
+	// function's pin into Manager.Execute. The pins are shares of the published
+	// lease, so a retirement in progress never blocks an already-admitted
+	// delivery.
+	snap := r.reg.snapshotPinned()
+	defer snap.release()
+	snapshot := snap.fns
 
 	// Pre-pass: collect every matched invocation ID so an exhausted attempt can
 	// decide whether the whole message is terminal (all matched invocations
@@ -1343,7 +1574,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					Image:     toImage(pf),
 				})
 				start := time.Now()
-				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
+				panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, snap.pinFor(pf), invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
 				elapsed := time.Since(start)
 				if panicked {
 					// A panicking execution is a misbehaving handler, not a
@@ -1583,7 +1814,15 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	//     legacy plain error.
 	//   - present but unavailable: temporary (build failed at startup/reconcile),
 	//     retryable exactly as today.
-	pf := r.reg.GetByName(fnName)
+	//
+	// The lookup PINS the function's published image (a share of its publication
+	// lease, acquired under the registry lock), held until this invocation
+	// returns, so a concurrent retirement cannot remove the image between this
+	// lookup and the handler's execution.
+	pf, pin := r.reg.getByNamePinned(fnName)
+	if pin != nil {
+		defer pin.Release()
+	}
 	if pf == nil {
 		if hasState {
 			r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
@@ -1725,7 +1964,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 				}},
 			}
 		}
-		err := r.invokeOnce(ctx, pf, handler, payload, timeout, invState, invocation, handlerAttempt, msgID)
+		err := r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, handlerAttempt, msgID)
 		if err != nil {
 			// A failed attempt — resolve extra env, marshal, execution, or
 			// timeout failures all land here. recordFailure decides retry vs
@@ -1746,7 +1985,7 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 	// No invocation state (direct callers/tests): preserve the legacy behavior
 	// exactly — execute the single handler and return the plain error (or nil on
 	// success). MarkComplete/success metrics still emit inside invokeOnce.
-	return r.invokeOnce(ctx, pf, handler, payload, timeout, nil, "", 0, msgID)
+	return r.invokeOnce(ctx, pf, handler, payload, timeout, pin, nil, "", 0, msgID)
 }
 
 // InvokeFunction executes every event rule of the named function whose pattern
@@ -1795,7 +2034,10 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 	ctx = opCtx
 	defer func() { finishOperationSpan(opSpan, err) }()
 
-	pf := r.reg.GetByName(name)
+	pf, pin := r.reg.getByNamePinned(name)
+	if pin != nil {
+		defer pin.Release()
+	}
 	if pf == nil {
 		return 0, fmt.Errorf("%w: %q", ErrFunctionNotFound, name)
 	}
@@ -1877,7 +2119,7 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 			})
 
 			start := time.Now()
-			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, invocationTrace{})
+			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, pin, invocationTrace{})
 			elapsed := time.Since(start)
 			if panicked {
 				r.log.Error("Function invoke: handler PANICKED",
@@ -2024,6 +2266,7 @@ func (r *Runner) invokeOnce(
 	handler string,
 	payload []byte,
 	timeout time.Duration,
+	lease *runtime.ImageLease,
 	invState stream.InvocationState,
 	invocation string,
 	handlerAttempt int,
@@ -2064,7 +2307,7 @@ func (r *Runner) invokeOnce(
 		Image:     toImage(pf),
 	})
 	start := time.Now()
-	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv,
+	panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, handler, payload, extraEnv, lease,
 		invocationTrace{state: invState, invocation: invocation, attempt: handlerAttempt})
 	elapsed := time.Since(start)
 	if panicked {

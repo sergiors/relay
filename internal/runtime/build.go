@@ -226,6 +226,11 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 // runnable image, so run-time concerns (the runtime user, the entrypoint) stay in
 // the function image's own layer.
 //
+// snap is the immutable manifest snapshot captured by the caller (see
+// snapshotDependency): the SAME bytes whose fingerprint names the tag are the
+// bytes staged here, so the image can never be tagged for one manifest content
+// while baking another.
+//
 // Concurrency: two processes may build the same dependency image concurrently
 // (two Relay workers, or two Manager instances sharing a daemon). Both stage
 // isolated temp contexts (per-call), run the exact same manifest + base + install
@@ -235,8 +240,8 @@ func buildDependencyImage(
 	ctx context.Context,
 	cli *client.Client,
 	spec plan.Spec,
-	fnDir string,
 	deps plan.Deps,
+	snap dependencySnapshot,
 	depRef, depFingerprint string,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-dep-build-*")
@@ -248,20 +253,15 @@ func buildDependencyImage(
 	// Stage ONLY the manifest files, not the function's source tree. The
 	// dependency image exists to cache the install; baking the whole source
 	// would couple the layer to every source change and defeat the reuse.
-	for _, name := range deps.Files {
-		src := filepath.Join(fnDir, filepath.FromSlash(name))
-		content, err := os.ReadFile(src)
-		if err != nil {
-			return fmt.Errorf("dependency %s: read manifest %q: %w", depRef, name, err)
-		}
-		target := filepath.Join(ctxDir, filepath.FromSlash(name))
+	for _, f := range snap.files {
+		target := filepath.Join(ctxDir, filepath.FromSlash(f.name))
 		if dir := filepath.Dir(target); dir != ctxDir {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("dependency %s: mkdir for %s: %w", depRef, name, err)
+				return fmt.Errorf("dependency %s: mkdir for %s: %w", depRef, f.name, err)
 			}
 		}
-		if err := os.WriteFile(target, content, 0o644); err != nil {
-			return fmt.Errorf("dependency %s: write manifest %s: %w", depRef, name, err)
+		if err := os.WriteFile(target, f.content, 0o644); err != nil {
+			return fmt.Errorf("dependency %s: write manifest %s: %w", depRef, f.name, err)
 		}
 	}
 

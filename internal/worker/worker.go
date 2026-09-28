@@ -826,7 +826,14 @@ func Run(logger *slog.Logger) error {
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
 			UpdateServices: func(name string, tmpl *function.Template, image string) {
-				enqueueLiveServices(services, runWorker.Registry(), name, tmpl, image)
+				enqueueLiveServices(
+					services,
+					manager,
+					runWorker.Registry(),
+					name,
+					tmpl,
+					image,
+				)
 			},
 			UpdateServicesWithStatus: func(
 				name string,
@@ -837,6 +844,7 @@ func Run(logger *slog.Logger) error {
 			) {
 				enqueueLiveServicesWithStatus(
 					services,
+					manager,
 					runWorker.Registry(),
 					name,
 					tmpl,
@@ -854,6 +862,7 @@ func Run(logger *slog.Logger) error {
 			) {
 				enqueueLiveServiceObservationWithStatus(
 					services,
+					manager,
 					runWorker.Registry(),
 					name,
 					tmpl,
@@ -1300,8 +1309,16 @@ func startupFinalFingerprint(fn function.Function, supplied string, logger *slog
 // bounded workers converge it with the worker LIFECYCLE context. A nil Prepared
 // (unavailable) entry falls back to no plan env, mirroring the runner's
 // nil-safe behavior.
+//
+// The managed function image lease is acquired BEFORE the enqueue and handed to
+// the coordinator, which holds it across pending/coalesced/running service
+// reconciliation through StartService completion, so a concurrent retirement
+// cannot remove the image a service pass is still converging. When the image is
+// already retiring (a superseded desired state), the enqueue is skipped: a newer
+// desired state will follow.
 func enqueueLiveServices(
 	services *reconciler.ServiceCoordinator,
+	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
 	tmpl *function.Template,
@@ -1311,11 +1328,13 @@ func enqueueLiveServices(
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.Enqueue(name, tmpl, image, preparedEnv)
+	lease := acquireServiceLease(manager, name, image)
+	services.EnqueueLeased(name, tmpl, image, preparedEnv, lease)
 }
 
 func enqueueLiveServicesWithStatus(
 	services *reconciler.ServiceCoordinator,
+	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
 	tmpl *function.Template,
@@ -1327,11 +1346,21 @@ func enqueueLiveServicesWithStatus(
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.EnqueueWithStatus(name, tmpl, image, preparedEnv, onReconcileStart, onComplete)
+	lease := acquireServiceLease(manager, name, image)
+	services.EnqueueWithStatusLeased(
+		name,
+		tmpl,
+		image,
+		preparedEnv,
+		lease,
+		onReconcileStart,
+		onComplete,
+	)
 }
 
 func enqueueLiveServiceObservationWithStatus(
 	services *reconciler.ServiceCoordinator,
+	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
 	tmpl *function.Template,
@@ -1343,7 +1372,35 @@ func enqueueLiveServiceObservationWithStatus(
 	if cur := reg.GetByName(name); cur != nil && cur.Prepared() != nil {
 		preparedEnv = cur.Prepared().Env
 	}
-	services.EnqueueStatusObservation(name, tmpl, image, preparedEnv, onReconcileStart, onComplete)
+	lease := acquireServiceLease(manager, name, image)
+	services.EnqueueStatusObservationLeased(
+		name,
+		tmpl,
+		image,
+		preparedEnv,
+		lease,
+		onReconcileStart,
+		onComplete,
+	)
+}
+
+// acquireServiceLease admits a managed image lease for a service pass, or nil
+// when the image is not Relay-owned (an external image service) or a manager is
+// absent (tests). A retirement in progress yields nil: the enqueue proceeds
+// unleased, and a newer desired state will replace it. It never fails the
+// caller — service convergence is best-effort and the lease only narrows a
+// removal race.
+func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.ImageLease {
+	if manager == nil || !runtime.IsRelayImage(image) {
+		return nil
+	}
+	lease, err := manager.AcquireImageLease(image)
+	if err != nil {
+		manager.Logger().Debug("Service: image retiring; enqueue unleased",
+			"function", name, "image", image)
+		return nil
+	}
+	return lease
 }
 
 // enqueueStartupServices publishes each prepared function's initial desired
@@ -1381,8 +1438,15 @@ func enqueueStartupServicesWithState(
 	for _, pf := range prepared {
 		fn := pf.Function()
 		if prep := pf.Prepared(); prep != nil {
+			// Share the function's publication lease into the startup service
+			// request, so a concurrent retirement cannot remove the image while
+			// the initial service convergence still needs it. The share is
+			// admitted from the SAME lease the registry will publish, and is
+			// released when the request concludes. A no-runtime function has no
+			// lease and enqueues unleased.
+			lease := pf.SharePublication()
 			if st != nil && len(fn.Template.Services) > 0 {
-				services.EnqueueWithStatus(fn.Name, fn.Template, prep.Image, prep.Env,
+				services.EnqueueWithStatusLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease,
 					func() { st.RecordReconciling(fn.Name) },
 					func(err error) {
 						if err != nil {
@@ -1397,7 +1461,7 @@ func enqueueStartupServicesWithState(
 						st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
 					})
 			} else {
-				services.Enqueue(fn.Name, fn.Template, prep.Image, prep.Env)
+				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)
 			}
 			continue
 		}

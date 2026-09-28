@@ -88,11 +88,18 @@ func functionNameFromImage(image string) (string, bool) {
 // relayTags lists every local image RepoTag carrying the Relay namespace prefix,
 // returning name -> set of full tags. It lists all images and filters client-side
 // rather than using server-side filters: single client implementation reused by
-// every cleanup path, no dependency on a specific Engine API filter version.
+// every cleanup path, no dependency on a specific Engine API filter version. It
+// is lifecycle-owned (see beginRemovalOperation): once shutdown begins the
+// listing is refused, and a listing in flight is joined before the client closes.
 func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}, error) {
-	list, err := m.cli.ImageList(ctx, client.ImageListOptions{})
+	opCtx, finish, err := m.beginRemovalOperation(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list images: %w", err)
+		return nil, err
+	}
+	defer finish()
+	list, err := m.cli.ImageList(opCtx, client.ImageListOptions{})
+	if err != nil {
+		return nil, m.leaseCoord().shutdownErr(ctx, fmt.Errorf("list images: %w", err))
 	}
 	byName := map[string]map[string]struct{}{}
 	for _, img := range list.Items {
@@ -112,6 +119,35 @@ func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}
 		}
 	}
 	return byName, nil
+}
+
+// listImagesForRemoval lists all local images through the lifecycle-owned
+// removal gate, so a dependency-GC pass that fires after manager shutdown is
+// refused (ErrManagerShuttingDown) and a listing in flight is joined before the
+// Docker client closes.
+func (m *Manager) listImagesForRemoval(ctx context.Context) (client.ImageListResult, error) {
+	opCtx, finish, err := m.beginRemovalOperation(ctx)
+	if err != nil {
+		return client.ImageListResult{}, err
+	}
+	defer finish()
+	list, err := m.cli.ImageList(opCtx, client.ImageListOptions{})
+	if err != nil {
+		return client.ImageListResult{}, m.leaseCoord().shutdownErr(ctx, fmt.Errorf("list images: %w", err))
+	}
+	return list, nil
+}
+
+// IsRelayImage reports whether image is within one of Relay's own image
+// namespaces ("relay-fn-" or "relay-dep-"). It is the guard that keeps the
+// image-lease coordinator scoped to images Relay owns: an external service
+// image must NEVER be leased, retired, or garbage-collected by Relay.
+func IsRelayImage(image string) bool {
+	repo, _, ok := strings.Cut(image, ":")
+	if !ok {
+		repo = image
+	}
+	return strings.HasPrefix(repo, relayRepoPrefix) || isDepRepo(repo)
 }
 
 // imageExists reports whether a local image carrying the exact reference ref is
@@ -144,7 +180,27 @@ var ErrImageInUse = errors.New("image still referenced by a relay-owned containe
 // containers are never inspected or touched. An error listing containers is
 // propagated to the caller so a conservative failure can refuse removal rather
 // than delete on unknown state.
+//
+// It is lifecycle-owned: once manager shutdown has begun it refuses with
+// ErrManagerShuttingDown instead of listing containers against a closing client,
+// and a listing already in flight is joined before the client closes.
 func (m *Manager) ImageReferencedByManagedContainer(ctx context.Context, image string) (bool, error) {
+	opCtx, finish, err := m.beginRemovalOperation(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer finish()
+	referenced, err := m.imageReferencedByManagedContainer(opCtx, image)
+	if err != nil {
+		return false, m.leaseCoord().shutdownErr(ctx, err)
+	}
+	return referenced, nil
+}
+
+// imageReferencedByManagedContainer is the un-gated container-reference guard,
+// used by removal paths that already hold a lifecycle-owned removal operation
+// (retireOwned → removeImageLocked) so the guard does not double-register.
+func (m *Manager) imageReferencedByManagedContainer(ctx context.Context, image string) (bool, error) {
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return false, fmt.Errorf("list containers for %s: %w", image, err)
@@ -157,21 +213,151 @@ func (m *Manager) ImageReferencedByManagedContainer(ctx context.Context, image s
 	return false, nil
 }
 
-// RemoveImage removes a single image reference. Removing an image that is
-// already gone is a success (the daemon reports not-found): log at debug and
-// return nil. This is the only path that removes a named Relay image; it never
-// removes anything outside an exact reference the caller computed.
+// RemoveImage removes a single image reference through the single production
+// ownership authority. It commits the image to retirement (rejecting NEW
+// independent leases while work admitted before this point drains), waits on ctx
+// for every admitted lease to drain, then consults
+// ImageReferencedByManagedContainer (the cross-process / warm-container defense)
+// and performs a FORCE-FREE ImageRemove.
 //
-// Defensive guard: before calling docker, it consults
-// ImageReferencedByManagedContainer and refuses (returning a wrapped ErrImageInUse)
-// while any Relay-owned container still references the image. This is the single
-// enforcement point for "never remove an image a Relay-owned container still
-// depends on", guarding every caller (runner async removal, the startup sweep,
-// RetireServiceImages). The ImageRemove options stay FORCE-FREE: never Force, an
-// image referenced by a Relay-owned container must be removable only after that
-// container is gone.
+// It is the caller-visible authority-aware removal: a direct Prepare caller
+// that never published its handle holds an admitted lease and must release it
+// (Prepared.ReleaseLease) for the image to become removable; a published image
+// is held by its registry publication lease and becomes removable only after
+// the entry is superseded. When ctx is done before the drain completes the image
+// stays committed to removal and the returned error is ctx.Err(), so the caller
+// retries later rather than removing early.
+//
+// On any non-removal outcome (a container reference, a daemon error) the
+// retirement gate is cleared so the image stays usable and a later natural
+// cleanup pass retries. On success the image's coordination state is dropped.
+// A duplicate caller that finds removal already in progress (another goroutine
+// owns the retirement) gets a wrapped ErrImageRetiring and must defer; it never
+// races a second ImageRemove. Removing an image that is already gone is a
+// success (the daemon reports not-found). This is the only path that removes a
+// named Relay image; it never removes anything outside an exact reference the
+// caller computed. The ImageRemove options stay FORCE-FREE.
+//
+// It is lifecycle-owned: once the manager has begun shutting down it returns
+// ErrManagerShuttingDown without issuing any Docker call, and a removal already
+// in flight is cancelled and joined before the Docker client closes.
 func (m *Manager) RemoveImage(ctx context.Context, image string) error {
-	referenced, err := m.ImageReferencedByManagedContainer(ctx, image)
+	if _, ok := ctx.Deadline(); !ok {
+		// Defense: never block forever on a drain when the caller passed an
+		// unbounded context. Callers that need a longer bound pass a deadline.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, retireBound)
+		defer cancel()
+	}
+	_, err := m.retireOwned(ctx, image, true)
+	return err
+}
+
+// RemoveImageNow is the NON-BLOCKING form of RemoveImage: it commits the image
+// to retirement and, when every admitted lease is already drained, removes it.
+// When any admitted lease is still held it clears the gate and returns a
+// wrapped ErrImageRetiring immediately, never blocking. The startup sweep and
+// dependency GC use it so a leaked/legitimately-held lease can never stall a
+// best-effort cleanup pass; the runner's retirement path uses the blocking
+// RetireImageLease so an in-flight execution's image is removed as soon as it
+// drains.
+func (m *Manager) RemoveImageNow(ctx context.Context, image string) error {
+	_, err := m.retireOwned(ctx, image, false)
+	return err
+}
+
+// retireOwned commits image to retirement and, when it owns removal, performs
+// it. When wait is true it blocks on ctx for every admitted lease to drain;
+// when false a still-held lease is reported as ErrImageRetiring immediately.
+// removed reports whether this call actually issued a successful removal.
+//
+// The whole operation is lifecycle-owned: its context is derived from both the
+// caller's ctx and the manager's shutdown signals (see Manager.removalContext),
+// and it is registered with the coordinator's beginRemoval, so manager shutdown
+// refuses new removals and joins this one before the Docker client closes.
+func (m *Manager) retireOwned(ctx context.Context, image string, wait bool) (removed bool, err error) {
+	if image == "" {
+		return false, nil
+	}
+	rmCtx, stop := m.removalContext(ctx)
+	defer stop()
+	coord := m.leaseCoord()
+	drained, owner, err := coord.beginRemoval(image)
+	if err != nil {
+		// The manager is shutting down: no new Docker removal may begin. A
+		// caller whose own context is already done sees its own error (the
+		// cancellation, not a synthesized shutdown sentinel), preserving caller
+		// cancellation semantics.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, err
+	}
+	if !owner {
+		// Another caller already owns this image's removal: defer without
+		// racing a second ImageRemove.
+		return false, fmt.Errorf("remove image %s: %w", image, ErrImageRetiring)
+	}
+	// Every owned removal concludes exactly once (success or failure), so the
+	// coordinator's join registration is always released and the retirement gate
+	// is always cleared on a non-removal outcome.
+	concluded := false
+	defer func() {
+		if !concluded {
+			coord.finishRemoval(image, false)
+		}
+	}()
+	// Drop warm execution containers first so the container-reference guard
+	// clears without waiting for an in-flight invocation to release.
+	if m.containers != nil {
+		m.containers.invalidateImage(image)
+	}
+	if wait {
+		select {
+		case <-drained:
+		case <-rmCtx.Done():
+			// The bound expired or the manager began shutting down with admitted
+			// work still draining. Clear the gate (the image stays reusable and a
+			// later cleanup pass re-owns the removal) rather than leaving it
+			// permanently committed. A shutdown abort is reported distinctly so
+			// the runner defers instead of retrying against a closed client.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			return false, fmt.Errorf("remove image %s: %w", image, ErrManagerShuttingDown)
+		}
+	} else {
+		select {
+		case <-drained:
+		default:
+			// Admitted work still holds the image: clear the gate (the image
+			// stays usable) and report the retryable transitional state.
+			return false, fmt.Errorf("remove image %s: %w", image, ErrImageRetiring)
+		}
+	}
+	// The drain may close concurrently with shutdown: re-check the removal
+	// context so a removal that won the drain race still aborts instead of
+	// issuing Docker calls against a closing client.
+	if err := rmCtx.Err(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, fmt.Errorf("remove image %s: %w", image, ErrManagerShuttingDown)
+	}
+	if err := m.removeImageLocked(rmCtx, image); err != nil {
+		return false, coord.shutdownErr(ctx, err)
+	}
+	coord.finishRemoval(image, true)
+	concluded = true
+	return true, nil
+}
+
+// removeImageLocked performs the container-reference guard and the actual
+// FORCE-FREE ImageRemove for an image whose retirement gate is already held and
+// whose removal operation is already registered with the coordinator. It uses
+// the un-gated guard so the operation is registered exactly once.
+func (m *Manager) removeImageLocked(ctx context.Context, image string) error {
+	referenced, err := m.imageReferencedByManagedContainer(ctx, image)
 	if err != nil {
 		return fmt.Errorf("remove image %s: %w", image, err)
 	}
@@ -233,13 +419,13 @@ func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) 
 			if keep[tag] {
 				continue
 			}
-			if err := m.RemoveImage(ctx, tag); err != nil {
-				if errors.Is(err, ErrImageInUse) {
-					// A container still references this image (a leftover not yet
-					// replaced this boot). This is expected during the sweep; the
-					// owning function's reconcile replaces the container first and
-					// only then retires the image. Log at debug and leave it for a
-					// later pass.
+			if err := m.RemoveImageNow(ctx, tag); err != nil {
+				if errors.Is(err, ErrImageRetiring) || errors.Is(err, ErrImageInUse) || errors.Is(err, ErrManagerShuttingDown) {
+					// An admitted lease (a build/execution/publication still in
+					// flight), a container still references this image, or the
+					// manager began shutting down. This is expected during the
+					// sweep; the owning function's reconcile retires it on a
+					// later pass. Log at debug and leave it.
 					m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
 					continue
 				}

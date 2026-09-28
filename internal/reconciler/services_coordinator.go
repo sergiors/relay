@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"relay/internal/function"
+	"relay/internal/runtime"
 )
 
 const serviceReconcileWorkers = 2
@@ -15,6 +16,15 @@ type serviceRequest struct {
 	tmpl        *function.Template
 	image       string
 	preparedEnv []string
+	// lease is the managed image lease the producer acquired BEFORE enqueue and
+	// owns across this request's whole life. It is held through pending
+	// retention, worker execution, and StartService completion, so the function
+	// image a service pass is converging to (or from) cannot be removed out from
+	// under it. A coalesced (superseded) pending request releases its lease; a
+	// request the worker never picks up (lifecycle cancellation) also releases
+	// it; a request that runs releases it after the operation. Nil for a
+	// removal request and for the legacy unleased enqueue paths (tests).
+	lease *runtime.ImageLease
 	// done is closed exactly once, by whoever concludes the request's life:
 	// the worker that executes it (after the operation returns), a newer enqueue
 	// that supersedes it before it starts, or lifecycle cancellation that drops
@@ -133,6 +143,53 @@ func (c *ServiceCoordinator) EnqueueWithStatus(
 ) {
 	c.enqueue(&serviceRequest{name: name, meaningful: true, tmpl: cloneServiceTemplate(tmpl), image: image,
 		preparedEnv: append([]string(nil), preparedEnv...), onReconcileStart: onReconcileStart, onComplete: onComplete})
+}
+
+// EnqueueLeased publishes the latest desired state for name with an admitted
+// managed image lease that the producer acquired BEFORE enqueue. The lease is
+// held across pending retention, worker execution, and StartService completion,
+// so the image cannot be removed while this service pass may still need it. A
+// superseded pending request releases its lease; the worker releases the running
+// one after the operation. lease may be nil (a no-runtime function or a test
+// caller), making this identical to Enqueue.
+func (c *ServiceCoordinator) EnqueueLeased(
+	name string,
+	tmpl *function.Template,
+	image string,
+	preparedEnv []string,
+	lease *runtime.ImageLease,
+) {
+	c.enqueue(&serviceRequest{
+		name:        name,
+		tmpl:        cloneServiceTemplate(tmpl),
+		image:       image,
+		preparedEnv: append([]string(nil), preparedEnv...),
+		lease:       lease,
+	})
+}
+
+// EnqueueWithStatusLeased is EnqueueWithStatus with an admitted image lease
+// (see EnqueueLeased).
+func (c *ServiceCoordinator) EnqueueWithStatusLeased(
+	name string, tmpl *function.Template, image string, preparedEnv []string,
+	lease *runtime.ImageLease,
+	onReconcileStart func(), onComplete func(error),
+) {
+	c.enqueue(&serviceRequest{name: name, meaningful: true, tmpl: cloneServiceTemplate(tmpl), image: image,
+		preparedEnv: append([]string(nil), preparedEnv...), lease: lease,
+		onReconcileStart: onReconcileStart, onComplete: onComplete})
+}
+
+// EnqueueStatusObservationLeased is EnqueueStatusObservation with an admitted
+// image lease (see EnqueueLeased).
+func (c *ServiceCoordinator) EnqueueStatusObservationLeased(
+	name string, tmpl *function.Template, image string, preparedEnv []string,
+	lease *runtime.ImageLease,
+	onReconcileStart func(), onComplete func(error),
+) {
+	c.enqueue(&serviceRequest{name: name, tmpl: cloneServiceTemplate(tmpl), image: image,
+		preparedEnv: append([]string(nil), preparedEnv...), lease: lease,
+		onReconcileStart: onReconcileStart, onComplete: onComplete})
 }
 
 // EnqueueStatusObservation publishes a verification or self-heal pass whose
@@ -283,6 +340,9 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	if c.stopped || (c.ctx != nil && c.ctx.Err() != nil) {
 		c.mu.Unlock()
 		close(req.done)
+		// The request will never run: release its admitted image lease so a
+		// cancelled enqueue never strands the image from retiring.
+		req.releaseLease()
 		return req.done
 	}
 	state := c.states[req.name]
@@ -301,9 +361,13 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	}
 	// A newer desired state replaces an unstarted pending one; the superseded
 	// request will never run, so release its waiter now rather than leaving it
-	// open forever.
+	// open forever. Its admitted image lease is released too: the replaced work
+	// no longer needs the image pinned, and a leaked lease would keep the image
+	// from retiring.
 	if state.pending != nil {
-		close(state.pending.done)
+		superseded := state.pending
+		close(superseded.done)
+		superseded.releaseLease()
 	}
 	state.pending = req
 	// While RunExclusive holds the housekeeping pause, scheduling is deferred:
@@ -373,7 +437,10 @@ func (c *ServiceCoordinator) run(name string) {
 
 	// The request is now in flight: it is deliberately no longer referenced by
 	// state, so lifecycle cancellation can never release its waiter early. The
-	// worker closes it below, after the (bounded) operation returns.
+	// worker closes it below, after the (bounded) operation returns. Its admitted
+	// image lease (when present) is held for the whole operation and released
+	// after it, so the function image cannot be removed while the service pass
+	// still needs it.
 	if req.remove {
 		// Removal is a single quick Docker operation, so it runs on its own
 		// fresh bounded context rooted in the coordinator lifecycle. Bounding it
@@ -387,7 +454,9 @@ func (c *ServiceCoordinator) run(name string) {
 	} else {
 		// Apply receives the lifecycle context, NOT a pass-wide reconcileTimeout
 		// budget: Reconcile derives a fresh bound for each of its Docker
-		// operations itself.
+		// operations itself. The request's admitted image lease is carried into
+		// the context so StartService borrows from it (a child share) rather than
+		// acquiring a fresh lease a concurrent retirement would reject.
 		reconcileStarted := req.onReconcileStart
 		if reconcileStarted != nil {
 			reconcileStarted = func() {
@@ -396,11 +465,20 @@ func (c *ServiceCoordinator) run(name string) {
 				}
 			}
 		}
-		err := c.services.ApplyWithStatus(c.ctx, req.name, req.tmpl, req.image, req.preparedEnv, reconcileStarted)
+		applyCtx := c.ctx
+		if req.lease != nil {
+			applyCtx = runtime.WithImageLease(applyCtx, req.lease)
+		}
+		err := c.services.ApplyWithStatus(applyCtx, req.name, req.tmpl, req.image, req.preparedEnv, reconcileStarted)
 		if req.onComplete != nil && c.currentRequest(req) {
 			req.onComplete(err)
 		}
 	}
+
+	// The operation is complete: release this request's image lease now, before
+	// waking any waiter, so a retirement that was waiting on the last service
+	// reference can proceed.
+	req.releaseLease()
 
 	// Operation complete: release this request's waiter only now, so
 	// RemoveAndWait can never observe completion before the operation returned.
@@ -512,9 +590,21 @@ func (c *ServiceCoordinator) cancelPending() {
 	for _, state := range c.states {
 		if state.pending != nil {
 			close(state.pending.done)
+			// The dropped request never runs: release its admitted image lease.
+			state.pending.releaseLease()
 			state.pending = nil
 		}
 		state.running = false
 	}
 	c.idle.Broadcast()
+}
+
+// releaseLease drops the request's admitted image lease, if any. It is
+// idempotent and nil-safe, so the multiple life-ending paths (supersede,
+// cancellation, completion) can each call it without coordination.
+func (r *serviceRequest) releaseLease() {
+	if r == nil || r.lease == nil {
+		return
+	}
+	r.lease.Release()
 }

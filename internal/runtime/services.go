@@ -314,6 +314,32 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // retirement grouped under FunctionImageTags with no separate service images.
 // An `image` source instead runs its external reference with Entry empty.
 func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica int) (string, error) {
+	// Pin the service image for the whole create+start window. For a Relay-owned
+	// image (an entrypoint-source service runs the function image) this prevents
+	// a concurrent retirement from committing removal between the caller's
+	// reference check and the container create. The pin prefers the request's
+	// admitted lease carried on ctx (a service pass that enqueued with a lease):
+	// a child SHARE of it keeps the image admitted even while retirement drains.
+	// A direct caller with no lease acquires its own; a retirement in progress
+	// rejects it with a retryable ErrImageRetiring. External images (never
+	// Relay-owned) are not leased at all — Relay must never GC them.
+	var lease *ImageLease
+	if IsRelayImage(spec.Image) {
+		if reqLease := ImageLeaseFrom(ctx); reqLease != nil {
+			lease = reqLease.Share()
+		}
+		if lease == nil {
+			owned, err := m.AcquireImageLease(spec.Image)
+			if err != nil {
+				return "", fmt.Errorf("service: %w", err)
+			}
+			lease = owned
+		}
+		if lease != nil {
+			defer lease.Release()
+		}
+	}
+
 	cfg := &container.Config{
 		Image:  spec.Image,
 		Env:    spec.Env,
@@ -542,8 +568,17 @@ func (m *Manager) RemoveFunctionServiceContainers(ctx context.Context, fnName st
 // slips past the keep-set (e.g. a container whose label this boot has not yet
 // observed) is still skipped rather than removed while referenced. Returns the
 // number of images removed.
+//
+// The whole pass is lifecycle-owned: it runs under one removal-operation
+// registration, so manager shutdown refuses a new pass and joins an in-flight
+// one before the Docker client closes.
 func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, error) {
-	containers, err := m.ServiceContainerList(ctx)
+	opCtx, finish, err := m.beginRemovalOperation(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer finish()
+	containers, err := m.ServiceContainerList(opCtx)
 	if err != nil {
 		return 0, err
 	}
@@ -554,7 +589,7 @@ func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, 
 		}
 	}
 
-	tags, err := m.FunctionImageTags(ctx, fnName)
+	tags, err := m.FunctionImageTags(opCtx, fnName)
 	if err != nil {
 		return 0, err
 	}
@@ -564,12 +599,13 @@ func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, 
 		if keep[tag] {
 			continue
 		}
-		if err := m.RemoveImage(ctx, tag); err != nil {
-			if errors.Is(err, ErrImageInUse) {
-				// A container still references this image; the keep-set built from
-				// ServiceContainerList above and the container-reference guard both
-				// recognize this as the normal transitional state. Defer to a later
-				// pass: log at debug, not counted, not surfaced as a failure.
+		if err := m.RemoveImageNow(opCtx, tag); err != nil {
+			if errors.Is(err, ErrImageInUse) || errors.Is(err, ErrImageRetiring) || errors.Is(err, ErrManagerShuttingDown) {
+				// A container still references this image, an admitted lease
+				// (a build/execution/publication) still holds it, or the manager
+				// is shutting down; all are the normal transitional state. Defer
+				// to a later pass: log at debug, not counted, not surfaced as a
+				// failure.
 				m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
 				continue
 			}
