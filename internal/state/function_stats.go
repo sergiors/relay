@@ -19,7 +19,10 @@ import (
 // HandlerSuccessTotal/HandlerFailureTotal are per rule execution.
 // RetryTotal counts every failing rule execution (a retry driver);
 // DLQTotal counts a function once when its failing rule execution is the one
-// that exhausts the delivery attempts and the message is routed to the DLQ.
+// that exhausts its retry budget and the invocation is marked terminal for the
+// DLQ. It is counted at that exhaustion commit, which may precede the actual
+// message-level DLQ write (that happens after every exhausted sibling
+// invocation in the same delivery has finished).
 //
 // The four Last*At fields are per-function execution-history timestamps in the
 // RFC3339 convention of UpdatedAt (empty string = never observed):

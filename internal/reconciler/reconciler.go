@@ -125,6 +125,14 @@ type Config struct {
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
+	//
+	// It is the STATUS-LESS form: it reports no reconcile-start/complete
+	// lifecycle to the state sink. The production worker wires
+	// UpdateServicesWithStatus / UpdateServicesObservationWithStatus instead, so
+	// this one is the fallback for a Builder, test, or embedding host that wants
+	// service convergence without status reporting. When any status-aware hook is
+	// set it takes precedence (see reconcileFunction), so the two are never both
+	// invoked for one convergence.
 	UpdateServices                      func(name string, tmpl *function.Template, image string)
 	UpdateServicesWithStatus            func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
 	UpdateServicesObservationWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
@@ -327,12 +335,16 @@ func (r *Reconciler) Enqueue(name string) {
 	r.timers[name] = t
 }
 
-// dispatch feeds a function into the single reconciler goroutine (the pump),
-// dropping it if the queue is full. Both the debounce timers and the periodic
+// dispatch feeds a function into the single reconciler goroutine (the pump).
+// The send blocks when the queue is full (there is no default case): the caller
+// is a debounce timer goroutine, so backpressure simply delays that timer
+// rather than dropping the reconcile. Both the debounce timers and the periodic
 // pass converge here so no two reconciles of the same function ever run
-// concurrently. incoming is never closed; on shutdown the done case wins, so a
-// timer firing during teardown is safely discarded rather than panicking on a
-// closed channel.
+// concurrently. incoming is never closed; done lets a sender parked on a full
+// queue unblock at shutdown. If both cases are ready the select chooses at
+// random, so done is not strictly prioritized, but either outcome is safe: a
+// timer firing during teardown either enqueues into a queue the pump will stop
+// draining, or returns without sending. Neither panics on a closed channel.
 func (r *Reconciler) dispatch(name string) {
 	select {
 	case r.incoming <- name:

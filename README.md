@@ -37,7 +37,10 @@ process — it consumes events, loads functions, builds images, and reconciles
 subcommands are administrative/inspection commands around the same binary;
 they never start the runtime. Their writes are the local secrets store
 (`relay secret set/rm`), the DLQ stream (`relay dlq rm`, and `relay dlq replay`
-on success), and — read-only otherwise — the state database they read from.
+on success), and the local state database. The state database is read-mostly,
+not read-only: the worker writes it (discovery, reconcile outcomes, the 5s
+stats flush) and `relay stats reset` zeroes its cumulative counters in place,
+while every other state-touching subcommand only reads it.
 
 ```
 relay start                # start Relay in the foreground
@@ -102,11 +105,14 @@ services:
   socket-proxy:
     image: tecnativa/docker-socket-proxy
     environment:
-      - PING=1
-      - VERSION=1
-      - BUILD=1
-      - CONTAINERS=1
-      - POST=1
+      - PING=1        # daemon ping
+      - VERSION=1     # API version negotiation
+      - BUILD=1       # image build (function + dependency layers)
+      - IMAGES=1      # image list / inspect / pull / remove
+      - CONTAINERS=1  # container list / logs / attach / create / start / wait / kill / stop / remove
+      - NETWORKS=1    # network inspect (Relay never creates networks)
+      - POST=1        # container create/start/wait/kill/stop and image pull/build are POSTs
+      - DELETE=1      # container remove and image remove are DELETEs
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
@@ -121,15 +127,18 @@ services:
 
 > **Security warning: the Docker socket is privileged.**
 > The socket is mounted read-only into a dedicated proxy container, and the
-> proxy forwards only a curated allow-list of Docker Engine API requests (an
-> endpoint allow-list plus read-only access) instead of granting Relay the full
-> socket. This reduces Relay's attack surface against the daemon, but it is
-> **not** a strong security boundary and it does **not** make Docker execution
-> unprivileged: Relay still builds images and creates/runs containers, which is
-> effectively root-equivalent on the host. This tradeoff is accepted at this
-> stage of the project so Relay can build and run function images against the
-> host daemon. Separating the executor into a remote/privileged sidecar or a
-> properly isolated build+run service is out of scope for this iteration.
+> proxy forwards only a curated allow-list of Docker Engine API categories
+> instead of granting Relay the full socket. That list includes mutating
+> operations (`POST=1`, `DELETE=1`, plus image build/pull), so it is an
+> endpoint allow-list, **not** read-only access: Relay must create, start, and
+> remove containers and build/pull/remove images to do its job. This reduces
+> Relay's attack surface against the daemon, but it is **not** a strong security
+> boundary and it does **not** make Docker execution unprivileged: Relay still
+> builds images and creates/runs containers, which is effectively
+> root-equivalent on the host. This tradeoff is accepted at this stage of the
+> project so Relay can build and run function images against the host daemon.
+> Separating the executor into a remote/privileged sidecar or a properly
+> isolated build+run service is out of scope for this iteration.
 
 ### Development with Compose
 
@@ -153,8 +162,10 @@ Relay reaches the host daemon through the proxy over the internal compose
 network with `DOCKER_HOST=tcp://socket-proxy:2375` (Relay's moby client honors
 `DOCKER_HOST` via `FromEnv`). The socket itself is mounted **read-only and only
 into the `socket-proxy` container**, which forwards just the Engine API
-endpoints Relay needs (ping/version, image build, and container create/attach/
-start/wait/kill/remove). Port `2375` is **not** exposed to the host, so the
+endpoints Relay needs (ping/version, image build/list/inspect/pull/remove,
+container list/create/attach/start/wait/kill/stop/remove, and network inspect;
+see the proxy sample and `compose.dev.yaml` for the exact category list). Port
+`2375` is **not** exposed to the host, so the
 proxy is reachable only from the compose network. `./examples/functions` is still
 mounted read-only into Relay at `/functions`. The socket mount is privileged (see the security
 warning above); this is a dev-only convenience. The Relay container's healthcheck
@@ -192,7 +203,8 @@ immediately) if any of them is unset or empty. `REDIS_STREAM_RETENTION` is
 optional and enables internal stream retention (see below). `METRICS_ADDR` is
 optional and opt-in: when set to a non-empty listen address it starts the
 Prometheus HTTP endpoint on that address, and when unset or empty no HTTP
-server is started. An unbindable address is logged and retried, never fatal.
+server is started. An address that cannot be bound (e.g. a taken port) is fatal
+at startup — the bind is synchronous and fail-fast — matching the webhook server.
 `GIT_WEBHOOK_ADDR` is likewise opt-in: when set it starts the GitHub webhook
 endpoint on that address (see _Git_), and when unset or empty the webhook
 server is not started. Even when it is set, the webhook is disabled unless the
@@ -410,8 +422,9 @@ consumer names to scale out consuming; each worker uses its hostname as its
 consumer name automatically (the container ID / pod name under
 Docker/Kubernetes), so replicas are distinct without any configuration. The
 consumer group is created automatically (with `MKSTREAM`) if the stream or
-group does not exist; the group is created at position `0`, so only messages
-added after startup are consumed.
+group does not exist; the group is created at position `0`, so a new group over
+an existing stream replays that stream's backlog (every entry already present
+becomes eligible, not only messages added after startup).
 
 ## Functions
 
@@ -1478,11 +1491,14 @@ writes into `/functions`.
 ## Local state database
 
 Relay keeps a small local **SQLite** database describing its current view of the
-loaded functions — a read-only state view, **not** the source of truth. The
-`/functions` directory remains authoritative; the local state database is
-rebuilt automatically when empty and never drives matching, image building, or
-reconciliation. It exists so operators can introspect what Relay has loaded and
-how the last reconcile of each function went without touching Redis or Docker.
+loaded functions — a read-mostly operator snapshot, **not** the source of truth
+and not immutable. The worker writes it (discovery, reconcile outcomes, the 5s
+stats flush) and `relay stats reset` writes it; every other state-touching
+subcommand only reads it. The `/functions` directory remains authoritative; the
+local state database is rebuilt automatically when empty and never drives
+matching, image building, or reconciliation. It exists so operators can
+introspect what Relay has loaded and how the last reconcile of each function
+went without touching Redis or Docker.
 
 - **Location**: `/var/lib/relay/db.sqlite3` (a fixed internal path, not
   env-configurable). The parent directory is created automatically, so the file
@@ -1538,7 +1554,8 @@ how the last reconcile of each function went without touching Redis or Docker.
 
 Relay persists state at startup and on every reconcile. Three read-only CLI
 commands expose it (no Redis, Docker, or `/functions` needed — they read the
-state database file only):
+state database file only; `relay stats reset` is the one state-writing CLI
+command, covered below):
 
 ```sh
 relay function ls
@@ -1845,7 +1862,8 @@ relay git keygen                             # generate an SSH deploy key (once)
 relay git set git@github.com:acme/repo.git   # remember the SSH source
 relay git sync                               # when you want, materialize into /functions
 relay git status                             # inspect the sync state
-relay git remove                             # forget the source + drop the checkout
+relay git remove                             # forget the source + drop the checkout (prompts, default No)
+relay git remove -y                          # same, skipping confirmation (for automation)
 ```
 
 `relay git set` accepts an SSH URL only — either scp-like (`git@host:org/repo.git`)
@@ -1948,14 +1966,17 @@ exist, the resolved commit (if a checkout exists), and the last sync time — ne
 any key material. With nothing configured it prints "No git source configured."
 and exits 0.
 
-`relay git remove` deletes the persisted config and the checkout directory. It
-leaves `/functions` untouched and **keeps the SSH key** (the operator registered
-its public half as a Deploy Key; removing the source is unrelated to the key's
-lifecycle, and re-keying is an explicit `relay git keygen` operation). Removal is
-decided by file existence, never by parsing the config, so it also clears a
-hand-edited `source.json` that `relay git status`/`sync` would reject (bad JSON
-or an invalid repository/ref/path/secret reference). It is idempotent: running it
-again reports nothing configured.
+`relay git remove` deletes the persisted config and the checkout directory. On a
+terminal it prompts for confirmation with a default of **No** (so a bare
+non-interactive `relay git remove` removes nothing); pass `-y`/`--yes`
+(`relay git remove -y`) to skip the prompt for automation. It leaves `/functions`
+untouched and **keeps the SSH key** (the operator registered its public half as a
+Deploy Key; removing the source is unrelated to the key's lifecycle, and
+re-keying is an explicit `relay git keygen` operation). Removal is decided by
+file existence, never by parsing the config, so it also clears a hand-edited
+`source.json` that `relay git status`/`sync` would reject (bad JSON or an invalid
+repository/ref/path/secret reference). It is idempotent: running it again reports
+nothing configured.
 
 ## Observability
 
@@ -2060,9 +2081,10 @@ remains the health check.
   Prometheus-only and not part of the SQLite snapshot. Labels are bounded to
   `function`/`handler`/`outcome` plus the small closed runtime-pool value sets
   below; IDs (message, event, container, fingerprint) are never labels. The
-  metrics server is operationally isolated: bind failures
-  are logged and retried, scrape errors never stop event consumption, and
-  shutdown is graceful. Prometheus is the source for time-series metrics.
+  metrics server is operationally isolated from the event path: scrape errors
+  never stop event consumption and shutdown is graceful, but the bind is
+  synchronous and fail-fast — a taken `METRICS_ADDR` port aborts startup rather
+  than being retried. Prometheus is the source for time-series metrics.
 - **Event classification counters**: `events_received_total`,
   `events_matched_total`, and `events_unmatched_total` form a closed partition
   of the **logical** incoming events the runner handled:
@@ -2262,9 +2284,9 @@ handler failure — stays in the PEL.
   the next recovery cycle redelivers it; the exhausted invocation is skipped
   without re-running and exhaustion is re-reported, so the message is re-routed
   instead of being lost. Once an invocation's entry is successfully written, its
-  invocation-state marker becomes `exhausted:<attempts>:dlq`; a redelivery skips
-  the already-persisted entries (without scanning the DLQ) and writes only the
-  missing ones, so retrying a partially-written multi-entry DLQ (after an XACK
+  invocation-state marker becomes `exhausted:<attempt>:<token>:dlq`; a redelivery
+  skips the already-persisted entries (without scanning the DLQ) and writes only
+  the missing ones, so retrying a partially-written multi-entry DLQ (after an XACK
   failure, a crash, or a one-of-N write failure) neither duplicates nor loses
   entries. The XACK and the invocation-state clear happen only after every
   required entry is persisted.
@@ -2292,40 +2314,63 @@ routed to the DLQ. To avoid re-running work that already succeeded, Relay record
 per-handler invocation state in Redis: each message has a TTL'd hash keyed by
 message (`relay:invocation:{stream}:{group}:{msgID}`, field
 `<function>/<handler>`; stream/group names are percent-encoded in the key). The
-field value describes the invocation's lifecycle for this message:
+field value describes the invocation's lifecycle for this message. Deadlines are
+integer **Unix milliseconds**, and `<token>` is a crypto-random opaque claim
+identity (never logged, metricked, or written to the DLQ):
 
 - `ok` — the invocation completed on a previous delivery; redeliveries skip it.
-- `running:<unix-nano deadline>#<attempts>` — an attempt is (or was) executing,
-  protected until that absolute deadline; `<attempts>` is the 1-based attempt
-  number. A deadline marker without `#<attempts>` does not parse (treated as
-  absent/eligible).
-- `next_attempt_at:<unix-nano deadline>#<attempts>` — a failed attempt is
-  waiting out its retry backoff, protected until that absolute deadline.
-- `exhausted:<attempts>` — the invocation's attempts are exhausted; it is
+- `running:<deadline_ms>:<attempt>:<token>` — an attempt is (or was) executing,
+  protected until that absolute Unix-ms deadline; `<attempt>` is the 1-based
+  handler attempt and `<token>` is the opaque claim identity. A marker missing
+  either `<attempt>` or `<token>` does not parse (treated as absent/eligible).
+- `next_attempt_at:<deadline_ms>:<attempt>:<token>` — a failed attempt is
+  waiting out its retry backoff, protected until that absolute deadline; the
+  claim identity is retained so only this claim may write the next state.
+- `exhausted:<attempt>:<token>` — the invocation's attempts are exhausted; it is
   terminal and never eligible again, and its DLQ entry has not yet been
-  persisted. A redelivery of an exhausted invocation skips re-execution but
-  still re-reports exhaustion, so a message whose DLQ write or post-DLQ XACK
-  failed is re-routed to the DLQ rather than being acknowledged without an entry.
-- `exhausted:<attempts>:dlq` — the invocation's attempts are exhausted and its
-  DLQ entry has been persisted. It parses exactly like `exhausted:<attempts>`
-  (same terminal state and attempt count); the suffix only lets a redelivery
-  skip the already-written entry without scanning the DLQ stream, so retrying a
-  partially-written multi-entry DLQ is idempotent.
+  persisted. The claim identity is retained so the DLQ-persistence upgrade can
+  CAS the same exhausted claim. A redelivery of an exhausted invocation skips
+  re-execution but still re-reports exhaustion, so a message whose DLQ write or
+  post-DLQ XACK failed is re-routed to the DLQ rather than being acknowledged
+  without an entry.
+- `exhausted:<attempt>:<token>:dlq` — the invocation's attempts are exhausted
+  and its DLQ entry has been persisted. It parses exactly like
+  `exhausted:<attempt>:<token>` (same terminal state and attempt count); the
+  suffix only lets a redelivery skip the already-written entry without scanning
+  the DLQ stream, so retrying a partially-written multi-entry DLQ is idempotent.
 - absent — eligible to execute.
 
 Before executing an invocation, the runner claims it via `TryStart`, which
-persists `running:<now+timeout>#<attempts>` — the same capped timeout the local
-`context.WithTimeout` enforces, so the persisted deadline and the local timer
-match by construction. On success `MarkComplete` overwrites the marker with `ok`;
-on failure `RecordFailure` persists `next_attempt_at:<now+backoff>#<attempts>`
-with the rule's backoff (1m/2m/5m/10m); once attempts are exhausted
-`MarkExhausted` writes `exhausted:<attempts>`. Another worker that redelivers
-the message while `now < running_until` or `now < next_attempt_at` skips that
-invocation, because a live attempt (this or another replica) may be executing it
-or it is waiting out its backoff. A crashed worker's marker self-expires at its
-deadline, so recovery waits it out (bounded by at most one timeout) instead of
-racing a live attempt. Bookkeeping failures fail open: a Redis error on the read
-or write never blocks delivery, preserving at-least-once. The message is
+persists `running:<deadline_ms>:<attempt>:<token>` — the same capped timeout the
+local `context.WithTimeout` enforces, so the persisted deadline and the local
+timer match by construction. Eligibility is exact integer-millisecond: a
+running/`next_attempt_at` marker is protected iff `now_ms < deadline_ms` and
+eligible iff `now_ms >= deadline_ms` (no clock-skew fudge). On success
+`MarkComplete` overwrites the marker with `ok`; on failure `RecordFailure`
+persists `next_attempt_at:<deadline_ms>:<attempt>:<token>` with the rule's
+backoff (1m/2m/5m/10m); once attempts are exhausted `MarkExhausted` writes
+`exhausted:<attempt>:<token>`, and a successful DLQ write upgrades it to the
+`:dlq` form. Every active-claim-originated transition CASes BOTH the attempt and
+the token, so a stale owner (whose deadline lapsed and whose invocation was
+re-claimed by a newer token) can never overwrite the newer marker even if the
+attempt number happens to match; a refused (stale/terminal) transition is not an
+ACK — the message stays pending and a superseded claim's outcome can never
+acknowledge or dead-letter a newer claim's message. Another worker that
+redelivers the message while `now_ms < running deadline` or
+`now_ms < next_attempt_at` skips that invocation, because a live attempt (this or
+another replica) may be executing it or it is waiting out its backoff. A crashed
+worker's marker self-expires at its deadline, so recovery waits it out (bounded
+by at most one timeout) instead of racing a live attempt; an active marker's key
+TTL is at least `(deadline - now) + 1m`, so the key can never expire before its
+protected deadline and a reclaim always observes the just-expired marker
+(carrying the attempt forward instead of resetting it). Bookkeeping reads and
+the completion/failure/exhaustion writes fail open: a Redis error on such a read
+or write is logged and never becomes a new failure source — the invocation is
+re-run on a later delivery (at-least-once), and such an error never ACKs the
+message. `TryStart` is the one exception: an ambiguous claim (a
+Redis/transport error, or a claim-token generation failure) fails CLOSED — the
+handler is not executed and the message is left pending, because running a
+duplicate could race a replica that won the same claim. The message is
 acknowledged once every matching invocation is complete, or once all are
 terminal and at least one exhausted (the message is successfully routed to the
 DLQ); the invocation-state key is cleared after a successful XACK on success or

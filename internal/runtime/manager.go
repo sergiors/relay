@@ -949,11 +949,13 @@ func (m *Manager) prepare(
 
 	start := time.Now()
 	// The build runs on an independent, lifecycle-rooted buildTimeout context,
-	// NOT on the caller's ctx: Prepare is a seam for the reconciler, whose ctx
-	// may be a short service-reconcile budget, and a slow image build must not
-	// be cut off by it (while still being cancelled at Relay shutdown via the
-	// manager lifecycle). The reuse probes above deliberately keep using the
-	// caller's ctx — they are quick and must honor its cancellation.
+	// NOT on the caller's ctx. In production the reconciler and the startup
+	// preparation both pass the worker LIFECYCLE context (Prepare is a seam
+	// embedders and tests may also call), so a slow image build must not depend
+	// on the caller's deadline being long, while still being cancelled at Relay
+	// shutdown via the manager lifecycle. The reuse probes above deliberately
+	// keep using the caller's ctx — they are quick and must honor its
+	// cancellation.
 	//
 	// notifyFunctionBuild fires at this exact boundary — after every reuse probe,
 	// immediately before buildImage — so the caller publishes the persisted

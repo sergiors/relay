@@ -10,10 +10,11 @@
 //     FROM, so unchanged dependency manifests are reused across source changes
 //   - Build bounds: a Dockerfile build (function or dependency image) runs on
 //     an independent buildTimeout (10m) rooted in the manager
-//     lifecycle, NOT in the caller's context. The reconciler reaches Prepare
-//     through a short (30s) reconcile budget, which must never cut off a
-//     legitimate image build; the lifecycle root keeps builds cancellable on
-//     Relay shutdown.
+//     lifecycle, NOT in the caller's context. In production the reconciler and
+//     startup preparation pass the worker lifecycle context to Prepare (a seam
+//     embedders and tests may call with any context), and a caller's deadline
+//     must never cut off a legitimate image build; the lifecycle root keeps
+//     builds cancellable on Relay shutdown.
 //   - Execute: a leased container from the function's warm pool (bounded by the
 //     function's resolved concurrency), event JSON on stdin, stdout/stderr
 //     forwarded verbatim to the process output sink as a raw transport (not

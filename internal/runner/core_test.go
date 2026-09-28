@@ -216,7 +216,8 @@ func TestHandleFailureSchedulesRetry(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// First delivery fails: a retry backoff is recorded (not an endRunning).
+	// First delivery fails: a retry backoff is recorded (the running marker is
+	// replaced by a next_attempt_at marker), not left as a bare running marker.
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected failure")
 	}

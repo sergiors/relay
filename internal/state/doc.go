@@ -1,12 +1,15 @@
-// Package state persists a read-only view of Relay's function state in a
-// local SQLite database.
+// Package state persists a read-mostly operator snapshot of Relay's function
+// state in a local SQLite database.
 //
 // The state database is a state VIEW, not the source of truth: /functions (the
-// filesystem root the loader reads) is authoritative. The database is rebuilt
-// automatically when empty and never drives matching, image building, or
-// reconciliation decisions. It exists so operators can introspect what Relay
-// has loaded and how the last reconcile of each function went, independent of
-// Redis or Docker.
+// filesystem root the loader reads) is authoritative. It is not immutable or
+// read-only — the worker writes it (the startup/discovery state phase, the
+// reconcile outcomes, the periodic stats flush) and `relay stats reset` writes
+// it — but it is read-mostly in that no read path mutates it and it never
+// drives matching, image building, or reconciliation decisions. The database is
+// rebuilt automatically when empty. It exists so operators can introspect what
+// Relay has loaded and how the last reconcile of each function went, independent
+// of Redis or Docker.
 //
 // State Model:
 //   - status: the public lifecycle of the current generation. It is linear —
@@ -47,8 +50,8 @@
 //     and there are no per-handler/schedule/service child tables.
 //   - The handler/event and schedule entries deliberately omit the template
 //     parser's opaque matcher patterns: matching is rebuilt from template.yaml,
-//     never from this read-only view, and those matcher interfaces cannot be
-//     JSON round-tripped.
+//     never from this state view, and those matcher interfaces cannot be JSON
+//     round-tripped.
 //
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the
@@ -100,7 +103,7 @@
 // totals continue from zero while the counters stay monotonic.
 //
 // The driver is modernc.org/sqlite (pure Go, CGO-free) so the binary stays
-// static under CGO_ENABLED=0 and the CLI is fully read-only with no external
+// static under CGO_ENABLED=0 and the CLI needs no external database
 // dependencies.
 //
 // Concurrency model:

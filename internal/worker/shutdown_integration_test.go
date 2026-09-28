@@ -427,8 +427,9 @@ export async function slow(event) {
 	// Cancel the worker ctx — the exact runtime effect of SIGTERM (NotifyContext
 	// cancels its ctx when the signal arrives). The in-flight handler's ctx is
 	// derived from this one, so the executor kills the container and returns a
-	// ctx.Err-wrapped error; the runner's failure path calls EndRunning; and
-	// processMessage sees ctx.Err() != nil and leaves the message pending.
+	// ctx.Err-wrapped error; processMessage then sees ctx.Err() != nil and leaves
+	// the message pending (no ACK, no retry accounting), so the invocation's
+	// running marker survives in Redis.
 	shutdownStart := time.Now()
 	env.cancel()
 
@@ -494,10 +495,13 @@ export async function slow(event) {
 		t.Fatal("message should still be pending (not acked) after shutdown")
 	}
 
-	// Invocation state is NOT "ok": the invocation did not complete. In the
-	// graceful-shutdown path the runner's failure branch calls EndRunning, which
-	// HDELs the running marker, so the field is typically absent; a hard crash
-	// would leave it as "running:<deadline>". Either way it must not be "ok".
+	// Invocation state is NOT "ok": the invocation did not complete. The runner
+	// claimed it via TryStart, so the running marker
+	// "running:<deadline_ms>:<attempt>:<token>" (now+25s) survives: the
+	// cancellation makes the failure path's RecordFailure write fail on the
+	// canceled context ("record failure failed; leaving field as-is"), so no
+	// backoff marker replaces it — exactly as a hard crash would leave it. Only
+	// the absence of an "ok" write proves the handler did not finish.
 	invKey := "relay:invocation:" + streamName + ":" + groupName + ":" + msgID
 	if v, err := env.client.HGet(context.Background(), invKey, fnName+"/index.slow").Result(); err == nil && v == "ok" {
 		t.Fatal("invocation state should NOT be 'ok' after mid-handler shutdown")
@@ -515,16 +519,14 @@ export async function slow(event) {
 	// settings reclaims the idle pending message and acks it, proving the message
 	// is recoverable through the normal reclaim path after a crash-like shutdown.
 	//
-	// Invocation-state deletion rationale: after a HARD crash the running marker
-	// survives as "running:<deadline>" (now+25s), and the second consumer's
-	// runner would skip the invocation until that deadline expires — the deadline
-	// model's crash-recovery latency. In THIS graceful-shutdown test the runner's
-	// failure path already cleared the marker via EndRunning, so the field is
-	// absent; the DEL below is therefore a defensive no-op that also covers the
-	// crash case (simulating the running deadline having expired) so the second
-	// consumer executes promptly without a 25s wait. This models the crash
-	// semantics exactly (the marker survives and must be waited out) without
-	// stretching the test.
+	// Invocation-state deletion rationale: the cancellation leaves the running
+	// marker "running:<deadline_ms>:<attempt>:<token>" (now+25s), identical to a
+	// hard crash, and the second consumer's runner would skip the invocation
+	// until that deadline expires — the deadline model's crash-recovery latency.
+	// The DEL below is test-only: it clears the marker so the invocation is
+	// immediately eligible instead of waiting out the remaining ~25s. This keeps
+	// the test focused on message recovery; it does not exercise the production
+	// path where an expired marker carries its attempt forward.
 	_ = env.client.Del(context.Background(), invKey).Err()
 
 	var bCalls atomic.Int64

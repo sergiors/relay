@@ -956,11 +956,11 @@ func TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries(t *testi
 
 // TestIntegrationPerInvocationDLQPartialWriteResumes pins the no-DLQ-scan
 // idempotent retry across a partial multi-entry write. One exhausted invocation
-// already has its entry persisted (marker "exhausted:1:dlq", DLQ entry present);
-// the other is exhausted but unpersisted. A redelivery must write ONLY the
-// missing second entry — never duplicate the first — then ACK. This is the
-// recovery path after a crash between two XADDs (or an XADD batch where one
-// succeeded).
+// already has its entry persisted (marker "exhausted:<attempt>:<token>:dlq", DLQ
+// entry present); the other is exhausted but unpersisted. A redelivery must
+// write ONLY the missing second entry — never duplicate the first — then ACK.
+// This is the recovery path after a crash between two XADDs (or an XADD batch
+// where one succeeded).
 func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
@@ -1004,9 +1004,10 @@ func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 
 // TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent pins the retry
 // after a successful XADD batch whose XACK failed. Both invocation markers are
-// already "exhausted:n:dlq" and both DLQ entries exist (the state a redelivery
-// sees when the ACK was lost). The redelivery must NOT write any new entry (no
-// DLQ scan, no duplicate) and must ACK the message, clearing state.
+// already "exhausted:<attempt>:<token>:dlq" and both DLQ entries exist (the
+// state a redelivery sees when the ACK was lost). The redelivery must NOT write
+// any new entry (no DLQ scan, no duplicate) and must ACK the message, clearing
+// state.
 func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})

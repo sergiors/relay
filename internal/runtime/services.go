@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -595,71 +594,6 @@ func (m *Manager) RemoveFunctionServiceContainers(ctx context.Context, fnName st
 		return 0, err
 	}
 	return len(fnContainers), nil
-}
-
-// RetireServiceImages removes every local image in the named function's repo
-// (via FunctionImageTags) that is NOT still referenced by an existing service
-// container's labelImage. Building the keep-set across ALL remaining service
-// containers (any function) guarantees an image is never removed while an old
-// service container still depends on it, and only relay-fn-<name> tags are ever
-// touched (never non-Relay images, nor other functions' repos). The keep-set is
-// further backed by RemoveImage's container-reference guard, so an image that
-// slips past the keep-set (e.g. a container whose label this boot has not yet
-// observed) is still skipped rather than removed while referenced. Returns the
-// number of images removed.
-//
-// The whole pass is lifecycle-owned: it runs under one removal-operation
-// registration, so manager shutdown refuses a new pass and joins an in-flight
-// one before the Docker client closes.
-func (m *Manager) RetireServiceImages(ctx context.Context, fnName string) (int, error) {
-	opCtx, finish, err := m.beginRemovalOperation(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer finish()
-	containers, err := m.ServiceContainerList(opCtx)
-	if err != nil {
-		return 0, err
-	}
-	keep := make(map[string]bool)
-	for _, c := range containers {
-		if c.Image != "" {
-			keep[c.Image] = true
-		}
-	}
-
-	tags, err := m.FunctionImageTags(opCtx, fnName)
-	if err != nil {
-		return 0, err
-	}
-	removed := 0
-	var firstErr error
-	for _, tag := range tags {
-		if keep[tag] {
-			continue
-		}
-		if err := m.RemoveImageNow(opCtx, tag); err != nil {
-			if errors.Is(err, ErrImageInUse) || errors.Is(err, ErrImageRetiring) || errors.Is(err, ErrManagerShuttingDown) {
-				// A container still references this image, an admitted lease
-				// (a build/execution/publication) still holds it, or the manager
-				// is shutting down; all are the normal transitional state. Defer
-				// to a later pass: log at debug, not counted, not surfaced as a
-				// failure.
-				m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
-				continue
-			}
-			if firstErr == nil {
-				firstErr = err
-			}
-			m.log.Warn("Service: retire image failed", "image", tag, "error", err)
-			continue
-		}
-		removed++
-	}
-	if firstErr != nil {
-		return removed, firstErr
-	}
-	return removed, nil
 }
 
 // validateServiceEntrypoint rejects a service entrypoint that cannot be launched

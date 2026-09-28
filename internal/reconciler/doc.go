@@ -22,8 +22,10 @@
 // because the seeded value is older.
 //
 // When Config.State is set, reconcile outcomes are recorded into the local
-// state database (a read-only state view) — success, failure (retaining the
-// prior active version), unchanged-skip, and removal. State writes never drive
+// state database (a persisted, read-mostly state view) — success, failure
+// (retaining the prior active version), unchanged-skip, and removal. The
+// database is never the source of truth: the worker also writes it (startup
+// discovery, the periodic stats flush), and state writes never drive reconcile
 // decisions and never fail the reconcile loop; errors are only logged.
 //
 // When Config.UpdateSchedules is set, it is called after a function's new

@@ -55,8 +55,10 @@ type StartRun func(logger *slog.Logger) error
 // mutable variables, so a command's paths and connection come from its
 // construction rather than from global state.
 type Dependencies struct {
-	// StatePath is the local state database the read-only administrative
-	// commands (function, stats) open. Production: state.DBPath.
+	// StatePath is the local state database the administrative commands
+	// (function, stats) open. It is read-mostly, not read-only: the read paths
+	// (function inspect, stats) only read, while `stats reset` writes (zeroing
+	// the cumulative counters in place). Production: state.DBPath.
 	StatePath string
 	// SocketPath is the live worker query socket `relay function inspect`
 	// dials for the live runtime-pool gauges. Production: worker.SocketPath.

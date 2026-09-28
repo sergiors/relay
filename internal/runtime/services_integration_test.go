@@ -429,10 +429,7 @@ events:
 	waitForContainerRunning(t, ctx, cli, svc2)
 
 	// Retire svc-retire's images. v2 is referenced by the running container -> kept.
-	removed, err := m.RetireServiceImages(ctx, "svc-retire")
-	if err != nil {
-		t.Fatalf("retire: %v", err)
-	}
+	removed := retireFunctionImages(t, ctx, m, "svc-retire")
 	// v1 is no longer referenced -> removed. v2 kept. (Other unreferenced v-refs:
 	// none.) removed should be >= 1 (v1).
 	if removed == 0 {
@@ -464,9 +461,7 @@ events:
 		t.Fatalf("other function image should exist")
 	}
 	// Retire fn1's images again (any unreferenced leftovers); fn2's must survive.
-	if _, err := m.RetireServiceImages(ctx, "svc-retire"); err != nil {
-		t.Fatalf("retire 2: %v", err)
-	}
+	retireFunctionImages(t, ctx, m, "svc-retire")
 	if !imageExistsInDaemon(cli, ctx, pOther.Image) {
 		t.Error("unrelated function's image must not be touched by retirement")
 	}
@@ -538,6 +533,36 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	if imageExistsInDaemon(cli, ctx, v1Ref) {
 		t.Fatalf("image should have been removed once no container references it")
 	}
+}
+
+// retireFunctionImages retires fn's superseded images through the production
+// primitives the runner's function-removal path drives: FunctionImageTags lists
+// the function's own Relay-owned tags, and each is handed to RemoveImageNow
+// (whose container-reference guard refuses an image a service container still
+// references). Transitional refusals (ErrImageInUse / ErrImageRetiring /
+// ErrManagerShuttingDown) are the normal skip state, mirroring
+// RemoveImagesExcept and the runner's cleanup retry path, and are not counted.
+// It returns how many images were actually removed.
+func retireFunctionImages(t *testing.T, ctx context.Context, m *Manager, fn string) int {
+	t.Helper()
+	tags, err := m.FunctionImageTags(ctx, fn)
+	if err != nil {
+		t.Fatalf("FunctionImageTags(%s): %v", fn, err)
+	}
+	removed := 0
+	for _, tag := range tags {
+		err := m.RemoveImageNow(ctx, tag)
+		if err == nil {
+			removed++
+			continue
+		}
+		if errors.Is(err, ErrImageInUse) || errors.Is(err, ErrImageRetiring) || errors.Is(err, ErrManagerShuttingDown) {
+			t.Logf("retire %s: transitional skip: %v", tag, err)
+			continue
+		}
+		t.Fatalf("RemoveImageNow(%s): %v", tag, err)
+	}
+	return removed
 }
 
 // waitForServiceRunning polls until at least one of fn's service containers is

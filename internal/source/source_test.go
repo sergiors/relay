@@ -272,3 +272,30 @@ func TestNewRejectsDirOutsideRoot(t *testing.T) {
 		t.Fatal("New with dir outside root: nil error, want error")
 	}
 }
+
+// TestExampleFastapiServiceExcludesGeneratedVenv pins the example-hygiene
+// decision: the fastapi-service example ships a function-root .gitignore that
+// excludes its generated Python environment (`.venv/`) as a whole, so source
+// selection never descends into it. Without that root rule the only protection
+// is the generated `.venv/.gitignore` (content `*`), which would itself enter
+// the copy and the fingerprint; a root rule excludes the whole directory before
+// any inner file is read. The test asserts the policy from the real example
+// directory and does not require the (gitignored, developer-local) `.venv`
+// tree to be present, since .gitignore matching is independent of the target's
+// existence.
+func TestExampleFastapiServiceExcludesGeneratedVenv(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "functions", "fastapi-service")
+	selection, err := ForDir(dir)
+	if err != nil {
+		t.Fatalf("ForDir(%s): %v", dir, err)
+	}
+	if selection.Includes(".venv", true) {
+		t.Error("the generated .venv directory must be excluded from source by the example's root .gitignore")
+	}
+	if selection.Includes(".venv/.gitignore", false) {
+		t.Error("no file inside .venv may be source, including its generated inner .gitignore")
+	}
+	if !selection.Includes("app/main.py", false) {
+		t.Error("the example's real application source must remain included")
+	}
+}

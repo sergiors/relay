@@ -60,9 +60,10 @@ const statsFlushInterval = 5 * time.Second
 // reconcileTimeout bounds every bounded service-reconcile daemon operation:
 // the startup orphan container sweep, the startup image keep-set list, the
 // coordinator's per-removal operation context (RemoveAndWait/EnqueueRemove), and
-// — injected into the ServiceReconciler — each normal pre-build and post-build
-// Docker operation inside a per-function Apply. Each such operation gets its own
-// fresh bound so one slow Docker call cannot consume the budget of the calls
+// — injected into the ServiceReconciler — each normal pre-resolution and
+// post-resolution Docker operation inside a per-function Apply. Each such
+// operation gets its own fresh bound so one slow Docker call cannot consume the
+// budget of the calls
 // that follow. It deliberately does NOT bound Dockerfile builds: a build is
 // bounded by runtime.buildTimeout (10m) on a context rooted in the worker
 // lifecycle, so a slow image build can never be cut off by this short reconcile
@@ -328,8 +329,10 @@ func Run(logger *slog.Logger) error {
 	// upserts), Manager.Prepare (the built/reused image's tag), and the
 	// reconciler seed; the selection additionally feeds Manager.Prepare so a
 	// startup build stages the exact policy the tag came from — no stage
-	// re-reads /functions. The state DB is a read-only local state view (see
-	// internal/state), NOT the source of truth and never drives matching or
+	// re-reads /functions. The state DB is a persisted, read-mostly local state
+	// view (see internal/state), NOT the source of truth and NOT a snapshot the
+	// worker only reads: the worker also writes it (this discovery phase,
+	// reconcile outcomes, the 5s stats flush). It never drives matching or
 	// building; it is opened after the fingerprints so even a broken DB still
 	// yields fingerprints for Prepare and the reconciler.
 	_, fingerprintSpan := tracing.Start(startupCtx, "functions.fingerprint")

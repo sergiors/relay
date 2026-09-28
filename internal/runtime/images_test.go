@@ -139,12 +139,15 @@ func TestRelayTagsFiltersToRelayNamespace(t *testing.T) {
 	}
 }
 
-// TestRetireServiceImagesNeverTouchesExternalImage pins the GC ownership rule:
-// image retirement only ever removes Relay's own relay-fn-<name> tags, so an
+// TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages pins the GC
+// ownership rule at the production retirement primitives (FunctionImageTags ->
+// RemoveImageNow, the sequence the runner's function-removal path drives):
+// FunctionImageTags returns only Relay's own relay-fn-<name> tags, so an
 // external `image`-source service's reference (referenced by a running service
-// container) is never a removal candidate. The scripted daemon has no DELETE
-// route for the external reference; the transport fails the test if one is sent.
-func TestRetireServiceImagesNeverTouchesExternalImage(t *testing.T) {
+// container) and another function's repo are never removal candidates. The
+// scripted daemon has no DELETE route for the external reference; the transport
+// fails the test if one is sent.
+func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.T) {
 	const (
 		fn      = "svc-ext"
 		extRef  = "ghcr.io/acme/api:1.2"
@@ -155,22 +158,33 @@ func TestRetireServiceImagesNeverTouchesExternalImage(t *testing.T) {
 		`"relay.identity":"` + extRef + `","relay.image":"` + extRef + `"}}]`
 	dels := 0
 	cli := newScriptedDockerClient(t,
-		// ServiceContainerList + the RemoveImage reference guard both list
-		// containers; the guard sees c1 referencing extRef, so a mistaken attempt
-		// to remove extRef is refused before any DELETE.
+		// RemoveImageNow's reference guard lists containers; it sees c1
+		// referencing extRef, so a mistaken attempt to remove extRef is refused
+		// before any DELETE.
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: containers},
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: imageListJSON(ownTag, otherFn, extRef, "python:3.14-slim")},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-	removed, err := m.RetireServiceImages(context.Background(), fn)
+	tags, err := m.FunctionImageTags(context.Background(), fn)
 	if err != nil {
-		t.Fatalf("RetireServiceImages: %v", err)
+		t.Fatalf("FunctionImageTags: %v", err)
 	}
-	// The only candidate is the function's own unreferenced tag (ownTag); the
-	// keep-set holds extRef (a running service's reference) and otherFn is another
-	// function's repo, never a candidate.
+	// The only candidate is the function's own tag (ownTag); extRef is a running
+	// service's external reference and otherFn is another function's repo, so
+	// neither is ever returned.
+	if len(tags) != 1 || tags[0] != ownTag {
+		t.Fatalf("FunctionImageTags = %v, want exactly [%s]", tags, ownTag)
+	}
+
+	removed := 0
+	for _, tag := range tags {
+		if err := m.RemoveImageNow(context.Background(), tag); err != nil {
+			t.Fatalf("RemoveImageNow(%s): %v", tag, err)
+		}
+		removed++
+	}
 	if removed != 1 {
 		t.Fatalf("removed = %d, want exactly the function's own unreferenced tag", removed)
 	}

@@ -204,7 +204,9 @@ func DLQStreamFor(stream string) string {
 
 // EnsureGroup creates the consumer group if it does not exist, tolerating a
 // group that already exists (BUSYGROUP). MKSTREAM creates the stream if needed;
-// the group reads from "0" so only new messages are consumed.
+// the group starts at "0", so its consumers see every entry already in the
+// stream as well as new ones (not just new messages); a fresh group over an
+// existing stream therefore replays the backlog.
 func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	err := c.client.XGroupCreateMkStream(ctx, c.stream, c.group, "0").Err()
 	if err == nil {

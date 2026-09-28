@@ -201,7 +201,7 @@ var metricHelp = map[string]string{
 	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the function, counted once per handler attempt across event, schedule, and manual invocations.",
 	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the function, counted once per attempt; a failed attempt that will retry is counted here too.",
 	MetricFunctionRetries:                 "Failed handler attempts attributed to the function that will be retried according to the rule's retry budget.",
-	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were routed to the dead-letter queue, counted once per exhausted invocation.",
+	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. Counted when exhaustion is committed for the invocation; the message-level DLQ write happens later, after every exhausted sibling invocation in the same delivery has finished.",
 	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by function and outcome; warm leases an existing idle container, cold starts a fresh container.",
 	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by function and finite teardown reason.",
 	MetricRuntimeContainerWaits:           "Warm-container pool acquires that had to block at the pool's capacity bound, regardless of eventual success.",
@@ -517,8 +517,10 @@ func New() *Registry {
 	// MetricFunctionRetries counts every failing rule execution that will be
 	// retried (a retry driver); MetricFunctionDLQ counts a function once when
 	// its failing rule execution is the one that exhausts the rule's retry
-	// budget (attempt >= 1+retries, per-invocation) and the message is routed
-	// to the DLQ.
+	// budget (attempt >= 1+retries, per-invocation) and the invocation is marked
+	// terminal for the DLQ. It is incremented at that exhaustion commit, which
+	// may precede the actual message-level DLQ write (that happens after all
+	// exhausted siblings in the same delivery finish).
 	for _, name := range []string{
 		MetricFunctionEventsMatched,
 		MetricFunctionHandlerSuccess,
