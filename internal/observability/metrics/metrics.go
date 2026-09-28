@@ -109,6 +109,36 @@ const (
 	// for successful processing.
 	MetricMissingPayload = metricNamespacePrefix + "missing_payload_total"
 
+	// MetricFunctionStatus is the one-hot lifecycle status gauge. Exactly one
+	// status series per function holds 1 (the function's current public status)
+	// and every other allowed status holds 0, so a dashboard can read the
+	// function's lifecycle without summing series. The status label is a closed
+	// set (FunctionStatuses below), so cardinality is bounded by
+	// function × 6; the values mirror the state package's public lifecycle
+	// statuses by convention — this leaf observability package deliberately does
+	// not import state. A status write creates/updates all six series eagerly
+	// (one-hot); a function removal/prune deletes all of them.
+	MetricFunctionStatus = metricNamespacePrefix + "function_status"
+
+	// MetricRedisReadErrors counts failed Redis READ commands by the finite
+	// RedisOp* operation label. It exists to separate an actual read failure
+	// (Redis unreachable, command rejected) from the health/backoff transition
+	// logging noteOutcome performs: the label identifies WHICH read failed, and
+	// no raw error value is ever attached (that would be unbounded). There is
+	// deliberately no reconnect counter: go-redis exposes no reliable
+	// reconnection callback (the DialHook fires per dial, not per recovery), so
+	// the closest signal is the consumer's transition-only "connection
+	// recovered" log, not a metric.
+	MetricRedisReadErrors = metricNamespacePrefix + "redis_read_errors_total"
+
+	// Service reconcile observability. MetricServiceReconciles counts every
+	// ServiceReconciler.Apply outcome (changed/unchanged/error), including the
+	// periodic no-op verification passes; MetricServiceReconcileDuration
+	// observes each pass's wall-clock duration. Both are labeled by the bounded
+	// function dimension, and the outcome label is a closed three-value set.
+	MetricServiceReconciles        = metricNamespacePrefix + "service_reconciles_total"
+	MetricServiceReconcileDuration = metricNamespacePrefix + "service_reconcile_duration_seconds"
+
 	// Warm-container pool observability (Phase 4). The state gauge is labeled by
 	// function and by a fixed state set (idle/busy/starting); acquires are split
 	// into the warm (reused idle container) and cold (freshly started) outcomes;
@@ -186,7 +216,47 @@ var metricHelp = map[string]string{
 	MetricMissingPayload:      "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
 	MetricRuntimeContainers:   "Current number of warm-container pool containers by function and state (idle, busy, or starting).",
 	MetricRuntimePoolCapacity: "Current resolved per-function concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
+
+	MetricFunctionStatus:           "Current public lifecycle status of the function as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
+	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",
+	MetricServiceReconciles:        "Service convergence passes by function and outcome; counted once per ServiceReconciler pass, including periodic no-op verification passes.",
+	MetricServiceReconcileDuration: "Service convergence pass duration in seconds by function, observed for every pass (changed, unchanged, or failed).",
 }
+
+// FunctionStatuses is the closed set of public lifecycle statuses surfaced by
+// MetricFunctionStatus. It mirrors the state package's persisted statuses
+// (preparing/building/reconciling/ready/degraded/unavailable) by convention;
+// this leaf observability package does not import state, so the two lists are
+// kept in sync deliberately. The order here is the canonical one-hot order.
+var FunctionStatuses = []string{
+	"preparing",
+	"building",
+	"reconciling",
+	"ready",
+	"degraded",
+	"unavailable",
+}
+
+// Redis read operation label values: the finite set of Redis READ commands the
+// stream consumer issues. Each labels MetricRedisReadErrors by which command
+// failed; pending_gauge is the periodic XPENDING depth sampler, which is
+// instrumented through the same counter but is distinct from a reclaim-path
+// pending read so the two never double count one command.
+const (
+	RedisOpReadGroup    = "read_group"
+	RedisOpPending      = "pending"
+	RedisOpAutoclaim    = "autoclaim"
+	RedisOpPendingGauge = "pending_gauge"
+)
+
+// Service reconcile outcome label values. A pass that changed container state
+// is "changed", a fully-converged verification pass is "unchanged", and a pass
+// that issued no change but recorded at least one error is "error".
+const (
+	ServiceOutcomeChanged   = "changed"
+	ServiceOutcomeUnchanged = "unchanged"
+	ServiceOutcomeError     = "error"
+)
 
 // Runtime pool gauge label values. They are a closed set so the
 // runtime_containers gauge's cardinality stays bounded by function × 3.
@@ -580,6 +650,55 @@ func New() *Registry {
 		vec:   containerWaits,
 	}
 
+	// Function lifecycle status as a one-hot gauge. The status label is the
+	// closed FunctionStatuses set; SetFunctionStatus writes all six series for a
+	// function atomically (one 1, five 0), and the status removal path deletes
+	// them all alongside the function's other series.
+	functionStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricFunctionStatus,
+		Help: metricHelp[MetricFunctionStatus],
+	}, []string{"function", "status"})
+	reg.MustRegister(functionStatus)
+	r.gaugeVecs[MetricFunctionStatus] = &labeledGaugeVec{
+		order: []string{"function", "status"},
+		vec:   functionStatus,
+	}
+
+	// Redis read failures, labeled solely by the finite operation set. No error
+	// text is ever attached (unbounded cardinality); the caller logs the error.
+	redisReadErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricRedisReadErrors,
+		Help: metricHelp[MetricRedisReadErrors],
+	}, []string{"operation"})
+	reg.MustRegister(redisReadErrors)
+	r.counterVecs[MetricRedisReadErrors] = &labeledCounterVec{
+		order: []string{"operation"},
+		vec:   redisReadErrors,
+	}
+
+	// Service convergence passes: outcome counter (changed/unchanged/error) and
+	// duration histogram, both by the bounded function label.
+	serviceReconciles := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: MetricServiceReconciles,
+		Help: metricHelp[MetricServiceReconciles],
+	}, []string{"function", "outcome"})
+	reg.MustRegister(serviceReconciles)
+	r.counterVecs[MetricServiceReconciles] = &labeledCounterVec{
+		order: []string{"function", "outcome"},
+		vec:   serviceReconciles,
+	}
+
+	serviceReconcileDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    MetricServiceReconcileDuration,
+		Help:    metricHelp[MetricServiceReconcileDuration],
+		Buckets: buckets,
+	}, []string{"function"})
+	reg.MustRegister(serviceReconcileDuration)
+	r.histogramVecs[MetricServiceReconcileDuration] = &labeledHistogramVec{
+		order: []string{"function"},
+		vec:   serviceReconcileDuration,
+	}
+
 	return r
 }
 
@@ -760,8 +879,52 @@ func (r *Registry) SetGaugeLabels(name string, labels []Label, v float64) {
 	}
 }
 
+// SetFunctionStatus writes the one-hot lifecycle status series for a function:
+// exactly the series for status is set to 1 and every other allowed
+// FunctionStatuses value is set to 0, so the exposed set is always coherent and
+// bounded by function × len(FunctionStatuses). The write is a no-op for an
+// unknown status (only the closed set is representable) and for a nil receiver.
+// It creates any missing series, so a function's first status write surfaces all
+// six series rather than only the current one. It never touches Prometheus
+// counters (one-hot gauges are set, not incremented).
+func (r *Registry) SetFunctionStatus(function, status string) {
+	if r == nil || !isFunctionStatus(status) {
+		return
+	}
+	for _, s := range FunctionStatuses {
+		v := 0.0
+		if s == status {
+			v = 1
+		}
+		r.SetGaugeLabels(MetricFunctionStatus, []Label{{Name: "function", Value: function}, {Name: "status", Value: s}}, v)
+	}
+}
+
+// RemoveFunctionStatus deletes every MetricFunctionStatus series labeled
+// function=name, so a removed/pruned function leaves no stale one-hot status
+// behind. It is idempotent and nil-safe. RemoveFunction/SweepFunctionMetrics
+// also delete these series through the shared function-scoped cleanup (the vec is
+// in functionMetrics and classified partial); this method exists for the status
+// observer's explicit removal so a status removal never has to go through the
+// broader cleanup.
+func (r *Registry) RemoveFunctionStatus(name string) {
+	if r == nil {
+		return
+	}
+	r.deleteFunction(MetricFunctionStatus, name)
+}
+
+// isFunctionStatus reports whether status is one of the closed FunctionStatuses.
+func isFunctionStatus(status string) bool {
+	for _, s := range FunctionStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
 // Counter returns the current value of the unlabeled counter with the given
-// name, or 0 when it has not been registered. A nil receiver returns 0.
 func (r *Registry) Counter(name string) int64 {
 	if r == nil {
 		return 0
@@ -973,6 +1136,9 @@ var functionMetrics = []string{
 	MetricRuntimeContainerDiscards,
 	MetricRuntimeContainerAcquireDuration,
 	MetricRuntimeContainerWaits,
+	MetricFunctionStatus,
+	MetricServiceReconciles,
+	MetricServiceReconcileDuration,
 }
 
 // isFunctionCarryingMetric reports whether name is one of the labeled vecs that
@@ -1154,7 +1320,9 @@ func isPartialFunctionMetric(name string) bool {
 		MetricHandlerDuration,
 		MetricRuntimeContainers,
 		MetricRuntimeContainerAcquires,
-		MetricRuntimeContainerDiscards:
+		MetricRuntimeContainerDiscards,
+		MetricFunctionStatus,
+		MetricServiceReconciles:
 		return true
 	}
 	return false

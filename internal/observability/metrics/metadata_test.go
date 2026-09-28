@@ -55,6 +55,10 @@ func seedAllMetrics(r *Registry) {
 	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}})
 	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", "a"}, {"state", RuntimeStateIdle}}, 1)
 	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", "a"}}, 1)
+	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", "a"}, {"status", "ready"}}, 1)
+	r.IncLabels(MetricRedisReadErrors, []Label{{"operation", RedisOpReadGroup}})
+	r.IncLabels(MetricServiceReconciles, []Label{{"function", "a"}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", "a"}}, 2*time.Second)
 	for _, name := range []string{
 		MetricPendingEntries,
 		MetricPendingOldestAge,

@@ -44,14 +44,20 @@
 //     relay_function_retries_total{function}, relay_function_dlq_total{function},
 //     and the warm-container pool acquire/discard/waits CounterVecs below.
 //   - Histograms: relay_handler_duration_seconds{function,handler},
-//     relay_function_build_seconds{function}, and
-//     relay_runtime_container_acquire_duration_seconds{function}
+//     relay_function_build_seconds{function},
+//     relay_runtime_container_acquire_duration_seconds{function}, and
+//     relay_service_reconcile_duration_seconds{function}
 //     (prometheus.DefBuckets; all observed in seconds).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
 //     (Redis backlog depth and age sampled by the stream consumer),
 //     relay_buffered_events (the consumer's local in-flight buffer occupancy),
-//     and relay_in_flight_invocations (the runner's current executing
-//     invocation count).
+//     relay_in_flight_invocations (the runner's current executing
+//     invocation count), and relay_function_status{function,status} (one-hot
+//     public lifecycle: exactly one of the closed status set is 1).
+//   - Selective operational counters: relay_redis_read_errors_total{operation}
+//     (failed Redis reads by the finite operation set; no raw error label) and
+//     relay_service_reconciles_total{function,outcome=changed|unchanged|error}
+//     (every ServiceReconciler pass, including periodic no-op verifications).
 //   - Warm-container pool (runtime, function-scoped):
 //     relay_runtime_pool_capacity{function} and
 //     relay_runtime_containers{function,state=idle|busy|starting} gauges,
@@ -62,7 +68,11 @@
 //     relay_runtime_container_acquire_duration_seconds{function}.
 //
 // The schedule-coordination counters are Prometheus-only: they are deliberately
-// NOT wired into the SQLite stats snapshot.
+// NOT wired into the SQLite stats snapshot. The selective metrics added later —
+// relay_function_status, relay_redis_read_errors_total, and the
+// relay_service_reconcile_* family — are likewise Prometheus-only: a
+// current-state gauge and failure/histogram series are scrape-time observations,
+// not cumulative Relay totals worth persisting.
 //
 // Event classification: the three relay_events_* counters form a closed
 // partition of the logical incoming events the runner handled
@@ -73,9 +83,23 @@
 //
 // Cardinality is bounded: labels are limited to function/handler/outcome plus
 // the small closed runtime-pool value sets (state=idle|busy|starting,
-// outcome=warm|cold, and the finite discard reasons), which are validated
+// outcome=warm|cold, and the finite discard reasons) plus the closed
+// function_status status set and the finite redis read/error operation set,
+// which are validated
 // low-cardinality identifiers. High-cardinality values such as event IDs,
-// message IDs, container IDs, or fingerprints must never be used as labels.
+// message IDs, container IDs, fingerprints, or raw error strings must never be
+// used as labels.
+//
+// Deliberately NOT instrumented (review conclusion):
+//   - Build/version info (a relay_build_info{version,commit} gauge or OTel
+//     resource attribute): the project has no reliable injected version/commit
+//     at build time (no linker-stamped variable is plumbed into the worker), so
+//     any such metric would report a fabricated or empty value. It is skipped
+//     rather than exposing misleading metadata.
+//   - OTel exporter health/callback metrics: the OTel SDK in use exposes no
+//     clean per-export success/failure callback (the trace exporter's internals
+//     are not a supported observation surface). A metric derived from it would
+//     be brittle; skipped.
 //
 // The discard reason label carries ONLY real, finite teardown causes. Persisted
 // per-function discards are one a-causal aggregate, so rather than expose a

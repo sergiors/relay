@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -170,6 +171,20 @@ type State struct {
 	// to advance time deterministically without sleeping. Tests must set it
 	// before any writes, so every stamped row uses the fake clock.
 	nowFn func() time.Time
+
+	// statusObserverMu guards statusObserver. Status writes happen from several
+	// goroutines (the reconciler pump, the service coordinator, startup
+	// preparation), so the observer is read under RLock; it is installed once by
+	// the worker right after Open and normally never changes.
+	statusObserverMu sync.RWMutex
+	// statusObserver, when non-nil, is notified AFTER each successful status
+	// write with the function name and its new public status. The empty status
+	// signals that the function was removed/pruned and its status series should
+	// be deleted. It exists so observability (the metrics registry) can keep the
+	// one-hot function_status gauge in sync with state without this package
+	// importing metrics. A nil observer (or state opened without wiring) is a
+	// silent no-op; state never depends on it.
+	statusObserver func(name, status string)
 }
 
 // fallbackLogger is the package-level default logger used when a State is
@@ -242,6 +257,41 @@ func Open(path string) (*State, error) {
 func (st *State) SetLogger(logger *slog.Logger) {
 	if st != nil && logger != nil {
 		st.log = logger
+	}
+}
+
+// SetStatusObserver installs the observer notified after each SUCCESSFUL status
+// write, called with the function name and its new public status. The metrics
+// wiring uses it to keep the one-hot relay_function_status gauge in sync with
+// the persisted lifecycle without the state package importing metrics. A nil
+// observer (or a nil receiver) clears/leaves the observer unset and is safe.
+//
+// The observer is invoked with the empty status when a function is removed or
+// pruned, which is the signal to delete the function's status series. It is
+// called AFTER the write transaction commits, so an observer can never observe
+// a status the database did not persist, and it is never called for a failed
+// write (the gauge then keeps its prior value rather than claiming a transition
+// that did not land).
+func (st *State) SetStatusObserver(observer func(name, status string)) {
+	if st == nil {
+		return
+	}
+	st.statusObserverMu.Lock()
+	st.statusObserver = observer
+	st.statusObserverMu.Unlock()
+}
+
+// notifyStatus calls the installed status observer, if any. It is a no-op when
+// no observer is installed or the receiver is nil.
+func (st *State) notifyStatus(name, status string) {
+	if st == nil {
+		return
+	}
+	st.statusObserverMu.RLock()
+	observer := st.statusObserver
+	st.statusObserverMu.RUnlock()
+	if observer != nil {
+		observer(name, status)
 	}
 }
 
@@ -404,9 +454,10 @@ func (st *State) RebuildFromFunctions(discovered []DiscoveredFunction) error {
 // rebuildDiscoveredTx writes every prepared discovery in one transaction so a
 // partial scan never leaves a half-populated database. Fingerprints are computed
 // (or supplied) BEFORE this call: the transaction must hold no external I/O
-// (filesystem reads) while it is open, so the body only writes.
+// (filesystem reads) while it is open, so the body only writes. On success every
+// seeded function's preparing status is published to the status observer.
 func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []DiscoveredFunction) error {
-	return st.rebuildTx(ctx, func(tx *sql.Tx) error {
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		for _, d := range discovered {
 			detail := functionSnapshot(d.Function.Name, d.Function.Template, StatusPreparing, "", "", d.Fingerprint, "", "", "", "")
 			detail.UpdatedAt = st.nowString()
@@ -416,6 +467,13 @@ func (st *State) rebuildDiscoveredTx(ctx context.Context, discovered []Discovere
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, d := range discovered {
+		st.notifyStatus(d.Function.Name, StatusPreparing)
+	}
+	return nil
 }
 
 // fingerprintFunctions computes each loaded function's fingerprint once, logging
@@ -480,7 +538,9 @@ func (st *State) RecordDiscoveredWithFingerprint(fn function.Function, fingerpri
 	})
 	if err != nil {
 		st.log.Warn("State: record discovered failed", "function", fn.Name, "error", err)
+		return
 	}
+	st.notifyStatus(fn.Name, StatusPreparing)
 }
 
 // recordDesiredTx is the shared body of the desired-generation writes (startup
@@ -542,7 +602,9 @@ func (st *State) RecordReconcileSuccess(
 	})
 	if err != nil {
 		st.log.Warn("State: record success failed", "function", name, "error", err)
+		return
 	}
+	st.notifyStatus(name, StatusReady)
 }
 
 // RecordPreparing marks the desired configuration as in progress while retaining
@@ -575,7 +637,11 @@ func (st *State) RecordPreparingWithFingerprint(name string, fn function.Functio
 	})
 	if err != nil {
 		st.log.Warn("State: record preparing failed", "function", name, "error", err)
+		return
 	}
+	// recordDesiredTx writes StatusPreparing through the same desired-generation
+	// path as discovery, so the observer is notified with preparing here too.
+	st.notifyStatus(name, StatusPreparing)
 }
 
 // RecordReconcileBuilding changes only the lifecycle status to building. It is
@@ -600,6 +666,7 @@ func (st *State) RecordReconciling(name string) {
 func (st *State) recordStatus(name, status string) {
 	ctx := context.Background()
 	ts := st.nowString()
+	wrote := false
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at FROM functions WHERE name = ?`, name))
@@ -611,11 +678,18 @@ func (st *State) recordStatus(name, status string) {
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE functions SET data = jsonb(?), updated_at = ? WHERE name = ?`, payload, ts, name)
-		return err
+		if _, err = tx.ExecContext(ctx, `UPDATE functions SET data = jsonb(?), updated_at = ? WHERE name = ?`, payload, ts, name); err != nil {
+			return err
+		}
+		wrote = true
+		return nil
 	})
 	if err != nil {
 		st.log.Warn("State: record status failed", "function", name, "status", status, "error", err)
+		return
+	}
+	if wrote {
+		st.notifyStatus(name, status)
 	}
 }
 
@@ -634,6 +708,7 @@ func (st *State) recordStatus(name, status string) {
 func (st *State) RecordReconcileFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
+	status := ""
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
@@ -657,6 +732,7 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 		} else {
 			detail.Status = StatusUnavailable
 		}
+		status = detail.Status
 		detail.UpdatedAt = ts
 		payload, err := marshalFunction(detail)
 		if err != nil {
@@ -669,6 +745,10 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 	})
 	if err != nil {
 		st.log.Warn("State: record failure failed", "function", name, "error", err)
+		return
+	}
+	if status != "" {
+		st.notifyStatus(name, status)
 	}
 }
 
@@ -680,6 +760,7 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 func (st *State) RecordServiceFailure(name string, err2 error) {
 	ctx := context.Background()
 	ts := st.nowString()
+	status := ""
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
 			`SELECT `+jsonPayloadExpr+`, updated_at
@@ -695,6 +776,7 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 		} else {
 			detail.Status = StatusUnavailable
 		}
+		status = detail.Status
 		detail.UpdatedAt = ts
 		payload, err := marshalFunction(detail)
 		if err != nil {
@@ -707,11 +789,17 @@ func (st *State) RecordServiceFailure(name string, err2 error) {
 	})
 	if err != nil {
 		st.log.Warn("State: record service failure failed", "function", name, "error", err)
+		return
+	}
+	if status != "" {
+		st.notifyStatus(name, status)
 	}
 }
 
 // RecordRemoved deletes a function and its per-function stats from the state
-// database, so a removed function never leaves a stale stats row behind.
+// database, so a removed function never leaves a stale stats row behind. On
+// success the status observer is notified with an EMPTY status, the signal to
+// delete the function's status series (a removed function has no lifecycle).
 func (st *State) RecordRemoved(name string) {
 	ctx := context.Background()
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
@@ -719,7 +807,9 @@ func (st *State) RecordRemoved(name string) {
 	})
 	if err != nil {
 		st.log.Warn("State: record removed failed", "function", name, "error", err)
+		return
 	}
+	st.notifyStatus(name, "")
 }
 
 // PruneRemoved removes state rows for every function recorded in the database
@@ -766,6 +856,9 @@ func (st *State) PruneRemoved(dir string) {
 				st.log.Warn("State: prune removed failed", "function", name, "error", rerr)
 				continue
 			}
+			// Notify the observer (empty status) so a function pruned at startup
+			// has its status series removed alongside the row.
+			st.notifyStatus(name, "")
 			st.log.Info("State: function pruned at startup", "function", name)
 		}
 		// Any other stat error (permissions/I/O) is skipped: only a genuine

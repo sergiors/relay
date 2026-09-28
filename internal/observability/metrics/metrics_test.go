@@ -50,6 +50,10 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}})
 	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", "a"}}, time.Millisecond)
 	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", "a"}})
+	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", "a"}, {"status", "ready"}}, 1)
+	r.IncLabels(MetricRedisReadErrors, []Label{{"operation", RedisOpReadGroup}})
+	r.IncLabels(MetricServiceReconciles, []Label{{"function", "a"}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", "a"}}, time.Millisecond)
 	r.SetGauge(MetricPendingEntries, 1)
 	r.SetGauge(MetricPendingOldestAge, 1)
 	r.SetGauge(MetricBufferedEvents, 1)
@@ -76,12 +80,12 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	}
 	// The expected family count is derived from the registry's own registration
 	// tables rather than a hard-coded constant, so adding a collector updates the
-	// expectation automatically. Every static (non-function) collector is one
-	// family; each function-carrying vec contributes one family once seeded.
-	wantFamilies := len(r.counters) + len(r.gauges) + len(functionMetrics)
+	// expectation automatically: one family per registered collector once its
+	// series are seeded (every counter/vec/histogram vec is seeded above).
+	wantFamilies := len(r.counters) + len(r.gauges) + len(r.counterVecs) + len(r.histogramVecs) + len(r.gaugeVecs)
 	if len(seen) != wantFamilies {
-		t.Errorf("gathered %d families, want %d (%d static counters + %d static gauges + %d function vecs)",
-			len(seen), wantFamilies, len(r.counters), len(r.gauges), len(functionMetrics))
+		t.Errorf("gathered %d families, want %d (%d static counters + %d static gauges + %d counter vecs + %d histogram vecs + %d gauge vecs)",
+			len(seen), wantFamilies, len(r.counters), len(r.gauges), len(r.counterVecs), len(r.histogramVecs), len(r.gaugeVecs))
 	}
 }
 

@@ -359,6 +359,13 @@ func Run(logger *slog.Logger) error {
 		st = nil
 	}
 	if st != nil {
+		// Keep the one-hot function_status gauge in sync with every persisted
+		// status transition, centrally, so startup discovery, the reconciler, and
+		// the service callbacks all flow through one seam. Installed immediately
+		// after open, before any discovery/status write, so no transition is
+		// missed. Metrics stay decoupled from state (state imports nothing
+		// observability-related; the worker owns the closure).
+		wireStatusObserver(st, metricsInstance)
 		// SQLite close has no context; the shutdown registry bounds its wait.
 		shutdown.register(shutdownStep{
 			name:    shutdownStepState,
@@ -520,7 +527,7 @@ func Run(logger *slog.Logger) error {
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
-	}, logger, reconcileTimeout)
+	}, logger, reconcileTimeout, reconciler.WithMetrics(metricsInstance))
 	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
@@ -1210,6 +1217,33 @@ func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *m
 	}
 	metricsServer := metrics.NewServer(cfg.MetricsAddr, metricsInstance.Handler(), logger)
 	return metricsInstance, metricsServer
+}
+
+// wireStatusObserver installs the state status observer that projects every
+// persisted lifecycle transition onto the one-hot function_status gauge. An
+// EMPTY status is the removal/prune signal and deletes the function's status
+// series; every other status is written one-hot. It is nil-safe on both the
+// state handle and the registry, so a failed state open (or a nil registry in a
+// test) is a silent no-op. It centralizes the state→metrics bridge in one
+// closure so startup discovery, the reconciler's status writes, and the service
+// callbacks all stay in sync without state importing metrics.
+//
+// When the state handle is nil, no status is projected: every state status write
+// is nil-guarded elsewhere, so there is no authoritative status to observe, and
+// synthesizing one would invent a value the worker does not actually know. The
+// gauge is simply absent in that degraded mode, which is preferable to a wrong
+// one.
+func wireStatusObserver(st *state.State, metricsInstance *metrics.Registry) {
+	if st == nil {
+		return
+	}
+	st.SetStatusObserver(func(name, status string) {
+		if status == "" {
+			metricsInstance.RemoveFunctionStatus(name)
+			return
+		}
+		metricsInstance.SetFunctionStatus(name, status)
+	})
 }
 
 // managedRuntimeBuildContext installs the function-image build observer that

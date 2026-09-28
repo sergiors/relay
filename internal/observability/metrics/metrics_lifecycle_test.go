@@ -28,6 +28,9 @@ func seedFunction(r *Registry, name string) {
 	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", name}, {"reason", "shutdown"}})
 	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", name}}, time.Millisecond)
 	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", name}})
+	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", name}, {"status", "ready"}}, 1)
+	r.IncLabels(MetricServiceReconciles, []Label{{"function", name}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", name}}, time.Millisecond)
 }
 
 // seriesPresent reports whether the snapshot contains a series whose rendered

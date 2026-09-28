@@ -246,6 +246,22 @@ func (c *Consumer) noteOutcome(err error, delay time.Duration) {
 	c.backoff.reset()
 }
 
+// recordRedisReadError increments the Redis read-error counter for a genuine
+// read-command failure, labeled by the finite operation set. It deliberately
+// excludes redis.Nil (a blocking XREADGROUP timeout, not a failure) and context
+// cancellation/deadline (an intentional shutdown, not a Redis fault), mirroring
+// the health path's classification. It never attaches error text: the counter is
+// a count of failures by operation, and the caller keeps logging the error. A
+// nil metrics registry (or nil receiver) is a no-op. One failed command yields
+// exactly one increment.
+func recordRedisReadError(reg *metrics.Registry, operation string, err error) {
+	if err == nil || errors.Is(err, redis.Nil) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	reg.IncLabels(metrics.MetricRedisReadErrors, []metrics.Label{{Name: "operation", Value: operation}})
+}
+
 // bufferSemaphore is a channel-based counting semaphore that bounds the number
 // of locally buffered events (messages read from Redis but not yet finished).
 // It also tracks the current occupancy (a mutex-protected counter) so the
@@ -440,6 +456,7 @@ Drain:
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				break
 			}
+			recordRedisReadError(c.metrics, metrics.RedisOpReadGroup, err)
 			if errors.Is(err, redis.Nil) {
 				// Block timed out with no messages; connectivity is fine.
 				c.noteOutcome(nil, 0)
@@ -542,6 +559,7 @@ func (source *PendingGaugeSource) Refresh(ctx context.Context) {
 	// Count plus the oldest pending message ID in Lower.
 	pending, err := source.client.XPending(ctx, source.stream, source.group).Result()
 	if err != nil {
+		recordRedisReadError(source.metrics, metrics.RedisOpPendingGauge, err)
 		source.log.Debug("Metrics: xpending failed", "stream", source.stream, "group", source.group, "error", err)
 		return
 	}
@@ -614,6 +632,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 		// The recovery loop is paced by its own ticker, so it only feeds the
 		// health state (transition-log + mark unhealthy) and does not run a
 		// second backoff mechanism.
+		recordRedisReadError(c.metrics, metrics.RedisOpPending, err)
 		c.noteOutcome(err, c.backoff.peek())
 		return
 	}
@@ -648,6 +667,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 			Count:    c.count,
 		}).Result()
 		if err != nil {
+			recordRedisReadError(c.metrics, metrics.RedisOpAutoclaim, err)
 			c.noteOutcome(err, c.backoff.peek())
 			return
 		}
@@ -686,6 +706,7 @@ func (c *Consumer) reclaimTick(ctx context.Context, handler Handler) {
 					Stream: c.stream, Group: c.group, Start: msg.ID, End: msg.ID, Count: 1,
 				}).Result()
 				if err != nil || len(entries) == 0 {
+					recordRedisReadError(c.metrics, metrics.RedisOpPending, err)
 					c.log.Debug("Message: beyond reclaim window and pending lookup failed; skipping this tick",
 						"message_id", msg.ID, "error", err)
 					continue

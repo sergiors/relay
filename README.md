@@ -2032,10 +2032,20 @@ remains the health check.
   `function_build_seconds{function}`. Gauges: `pending_entries`,
   `pending_oldest_age_seconds` — sampled from the Redis consumer group
   (`XPENDING`) every 15s, not per event — plus `buffered_events` (the current
-  local buffer occupancy, set on each acquire/release) and
+  local buffer occupancy, set on each acquire/release),
   `in_flight_invocations` (the current number of executing invocations in this
-  worker), and the `concurrency_waits_total` counter (each time an invocation's
-  concurrency-slot acquisition had to block). Schedule coordination counters
+  worker), and `function_status{function,status}` (a one-hot public lifecycle
+  gauge: exactly one of `preparing`/`building`/`reconciling`/`ready`/`degraded`/
+  `unavailable` is 1 and the rest are 0, kept in sync with the persisted state
+  through an observer the worker installs at startup), and the
+  `concurrency_waits_total` counter (each time an invocation's
+  concurrency-slot acquisition had to block). Selective operational counters:
+  `redis_read_errors_total{operation}` (failed Redis reads by the finite
+  operation set `read_group`/`pending`/`autoclaim`/`pending_gauge`; no raw error
+  is ever a label) and `service_reconciles_total{function,outcome}` with
+  `service_reconcile_duration_seconds{function}` (every `ServiceReconciler`
+  pass, including periodic no-op verification passes; outcome is
+  `changed`/`unchanged`/`error`). Schedule coordination counters
   (`schedule_occurrences_published_total`,
   `schedule_occurrences_duplicate_total`, `schedule_publish_failures_total`,
   `schedule_publish_retries_total`, `schedule_publish_exhausted_total`,

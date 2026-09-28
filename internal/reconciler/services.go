@@ -47,6 +47,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 
 	"relay/internal/function"
+	"relay/internal/observability/metrics"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 )
@@ -598,7 +599,23 @@ type ServiceReconciler struct {
 	// lifecycle.
 	reconcileTimeout time.Duration
 
+	// metrics is the optional observability registry. When nil every metric call
+	// is a no-op; it is set through NewServiceReconciler's options (the worker
+	// passes WithMetrics). It is never used to gate behavior.
+	metrics *metrics.Registry
+
 	mu sync.Mutex
+}
+
+// ServiceReconcilerOption configures optional ServiceReconciler dependencies.
+// Options keep existing callers (and tests) source-compatible: a call without
+// options behaves exactly as before, with observability disabled.
+type ServiceReconcilerOption func(*ServiceReconciler)
+
+// WithMetrics wires the metrics registry that records service reconcile
+// outcomes and durations. A nil registry leaves observability disabled.
+func WithMetrics(reg *metrics.Registry) ServiceReconcilerOption {
+	return func(c *ServiceReconciler) { c.metrics = reg }
 }
 
 // NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
@@ -606,21 +623,29 @@ type ServiceReconciler struct {
 // services whose template declares a host). reconcileTimeout is the worker's
 // normal-service-operation budget, applied by Reconcile to every pre-resolution
 // and post-resolution Docker operation (a non-positive value leaves them bounded
-// only by the lifecycle context).
+// only by the lifecycle context). Options are optional (e.g. WithMetrics for
+// observability).
 func NewServiceReconciler(
 	docker Docker,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 	reconcileTimeout time.Duration,
+	opts ...ServiceReconcilerOption,
 ) *ServiceReconciler {
-	return &ServiceReconciler{
+	c := &ServiceReconciler{
 		docker:           docker,
 		secrets:          secrets,
 		traefik:          traefik,
 		log:              log,
 		reconcileTimeout: reconcileTimeout,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
 }
 
 // Apply converges fnName's services to tmpl+image: it runs Reconcile and logs
@@ -657,7 +682,13 @@ func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *func
 		replicas += svc.Replicas
 	}
 
+	// Observe every pass exactly once, including the periodic no-op
+	// verification: the duration covers the whole Reconcile call and the outcome
+	// is the closed changed/unchanged/error set. A nil registry is a no-op. The
+	// function label is the existing bounded dimension.
+	start := time.Now()
 	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, reconcileStarted)
+	c.observeReconcile(fnName, changed, err, time.Since(start))
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
 			"function", fnName,
@@ -680,6 +711,31 @@ func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *func
 		"replicas", replicas,
 	)
 	return nil
+}
+
+// observeReconcile records one service pass's outcome and duration. The outcome
+// is error when the pass returned an error (even if it also changed some
+// containers — the error is the operator-relevant signal), changed when it
+// converged container state, and unchanged for a fully-converged verification
+// pass. It is nil-registry-safe.
+func (c *ServiceReconciler) observeReconcile(fnName string, changed bool, err error, d time.Duration) {
+	if c.metrics == nil {
+		return
+	}
+	outcome := metrics.ServiceOutcomeUnchanged
+	switch {
+	case err != nil:
+		outcome = metrics.ServiceOutcomeError
+	case changed:
+		outcome = metrics.ServiceOutcomeChanged
+	}
+	c.metrics.IncLabels(metrics.MetricServiceReconciles, []metrics.Label{
+		{Name: "function", Value: fnName},
+		{Name: "outcome", Value: outcome},
+	})
+	c.metrics.ObserveDurationLabels(metrics.MetricServiceReconcileDuration, []metrics.Label{
+		{Name: "function", Value: fnName},
+	}, d)
 }
 
 // Remove stops and removes every service container belonging to fnName. Called
