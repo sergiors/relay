@@ -229,8 +229,17 @@ func NetworksLabel(networks ...string) string {
 // EnvHash returns the short content hash of a service replica's effective
 // environment (relay.env_hash): a deterministic, order-sensitive digest over the
 // exact Config.Env slice StartService applies. It is a one-way hash, so no
-// secret value is ever exposed in a label, log, metric, or inspect output — the
-// environment itself is the only place values live.
+// secret value is ever exposed in a label, log, metric, or inspect output.
+//
+// The digest is deliberately UNSALTED (a plain SHA-256 of the NUL-joined
+// Config.Env entries): the reconciler compares a discovered container's label
+// against a freshly computed desired hash on every pass and across worker
+// restarts, so the value must be a deterministic function of the environment
+// alone. A salt would require a stable key persisted somewhere, and without such
+// a key it would change across restarts and break deterministic reconciliation
+// (spuriously replacing every service container). A salted digest with a
+// persisted key remains a possible future hardening step; the value carries no
+// raw content either way.
 //
 // The reconciler uses it to detect that a container's environment no longer
 // matches the template: a changed template env on an `image` source (whose image

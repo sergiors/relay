@@ -170,10 +170,10 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("image service = %+v", im)
 	}
 
-	// Env values (including one containing '=') survive; secrets hold only the
-	// reference name, never a value.
-	if detail.Env["API_URL"] != "https://api.example.com" || detail.Env["CONN"] != "postgres://user:pass@host/db" {
-		t.Fatalf("env = %v", detail.Env)
+	// Env keys survive with redacted values; secrets hold only the reference
+	// name, never a value — and no literal env value is present.
+	if detail.Env["API_URL"] != RedactedEnvValue || detail.Env["CONN"] != RedactedEnvValue {
+		t.Fatalf("env = %v, want redacted values for both keys", detail.Env)
 	}
 	if detail.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("secrets = %v", detail.Secrets)
@@ -260,6 +260,47 @@ func TestFunctionRemovalDeletesSnapshotAndStats(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("functions rows = %d, want 0", n)
+	}
+}
+
+// TestFunctionSnapshotNeverPersistsLiteralEnvOrSecretValues is the canary guard
+// for the state file: the DB is a local file an operator can read, so a literal
+// template env value must never appear in the raw functions.data payload. The
+// env keys survive (structurally) with the redaction marker; secret references
+// are names only by construction (no resolved value ever reaches
+// functionSnapshot).
+func TestFunctionSnapshotNeverPersistsLiteralEnvOrSecretValues(t *testing.T) {
+	c := openTestState(t)
+	const envCanary = "CANARY-ENV-VALUE-7f3a"
+	tmpl := mustTemplate(t, `runtime: python3.14
+env:
+  API_URL: `+envCanary+`
+  TOKEN: another-literal
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+`)
+	c.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
+
+	data, _, _ := rawFunctionData(t, c, "demo")
+	if strings.Contains(data, envCanary) || strings.Contains(data, "another-literal") {
+		t.Errorf("raw snapshot leaked a literal env value:\n%s", data)
+	}
+	// The structural keys and the redaction marker are present.
+	if !strings.Contains(data, "API_URL") || !strings.Contains(data, "TOKEN") || !strings.Contains(data, RedactedEnvValue) {
+		t.Errorf("raw snapshot must keep env keys and the redaction marker:\n%s", data)
+	}
+	if !strings.Contains(data, "DATABASE_URL") || !strings.Contains(data, "database-url") {
+		t.Errorf("raw snapshot must keep the secret reference name:\n%s", data)
+	}
+
+	// The typed read also exposes only redacted env values.
+	detail, _ := c.GetFunction("demo")
+	if detail.Env["API_URL"] != RedactedEnvValue || detail.Env["TOKEN"] != RedactedEnvValue {
+		t.Errorf("read-back env = %v, want redacted values", detail.Env)
 	}
 }
 

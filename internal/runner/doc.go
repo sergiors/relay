@@ -46,11 +46,14 @@
 //     (startup, reconciler, Redis client) are not recovered and stay fatal
 //   - Secrets: a template's secret references are resolved to values immediately
 //     before each execution (via the provider set with SetSecretProvider) and
-//     passed to the executor as extra env. Resolved values are never cached on
-//     Prepared, never baked into images, and never logged; a resolution failure
-//     is a failed attempt that flows through the normal retry/exhaustion
-//     machinery. A template that references a secret with no provider configured
-//     fails the invocation with a clear error naming the reference.
+//     passed to the executor as extra env. The executor carries those values (and
+//     the template's literal env values) in the per-invocation request frame to
+//     the reused bootstrap process; they are never written into an execution
+//     container's Docker Config.Env, never cached on Prepared, never baked into
+//     images, never logged, and never persisted. A resolution failure is a failed
+//     attempt that flows through the normal retry/exhaustion machinery. A
+//     template that references a secret with no provider configured fails the
+//     invocation with a clear error naming the reference.
 //
 // Key Guarantees:
 //   - Handle holds one registry snapshot for the whole call, so in-flight

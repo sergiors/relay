@@ -140,7 +140,7 @@ func TestResetStatsZeroesCountersKeepsGauges(t *testing.T) {
 	if len(detail.Services) != 1 || detail.Services[0].Port != 3000 || detail.Services[0].Replicas != 2 {
 		t.Fatalf("services must survive: %+v", detail.Services)
 	}
-	if detail.Env["API_URL"] != "https://api.example.com" || detail.Secrets["DATABASE_URL"] != "database-url" {
+	if detail.Env["API_URL"] != RedactedEnvValue || detail.Secrets["DATABASE_URL"] != "database-url" {
 		t.Fatalf("env/secret mappings must survive: env=%v secrets=%v", detail.Env, detail.Secrets)
 	}
 }

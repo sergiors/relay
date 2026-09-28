@@ -21,14 +21,25 @@
 //     once idle longer than the configured timeout, and a removed function's
 //     warm state is discarded (see container_cache.go)
 //
-// Env and secrets injection: each execution container's environment is the base
-// RELAY_HANDLER var, then the function's plan env (runtime needs), then the
-// per-invocation extra env (the template's literal env values and resolved
-// secret values, passed to Execute). Secret values are resolved by the runner
-// immediately before each execution and live only in the container's Config.Env
-// — never in Prepared, never in the fingerprint, never in the image, and never
-// in the state database. template.yaml is excluded from the build context so env
-// values and secret references are never baked into image layers.
+// Env and secrets injection: an execution container's Docker Config.Env is only
+// the function's plan env (runtime needs, e.g. PYTHONDONTWRITEBYTECODE) — never
+// the template's literal env values and never a resolved secret. Per-invocation
+// values (template env + resolved secrets) are carried in the request frame's
+// "env" object and applied by the reused bootstrap process (python/ and node/),
+// resolved by the runner immediately before each execution. They are never in
+// Prepared, never in the fingerprint, never in the image, never in a Docker
+// label, metric, log, or trace, and never in the state database. template.yaml
+// is excluded from the build context so env values and secret references are
+// never baked into image layers.
+//
+// Persistent service containers are the deliberate exception: a long-lived
+// service process needs its environment at process START, so StartService
+// writes the effective env (plan env + template env + resolved secrets + PORT)
+// into the service container's Docker Config.Env. Those values are therefore
+// readable through the Docker daemon/API (docker inspect, the Docker socket) by
+// anyone already trusted with daemon access, which is the same trust boundary as
+// the host itself. Relay never writes any value into a Docker label, log line,
+// metric, or span; only the one-way relay.env_hash digest is labeled.
 //
 // The build context stages exactly the function's selected source via the shared
 // internal/source policy (the function's .gitignore rules), the same selection

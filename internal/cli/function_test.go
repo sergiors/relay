@@ -291,9 +291,9 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 	}
 }
 
-// TestFunctionInspectShowsEnvSecretsMappings verifies inspect renders the
-// env/secret MAPPINGS (literal env values and secret references) but never a
-// secret VALUE.
+// TestFunctionInspectShowsEnvSecretsMappings verifies inspect renders the env
+// NAMES (values redacted) and secret REFERENCE names, but never a literal env
+// value and never a secret value.
 func TestFunctionInspectShowsEnvSecretsMappings(t *testing.T) {
 	st, _ := openTempState(t)
 
@@ -319,7 +319,7 @@ events:
 	out := w.String()
 	for _, want := range []string{
 		"Environment:",
-		"API_URL=https://api.example.com",
+		"API_URL=[redacted]",
 		"Secrets:",
 		"DATABASE_URL=database-url",
 	} {
@@ -327,9 +327,12 @@ events:
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
 	}
-	// The secret VALUE must never appear — only the reference.
-	if strings.Contains(out, "postgres://") {
-		t.Errorf("inspect leaked a secret value:\n%s", out)
+	// Inspect shows env NAMES only: the literal env value and any secret value
+	// must never appear.
+	for _, leaked := range []string{"https://api.example.com", "postgres://", "database-url-secret"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("inspect leaked a value %q:\n%s", leaked, out)
+		}
 	}
 }
 

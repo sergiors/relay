@@ -103,6 +103,31 @@ func TestEnvHashEmptyIsStableAndValueFree(t *testing.T) {
 	}
 }
 
+// TestEnvHashDeterministicAcrossProcesses pins the cross-restart determinism the
+// service reconciler depends on: the same effective env must hash to the SAME
+// value every time and every build. The digest is a pure, UNSALTED function of
+// the env alone (nothing per-boot is mixed in), so a container labeled before a
+// worker restart still compares equal after it. A salted digest with no
+// persisted key would break that and spuriously replace every service container
+// on each restart; this test guards against introducing a process-random salt.
+// Only the digest is asserted, never a raw env value.
+func TestEnvHashDeterministicAcrossProcesses(t *testing.T) {
+	env := []string{"A=1", "TOKEN=secret-value", "PORT=8080"}
+	first := EnvHash(env)
+	second := EnvHash(append([]string(nil), env...))
+	if first != second {
+		t.Fatalf("EnvHash is not deterministic: %q vs %q", first, second)
+	}
+	// The exact digest pins the UNSALTED construction across builds.
+	const want = "f913ec6c9980f339"
+	if first != want {
+		t.Fatalf("EnvHash = %q, want the unsalted construction %q", first, want)
+	}
+	if strings.Contains(first, "secret-value") {
+		t.Fatalf("EnvHash leaked env content: %q", first)
+	}
+}
+
 func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

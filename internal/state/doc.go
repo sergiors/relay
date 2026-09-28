@@ -38,9 +38,9 @@
 //     NULL) stores ONE whole per-function snapshot as a JSON object in data,
 //     written through SQLite's jsonb(?) (binary JSON / JSONB format) and read
 //     back with json(data). Only the stable name key and the write timestamp
-//     stay as columns. The nested configuration — the env and secret MAPPINGS
-//     (env-var name → literal value, and env-var name → secret REFERENCE, never
-//     a secret value), the event handlers (name
+//     stay as columns. The nested configuration — the env names (each value is
+//     the fixed RedactedEnvValue marker, never the literal template value) and
+//     the secret REFERENCE names (never a secret value), the event handlers (name
 //   - timeout), the schedules (handler/cron/timezone/timeout/retries), and the
 //     services (entrypoint/image/host/path/port/replicas) — is all part of
 //     that one payload, so a template change replaces the snapshot atomically
@@ -51,7 +51,8 @@
 //     JSON round-tripped.
 //
 // Secret values are never stored: only the reference names appear in the
-// snapshot.
+// snapshot. Literal env values are never stored either: env entries keep the
+// env-var name only, with a fixed redaction marker as the value.
 //
 // Design Constraint:
 //   - State errors are never fatal. Callers (main, reconciler) log them and

@@ -63,6 +63,10 @@ type Row struct {
 // embedded Row fields and every field below — except Name, UpdatedAt, and the
 // derived HandlerCount — are part of that snapshot.
 //
+// Env holds env-var names only (each value is RedactedEnvValue); literal env
+// values are never persisted. Secrets holds secret reference names only, never
+// resolved values.
+//
 // Generation model: Image/Fingerprint/PreparedAt describe the last USABLE
 // (successfully prepared and serving) generation and are only replaced by a
 // success. DesiredFingerprint is the latest desired content fingerprint seen by
@@ -72,16 +76,20 @@ type Row struct {
 // LastError describe the last MEANINGFUL reconcile outcome.
 type Detail struct {
 	Row
-	Image              string            `json:"image,omitempty"`
-	Fingerprint        string            `json:"fingerprint,omitempty"`
-	DesiredFingerprint string            `json:"desired_fingerprint,omitempty"`
-	LastReconcileAt    string            `json:"last_reconcile_at,omitempty"`
-	LastError          string            `json:"last_error,omitempty"`
-	Handlers           []Handler         `json:"handlers,omitempty"`
-	Schedules          []Schedule        `json:"schedules,omitempty"`
-	Services           []Service         `json:"services,omitempty"`
-	Env                map[string]string `json:"env,omitempty"`
-	Secrets            map[string]string `json:"secrets,omitempty"`
+	Image              string     `json:"image,omitempty"`
+	Fingerprint        string     `json:"fingerprint,omitempty"`
+	DesiredFingerprint string     `json:"desired_fingerprint,omitempty"`
+	LastReconcileAt    string     `json:"last_reconcile_at,omitempty"`
+	LastError          string     `json:"last_error,omitempty"`
+	Handlers           []Handler  `json:"handlers,omitempty"`
+	Schedules          []Schedule `json:"schedules,omitempty"`
+	Services           []Service  `json:"services,omitempty"`
+	// Env holds the function's env-var NAMES only: each value is the fixed
+	// RedactedEnvValue marker, never the literal template value. Literal env
+	// values live only in template.yaml and in the runtime injection path; the
+	// state snapshot (a local file an operator can read) must never carry them.
+	Env     map[string]string `json:"env,omitempty"`
+	Secrets map[string]string `json:"secrets,omitempty"`
 	// Resources is the function's EFFECTIVE per-container resource configuration
 	// (memory/cpus/pids), resolved with defaults. It is part of the persisted
 	// snapshot so `relay function inspect` can render it; the values are
@@ -883,7 +891,9 @@ func upsertFunctionTx(ctx context.Context, tx *sql.Tx, detail Detail) error {
 // lifecycle fields passed in PLUS the whole configuration (env/secret
 // references, handlers, schedules, services). Name is relational
 // metadata and UpdatedAt is stamped by the caller; HandlerCount is derived on
-// read. Secret entries hold only the reference name — never a resolved value.
+// read. Secret entries hold only the reference name — never a resolved value —
+// and env entries hold only the env-var name plus a redaction marker, never the
+// literal value.
 func functionSnapshot(
 	name string,
 	tmpl *function.Template,
@@ -933,16 +943,25 @@ func snapshotResources(tmpl *function.Template) *Resources {
 	}
 }
 
+// RedactedEnvValue is the fixed marker stored as every env value in the
+// persisted snapshot. The state database is a local file an operator can read,
+// so it records env-var NAMES only (structural keys); the literal template
+// value is never written. Keeping the map shape (name -> marker), rather than
+// a bare key list, preserves the internal JSON shape and lets the CLI render
+// the configured names without any code-path branching.
+const RedactedEnvValue = "[redacted]"
+
 // snapshotConfig copies a template's env and secret MAPPINGS for the persisted
-// snapshot. Only the env/secret MAPPINGS are
-// stored (env-var name → literal value, and env-var name → secret reference) —
-// never a secret VALUE. Empty maps stay nil so the payload omits them and
-// a read-back yields nil (the CLI's "section absent" convention).
+// snapshot. Only the env/secret MAPPINGS are stored (env-var name → secret
+// reference, and env-var name → the fixed RedactedEnvValue marker) — never a
+// literal env value and never a resolved secret value. Empty maps stay nil so
+// the payload omits them and a read-back yields nil (the CLI's "section
+// absent" convention).
 func snapshotConfig(tmpl *function.Template) (env, secrets map[string]string) {
 	if len(tmpl.Env) > 0 {
 		env = make(map[string]string, len(tmpl.Env))
-		for name, value := range tmpl.Env {
-			env[name] = value
+		for name := range tmpl.Env {
+			env[name] = RedactedEnvValue
 		}
 	}
 	if len(tmpl.Secrets) > 0 {

@@ -854,9 +854,11 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 	}
 }
 
-// TestEnvSecretsMappingsPersisted verifies the env/secret MAPPINGS (never
-// values) round-trip through the functions table, including env values that
-// contain '=' (which is why JSON, not logfmt, is used).
+// TestEnvSecretsMappingsPersisted verifies the env names and secret REFERENCE
+// names round-trip through the functions table, and that the env values are
+// REDACTED: the literal template env values must never appear in the persisted
+// snapshot (the DB is a local file an operator can read). Env-var keys are
+// preserved so inspect can render them; values are the fixed marker.
 func TestEnvSecretsMappingsPersisted(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, `runtime: python3.14
@@ -876,20 +878,36 @@ events:
 	if !ok {
 		t.Fatal("expected row")
 	}
-	if detail.Env["API_URL"] != "https://api.example.com" {
-		t.Errorf("env API_URL = %q, want https://api.example.com", detail.Env["API_URL"])
+	if _, ok := detail.Env["API_URL"]; !ok {
+		t.Errorf("env API_URL key missing, got %v", detail.Env)
 	}
-	// An env value containing '=' must survive intact.
-	if detail.Env["CONN"] != "postgres://user:pass@host/db" {
-		t.Errorf("env CONN = %q, want the full connection string", detail.Env["CONN"])
+	if _, ok := detail.Env["CONN"]; !ok {
+		t.Errorf("env CONN key missing, got %v", detail.Env)
+	}
+	for name, val := range detail.Env {
+		if val != RedactedEnvValue {
+			t.Errorf("env %s = %q, want the redaction marker %q", name, val, RedactedEnvValue)
+		}
 	}
 	if detail.Secrets["DATABASE_URL"] != "database-url" {
 		t.Errorf("secrets DATABASE_URL = %q, want database-url (the reference, never a value)", detail.Secrets["DATABASE_URL"])
 	}
+
+	// The raw stored snapshot must not contain any literal env value.
+	data, _, _ := rawFunctionData(t, c, "fn")
+	for _, leaked := range []string{"https://api.example.com", "postgres://user:pass@host/db"} {
+		if strings.Contains(data, leaked) {
+			t.Errorf("raw snapshot leaked literal env value %q:\n%s", leaked, data)
+		}
+	}
+	if !strings.Contains(data, RedactedEnvValue) {
+		t.Errorf("raw snapshot must carry the redaction marker:\n%s", data)
+	}
 }
 
 // TestEnvSecretsMappingsNilWhenAbsent verifies a template with no env/secrets
-// yields nil maps (not empty non-nil maps).
+// yields nil maps (not empty non-nil maps) — including a hand-built Template
+// whose Env/Secrets maps are nil (never parsed), which must not panic.
 func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
@@ -904,6 +922,18 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	}
 	if detail.Secrets != nil {
 		t.Errorf("secrets = %v, want nil when absent", detail.Secrets)
+	}
+
+	// A directly-constructed Template (nil Env/Secrets maps) must not panic and
+	// must also persist nil maps.
+	direct := &function.Template{Runtime: "node24"}
+	c.RecordReconcileSuccess("direct", "img", "fp", time.Now(), fnFor(t, "direct", direct))
+	d, ok := c.GetFunction("direct")
+	if !ok {
+		t.Fatal("expected direct row")
+	}
+	if d.Env != nil || d.Secrets != nil {
+		t.Errorf("direct-built template env/secrets = %v/%v, want nil", d.Env, d.Secrets)
 	}
 }
 

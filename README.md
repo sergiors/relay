@@ -513,8 +513,12 @@ a time.
 
 Because the interpreter process persists, function code must not assume
 process-global state is fresh per invocation. Module-level state may survive
-between invocations, and per-invocation environment values are applied to the
-long-running process for each request.
+between invocations. Per-invocation environment values are applied EXACTLY for
+each request: a key that a new request frame no longer carries is restored to
+its pre-Relay process value (or removed), so a rotated or removed env value or
+secret never leaks into a later invocation, while unrelated OS/system/container
+variables are left untouched. `RELAY_HANDLER` is reserved and overwritten every
+invocation.
 
 A container is returned to the idle pool only while it remains healthy.
 Timeouts, process exits, protocol errors, image changes, and shutdown invalidate
@@ -873,7 +877,16 @@ events:
   never changes the fingerprint and never requires a rebuild or restart.
 - Env values and secret references are injected at runtime only — they are never
   baked into the function image (template.yaml is excluded from the build
-  context), never stored in the state database, and never logged.
+  context). For **event/schedule invocations**, the template env values and the
+  resolved secret values are carried in the per-invocation request frame and
+  applied by the reused bootstrap process; they are **never** written to the
+  execution container's Docker `Config.Env`, a Docker label, a metric, a log, a
+  trace, or the state database. For **persistent service containers** the
+  effective environment (plan env + template env + resolved secrets + `PORT`)
+  is necessarily written to the service container's Docker `Config.Env` at
+  process start; see _Secrets → Docker access boundary_ below. `relay function
+  inspect` shows env-var names (values redacted) and secret reference names
+  only, never a value.
 
 A pattern is a tree of field conditions:
 
@@ -1478,7 +1491,8 @@ how the last reconcile of each function went without touching Redis or Docker.
   mounts a named volume `relay-data` at `/var/lib/relay`.
 - **Schema**: a `functions` table (`name`, `data`, `updated_at`) where `data` is
   a single stored JSON snapshot of the whole function — runtime/status/image/
-  fingerprint/prepared_at/last-reconcile outcome, env/secret **mappings**,
+  fingerprint/prepared_at/last-reconcile outcome, env-var **names** (values
+  redacted) and secret **references** (values never stored),
   handlers (name/timeout/retries), schedules (handler/cron/timezone/
   timeout/retries), and services (entrypoint/image/host/path/port/
   replicas) — with only the stable name key and write timestamp kept as columns.
@@ -1491,7 +1505,8 @@ how the last reconcile of each function went without touching Redis or Docker.
   (`jsonb(?)` on write, `json(data)` on read). Only stable relational metadata is
   a column; the evolving payload is JSON so new instrumentation needs no schema
   change, and absent fields decode to zero. Secret **references** (never values)
-  live inside the function snapshot. These are **current snapshots only** — no
+  and env-var **names** (values redacted) live inside the function snapshot.
+  These are **current snapshots only** — no
   per-event rows, no metric history (Prometheus is the time-series source).
 - **State model**: `status` is the public lifecycle of the current generation:
   `preparing` (a discovered or newly desired generation is being prepared) ->
@@ -1590,12 +1605,14 @@ Stats:
 ```
 
 `relay function inspect <name>` also shows the function's env and secret
-**mappings** (from its template) when it defines any — literal env values and
-secret references, never secret values:
+**mappings** (from its template) when it defines any. Env values are **always
+redacted** — inspect renders the configured env-var names with a `[redacted]`
+placeholder, never a literal value; secrets show only their reference name,
+never a resolved value:
 
 ```
 Environment:
-  API_URL=https://api.example.com
+  API_URL=[redacted]
 
 Secrets:
   DATABASE_URL=database-url
@@ -1728,9 +1745,30 @@ acquired the lock.
 Relay stores secrets as files on disk, one per secret, under a fixed directory.
 Templates reference secrets by name; the runtime resolves each reference to its
 value immediately before an execution and injects it into the container's
-environment. Resolved values live only in the container's `Config.Env` — they
-are never baked into images, never stored in the state database, never logged,
-and never shown by `relay function inspect` (which shows only the reference).
+environment. Resolved values are never baked into images, never stored in the
+state database, never logged, and never shown by `relay function inspect` (which
+shows only the reference).
+
+- **Where values live.** For an **event/schedule invocation**, the resolved
+  value (and the template's literal env values) live only in the JSON request
+  frame the reused bootstrap process applies to its own process environment for
+  that one invocation; they are never written to the execution container's
+  Docker `Config.Env`, a Docker label, a metric, a log, or a trace. For a
+  **persistent service container**, a long-lived process needs its environment
+  at process start, so the effective environment (plan env + template env +
+  resolved secrets + `PORT`) is written to the service container's Docker
+  `Config.Env` at create time. Relay never writes a value into a Docker label,
+  metric, log, or span — only the one-way `relay.env_hash` digest is labeled.
+- **Docker access boundary.** A service container's environment is therefore
+  readable through the Docker daemon/API — `docker inspect`, the Docker socket,
+  or any process with daemon access. That is exactly the trust boundary of the
+  host: anyone who can talk to the Docker daemon can already read every
+  container's environment, the mounted Relay data volume (including the secrets
+  files themselves), and the process memory of any container. Relay's guarantee
+  is that a secret value is never stored in, or exposed through, Relay's own
+  surfaces (the state database, template.yaml, labels, logs, metrics, and
+  traces) — not that it is hidden from the Docker daemon. Treat daemon access as
+  equivalent to secret read access.
 
 - **Location**: `/var/lib/relay/secrets` (a fixed internal path, not
   env-configurable). The directory is created on first write with mode `0700`;

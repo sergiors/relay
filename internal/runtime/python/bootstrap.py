@@ -20,9 +20,11 @@ Process-model notes (intended semantics, not a bug):
     nonzero so Relay discards the container.
   - EOF on stdin means Relay is done with the container; exit 0 cleanly.
   - sys.modules caches imported modules, so module-level state (a cache dict,
-    a client, a connection) persists across invocations. Per-request env values
-    are applied to os.environ and likewise persist across invocations: a value
-    set for one invocation remains visible to later ones unless overwritten.
+    a client, a connection) persists across invocations. Per-request env is
+    applied EXACTLY per invocation: a key absent from the new frame is restored
+    to its pre-Relay baseline (or removed) and unrelated OS/system/container
+    variables are preserved (see apply_env). RELAY_HANDLER is reserved and
+    overwritten every invocation.
   - The optional "trace" object carries the W3C trace context Relay injected for
     this invocation. It is extracted and attached ONLY around the one handler
     call and always detached afterwards, so one invocation's context never leaks
@@ -75,6 +77,51 @@ try:
     sys.stdout.reconfigure(line_buffering=True)
 except (AttributeError, ValueError):
     pass
+
+# Relay-managed invocation env: exact per-request application without wiping the
+# process's OS/system/container variables.
+#
+# The bootstrap is a long-lived, reused process, so per-request env keys would
+# otherwise linger from an earlier invocation. Instead of blindly writing every
+# frame value into os.environ (which leaked a removed/rotated key into later
+# invocations), the bootstrap tracks only the keys Relay itself applies:
+#   _applied  — the keys currently owned by Relay in os.environ
+#   _baseline — for each owned key, the value os.environ had BEFORE Relay first
+#               overrode it, or _MISSING when it did not exist then
+# On each request the env is applied EXACTLY: a previously applied key absent
+# from the new frame is restored to its pre-Relay baseline (or deleted), a
+# present key is set to the new value (its baseline captured once, on first
+# application), and every unrelated variable is left untouched. Cleanup runs at
+# the top of each request, before the next env is applied, so it is robust even
+# when the previous handler raised or called SystemExit.
+_MISSING = object()
+_applied = set()
+_baseline = {}
+
+
+def apply_env(env):
+    """Apply one request frame's env to os.environ exactly, without wiping
+    unrelated process variables. A key Relay applied in an earlier invocation
+    that this frame no longer carries is restored to its pre-Relay value (or
+    removed), so a rotated or removed env/secret never leaks forward; a key that
+    is present is set to its new value. Only keys Relay applies are tracked."""
+    incoming = {}
+    if isinstance(env, dict):
+        for key, value in env.items():
+            incoming[str(key)] = str(value)
+    for key in list(_applied):
+        if key not in incoming:
+            prior = _baseline.pop(key, _MISSING)
+            if prior is _MISSING:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prior
+            _applied.discard(key)
+    for key, value in incoming.items():
+        if key not in _applied:
+            _baseline[key] = os.environ.get(key, _MISSING)
+        os.environ[key] = value
+        _applied.add(key)
 
 
 def respond(req_id, ok, error=None):
@@ -174,10 +221,11 @@ def main():
         req_id = req.get("id", "")
         handler = req.get("handler", "")
 
-        # Per-request environment: set/overwrite. Values persist for later
-        # invocations unless overwritten (documented process-global behavior).
-        for key, value in (req.get("env") or {}).items():
-            os.environ[str(key)] = str(value)
+        # Per-request environment: applied EXACTLY (see apply_env). Keys this
+        # invocation no longer carries are restored to their pre-Relay baseline
+        # (or removed), so a rotated/removed value never leaks forward; every
+        # unrelated OS/system/container variable is preserved.
+        apply_env(req.get("env"))
         os.environ["RELAY_HANDLER"] = str(handler)
 
         try:

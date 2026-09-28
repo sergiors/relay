@@ -2703,14 +2703,15 @@ func stringify(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-// resolveExtraEnv builds the per-invocation extra env for a template: the
-// literal env values followed by the resolved secret values, both name-ordered.
-// Secret values are resolved here, immediately before execution, so they are
-// never cached on Prepared or baked into the fingerprint. A template that
-// references a secret but has no provider configured fails with a clear error
-// naming the reference. The returned slice is the ONLY place a resolved secret
-// value lives before it is handed to the executor (and from there to the
-// container's Config.Env); it is never logged or persisted.
+// resolveExtraEnv builds the per-invocation env for a template: the literal env
+// values followed by the resolved secret values, both name-ordered. Secret
+// values are resolved here, immediately before execution, so they are never
+// cached on Prepared or baked into the fingerprint. A template that references a
+// secret but has no provider configured fails with a clear error naming the
+// reference. The returned slice is the ONLY place a resolved secret value lives
+// before it is handed to the executor; the executor carries it in the request
+// frame's env map to the reused bootstrap process. It is never logged,
+// persisted, or written into an execution container's Docker Config.Env.
 func (r *Runner) resolveExtraEnv(ctx context.Context, tmpl *function.Template) ([]string, error) {
 	var extra []string
 	for _, ev := range tmpl.EnvList() {

@@ -156,6 +156,74 @@ func TestHandleResolvesSecretsPerInvocation(t *testing.T) {
 	}
 }
 
+// TestResolveExtraEnvReflectsCurrentTemplateSet verifies the runner builds the
+// per-invocation frame env from the CURRENT template set only: an env var or
+// secret binding omitted from the template yields NO frame entry, so the reused
+// bootstrap (which applies the frame exactly) removes a previously applied key.
+// This is the runner half of secret/env removal; the bootstrap half is covered by
+// the python/node bootstrap tests.
+func TestResolveExtraEnvReflectsCurrentTemplateSet(t *testing.T) {
+	prov := &fakeProvider{vals: map[string]string{"tok": "SECRET-VALUE"}}
+	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
+	r.SetSecretProvider(prov)
+
+	// A template that declares both an env var and a secret.
+	full := &function.Template{
+		Env:     map[string]string{"FOO": "bar"},
+		Secrets: map[string]function.SecretRef{"TOKEN": "tok"},
+	}
+	got, err := r.resolveExtraEnv(context.Background(), full)
+	if err != nil {
+		t.Fatalf("resolve full: %v", err)
+	}
+	want := map[string]string{"FOO": "bar", "TOKEN": "SECRET-VALUE"}
+	assertEnvEntries(t, got, want)
+
+	// The same env var with the secret REMOVED: the frame must carry FOO only.
+	withoutSecret := &function.Template{Env: map[string]string{"FOO": "bar"}}
+	got, err = r.resolveExtraEnv(context.Background(), withoutSecret)
+	if err != nil {
+		t.Fatalf("resolve without secret: %v", err)
+	}
+	assertEnvEntries(t, got, map[string]string{"FOO": "bar"})
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "TOKEN=") {
+			t.Fatalf("frame still carries a removed secret binding: %v", got)
+		}
+	}
+
+	// Both removed: the frame is empty (the bootstrap then clears prior keys).
+	empty := &function.Template{}
+	got, err = r.resolveExtraEnv(context.Background(), empty)
+	if err != nil {
+		t.Fatalf("resolve empty: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("frame = %v, want empty for a template with no env/secrets", got)
+	}
+}
+
+// assertEnvEntries compares a "K=V" slice to a map, order-independently.
+func assertEnvEntries(t *testing.T, got []string, want map[string]string) {
+	t.Helper()
+	seen := make(map[string]string, len(got))
+	for _, kv := range got {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("malformed env entry %q", kv)
+		}
+		seen[k] = v
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("env entries = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if seen[k] != v {
+			t.Fatalf("env[%s] = %q, want %q (full: %v)", k, seen[k], v, got)
+		}
+	}
+}
+
 // TestHandleSecretValueNeverLogged verifies a resolved secret value never
 // appears in the runner's log output.
 func TestHandleSecretValueNeverLogged(t *testing.T) {

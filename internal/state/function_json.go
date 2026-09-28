@@ -19,7 +19,9 @@ import (
 // retries): the template parser's opaque ValueMatcher pattern interfaces are
 // deliberately never part of the persisted snapshot — matching is rebuilt from
 // template.yaml, never from this read-only view. Secret entries hold only the
-// reference name, never a resolved value.
+// reference name, never a resolved value; env entries hold only the env-var
+// name plus a fixed redaction marker, never the template's literal value (the
+// database is a local file an operator can read).
 
 // marshalFunction encodes detail as the JSON object stored in functions.data. Name
 // and UpdatedAt are relational metadata (functions.name / functions.updated_at)

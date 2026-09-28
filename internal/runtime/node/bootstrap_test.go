@@ -117,7 +117,12 @@ func bootstrapFor(root string) string {
 
 // startNode runs the real embedded bootstrap under node. The bootstrap is
 // written into root/relay with the /app base rewritten to root/app, mirroring
-// the in-image layout.
+// the in-image layout. Two controlled variables are seeded into the child
+// environment so the exact-per-invocation env tests can prove baseline
+// restoration and system-var preservation:
+//
+//	RELAY_TEST_BASELINE=process-baseline  (a key Relay may override then restore)
+//	RELAY_TEST_SYSTEM=system-value        (a key Relay never touches)
 func startNode(t *testing.T, root string) *nodeProc {
 	t.Helper()
 	bs := bootstrapFor(root)
@@ -126,7 +131,10 @@ func startNode(t *testing.T, root string) *nodeProc {
 		t.Fatalf("write bootstrap: %v", err)
 	}
 	cmd := exec.Command("node", bsPath)
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(),
+		"RELAY_TEST_BASELINE=process-baseline",
+		"RELAY_TEST_SYSTEM=system-value",
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe: %v", err)
@@ -436,6 +444,123 @@ export function env() {
 	r2 := p.invoke(t, "index.env", `{}`, map[string]string{"VAR": "two"})
 	if !r2.OK || !strings.Contains(r2.Out, "VAR=two") {
 		t.Fatalf("second env invoke: %+v, want VAR=two (rotated)", r2)
+	}
+}
+
+// TestNodeRuntimeEnvAppliedExactlyAcrossInvocations proves the bootstrap applies
+// each request frame's env EXACTLY on the reused process: a key present in
+// invocation 1 and absent in invocation 2 is removed (or restored to its
+// pre-Relay baseline), unrelated OS/system/container variables are preserved,
+// and RELAY_HANDLER is overwritten every invocation.
+func TestNodeRuntimeEnvAppliedExactlyAcrossInvocations(t *testing.T) {
+	skipIfNoNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function show() {
+  const e = process.env;
+  console.log("FOO=" + (e.FOO ?? "<unset>"));
+  console.log("BAR=" + (e.BAR ?? "<unset>"));
+  console.log("BASELINE=" + (e.RELAY_TEST_BASELINE ?? "<unset>"));
+  console.log("SYSTEM=" + (e.RELAY_TEST_SYSTEM ?? "<unset>"));
+  console.log("HANDLER=" + (e.RELAY_HANDLER ?? "<unset>"));
+}
+`)
+	p := startNode(t, root)
+
+	// Invocation 1 carries FOO and BAR plus an override of an existing baseline
+	// variable.
+	r1 := p.invoke(t, "index.show", `{}`, map[string]string{
+		"FOO": "one", "BAR": "bar1", "RELAY_TEST_BASELINE": "overridden",
+	})
+	if !r1.OK {
+		t.Fatalf("invoke 1 failed: %s", r1.Err)
+	}
+	for _, want := range []string{"FOO=one", "BAR=bar1", "BASELINE=overridden", "SYSTEM=system-value", "HANDLER=index.show"} {
+		if !strings.Contains(r1.Out, want) {
+			t.Fatalf("invoke 1 out = %q, want %q", r1.Out, want)
+		}
+	}
+
+	// Invocation 2 carries ONLY FOO: BAR must be gone, and the baseline override
+	// must be restored to the process's original value. System env is intact.
+	r2 := p.invoke(t, "index.show", `{}`, map[string]string{"FOO": "two"})
+	if !r2.OK {
+		t.Fatalf("invoke 2 failed: %s", r2.Err)
+	}
+	for _, want := range []string{"FOO=two", "BAR=<unset>", "BASELINE=process-baseline", "SYSTEM=system-value"} {
+		if !strings.Contains(r2.Out, want) {
+			t.Fatalf("invoke 2 out = %q, want %q (removed key must not leak forward)", r2.Out, want)
+		}
+	}
+
+	// Invocation 3 carries NO env: FOO must be removed too.
+	r3 := p.invoke(t, "index.show", `{}`, nil)
+	if !r3.OK {
+		t.Fatalf("invoke 3 failed: %s", r3.Err)
+	}
+	for _, want := range []string{"FOO=<unset>", "BAR=<unset>", "BASELINE=process-baseline", "SYSTEM=system-value"} {
+		if !strings.Contains(r3.Out, want) {
+			t.Fatalf("invoke 3 out = %q, want %q", r3.Out, want)
+		}
+	}
+}
+
+// TestNodeRuntimeEnvCleanupAfterHandlerFailure proves the top-of-request
+// cleanup is robust even when the previous handler failed: a key applied for a
+// failing invocation is still removed on the next request.
+func TestNodeRuntimeEnvCleanupAfterHandlerFailure(t *testing.T) {
+	skipIfNoNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function boom() {
+  throw new Error("kaboom");
+}
+export function show() {
+  console.log("TOKEN=" + (process.env.TOKEN ?? "<unset>"));
+}
+`)
+	p := startNode(t, root)
+
+	r1 := p.invoke(t, "index.boom", `{}`, map[string]string{"TOKEN": "secret-v1"})
+	if r1.OK {
+		t.Fatal("expected the raising handler to fail")
+	}
+	r2 := p.invoke(t, "index.show", `{}`, nil)
+	if !r2.OK {
+		t.Fatalf("post-failure invoke failed: %s", r2.Err)
+	}
+	if !strings.Contains(r2.Out, "TOKEN=<unset>") {
+		t.Fatalf("out = %q, want TOKEN=<unset> (cleanup must run even after a failed handler)", r2.Out)
+	}
+}
+
+// TestNodeRuntimeNoEnvValueLeaks proves the bootstrap never writes an env value
+// to a response error or operator-visible stderr: a resolved secret value is
+// visible only to the handler through process.env.
+func TestNodeRuntimeNoEnvValueLeaks(t *testing.T) {
+	skipIfNoNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function leak() {
+  console.log("value=" + (process.env.SUPER_SECRET ?? ""));
+  throw new Error("handler failed");
+}
+`)
+	p := startNode(t, root)
+	const secret = "CANARY-SECRET-VALUE-abc123"
+	r := p.invoke(t, "index.leak", `{}`, map[string]string{"SUPER_SECRET": secret})
+	if r.OK {
+		t.Fatal("expected the raising handler to fail")
+	}
+	if strings.Contains(r.Err, secret) {
+		t.Fatalf("response error leaked the secret value: %q", r.Err)
+	}
+	if !strings.Contains(r.Out, "value="+secret) {
+		t.Fatalf("handler must observe its own env value; out = %q", r.Out)
+	}
+	// stderr carries the handler failure text only, never the env value.
+	if strings.Contains(p.stderrString(), secret) {
+		t.Fatalf("stderr leaked the secret value:\n%s", p.stderrString())
 	}
 }
 

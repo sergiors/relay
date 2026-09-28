@@ -123,14 +123,24 @@ func startPythonWithoutOtel(t *testing.T, dir string) *pyProc {
 	return startBootstrap(t, dir)
 }
 
-// startBootstrap runs the embedded bootstrap in dir as a live process.
+// startBootstrap runs the embedded bootstrap in dir as a live process. Two
+// controlled variables are seeded into the child environment so the
+// exact-per-invocation env tests can prove baseline restoration and system-var
+// preservation:
+//
+//	RELAY_TEST_BASELINE=process-baseline  (a key Relay may override then restore)
+//	RELAY_TEST_SYSTEM=system-value        (a key Relay never touches)
 func startBootstrap(t *testing.T, dir string) *pyProc {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "bootstrap.py"), Bootstrap, 0o644); err != nil {
 		t.Fatalf("write bootstrap: %v", err)
 	}
 	cmd := exec.Command("python3", filepath.Join(dir, "bootstrap.py"))
-	cmd.Env = append(os.Environ(), "PYTHONPATH="+dir)
+	cmd.Env = append(os.Environ(),
+		"PYTHONPATH="+dir,
+		"RELAY_TEST_BASELINE=process-baseline",
+		"RELAY_TEST_SYSTEM=system-value",
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("stdin pipe: %v", err)
@@ -419,6 +429,125 @@ def showenv(event):
 	r2 := p.invoke(t, "handler.showenv", `{}`, map[string]string{"VAR": "two"})
 	if !r2.OK || !strings.Contains(r2.Out, "VAR=two") {
 		t.Fatalf("second env invoke: %+v, want VAR=two (rotated)", r2)
+	}
+}
+
+// TestPythonRuntimeEnvAppliedExactlyAcrossInvocations proves the bootstrap
+// applies each request frame's env EXACTLY on the reused process: a key present
+// in invocation 1 and absent in invocation 2 is removed (or restored to its
+// pre-Relay baseline), unrelated OS/system/container variables are preserved,
+// and RELAY_HANDLER is overwritten every invocation.
+func TestPythonRuntimeEnvAppliedExactlyAcrossInvocations(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import os
+
+def show(event):
+    print("FOO=" + os.environ.get("FOO", "<unset>"))
+    print("BAR=" + os.environ.get("BAR", "<unset>"))
+    print("BASELINE=" + os.environ.get("RELAY_TEST_BASELINE", "<unset>"))
+    print("SYSTEM=" + os.environ.get("RELAY_TEST_SYSTEM", "<unset>"))
+    print("HANDLER=" + os.environ.get("RELAY_HANDLER", "<unset>"))
+`)
+	p := startPython(t, dir)
+
+	// Invocation 1 carries FOO and BAR plus an override of an existing baseline
+	// variable.
+	r1 := p.invoke(t, "handler.show", `{}`, map[string]string{
+		"FOO": "one", "BAR": "bar1", "RELAY_TEST_BASELINE": "overridden",
+	})
+	if !r1.OK {
+		t.Fatalf("invoke 1 failed: %s", r1.Err)
+	}
+	for _, want := range []string{"FOO=one", "BAR=bar1", "BASELINE=overridden", "SYSTEM=system-value", "HANDLER=handler.show"} {
+		if !strings.Contains(r1.Out, want) {
+			t.Fatalf("invoke 1 out = %q, want %q", r1.Out, want)
+		}
+	}
+
+	// Invocation 2 carries ONLY FOO: BAR must be gone, and the baseline override
+	// must be restored to the process's original value. System env is intact.
+	r2 := p.invoke(t, "handler.show", `{}`, map[string]string{"FOO": "two"})
+	if !r2.OK {
+		t.Fatalf("invoke 2 failed: %s", r2.Err)
+	}
+	for _, want := range []string{"FOO=two", "BAR=<unset>", "BASELINE=process-baseline", "SYSTEM=system-value"} {
+		if !strings.Contains(r2.Out, want) {
+			t.Fatalf("invoke 2 out = %q, want %q (removed key must not leak forward)", r2.Out, want)
+		}
+	}
+
+	// Invocation 3 carries NO env: FOO must be removed too.
+	r3 := p.invoke(t, "handler.show", `{}`, nil)
+	if !r3.OK {
+		t.Fatalf("invoke 3 failed: %s", r3.Err)
+	}
+	for _, want := range []string{"FOO=<unset>", "BAR=<unset>", "BASELINE=process-baseline", "SYSTEM=system-value"} {
+		if !strings.Contains(r3.Out, want) {
+			t.Fatalf("invoke 3 out = %q, want %q", r3.Out, want)
+		}
+	}
+}
+
+// TestPythonRuntimeEnvCleanupAfterHandlerFailure proves the top-of-request
+// cleanup is robust even when the previous handler failed: a key applied for a
+// failing invocation is still removed on the next request.
+func TestPythonRuntimeEnvCleanupAfterHandlerFailure(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import os
+
+def boom(event):
+    raise ValueError("kaboom")
+
+def show(event):
+    print("TOKEN=" + os.environ.get("TOKEN", "<unset>"))
+`)
+	p := startPython(t, dir)
+
+	r1 := p.invoke(t, "handler.boom", `{}`, map[string]string{"TOKEN": "secret-v1"})
+	if r1.OK {
+		t.Fatal("expected the raising handler to fail")
+	}
+	r2 := p.invoke(t, "handler.show", `{}`, nil)
+	if !r2.OK {
+		t.Fatalf("post-failure invoke failed: %s", r2.Err)
+	}
+	if !strings.Contains(r2.Out, "TOKEN=<unset>") {
+		t.Fatalf("out = %q, want TOKEN=<unset> (cleanup must run even after a failed handler)", r2.Out)
+	}
+}
+
+// TestPythonRuntimeNoEnvValueLeaks proves the bootstrap never writes an env
+// value to a response error or operator-visible stderr: a resolved secret value
+// is visible only to the handler through os.environ.
+func TestPythonRuntimeNoEnvValueLeaks(t *testing.T) {
+	skipIfNoPython(t)
+	dir := t.TempDir()
+	writeHandler(t, dir, "handler", `
+import os
+
+def leak(event):
+    print("value=" + os.environ.get("SUPER_SECRET", ""))
+    raise ValueError("handler failed")
+`)
+	p := startPython(t, dir)
+	const secret = "CANARY-SECRET-VALUE-abc123"
+	r := p.invoke(t, "handler.leak", `{}`, map[string]string{"SUPER_SECRET": secret})
+	if r.OK {
+		t.Fatal("expected the raising handler to fail")
+	}
+	if strings.Contains(r.Err, secret) {
+		t.Fatalf("response error leaked the secret value: %q", r.Err)
+	}
+	if !strings.Contains(r.Out, "value="+secret) {
+		t.Fatalf("handler must observe its own env value; out = %q", r.Out)
+	}
+	// stderr carries the handler failure text only, never the env value.
+	if strings.Contains(p.stderrString(), secret) {
+		t.Fatalf("stderr leaked the secret value:\n%s", p.stderrString())
 	}
 }
 

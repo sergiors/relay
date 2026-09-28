@@ -19,8 +19,11 @@
 //     handlers are installed: a fatal crash must crash the process.
 //   - EOF on stdin means Relay is done with the container; exit 0 cleanly.
 //   - A dynamic import() promise is CACHED per resolved module path, so
-//     module-level state persists across invocations; per-request env values
-//     applied to process.env likewise persist across invocations.
+//     module-level state persists across invocations; per-request env is
+//     applied EXACTLY per invocation: a key absent from the new frame is
+//     restored to its pre-Relay baseline (or removed) and unrelated
+//     OS/system/container variables are preserved (see applyEnv).
+//     RELAY_HANDLER is reserved and overwritten every invocation.
 
 import { statSync } from "node:fs";
 import * as readline from "node:readline";
@@ -42,6 +45,57 @@ const MAX_ERROR_BYTES = 3 * 1024;
 // moduleCache caches, per resolved file path, the dynamic import() promise so
 // a module is imported exactly once and its state persists.
 const moduleCache = new Map();
+
+// Relay-managed invocation env: exact per-request application without wiping
+// the process's OS/system/container variables.
+//
+// The bootstrap is a long-lived, reused process, so per-request env keys would
+// otherwise linger from an earlier invocation. Instead of blindly writing every
+// frame value into process.env (which leaked a removed/rotated key into later
+// invocations), the bootstrap tracks only the keys Relay itself applies:
+//   appliedEnv  — keys currently owned by Relay in process.env
+//   baselineEnv — for each owned key, the value process.env had BEFORE Relay
+//                 first overrode it, or MISSING when it did not exist then
+// applyEnv applies one frame's env EXACTLY: a previously applied key absent
+// from the new frame is restored to its pre-Relay baseline (or deleted), a
+// present key is set to the new value (its baseline captured once, on first
+// application), and every unrelated variable is left untouched. Cleanup runs at
+// the top of each request, before the next env is applied.
+const MISSING = Symbol("relay-env-missing");
+const appliedEnv = new Set();
+const baselineEnv = new Map();
+
+function applyEnv(env) {
+  const incoming = new Map();
+  if (env && typeof env === "object") {
+    for (const [k, v] of Object.entries(env)) {
+      incoming.set(String(k), String(v));
+    }
+  }
+  for (const key of Array.from(appliedEnv)) {
+    if (!incoming.has(key)) {
+      if (baselineEnv.get(key) === MISSING || !baselineEnv.has(key)) {
+        delete process.env[key];
+      } else {
+        process.env[key] = baselineEnv.get(key);
+      }
+      baselineEnv.delete(key);
+      appliedEnv.delete(key);
+    }
+  }
+  for (const [key, value] of incoming) {
+    if (!appliedEnv.has(key)) {
+      baselineEnv.set(
+        key,
+        Object.prototype.hasOwnProperty.call(process.env, key)
+          ? process.env[key]
+          : MISSING,
+      );
+    }
+    process.env[key] = value;
+    appliedEnv.add(key);
+  }
+}
 
 // resolveModulePath resolves a module part to a file under /app without
 // importing anything: "index" -> ./index.js/.mjs or ./index/index.js/.mjs;
@@ -107,13 +161,11 @@ async function handle(line) {
   const id = typeof req.id === "string" ? req.id : "";
   const handler = typeof req.handler === "string" ? req.handler : "";
 
-  // Per-request environment: set/overwrite; values persist for later
-  // invocations unless overwritten (documented process-global behavior).
-  if (req.env && typeof req.env === "object") {
-    for (const [k, v] of Object.entries(req.env)) {
-      process.env[k] = String(v);
-    }
-  }
+  // Per-request environment: applied EXACTLY (see applyEnv). Keys this
+  // invocation no longer carries are restored to their pre-Relay baseline (or
+  // removed), so a rotated/removed value never leaks forward; every unrelated
+  // OS/system/container variable is preserved.
+  applyEnv(req.env);
   process.env.RELAY_HANDLER = handler;
 
   let error = null;

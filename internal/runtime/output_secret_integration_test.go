@@ -127,12 +127,14 @@ export function secret(event) {
 }
 
 // TestIntegrationMultilineSecretInjection verifies a PEM-shaped secret value is
-// injected into an execution container's environment byte-for-byte and that the
-// handler process observes the EXACT original value (including every internal
-// newline, the blank line, and the indented line). It uses the same
-// Manager.Execute extraEnv injection path the runner uses, so it proves the
-// full chain: runner resolution -> runContainer -> container.Config.Env ->
-// handler process -> handler stdout. The handler logs the value between clear
+// injected into an execution container's per-invocation environment
+// byte-for-byte and that the handler process observes the EXACT original value
+// (including every internal newline, the blank line, and the indented line). It
+// uses the same Manager.Execute extraEnv injection path the runner uses, so it
+// proves the full chain: runner resolution -> request frame env ->
+// bootstrap process env -> handler stdout. (The value is deliberately NOT in the
+// container's Docker Config.Env — only the runtime plan env is; see
+// execution_env_integration_test.go.) The handler logs the value between clear
 // delimiters so exact matching is robust against surrounding output. The
 // manager's operational log buffer must never contain any fragment of the
 // value (handler stdout goes to the function-output sink, not the op log).

@@ -72,7 +72,8 @@ func functionCommand(deps Dependencies) *cli.Command {
 				Usage:     "Show detailed information about a function",
 				UsageText: "relay function inspect NAME",
 				Description: "Show the full detail record for a single function, including " +
-					"its runtime, status, events and schedules, env/secret mappings, and " +
+					"its runtime, status, events and schedules, env-var names (values " +
+					"redacted) and secret reference names, and " +
 					"its cumulative container pool counters.",
 				Arguments: []cli.Argument{
 					&cli.StringArgs{Name: "name", Min: 1, Max: 1},
@@ -279,7 +280,9 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 		fmt.Fprintln(w, "Environment:")
 		ew := tabwriter.NewWriter(w, 0, 4, 3, ' ', 0)
 		for _, k := range sortedKeys(detail.Env) {
-			fmt.Fprintf(ew, "  %s=%s\n", k, detail.Env[k])
+			// Names only: the persisted value is a redaction marker, and inspect
+			// renders it explicitly so a raw stored value can never be printed.
+			fmt.Fprintf(ew, "  %s=%s\n", k, state.RedactedEnvValue)
 		}
 		ew.Flush()
 	}
