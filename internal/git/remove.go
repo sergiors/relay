@@ -1,7 +1,6 @@
 package git
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,9 +18,17 @@ import (
 // source config is unrelated to the key lifecycle, so remove leaves the key in
 // place. (Operators rotate a key by removing the file directly and re-keying.)
 //
+// Removal decides whether a config is present by stat'ing the filesystem, never
+// by reading or validating its contents. That is deliberate: `git remove` is the
+// escape hatch for a hand-edited source.json that LoadConfig rejects (bad JSON,
+// a non-SSH repository, or a bad ref/path/secret reference), so a broken config
+// must stay removable. The file's bytes are never parsed, trusted, or acted on.
+//
 // Remove is idempotent: when nothing is configured (or the checkout is already
 // gone) it succeeds, reporting "not configured" or simply doing nothing. Missing
-// directories are not errors.
+// directories are not errors. A genuine inspect/removal failure is still
+// reported, but it never prevents the checkout from being cleaned up: the
+// checkout is attempted regardless and the first error (if any) is returned.
 func Remove(cfgPath, checkoutDir string, out io.Writer) error {
 	report := func(format string, args ...any) {
 		if out != nil {
@@ -29,36 +36,42 @@ func Remove(cfgPath, checkoutDir string, out io.Writer) error {
 		}
 	}
 
-	_, err := LoadConfig(cfgPath)
-	configured := err == nil
-	if err != nil && !isErrNoSource(err) {
-		// A corrupt/unreadable config should still not block cleanup of the
-		// checkout, but surface the read issue. A missing config (ErrConfigNotFound
-		// via errors.Is) is the normal "nothing to remove" state, not an error.
-		return fmt.Errorf("git: read config: %w", err)
+	// firstErr keeps the first genuine failure without aborting the rest of the
+	// cleanup, so a config problem can never block dropping the checkout.
+	var firstErr error
+	record := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	if configured {
+	// Existence, not validity, decides whether a config is present: a
+	// hand-edited file that LoadConfig rejects is still removed here because
+	// remove never parses the contents. A missing file is the normal "nothing
+	// configured" state (the idempotent second run), not an error.
+	switch _, statErr := os.Stat(cfgPath); {
+	case statErr == nil:
 		if err := os.Remove(cfgPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("git: remove config: %w", err)
+			record(fmt.Errorf("git: remove config: %w", err))
+		} else {
+			report("Removed git source config")
 		}
-		report("Removed git source config")
-	} else {
+	case os.IsNotExist(statErr):
 		report("Not configured; nothing to remove")
+	default:
+		// The file may exist but be unstat-able (e.g. a parent-dir permission
+		// error). Surface it, but still attempt the checkout cleanup below.
+		record(fmt.Errorf("git: inspect config: %w", statErr))
 	}
 
 	if _, err := os.Stat(checkoutDir); err == nil {
 		if err := os.RemoveAll(checkoutDir); err != nil {
-			return fmt.Errorf("git: remove checkout: %w", err)
+			record(fmt.Errorf("git: remove checkout: %w", err))
+		} else {
+			report("Removed checkout")
 		}
-		report("Removed checkout")
+	} else if !os.IsNotExist(err) {
+		record(fmt.Errorf("git: inspect checkout: %w", err))
 	}
-	return nil
-}
-
-// isErrNoSource reports whether err is the "no git source configured" sentinel.
-// It uses errors.Is (not a bare ==) so it also catches the sentinel wrapped by
-// LoadConfig, keeping the check identical to every other call site.
-func isErrNoSource(err error) bool {
-	return errors.Is(err, ErrConfigNotFound())
+	return firstErr
 }

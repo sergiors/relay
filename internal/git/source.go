@@ -6,7 +6,50 @@ import (
 	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing/transport"
+
+	"relay/internal/secrets"
 )
+
+// NormalizeAndValidateConfig applies the canonical source-config rules to c and
+// returns the normalized config. It is the ONE validation path every entry that
+// reads or writes a Config funnels through — LoadConfig, writeConfig, SetSource,
+// and the sync core — so a bad value can neither be persisted nor acted upon,
+// whether it arrived from the operator-facing `git set`, a hand-edited
+// source.json, or a directly-constructed Config passed to SyncFromConfig.
+//
+// Rules:
+//   - Repository must be a supported SSH URL (ValidateRepositoryURL). This is
+//     the persisted-source policy; the local/filesystem transport seam is
+//     SyncOptions.CloneURL, never Config.Repository.
+//   - An empty Ref is defaulted to DefaultRef (so a config written before the
+//     field existed, or hand-edited, still syncs), then must be a clean revision
+//     (validateRef).
+//   - The optional monorepo Path must stay inside the checkout (validatePath).
+//   - A non-empty WebhookSecretRef must be a legal secret name
+//     (secrets.ValidateName); the name is a store reference, never a value.
+//
+// Validator errors are returned verbatim (no extra wrapping), so SetSource,
+// writeConfig, and LoadConfig report byte-identical text for the same bad field.
+func NormalizeAndValidateConfig(c Config) (Config, error) {
+	if err := ValidateRepositoryURL(c.Repository); err != nil {
+		return Config{}, err
+	}
+	if c.Ref == "" {
+		c.Ref = DefaultRef
+	}
+	if err := validateRef(c.Ref); err != nil {
+		return Config{}, err
+	}
+	if err := validatePath(c.Path); err != nil {
+		return Config{}, err
+	}
+	if c.WebhookSecretRef != "" {
+		if err := secrets.ValidateName(c.WebhookSecretRef); err != nil {
+			return Config{}, err
+		}
+	}
+	return c, nil
+}
 
 // validateRef reports whether ref is a plausible git revision string for the
 // config. It enforces the minimal safety/production rules: non-empty and free of
@@ -48,6 +91,16 @@ func ValidateRepositoryURL(repository string) error {
 	}
 	if ep.Host == "" {
 		return fmt.Errorf("git: repository %q has no host", repository)
+	}
+	// A parsed host is a hostname or IP literal, never userinfo. An scp-like URL
+	// whose user part cannot be split (e.g. "git@:org/repo.git") is parsed by
+	// go-git's regex with the "@" swallowed into the host ("git@"), which would
+	// otherwise be accepted as a "host" and later dialed. Rejecting "@" in a host
+	// closes that malformed-scp gap; ssh:// URLs already split userinfo out via
+	// net/url, so a clean host never contains it. This tightens the SSH-URL rule
+	// only; no other validator changes.
+	if strings.Contains(ep.Host, "@") {
+		return fmt.Errorf("git: repository %q has an invalid host %q", repository, ep.Host)
 	}
 	return nil
 }

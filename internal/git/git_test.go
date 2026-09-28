@@ -115,7 +115,22 @@ func TestValidateRepositoryURL(t *testing.T) {
 			t.Errorf("ValidateRepositoryURL(%q): %v, want nil", u, err)
 		}
 	}
-	for _, u := range []string{"", "https://github.com/a/r", "http://x/y", "file:///tmp/r", "plain-path"} {
+	for _, u := range []string{
+		"",
+		"https://github.com/a/r",
+		"http://x/y",
+		"file:///tmp/r",
+		"plain-path",
+		// Malformed ssh:// URLs.
+		"ssh://git@github.com:acme/r.git", // non-numeric port => parse error
+		"ssh://git@/acme/r.git",           // ssh:// with no host
+		"ssh://",                          // ssh:// with no host
+		"ssh://git@",                      // ssh:// with no host
+		// Malformed scp-like URLs.
+		"git@:acme/r.git", // user part not split: host parses as "git@"
+		"git@github.com:", // empty repo path (parsed as a local path, not SSH)
+		"git@github.com",  // no colon (parsed as a local path, not SSH)
+	} {
 		if err := ValidateRepositoryURL(u); err == nil {
 			t.Errorf("ValidateRepositoryURL(%q): nil, want error", u)
 		}

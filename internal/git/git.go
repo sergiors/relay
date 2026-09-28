@@ -14,8 +14,6 @@ import (
 	"time"
 
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
-
-	"relay/internal/secrets"
 )
 
 // Fixed application-convention paths, mirroring state.DBPath and
@@ -100,26 +98,29 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return Config{}, fmt.Errorf("git: parse config: %w", err)
 	}
-	if c.Ref == "" {
-		// Configs written before the ref field existed, or hand-edited files,
-		// fall back to the documented default so an old config still syncs.
-		c.Ref = DefaultRef
-	}
-	return c, nil
+	// Validate every persisted field through the ONE canonical normalizer before
+	// the config is handed to any caller (status, sync, webhook assembly). A
+	// hand-edited source.json can therefore never drive a network, auth, or
+	// filesystem operation with a bad repository/ref/path/secret reference. An
+	// empty ref is still defaulted to DefaultRef by the normalizer, preserving
+	// the behavior for configs written before the field existed.
+	return NormalizeAndValidateConfig(c)
 }
 
 // writeConfig persists c atomically to path (0700 dir, 0600 file), mirroring
 // secrets/local.go's Set: the value is written to a temp file in the same
 // directory, fsynced, then renamed over the target so a reader never observes a
 // partial config. On any error the temp file is removed.
+//
+// It validates through NormalizeAndValidateConfig before writing, so a directly
+// constructed Config (e.g. the sync bookkeeping update) can never persist an
+// invalid source, and the normalized form (defaulted ref) is what lands on disk.
+// The config's own value is never printed: a validation error names only the
+// offending field value, never secret material.
 func writeConfig(c Config, path string) error {
-	if c.Repository == "" {
-		return fmt.Errorf("git: repository must not be empty")
-	}
-	if c.Ref == "" {
-		return fmt.Errorf("git: ref must not be empty")
-	}
-	if err := validatePath(c.Path); err != nil {
+	var err error
+	c, err = NormalizeAndValidateConfig(c)
+	if err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
@@ -160,15 +161,19 @@ func writeConfig(c Config, path string) error {
 // SetSource validates and persists a sync source config: repository (an SSH URL),
 // ref, an optional monorepo path, and an optional name of the secret holding the
 // GitHub webhook secret (see Config.WebhookSecretRef). Calling it again
-// overwrites (upsert). It enforces the SSH-URL rule and the monorepo-path safety
-// rule so a bad value can never be persisted. The ref and path are stored exactly
-// as given (the CLI defaults an omitted ref to DefaultRef; an empty path means
-// repo root). Any prior last-synced bookkeeping is retained on update so an
-// operator changing the ref/path keeps the last-success metadata until the next
-// sync.
+// overwrites (upsert). Validation is delegated to the ONE canonical path
+// (NormalizeAndValidateConfig via writeConfig), so it enforces the SSH-URL rule,
+// the ref/path safety rules, and the webhook-secret-name rule so a bad value can
+// never be persisted — with byte-identical error semantics to LoadConfig. The ref
+// and path are stored exactly as given (an omitted ref defaults to DefaultRef; an
+// empty path means repo root). Any prior last-synced bookkeeping is retained on
+// update so an operator changing the ref/path keeps the last-success metadata
+// until the next sync.
 func SetSource(path, repository, ref, monorepoPath, webhookSecretRef string) error {
 	// Preserve prior bookkeeping on an update (upsert) so status survives a
-	// config change until the next sync records fresh values.
+	// config change until the next sync records fresh values. A config that is
+	// missing OR currently invalid is treated as "no prior bookkeeping": the
+	// operator is fixing it, and writeConfig below re-validates the new source.
 	var (
 		priorSynced bool
 		priorCommit string
@@ -179,29 +184,13 @@ func SetSource(path, repository, ref, monorepoPath, webhookSecretRef string) err
 		priorCommit = existing.LastSyncedCommit
 		priorAt = existing.LastSyncedAt
 	}
-	if err := ValidateRepositoryURL(repository); err != nil {
-		return err
-	}
-	if err := validateRef(ref); err != nil {
-		return err
-	}
-	if err := validatePath(monorepoPath); err != nil {
-		return err
-	}
 	// A non-empty webhookSecretRef must be a legal secret name so the webhook
 	// server can resolve it for HMAC verification. An empty ref is still a
 	// valid source config (it means no webhook endpoint is enabled for it —
 	// the webhook server requires a secret and never accepts unsigned
 	// deliveries); the value is never validated as the secret's VALUE, only its
-	// store name.
-	if webhookSecretRef != "" {
-		if err := secrets.ValidateName(webhookSecretRef); err != nil {
-			return err
-		}
-	}
-	if ref == "" {
-		ref = DefaultRef
-	}
+	// store name. writeConfig applies the full canonical validation (SSH URL,
+	// defaulted ref, path safety, secret-name shape).
 	return writeConfig(Config{
 		Repository:       repository,
 		Ref:              ref,

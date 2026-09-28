@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,10 +18,15 @@ type cliGitPaths struct {
 }
 
 // redirectGitDirs points the CLI git paths at temp dirs so tests never touch
-// /var/lib/relay or /functions, and returns the redirected paths.
+// /var/lib/relay or /functions, and returns the redirected paths. It also clears
+// the git sync transport seam (gitCloneURL) so a test that wants a local
+// filesystem source opts in explicitly; the previous values are restored on
+// cleanup.
 func redirectGitDirs(t *testing.T) cliGitPaths {
 	t.Helper()
 	oldCfg, oldCo, oldSSH, oldFn := gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir
+	oldClone := gitCloneURL
+	gitCloneURL = ""
 	p := cliGitPaths{
 		configPath:   filepath.Join(t.TempDir(), "git", "source.json"),
 		checkoutDir:  filepath.Join(t.TempDir(), "git", "checkout"),
@@ -32,6 +36,7 @@ func redirectGitDirs(t *testing.T) cliGitPaths {
 	gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir = p.configPath, p.checkoutDir, p.sshDir, p.functionsDir
 	t.Cleanup(func() {
 		gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir = oldCfg, oldCo, oldSSH, oldFn
+		gitCloneURL = oldClone
 	})
 	return p
 }
@@ -177,6 +182,74 @@ func TestGitSetRejectsTraversal(t *testing.T) {
 	}
 	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
 		t.Fatal("config persisted despite traversal path")
+	}
+}
+
+// TestGitSetAndLoadConfigShareValidators pins that the operator path (`git set`
+// via git.SetSource) and persisted loading (git.LoadConfig) run the SAME
+// canonical validators: a value rejected by `git set` is rejected identically
+// when hand-edited into source.json. It asserts the error substrings match for
+// each malformed field and that neither path silently accepts the bad value.
+func TestGitSetAndLoadConfigShareValidators(t *testing.T) {
+	type tc struct {
+		name string
+		// args are the `git set` arguments (repository + optional flags).
+		args []string
+		// raw is the equivalent hand-edited source.json.
+		raw string
+	}
+	cases := []tc{
+		{
+			name: "non-ssh repository",
+			args: []string{"git", "set", "https://github.com/a/r"},
+			raw:  `{"repository":"https://github.com/a/r","ref":"main"}`,
+		},
+		{
+			name: "whitespace ref",
+			args: []string{"git", "set", "--ref", "has space", "git@github.com:a/r.git"},
+			raw:  `{"repository":"git@github.com:a/r.git","ref":"has space"}`,
+		},
+		{
+			name: "traversal path",
+			args: []string{"git", "set", "--path", "../x", "git@github.com:a/r.git"},
+			raw:  `{"repository":"git@github.com:a/r.git","ref":"main","path":"../x"}`,
+		},
+		{
+			name: "invalid webhook secret",
+			args: []string{"git", "set", "--webhook-secret", "GH_secret", "git@github.com:a/r.git"},
+			raw:  `{"repository":"git@github.com:a/r.git","ref":"main","webhookSecretRef":"GH_secret"}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := redirectGitDirs(t)
+			_, _, setErr := runCLI(t, "", c.args...)
+			if setErr == nil {
+				t.Fatal("git set: nil error, want rejection")
+			}
+			if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+				t.Fatal("config persisted despite invalid value")
+			}
+			if err := os.MkdirAll(filepath.Dir(p.configPath), 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(p.configPath, []byte(c.raw), 0o600); err != nil {
+				t.Fatalf("write raw config: %v", err)
+			}
+			_, loadErr := gitpkg.LoadConfig(p.configPath)
+			if loadErr == nil {
+				t.Fatal("LoadConfig of hand-edited invalid config: nil error, want rejection")
+			}
+			// Shared canonical validators => identical error semantics.
+			for _, want := range []string{setErr.Error(), loadErr.Error()} {
+				if want == "" {
+					t.Fatalf("empty error text for %s", c.name)
+				}
+			}
+			if setErr.Error() != loadErr.Error() {
+				t.Fatalf("git set err = %q, LoadConfig err = %q; want identical", setErr, loadErr)
+			}
+		})
 	}
 }
 
@@ -373,6 +446,44 @@ func TestGitRemoveIdempotent(t *testing.T) {
 	}
 }
 
+// TestGitRemoveInvalidConfig drives the operator path end to end: a hand-edited
+// source.json that the canonical loader rejects (so `git status`/`sync` refuse
+// it) is still removable by `git remove -y`, which decides by file existence and
+// never parses the contents. The persisted config is dropped and the checkout is
+// cleaned up alongside it.
+func TestGitRemoveInvalidConfig(t *testing.T) {
+	p := redirectGitDirs(t)
+
+	// A hand-edited config with bad JSON: LoadConfig rejects it.
+	if err := os.MkdirAll(filepath.Dir(p.configPath), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(p.configPath, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+	if _, err := gitpkg.LoadConfig(p.configPath); err == nil {
+		t.Fatal("LoadConfig accepted invalid config; precondition broken")
+	}
+	// A checkout directory that remove must also drop.
+	if err := os.MkdirAll(filepath.Join(p.checkoutDir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir checkout: %v", err)
+	}
+
+	out, _, err := runCLI(t, "", "git", "remove", "-y")
+	if err != nil {
+		t.Fatalf("git remove -y with invalid config: %v", err)
+	}
+	if !strings.Contains(out, "Removed git source config") {
+		t.Fatalf("remove output missing confirmation:\n%s", out)
+	}
+	if _, err := os.Stat(p.configPath); !os.IsNotExist(err) {
+		t.Fatal("invalid config not removed")
+	}
+	if _, err := os.Stat(p.checkoutDir); !os.IsNotExist(err) {
+		t.Fatal("checkout not removed alongside invalid config")
+	}
+}
+
 // TestGitHelpRendersSubcommands verifies `git --help` lists the subcommands.
 func TestGitHelpRendersSubcommands(t *testing.T) {
 	_ = redirectGitDirs(t)
@@ -450,8 +561,9 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 
 // seedLocalBareRepo builds a local work repo with one function and a bare remote
 // cloned from it via the shared testutil fixture, returning the bare path. It lets
-// a CLI git sync run end to end against a filesystem source (no SSH, no network),
-// with the repository stored as a plain path in the persisted config.
+// a CLI git sync run end to end against a filesystem source (no SSH, no network)
+// through the CLI's gitCloneURL transport seam while the persisted repository
+// stays a valid SSH URL.
 func seedLocalBareRepo(t *testing.T) string {
 	t.Helper()
 	return testutil.NewBareRepo(t)
@@ -467,19 +579,14 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 	p := redirectGitDirs(t)
 	bare := seedLocalBareRepo(t)
 
-	// Persist a config with a plain local path as the repository (bypasses the
-	// SSH-URL validation the operator-facing `git set` enforces, exactly as the
-	// git package's local test seam does).
-	data, err := json.Marshal(map[string]any{"repository": bare, "ref": "main"})
-	if err != nil {
-		t.Fatalf("marshal config: %v", err)
+	// Persist a valid SSH source (the only thing Config.Repository may hold now)
+	// and route the actual transport through the CLI's documented local-test seam
+	// (gitCloneURL), exactly as the git package drives local sources via
+	// SyncOptions.CloneURL.
+	if _, _, err := runCLI(t, "", "git", "set", "git@github.com:acme/repo.git"); err != nil {
+		t.Fatalf("git set: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(p.configPath), 0o755); err != nil {
-		t.Fatalf("mkdir config dir: %v", err)
-	}
-	if err := os.WriteFile(p.configPath, data, 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	gitCloneURL = bare
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))

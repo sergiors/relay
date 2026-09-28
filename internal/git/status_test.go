@@ -143,6 +143,62 @@ func TestRemoveMissingDirsNotError(t *testing.T) {
 	}
 }
 
+// TestRemoveInvalidConfigStillRemoves pins finding #1: `git remove` is the escape
+// hatch for a hand-edited source.json that LoadConfig now rejects. Removal must
+// decide existence by stat (never by parsing), so it drops both an unparseable
+// file and a parseable-but-invalid one, removes the checkout alongside it, and
+// stays idempotent — even though LoadConfig would error on the same file.
+func TestRemoveInvalidConfigStillRemoves(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "unparseable json", raw: "{not json"},
+		{name: "non-ssh repository", raw: `{"repository":"https://github.com/a/r","ref":"main"}`},
+		{name: "invalid scp host", raw: `{"repository":"git@:a/r.git","ref":"main"}`},
+		{name: "bad ref", raw: `{"repository":"git@github.com:a/r.git","ref":"has space"}`},
+		{name: "traversal path", raw: `{"repository":"git@github.com:a/r.git","ref":"main","path":"../x"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := fixture(t, false)
+			// Create a real checkout via a sync, then poison the config on disk.
+			mustSync(t, e, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
+			cfgPath := filepath.Join(e.gitDir, "source.json")
+			if err := os.WriteFile(cfgPath, []byte(c.raw), 0o600); err != nil {
+				t.Fatalf("poison config: %v", err)
+			}
+			// Sanity: the canonical loader rejects this file (remove must not care).
+			if _, err := LoadConfig(cfgPath); err == nil {
+				t.Fatal("LoadConfig accepted the poisoned config; test precondition broken")
+			}
+
+			var buf bytes.Buffer
+			if err := Remove(cfgPath, e.checkout, &buf); err != nil {
+				t.Fatalf("Remove invalid config: %v", err)
+			}
+			if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+				t.Fatal("invalid config file not removed")
+			}
+			if _, err := os.Stat(e.checkout); !os.IsNotExist(err) {
+				t.Fatal("checkout dir not removed alongside invalid config")
+			}
+			if !strings.Contains(buf.String(), "Removed git source config") {
+				t.Fatalf("remove output = %q, want config-removed report", buf.String())
+			}
+
+			// Idempotent second run: nothing configured, no checkout.
+			var buf2 bytes.Buffer
+			if err := Remove(cfgPath, e.checkout, &buf2); err != nil {
+				t.Fatalf("second Remove: %v", err)
+			}
+			if !strings.Contains(buf2.String(), "Not configured") {
+				t.Fatalf("second remove output = %q, want 'Not configured'", buf2.String())
+			}
+		})
+	}
+}
+
 // TestStatusErrOnCorruptConfig verifies Status surfaces a corrupt/unreadable
 // config as an error (as opposed to "nothing configured").
 func TestStatusErrOnCorruptConfig(t *testing.T) {

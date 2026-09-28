@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -370,6 +371,27 @@ func subsystemConfigNoSecret(t *testing.T) Config {
 		CheckoutDir:  filepath.Join(gitDir, "checkout"),
 		FunctionsDir: filepath.Join(t.TempDir(), "functions"),
 		SSHDir:       filepath.Join(gitDir, "ssh"),
+	}
+}
+
+// TestNewDisabledWithInvalidPersistedConfig verifies NewServer disables the
+// webhook (nil, Warn logged) when the persisted git source is invalid. LoadConfig
+// now validates the SSH URL/ref/path/secret reference, so a hand-edited
+// source.json can never bring up a webhook endpoint over an invalid source.
+func TestNewDisabledWithInvalidPersistedConfig(t *testing.T) {
+	logger, buf := testLogger()
+	gitDir := t.TempDir()
+	cfgPath := filepath.Join(gitDir, "source.json")
+	// An http (non-SSH) repository is invalid for a persisted source.
+	if err := os.WriteFile(cfgPath, []byte(`{"repository":"https://github.com/acme/backend.git","ref":"main","webhookSecretRef":"gh_secret"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := Config{Secrets: mustProvider(t), ConfigPath: cfgPath}
+	if s := NewServer("127.0.0.1:0", logger, cfg); s != nil {
+		t.Fatal("NewServer returned non-nil for an invalid persisted config; want nil (disabled)")
+	}
+	if !strings.Contains(buf.String(), "continuing without webhook") {
+		t.Fatalf("missing read-config Warn:\n%s", buf.String())
 	}
 }
 

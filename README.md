@@ -1913,9 +1913,11 @@ and exits 0.
 `relay git remove` deletes the persisted config and the checkout directory. It
 leaves `/functions` untouched and **keeps the SSH key** (the operator registered
 its public half as a Deploy Key; removing the source is unrelated to the key's
-lifecycle, and re-keying is an explicit `relay git keygen` operation). It is
-idempotent: running it again reports nothing configured and fails only if the
-config is corrupt.
+lifecycle, and re-keying is an explicit `relay git keygen` operation). Removal is
+decided by file existence, never by parsing the config, so it also clears a
+hand-edited `source.json` that `relay git status`/`sync` would reject (bad JSON
+or an invalid repository/ref/path/secret reference). It is idempotent: running it
+again reports nothing configured.
 
 ## Observability
 

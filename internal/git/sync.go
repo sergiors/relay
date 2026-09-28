@@ -139,7 +139,40 @@ func (a gitOpsAuth) authFor(sourceURL string) (gitssh.AuthMethod, error) {
 // syncWithGit is the shared implementation behind Sync and SyncFromConfig. It
 // takes the transport seam (ops) and the auth builder so both entries behave
 // identically.
+//
+// Before any timeout, auth build, network, or filesystem action it validates the
+// config and every effective override through the one canonical path
+// (NormalizeAndValidateConfig for the config, plus the same per-field validators
+// for the RepositoryURL/Ref/Path overrides). A hand-edited source.json or a
+// directly constructed Config passed to SyncFromConfig can therefore never reach
+// gitOps/network or materialization with a bad repository, ref, path, or webhook
+// secret reference. opts.CloneURL is the documented local/filesystem transport
+// seam for tests and local sources and is deliberately exempt from the persisted
+// SSH-URL rule; a RepositoryURL override IS validated as the persisted URL is.
 func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, auth builder) error {
+	// NormalizeAndValidateConfig also defaults an empty cfg.Ref to DefaultRef, so
+	// the effective-ref logic below always sees a concrete ref.
+	normalized, err := NormalizeAndValidateConfig(cfg)
+	if err != nil {
+		return err
+	}
+	cfg = normalized
+	if opts.RepositoryURL != "" {
+		if err := ValidateRepositoryURL(opts.RepositoryURL); err != nil {
+			return err
+		}
+	}
+	if opts.Ref != "" {
+		if err := validateRef(opts.Ref); err != nil {
+			return err
+		}
+	}
+	if opts.Path != nil {
+		if err := validatePath(*opts.Path); err != nil {
+			return err
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
 	defer cancel()
 
@@ -161,13 +194,6 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		if log != nil {
 			log.Debug(msg, args...)
 		}
-	}
-
-	if err := validatePath(cfg.Path); err != nil {
-		return err
-	}
-	if cfg.Repository == "" {
-		return fmt.Errorf("git: configured repository is empty")
 	}
 
 	// The actual clone source. Production uses the configured Repository; tests

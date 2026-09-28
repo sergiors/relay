@@ -18,11 +18,18 @@ import (
 // paths the CLI git commands operate on. They default to the fixed internal
 // paths (/var/lib/relay/... and function.Dir); tests replace them with temp dirs
 // so the commands never touch /var/lib/relay or /functions.
+//
+// gitCloneURL is the transport seam for `git sync`, mirroring the git package's
+// SyncOptions.CloneURL. It is empty in production (sync uses the persisted,
+// validated SSH repository); tests point it at a local filesystem repository so
+// a real `relay git sync` runs end to end with no SSH and no network. It is
+// never persisted: Config.Repository always remains the validated SSH URL.
 var (
 	gitConfigPath   = git.ConfigPath
 	gitCheckoutDir  = git.CheckoutDir
 	gitSSHDir       = git.SSHDir
 	gitFunctionsDir = function.Dir
+	gitCloneURL     string
 )
 
 // gitCommand builds the `relay git ...` manual sync subcommand family. It never
@@ -158,17 +165,18 @@ func gitKeygen(w io.Writer) error {
 }
 
 // gitSet validates and persists the source config (upsert semantics; calling
-// again overwrites). It enforces the SSH-URL, monorepo-path, and (when
-// provided) webhook-secret-name rules. It takes no logger: the confirmation
-// line on w IS the complete record of this single-step command. The confirmation
-// line may mention the webhook-secret REFERENCE name (never its value).
+// again overwrites) by delegating to git.SetSource, which funnels through the
+// package's one canonical validation path (SSH-URL, ref, monorepo-path, and,
+// when provided, webhook-secret-name rules). It takes no logger: the
+// confirmation line on w IS the complete record of this single-step command. The
+// confirmation line may mention the webhook-secret REFERENCE name (never its
+// value).
 func gitSet(ctx context.Context, w io.Writer, repository, ref, path, webhookSecretRef string) error {
-	// Default the ref to DefaultRef when the flag was omitted.
+	// Default the ref to DefaultRef when the flag was omitted, so the
+	// confirmation line shows the effective ref. SetSource applies the same
+	// default and the full canonical validation.
 	if ref == "" {
 		ref = git.DefaultRef
-	}
-	if err := git.ValidateRepositoryURL(repository); err != nil {
-		return err
 	}
 	if err := git.SetSource(gitConfigPath, repository, ref, path, webhookSecretRef); err != nil {
 		return err
@@ -195,6 +203,7 @@ func gitSync(ctx context.Context, w io.Writer) error {
 	o.CheckoutDir = gitCheckoutDir
 	o.FunctionsDir = gitFunctionsDir
 	o.SSHDir = gitSSHDir
+	o.CloneURL = gitCloneURL
 	o.Out = w
 	return git.Sync(ctx, o)
 }
