@@ -30,9 +30,9 @@ automatically.
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`    | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                        |
 | `METRICS_ADDR`                | unset   | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                           |
 | `GIT_WEBHOOK_ADDR`            | unset   | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                              |
-| `NETWORKS`                    | unset   | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup.                 |
+| `NETWORKS`                    | unset   | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
 | `REDIS_STREAM_RETENTION`      | unset   | Go duration (`6h`)                                                      | The one optional value that **logs and disables** instead of failing. See below.                                                                      |
-| `TRAEFIK_NETWORK`             | unset   | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile.                                                                     |
+| `TRAEFIK_NETWORK`             | unset   | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                               |
 | `TRAEFIK_ENTRYPOINTS`         | unset   | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`) | Passed through verbatim into the router label; no default.                                                                                            |
 | `TRAEFIK_CERTRESOLVER`        | unset   | resolver name (`letsencrypt`)                                           | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                            |
 | `TRAEFIK_PRIORITY`            | unset   | positive integer                                                        | Any provided value must be positive (a fatal error otherwise); unset omits the label.                                                                 |
@@ -42,6 +42,13 @@ automatically.
 the worker; the read-only admin commands that don't need Redis still call
 `config.Load`, so an invalid `LOG_LEVEL` or tuning value fails those commands
 too.
+
+`NETWORKS` and `TRAEFIK_NETWORK` name Docker networks Relay attaches containers
+to; Relay **never creates or removes** them (they are infrastructure owned
+outside Relay). A name present at startup verification that is later deleted from
+the daemon surfaces as a container-create failure on the next execution/service
+create — Relay reports it and never re-creates the network. `NETWORKS` is startup
+configuration: changing it requires a worker restart.
 
 ### Concurrency and backpressure
 

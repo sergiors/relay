@@ -57,7 +57,8 @@ func TestNetworkExistsNotFoundSemantics(t *testing.T) {
 // TestVerifyNetworks pins the startup pre-flight the worker performs for the
 // worker-global NETWORKS set: every network must exist; the first missing one is
 // reported (ok=false) and Relay NEVER creates a network. A non-not-found inspect
-// error is surfaced as a genuine error.
+// error is surfaced as a genuine error. The list is normalized defensively, so a
+// duplicate is inspected at most once.
 func TestVerifyNetworks(t *testing.T) {
 	t.Run("all present", func(t *testing.T) {
 		cli := newScriptedDockerClient(t,
@@ -68,6 +69,22 @@ func TestVerifyNetworks(t *testing.T) {
 		missing, ok, err := m.VerifyNetworks(context.Background(), []string{"backend", "frontend"})
 		if err != nil || !ok || missing != "" {
 			t.Fatalf("VerifyNetworks = (%q, %v, %v), want (\"\", true, nil)", missing, ok, err)
+		}
+	})
+
+	t.Run("duplicates inspected once and all present", func(t *testing.T) {
+		calls := 0
+		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodGet, path: "/networks/backend", body: `{"Name":"backend"}`,
+				onMatch: func() { calls++ }},
+		)
+		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+		missing, ok, err := m.VerifyNetworks(context.Background(), []string{"backend", "backend", "", "backend"})
+		if err != nil || !ok || missing != "" {
+			t.Fatalf("VerifyNetworks(dupes) = (%q, %v, %v), want (\"\", true, nil)", missing, ok, err)
+		}
+		if calls != 1 {
+			t.Fatalf("backend inspected %d times, want exactly once", calls)
 		}
 	})
 
@@ -82,6 +99,35 @@ func TestVerifyNetworks(t *testing.T) {
 		}
 		if ok || missing != "backend" {
 			t.Fatalf("VerifyNetworks = (%q, %v, %v), want (\"backend\", false, nil)", missing, ok, err)
+		}
+	})
+
+	t.Run("one missing among several fails with that name", func(t *testing.T) {
+		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodGet, path: "/networks/backend", body: `{"Name":"backend"}`},
+			dockerRoute{method: http.MethodGet, path: "/networks/frontend", status: http.StatusNotFound, body: `{"message":"network frontend not found"}`},
+		)
+		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+		missing, ok, err := m.VerifyNetworks(context.Background(), []string{"backend", "frontend"})
+		if err != nil {
+			t.Fatalf("a missing network must not be an error: %v", err)
+		}
+		if ok || missing != "frontend" {
+			t.Fatalf("VerifyNetworks = (%q, %v, %v), want (\"frontend\", false, nil)", missing, ok, err)
+		}
+	})
+
+	t.Run("inspect failure surfaces as an error", func(t *testing.T) {
+		cli := newScriptedDockerClient(t,
+			dockerRoute{method: http.MethodGet, path: "/networks/backend", status: http.StatusInternalServerError, body: `{"message":"daemon exploded"}`},
+		)
+		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+		missing, ok, err := m.VerifyNetworks(context.Background(), []string{"backend"})
+		if err == nil {
+			t.Fatal("a non-not-found inspect failure must surface as an error")
+		}
+		if ok || missing != "backend" {
+			t.Fatalf("VerifyNetworks = (%q, %v, %v), want (\"backend\", false, err)", missing, ok, err)
 		}
 	})
 

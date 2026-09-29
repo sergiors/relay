@@ -202,7 +202,9 @@ External image
   Relay does not build or own that image
 ```
 
-Services may also use function-level environment variables, secrets, networks, resources, replicas, and routing configuration.
+Services may also use function-level environment variables, secrets, Docker
+networks (the worker-global `NETWORKS` plus `TRAEFIK_NETWORK` for routed
+services), resources, replicas, and routing configuration.
 
 See [docs/services.md](docs/services.md).
 

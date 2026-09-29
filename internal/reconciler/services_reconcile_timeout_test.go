@@ -175,7 +175,7 @@ func TestReconcileSlowResolveDoesNotConsumePostResolveDeadline(t *testing.T) {
 	const budget = 20 * time.Millisecond
 	f := &phaseDocker{resolveDelay: 5 * budget}
 
-	changed, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	changed, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
 	if err != nil {
 		t.Fatalf("reconcile with a slow resolve: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestReconcilePreAndPostResolveBoundsAreFreshAndSeparate(t *testing.T) {
 	const budget = 50 * time.Millisecond
 	f := &phaseDocker{resolveDelay: 3 * budget}
 
-	if _, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
+	if _, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestReconcilePostResolveIsBoundedToReconcileTimeout(t *testing.T) {
 	f := &phaseDocker{blockStart: true}
 
 	start := time.Now()
-	_, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+	_, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
 	elapsed := time.Since(start)
 
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
@@ -265,7 +265,7 @@ func TestReconcileLifecycleCancellationCancelsNormalOperation(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconcile(lifecycle, time.Minute, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+		_, err := Reconcile(lifecycle, time.Minute, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
 		done <- err
 	}()
 
@@ -298,7 +298,7 @@ func TestReconcileLifecycleCancellationCancelsResolvePhase(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconcile(lifecycle, time.Minute, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+		_, err := Reconcile(lifecycle, time.Minute, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
 		done <- err
 	}()
 
@@ -328,7 +328,7 @@ func TestReconcileNonPositiveTimeoutLeavesOperationsLifecycleBounded(t *testing.
 	defer cancel()
 	f := &phaseDocker{}
 
-	if _, err := Reconcile(lifecycle, 0, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
+	if _, err := Reconcile(lifecycle, 0, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	for _, op := range []string{"list", "resolve", "start"} {
@@ -345,7 +345,7 @@ func TestReconcileNonPositiveTimeoutLeavesOperationsLifecycleBounded(t *testing.
 	f2 := &phaseDocker{blockList: true}
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconcile(lifecycle, 0, f2, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
+		_, err := Reconcile(lifecycle, 0, f2, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger())
 		done <- err
 	}()
 	waitForObservation(t, f2, "list")
@@ -369,7 +369,7 @@ func TestReconcileCachedResolveStillBoundsPostResolve(t *testing.T) {
 	const budget = 40 * time.Millisecond
 	f := &phaseDocker{} // resolveDelay 0: resolution is the short-circuit path
 
-	if _, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
+	if _, err := Reconcile(context.Background(), budget, f, "fn", slowResolveServiceTemplate(), "img", nil, nil, nil, routing.TraefikConfig{}, testutil.DiscardLogger()); err != nil {
 		t.Fatalf("reconcile (cached resolve): %v", err)
 	}
 	start := f.observationsFor("start")

@@ -133,6 +133,13 @@ func BuildEnv(
 // error is returned (at least one error surfaces when anything failed), so a
 // transient daemon error on one container does not abort convergence of the rest.
 //
+// serviceNetworks is the worker-global Docker network set (NETWORKS) every
+// service container joins, exactly as it applies to execution containers; a
+// routed service additionally joins its routing network (TRAEFIK_NETWORK). The
+// networks are infrastructure owned OUTSIDE Relay — Relay never creates them —
+// and are normalized into a set (see runtime.NetworkSet), so a container is
+// joined/replaced based on the SET of networks, not the declaration order.
+//
 // ctx is the LIFECYCLE context, NOT a pre-bounded reconcile budget. Reconcile
 // derives every normal-operation bound itself from ctx and reconcileTimeout, so a
 // caller can never accidentally wrap a whole pass in one short deadline.
@@ -161,11 +168,15 @@ func Reconcile(
 	tmpl *function.Template,
 	functionImage string,
 	preparedEnv []string,
+	serviceNetworks []string,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
 ) (bool, error) {
-	return reconcileWithObserver(ctx, reconcileTimeout, docker, fnName, tmpl, functionImage, preparedEnv, secrets, traefik, log, nil)
+	return reconcileWithObserver(
+		ctx, reconcileTimeout, docker, fnName, tmpl, functionImage, preparedEnv,
+		serviceNetworks, secrets, traefik, log, nil,
+	)
 }
 
 func reconcileWithObserver(
@@ -176,6 +187,7 @@ func reconcileWithObserver(
 	tmpl *function.Template,
 	functionImage string,
 	preparedEnv []string,
+	serviceNetworks []string,
 	secrets SecretResolver,
 	traefik routing.TraefikConfig,
 	log *slog.Logger,
@@ -395,12 +407,17 @@ func reconcileWithObserver(
 		// even though the image reference (and image fingerprint) are unchanged.
 		resources := tmpl.ResourceLimits()
 		resourceHash := resources.Fingerprint()
-		// desiredNetworks is the canonical relay.networks value the container
-		// must carry: the routing network (if routed) — service networking is
-		// owned by the routing layer and is independent of any worker-global
-		// network set. A routing-network change makes the running container
-		// stale and replaces it.
-		desiredNetworks := runtime.NetworksLabel(routeNetwork)
+		// desiredNetworks / desiredNetworkSet is the canonical network set the
+		// container must carry and join: the worker-global NETWORKS set every
+		// service container joins, plus the routing network for a routed
+		// service (none otherwise). Normalizing to a sorted, de-duplicated set
+		// makes the comparison order- and duplicate-invariant, so a
+		// relay.networks label discovered on a container matches whenever the
+		// SET is the same — a reordered or repeated declaration never replaces a
+		// container. A routing-network change (or a global change) makes the
+		// running container stale and replaces it.
+		desiredNetworkSet := runtime.NetworkSet(append(append([]string(nil), serviceNetworks...), routeNetwork))
+		desiredNetworks := runtime.NetworksLabel(desiredNetworkSet...)
 
 		// A container is a keep candidate only when it is both healthy (running)
 		// and currently configured correctly (image, image content, port,
@@ -477,7 +494,7 @@ func reconcileWithObserver(
 				Env:       env,
 				Resources: resources,
 				Labels:    routeLabels,
-				Network:   routeNetwork,
+				Networks:  desiredNetworkSet,
 			}
 			if _, err := docker.StartService(postCtx, spec, slot); err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))
@@ -589,7 +606,14 @@ type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
 	traefik routing.TraefikConfig
-	log     *slog.Logger
+	// networks is the worker-global Docker network set (NETWORKS) every service
+	// container joins, exactly as it applies to execution containers. It is set
+	// through WithNetworks (the worker wires config's resolved value) and is
+	// nil for a direct call without the option, preserving pre-existing
+	// behavior (no global networks). It is copied at construction and is
+	// startup configuration: changing it requires a worker restart.
+	networks []string
+	log      *slog.Logger
 
 	// reconcileTimeout is the bound Reconcile derives for each normal
 	// service-operation context, rooted in the lifecycle context its caller
@@ -616,6 +640,16 @@ type ServiceReconcilerOption func(*ServiceReconciler)
 // outcomes and durations. A nil registry leaves observability disabled.
 func WithMetrics(reg *metrics.Registry) ServiceReconcilerOption {
 	return func(c *ServiceReconciler) { c.metrics = reg }
+}
+
+// WithNetworks wires the worker-global Docker network set (NETWORKS) every
+// service container joins, exactly as it applies to execution containers. The
+// worker passes config's resolved list; omitting the option (or passing nil)
+// leaves services with no global networks. The list is copied so a caller
+// cannot mutate the reconciler's configuration after construction, and it is
+// startup configuration: changing it requires a worker restart.
+func WithNetworks(networks []string) ServiceReconcilerOption {
+	return func(c *ServiceReconciler) { c.networks = append([]string(nil), networks...) }
 }
 
 // NewServiceReconciler builds a ServiceReconciler. traefik is the worker-level
@@ -672,11 +706,17 @@ func (c *ServiceReconciler) Apply(
 	return c.apply(ctx, fnName, tmpl, image, preparedEnv, nil)
 }
 
-func (c *ServiceReconciler) ApplyWithStatus(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string, reconcileStarted func()) error {
+func (c *ServiceReconciler) ApplyWithStatus(
+	ctx context.Context, fnName string, tmpl *function.Template, image string,
+	preparedEnv []string, reconcileStarted func(),
+) error {
 	return c.apply(ctx, fnName, tmpl, image, preparedEnv, reconcileStarted)
 }
 
-func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *function.Template, image string, preparedEnv []string, reconcileStarted func()) error {
+func (c *ServiceReconciler) apply(
+	ctx context.Context, fnName string, tmpl *function.Template, image string,
+	preparedEnv []string, reconcileStarted func(),
+) error {
 	replicas := 0
 	for _, svc := range tmpl.Services {
 		replicas += svc.Replicas
@@ -687,7 +727,10 @@ func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *func
 	// is the closed changed/unchanged/error set. A nil registry is a no-op. The
 	// function label is the existing bounded dimension.
 	start := time.Now()
-	changed, err := reconcileWithObserver(ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv, c.secrets, c.traefik, c.log, reconcileStarted)
+	changed, err := reconcileWithObserver(
+		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
+		c.networks, c.secrets, c.traefik, c.log, reconcileStarted,
+	)
 	c.observeReconcile(fnName, changed, err, time.Since(start))
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
@@ -718,7 +761,9 @@ func (c *ServiceReconciler) apply(ctx context.Context, fnName string, tmpl *func
 // containers — the error is the operator-relevant signal), changed when it
 // converged container state, and unchanged for a fully-converged verification
 // pass. It is nil-registry-safe.
-func (c *ServiceReconciler) observeReconcile(fnName string, changed bool, err error, d time.Duration) {
+func (c *ServiceReconciler) observeReconcile(
+	fnName string, changed bool, err error, d time.Duration,
+) {
 	if c.metrics == nil {
 		return
 	}

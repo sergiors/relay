@@ -23,19 +23,16 @@ import (
 // execution (event/schedule) container from the worker-global network set
 // (WithNetworks): each named network exactly once. An empty/nil list yields
 // nil, so a worker with no NETWORKS sends no NetworkingConfig (unchanged
-// default bridge/network behavior).
+// default bridge/network behavior). It shares NetworkSet with the service path,
+// so both normalize identically.
 func executionEndpoints(networks []string) map[string]*network.EndpointSettings {
-	if len(networks) == 0 {
+	set := NetworkSet(networks)
+	if len(set) == 0 {
 		return nil
 	}
-	endpoints := make(map[string]*network.EndpointSettings, len(networks))
-	for _, n := range networks {
-		if n != "" {
-			endpoints[n] = &network.EndpointSettings{}
-		}
-	}
-	if len(endpoints) == 0 {
-		return nil
+	endpoints := make(map[string]*network.EndpointSettings, len(set))
+	for _, n := range set {
+		endpoints[n] = &network.EndpointSettings{}
 	}
 	return endpoints
 }

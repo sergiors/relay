@@ -32,8 +32,8 @@ type fakeContainer struct {
 	envHash    string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	resources  string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
 	labels     map[string]string
-	network    string // spec.Network passed to StartService (the routing network)
-	hostname   string // the worker identity (relay.hostname) that owns the container
+	networks   []string // spec.Networks passed to StartService (global + routing networks)
+	hostname   string   // the worker identity (relay.hostname) that owns the container
 }
 
 // defaultFakeHostname is the worker identity containers get when started via
@@ -112,13 +112,13 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// the effective env's content hash (relay.env_hash), even for an empty
 		// env. Directly seeded fakeContainers omit it to model a legacy/unlabeled
 		// container. It also carries the canonical relay.networks label (the
-		// routing network), so a converged pass sees the networks match. The
-		// effective resource limits' fingerprint (relay.resources) is stamped
-		// too, so a resource-only change replaces the container.
+		// global + routing network set), so a converged pass sees the networks
+		// match. The effective resource limits' fingerprint (relay.resources) is
+		// stamped too, so a resource-only change replaces the container.
 		envHash:   runtime.EnvHash(spec.Env),
 		resources: spec.Resources.OrDefault().Fingerprint(),
 		labels:    spec.Labels,
-		network:   spec.Network,
+		networks:  append([]string(nil), spec.Networks...),
 		hostname:  defaultFakeHostname,
 	}
 	return id, nil
@@ -148,7 +148,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			Hostname:  c.hostname,
 			EnvHash:   c.envHash,
 			Resources: c.resources,
-			Networks:  runtime.NetworksLabel(c.network),
+			Networks:  runtime.NetworksLabel(c.networks...),
 			Labels:    c.labels,
 		})
 	}
@@ -273,12 +273,19 @@ func serviceResources() string {
 const testReconcileTimeout = 30 * time.Second
 
 // reconcile runs Reconcile with a background LIFECYCLE context, no prepared env,
-// no secrets, and a discarded logger — the common shape across the service
-// tests. The lifecycle context is unbounded; Reconcile derives its own
-// per-operation bounds from the explicit timeout.
+// no secrets, no service networks, and a discarded logger — the common shape
+// across the service tests. The lifecycle context is unbounded; Reconcile
+// derives its own per-operation bounds from the explicit timeout.
 func reconcile(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, cfg, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, nil, cfg, testutil.DiscardLogger())
+}
+
+// reconcileNetworks runs Reconcile with an explicit worker-global network set,
+// for the global-network tests.
+func reconcileNetworks(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, networks []string, cfg routing.TraefikConfig) (bool, error) {
+	t.Helper()
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, networks, nil, cfg, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
@@ -689,7 +696,7 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 // env/secret staleness tests.
 func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
 	t.Helper()
-	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
+	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, nil, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
 }
 
 // TestReconcileEnvChangeReplacesContainer: changing a template env value on an

@@ -523,14 +523,15 @@ func Run(logger *slog.Logger) error {
 	// path when shutdown cleanup did not execute. The service reconciler itself
 	// decides whether routing applies (only services declaring a host are routed)
 	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
-	// configured value.
+	// configured value. The same worker-global NETWORKS set applied to execution
+	// containers is forwarded too, so every service container joins it.
 	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
 		Network:      cfg.TraefikNetwork,
 		EntryPoints:  cfg.TraefikEntryPoints,
 		CertResolver: cfg.TraefikCertResolver,
 		Priority:     cfg.TraefikPriority,
 		HostOverride: cfg.TraefikHostOverride,
-	}, logger, reconcileTimeout, reconciler.WithMetrics(metricsInstance))
+	}, logger, reconcileTimeout, reconciler.WithMetrics(metricsInstance), reconciler.WithNetworks(cfg.Networks))
 	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
@@ -1765,6 +1766,14 @@ func sweepStartupServiceOrphans(
 	svcCtrl.SweepOrphans(sweepCtx, liveNames)
 }
 
+// networkVerifier is the narrow view of the runtime Manager that the startup
+// NETWORKS pre-flight needs. *runtime.Manager satisfies it; a test fake can
+// implement it, so the verification error semantics are unit-testable without a
+// Docker daemon (matching consumerGroupEnsurer's seam).
+type networkVerifier interface {
+	VerifyNetworks(ctx context.Context, networks []string) (string, bool, error)
+}
+
 // verifyConfiguredNetworks verifies every network in the worker-global NETWORKS
 // set exists on the Docker daemon before any function is prepared or any
 // container created. A missing network, or a verify error (a broken daemon), is
@@ -1773,7 +1782,7 @@ func sweepStartupServiceOrphans(
 // fault. It is a no-op when networks is empty, so an unset NETWORKS keeps the
 // default bridge behavior. The check is bounded by the worker lifecycle and a
 // reconcileTimeout so a hung daemon cannot stall startup forever.
-func verifyConfiguredNetworks(ctx context.Context, manager *runtime.Manager, networks []string) error {
+func verifyConfiguredNetworks(ctx context.Context, manager networkVerifier, networks []string) error {
 	if len(networks) == 0 {
 		return nil
 	}

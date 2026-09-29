@@ -61,17 +61,19 @@ type ServiceSpec struct {
 	// can never spoof or clobber relay.* labels, which define ownership and
 	// discovery.
 	Labels map[string]string
-	// Network is the Docker network the container must join at create time
-	// (e.g. the routing layer's network). Empty means no extra network (default
-	// bridge/network mode only). The network itself is infrastructure owned
-	// OUTSIDE Relay — it is never created here — and the caller (the service
-	// reconciler) validates it exists before starting routed containers.
+	// Networks is the set of Docker networks the container must join at create
+	// time: the worker-global NETWORKS set every service container joins, plus
+	// the routing network (TRAEFIK_NETWORK) for a routed service. Empty means no
+	// extra network (default bridge/network mode only). Each name is applied
+	// exactly once (see NetworkSet); order is not significant — Docker's
+	// EndpointsConfig is a map and the relay.networks label is canonicalized.
 	//
-	// Service networking is deliberately independent of the worker-global
-	// NETWORKS set applied to execution containers: a persistent service is
-	// reached through its routing layer (Traefik), which owns the network it
-	// joins. A service that declares no host joins no network here.
-	Network string
+	// The networks themselves are infrastructure owned OUTSIDE Relay — they are
+	// never created here — and the caller (the service reconciler) validates the
+	// routing network exists before starting routed containers while the worker
+	// verifies the global set at startup. A network that disappears after
+	// verification surfaces as a create error rather than a chaos fix-up.
+	Networks []string
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
@@ -106,11 +108,12 @@ type ServiceContainer struct {
 	// container created before the label existed, which never equals a desired
 	// fingerprint, so such a container is replaced once.
 	Resources string
-	// Networks is the canonical, sorted, comma-separated set of extra Docker
-	// networks the container was created attached to, parsed from
-	// relay.networks. It is "" for a container with no extra networks (or one
-	// created before the label existed). The service reconciler compares it to
-	// the desired set to detect a network change.
+	// Networks is the canonical, sorted, comma-separated set of Docker
+	// networks the container was created attached to (the worker-global
+	// NETWORKS set plus the routing network for a routed service), parsed from
+	// relay.networks. It is "" for a container with no networks (or one created
+	// before the label existed). The service reconciler compares it to the
+	// desired set to detect a network change.
 	Networks string
 	// Labels is the container's FULL label set (nil-safe; nil when the
 	// container has none). The service reconciler compares routing metadata
@@ -185,16 +188,44 @@ func serviceIdentityHash(functionName, identity string) string {
 	return hex.EncodeToString(sum[:])[:serviceIdentityHashLen]
 }
 
-// serviceEndpoints builds the Docker NetworkingConfig EndpointsConfig for a
-// service container: the routing network (primary, may be empty). The result is
-// a set keyed by network name — Docker's EndpointsConfig is itself a map, so
-// there is no meaningful iteration order and none is relied on. An empty result
-// means no NetworkingConfig is sent (default bridge/network mode only).
-func serviceEndpoints(primary string) map[string]*network.EndpointSettings {
-	if primary == "" {
+// NetworkSet normalizes a network list into the de-duplicated, SORTED slice of
+// non-empty names Relay treats as a set. It is the single normalization point
+// behind both the Docker NetworkingConfig and the canonical relay.networks
+// label, so a caller cannot introduce an order-dependent or repeated network.
+// An empty/all-empty input yields nil.
+func NetworkSet(networks []string) []string {
+	seen := make(map[string]bool, len(networks))
+	out := make([]string, 0, len(networks))
+	for _, n := range networks {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	return map[string]*network.EndpointSettings{primary: {}}
+	sort.Strings(out)
+	return out
+}
+
+// serviceEndpoints builds the Docker NetworkingConfig EndpointsConfig for a
+// service container from its normalized network set (see NetworkSet): every
+// named network exactly once. The result is keyed by network name — Docker's
+// EndpointsConfig is itself a map, so there is no meaningful iteration order and
+// none is relied on. An empty result means no NetworkingConfig is sent (default
+// bridge/network mode only).
+func serviceEndpoints(networks []string) map[string]*network.EndpointSettings {
+	set := NetworkSet(networks)
+	if len(set) == 0 {
+		return nil
+	}
+	endpoints := make(map[string]*network.EndpointSettings, len(set))
+	for _, n := range set {
+		endpoints[n] = &network.EndpointSettings{}
+	}
+	return endpoints
 }
 
 // NetworksLabel returns the canonical value of the relay.networks label for a
@@ -204,25 +235,16 @@ func serviceEndpoints(primary string) map[string]*network.EndpointSettings {
 // input field order, so a reconciler comparing a desired value to a discovered
 // label sees equality whenever the SET of networks matches.
 //
-// It is used for persistent service containers, whose only non-default network
-// is the routing layer's (TRAEFIK_NETWORK); it is independent of the
-// worker-global NETWORKS set, which applies to execution containers only.
+// It is used for persistent service containers, whose networks are the
+// worker-global set (NETWORKS) plus the routing layer's (TRAEFIK_NETWORK) for a
+// routed service; the canonical form makes the comparison order- and
+// duplicate-invariant.
 func NetworksLabel(networks ...string) string {
-	set := make(map[string]bool, len(networks))
-	for _, n := range networks {
-		if n != "" {
-			set[n] = true
-		}
-	}
+	set := NetworkSet(networks)
 	if len(set) == 0 {
 		return ""
 	}
-	out := make([]string, 0, len(set))
-	for n := range set {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return strings.Join(out, ",")
+	return strings.Join(set, ",")
 }
 
 // EnvHash returns the short content hash of a service replica's effective
@@ -289,7 +311,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	if spec.ImageID != "" {
 		labels[labelImageID] = spec.ImageID
 	}
-	if networks := NetworksLabel(spec.Network); networks != "" {
+	if networks := NetworksLabel(spec.Networks...); networks != "" {
 		labels[labelNetworks] = networks
 	}
 	for k, v := range spec.Labels {
@@ -314,7 +336,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	// The networks label is ownership metadata too: re-apply it last so a
 	// caller-supplied label can never spoof the container's actual networks,
 	// and clear a spoofed value when the spec declares none.
-	if networks := NetworksLabel(spec.Network); networks != "" {
+	if networks := NetworksLabel(spec.Networks...); networks != "" {
 		labels[labelNetworks] = networks
 	} else {
 		delete(labels, labelNetworks)
@@ -400,14 +422,17 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		HostConfig: hardenedHostConfig(false, spec.Resources),
 		Name:       serviceContainerName(spec.Function, spec.Identity, replica),
 	}
-	if endpoints := serviceEndpoints(spec.Network); len(endpoints) > 0 {
-		// Join the routing network at create time (containers must belong to a
-		// network from creation to be on it at start). The network is
-		// infrastructure owned OUTSIDE Relay — it is never created here — and
-		// the caller (the service reconciler) validates it exists before
-		// starting containers; a missing network surfaces as a create error
-		// below rather than a chaos fix-up. Service networking is independent of
-		// the worker-global NETWORKS set applied to execution containers.
+	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
+		// Join every configured network at create time (containers must belong to
+		// a network from creation to be on it at start). The worker-global
+		// NETWORKS set applies to service containers exactly as it does to
+		// execution containers; a routed service additionally joins the routing
+		// network. All are infrastructure owned OUTSIDE Relay — they are never
+		// created here — and the caller (the service reconciler for the routing
+		// network, the worker at startup for the global set) validates them
+		// before starting containers; a network that disappears after
+		// verification surfaces as a create error below rather than a chaos
+		// fix-up.
 		createOps.NetworkingConfig = &network.NetworkingConfig{EndpointsConfig: endpoints}
 	}
 	createResp, err := m.cli.ContainerCreate(ctx, createOps)
@@ -522,11 +547,12 @@ func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, erro
 // Relay reports rather than fixes — it NEVER creates a network. A non-not-found
 // inspect error is returned as a genuine error so a broken daemon never looks
 // like a missing network. The worker treats either failure as fatal startup.
+//
+// The list is normalized defensively through NetworkSet first: config already
+// parses NETWORKS into a de-duplicated list, but a caller passing duplicates or
+// empty names still inspects each network at most once.
 func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string, bool, error) {
-	for _, network := range networks {
-		if network == "" {
-			continue
-		}
+	for _, network := range NetworkSet(networks) {
 		ok, err := m.NetworkExists(ctx, network)
 		if err != nil {
 			return network, false, err

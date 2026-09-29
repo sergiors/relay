@@ -59,8 +59,8 @@ func TestReconcileUnroutedNoRoutingActivity(t *testing.T) {
 	if hasTraefikKey(c.labels) {
 		t.Fatalf("unrouted container labels contain traefik keys: %v", c.labels)
 	}
-	if c.network != "" {
-		t.Fatalf("unrouted container network = %q, want \"\"", c.network)
+	if len(c.networks) != 0 {
+		t.Fatalf("unrouted container networks = %v, want none", c.networks)
 	}
 }
 
@@ -142,8 +142,8 @@ func TestReconcileRoutedHappyPath(t *testing.T) {
 	if _, ok := c.labels[routingServicePrefix+id+".loadbalancer.server.port"]; !ok {
 		t.Fatalf("loadbalancer port label missing in %v", c.labels)
 	}
-	if c.network != "proxy" {
-		t.Fatalf("started network = %q, want proxy", c.network)
+	if len(c.networks) != 1 || c.networks[0] != "proxy" {
+		t.Fatalf("started networks = %v, want [proxy]", c.networks)
 	}
 	if len(f.networkLookups) != 1 || f.networkLookups[0] != "proxy" {
 		t.Fatalf("networkLookups = %v, want [proxy]", f.networkLookups)
@@ -170,8 +170,8 @@ func TestReconcileRoutedFullHTTPSConfig(t *testing.T) {
 	if c == nil {
 		t.Fatal("no started container")
 	}
-	if c.network != "proxy" {
-		t.Fatalf("network = %q, want proxy", c.network)
+	if len(c.networks) != 1 || c.networks[0] != "proxy" {
+		t.Fatalf("networks = %v, want [proxy]", c.networks)
 	}
 	id := routing.ServiceProviderID("fn", "service.js")
 	want := map[string]string{
@@ -278,8 +278,8 @@ func TestReconcileUnroutedWithHTTPSConfigNoRouting(t *testing.T) {
 	if hasTraefikKey(c.labels) {
 		t.Fatalf("unrouted container labels contain traefik keys: %v", c.labels)
 	}
-	if c.network != "" {
-		t.Fatalf("network = %q, want \"\"", c.network)
+	if len(c.networks) != 0 {
+		t.Fatalf("networks = %v, want none", c.networks)
 	}
 }
 
@@ -325,7 +325,7 @@ func TestReconcileNetworkChangeReplaces(t *testing.T) {
 		t.Fatalf("stops = %v, want one replaced container", f.stops)
 	}
 	c := f.lastStartedFor("fn", "service.js")
-	if c == nil || c.network != "proxy2" || c.labels[routingNetworkKey] != "proxy2" {
+	if c == nil || len(c.networks) != 1 || c.networks[0] != "proxy2" || c.labels[routingNetworkKey] != "proxy2" {
 		t.Fatalf("replacement container = %+v, want network/labels proxy2", c)
 	}
 }
@@ -354,8 +354,8 @@ func TestReconcileHostRemovedReplacesUnrouted(t *testing.T) {
 	if hasTraefikKey(c.labels) {
 		t.Fatalf("replacement labels contain traefik keys: %v", c.labels)
 	}
-	if c.network != "" {
-		t.Fatalf("replacement network = %q, want \"\"", c.network)
+	if len(c.networks) != 0 {
+		t.Fatalf("replacement networks = %v, want none", c.networks)
 	}
 }
 
@@ -584,8 +584,8 @@ func TestReconcileHostOverrideMapsRule(t *testing.T) {
 	if got := c.labels["traefik.http.middlewares."+routing.PathMiddlewareID("fn", "service.js")+".stripprefix.prefixes"]; got != "/v2" {
 		t.Fatalf("stripprefix = %q, want /v2 (unchanged)", got)
 	}
-	if c.labels[routingNetworkKey] != "proxy" || c.network != "proxy" {
-		t.Fatalf("network = labels %q / spec %q, want proxy", c.labels[routingNetworkKey], c.network)
+	if c.labels[routingNetworkKey] != "proxy" || len(c.networks) != 1 || c.networks[0] != "proxy" {
+		t.Fatalf("network = labels %q / spec %v, want proxy", c.labels[routingNetworkKey], c.networks)
 	}
 	// The template host is untouched.
 	if tmpl.Services[0].Host != "issuer.example.com" {

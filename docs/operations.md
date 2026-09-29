@@ -250,5 +250,8 @@ worker and deletes it only on success (kept on failure). See [cli.md](cli.md).
   are fixed internals, not configurable.
 - `resources` are per container; there is no aggregate per-function budget.
 - Networking is enabled (outbound access is a legitimate function need);
-  per-function network policy is not implemented.
+  per-function network policy is not implemented. Relay never creates or removes
+  Docker networks: `NETWORKS` and `TRAEFIK_NETWORK` are operator-owned, verified
+  before use, and a network removed from the daemon afterwards surfaces as a
+  container-create failure rather than being re-created.
 - Build/version metadata is not plumbed into the binary (no build-info metric).

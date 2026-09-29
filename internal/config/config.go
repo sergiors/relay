@@ -49,13 +49,14 @@ type Config struct {
 	// worker before they complete/ACK. It bounds the local buffer so the
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
-	// Networks is the NETWORKS value: the ordered, de-duplicated list of Docker
-	// networks every execution container this worker creates joins at create
-	// time. It is empty (nil) when NETWORKS is unset. The names are parsed once
-	// at startup (see ParseNetworks) and are startup configuration: changing
-	// them requires a worker restart. The networks are infrastructure owned
-	// OUTSIDE Relay — Relay verifies they exist at startup and never creates
-	// them.
+	// Networks is the NETWORKS value: the ordered, de-duplicated global
+	// workload network set. It applies to both execution containers and
+	// persistent service containers this worker creates (a routed service
+	// additionally joins TraefikNetwork), as one order-independent set. It is
+	// empty (nil) when NETWORKS is unset. The names are parsed once at startup
+	// (see ParseNetworks) and are startup configuration: changing them requires
+	// a worker restart. The networks are infrastructure owned OUTSIDE Relay —
+	// Relay verifies they exist at startup and never creates them.
 	Networks []string
 	// TraefikNetwork is the optional TRAEFIK_NETWORK value: the Docker network
 	// Traefik is attached to. It is required only when a function's template

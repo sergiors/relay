@@ -73,11 +73,20 @@ Per-container `resources` apply to service containers too. The hardening is the
 same as invocation containers: non-root, dropped capabilities, read-only rootfs,
 bounded `/tmp`, memory/CPU/pids limits.
 
-Service networking: a routed service joins `TRAEFIK_NETWORK`; an unrouted service
-joins no extra network. Service containers are **not** attached to `NETWORKS`
-(that variable is for execution containers only). Each service container carries
-a `relay.networks` label recording its routing network so the reconciler can
-detect a network change and replace the container.
+Service networking: every service container joins the worker-global `NETWORKS`
+set (the same set execution containers join); a **routed** service additionally
+joins `TRAEFIK_NETWORK`. An unrouted service with no global networks joins no
+extra network. The set is de-duplicated and order-independent, so a service
+listed on both `NETWORKS` and `TRAEFIK_NETWORK` joins that network exactly once.
+Each service container carries a `relay.networks` label recording the canonical
+(sorted) set so the reconciler can detect a network change and replace the
+container. Relay never creates or removes any of these networks; the global set
+is verified at startup and the routing network before each routed container
+starts (see [configuration.md](configuration.md)). A network deleted from the
+daemon **after** that verification is not re-created: a container that needs
+creating (a replacement or a new replica) fails, the failure is reported for that
+service and retried on the next reconcile, and an already-converged running
+container is left untouched.
 
 ## Convergence and lifecycle
 
@@ -101,7 +110,10 @@ to the template.
 - Containers whose image (or, for an external tag, image **content**), port,
   effective environment (`relay.env_hash`), per-container resources
   (`relay.resources`), or routing labels no longer match are **replaced**.
-  Others are preserved — no unnecessary restarts.
+  Others are preserved — no unnecessary restarts. The joined network **set**
+  (global `NETWORKS` + routing network for a routed service) participates in
+  this comparison order-independently: reordering or repeating a network never
+  replaces a container, but adding/removing/switching one does.
 - Environment comparison is what makes a changed template `env` value or a
   **rotated secret value** replace a service's container: the image reference and
   fingerprint do not change for either, but a long-lived container would
@@ -128,7 +140,8 @@ check does not advance the window, so it retries at the next reconcile.
 
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.function`, `relay.identity`, plus image content id,
-port, replica slot, `relay.env_hash`, `relay.resources`), never by name alone.
+port, replica slot, `relay.env_hash`, `relay.resources`, `relay.networks`), never
+by name alone.
 `relay.identity` is the configured source descriptor; service containers carry no
 `relay.handler` label — the source **is** the service.
 
@@ -160,6 +173,10 @@ Requirements:
 - `TRAEFIK_NETWORK` is **required** for a routed service. Relay never creates the
   network: it verifies it exists before starting routed containers. Unset or a
   missing network is reported per service and skipped (not half-reconciled).
+  It is joined in addition to the global `NETWORKS` set; a network named in both
+  is joined once. A network removed from the daemon after startup verification
+  surfaces as a container-create failure on the next replacement — Relay never
+  re-creates it.
 - `TRAEFIK_HOST_OVERRIDE` changes only the effective host in the rule, replacing
   the domain while keeping the left-most label (`issuer.example.com` →
   `issuer.localhost`). The template host is not modified.

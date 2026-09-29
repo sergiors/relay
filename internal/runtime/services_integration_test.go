@@ -601,13 +601,13 @@ func countServiceContainers(t *testing.T, ctx context.Context, m *Manager, fn st
 	return n
 }
 
-// TestIntegrationServiceJoinsExternalNetwork pins the ServiceSpec.Network +
-// ServiceSpec.Labels wiring end to end: a service started with Network=<name>
-// is created attached to that external Docker network (created by the TEST as
-// the infra owner — Relay never creates networks), and its supplied extra
-// labels land on the container next to the relay.* ownership labels. The
-// negative case: starting a service against a NONEXISTENT network fails and
-// leaves no container behind.
+// TestIntegrationServiceJoinsExternalNetwork pins the ServiceSpec.Networks +
+// ServiceSpec.Labels wiring end to end: a service started with
+// Networks=[<name>] is created attached to that external Docker network (created
+// by the TEST as the infra owner — Relay never creates networks), and its
+// supplied extra labels land on the container next to the relay.* ownership
+// labels. The negative case: starting a service against a NONEXISTENT network
+// fails and leaves no container behind.
 func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	m, _ := newManager(t)
@@ -641,7 +641,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		Entry:    []string{"node", "/app/app/service.js"},
 		Env:      []string{"PORT=3000"},
 		Labels:   map[string]string{"traefik.enable": "true"},
-		Network:  networkName,
+		Networks: []string{networkName},
 	}, 0)
 	if err != nil {
 		t.Fatalf("start service: %v", err)
@@ -682,7 +682,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
 		Env:      []string{"PORT=3000"},
-		Network:  "relay-test-nonexistent-network",
+		Networks: []string{"relay-test-nonexistent-network"},
 	}, 1)
 	if err == nil {
 		t.Fatal("expected an error starting a service on a nonexistent network")

@@ -134,8 +134,9 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   logs, traces, or state.
 - Routing (Traefik) is optional, only for services declaring a `host`; the
   routing network is required, verified, and never created by Relay. `NETWORKS`
-  attaches execution containers only, is verified at startup, and is startup
-  configuration.
+  is verified at startup and applies to execution containers and, as one
+  order-independent set, to persistent service containers (a routed service adds
+  `TRAEFIK_NETWORK`); it is startup configuration.
 
 ## Lifecycle and command hierarchy
 

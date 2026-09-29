@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 
 	"relay/internal/function"
 	"relay/internal/testutil"
@@ -621,45 +623,152 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	}
 }
 
-// TestStartServiceNetworkingConfig pins that the routing network reaches
-// Docker's NetworkingConfig EndpointsConfig and that the canonical
-// relay.networks label matches. A service with no routing network sends no
-// NetworkingConfig at all (default bridge/network behavior). Service networking
-// is independent of the worker-global NETWORKS set applied to execution
-// containers.
+// TestStartServiceNetworkingConfig drives the real StartService client path
+// against the scripted daemon and inspects the ACTUAL serialized
+// /containers/create request (via captureServiceCreate + decodeCreateRequest),
+// so the service's final network set is proven to reach Docker's
+// NetworkingConfig.EndpointsConfig exactly as the service reconciler intends.
+//
+// The reconciler merges the worker-global NETWORKS set with the routing network
+// (TRAEFIK_NETWORK) for a routed service, de-duplicated and sorted, and passes
+// that FINAL set as spec.Networks. These cases assert that final set as the
+// Docker request layer sees it: the exact endpoint key set (order-independent;
+// EndpointsConfig is a map) and the canonical relay.networks label the
+// reconciler later compares to decide whether a container is stale.
 func TestStartServiceNetworkingConfig(t *testing.T) {
-	t.Run("routing network joined", func(t *testing.T) {
-		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
-			Env: []string{"PORT=3000"}, Network: "proxy",
-		}))
-		if req.NetworkingConfig == nil {
-			t.Fatal("expected a NetworkingConfig for a routed service")
-		}
-		got := req.NetworkingConfig.EndpointsConfig
-		if len(got) != 1 {
-			t.Fatalf("endpoints = %v, want only proxy", got)
-		}
-		if _, ok := got["proxy"]; !ok {
-			t.Fatalf("missing proxy endpoint: %v", got)
-		}
-		if req.Config.Labels[labelNetworks] != "proxy" {
-			t.Fatalf("relay.networks = %q, want proxy", req.Config.Labels[labelNetworks])
-		}
-	})
+	for _, tc := range []struct {
+		name string
+		spec []string // spec.Networks: the reconciler's final desired set
+		want []string // exact expected endpoints / relay.networks members
+	}{
+		{
+			// Unrouted service: exactly the worker-global backend +
+			// observability set, no routing network.
+			name: "unrouted global backend and observability",
+			spec: []string{"backend", "observability"},
+			want: []string{"backend", "observability"},
+		},
+		{
+			// Routed service: the global backend + observability set plus the
+			// routing proxy, each joined exactly once.
+			name: "routed global backend observability and proxy",
+			spec: []string{"backend", "observability", "proxy"},
+			want: []string{"backend", "observability", "proxy"},
+		},
+		{
+			// The routing proxy also appears in the global set: the merged set
+			// contains proxy once, so the endpoints are exactly backend+proxy.
+			name: "global backend and proxy overlapping routing",
+			spec: []string{"backend", "proxy"},
+			want: []string{"backend", "proxy"},
+		},
+		{
+			// A single global network is applied exactly once.
+			name: "single global backend",
+			spec: []string{"backend"},
+			want: []string{"backend"},
+		},
+		{
+			// Repeated global values collapse to the distinct set (and the
+			// canonical label), never a duplicated endpoint.
+			name: "repeated global values deduped",
+			spec: []string{"backend", "backend", "observability", "observability"},
+			want: []string{"backend", "observability"},
+		},
+		{
+			// A service with no networks sends no NetworkingConfig at all
+			// (default bridge/network behavior) and omits relay.networks.
+			name: "no network sends no NetworkingConfig",
+			spec: nil,
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
+				Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
+				Env: []string{"PORT=3000"}, Networks: tc.spec,
+			}))
+			assertServiceEndpoints(t, req, tc.want...)
+		})
+	}
+}
 
-	t.Run("no network sends no NetworkingConfig", func(t *testing.T) {
-		req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-			Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
-			Env: []string{"PORT=3000"},
-		}))
+// assertServiceEndpoints asserts a decoded create request's ACTUAL
+// NetworkingConfig.EndpointsConfig is exactly the expected network set — same
+// count and same keys, order-independent because EndpointsConfig is a map — and
+// that the canonical relay.networks label matches that same canonical set. An
+// empty want asserts no NetworkingConfig and no relay.networks label at all.
+func assertServiceEndpoints(t *testing.T, req *container.CreateRequest, want ...string) {
+	t.Helper()
+	wantSet := NetworkSet(want)
+	if len(wantSet) == 0 {
 		if req.NetworkingConfig != nil {
 			t.Fatalf("expected no NetworkingConfig, got %v", req.NetworkingConfig)
 		}
 		if _, ok := req.Config.Labels[labelNetworks]; ok {
 			t.Fatalf("relay.networks must be omitted, got %q", req.Config.Labels[labelNetworks])
 		}
-	})
+		return
+	}
+	if req.NetworkingConfig == nil {
+		t.Fatalf("expected a NetworkingConfig with %v", wantSet)
+	}
+	got := req.NetworkingConfig.EndpointsConfig
+	if len(got) != len(wantSet) {
+		t.Fatalf("endpoint count = %d (%v), want %d (%v)", len(got), endpointKeys(got), len(wantSet), wantSet)
+	}
+	for _, name := range wantSet {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("missing %q endpoint: %v", name, endpointKeys(got))
+		}
+	}
+	wantLabel := strings.Join(wantSet, ",")
+	if gotLabel := req.Config.Labels[labelNetworks]; gotLabel != wantLabel {
+		t.Fatalf("relay.networks = %q, want the canonical %q", gotLabel, wantLabel)
+	}
+}
+
+// endpointKeys returns the sorted network names of an EndpointsConfig, so a
+// failure message is deterministic regardless of map iteration order.
+func endpointKeys(endpoints map[string]*network.EndpointSettings) []string {
+	keys := make([]string, 0, len(endpoints))
+	for name := range endpoints {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestStartServiceDeletedNetworkCreateFailure pins the post-start network-deleted
+// behavior for services: a network that vanished after startup verification
+// surfaces as a container-create error, and Relay NEVER issues a network create
+// to fix it. The scripted daemon fails the test on any unhandled route, so a
+// /networks/create would surface structurally as well as via the counter.
+func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
+	networkCreates := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{
+			method: http.MethodPost, path: "/containers/create",
+			status: http.StatusNotFound,
+			body:   `{"message":"network backend not found"}`,
+		},
+		dockerRoute{
+			method: http.MethodPost, path: "/networks/create", body: `{"Id":"nid"}`,
+			onMatch: func() { networkCreates++ },
+		},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
+
+	_, err := m.StartService(context.Background(), ServiceSpec{
+		Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
+		Env: []string{"PORT=3000"}, Networks: []string{"backend"},
+	}, 0)
+	if err == nil {
+		t.Fatal("a missing network must surface as a service container create error")
+	}
+	if networkCreates != 0 {
+		t.Fatalf("Relay issued %d network create(s); it must never create networks", networkCreates)
+	}
 }
 
 // TestServiceLabelsNetworks pins the canonical relay.networks label: sorted,
@@ -672,14 +781,14 @@ func TestServiceLabelsNetworks(t *testing.T) {
 	}
 
 	got := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img", Network: "proxy",
+		Function: "fn", Identity: "svc", Image: "img", Networks: []string{"proxy"},
 	}, "h", 0)
 	if got[labelNetworks] != "proxy" {
 		t.Fatalf("relay.networks = %q, want proxy", got[labelNetworks])
 	}
 
 	spoof := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img", Network: "real",
+		Function: "fn", Identity: "svc", Image: "img", Networks: []string{"real"},
 		Labels: map[string]string{labelNetworks: "spoofed"},
 	}, "h", 0)
 	if spoof[labelNetworks] != "real" {
@@ -688,7 +797,7 @@ func TestServiceLabelsNetworks(t *testing.T) {
 }
 
 // TestNetworksLabelCanonical pins the exported canonical helper used by the
-// service reconciler to compare a desired network set to a discovered label.
+// reconciler to compare a desired network set to a discovered label.
 func TestNetworksLabelCanonical(t *testing.T) {
 	if got := NetworksLabel(); got != "" {
 		t.Fatalf("empty = %q, want empty", got)
@@ -701,5 +810,30 @@ func TestNetworksLabelCanonical(t *testing.T) {
 	}
 	if got := NetworksLabel("b", "a", "proxy", ""); got != "a,b,proxy" {
 		t.Fatalf("union = %q, want a,b,proxy", got)
+	}
+	if got := NetworksLabel("b", "a", "b", "proxy"); got != "a,b,proxy" {
+		t.Fatalf("union with duplicates = %q, want a,b,proxy", got)
+	}
+}
+
+// TestNetworkSet pins the shared normalization used by both the Docker
+// NetworkingConfig and the relay.networks label: non-empty entries, de-duped,
+// sorted; nil for empty/all-empty.
+func TestNetworkSet(t *testing.T) {
+	if got := NetworkSet(nil); got != nil {
+		t.Fatalf("NetworkSet(nil) = %v, want nil", got)
+	}
+	if got := NetworkSet([]string{"", ""}); got != nil {
+		t.Fatalf("NetworkSet(empties) = %v, want nil", got)
+	}
+	got := NetworkSet([]string{"proxy", "backend", "proxy", "frontend"})
+	want := []string{"backend", "frontend", "proxy"}
+	if len(got) != len(want) {
+		t.Fatalf("NetworkSet = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NetworkSet[%d] = %q, want %q (full %v)", i, got[i], want[i], got)
+		}
 	}
 }

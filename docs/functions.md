@@ -229,9 +229,12 @@ per-container memory/CPU/PID limits, outbound networking enabled.
 
 `NETWORKS` attaches every **execution** container this worker creates to
 operator-provided Docker networks (comma-separated, verified at startup; Relay
-never creates them). Persistent service containers are **not** attached to
-`NETWORKS`: a routed service joins `TRAEFIK_NETWORK` instead, and an unrouted
-service joins no extra network. Changing `NETWORKS` requires a worker restart.
+never creates them). The same set is applied to every **persistent service**
+container too; a routed service additionally joins `TRAEFIK_NETWORK`, and an
+unrouted service with no global networks joins no extra network. A network
+removed from the daemon after startup verification surfaces as a create failure
+(execution or service) — Relay never re-creates it. Changing `NETWORKS` requires
+a worker restart.
 
 ### Hot reload
 
