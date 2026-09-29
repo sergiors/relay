@@ -1,0 +1,185 @@
+# Services
+
+A `services` list declares **persistent long-running containers** kept running
+and reconciled continuously — an HTTP server, for example — as opposed to
+event/schedule invocations that exit after one request.
+
+## Source model
+
+Each service declares **exactly one source**, and the configured source
+descriptor is the service's identity (it keys containers, routing, and persisted
+rows; there is no synthetic entrypoint):
+
+```yaml
+runtime: node24
+
+services:
+  - entrypoint: service.js # a runtime-managed application entrypoint file
+    port: 3000
+    replicas: 2
+
+  - image: nginx:1.27-alpine # an external image reference
+    port: 80
+    replicas: 1
+```
+
+- `entrypoint` is an application entrypoint **file** started as the long-lived
+  process (e.g. `service.js`, `app/main.py`) — not the `module.function` event
+  handler form. It must be a relative path inside the application directory, with
+  no whitespace, no absolute paths, and no `..`. Node runs it directly
+  (`node <entrypoint>`); Python runs it as a module (`python -m app.main`), so
+  package-relative imports work. An `entrypoint` service needs a `runtime`.
+- `image` is an external image reference (e.g. `nginx:1.27`,
+  `ghcr.io/acme/api@sha256:…`). Relay inspects the local image and pulls from its
+  registry when the image is missing locally or the hourly freshness window has
+  elapsed; the image's own `ENTRYPOINT`/`CMD` are preserved. An `image` service
+  does not need a `runtime`. **Relay never removes external images** — cleanup
+  only ever touches its own `relay-fn-*` / `relay-dep-*` namespaces.
+
+Source descriptors must be unique within a function.
+
+## Port, host, path, replicas
+
+- `port` (optional) is the internal TCP port the application listens on.
+  Default `80`, range `1`–`65535`. Relay injects it as the `PORT` environment
+  variable (it cannot be overridden by template env or secrets) and exposes it
+  as container metadata only — **no host port is published**. A routed service's
+  Traefik rule targets this port.
+- `host` (optional) is a hostname (e.g. `api.example.com`) exposing the service
+  through Traefik. Empty/omitted means an internal unrouted service with no
+  routing labels. Validated as a hostname at parse time.
+- `path` (optional) is a URL path prefix (e.g. `/v2`) under which the service is
+  exposed on its host. It requires a `host` (`path` alone is rejected). A
+  configured path must start with `/`; whitespace, query, fragment, backslash,
+  and empty segments are rejected. It is canonicalized (trailing slashes
+  removed, except `/`), so `/v2` and `/v2/` are the same configured path.
+- `replicas` (optional) is the desired replica count Relay maintains. Default
+  `1`; must be a positive integer. There is **no autoscaling** — the count is
+  exactly what the template declares.
+
+## Environment, secrets, resources, networks
+
+The environment each replica gets, in order: the runtime's plan environment
+(e.g. `PYTHONDONTWRITEBYTECODE=1` for Python; empty for image sources), the
+template's `env` values, resolved `secrets` values, then `PORT`.
+
+Unlike event/schedule invocations, a persistent service needs its environment at
+process **start**, so the effective environment is written to the service
+container's Docker `Config.Env`. Anyone with Docker daemon access can read it via
+`docker inspect`; Relay never writes a value into a label, log, metric, or span,
+only the one-way `relay.env_hash` digest.
+
+Per-container `resources` apply to service containers too. The hardening is the
+same as invocation containers: non-root, dropped capabilities, read-only rootfs,
+bounded `/tmp`, memory/CPU/pids limits.
+
+Service networking: a routed service joins `TRAEFIK_NETWORK`; an unrouted service
+joins no extra network. Service containers are **not** attached to `NETWORKS`
+(that variable is for execution containers only). Each service container carries
+a `relay.networks` label recording its routing network so the reconciler can
+detect a network change and replace the container.
+
+## Convergence and lifecycle
+
+Both source kinds share **one cohesive reconciler and lifecycle**; the only
+difference is how the desired image is resolved:
+
+- an `entrypoint` service runs the function image prepared exactly as for
+  invocations, with its entrypoint overridden per container;
+- an `image` service runs the external reference (inspected locally, pulled when
+  due).
+
+At startup and on every reconcile of the owning function (including the periodic
+pass, default every 30s), Relay lists its service containers and converges them
+to the template.
+
+- The desired image is resolved **before any container action**. If a source
+  cannot be resolved (failed pull, missing local image, unlaunchable entrypoint,
+  unresolved secret), the pass reports the failure and **preserves the existing
+  healthy containers** rather than tearing them down. A transient registry
+  outage therefore never degrades a working service.
+- Containers whose image (or, for an external tag, image **content**), port,
+  effective environment (`relay.env_hash`), per-container resources
+  (`relay.resources`), or routing labels no longer match are **replaced**.
+  Others are preserved — no unnecessary restarts.
+- Environment comparison is what makes a changed template `env` value or a
+  **rotated secret value** replace a service's container: the image reference and
+  fingerprint do not change for either, but a long-lived container would
+  otherwise keep serving its old environment. Resource comparison makes a
+  resource-only edit replace the container while the image is reused.
+- Scaling up starts missing replica slots; scaling down stops exactly the excess
+  containers (lowest-numbered replicas kept).
+- A replica whose process exits (a crash) is recreated on the next reconcile, so
+  a service self-heals within the periodic cadence — no event-style
+  retry/DLQ semantics.
+- Removing a service, or its whole function, stops and removes its containers.
+  Relay then retires obsolete `relay-fn-<name>` images, but only after no active
+  container references them, and ordered after service convergence. Image
+  removal is never forced.
+- On graceful shutdown, Relay stops and removes the service containers owned by
+  that worker (scoped by `relay.hostname`); containers left by a crashed process
+  are swept at the next startup.
+
+**External image freshness:** for an `image` service Relay checks the registry
+**at most once per hour per independent service** (per function + identity). A
+successful remote check is recorded in memory; the window is not persisted, and
+changing the configured source (a new identity) is checked immediately. A failed
+check does not advance the window, so it retries at the next reconcile.
+
+Containers are identified by deterministic Relay-owned labels
+(`relay.type=service`, `relay.function`, `relay.identity`, plus image content id,
+port, replica slot, `relay.env_hash`, `relay.resources`), never by name alone.
+`relay.identity` is the configured source descriptor; service containers carry no
+`relay.handler` label — the source **is** the service.
+
+## Traefik routing (optional)
+
+A service that declares a `host` is routed through Traefik, which is
+operator-provided infrastructure outside Relay. Relay attaches labels so
+Traefik's Docker provider picks up the container:
+
+```
+traefik.enable                                      = true
+traefik.docker.network                              = <TRAEFIK_NETWORK>
+traefik.http.routers.<id>.rule                      = Host(`api.example.com`)
+traefik.http.services.<id>.loadbalancer.server.port = <port>
+```
+
+When set, these optional labels are added (nothing is defaulted — no implicit
+`websecure`, `letsencrypt`, or fallback priority):
+
+```
+traefik.http.routers.<id>.entrypoints          = <TRAEFIK_ENTRYPOINTS>
+traefik.http.routers.<id>.tls                  = true                    (only when TRAEFIK_CERTRESOLVER set)
+traefik.http.routers.<id>.tls.certresolver     = <TRAEFIK_CERTRESOLVER>
+traefik.http.routers.<id>.priority             = <TRAEFIK_PRIORITY>
+```
+
+Requirements:
+
+- `TRAEFIK_NETWORK` is **required** for a routed service. Relay never creates the
+  network: it verifies it exists before starting routed containers. Unset or a
+  missing network is reported per service and skipped (not half-reconciled).
+- `TRAEFIK_HOST_OVERRIDE` changes only the effective host in the rule, replacing
+  the domain while keeping the left-most label (`issuer.example.com` →
+  `issuer.localhost`). The template host is not modified.
+- When a service also declares a `path`, the rule is
+  `Host(...) && PathPrefix(...)` with a StripPrefix middleware, so the upstream
+  sees the path without the prefix. The middleware name is distinct and
+  per-service.
+
+`<id>` is a deterministic Traefik-safe router/service id derived from the
+function name + source identity (never the host or path):
+`relay-<function>-<identity>-<hash>`, sanitized to `[a-z0-9-]`, capped at 100
+characters, where `<hash>` is a 64-bit suffix hashed from the full untruncated
+function and identity. Stable ids mean reconciliation produces stable labels.
+
+Changing `host`, `path`, `port`, or any routing value makes the running container
+stale and it is replaced with updated labels. Removing `host` replaces the routed
+container with an internal (unlabeled) one; clearing an optional value converges
+its labels away the same way.
+
+## Out of scope
+
+Host port publishing, autoscaling, and request-level handler invocation are not
+implemented. Routing is Traefik-only.
