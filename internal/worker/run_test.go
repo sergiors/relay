@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
 
@@ -544,17 +545,219 @@ func TestRunInvalidRedisDSNReturnsError(t *testing.T) {
 	}
 }
 
-// fakeEnsurer is the consumerGroupEnsurer seam: it returns a canned EnsureGroup
-// error so the cancellation-vs-genuine classification is exercised without a
-// Redis server.
-type fakeEnsurer struct {
-	err   error
-	calls int
+// preflightSpy records the exact order in which the preflight steps ran, so the
+// fixed Redis -> manager -> NETWORKS -> maintenance order and the
+// stop-at-first-failure boundary are provable without Redis or Docker. Each
+// step's error is scripted.
+type preflightSpy struct {
+	order []string
+	group error
+	open  error
+	net   error
+	// opens records how many times OpenManager was invoked; netManager records
+	// the manager instance the NETWORKS step received (nil when not reached);
+	// maintManager records the manager the maintenance step received (nil when
+	// not reached).
+	opens        int
+	netManager   *runtime.Manager
+	maintManager *runtime.Manager
 }
 
-func (f *fakeEnsurer) EnsureGroup(context.Context) error {
-	f.calls++
-	return f.err
+// deps builds the preflightDeps the production Run wires, with each step
+// recording itself. A non-nil manager is returned so a reached NETWORKS step
+// receives a non-nil manager (the production contract); tests that need to
+// observe the manager instance can do so via netManager/maintManager.
+func (s *preflightSpy) deps() preflightDeps {
+	manager := &runtime.Manager{}
+	return preflightDeps{
+		EnsureGroup: func(context.Context) error {
+			s.order = append(s.order, "group")
+			return s.group
+		},
+		OpenManager: func(context.Context) (*runtime.Manager, error) {
+			s.order = append(s.order, "manager")
+			s.opens++
+			if s.open != nil {
+				return nil, s.open
+			}
+			return manager, nil
+		},
+		VerifyNetworks: func(_ context.Context, m *runtime.Manager) error {
+			s.order = append(s.order, "networks")
+			s.netManager = m
+			return s.net
+		},
+		StartMaintenance: func(m *runtime.Manager) {
+			s.order = append(s.order, "maintenance")
+			s.maintManager = m
+		},
+	}
+}
+
+// TestExternalPreflightOrder proves the external-dependency preflight runs its
+// four steps in exactly the documented order — Redis stream/group readiness,
+// then Docker runtime-manager readiness, then NETWORKS verification, then the
+// manager's deferred maintenance loop — on the success path, and yields the
+// manager the later phases use. A "load" sentinel appended only after the call
+// succeeds stands in for function loading/fingerprinting, proving the whole
+// preflight completes (including starting the manager loop LAST) before any
+// later phase starts.
+func TestExternalPreflightOrder(t *testing.T) {
+	spy := &preflightSpy{}
+	manager, err := runExternalPreflight(context.Background(), discardLogger(), spy.deps())
+	if err != nil {
+		t.Fatalf("runExternalPreflight = %v, want nil", err)
+	}
+	if manager == nil {
+		t.Fatal("runExternalPreflight returned a nil manager on success")
+	}
+	// Function loading/preparation begins only once the preflight succeeds.
+	spy.order = append(spy.order, "load")
+	want := []string{"group", "manager", "networks", "maintenance", "load"}
+	if len(spy.order) != len(want) {
+		t.Fatalf("preflight order = %v, want %v", spy.order, want)
+	}
+	for i := range want {
+		if spy.order[i] != want[i] {
+			t.Fatalf("preflight step %d = %q, want %q (full order %v)", i, spy.order[i], want[i], spy.order)
+		}
+	}
+	if spy.netManager != manager {
+		t.Fatalf("NETWORKS step received manager %p, want the opened %p", spy.netManager, manager)
+	}
+	if spy.maintManager != manager {
+		t.Fatalf("maintenance step received manager %p, want the opened %p", spy.maintManager, manager)
+	}
+}
+
+// TestExternalPreflightShortCircuitsOnFailure proves each preflight failure
+// stops every later step: a Redis/group failure never opens the manager, a
+// manager failure never verifies networks, and a network failure never starts
+// the manager's maintenance loop. Each failure is returned (not merely logged).
+// This is the boundary that keeps function loading, every later phase, and any
+// manager background loop from running against a broken external dependency.
+func TestExternalPreflightShortCircuitsOnFailure(t *testing.T) {
+	cases := []struct {
+		name       string
+		spy        *preflightSpy
+		wantSteps  []string
+		wantErrSub string
+	}{
+		{
+			name:       "redis group failure stops at group",
+			spy:        &preflightSpy{group: errors.New("dial tcp 127.0.0.1:6379: connection refused")},
+			wantSteps:  []string{"group"},
+			wantErrSub: "ensure consumer group failed",
+		},
+		{
+			name:       "manager failure stops at manager",
+			spy:        &preflightSpy{open: errors.New("cannot connect to Docker daemon")},
+			wantSteps:  []string{"group", "manager"},
+			wantErrSub: "runtime: new manager failed",
+		},
+		{
+			name:       "network failure stops at networks",
+			spy:        &preflightSpy{net: errors.New("verify NETWORKS: daemon exploded")},
+			wantSteps:  []string{"group", "manager", "networks"},
+			wantErrSub: "verify NETWORKS",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, err := runExternalPreflight(context.Background(), discardLogger(), tc.spy.deps())
+			if err == nil {
+				t.Fatal("runExternalPreflight = nil, want an error")
+			}
+			if manager != nil {
+				t.Fatalf("runExternalPreflight returned manager %p on failure, want nil", manager)
+			}
+			if len(tc.spy.order) != len(tc.wantSteps) {
+				t.Fatalf("preflight steps = %v, want %v (no later step may run)", tc.spy.order, tc.wantSteps)
+			}
+			for i := range tc.wantSteps {
+				if tc.spy.order[i] != tc.wantSteps[i] {
+					t.Fatalf("preflight step %d = %q, want %q", i, tc.spy.order[i], tc.wantSteps[i])
+				}
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.wantErrSub)
+			}
+			if got := startupResult(err); got == nil {
+				t.Fatal("startupResult(genuine preflight failure) = nil, want the error")
+			}
+		})
+	}
+}
+
+// TestExternalPreflightCancellationIsGraceful proves a lifecycle cancellation at
+// the Redis/group step is classified as errStartupInterrupted (which
+// startupResult turns into a graceful nil) and that it likewise short-circuits
+// the manager and network steps. The manager and network steps are covered by
+// TestExternalPreflightNetworkCancellationIsGraceful (shared startupInterrupted
+// predicate).
+func TestExternalPreflightCancellationIsGraceful(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	spy := &preflightSpy{group: fmt.Errorf("xgroup create: %w", context.Canceled)}
+	manager, err := runExternalPreflight(ctx, logger, spy.deps())
+	if !errors.Is(err, errStartupInterrupted) {
+		t.Fatalf("preflight cancellation = %v, want errStartupInterrupted", err)
+	}
+	if manager != nil {
+		t.Fatalf("preflight cancellation returned manager %p, want nil", manager)
+	}
+	if got := startupResult(err); got != nil {
+		t.Fatalf("startupResult(cancellation) = %v, want nil (graceful shutdown)", got)
+	}
+	if len(spy.order) != 1 || spy.order[0] != "group" {
+		t.Fatalf("steps after a cancelled group step = %v, want only [group]", spy.order)
+	}
+	if !strings.Contains(logs.String(), "consumer group creation interrupted by shutdown") {
+		t.Errorf("expected an Info log recording the interrupted startup, got:\n%s", logs.String())
+	}
+}
+
+// TestExternalPreflightNetworkCancellationIsGraceful proves the same graceful
+// classification when the lifecycle is cancelled during the LAST preflight step:
+// group and manager succeed, NETWORKS returns an error wrapping
+// context.Canceled while the lifecycle context is cancelled, and the result is
+// errStartupInterrupted with a nil manager — never a NETWORKS failure. The
+// recorded step order is exactly the three preflight steps, proving no later
+// phase (function loading/fingerprinting) continued after the interrupted
+// network step.
+func TestExternalPreflightNetworkCancellationIsGraceful(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// group and manager succeed; only the network verify observes cancellation,
+	// so the test isolates the last step's classification rather than an early
+	// short-circuit.
+	spy := &preflightSpy{net: fmt.Errorf("verify NETWORKS: %w", context.Canceled)}
+	manager, err := runExternalPreflight(ctx, logger, spy.deps())
+	if !errors.Is(err, errStartupInterrupted) {
+		t.Fatalf("preflight network cancellation = %v, want errStartupInterrupted", err)
+	}
+	if manager != nil {
+		t.Fatalf("preflight network cancellation returned manager %p, want nil", manager)
+	}
+	if got := startupResult(err); got != nil {
+		t.Fatalf("startupResult(network cancellation) = %v, want nil (graceful shutdown)", got)
+	}
+	// The cancellation happened at the last step, so all three steps ran; a
+	// later phase appending after the call would show up here as a fourth entry.
+	if len(spy.order) != 3 || spy.order[0] != "group" || spy.order[1] != "manager" || spy.order[2] != "networks" {
+		t.Fatalf("steps before the interrupted network step = %v, want [group manager networks]", spy.order)
+	}
+	if !strings.Contains(logs.String(), "NETWORKS verification interrupted by shutdown") {
+		t.Errorf("expected an Info log recording the interrupted NETWORKS step, got:\n%s", logs.String())
+	}
 }
 
 // TestStartupInterruptedClassification pins the predicate that separates a
@@ -584,76 +787,6 @@ func TestStartupInterruptedClassification(t *testing.T) {
 		if got := startupInterrupted(tc.ctx, tc.err); got != tc.want {
 			t.Errorf("%s: startupInterrupted = %v, want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-// TestEnsureGroupCancellationIsGraceful proves the core lifecycle contract: an
-// EnsureGroup failure caused by the lifecycle being cancelled during startup is
-// classified as errStartupInterrupted, which startupResult converts to a nil
-// return, so Run converges through its deferred cleanup and reports success
-// rather than a startup error.
-func TestEnsureGroupCancellationIsGraceful(t *testing.T) {
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	c := &fakeEnsurer{err: fmt.Errorf("xgroup create: %w", context.Canceled)}
-	err := ensureGroup(ctx, c, logger)
-	if !errors.Is(err, errStartupInterrupted) {
-		t.Fatalf("ensureGroup cancellation error = %v, want errStartupInterrupted", err)
-	}
-	if got := startupResult(err); got != nil {
-		t.Fatalf("startupResult(cancellation) = %v, want nil (graceful shutdown)", got)
-	}
-	if !strings.Contains(logs.String(), "consumer group creation interrupted by shutdown") {
-		t.Errorf("expected an Info log recording the interrupted startup, got:\n%s", logs.String())
-	}
-}
-
-// TestEnsureGroupGenuineFailureIsReturned proves a real prerequisite failure is
-// NOT masked by a coincident cancellation: an error that does not wrap a context
-// error is wrapped and returned, and startupResult leaves it non-nil for the CLI
-// boundary to print and exit on.
-func TestEnsureGroupGenuineFailureIsReturned(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	// Even with a cancelled lifecycle, a genuine (non-context) error is a real
-	// failure, not a graceful shutdown.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	c := &fakeEnsurer{err: errors.New("dial tcp 127.0.0.1:6379: connection refused")}
-	err := ensureGroup(ctx, c, logger)
-	if err == nil {
-		t.Fatal("ensureGroup genuine failure = nil, want an error")
-	}
-	if errors.Is(err, errStartupInterrupted) {
-		t.Fatalf("genuine failure was classified as a shutdown: %v", err)
-	}
-	if !strings.Contains(err.Error(), "ensure consumer group failed") {
-		t.Fatalf("error = %q, want it to name the consumer-group failure", err)
-	}
-	if got := startupResult(err); !errors.Is(got, c.err) {
-		t.Fatalf("startupResult(genuine) = %v, want the original error %v", got, c.err)
-	}
-	// The failure ran exactly once and was not retried by the classification.
-	if c.calls != 1 {
-		t.Fatalf("EnsureGroup calls = %d, want 1", c.calls)
-	}
-}
-
-// TestEnsureGroupSuccessPassesThrough proves a successful group creation is a
-// plain nil, unaffected by the classification.
-func TestEnsureGroupSuccessPassesThrough(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := &fakeEnsurer{}
-	if err := ensureGroup(context.Background(), c, logger); err != nil {
-		t.Fatalf("ensureGroup(nil) = %v, want nil", err)
-	}
-	if got := startupResult(nil); got != nil {
-		t.Fatalf("startupResult(nil) = %v, want nil", got)
 	}
 }
 

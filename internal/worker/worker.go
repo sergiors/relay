@@ -1,7 +1,19 @@
 // Package worker is the long-running Relay runtime, started via `relay start`.
 // It loads functions, builds their images, reconciles them live, and consumes
 // the Redis stream, blocking until signalled. Configuration comes entirely
-// from the environment. Its in-memory accounting registry is always created and
+// from the environment.
+//
+// Startup begins with an explicit external-dependency preflight (see
+// runExternalPreflight) that runs BEFORE any function is loaded or fingerprinted,
+// before the state database is opened, and before the runtime socket, services,
+// sweeps, preparation, listener starts, background loops, scheduler, and
+// reconciler. The fixed order is: Redis stream/consumer-group readiness, then
+// Docker runtime-manager readiness, then verification of the configured NETWORKS
+// set, then the runtime manager's own background maintenance loop is started. A
+// failure at any step short-circuits every later phase; a lifecycle cancellation
+// during the preflight is a graceful shutdown.
+//
+// Its in-memory accounting registry is always created and
 // is the single source of truth for the operational counters; the Prometheus
 // /metrics HTTP endpoint (see internal/observability/metrics) is an optional
 // exposition of that same registry, gated on the METRICS_ADDR environment
@@ -122,14 +134,6 @@ func effectiveMaxBuffered(n int) int {
 // graceful shutdown, not a startup failure. It is never returned to the CLI.
 var errStartupInterrupted = errors.New("startup interrupted by shutdown")
 
-// consumerGroupEnsurer is the narrow view of the stream consumer that the
-// consumer-group startup step needs. *stream.Consumer satisfies it; a test fake
-// can implement it, so the cancellation-vs-genuine-failure classification is
-// unit-testable without Redis (matching retention.go's streamTrimmer seam).
-type consumerGroupEnsurer interface {
-	EnsureGroup(ctx context.Context) error
-}
-
 // startupInterrupted reports whether a fallible startup operation failed only
 // because the worker lifecycle was cancelled (or its deadline elapsed) rather
 // than for a genuine reason. The stream and runtime layers wrap the parent
@@ -158,27 +162,6 @@ func logStartupCleanupFailure(ctx context.Context, logger *slog.Logger, msg stri
 	logger.Warn(msg, "error", err)
 }
 
-// ensureGroup creates the consumer group required for consumption and
-// classifies a failure that only reflects the lifecycle being cancelled during
-// startup. A cancelled lifecycle (SIGTERM during a slow Redis round trip) is a
-// shutdown, not a startup failure: it is logged at Info and reported as
-// errStartupInterrupted, which Run converts to a graceful nil return AFTER
-// unwinding through its deferred cleanup. A genuine Redis or configuration
-// failure is wrapped and returned for the CLI boundary to print and exit on. The
-// classification is testable in isolation through the consumerGroupEnsurer seam,
-// without Redis.
-func ensureGroup(ctx context.Context, c consumerGroupEnsurer, logger *slog.Logger) error {
-	err := c.EnsureGroup(ctx)
-	if err == nil {
-		return nil
-	}
-	if startupInterrupted(ctx, err) {
-		logger.Info("Startup: consumer group creation interrupted by shutdown", "error", err)
-		return errStartupInterrupted
-	}
-	return fmt.Errorf("ensure consumer group failed: %w", err)
-}
-
 // startupResult converts the errStartupInterrupted sentinel into a nil return so
 // Run reports a cancelled startup as a graceful success, while any genuine
 // startup failure is returned unchanged. It is the single place the conversion
@@ -189,6 +172,119 @@ func startupResult(err error) error {
 		return nil
 	}
 	return err
+}
+
+// preflightDeps is the explicit ordering seam for the worker's
+// external-dependency preflight. Production Run wires the four real
+// operations; a test wires spies, so the fixed order and the
+// stop-at-first-failure boundary are provable without Redis or Docker. It is
+// deliberately a plain struct of four named steps, not a generic framework:
+// the ordering is the point, and it must stay visible in one place.
+type preflightDeps struct {
+	// EnsureGroup establishes Redis stream/consumer-group readiness by
+	// delegating to stream.EnsureGroup.
+	EnsureGroup func(ctx context.Context) error
+	// OpenManager establishes Docker readiness and returns the runtime manager
+	// every later phase uses. The implementation registers the manager's
+	// deferred shutdown before returning, and opens it with deferred
+	// maintenance so no manager background loop runs before VerifyNetworks.
+	OpenManager func(ctx context.Context) (*runtime.Manager, error)
+	// VerifyNetworks verifies the configured NETWORKS set against the manager.
+	VerifyNetworks func(ctx context.Context, manager *runtime.Manager) error
+	// StartMaintenance starts the runtime manager's deferred background
+	// maintenance loop. It is the LAST preflight step, reached only after
+	// NETWORKS verification succeeds, so no manager background loop runs while
+	// the worker's prerequisites are still unproven. It is infallible: a
+	// second call is a no-op, and a manager whose loop was never deferred is
+	// already running, so the call is safe for every caller.
+	StartMaintenance func(manager *runtime.Manager)
+}
+
+// runExternalPreflight runs the worker's external-dependency preflight in the
+// fixed order Redis stream/group readiness -> Docker runtime-manager readiness
+// -> configured NETWORKS verification -> manager maintenance start, BEFORE any
+// function is loaded or fingerprinted, before state.Open, and before the runtime
+// socket, services, sweeps, preparation, listener starts, background loops,
+// scheduler, and reconciler are touched. A failure at any step short-circuits
+// every later step and is returned so Run unwinds through its deferred shutdown;
+// a failure that only reflects the lifecycle being cancelled is classified as
+// errStartupInterrupted for a graceful nil return, and a genuine failure is
+// wrapped with its step's context.
+//
+// The manager is opened with deferred maintenance, and its single background
+// maintenance loop is started only as the final step — after NETWORKS
+// verification succeeds — so no manager loop runs while a prerequisite is still
+// unproven. If verification fails, no loop was ever started and Run's deferred
+// shutdown still closes the manager (and its Docker client) cleanly.
+//
+// The context argument is the startup trace root (a child of the worker
+// lifecycle), so each step's span is parented correctly, and a cancellation of
+// the lifecycle is observable through it.
+func runExternalPreflight(
+	ctx context.Context,
+	logger *slog.Logger,
+	deps preflightDeps,
+) (*runtime.Manager, error) {
+	_, redisSpan := tracing.Start(ctx, "redis.consumer_group")
+	if err := deps.EnsureGroup(ctx); err != nil {
+		interrupted := startupInterrupted(ctx, err)
+		if !interrupted {
+			redisSpan.RecordError(err)
+			redisSpan.SetStatus(codes.Error, err.Error())
+		}
+		redisSpan.End()
+		if interrupted {
+			logger.Info("Startup: consumer group creation interrupted by shutdown", "error", err)
+			return nil, errStartupInterrupted
+		}
+		return nil, fmt.Errorf("ensure consumer group failed: %w", err)
+	}
+	redisSpan.End()
+
+	_, managerSpan := tracing.Start(ctx, "runtime.initialize")
+	manager, err := deps.OpenManager(ctx)
+	if err != nil {
+		managerSpan.RecordError(err)
+		managerSpan.SetStatus(codes.Error, err.Error())
+		managerSpan.End()
+		// A lifecycle cancellation during the bounded startup ping is a
+		// shutdown, not a daemon failure: classify it like every other fallible
+		// startup step so a graceful stop is not reported as an error.
+		if startupInterrupted(ctx, err) {
+			logger.Info("Startup: runtime manager initialization interrupted by shutdown", "error", err)
+			return nil, errStartupInterrupted
+		}
+		// The runtime manager owns container execution, which the worker cannot
+		// serve without. Run's deferred cleanup closes the Redis client.
+		return nil, fmt.Errorf("runtime: new manager failed: %w", err)
+	}
+	managerSpan.End()
+
+	_, networkSpan := tracing.Start(ctx, "network.verify")
+	if err := deps.VerifyNetworks(ctx, manager); err != nil {
+		networkSpan.RecordError(err)
+		networkSpan.SetStatus(codes.Error, err.Error())
+		networkSpan.End()
+		// A lifecycle cancellation during verification is a shutdown, not a
+		// network failure: classify it like every other fallible startup step.
+		if startupInterrupted(ctx, err) {
+			logger.Info("Startup: NETWORKS verification interrupted by shutdown", "error", err)
+			return nil, errStartupInterrupted
+		}
+		return nil, err
+	}
+	networkSpan.End()
+
+	// Last: start the manager's deferred maintenance loop. It is deliberately
+	// after NETWORKS verification so no manager background loop ran while the
+	// preflight's prerequisites were still unproven; only now, when every
+	// external dependency is ready, does the warm-container eviction ticker
+	// begin. The step is infallible and idempotent.
+	if deps.StartMaintenance != nil {
+		deps.StartMaintenance(manager)
+	}
+
+	return manager, nil
 }
 
 // Run wires the whole worker: startup state, then the reconciler and stream
@@ -284,6 +380,109 @@ func Run(logger *slog.Logger) error {
 		startupSpan.End()
 		shutdown.run(logger)
 	}()
+
+	// External-dependency preflight, in one explicit fixed order: Redis
+	// stream/consumer-group readiness -> Docker runtime-manager readiness ->
+	// configured NETWORKS verification. It runs BEFORE any function is loaded or
+	// fingerprinted, before state.Open, and before the runtime socket, services,
+	// sweeps, preparation, listener starts, background loops, scheduler, and
+	// reconciler. A failure at any step short-circuits every later step: Redis
+	// or the Docker daemon being unavailable is an operator condition that must
+	// surface before the worker touches anything else, and a lifecycle
+	// cancellation during the preflight is still a graceful shutdown (the
+	// deferred cleanup above released the Redis client and tracing, and the
+	// manager is closed by its registered shutdown step when it was opened).
+	// The manager's own teardown step is registered by OpenManager only on a
+	// successful open, so an early failure never registers a step for a manager
+	// that does not exist.
+	manager, err := runExternalPreflight(startupCtx, logger, preflightDeps{
+		EnsureGroup: func(ctx context.Context) error {
+			return stream.EnsureGroup(ctx, client, cfg.RedisStream, cfg.RedisGroup)
+		},
+		// The closure deliberately ignores the preflight-step context and roots
+		// the manager in Run's worker lifecycle `ctx` (the signal context), the
+		// same lifecycle the manager owned before this refactor: builds and the
+		// startup ping must be cancelled by SIGTERM/SIGINT, and the startup-span
+		// context is used only for the phase span in runExternalPreflight.
+		OpenManager: func(_ context.Context) (*runtime.Manager, error) {
+			m, err := runtime.NewManager(
+				logger,
+				metricsInstance,
+				cfg.ConsumerName,
+				runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
+				// The SAME MAX_CONCURRENCY the runner's global semaphore uses:
+				// the runtime clips each function's effective per-function
+				// concurrency to it, so a template asking for more than the
+				// worker-global cap (e.g. 15 with MAX_CONCURRENCY=8) warms,
+				// reports, and admits only the cap's worth. It is startup
+				// configuration; a global change requires a worker restart.
+				runtime.WithMaxConcurrency(cfg.MaxConcurrency),
+				// The worker-global Docker networks (NETWORKS) every execution
+				// container joins at create time. They are verified by the next
+				// preflight step before any function is prepared or any container
+				// created.
+				runtime.WithNetworks(cfg.Networks),
+				// Root Dockerfile builds in the WORKER LIFECYCLE (ctx), not the
+				// startup-span context: they get an independent 10m bound
+				// (runtime.buildTimeout) but are still cancelled when Relay shuts
+				// down. Builds must NOT inherit the short 30s reconcile budget
+				// the worker uses for normal service operations.
+				runtime.WithLifecycleContext(ctx),
+				// Do NOT start the warm-container maintenance loop in the
+				// constructor: the manager is opened before NETWORKS is
+				// verified, and the request is that all configured networks
+				// validate before ANY background loop starts. The loop is
+				// started by the final preflight step (StartMaintenance) only
+				// after verification succeeds; if it fails, the manager (and its
+				// Docker client) is still torn down by the registered shutdown
+				// step with no loop ever started.
+				runtime.WithDeferredMaintenance(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			// Manager cleanup is context-aware, so the Docker client is only
+			// closed after every worker-owned goroutine has stopped and every
+			// warm container has been torn down (in parallel, bounded) or the
+			// step's finite bound expires. Registered BEFORE the preflight
+			// returns so a later preflight-step failure (NETWORKS verification)
+			// still converges through the deferred shutdown.
+			shutdown.register(shutdownStep{
+				name:    shutdownStepManager,
+				timeout: 30 * time.Second,
+				run:     m.CloseContext,
+			})
+			return m, nil
+		},
+		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
+			// Verify every configured NETWORKS network exists BEFORE any
+			// function is prepared or any container created. The networks are
+			// infrastructure owned OUTSIDE Relay — Relay never creates them —
+			// so a missing one is an operator condition that must fail startup
+			// rather than silently produce containers on the wrong (or no)
+			// network. A verify error (a broken daemon) is likewise fatal. The
+			// check is skipped entirely when NETWORKS is unset.
+			return verifyConfiguredNetworks(ctx, m, cfg.Networks)
+		},
+		// The manager was opened with deferred maintenance, so this is the
+		// single place the warm-container eviction loop starts — only after
+		// NETWORKS verification succeeded. For a manager that did not defer,
+		// the call is a no-op (the loop is already running).
+		StartMaintenance: func(m *runtime.Manager) {
+			m.StartMaintenance()
+		},
+	})
+	if err != nil {
+		// startupResult converts a lifecycle-cancelled preflight into a
+		// graceful nil return (the process is already shutting down) and leaves
+		// a genuine prerequisite failure for the CLI to print and exit on.
+		return startupResult(err)
+	}
+	logger.Info("Startup: external dependencies ready",
+		"redis_stream", cfg.RedisStream,
+		"redis_group", cfg.RedisGroup,
+		"networks", len(cfg.Networks),
+	)
 
 	// A single shared secrets provider, used by both the webhook (below) and the
 	// runner (later). Construction is infallible (the dir is created lazily on
@@ -415,75 +614,6 @@ func Run(logger *slog.Logger) error {
 			return nil
 		},
 	})
-
-	_, managerSpan := tracing.Start(startupCtx, "runtime.initialize")
-	manager, err := runtime.NewManager(
-		logger,
-		metricsInstance,
-		cfg.ConsumerName,
-		runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
-		// The SAME MAX_CONCURRENCY the runner's global semaphore uses: the
-		// runtime clips each function's effective per-function concurrency to it,
-		// so a template asking for more than the worker-global cap (e.g. 15 with
-		// MAX_CONCURRENCY=8) warms, reports, and admits only the cap's worth. It
-		// is startup configuration; a global change requires a worker restart.
-		runtime.WithMaxConcurrency(cfg.MaxConcurrency),
-		// The worker-global Docker networks (NETWORKS) every execution container
-		// joins at create time. They are verified once below before any function
-		// is prepared or any container created.
-		runtime.WithNetworks(cfg.Networks),
-		// Root Dockerfile builds in the worker lifecycle: they get an
-		// independent 10m bound (runtime.buildTimeout) but are still cancelled
-		// when Relay shuts down. Builds must NOT inherit the short 30s
-		// reconcile budget the worker uses for normal service operations.
-		runtime.WithLifecycleContext(ctx),
-	)
-	if err != nil {
-		managerSpan.RecordError(err)
-		managerSpan.SetStatus(codes.Error, err.Error())
-		managerSpan.End()
-		// A lifecycle cancellation during the bounded startup ping is a
-		// shutdown, not a daemon failure: classify it like every other fallible
-		// startup step so a graceful stop is not reported as an error.
-		if startupInterrupted(ctx, err) {
-			logger.Info("Startup: runtime manager initialization interrupted by shutdown", "error", err)
-			return startupResult(errStartupInterrupted)
-		}
-		// The runtime manager owns container execution, which the worker cannot
-		// serve without. The deferred cleanup closes the Redis client and state DB.
-		return fmt.Errorf("runtime: new manager failed: %w", err)
-	}
-	managerSpan.End()
-	// Manager cleanup is context-aware, so the Docker client is only closed
-	// after every worker-owned goroutine has stopped and every warm container has
-	// been torn down (in parallel, bounded) or the step's finite bound expires.
-	shutdown.register(shutdownStep{
-		name:    shutdownStepManager,
-		timeout: 30 * time.Second,
-		run:     manager.CloseContext,
-	})
-
-	// Verify every configured NETWORKS network exists BEFORE any function is
-	// prepared or any container created. The networks are infrastructure owned
-	// OUTSIDE Relay — Relay never creates them — so a missing one is an operator
-	// condition that must fail startup rather than silently produce containers
-	// on the wrong (or no) network. A verify error (a broken daemon) is likewise
-	// fatal. The check is skipped entirely when NETWORKS is unset.
-	networkCtx, networkSpan := tracing.Start(startupCtx, "network.verify")
-	if err := verifyConfiguredNetworks(networkCtx, manager, cfg.Networks); err != nil {
-		networkSpan.RecordError(err)
-		networkSpan.SetStatus(codes.Error, err.Error())
-		networkSpan.End()
-		// A lifecycle cancellation during verification is a shutdown, not a
-		// network failure: classify it like every other fallible startup step
-		// and return nil so the CLI does not report a graceful stop as an error.
-		if startupInterrupted(ctx, err) {
-			logger.Info("Startup: NETWORKS verification interrupted by shutdown", "error", err)
-			return startupResult(errStartupInterrupted)
-		}
-		return err
-	}
-	networkSpan.End()
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
 	// started now that the manager exists: the CLI's `function inspect` dials it
@@ -772,22 +902,6 @@ func Run(logger *slog.Logger) error {
 			return nil
 		},
 	})
-
-	groupCtx, groupSpan := tracing.Start(startupCtx, "redis.consumer_group")
-	if err := ensureGroup(groupCtx, consumer, logger); err != nil {
-		if !errors.Is(err, errStartupInterrupted) {
-			groupSpan.RecordError(err)
-			groupSpan.SetStatus(codes.Error, err.Error())
-		}
-		groupSpan.End()
-		// The consumer group is a hard prerequisite for consumption. Return now so
-		// the deferred cleanup stops the servers and loops; startupResult turns a
-		// lifecycle-cancelled startup into a graceful nil return (the process is
-		// already shutting down), while a genuine failure is returned for the CLI
-		// to print and exit on.
-		return startupResult(err)
-	}
-	groupSpan.End()
 
 	// The schedule publisher atomically publishes one stream entry per logical
 	// occurrence cluster-wide (publish-if-new Lua script) into the same stream the
@@ -1769,7 +1883,7 @@ func sweepStartupServiceOrphans(
 // networkVerifier is the narrow view of the runtime Manager that the startup
 // NETWORKS pre-flight needs. *runtime.Manager satisfies it; a test fake can
 // implement it, so the verification error semantics are unit-testable without a
-// Docker daemon (matching consumerGroupEnsurer's seam).
+// Docker daemon (matching the preflight seam's shape).
 type networkVerifier interface {
 	VerifyNetworks(ctx context.Context, networks []string) (string, bool, error)
 }

@@ -25,8 +25,8 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 ## Package map (`internal/`)
 
 - `cli` command tree (urfave/cli/v3), parsing/help only, errors returned;
-  `config` resolves env into one `Config`; `worker` the runtime lifecycle and
-  Unix control socket.
+  `config` resolves env into one `Config`; `worker` the runtime lifecycle
+  (external-dependency preflight, then resources) and Unix control socket.
 - `function` pure decision layer (discovery, validation, matching,
   fingerprinting) with `source` the shared `.gitignore` policy; `runtime` Docker
   client, image build/GC, warm pool, engines (`runtime/python`, `runtime/node`).
@@ -140,6 +140,17 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Lifecycle and command hierarchy
 
+- Startup runs an explicit external-dependency preflight BEFORE function
+  loading/fingerprinting, `state.Open`, the runtime socket/services, sweeps and
+  preparation, listener starts, background loops, the scheduler, and the
+  reconciler. The fixed order is Redis stream/group readiness → Docker
+  runtime-manager readiness → configured `NETWORKS` verification → the runtime
+  manager's deferred warm-container maintenance loop is started; a failure at
+  any step short-circuits every later phase, and a lifecycle cancellation during
+  the preflight is a graceful shutdown, not an error. The manager is opened with
+  deferred maintenance so no manager background loop runs while `NETWORKS` is
+  still unverified; a verification failure closes the manager with no loop ever
+  started.
 - `relay start` runs in the foreground, holds a process lock, and never
   daemonizes, forks, or writes a PID file. Shutdown cancels the lifecycle first,
   then runs bounded, ordered steps; the process lock and Redis are released last.

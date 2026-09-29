@@ -202,13 +202,29 @@ func DLQStreamFor(stream string) string {
 	return "relay:" + stream + ":dlq"
 }
 
+// groupCreator is the narrow Redis view the consumer-group bootstrap needs:
+// XGROUP CREATE with MKSTREAM. *redis.Client satisfies it; a test fake can
+// implement it too, so the BUSYGROUP/MKSTREAM-at-0 semantics are unit-testable
+// without a Redis server.
+type groupCreator interface {
+	XGroupCreateMkStream(ctx context.Context, stream, group, start string) *redis.StatusCmd
+}
+
 // EnsureGroup creates the consumer group if it does not exist, tolerating a
 // group that already exists (BUSYGROUP). MKSTREAM creates the stream if needed;
 // the group starts at "0", so its consumers see every entry already in the
 // stream as well as new ones (not just new messages); a fresh group over an
 // existing stream therefore replays the backlog.
-func (c *Consumer) EnsureGroup(ctx context.Context) error {
-	err := c.client.XGroupCreateMkStream(ctx, c.stream, c.group, "0").Err()
+//
+// It is the single stream-level bootstrap both Consumer.EnsureGroup and the
+// worker's external-dependency preflight delegate to, so these semantics have
+// exactly one implementation. The worker invokes it as a startup prerequisite
+// before any function is loaded or fingerprinted and before the state DB and
+// runtime workload initialization (the Redis client and tracing already exist;
+// the Docker manager is opened afterwards, see internal/worker); an embedder
+// invokes it before Consume.
+func EnsureGroup(ctx context.Context, client groupCreator, stream, group string) error {
+	err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err()
 	if err == nil {
 		return nil
 	}
@@ -216,8 +232,18 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	if isBusyGroup(err) {
 		return nil
 	}
-	return fmt.Errorf("create consumer group %q on stream %q: %w", c.group, c.stream, err)
+	return fmt.Errorf("create consumer group %q on stream %q: %w", group, stream, err)
 }
+
+// EnsureGroup creates the consumer group required for consumption. It delegates
+// to the package-level EnsureGroup, binding this consumer's client, stream, and
+// group, so the BUSYGROUP/MKSTREAM-at-0 semantics are not duplicated.
+func (c *Consumer) EnsureGroup(ctx context.Context) error {
+	return EnsureGroup(ctx, c.client, c.stream, c.group)
+}
+
+// The production Redis client must satisfy the group-bootstrap seam.
+var _ groupCreator = (*redis.Client)(nil)
 
 // Healthy reports whether the consumer's last observed Redis operation
 // succeeded: true while Redis is reachable, false during an outage. It is an

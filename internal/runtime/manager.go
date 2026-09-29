@@ -171,6 +171,23 @@ type Manager struct {
 	done chan struct{}
 	// maintDone is closed by the maintenance loop when it exits.
 	maintDone chan struct{}
+	// maintInterval is the tick the maintenance loop is started with, derived
+	// once at construction from the resolved idle timeout. It is what the
+	// exported StartMaintenance uses, so a deferred-maintenance manager starts
+	// the loop with exactly the interval NewManager would have used eagerly. It
+	// is zero for a Manager constructed directly by tests (which call
+	// startMaintenance with an explicit interval).
+	maintInterval time.Duration
+	// maintMu guards the start/close handshake for the maintenance loop, so
+	// StartMaintenance is idempotent and Close only joins a loop that was
+	// actually started (see startMaintenance and CloseContext).
+	maintMu sync.Mutex
+	// maintStarted reports whether the maintenance loop goroutine was launched.
+	maintStarted bool
+	// closed reports whether Close has begun; StartMaintenance refuses to start
+	// a loop after that, so a close/start race can never leak a goroutine or
+	// double-close a channel.
+	closed bool
 	// closeOnce makes Close idempotent and keeps the maintenance loop's stop
 	// handshake single-fire.
 	closeOnce sync.Once
@@ -230,6 +247,11 @@ type managerOptions struct {
 	// pingDocker. Tests inject a fake so the ping's finite bound and lifecycle
 	// ownership are exercised without a daemon.
 	ping pingFunc
+	// deferredMaintenance, when set (WithDeferredMaintenance), makes NewManager
+	// NOT start the warm-container maintenance loop. The caller must start it
+	// explicitly with StartMaintenance once its own prerequisites (the worker's
+	// NETWORKS verification) hold. False preserves the historical eager start.
+	deferredMaintenance bool
 }
 
 // WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
@@ -277,6 +299,20 @@ func WithLifecycleContext(lifecycle context.Context) ManagerOption {
 	return func(o *managerOptions) { o.lifecycle = lifecycle }
 }
 
+// WithDeferredMaintenance makes NewManager return WITHOUT starting the
+// warm-container maintenance loop; the caller must start it explicitly with
+// StartMaintenance once its own startup prerequisites hold. It exists for the
+// worker, which opens the manager (and so pings Docker) as one preflight step
+// but must verify every configured NETWORKS network BEFORE it starts any
+// background loop: a manager whose eviction ticker started early would be an
+// active background loop during a phase that is required to fail closed before
+// later loops begin. Omitting the option (every other caller) preserves the
+// historical behavior: NewManager starts the loop eagerly. Close is safe
+// whether or not StartMaintenance was ever called.
+func WithDeferredMaintenance() ManagerOption {
+	return func(o *managerOptions) { o.deferredMaintenance = true }
+}
+
 // withClock injects a deterministic clock for tests. It is unexported because
 // only in-package tests need it; production always uses the wall clock.
 func withClock(now func() time.Time) ManagerOption {
@@ -302,7 +338,9 @@ func withPing(ping pingFunc) ManagerOption {
 // Options are variadic so the original three-argument call remains valid; the
 // worker passes WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout).
 // NewManager starts the single warm-container maintenance loop, stopped by
-// Close.
+// Close. WithDeferredMaintenance suppresses that eager start so the caller can
+// StartMaintenance it explicitly once its own startup prerequisites hold; Close
+// remains safe in either case.
 func NewManager(
 	logger *slog.Logger,
 	registry *metrics.Registry,
@@ -363,7 +401,10 @@ func NewManager(
 	mgr.containers.now = resolved.now
 	mgr.containers.metrics = registry
 	mgr.leases = newImageCoordinator()
-	mgr.startMaintenance(maintenanceInterval(resolved.idleTimeout))
+	mgr.maintInterval = maintenanceInterval(resolved.idleTimeout)
+	if !resolved.deferredMaintenance {
+		mgr.startMaintenance(mgr.maintInterval)
+	}
 	return mgr, nil
 }
 
@@ -423,17 +464,45 @@ func maintenanceInterval(idle time.Duration) time.Duration {
 	return interval
 }
 
-// startMaintenance launches the single maintenance loop. It is a method so
-// tests that construct a Manager directly (bypassing NewManager/Docker) can
-// start the loop with a test clock.
+// startMaintenance launches the single maintenance loop. It is idempotent and
+// safe to race with Close: the start/close handshake is serialized by maintMu,
+// so at most one goroutine is launched, no loop is started after Close has
+// begun, and Close joins exactly the loop that was actually started. It is a
+// method so tests that construct a Manager directly (bypassing NewManager/Docker)
+// can start the loop with a test clock; production goes through StartMaintenance.
 func (m *Manager) startMaintenance(interval time.Duration) {
+	m.maintMu.Lock()
+	defer m.maintMu.Unlock()
+	if m.maintStarted || m.closed {
+		return
+	}
 	if m.done == nil {
 		m.done = make(chan struct{})
 	}
 	if m.maintDone == nil {
 		m.maintDone = make(chan struct{})
 	}
+	m.maintStarted = true
 	go m.maintenanceLoop(interval)
+}
+
+// StartMaintenance starts the warm-container maintenance loop that NewManager
+// suppressed under WithDeferredMaintenance. It is the explicit start the worker
+// calls only after every configured NETWORKS network has been verified, so no
+// background loop runs before the preflight fails closed. It is idempotent
+// (a second call is a no-op) and refuses to start after Close, so a close/start
+// race can neither leak a goroutine nor double-close the stop channel. Callers
+// that did not request deferred maintenance need not call it: their loop is
+// already running.
+func (m *Manager) StartMaintenance() {
+	interval := m.maintInterval
+	if interval <= 0 {
+		// A Manager constructed directly (tests) may not carry the resolved
+		// interval; fall back to the default-derived tick rather than panic in
+		// time.NewTicker.
+		interval = maintenanceInterval(DefaultWarmContainerIdleTimeout)
+	}
+	m.startMaintenance(interval)
 }
 
 // maintenanceLoop runs evictIdle on a single ticker until Close, then closes
@@ -509,10 +578,26 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 			m.lifecycleCancel()
 		}
 		if m.done != nil {
+			// Serialize with StartMaintenance: once closed is set, a
+			// concurrent or later StartMaintenance refuses to launch the loop,
+			// so the close below and the (possibly absent) maintDone join are
+			// race-free. A deferred-maintenance manager whose loop was never
+			// started has nothing to join.
+			m.maintMu.Lock()
+			m.closed = true
+			started := m.maintStarted
 			close(m.done)
-			if m.maintDone != nil {
+			m.maintMu.Unlock()
+			if started && m.maintDone != nil {
 				<-m.maintDone
 			}
+		} else {
+			// A direct-construction manager with no stop channel: record the
+			// close so a later StartMaintenance cannot start a loop that would
+			// outlive the closed manager.
+			m.maintMu.Lock()
+			m.closed = true
+			m.maintMu.Unlock()
 		}
 		// Make retirement/removal lifecycle-owned: close the removal gate BEFORE
 		// joining, so no new manager-owned removal can begin once shutdown has

@@ -153,6 +153,62 @@ func TestIsBusyGroup(t *testing.T) {
 	}
 }
 
+// fakeGroupCreator is the groupCreator seam: it records the exact arguments the
+// package-level EnsureGroup issues and returns a canned command result, so the
+// BUSYGROUP/MKSTREAM-at-0 semantics are unit-testable without Redis.
+type fakeGroupCreator struct {
+	stream, group, start string
+	calls                int
+	// err is the command error; nil means success.
+	err error
+}
+
+func (f *fakeGroupCreator) XGroupCreateMkStream(_ context.Context, stream, group, start string) *redis.StatusCmd {
+	f.calls++
+	f.stream, f.group, f.start = stream, group, start
+	return redis.NewStatusResult("OK", f.err)
+}
+
+// TestEnsureGroupBootstrapSemantics pins the single stream-level group bootstrap
+// that both Consumer.EnsureGroup and the worker's external-dependency preflight
+// delegate to: it issues XGROUP CREATE with MKSTREAM at position "0", tolerates
+// a BUSYGROUP (the group already exists) as success, and wraps any other error
+// with both the group and the stream named.
+func TestEnsureGroupBootstrapSemantics(t *testing.T) {
+	t.Run("issues MKSTREAM at position 0", func(t *testing.T) {
+		f := &fakeGroupCreator{}
+		if err := EnsureGroup(context.Background(), f, "events", "workers"); err != nil {
+			t.Fatalf("EnsureGroup = %v, want nil", err)
+		}
+		if f.calls != 1 {
+			t.Fatalf("XGroupCreateMkStream calls = %d, want 1", f.calls)
+		}
+		if f.stream != "events" || f.group != "workers" || f.start != "0" {
+			t.Fatalf("issued (%q, %q, %q), want (events, workers, 0)", f.stream, f.group, f.start)
+		}
+	})
+
+	t.Run("BUSYGROUP is tolerated", func(t *testing.T) {
+		f := &fakeGroupCreator{err: errors.New("BUSYGROUP Consumer Group name already exists")}
+		if err := EnsureGroup(context.Background(), f, "events", "workers"); err != nil {
+			t.Fatalf("EnsureGroup(BUSYGROUP) = %v, want nil", err)
+		}
+	})
+
+	t.Run("genuine failure names group and stream", func(t *testing.T) {
+		f := &fakeGroupCreator{err: errors.New("connection refused")}
+		err := EnsureGroup(context.Background(), f, "events", "workers")
+		if err == nil {
+			t.Fatal("EnsureGroup genuine failure = nil, want an error")
+		}
+		for _, want := range []string{"workers", "events", "connection refused"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error %q does not mention %q", err, want)
+			}
+		}
+	})
+}
+
 // TestBufferSemaphoreAcquireReleaseGauge pins the semaphore's capacity bound and
 // its occupancy counter: acquire/tryAcquire take a slot and increment inflight,
 // release frees it, and tryAcquire fails (without blocking) at capacity.

@@ -20,7 +20,10 @@
 //     forwarded verbatim to the process output sink as a raw transport (not
 //     slog); healthy idle containers are evicted by a single maintenance loop
 //     once idle longer than the configured timeout, and a removed function's
-//     warm state is discarded (see container_cache.go)
+//     warm state is discarded (see container_cache.go). NewManager starts that
+//     loop eagerly; WithDeferredMaintenance suppresses it so a caller that must
+//     verify its own prerequisites first (the worker's NETWORKS preflight)
+//     starts it explicitly with StartMaintenance, and Close is safe either way.
 //
 // Env and secrets injection: an execution container's Docker Config.Env is only
 // the function's plan env (runtime needs, e.g. PYTHONDONTWRITEBYTECODE) — never

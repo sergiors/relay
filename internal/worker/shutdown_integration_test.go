@@ -77,7 +77,9 @@ type workerEnv struct {
 // ctx/cancel, and cancel() is the exact runtime effect of SIGTERM (NotifyContext
 // cancels its ctx when the signal arrives). Sending the real signal to the test
 // process is not possible safely, so cancelling the NotifyContext-equivalent ctx
-// is the faithful substitute.
+// is the faithful substitute. It mirrors Run's first preflight step (the Redis
+// group bootstrap) but not the whole preflight: the test needs concrete handles
+// (manager, state, consumer) to drive and assert the shutdown path.
 //
 // Consume runs in a goroutine writing to consumeDone so the test can observe
 // when it returns after cancel, exactly as Run()'s blocking Consume would return
@@ -94,6 +96,24 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Cleanup(func() { _ = client.Close() })
 
 	m := metrics.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Tear the wiring down on EVERY exit path, including a t.Fatalf below
+	// (EnsureGroup/Prepare failures): cleanup cancels ctx so the MetricsLogger,
+	// metrics server, statsLoop, reconciler, and consumer goroutines stop and
+	// join instead of leaking past the test. The test's own cancel() later is
+	// the normal (SIGTERM-equivalent) shutdown path.
+	t.Cleanup(cancel)
+
+	// Mirror the FIRST step of Run()'s external-dependency preflight: the
+	// Redis stream/group bootstrap runs before functions are loaded or the
+	// state DB is opened. Run uses the package-level stream.EnsureGroup (the
+	// consumer method delegates to it), so this exercises the same path. The
+	// remaining wiring below is bespoke to this shutdown test (it needs concrete
+	// handles for its assertions), not a line-for-line copy of Run.
+	if err := stream.EnsureGroup(ctx, client, cfg.stream, cfg.group); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
 
 	loader := function.NewLoader(cfg.fnRoot, logger)
 	functions, err := loader.Load()
@@ -157,14 +177,6 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		Block: 250 * time.Millisecond,
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Tear the wiring down on EVERY exit path, including a t.Fatalf below
-	// (EnsureGroup/Prepare failures): cleanup cancels ctx so the MetricsLogger,
-	// metrics server, statsLoop, reconciler, and consumer goroutines stop and
-	// join instead of leaking past the test. The test's own cancel() later is
-	// the normal (SIGTERM-equivalent) shutdown path.
-	t.Cleanup(cancel)
-
 	// Start the metrics components the same way the worker does: named
 	// variables, started separately, so the lifecycle reads the same as
 	// production (create → start → stop on shutdown).
@@ -196,10 +208,6 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		defer close(statsDone)
 		statsLoop(ctx, newStatsFlusher(st, m), statsFlushInterval)
 	}()
-
-	if err := consumer.EnsureGroup(ctx); err != nil {
-		t.Fatalf("ensure group: %v", err)
-	}
 
 	runWorker := runner.NewWithMetrics(prepared, logger, m)
 	runWorker.SetHostname(cfg.consumerName)

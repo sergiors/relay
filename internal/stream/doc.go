@@ -1,7 +1,14 @@
 // Package stream owns Redis Stream consumption and recovery.
 //
 // This package manages the consumer-group lifecycle and message delivery:
-//   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP
+//   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP, via the
+//     package-level EnsureGroup (Consumer.EnsureGroup delegates to it). The
+//     worker runs it as the FIRST step of its external-dependency preflight,
+//     before any function is loaded or fingerprinted and before the state DB and
+//     runtime workload initialization (the Redis client and tracing already
+//     exist; the Docker manager is opened afterwards, see internal/worker), so a
+//     Redis stream/group problem short-circuits startup; the group is not
+//     created lazily right before Consume. An embedder uses it before Consume.
 //   - Consumption: an XREADGROUP loop that hands each decoded event to a Handler
 //   - Schedule occurrences: messages whose decode is recognized as a schedule
 //     envelope (see internal/schedule) ride this same consumer-group / PEL /
@@ -135,7 +142,12 @@
 //     are outside message processing and are deliberately NOT
 //     recovered: they remain fatal
 //
-// Usage: NewConsumer, then EnsureGroup, then Consume with a Handler.
+// Usage: NewConsumer, then EnsureGroup, then Consume with a Handler. The
+// group bootstrap may be done either through Consumer.EnsureGroup or the
+// package-level EnsureGroup(ctx, client, stream, group) (the single
+// implementation Consumer.EnsureGroup delegates to); the worker runs the
+// package-level form as the first external-dependency preflight step before
+// Consume.
 //
 // The package knows nothing about matching or execution; it delegates each
 // decoded event to the caller's Handler. Schedule-occurrence messages are a

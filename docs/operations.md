@@ -11,16 +11,28 @@ Kubernetes, etc.
 
 At startup Relay:
 
-1. loads configuration and connects to Redis and the Docker daemon (a ping with
-   a 10s bound);
-2. initializes tracing (disabled by default) and the metrics registry;
-3. verifies every configured `NETWORKS` network exists;
-4. loads functions from `/functions` and computes each fingerprint once;
-5. opens the local state database (errors are logged, never fatal);
-6. runs a conservative orphan sweep (bounded to 30s) removing only stale
+1. loads configuration and initializes tracing (disabled by default) and the
+   metrics registry;
+2. runs the external-dependency preflight in a fixed order, before anything
+   touches `/functions` or the state DB: Redis stream/consumer-group readiness
+   (creates the group with `MKSTREAM` at position `0`, tolerating `BUSYGROUP`),
+   then Docker daemon readiness (a ping with a 10s bound), then verification that
+   every configured `NETWORKS` network exists, then the runtime manager's
+   warm-container maintenance loop is started;
+3. loads functions from `/functions` and computes each fingerprint once;
+4. opens the local state database (errors are logged, never fatal);
+5. runs a conservative orphan sweep (bounded to 30s) removing only stale
    Relay containers owned by this worker hostname;
-7. prepares each function's image and starts the reconciler, scheduler, and
+6. prepares each function's image and starts the reconciler, scheduler, and
    stream consumer.
+
+A preflight failure short-circuits every later phase: Redis or the Docker daemon
+being unavailable, or a configured network missing, fails startup instead of
+letting the worker load functions, open the state DB, or create containers. The
+manager is opened with deferred maintenance, so a preflight failure before the
+final step closes the manager with no background loop ever started. A lifecycle
+cancellation (SIGTERM/SIGINT) during the preflight is a graceful shutdown, not an
+error.
 
 Changes under `/functions` are reconciled live: a new directory is built and
 starts matching; edits rebuild only that function (debounced 750ms); a failed
