@@ -2485,7 +2485,7 @@ relay: function "welcome-email-node" handler "handler.handler" executed for even
 ## Out of scope
 
 Other runtimes, poetry/pipenv/pnpm/yarn/bun,
-build caching, source hashing,
+build caching,
 k8s, configurable retry _policies per rule_ (delays/attempt counts
 are fixed internals — a rule's `retries` count is configurable, the backoff
 schedule is not), idempotency, exactly-once, per-function
