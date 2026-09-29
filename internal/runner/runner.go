@@ -102,9 +102,43 @@ type Executor interface {
 // are atomic: Handle takes one snapshot per call and keeps it for the whole
 // invocation, so an in-flight execution never sees a half-replaced set. It is
 // exported so the reconciler can swap functions live from its own package.
+//
+// Alongside the function slice the registry owns an immutable candidate index
+// (function.RuleIndex) per published function, rebuilt in the SAME locked
+// mutation as the slice. The two are published together, so a snapshot can never
+// observe a function set from one generation and an index from another. The
+// index is a false-positive-only prefilter: it only narrows which rules are
+// exact-tested, and the exact matcher remains the authority on every candidate.
 type Registry struct {
 	mu  sync.RWMutex
 	fns []*PreparedFunction
+	// ruleIdx maps each published function to its immutable candidate index,
+	// built from that function's CURRENT template events. Both available and
+	// unavailable entries are indexed: an unavailable function must still be
+	// classified as matching (it is never DLQ'd for unavailability alone). A
+	// hand-built entry with a nil template has no entry and falls back to a full
+	// exact scan. The map is replaced wholesale on every mutation (never mutated
+	// in place), so a snapshot's shared reference stays immutable.
+	ruleIdx map[*PreparedFunction]*function.RuleIndex
+}
+
+// buildRuleIndex derives the per-function candidate index from the current
+// prepared set. It is called while the registry lock is held, immediately after
+// the function slice is updated, so the index and the slice share one generation.
+// Entries whose template is nil (only reachable from a hand-built value, never
+// the loader) are omitted; matching falls back to a full exact scan for them.
+func buildRuleIndex(fns []*PreparedFunction) map[*PreparedFunction]*function.RuleIndex {
+	if len(fns) == 0 {
+		return nil
+	}
+	out := make(map[*PreparedFunction]*function.RuleIndex, len(fns))
+	for _, pf := range fns {
+		if pf == nil || pf.fn.Template == nil {
+			continue
+		}
+		out[pf] = function.NewRuleIndex(pf.fn.Template.Events)
+	}
+	return out
 }
 
 func (r *Registry) snapshot() []*PreparedFunction {
@@ -126,6 +160,36 @@ func (r *Registry) snapshot() []*PreparedFunction {
 type pinnedSnapshot struct {
 	fns  []*PreparedFunction
 	pins map[*PreparedFunction]*runtime.ImageLease
+	// ruleIdx is the candidate index generation published WITH fns, captured
+	// under the same read lock. It is shared immutably, so one Handle consumes
+	// exactly one index generation for the whole delivery.
+	ruleIdx map[*PreparedFunction]*function.RuleIndex
+}
+
+// rulesFor returns the immutable candidate index bound to pf in this snapshot's
+// generation, or nil when pf has no index (a nil-template entry), in which case
+// the caller must fall back to a full exact scan.
+func (s *pinnedSnapshot) rulesFor(pf *PreparedFunction) *function.RuleIndex {
+	if s == nil || s.ruleIdx == nil {
+		return nil
+	}
+	return s.ruleIdx[pf]
+}
+
+// matchingRules returns the rules of pf matching event under THIS snapshot's
+// index generation. When pf has a published candidate index the indexed matcher
+// is used (anchor prefilter plus exact verification, identical to a full scan);
+// otherwise — a nil template, only reachable from a hand-built value — it falls
+// back to a full exact scan. Both paths are bound to the snapshot's generation,
+// so every match decision in one Handle call comes from one index generation.
+func (s *pinnedSnapshot) matchingRules(pf *PreparedFunction, event map[string]any) []function.EventRule {
+	if ix := s.rulesFor(pf); ix != nil {
+		return ix.MatchingEventRules(event)
+	}
+	if pf == nil || pf.fn.Template == nil {
+		return nil
+	}
+	return pf.fn.Template.MatchingEventRules(event)
 }
 
 // pinFor returns the shared publication lease pinning pf's image for this
@@ -159,8 +223,9 @@ func (r *Registry) snapshotPinned() *pinnedSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := &pinnedSnapshot{
-		fns:  append([]*PreparedFunction(nil), r.fns...),
-		pins: make(map[*PreparedFunction]*runtime.ImageLease, len(r.fns)),
+		fns:     append([]*PreparedFunction(nil), r.fns...),
+		pins:    make(map[*PreparedFunction]*runtime.ImageLease, len(r.fns)),
+		ruleIdx: r.ruleIdx,
 	}
 	for _, pf := range out.fns {
 		if lease := pf.sharePublication(); lease != nil {
@@ -196,6 +261,9 @@ func (r *Registry) Set(fns []*PreparedFunction) {
 	old := r.fns
 	r.fns = append([]*PreparedFunction(nil), fns...)
 	sortFn(r.fns)
+	// Rebuild the candidate index in the same locked step as the slice, so a
+	// snapshot either sees both from the old generation or both from the new one.
+	r.ruleIdx = buildRuleIndex(r.fns)
 	r.mu.Unlock()
 	releaseSuperseded(old, fns)
 }
@@ -226,6 +294,12 @@ func (r *Registry) Replace(name string, pf *PreparedFunction) {
 		r.fns = append(r.fns, pf)
 		sortFn(r.fns)
 	}
+	// Rebuild the candidate index in the same locked step as the slice. A nil pf
+	// (removal) drops the entry from the index; an invalid/absent template is
+	// omitted and falls back to a full exact scan. Rebuilding wholesale (rather
+	// than mutating the previous map) keeps every already-published snapshot's
+	// shared index immutable.
+	r.ruleIdx = buildRuleIndex(r.fns)
 	r.mu.Unlock()
 	// A function replacement supersedes only the old entry; an add/remove
 	// supersedes only the removed entry.
@@ -1312,7 +1386,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if pf.fn.Template == nil {
 			continue
 		}
-		rules := pf.fn.Template.MatchingEventRules(event)
+		rules := snap.matchingRules(pf, event)
 		if len(rules) == 0 {
 			continue
 		}
@@ -1398,7 +1472,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		if !pf.available {
 			continue
 		}
-		rules := pf.fn.Template.MatchingEventRules(event)
+		rules := snap.matchingRules(pf, event)
 		for _, rule := range rules {
 			// The invocation identity is stable across restarts and config
 			// reloads as long as the rule still exists: the function name and the

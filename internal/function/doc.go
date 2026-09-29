@@ -9,7 +9,12 @@
 //     silently leaving a stale view; Load keeps its historical skip-and-log
 //     behavior. A directory that vanished is a removal, never an invalid
 //     definition.
-//   - Matching: rules pair handlers with patterns evaluated against events
+//   - Matching: rules pair handlers with patterns evaluated against events. A
+//     prepared template may also carry an immutable candidate index
+//     (NewRuleIndex) that pre-filters rules by a conservative necessary
+//     ("anchor") condition; the index is false-positive-only and always defers
+//     the final decision to the exact matcher, so it never changes which rules
+//     match.
 //   - Fingerprinting: a deterministic hash of a function's SELECTED source
 //     (internal/source: files included after applying the function's .gitignore
 //     rules) gates reconciler rebuilds; applicable ignore files are hashed too,
