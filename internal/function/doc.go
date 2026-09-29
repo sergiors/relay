@@ -3,7 +3,12 @@
 // This package reads the /functions root and models what the runtime needs:
 //   - Discovery: each direct subdirectory is a function with a template.yaml
 //   - Validation: templates are parsed and validated, including per-rule
-//     timeout resolution and handler form
+//     timeout resolution and handler form. Loader.LoadWithDiagnostics surfaces
+//     each PRESENT entry that cannot be loaded (invalid path, missing/invalid
+//     template) so a caller can record the invalid desired state instead of
+//     silently leaving a stale view; Load keeps its historical skip-and-log
+//     behavior. A directory that vanished is a removal, never an invalid
+//     definition.
 //   - Matching: rules pair handlers with patterns evaluated against events
 //   - Fingerprinting: a deterministic hash of a function's SELECTED source
 //     (internal/source: files included after applying the function's .gitignore

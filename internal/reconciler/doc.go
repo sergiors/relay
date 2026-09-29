@@ -29,10 +29,15 @@
 //
 // When Config.State is set, reconcile outcomes are recorded into the local
 // state database (a persisted, read-mostly state view) — success, failure
-// (retaining the prior active version), unchanged-skip, and removal. The
-// database is never the source of truth: the worker also writes it (startup
-// discovery, the periodic stats flush), and state writes never drive reconcile
-// decisions and never fail the reconcile loop; errors are only logged.
+// (retaining the prior active version), unchanged-skip, removal, and invalid
+// desired definitions. A present-but-invalid desired definition (an invalid
+// path, a missing template, or an invalid template) records a failed view via
+// State.RecordInvalidDesired while preserving the previous active generation and
+// leaving the runtime registry untouched; it is never treated as a removal. A
+// genuinely missing directory instead removes the entry. The database is never
+// the source of truth: the worker also writes it (startup discovery, the
+// periodic stats flush), and state writes never drive reconcile decisions and
+// never fail the reconcile loop; errors are only logged.
 //
 // When Config.UpdateSchedules is set, it is called after a function's new
 // version is swapped into the registry (discovery and update paths only, never

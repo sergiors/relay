@@ -26,14 +26,35 @@
 //     MEANINGFUL reconcile — a success or a failure — so an unchanged-function
 //     periodic pass never overwrites them)
 //
-// A failed reconcile never displaces the previously active
-// image/fingerprint/prepared_at, so the last good version still serves: a
-// failure for a function with a usable active image is "degraded", and only a
-// failure with no usable generation is "unavailable". The failure is always
-// visible — a failure never reports "ready". The latest desired fingerprint is
-// kept separately from the active generation (DesiredFingerprint vs
-// Fingerprint), so a prepare may target a new content digest while the old
-// generation keeps serving. All timestamps are RFC3339 strings.
+// Desired vs active: the LAST USABLE generation (Image/Fingerprint/PreparedAt)
+// is only ever replaced by a successful reconcile, so it always describes what
+// the previous process was actually serving. The LATEST DESIRED content digest
+// is kept separately (DesiredFingerprint vs Fingerprint), so a prepare may target
+// a new digest while the old generation keeps serving.
+//
+// Two failure kinds are distinguished:
+//   - A VALID desired generation that fails to prepare (a build error) records a
+//     failure while PRESERVING both the active generation and the desired
+//     fingerprint (the failed generation is still the desired one, so a later
+//     pass retries it).
+//   - An INVALID desired definition (RecordInvalidDesired: an invalid path, a
+//     missing template.yaml, an invalid/unreadable template) records a failure
+//     while preserving only the active generation: the definition cannot be
+//     parsed, so there is no trustworthy desired fingerprint or template-derived
+//     configuration, and those fields are cleared. This applies equally to
+//     startup discovery (the loader reports present-but-invalid entries) and the
+//     live reconciler.
+//
+// In both cases a failure never reports "ready": degraded when a usable active
+// generation exists, unavailable otherwise. All timestamps are RFC3339 strings.
+//
+// SQLite-view boundary: this database is a VIEW, never the source of truth. It
+// records what was loaded/prepared/served for operators, but it never drives
+// matching, image building, scheduling, or execution decisions — those are
+// rebuilt from /functions. An invalid function therefore stays out of the
+// runtime registry entirely; only its state row reflects the invalid desired
+// state, and only the persisted active image is consulted (conservatively) by
+// the startup image keep-set.
 //
 // Function storage model:
 //

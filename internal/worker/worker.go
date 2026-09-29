@@ -508,7 +508,7 @@ func Run(logger *slog.Logger) error {
 
 	_, loaderSpan := tracing.Start(startupCtx, "functions.load")
 	loader := function.NewLoader(function.Dir, logger)
-	functions, err := loader.Load()
+	functions, loadIssues, err := loader.LoadWithDiagnostics()
 	if err != nil {
 		loaderSpan.RecordError(err)
 		loaderSpan.SetStatus(codes.Error, err.Error())
@@ -519,7 +519,7 @@ func Run(logger *slog.Logger) error {
 		return fmt.Errorf("load functions failed: %w", err)
 	}
 	loaderSpan.End()
-	logger.Info("Loaded functions", "count", len(functions), "root", function.Dir)
+	logger.Info("Loaded functions", "count", len(functions), "invalid", len(loadIssues), "root", function.Dir)
 
 	// Compute every loaded function's content fingerprint — and, for a
 	// runtime-backed function, the source selection it was computed from — ONCE
@@ -577,17 +577,11 @@ func Run(logger *slog.Logger) error {
 		// The already-computed fingerprint pairs feed both the fresh-database
 		// rebuild and the per-function discovery upserts; /functions is never
 		// re-read for state and each function's source is hashed exactly once.
-		if err := st.RebuildFromFunctions(discovered); err != nil {
-			logger.Warn("State: rebuild from functions failed; continuing", "error", err)
-			stateSpan.RecordError(err)
-		}
-		// Prune state rows for functions no longer on disk BEFORE
-		// restorePersistedStats, so a pruned function's stats row is gone before
-		// the fresh registry is seeded from it (a function removed while down
-		// must not be re-seeded into metrics).
-		st.PruneRemoved(function.Dir)
-		for _, d := range discovered {
-			st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
+		// Present-but-invalid desired definitions are persisted alongside the
+		// valid discovery; they stay out of the loaded set, so they never reach
+		// the runtime registry, matching, the scheduler, or preparation.
+		if rerr := persistStartupDiscovery(st, function.Dir, discovered, loadIssues, logger); rerr != nil {
+			stateSpan.RecordError(rerr)
 		}
 	}
 	stateSpan.End()
@@ -735,7 +729,7 @@ func Run(logger *slog.Logger) error {
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
 		exclusive: services.RunExclusive,
 		sweep:     func(hctx context.Context) { sweepStartupServiceOrphans(hctx, svcCtrl, liveNames) },
-		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, startup, prepared, st, logger) },
+		images:    func(hctx context.Context) { sweepStartupImages(hctx, manager, prepared, st, logger) },
 		deps:      func(hctx context.Context) { cleanupStartupDependencies(hctx, manager, logger) },
 	})
 	shutdown.register(shutdownStep{
@@ -1445,6 +1439,49 @@ func discoveredFromStartup(startup []startupFunction) []state.DiscoveredFunction
 	return discovered
 }
 
+// persistStartupDiscovery writes the startup state phase: it seeds a fresh
+// database from the already-loaded (function, fingerprint) pairs, records each
+// PRESENT-but-invalid desired definition from the loader diagnostics as invalid
+// (preserving any active generation while clearing the untrustworthy desired
+// snapshot), prunes rows for functions genuinely absent from dir, and records
+// each valid function as discovered (preserving its active generation).
+//
+// Ordering matters. The invalid writes happen BEFORE the prune so a directory
+// the loader observed as present but which vanished before the sweep is still
+// removed by the filesystem-authoritative prune rather than resurrected as an
+// invalid row — a disappearance is a removal, never an invalid desired state.
+// The prune still runs BEFORE the valid discovery so a function removed while
+// down is never resurrected, and the whole phase runs before
+// restorePersistedStats (the caller) so a pruned function's stats row is gone
+// before the fresh registry is seeded from it. Invalid functions stay out of the
+// loaded set and are never passed to discovery, matching, the scheduler, or
+// startup preparation — only their state view is updated.
+//
+// It is split out of Run as a pure seam over the state handle so the
+// discovery/invalid persistence is unit-testable without Docker or Redis. A
+// rebuild error is returned for the caller to surface (state stays non-fatal).
+func persistStartupDiscovery(
+	st *state.State,
+	dir string,
+	discovered []state.DiscoveredFunction,
+	issues []function.LoadIssue,
+	logger *slog.Logger,
+) error {
+	var rebuildErr error
+	if err := st.RebuildFromFunctions(discovered); err != nil {
+		rebuildErr = err
+		logger.Warn("State: rebuild from functions failed; continuing", "error", err)
+	}
+	for _, issue := range issues {
+		st.RecordInvalidDesired(issue.Name, issue.Err)
+	}
+	st.PruneRemoved(dir)
+	for _, d := range discovered {
+		st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
+	}
+	return rebuildErr
+}
+
 // functionPreparer is the narrow view of the runtime Manager that startup
 // preparation needs: the selection-aware Prepare, plus (via runner.Executor) the
 // Execute used to pair each returned handle with its executor for the runner.
@@ -1786,10 +1823,19 @@ func startStartupHousekeeping(
 // unchanged) and services are converged. The keep-set holds (a) the exact image
 // each function was actually prepared with this boot (Prepared.Image, not a
 // re-derived expected tag), (b) images the running service containers
-// reference. It also keeps (c) any last-active image state recorded for a
-// function still on disk — the crash guard for a swap that started but whose
-// RecordReconcileSuccess never landed, where the recorded image may still be the
-// one serving.
+// reference. It also keeps (c) every last-active image recorded in state — the
+// crash guard for a swap that started but whose RecordReconcileSuccess never
+// landed, where the recorded image may still be the one serving.
+//
+// The recorded-image gather is the full state listing rather than only the
+// loaded set: a function whose desired definition is PRESENT but INVALID is not
+// part of the loaded set (it is never prepared or registered), yet it may still
+// have a previously-serving active image that must not be swept. PruneRemoved
+// has already dropped rows for genuinely absent functions, so every remaining
+// row corresponds to a function present on disk (or one whose stat transiently
+// failed, which is conservatively kept); keeping its recorded image is the safe
+// choice. This affects GC only — never execution, which uses the runtime
+// registry of valid functions.
 //
 // Keeping Prepared.Image is deliberate: the image each function is actually
 // serving this boot is the authoritative answer, and it needs no tree scan — a
@@ -1806,7 +1852,6 @@ func startStartupHousekeeping(
 func sweepStartupImages(
 	lifecycle context.Context,
 	manager *runtime.Manager,
-	startup []startupFunction,
 	prepared []*runner.PreparedFunction,
 	st *state.State,
 	logger *slog.Logger,
@@ -1844,9 +1889,9 @@ func sweepStartupImages(
 	// and service images alone (and the sweep below is skipped entirely).
 	var recordedImages []string
 	if st != nil {
-		for _, s := range startup {
-			if detail, ok := st.GetFunction(s.Function.Name); ok && detail.Image != "" {
-				recordedImages = append(recordedImages, detail.Image)
+		for _, img := range st.ActiveImages() {
+			if img != "" {
+				recordedImages = append(recordedImages, img)
 			}
 		}
 	}

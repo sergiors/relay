@@ -558,27 +558,38 @@ func (r *Reconciler) reconcileFunction(name string) {
 		}
 		if errors.Is(err, function.ErrNotReady) {
 			// Directory exists but template isn't there yet (mid-copy); wait for
-			// more events rather than dropping a previously-active function.
+			// more events rather than dropping a previously-active function. The
+			// desired definition is present but not yet loadable, so record the
+			// invalid/failed view (retaining any active generation) while the
+			// runtime registry is untouched: a mid-copy never removes a healthy
+			// function.
+			r.recordInvalidDesired(name, err)
 			return
 		}
 		if errors.Is(err, function.ErrInvalidPath) {
 			// An invalid path (bad name, symlink, non-directory, not a direct
 			// child) can never be a function; retain any previously-loaded
-			// version rather than removing or replacing it.
+			// version rather than removing or replacing it. The present invalid
+			// desired definition is recorded so its stale ready view is not left
+			// behind.
 			r.log.Warn(
 				"Function: invalid path; retaining previous version",
 				"function", name,
 				"error", err,
 			)
+			r.recordInvalidDesired(name, err)
 			return
 		}
 		// A flaky read/stat (permissions, I/O) is not a removal: don't drop the
-		// function, but surface it so staleness isn't silently ignored.
+		// function, but surface it so staleness isn't silently ignored. The entry
+		// is present, so record the failed desired view (the active generation is
+		// preserved and the registry untouched).
 		r.log.Warn(
 			"Function: load error; retaining previous version",
 			"function", name,
 			"error", err,
 		)
+		r.recordInvalidDesired(name, err)
 		return
 	}
 	dir := fn.Dir
@@ -599,6 +610,11 @@ func (r *Reconciler) reconcileFunction(name string) {
 			"function", name,
 			"error", err,
 		)
+		// The desired definition is present and parseable but its source could
+		// not be fingerprinted, so the desired generation cannot be trusted.
+		// Record the failed view while retaining the active generation and
+		// leaving the runtime registry untouched.
+		r.recordInvalidDesired(name, err)
 		return
 	}
 
@@ -866,6 +882,34 @@ func (r *Reconciler) prepareContext(name string, generation uint64) context.Cont
 			r.st.RecordReconcileBuilding(name)
 		}
 	})
+}
+
+// recordInvalidDesired records a present-but-unloadable desired definition into
+// the state view (degraded with a retained active generation, or unavailable
+// without one) while leaving the runtime registry untouched. It is the shared
+// seam for every reconcileFunction failure that is NOT a removal and NOT a valid
+// desired generation that failed to build: ErrNotReady (mid-copy),
+// ErrInvalidPath, a flaky read/stat, and a fingerprint error. State is a view
+// only — the previously-loaded version stays served — so an operator sees the
+// failed desired state instead of a stale ready row. When no state sink is wired
+// it is a no-op.
+//
+// It also FORGETS the stored fingerprint for name. That stored value is the
+// reconciler's skip key: if it were left in place, a definition later restored
+// byte-identically would compare equal and take the unchanged skip path, leaving
+// the recorded failure visible forever (the skip path deliberately writes
+// nothing). Forgetting it forces the next reconcile to re-resolve the identity,
+// so a restored definition is re-verified and a real success replaces the
+// failure — the same "retry even when the fingerprint is stable" behavior an
+// unavailable function already has. It never writes a success itself.
+func (r *Reconciler) recordInvalidDesired(name string, err error) {
+	r.mu.Lock()
+	delete(r.fingerprints, name)
+	r.mu.Unlock()
+	if r.st == nil {
+		return
+	}
+	r.st.RecordInvalidDesired(name, err)
 }
 
 // remove drops a function from the registry and forgets its fingerprint.

@@ -72,9 +72,14 @@ type Row struct {
 // (successfully prepared and serving) generation and are only replaced by a
 // success. DesiredFingerprint is the latest desired content fingerprint seen by
 // discovery or a live desired-generation change; it may differ from Fingerprint
-// while a new generation is being prepared, and a failure leaves both the active
-// generation and the desired fingerprint in place. LastReconcileAt/Status and
-// LastError describe the last MEANINGFUL reconcile outcome.
+// while a new generation is being prepared, and a reconcile FAILURE of a valid
+// desired template leaves both the active generation and the desired fingerprint
+// in place (the failed generation is still the desired one, so a later pass can
+// retry it). An INVALID desired definition is different: it cannot be loaded at
+// all, so there is no trustworthy desired fingerprint or configuration to keep,
+// and RecordInvalidDesired clears both while preserving the active generation.
+// LastReconcileAt/Status and LastError describe the last MEANINGFUL reconcile
+// outcome.
 type Detail struct {
 	Row
 	Image              string     `json:"image,omitempty"`
@@ -750,6 +755,130 @@ func (st *State) RecordReconcileFailure(name string, err2 error) {
 	if status != "" {
 		st.notifyStatus(name, status)
 	}
+}
+
+// RecordInvalidDesired records that a function's desired definition is present
+// on disk but cannot be loaded or validated (an invalid path, a missing
+// template.yaml, or an invalid/unreadable template). It is the state view of an
+// INVALID desired state, distinct from RecordReconcileFailure, which records a
+// valid desired generation that failed to prepare:
+//
+//   - The last usable ACTIVE generation (image/fingerprint/prepared_at) is
+//     preserved untouched, so a previously-serving version is not erased and a
+//     still-serving image stays in the startup image keep-set / retire guards.
+//     Execution itself is never driven from state: the caller keeps the invalid
+//     function out of the runtime registry.
+//   - The DESIRED fingerprint is CLEARED (and, when the prior row carries a
+//     template-derived configuration snapshot — handlers/schedules/services/env/
+//     secrets/resources — it is cleared too): the invalid definition cannot be
+//     parsed, so retaining the old desired digest or configuration would falsely
+//     present stale template-derived fields as if they described the current
+//     (invalid) config.
+//   - last_reconcile_status=failed, last_reconcile_at=now, and last_error=err
+//     are persisted. Status is degraded when a usable active generation exists
+//     (the old version still serves) and unavailable otherwise (nothing was ever
+//     prepared).
+//
+// It is an UPSERT: an invalid function never seen before (no prior row) is
+// inserted, so a fresh invalid desired state is visible to operators instead of
+// being silently absent. The status observer is notified with the resulting
+// status, keeping the one-hot function_status gauge consistent.
+func (st *State) RecordInvalidDesired(name string, err2 error) {
+	ctx := context.Background()
+	ts := st.nowString()
+	status := ""
+	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+		detail, found, err := scanFunction(name, tx.QueryRowContext(ctx,
+			`SELECT `+jsonPayloadExpr+`, updated_at
+			 FROM functions WHERE name = ?`, name))
+		if err != nil {
+			return err
+		}
+		if !found {
+			// A present invalid entry with no prior row: insert a truthful row
+			// with no active generation and no configuration snapshot.
+			detail = Detail{Row: Row{Name: name}}
+		}
+		// An invalid desired definition has no trustworthy desired digest or
+		// template-derived configuration: clear them so stale fields are never
+		// presented as the current config. The active generation is preserved.
+		detail.Runtime = ""
+		detail.DesiredFingerprint = ""
+		detail.Handlers = nil
+		detail.Schedules = nil
+		detail.Services = nil
+		detail.Env = nil
+		detail.Secrets = nil
+		detail.Resources = nil
+		detail.LastReconcileAt = ts
+		detail.LastReconcileStatus = ReconcileFailed
+		detail.LastError = err2.Error()
+		// Degraded when a usable active generation exists (it still serves),
+		// unavailable otherwise; an invalid desired state never reports ready.
+		if detail.hasUsableGeneration() {
+			detail.Status = StatusDegraded
+		} else {
+			detail.Status = StatusUnavailable
+		}
+		status = detail.Status
+		detail.UpdatedAt = ts
+		payload, err := marshalFunction(detail)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO functions (name, data, updated_at) VALUES (?, jsonb(?), ?)
+			 ON CONFLICT(name) DO UPDATE SET
+			   data       = excluded.data,
+			   updated_at = excluded.updated_at`,
+			name, payload, ts)
+		return err
+	})
+	if err != nil {
+		st.log.Warn("State: record invalid desired failed", "function", name, "error", err)
+		return
+	}
+	if status != "" {
+		st.notifyStatus(name, status)
+	}
+}
+
+// ActiveImages returns the currently recorded active image reference for every
+// function that has one, keyed by function name. It is a narrow read seam for
+// the startup image keep-set: the caller can preserve an image for a function
+// whose desired definition is invalid (so it never reached the loaded set) from
+// the persisted active generation alone. Functions with no recorded image (never
+// prepared, or an image-less no-runtime service-only generation) are omitted.
+// It is a best-effort read: any error is logged and yields nil, never fatal.
+func (st *State) ActiveImages() map[string]string {
+	ctx := context.Background()
+	rows, err := st.db.QueryContext(ctx, `SELECT name, `+jsonPayloadExpr+` FROM functions`)
+	if err != nil {
+		st.log.Warn("State: list active images failed", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	out := make(map[string]string)
+	for rows.Next() {
+		var (
+			name string
+			data sql.NullString
+		)
+		if err := rows.Scan(&name, &data); err != nil {
+			st.log.Warn("State: scan active image failed", "error", err)
+			return out
+		}
+		detail, err := unmarshalFunction(data.String)
+		if err != nil {
+			st.log.Warn("State: read function payload failed", "function", name, "error", err)
+			continue
+		}
+		if detail.Image != "" {
+			out[name] = detail.Image
+		}
+	}
+	return out
 }
 
 // RecordServiceFailure records a service convergence failure without hiding a

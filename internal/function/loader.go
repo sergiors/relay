@@ -42,6 +42,18 @@ var ErrNotReady = errors.New("template.yaml not present")
 // "never loadable" (retain any previously-loaded version and do not replace it).
 var ErrInvalidPath = errors.New("not a valid function directory")
 
+// LoadIssue is one PRESENT directory entry that could not be loaded as a
+// function: its name and the load/validation error (an invalid path, a missing
+// template.yaml, an unreadable template, or an invalid template). It is reported
+// by LoadWithDiagnostics so a caller (the worker's startup state phase) can
+// record the invalid desired definition instead of silently leaving a stale
+// view. A directory that VANISHED between the directory read and the load is
+// not a desired definition at all and is never reported.
+type LoadIssue struct {
+	Name string
+	Err  error
+}
+
 // resolveFunctionDir resolves name to its function directory under root, applying
 // the discovery policy shared by startup discovery (Loader.Load) and live/
 // periodic reload (LoadSingle): the name must be a legal, single-element
@@ -116,14 +128,67 @@ func LoadSingle(root, name string) (Function, error) {
 // template.yaml are silently skipped; invalid names, symlinked or non-directory
 // entries, and invalid templates are logged and skipped without aborting the
 // load. Each entry is loaded through LoadSingle, so startup discovery and live
-// reload apply exactly the same path policy.
+// reload apply exactly the same path policy. Callers that must observe the
+// invalid entries (rather than only skip them) use LoadWithDiagnostics.
 func (l *Loader) Load() ([]Function, error) {
+	functions, issues, err := l.load()
+	if err != nil {
+		return nil, err
+	}
+	l.logIssues(issues)
+	return functions, nil
+}
+
+// logIssues emits the historical warning for every present-but-invalid entry,
+// skipping ErrNotReady: an entry without a template yet is not invalid, merely
+// not finished being copied, and was always logged silently. Both Load and
+// LoadWithDiagnostics share it so the diagnostic variant keeps exactly the
+// logging Load has always produced.
+func (l *Loader) logIssues(issues []LoadIssue) {
+	for _, issue := range issues {
+		if errors.Is(issue.Err, ErrNotReady) {
+			continue
+		}
+		l.log.Warn("Function: invalid; skipping", "function", issue.Name, "error", issue.Err)
+	}
+}
+
+// LoadWithDiagnostics loads exactly like Load — returning the same valid
+// functions, with the same logging and the same root-read error semantics — but
+// ALSO returns one LoadIssue per PRESENT entry that could not be loaded (an
+// invalid name/symlink/non-directory path, a missing template.yaml, or an
+// invalid/unreadable template). A directory that vanished between the directory
+// read and its load is not a desired definition and is deliberately omitted, so
+// a caller never mistakes a transient absence for an invalid desired state.
+//
+// A root read error is returned as a fatal error (nil functions), exactly as
+// Load does: the loader cannot even enumerate the entries, so there is nothing
+// to report. The invalid entries stay OUT of the returned functions, so a caller
+// that persists issues and prepares the valid set never executes or schedules an
+// invalid definition.
+func (l *Loader) LoadWithDiagnostics() ([]Function, []LoadIssue, error) {
+	functions, issues, err := l.load()
+	if err != nil {
+		return nil, nil, err
+	}
+	l.logIssues(issues)
+	return functions, issues, nil
+}
+
+// load is the shared loader body: it enumerates the root's direct child
+// directories, loads each through LoadSingle, and classifies the outcome. It
+// returns the loaded functions plus the present-but-invalid entries as issues;
+// vanished entries (fs.ErrNotExist) and entries without a template yet
+// (ErrNotReady) are neither functions nor issues. Callers own the logging and
+// the error semantics.
+func (l *Loader) load() ([]Function, []LoadIssue, error) {
 	entries, err := os.ReadDir(l.dir)
 	if err != nil {
-		return nil, fmt.Errorf("read functions dir %q: %w", l.dir, err)
+		return nil, nil, fmt.Errorf("read functions dir %q: %w", l.dir, err)
 	}
 
 	var functions []Function
+	var issues []LoadIssue
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			// A file, or a symlink (ReadDir reports the link's own type, never
@@ -133,19 +198,28 @@ func (l *Loader) Load() ([]Function, error) {
 		name := entry.Name()
 		fn, err := LoadSingle(l.dir, name)
 		if err != nil {
-			if errors.Is(err, ErrNotReady) || errors.Is(err, fs.ErrNotExist) {
-				// No template.yaml (or the directory vanished between the read
-				// and the load): not a function; silently skip, matching the
-				// historical "no template -> skip" behavior.
+			if errors.Is(err, fs.ErrNotExist) {
+				// The directory vanished between the read and the load: it is not
+				// a present desired definition, so it is neither a function nor an
+				// issue (a removal, not an invalid state).
 				continue
 			}
-			// An invalid name, symlink, non-directory, or invalid template:
-			// logged and skipped rather than aborting the whole load.
-			l.log.Warn("Function: invalid; skipping", "function", name, "error", err)
+			if errors.Is(err, ErrNotReady) {
+				// No template.yaml yet (mid-copy): a present entry, but not an
+				// invalid desired definition — it may become valid on a later
+				// event. Reported so a caller can record the incomplete state
+				// rather than leaving a stale one.
+				issues = append(issues, LoadIssue{Name: name, Err: err})
+				continue
+			}
+			// An invalid name, symlink, non-directory, unreadable template, or
+			// invalid template: a present desired definition that cannot be
+			// loaded. Reported as an issue; the caller decides how to record it.
+			issues = append(issues, LoadIssue{Name: name, Err: err})
 			continue
 		}
 		functions = append(functions, fn)
 	}
 
-	return functions, nil
+	return functions, issues, nil
 }

@@ -1,11 +1,13 @@
 package function
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -353,6 +355,139 @@ events:
 	}
 	if len(fns) != 1 || fns[0].Name != "valid" {
 		t.Fatalf("Load = %+v, want only the real 'valid' directory", fns)
+	}
+}
+
+// TestLoadWithDiagnosticsReportsPresentInvalidEntries pins the loader diagnostic
+// seam: each PRESENT entry that cannot be loaded is reported exactly once as a
+// LoadIssue (invalid template, missing template, invalid name), valid functions
+// are still returned, and a directory that vanished between the read and the
+// load is NOT reported (a removal, not an invalid desired definition).
+func TestLoadWithDiagnosticsReportsPresentInvalidEntries(t *testing.T) {
+	dir := t.TempDir()
+	writeTemplate(t, dir, "good", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	writeTemplate(t, dir, "bad-yaml", "events: [unclosed")
+	writeTemplate(t, dir, "bad-runtime", `
+runtime: python3.12
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	writeTemplate(t, dir, "bad-name", "runtime: python3.14\n")
+	// A directory with no template.yaml: present, but not an invalid definition
+	// (it may be mid-copy), so it is reported as an issue without being treated
+	// as loadable.
+	if err := os.MkdirAll(filepath.Join(dir, "no-template"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	fns, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "good" {
+		t.Fatalf("valid functions = %+v, want only 'good'", fns)
+	}
+
+	byName := make(map[string]error, len(issues))
+	for _, issue := range issues {
+		if _, dup := byName[issue.Name]; dup {
+			t.Errorf("duplicate issue for %q", issue.Name)
+		}
+		byName[issue.Name] = issue.Err
+	}
+	for _, name := range []string{"bad-yaml", "bad-runtime", "bad-name", "no-template"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("missing issue for present entry %q (issues: %v)", name, byName)
+		}
+	}
+	if len(issues) != 4 {
+		t.Fatalf("issues = %d, want 4 (one per present invalid/incomplete entry)", len(issues))
+	}
+}
+
+// TestLoadWithDiagnosticsRootReadErrorIsFatal pins that a root read failure is
+// returned as an error with no functions and no issues, exactly like Load: the
+// loader cannot even enumerate entries, so there is nothing to report.
+func TestLoadWithDiagnosticsRootReadErrorIsFatal(t *testing.T) {
+	loader := NewLoader(filepath.Join(t.TempDir(), "does-not-exist"), slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	fns, issues, err := loader.LoadWithDiagnostics()
+	if err == nil {
+		t.Fatal("missing root must be a fatal error")
+	}
+	if fns != nil || issues != nil {
+		t.Fatalf("fatal root error must return no functions/issues, got %v/%v", fns, issues)
+	}
+}
+
+// TestLoadWithDiagnosticsLogsInvalidEntries pins that the diagnostic variant
+// logs exactly like Load always has: a present-but-invalid entry is warned
+// about, while an entry without a template.yaml (ErrNotReady) stays silent
+// because it is not invalid, merely mid-copy. Without this, swapping the worker
+// to LoadWithDiagnostics would silently drop startup diagnostics.
+func TestLoadWithDiagnosticsLogsInvalidEntries(t *testing.T) {
+	dir := t.TempDir()
+	writeTemplate(t, dir, "bad-yaml", "events: [unclosed")
+	// Present but not ready: must be reported as an issue yet never logged.
+	if err := os.MkdirAll(filepath.Join(dir, "no-template"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	var buf bytes.Buffer
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(&buf, nil)))
+	_, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues = %+v, want one invalid and one not-ready", issues)
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "bad-yaml") || !strings.Contains(logs, "invalid; skipping") {
+		t.Fatalf("invalid entry must be logged, logs = %q", logs)
+	}
+	if strings.Contains(logs, "no-template") {
+		t.Fatalf("ErrNotReady must stay silent, logs = %q", logs)
+	}
+}
+
+// TestLoadWithDiagnosticsMatchesLoadValidSet pins that the diagnostic variant
+// returns exactly the valid set Load does, so a caller can swap to it without
+// changing execution behavior; only the invalid diagnostics are additive.
+func TestLoadWithDiagnosticsMatchesLoadValidSet(t *testing.T) {
+	dir := t.TempDir()
+	writeTemplate(t, dir, "good", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	writeTemplate(t, dir, "bad", "not: [valid: yaml")
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	plain, err := NewLoader(dir, logger).Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	diag, issues, err := NewLoader(dir, logger).LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("LoadWithDiagnostics: %v", err)
+	}
+	if len(plain) != len(diag) || len(diag) != 1 || plain[0].Name != diag[0].Name {
+		t.Fatalf("Load = %+v, LoadWithDiagnostics = %+v, want the same single valid function", plain, diag)
+	}
+	if len(issues) != 1 || issues[0].Name != "bad" {
+		t.Fatalf("issues = %+v, want one for bad", issues)
 	}
 }
 

@@ -205,14 +205,17 @@ func seedMetricsFunction(m *metrics.Registry, name string) {
 	m.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{{Name: "function", Value: name}}, time.Millisecond)
 }
 
-// Invalid template -> NO state write (no success/failure/skipped recorded).
-func TestReconcileStateNoWriteOnInvalidTemplate(t *testing.T) {
+// An invalid template is a present-but-invalid desired definition: it records a
+// failed desired view through state (unavailable, since no usable generation was
+// ever prepared) and last_error, while never writing a success/ready outcome and
+// never dropping the previously-loaded registry entry.
+func TestReconcileStateInvalidTemplateRecordsFailureWithoutActiveGeneration(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
@@ -223,8 +226,24 @@ func TestReconcileStateNoWriteOnInvalidTemplate(t *testing.T) {
 	if !ok {
 		t.Fatal("row should exist from initial seeding")
 	}
-	if detail.LastReconcileStatus != "" {
-		t.Fatalf("invalid template must not write a reconcile outcome, got %q", detail.LastReconcileStatus)
+	if detail.Status != state.StatusUnavailable {
+		t.Fatalf("status = %q, want unavailable (invalid desired, no usable generation)", detail.Status)
+	}
+	if detail.LastReconcileStatus != state.ReconcileFailed {
+		t.Fatalf("last_reconcile_status = %q, want failed", detail.LastReconcileStatus)
+	}
+	if detail.LastError == "" {
+		t.Fatal("last_error must record the invalid template")
+	}
+	// The invalid desired definition cannot be trusted: no stale desired
+	// fingerprint is retained as if it were current.
+	if detail.DesiredFingerprint != "" {
+		t.Fatalf("desired_fingerprint = %q, want cleared for an invalid desired definition", detail.DesiredFingerprint)
+	}
+	// The runtime registry is untouched: an invalid template never removes or
+	// replaces a previously-loaded version.
+	if pf := reg.GetByName("guarded"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("invalid template must not modify the live registry")
 	}
 }
 
@@ -365,14 +384,15 @@ func TestReconcileStateFailedBuildDoesNotRemoveStats(t *testing.T) {
 
 // TestReconcileStateInvalidTemplateDoesNotRemove is a regression that a broken
 // template (unparseable) must not be mistaken for a removal: the function row
-// and its function_stats survive untouched.
+// and its function_stats survive untouched as ROWS, the prior active generation
+// is retained (degraded), and the registry still serves the previous version.
 func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
 
 	// Change content so a rebuild is attempted, then seed an active version and
 	// per-function stats.
@@ -386,6 +406,7 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 	if !ok {
 		t.Fatal("expected guarded stats before invalid template")
 	}
+	active, _ := st.GetFunction("guarded")
 
 	// Break the template; reconcile must retain the previous version, not remove.
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
@@ -397,8 +418,16 @@ func TestReconcileStateInvalidTemplateDoesNotRemove(t *testing.T) {
 	if !ok {
 		t.Fatal("guarded row must survive an invalid template")
 	}
-	if detail.Status != state.StatusReady {
-		t.Fatalf("status = %s, want ready (retained)", detail.Status)
+	if detail.Status != state.StatusDegraded {
+		t.Fatalf("status = %s, want degraded (prior usable generation retained)", detail.Status)
+	}
+	if detail.Image != active.Image || detail.Fingerprint != active.Fingerprint {
+		t.Fatalf("active generation = %q/%q, want preserved %q/%q",
+			detail.Image, detail.Fingerprint, active.Image, active.Fingerprint)
+	}
+	// The runtime registry keeps serving the previous version.
+	if pf := reg.GetByName("guarded"); pf == nil || pf.Prepared() == nil {
+		t.Fatal("invalid template must not remove or replace the live registry entry")
 	}
 
 	after, ok := st.FunctionStats("guarded")
