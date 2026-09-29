@@ -1,0 +1,90 @@
+services:
+  relay:
+    build: .
+    # image: ghcr.io/sergiors/relay:latest
+    container_name: relay
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      socket-proxy:
+        condition: service_healthy
+
+    ports:
+      - 9090:9090
+
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+
+      - REDIS_URI=redis:6379
+      - REDIS_STREAM=events
+      - REDIS_GROUP=relay
+
+      - METRICS_ADDR=:9090
+      # - GIT_WEBHOOK_ADDR=:8081
+
+      - LOG_LEVEL=DEBUG
+
+    volumes:
+      - ./examples/functions:/functions:ro
+      - relay-data:/var/lib/relay
+
+    healthcheck:
+      test: ["CMD", "relay", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+
+  redis:
+    image: redis:8-alpine
+    container_name: redis
+
+    ports:
+      - 6379:6379
+
+    volumes:
+      - redis-data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    restart: unless-stopped
+    container_name: socket-proxy
+
+    environment:
+      PING: 1
+      VERSION: 1
+      BUILD: 1
+      IMAGES: 1
+      CONTAINERS: 1
+      NETWORKS: 1
+      POST: 1
+      DELETE: 1
+
+      TIMEOUT_CLIENT: 1h
+      TIMEOUT_CONNECT: 10s
+      TIMEOUT_SERVER: 1h
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:2375/_ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+
+volumes:
+  redis-data:
+  relay-data:
