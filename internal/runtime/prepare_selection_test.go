@@ -42,6 +42,12 @@ func stagedContextFiles(t *testing.T, raw []byte) map[string]bool {
 // selection is resolved to exclude the handler; a freshly resolved selection
 // would omit index.js from the context, while the supplied (pre-edit) selection
 // still contains it. index.js being staged shows the supplied policy was used.
+//
+// The returned fingerprint is the SNAPSHOT-derived identity, not the caller's
+// pre-edit value: the image is tagged with exactly the bytes this call staged
+// (including the .gitignore that appeared after the caller's scan), so the tag
+// and the image can never disagree. The next reconcile/audit compares the
+// live tree against this built identity and rebuilds the drift.
 func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
@@ -78,13 +84,29 @@ func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare with supplied selection: %v", err)
 	}
-	if got.Fingerprint != fp {
-		t.Fatalf("fingerprint = %q, want supplied %q", got.Fingerprint, fp)
+	// The tag is the snapshot-derived identity: it must be the digest over the
+	// bytes actually staged under the supplied policy, not the caller's pre-edit
+	// value (which predates the .gitignore).
+	wantFP, err := function.FingerprintSelection(selection)
+	if err != nil {
+		t.Fatalf("reference snapshot fingerprint: %v", err)
+	}
+	if got.Fingerprint != wantFP {
+		t.Fatalf("fingerprint = %q, want the snapshot-derived %q (not the caller's %q)", got.Fingerprint, wantFP, fp)
+	}
+	if got.Image != ImageRef(fn.Name, wantFP) {
+		t.Fatalf("image = %q, want %q", got.Image, ImageRef(fn.Name, wantFP))
 	}
 
 	staged := stagedContextFiles(t, contextTar)
 	if !staged["index.js"] {
 		t.Fatalf("supplied selection must stage index.js (it was included when resolved), got %v", staged)
+	}
+	// The .gitignore that appeared after the caller's scan is staged too (the
+	// supplied policy includes it), which is exactly why the built identity
+	// differs from the caller's pre-edit value.
+	if !staged[".gitignore"] {
+		t.Fatalf("staged context must include the applicable .gitignore, got %v", staged)
 	}
 }
 

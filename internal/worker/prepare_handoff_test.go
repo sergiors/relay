@@ -23,6 +23,11 @@ type handoffCapture struct {
 type startupSpyPreparer struct {
 	calls     int
 	callsByFn map[string]handoffCapture
+	// overrideFingerprint, when non-empty, is returned as the Prepared.Fingerprint
+	// instead of echoing the supplied value. It stands in for the snapshot-derived
+	// identity the real Prepare returns, so a test can prove callers persist the
+	// RETURNED identity rather than the value they supplied.
+	overrideFingerprint string
 }
 
 func (s *startupSpyPreparer) PrepareWithFingerprintAndSelection(
@@ -36,10 +41,14 @@ func (s *startupSpyPreparer) PrepareWithFingerprintAndSelection(
 		s.callsByFn = make(map[string]handoffCapture)
 	}
 	s.callsByFn[fn.Name] = handoffCapture{fingerprint: fingerprint, selection: selection}
+	built := fingerprint
+	if s.overrideFingerprint != "" {
+		built = s.overrideFingerprint
+	}
 	return &runtime.Prepared{
 		Name:        fn.Name,
 		Image:       "img-" + fn.Name,
-		Fingerprint: fingerprint,
+		Fingerprint: built,
 	}, nil
 }
 

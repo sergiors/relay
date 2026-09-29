@@ -7,8 +7,9 @@
 //
 //   - Git materialization (internal/git) copies a configured repository subtree
 //     into /functions.
-//   - Build-context staging (internal/runtime) copies a materialized function
-//     directory into an image build context.
+//   - Build-context staging (internal/runtime) stages the selected source into
+//     an image build context from one immutable snapshot of the selection, so
+//     the bytes baked into an image are the same bytes its fingerprint covers.
 //   - Content fingerprinting (internal/function) hashes a function directory to
 //     gate rebuilds.
 //

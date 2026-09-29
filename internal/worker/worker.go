@@ -539,15 +539,17 @@ func Run(logger *slog.Logger) error {
 	// runtime-backed function, the source selection it was computed from — ONCE
 	// for the whole startup, carrying both forward as the immutable startup
 	// records. The fingerprint feeds the state phase (rebuild + discovery
-	// upserts), Manager.Prepare (the built/reused image's tag), and the
-	// reconciler seed; the selection additionally feeds Manager.Prepare so a
-	// startup build stages the exact policy the tag came from — no stage
-	// re-reads /functions. The state DB is a persisted, read-mostly local state
-	// view (see internal/state), NOT the source of truth and NOT a snapshot the
-	// worker only reads: the worker also writes it (this discovery phase,
-	// reconcile outcomes, the 5s stats flush). It never drives matching or
-	// building; it is opened after the fingerprints so even a broken DB still
-	// yields fingerprints for Prepare and the reconciler.
+	// upserts); the selection feeds Manager.Prepare, which captures it into one
+	// immutable snapshot and derives the built image's tag, staged context, and
+	// returned identity from that single read — no startup stage re-reads
+	// /functions to build. The identity actually built is what the state phase
+	// records and the reconciler is seeded with, not this pre-prepare scan. The
+	// state DB is a persisted, read-mostly local state view (see internal/state),
+	// NOT the source of truth and NOT a snapshot the worker only reads: the worker
+	// also writes it (this discovery phase, reconcile outcomes, the 5s stats
+	// flush). It never drives matching or building; it is opened after the
+	// fingerprints so even a broken DB still yields fingerprints for Prepare and
+	// the reconciler.
 	_, fingerprintSpan := tracing.Start(startupCtx, "functions.fingerprint")
 	fingerprintStart := time.Now()
 	startup := selectAndFingerprintFunctions(functions, logger)
@@ -714,10 +716,13 @@ func Run(logger *slog.Logger) error {
 	orphanSpan.End()
 
 	// Build every function's image. A function whose image cannot be built is
-	// marked unavailable so the runner skips it; the rest continue. The
-	// fingerprints computed once above (and the selections they came from) are
-	// supplied to Prepare, so no startup build re-reads a function's source to
-	// derive an identity it already has, nor re-derives the selection policy.
+	// marked unavailable so the runner skips it; the rest continue. The startup
+	// selections are supplied to Prepare (which captures each into one immutable
+	// snapshot) so no startup build re-reads a function's source to derive an
+	// identity it already has, nor re-derives the selection policy. The state
+	// record and the reconciler seed use the identity each image was ACTUALLY
+	// built from, so a source edit during the build is detected by the next audit
+	// rather than recorded as current.
 	prepareCtx, prepareSpan := tracing.Start(startupCtx, "functions.prepare")
 	prepareStart := time.Now()
 	prepared := prepareFunctions(prepareCtx, manager, startup, st, logger)
@@ -1075,8 +1080,16 @@ func Run(logger *slog.Logger) error {
 		reconcilerSpan.RecordError(err)
 	} else {
 		seedStart := time.Now()
+		// Seed the identity each function's image was ACTUALLY built from
+		// (Prepared.Fingerprint), not the pre-prepare scan. A source edit between
+		// the scan and the build's snapshot changes the built identity, and seeding
+		// the built value makes the first reconcile compare against what is really
+		// baked: it observes the edit as a rebuild instead of treating the mutated
+		// tree as already prepared. The rule lives in the pure startupSeedFingerprints
+		// helper so it is pinned by a deterministic unit test.
+		seeds := startupSeedFingerprints(functions, fingerprints, prepared)
 		for _, fn := range functions {
-			rec.Seed(fn, fingerprints[fn.Name])
+			rec.Seed(fn, seeds[fn.Name])
 		}
 		logger.Debug("Startup: seeded startup fingerprints",
 			"count", len(functions),
@@ -1415,6 +1428,12 @@ func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn functio
 // package must not own, so state only ever sees the narrow
 // (function, fingerprint) conversion below.
 //
+// Fingerprint here is the PRE-PREPARE scan: it seeds the desired state. The
+// identity an image is ACTUALLY built from comes back as
+// runtime.Prepared.Fingerprint from the one immutable snapshot Prepare captures,
+// and that returned value is what the state phase records and the reconciler is
+// seeded with.
+//
 // Selection is nil for a no-runtime (external-image-only) function, which builds
 // no function image; its Fingerprint is then template-only by construction.
 type startupFunction struct {
@@ -1468,6 +1487,40 @@ func discoveredFromStartup(startup []startupFunction) []state.DiscoveredFunction
 		discovered = append(discovered, state.DiscoveredFunction{Function: s.Function, Fingerprint: s.Fingerprint})
 	}
 	return discovered
+}
+
+// startupSeedFingerprints returns the seed value for each loaded function, keyed
+// by name. The preferred seed is the identity the function's image was ACTUALLY
+// built from (Prepared.Fingerprint); the pre-prepare scan (fingerprints) is only
+// the fallback for a function that produced no built identity (an unavailable
+// build, a no-runtime function that builds no image, or a hand-built test value).
+//
+// Seeding the BUILT identity is what makes the first reconcile compare the live
+// tree against what is really baked: a source edit between the pre-prepare scan
+// and the build's snapshot changes the built value, so the reconcile observes a
+// rebuild instead of treating the mutated tree as already prepared. The rule is a
+// pure helper so it is pinned by a deterministic unit test rather than inferred
+// from Run's inline wiring.
+func startupSeedFingerprints(
+	functions []function.Function,
+	fingerprints map[string]string,
+	prepared []*runner.PreparedFunction,
+) map[string]string {
+	builtByFn := make(map[string]string, len(prepared))
+	for _, pf := range prepared {
+		if p := pf.Prepared(); p != nil && p.Fingerprint != "" {
+			builtByFn[pf.Name()] = p.Fingerprint
+		}
+	}
+	seeds := make(map[string]string, len(functions))
+	for _, fn := range functions {
+		seed := fingerprints[fn.Name]
+		if built := builtByFn[fn.Name]; built != "" {
+			seed = built
+		}
+		seeds[fn.Name] = seed
+	}
+	return seeds
 }
 
 // persistStartupDiscovery writes the startup state phase: it seeds a fresh
@@ -1534,11 +1587,16 @@ type functionPreparer interface {
 // it) rather than failing startup; the rest carry their fresh image. It receives
 // the startup records — each function with the fingerprint resolved exactly once
 // and (for a runtime-backed function) the source selection that fingerprint was
-// derived from — and supplies BOTH to the selection-aware Prepare, so the image
-// identity comes from the single startup hash rather than a fresh scan, and the
-// build stages exactly the policy the hash came from. Only a managed-runtime
-// function (whose build can span a source edit) is rescanned after the build,
-// via startupFinalFingerprint.
+// derived from — and supplies BOTH to the selection-aware Prepare. Prepare
+// itself captures one immutable snapshot of the selected source and derives the
+// build tag, the staged context, and the returned identity from it, so the built
+// generation is coherent even if the tree mutates during the build; the startup
+// scan is the input that says "a rebuild may be needed", never the label.
+//
+// The persisted record uses the RETURNED identity (prep.Fingerprint), so the
+// state DB always describes the content the image actually serves. A source edit
+// during the build is not in the image and is detected by the reconciler's
+// watcher/periodic audit on the next pass, exactly as in the live reconcile path.
 //
 // The building status is published at the ACTUAL managed runtime image-build
 // boundary via the observer installed by managedRuntimeBuildContext: a reused
@@ -1586,41 +1644,20 @@ func prepareFunctions(
 			continue
 		}
 		if st != nil && len(fn.Template.Services) == 0 {
-			// A managed-runtime build can run for minutes; a source edit during
-			// it is captured by a final authoritative scan so the state DB
-			// records the content currently on disk. A no-runtime function walks
-			// no tree, so the supplied (template-only) fingerprint stands.
-			fp := startupFinalFingerprint(fn, prep.Fingerprint, logger)
-			st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
+			// Persist the fingerprint the image was ACTUALLY built from
+			// (prep.Fingerprint, derived from the one immutable source snapshot the
+			// build staged), never a later live rescan. Recording a post-build scan
+			// would claim the image serves content it does not: a source edit during
+			// a long build is not in the image, and the reconciler's watcher/periodic
+			// audit detects it by comparing the on-disk digest against this recorded
+			// built identity on the next pass.
+			st.RecordReconcileSuccess(fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn)
 		}
 		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
 		preparedCount++
 	}
 	logger.Info("Prepared functions", "count", preparedCount)
 	return prepared
-}
-
-// startupFinalFingerprint returns the fingerprint the startup state phase
-// persists after a successful prepare. For a managed-runtime function — whose
-// build can run for minutes — it performs one final authoritative scan so a
-// source edit that landed DURING the build (or during the later service
-// convergence) is reflected; the reconciler's watcher window does not yet cover
-// this phase, so this post-build observation is deliberately retained and is a
-// distinct, stronger check than the pre-build supplied fingerprint. For a
-// no-runtime (external-image) function there is no build and no source input,
-// so the supplied fingerprint (template-only by construction) stands and no
-// tree is walked. A supplied "" (direct callers/tests) falls back to a scan so
-// the helper is total.
-func startupFinalFingerprint(fn function.Function, supplied string, logger *slog.Logger) string {
-	if supplied != "" && fn.Template != nil && !fn.Template.NeedsRuntime() {
-		return supplied
-	}
-	fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
-	if err != nil {
-		logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", err)
-		return ""
-	}
-	return fp
 }
 
 // enqueueLiveServices snapshots the current prepared environment and publishes
@@ -1773,12 +1810,12 @@ func enqueueStartupServicesWithState(
 							st.RecordServiceFailure(fn.Name, err)
 							return
 						}
-						// The convergence can be long (an external image pull),
-						// so a runtime function records one final authoritative
-						// scan; a no-runtime function has no source input and
-						// reuses its supplied template-only fingerprint.
-						fp := startupFinalFingerprint(fn, prep.Fingerprint, logger)
-						st.RecordReconcileSuccess(fn.Name, prep.Image, fp, time.Now(), fn)
+						// Persist the fingerprint the image was ACTUALLY built
+						// from, never a later live rescan: a post-convergence scan
+						// could record content the active image does not serve, and
+						// the next reconcile/audit detects any drift by comparing the
+						// on-disk digest against this built identity.
+						st.RecordReconcileSuccess(fn.Name, prep.Image, prep.Fingerprint, time.Now(), fn)
 					})
 			} else {
 				services.EnqueueLeased(fn.Name, fn.Template, prep.Image, prep.Env, lease)

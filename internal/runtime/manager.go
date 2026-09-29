@@ -217,6 +217,16 @@ type Manager struct {
 	// generation keying on image content can be exercised without a Docker
 	// daemon. A returned zero value falls back to the reference identity.
 	resolveImageIdentityFn func(ctx context.Context, ref, fingerprint string) (resolvedImage, error)
+	// afterSourceSnapshot is the deterministic seam around the captured source
+	// snapshot: Prepare calls it (test-only) ONCE, immediately after
+	// CaptureSourceSnapshot and before the fingerprint is derived, passing the
+	// live *function.SourceSnapshot. It is nil in production and never called
+	// then. A test uses it either to mutate the on-disk tree at the exact
+	// capture/build boundary (proving the tag and staged bytes still come from
+	// the one capture) or to retain the snapshot and assert its bytes were
+	// released when Prepare returns — including on the cancellation path. It is
+	// read and never mutated after construction.
+	afterSourceSnapshot func(*function.SourceSnapshot)
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -741,7 +751,10 @@ func (p *Prepared) TakeLease() *ImageLease {
 
 // Prepare builds exactly ONE image for the function's current content (never per
 // handler or event), then returns a handle for executing invocations against it.
-// It computes the function's content fingerprint itself (FingerprintFunction).
+// It captures the function's selected source into one immutable snapshot and
+// derives the content fingerprint, the image tag, and the staged build context
+// from that single capture, so the tag can never describe one set of bytes while
+// the image bakes another.
 //
 // The image reference is derived from that content fingerprint, so the same
 // source always maps to the same fingerprinted image. If that image is already
@@ -763,17 +776,18 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 
 // PrepareWithFingerprint is Prepare with a caller-supplied content fingerprint.
 // The worker's startup path computes each loaded function's fingerprint exactly
-// once (before the state phase) and passes it here, so Prepare does not rescan
-// the tree it already hashed: the supplied value is the identity the image is
-// tagged with and returned as Prepared.Fingerprint.
+// once (before the state phase) and passes it here so Prepare does not rescan the
+// tree it already hashed. The supplied value is the identity the CALLER compared
+// to decide a rebuild was needed; Prepare still captures the selected source once
+// and tags the image from that capture, returning it as Prepared.Fingerprint. If
+// the source mutated between the caller's scan and the capture, the capture wins
+// (coherent tag and bytes) and the caller persists the RETURNED value, so the
+// built generation is never mislabeled.
 //
 // An empty fingerprint means "not supplied" and falls back to computing one
 // internally, so direct and test callers that have no ready fingerprint keep the
-// exact Prepare behavior. A non-empty value is trusted as immutable: it was
-// computed from the same selection policy this call uses, so the tag stays
-// content-addressed. For a runtime-backed function the source selection must
-// still be resolved (the build context is staged from it), but the fingerprint
-// is NOT recomputed from it when one was supplied. A no-runtime function then
+// exact Prepare behavior. For a runtime-backed function the source selection must
+// still be resolved (the build context is staged from it). A no-runtime function
 // takes no filesystem walk at all: its fingerprint is template-only by
 // construction (see FingerprintFunction).
 //
@@ -794,13 +808,13 @@ func (m *Manager) PrepareWithFingerprint(
 // content fingerprint and the already-resolved source selection that fingerprint
 // was computed from. The reconciler computes the fingerprint to decide whether a
 // rebuild is needed, resolving the selection once (function.SelectAndFingerprintFunction),
-// and passes BOTH here so the build stages the exact source the tag was derived
-// from: the policy is not re-derived, so a concurrent .gitignore edit cannot make
-// the tag and the baked bytes disagree, and the tree is not re-selected.
+// and passes BOTH here so the build re-derives neither the policy nor the hash.
+// Prepare then captures one immutable snapshot of that selection and derives the
+// tag, the staged context, and the returned identity from that single capture, so
+// a concurrent edit can no longer make the tag and the baked bytes disagree.
 //
-// A nil selection falls back to resolving one here (matching PrepareWithFingerprint);
-// an empty fingerprint falls back to computing one from the selection. A
-// no-runtime function ignores both: it builds no image and its template-only
+// A nil selection falls back to resolving one here (matching PrepareWithFingerprint).
+// A no-runtime function ignores both: it builds no image and its template-only
 // fingerprint is used verbatim when supplied.
 func (m *Manager) PrepareWithFingerprintAndSelection(
 	ctx context.Context,
@@ -855,13 +869,12 @@ func (m *Manager) prepare(
 		return prepared, nil
 	}
 
-	// Resolve the source-selection policy ONCE and share it with the
-	// fingerprint and the build context: both must select exactly the same files
-	// (the function's .gitignore rules), and resolving a single Selection keeps
-	// them from disagreeing if a rule file is edited concurrently. The selection
-	// is required for the build context even when the fingerprint is supplied. A
-	// caller that already resolved it for the fingerprint it supplies (the
-	// reconciler) passes it in rather than making us re-read the policy.
+	// Resolve the source-selection policy ONCE. The policy (the function's
+	// .gitignore rules) decides which files are source, and a single resolved
+	// Selection keeps the capture below from disagreeing with the caller about
+	// it. A caller that already resolved it for the fingerprint it supplies (the
+	// reconciler, the worker startup pass) passes it in rather than making us
+	// re-read the policy.
 	selection := suppliedSelection
 	if selection == nil {
 		var err error
@@ -870,13 +883,46 @@ func (m *Manager) prepare(
 			return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
 		}
 	}
-	fp := fingerprint
+
+	// Capture ONE immutable snapshot of the selected source. The fingerprint, the
+	// image tag, and the staged build context ALL derive from this single read, so
+	// the tag can never describe one set of bytes while the image bakes another
+	// (the fingerprint-then-stage TOCTOU this replaces). The snapshot is owned by
+	// this preparation and released by the deferred Discard below on every path:
+	// success, error, and cancellation. A read failure is fatal to the prepare —
+	// there is deliberately no fallback that would stage live files under an
+	// identity that was never verified against them.
+	sourceSnapshot, err := function.CaptureSourceSnapshot(selection)
+	if err != nil {
+		return nil, fmt.Errorf("function %q: snapshot source: %w", fn.Name, err)
+	}
+	defer sourceSnapshot.Discard()
+	if m.afterSourceSnapshot != nil {
+		// Test-only seam: a test can mutate the on-disk source at exactly this
+		// boundary to prove the tag and the staged bytes still come from the one
+		// captured snapshot, or retain the snapshot to observe its release. Nil in
+		// production.
+		m.afterSourceSnapshot(sourceSnapshot)
+	}
+	fp := sourceSnapshot.Fingerprint()
 	if fp == "" {
-		var err error
-		fp, err = function.FingerprintSelection(selection)
-		if err != nil {
-			return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
-		}
+		// CaptureSourceSnapshot always yields a 64-hex digest, so an empty value
+		// would mean the identity is unavailable; never build under it.
+		return nil, fmt.Errorf("function %q: empty source fingerprint", fn.Name)
+	}
+	if fingerprint != "" && fingerprint != fp {
+		// The caller's pre-computed fingerprint (the value it compared to decide a
+		// rebuild was needed) no longer matches the captured bytes: the source
+		// mutated between the caller's read and this capture. The snapshot is
+		// authoritative — the image is tagged with and built from exactly its
+		// bytes — and the caller persists the RETURNED fingerprint, so the built
+		// generation is never mislabeled. The next reconcile/audit observes the
+		// caller's now-stale value and rebuilds.
+		m.log.Debug("Function: source changed before snapshot; using snapshot identity",
+			"function", fn.Name,
+			"supplied_fingerprint", fingerprint,
+			"snapshot_fingerprint", fp,
+		)
 	}
 
 	spec, err := lookup(fn.Template.Runtime)
@@ -1069,7 +1115,7 @@ func (m *Manager) prepare(
 	// function's span; the build itself still runs on the lifecycle-bounded
 	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), selection); err != nil {
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot); err != nil {
 		buildSpan.RecordError(err)
 		buildSpan.SetStatus(codes.Error, err.Error())
 		buildSpan.End()

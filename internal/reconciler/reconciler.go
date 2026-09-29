@@ -236,18 +236,20 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 
 // Seed records the fingerprint for a currently-loaded function so the first
 // reconcile pass does not rebuild a function that was already prepared at
-// startup. The fingerprint is SUPPLIED: the caller computed it once (the
-// startup fingerprint pass) and passes the value the prepared image was
-// actually tagged with, so Seed never re-reads the source tree. It is called
-// once during wiring, after PrepareWatch has established change detection and
-// before Start.
+// startup. The fingerprint is SUPPLIED by the caller: it is the identity the
+// prepared image was ACTUALLY built from (runtime.Prepared.Fingerprint, derived
+// from the source snapshot Prepare captured), so Seed never re-reads the source
+// tree and the seed describes what is really baked even if the tree changed
+// during the build.
 //
-// A change that lands between the caller's fingerprint computation and
-// PrepareWatch is still detected: the first reconcile rescans the tree and,
-// because the supplied seed is the OLDER value, observes the change as a
-// rebuild — never a missed update. An empty value is stored as-is; because no
-// real fingerprint is empty, the first reconcile simply treats the function as
-// changed and rebuilds it (the desired behavior for an unprepared function).
+// It is called once during wiring, after PrepareWatch has established change
+// detection and before Start. A change that lands between the caller's
+// fingerprint computation and PrepareWatch, or DURING the build, is still
+// detected: the first reconcile rescans the tree and finds it different from the
+// recorded built identity, so it observes the change as a rebuild — never a
+// missed update. An empty value is stored as-is; because no real fingerprint is
+// empty, the first reconcile simply treats the function as changed and rebuilds
+// it (the desired behavior for an unprepared function).
 func (r *Reconciler) Seed(fn function.Function, fingerprint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -260,8 +262,9 @@ func (r *Reconciler) Seed(fn function.Function, fingerprint string) {
 // startup fingerprints: the worker calls PrepareWatch, then Seed for each
 // startup function, then Start. Any change after the watch is installed is
 // observed as an fsnotify event; a change between the startup fingerprint scan
-// and this point is still caught by the first reconcile's own rescan because
-// the supplied seed is the older value.
+// and this point is also caught, because Seed stores the identity the image was
+// ACTUALLY built from (the snapshot capture inside Prepare), and the first
+// reconcile rescans the live tree and finds it different.
 //
 // It is idempotent: a watcher already prepared (Start called after
 // PrepareWatch, or a second PrepareWatch) is reused as-is. An error creating the
@@ -753,15 +756,28 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	r.reg.Replace(name, pf)
+	// The skip key and the persisted active fingerprint are the identity the
+	// image was ACTUALLY built from (built.Fingerprint, derived inside Prepare
+	// from the one immutable source snapshot the build staged), not the pre-build
+	// scan `fp`. They can differ when the source mutated between the reconciler's
+	// scan and the build's capture; recording the built value means the next
+	// reconcile/periodic audit compares against what is really baked and rebuilds
+	// the drift, instead of silently treating the mutated tree as current.
+	builtFP := built.Fingerprint
+	if builtFP == "" {
+		// Defensive: a Builder that does not return an identity (hand-built
+		// fakes) keeps the scanned value.
+		builtFP = fp
+	}
 	r.mu.Lock()
-	r.fingerprints[name] = fp
+	r.fingerprints[name] = builtFP
 	r.mu.Unlock()
 
 	ready := func() {
 		if r.st == nil || !r.currentGeneration(name, generation) {
 			return
 		}
-		r.st.RecordReconcileSuccess(name, built.Image, fp, time.Now(), fn)
+		r.st.RecordReconcileSuccess(name, built.Image, builtFP, time.Now(), fn)
 	}
 	failServices := func(serviceErr error) {
 		if serviceErr != nil && r.st != nil && r.currentGeneration(name, generation) {
@@ -847,13 +863,16 @@ func (r *Reconciler) currentGenerationNumber(name string) uint64 {
 // prepareImage builds the function's image, passing the fingerprint the
 // reconciler already computed (and, for a runtime-backed function, the source
 // selection it was computed from) when the builder supports it. The runtime
-// Manager does, so a live rebuild hands it BOTH the tag identity and the exact
-// policy to stage: the selection is never re-derived and the fingerprint is
-// never re-hashed. A test or non-Manager Builder that only implements Builder
-// falls back to Prepare, which computes them itself; those fakes do not care
-// about the identity anyway. fp is "" only for a function the reconciler could
-// not hash (which then never reaches here: a fingerprint error retains the
-// previous version), so the value supplied is always the one just compared.
+// Manager does, so a live rebuild hands it BOTH the tag identity it compared and
+// the exact policy to stage: the selection is never re-derived and the
+// fingerprint is never re-hashed by the reconciler. The Manager still captures
+// the selection once and derives the built identity from that capture; the
+// caller records the RETURNED fingerprint. A test or non-Manager Builder that
+// only implements Builder falls back to Prepare, which computes them itself;
+// those fakes do not care about the identity anyway. fp is "" only for a function
+// the reconciler could not hash (which then never reaches here: a fingerprint
+// error retains the previous version), so the value supplied is always the one
+// just compared.
 func (r *Reconciler) prepareImage(
 	ctx context.Context,
 	fn function.Function,

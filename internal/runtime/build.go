@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,7 +19,6 @@ import (
 
 	"relay/internal/function"
 	"relay/internal/runtime/plan"
-	"relay/internal/source"
 )
 
 // buildTimeout bounds a single Dockerfile build: the ImageBuild request and
@@ -131,7 +129,7 @@ func buildImage(
 	p plan.BuildPlan,
 	image string,
 	labels map[string]string,
-	selection *source.Selection,
+	snapshot *function.SourceSnapshot,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
@@ -139,21 +137,21 @@ func buildImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	// selection is the SAME source-selection policy the caller fingerprinted, so
-	// the image contains exactly the selected source: files excluded by the
-	// function's .gitignore rules are never baked into the image and the
-	// applicable ignore files are. Resolving it once in the caller keeps the
-	// fingerprint and the context from racing a concurrent rule edit. Staging is
-	// read-only; the user's function directory is never modified.
+	// snapshot is the SINGLE immutable read the caller already fingerprinted: the
+	// image is staged from exactly the bytes its tag was derived from, so a
+	// concurrent edit between the fingerprint and the build can no longer make the
+	// tag and the baked content disagree. The function's .gitignore policy was
+	// applied at capture time (ignored files and .git were never captured), so the
+	// staged context contains exactly the selected source. Staging is read-only;
+	// the user's function directory is never modified.
 	//
-	// Copy the selected function sources into the context, EXCLUDING
-	// template.yaml. The template is Relay configuration (runtime, rules, env
-	// values, secret references), not function source: baking it into the image
-	// would embed env values and secret references in the image layers. The
-	// fingerprint still covers template.yaml (its content gates rebuilds), but the
-	// image never contains it. Generated plan files are written separately, so the
-	// user's function directory is never modified.
-	if err := copySourceDir(selection, ctxDir); err != nil {
+	// template.yaml is excluded from the context even though it participates in
+	// the fingerprint: the template is Relay configuration (runtime, rules, env
+	// values, secret references), not function source, so baking it into the image
+	// would embed env values and secret references in the image layers. Generated
+	// plan files are written separately below, so the user's function directory is
+	// never modified.
+	if err := stageSourceSnapshot(snapshot, ctxDir); err != nil {
 		return fmt.Errorf("function %q: copy sources: %w", name, err)
 	}
 
@@ -399,59 +397,79 @@ func tarContext(ctxDir string) (io.Reader, error) {
 	return &buf, nil
 }
 
-// copySourceDir stages the SELECTED function source into the build context. It
-// walks the shared selection (so files excluded by the function's .gitignore
-// rules are never copied and the applicable ignore files are) and additionally
-// skips any file named template.yaml anywhere in the tree. That exclusion is by
-// base name so a nested template.yaml can never leak Relay configuration —
-// including env values and secret references — into an image; the loader only
-// ever reads the top-level one, so nested copies are dead weight at best.
-func copySourceDir(selection *source.Selection, dst string) error {
-	return selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+// stageSourceSnapshot writes the immutable snapshot's selected files (and the
+// directories that contain them) into the build context. It stages exactly the
+// bytes the fingerprint was derived from, so the tag and the image can never
+// disagree about a concurrent edit.
+//
+// template.yaml is deliberately excluded by BASE NAME anywhere in the tree: the
+// template is Relay configuration (runtime, rules, env values, secret
+// references), not function source, so it must never enter an image — including
+// a nested template.yaml the loader never reads. It still participates in the
+// fingerprint (the selected directory's own template.yaml is hashed with its
+// resources stripped; a nested one is hashed verbatim), so template edits still
+// gate rebuilds while the bytes stay out of the image. Entries with an empty
+// StageRel are ancestor policy files that are fingerprinted but never staged.
+//
+// Directories are created so an empty selected directory still appears in the
+// context (and so plan-file writes find their parents), and the original mode is
+// preserved. The snapshot is read-only here; the user's tree is never touched.
+func stageSourceSnapshot(snapshot *function.SourceSnapshot, dst string) error {
+	if snapshot == nil {
+		return fmt.Errorf("stage source: nil snapshot")
+	}
+	// A directory literally named template.yaml is excluded with its whole
+	// subtree, mirroring the historical base-name SkipDir behavior; its contents
+	// still participate in the fingerprint.
+	var excludedDirs []string
+	for _, e := range snapshot.Entries() {
+		if e.StageRel == "" {
+			continue
 		}
-		rel, err := filepath.Rel(selection.Dir(), path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		if filepath.Base(rel) == "template.yaml" {
-			if d.IsDir() {
-				return filepath.SkipDir
+		if filepath.Base(e.StageRel) == "template.yaml" {
+			if e.IsDir {
+				excludedDirs = append(excludedDirs, e.StageRel+"/")
 			}
-			return nil
+			continue
 		}
-		info, ierr := d.Info()
-		if ierr != nil {
-			return ierr
+		if underStageDir(e.StageRel, excludedDirs) {
+			continue
 		}
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, info.Mode())
+		target := filepath.Join(dst, filepath.FromSlash(e.StageRel))
+		if e.IsDir {
+			if err := os.MkdirAll(target, e.Mode.Perm()); err != nil {
+				return err
+			}
+			continue
 		}
-		if !info.Mode().IsRegular() {
-			return nil
+		if !e.Regular {
+			// A non-regular entry (a symlink, socket, ...) participates in the
+			// fingerprint but is never staged, matching the historical stager; the
+			// build only ever bakes regular files.
+			continue
 		}
-		return copyFile(path, target, info.Mode())
-	})
+		if dir := filepath.Dir(target); dir != dst {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return err
+			}
+		}
+		// Content is already in memory (the snapshot captured it), so write it
+		// without reopening the on-disk file: reopening would reintroduce the
+		// fingerprint-then-stage race the snapshot exists to remove.
+		if err := os.WriteFile(target, e.Content, e.Mode.Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+// underStageDir reports whether the slash path rel lies inside one of the
+// excluded directory prefixes.
+func underStageDir(rel string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(rel, p) {
+			return true
+		}
 	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
+	return false
 }

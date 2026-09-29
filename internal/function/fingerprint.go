@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"relay/internal/source"
 )
@@ -137,76 +139,251 @@ func fingerprintTemplate(dir string) (string, error) {
 
 // FingerprintSelection fingerprints an already-resolved source selection. It is
 // the seam the manager uses when it has already selected a function's source (so
-// the policy is not re-derived), and it keeps the hashing logic in one place.
+// the policy is not re-derived), and it keeps the hashing logic in one place. It
+// streams one file at a time (it never holds the whole tree in memory), so the
+// reconciler's periodic audit stays cheap; a caller that must ALSO stage the
+// same bytes uses CaptureSourceSnapshot instead.
 func FingerprintSelection(selection *source.Selection) (string, error) {
-	// Collect the included files as (hash path, filesystem path) pairs. The hash
-	// path is root-relative and slash-separated so the serialization is canonical
-	// and independent of how the walk produced absolute paths.
-	type entry struct{ rel, path string }
-	var entries []entry
+	entries, err := collectSelectionEntries(selection)
+	if err != nil {
+		return "", err
+	}
+	templateRel := templateRelFor(selection)
+
+	h := sha256.New()
+	for _, e := range entries {
+		if e.isDir {
+			continue
+		}
+		raw, rerr := os.ReadFile(e.path)
+		if rerr != nil {
+			return "", fmt.Errorf("read %q: %w", e.rel, rerr)
+		}
+		writeFingerprintEntry(h, e.rel, templateRel, raw)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// snapshotEntry is one entry collected from a selection: its canonical
+// root-relative path and filesystem path, its selected-directory-relative stage
+// path, its mode, and whether it is a directory. It is the intermediate the
+// streaming fingerprinter and the capturing snapshot share, so both see exactly
+// the same selection and ordering.
+type snapshotEntry struct {
+	rel      string
+	path     string
+	stageRel string
+	mode     fs.FileMode
+	isDir    bool
+}
+
+// collectSelectionEntries walks the resolved selection once and returns every
+// selected entry in canonical root-relative order. It is the single definition of
+// "which files are source and in what order" shared by FingerprintSelection and
+// CaptureSourceSnapshot, so the digest and the staged context can never select
+// differently. Applicable ignore files ABOVE the selected directory are included
+// (they affect selection) with an empty stageRel.
+func collectSelectionEntries(selection *source.Selection) ([]snapshotEntry, error) {
+	if selection == nil {
+		return nil, fmt.Errorf("collect source entries: nil selection")
+	}
+	dir := selection.Dir()
+
+	entries := make([]snapshotEntry, 0, 32)
+	seen := make(map[string]bool, 32)
 	err := selection.WalkDir(func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
+		rel, rerr := selection.Rel(path)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." || seen[rel] {
 			return nil
 		}
-		rel, err := selection.Rel(path)
-		if err != nil {
-			return err
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
 		}
-		entries = append(entries, entry{rel: rel, path: path})
+		seen[rel] = true
+		entries = append(entries, snapshotEntry{
+			rel: rel, path: path, stageRel: stagedRel(dir, path),
+			mode: info.Mode(), isDir: d.IsDir(),
+		})
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("walk %q: %w", selection.Dir(), err)
+		return nil, fmt.Errorf("walk %q: %w", dir, err)
 	}
-	seen := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		seen[e.rel] = true
-	}
-	// A subtree walk cannot visit policy files above the selected directory,
-	// but those files still affect the selected source and must be versioned.
+
+	// A subtree walk cannot visit policy files ABOVE the selected directory, but
+	// those files still affect the selected source and must be versioned. They are
+	// fingerprinted but never staged: they live outside the image.
 	for _, path := range selection.ApplicableIgnoreFiles() {
-		rel, err := selection.Rel(path)
-		if err != nil {
+		rel, rerr := selection.Rel(path)
+		if rerr != nil || rel == "." || seen[rel] {
 			continue
 		}
-		if seen[rel] {
-			continue
-		}
-		entries = append(entries, entry{rel: rel, path: path})
+		seen[rel] = true
+		entries = append(entries, snapshotEntry{
+			rel: rel, path: path, mode: 0o644,
+		})
 	}
+
 	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
+	return entries, nil
+}
 
-	// The function's own template.yaml is hashed with its top-level `resources`
-	// mapping removed, so a resource-only edit does not change the full-source
-	// fingerprint (matching FingerprintFunction's no-runtime path and
-	// stripTemplateResources). A nested template.yaml elsewhere in the tree (a
-	// monorepo) is an ordinary source file and is hashed verbatim.
-	templatePath := filepath.Join(selection.Dir(), "template.yaml")
-
-	h := sha256.New()
-	for _, e := range entries {
-		io.WriteString(h, e.rel)
-		h.Write([]byte{0})
-		f, err := os.Open(e.path)
-		if err != nil {
-			return "", fmt.Errorf("read %q: %w", e.rel, err)
-		}
-		raw, err := io.ReadAll(f)
-		if err != nil {
-			_ = f.Close()
-			return "", fmt.Errorf("read %q: %w", e.rel, err)
-		}
-		if err := f.Close(); err != nil {
-			return "", fmt.Errorf("close %q: %w", e.rel, err)
-		}
-		if e.path == templatePath {
-			raw = stripTemplateResources(raw)
-		}
-		h.Write(raw)
-		h.Write([]byte{0})
+// templateRelFor returns the root-relative path of the selected directory's own
+// template.yaml, or "" when the selection has none. Only that file has its
+// top-level `resources` mapping stripped before hashing; a nested template.yaml
+// is ordinary source.
+func templateRelFor(selection *source.Selection) string {
+	rel, err := selection.Rel(filepath.Join(selection.Dir(), "template.yaml"))
+	if err != nil {
+		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return rel
+}
+
+// writeFingerprintEntry frames one entry's bytes into the digest using the
+// canonical (path, NUL, content, NUL) serialization, stripping resources from the
+// selected directory's own template.yaml. It is the ONE place that framing is
+// defined, so the streaming fingerprinter and the snapshot fingerprinter can
+// never drift.
+func writeFingerprintEntry(h hash.Hash, rel, templateRel string, raw []byte) {
+	io.WriteString(h, rel)
+	h.Write([]byte{0})
+	if rel != "" && rel == templateRel {
+		raw = stripTemplateResources(raw)
+	}
+	h.Write(raw)
+	h.Write([]byte{0})
+}
+
+// SnapshotEntry is one captured entry of a function's selected source.
+type SnapshotEntry struct {
+	// Rel is the entry's ROOT-relative slash path: the canonical path the
+	// fingerprint frames entries with (so the serialization is independent of how
+	// the walk produced absolute paths and independent of the selected subtree).
+	Rel string
+	// StageRel is the entry's SELECTED-DIRECTORY-relative slash path: the path the
+	// build context stages it at. It is empty when the entry is a policy file
+	// above the selected directory (an ancestor .gitignore), which participates in
+	// the fingerprint but is not part of the image.
+	StageRel string
+	// Content is the exact captured bytes. It is nil for a directory. A
+	// non-regular entry (e.g. a symlink) captures the bytes its path resolves to,
+	// matching the historical fingerprint, but is never staged (see Regular).
+	Content []byte
+	// Mode is the entry's file mode at capture time.
+	Mode fs.FileMode
+	// IsDir reports whether the entry is a directory.
+	IsDir bool
+	// Regular reports whether the entry is a regular file. Only regular files are
+	// staged into the build context (matching the historical stager); a
+	// non-regular entry still participates in the fingerprint when it is selected.
+	Regular bool
+}
+
+// SourceSnapshot is an immutable, single-read capture of a function's selected
+// source. The content fingerprint and the runtime image build context BOTH derive
+// from exactly these bytes, so the tag can never describe one set of files while
+// the image bakes another (the fingerprint-then-stage TOCTOU the previous
+// selection-only handoff left open).
+//
+// A snapshot is owned by ONE preparation. CaptureSourceSnapshot reads every
+// selected file once; the caller threads the same value through the fingerprint
+// and the build-context staging and then releases it with Discard (a deferred
+// call covers success, error, and cancellation).
+type SourceSnapshot struct {
+	// templateRel is the root-relative path of the selected directory's own
+	// template.yaml. Only that file has its top-level `resources` mapping stripped
+	// before hashing (a nested template.yaml is ordinary source, hashed verbatim).
+	templateRel string
+	entries     []SnapshotEntry
+}
+
+// CaptureSourceSnapshot walks the resolved selection once and captures every
+// selected entry's exact bytes and mode. It applies exactly the same selection
+// and ordering as FingerprintSelection (both use collectSelectionEntries), and it
+// captures the bytes that fingerprint hashes, so the two can never disagree.
+//
+// Any read error is surfaced: a caller must never build an image from a tree it
+// could not fully capture, because that would bake a partial (and so
+// misidentified) source set.
+func CaptureSourceSnapshot(selection *source.Selection) (*SourceSnapshot, error) {
+	entries, err := collectSelectionEntries(selection)
+	if err != nil {
+		return nil, err
+	}
+
+	captured := make([]SnapshotEntry, 0, len(entries))
+	for _, e := range entries {
+		entry := SnapshotEntry{Rel: e.rel, StageRel: e.stageRel, Mode: e.mode, IsDir: e.isDir, Regular: !e.isDir}
+		if !e.isDir {
+			content, rerr := os.ReadFile(e.path)
+			if rerr != nil {
+				return nil, fmt.Errorf("read %q: %w", e.rel, rerr)
+			}
+			entry.Content = content
+			entry.Regular = e.mode.IsRegular()
+		}
+		captured = append(captured, entry)
+	}
+	return &SourceSnapshot{templateRel: templateRelFor(selection), entries: captured}, nil
+}
+
+// Fingerprint returns the content digest over the snapshot's captured files,
+// using the same per-entry framing, canonical ordering, and template-resource
+// stripping as FingerprintSelection. Directories are not hashed.
+//
+// The digest is always a non-empty 64-hex SHA-256 for a successfully captured
+// snapshot (even an empty selected tree hashes the empty input), so a caller can
+// treat "" as "no identity" without ambiguity.
+func (s *SourceSnapshot) Fingerprint() string {
+	h := sha256.New()
+	for _, e := range s.entries {
+		if e.IsDir {
+			continue
+		}
+		writeFingerprintEntry(h, e.Rel, s.templateRel, e.Content)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Entries returns the captured entries in canonical root-relative order for the
+// build-context stager. The returned slice must not be mutated; entries with an
+// empty StageRel are policy files outside the selected tree and must be skipped
+// by a stager.
+func (s *SourceSnapshot) Entries() []SnapshotEntry {
+	if s == nil {
+		return nil
+	}
+	return s.entries
+}
+
+// Discard releases the snapshot's captured bytes. It is the explicit cleanup for
+// one preparation and is owned by the capturing caller, so capturing code must
+// defer it: a preparation that succeeds, fails, or is cancelled must not retain
+// the captured source. It is nil-safe and idempotent.
+func (s *SourceSnapshot) Discard() {
+	if s == nil {
+		return
+	}
+	for i := range s.entries {
+		s.entries[i].Content = nil
+	}
+	s.entries = nil
+}
+
+// stagedRel returns path's path relative to the selected directory dir as a slash
+// path, or "" when it lies outside dir (an ancestor policy file).
+func stagedRel(dir, path string) string {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(rel)
 }

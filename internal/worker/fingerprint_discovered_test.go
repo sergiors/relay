@@ -1,11 +1,14 @@
 package worker
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"relay/internal/function"
+	"relay/internal/runner"
+	"relay/internal/runtime"
 	"relay/internal/state"
 )
 
@@ -171,62 +174,99 @@ func TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection(t *testing.T) {
 	}
 }
 
-// TestStartupFinalFingerprint pins the post-Prepare decision: a no-runtime
-// function reuses the supplied fingerprint (no tree walk), while a
-// runtime-backed function performs one final authoritative scan so an edit
-// during a long build is captured.
-func TestStartupFinalFingerprint(t *testing.T) {
+// TestStartupBuiltFingerprintIsReturnedIdentity pins the startup state contract:
+// the fingerprint persisted after a successful prepare is the identity the image
+// was ACTUALLY built from (prep.Fingerprint), NOT a post-build rescan of the
+// live tree. A source edit landing after the build must not be recorded as the
+// built generation (that would claim the image serves content it does not); the
+// reconciler's audit detects the drift instead.
+func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	root := t.TempDir()
 	writeWorkerFunction(t, root, "runtime-fn", "def handler(e): return 1\n")
-	writeWorkerFunction(t, root, "external-fn", "def handler(e): return 1\n")
 
 	fns, err := function.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	var runtimeFn, externalFn function.Function
-	for _, fn := range fns {
-		switch fn.Name {
-		case "runtime-fn":
-			runtimeFn = fn
-		case "external-fn":
-			externalFn = fn
-		}
-	}
-	if runtimeFn.Name == "" || externalFn.Name == "" {
-		t.Fatalf("loaded functions = %v, want both", fns)
+	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	if len(startup) != 1 {
+		t.Fatalf("startup records = %d, want 1", len(startup))
 	}
 
-	// Retag the external function as no-runtime for the test without touching
-	// its template (only NeedsRuntime is consulted).
-	externalFn.Template.Runtime = ""
-	externalFn.Template.Events = nil
-	if externalFn.Template.NeedsRuntime() {
-		t.Fatal("fixture precondition: external-fn must not need a runtime")
+	// The identity the preparer returns is a distinct sentinel, standing in for
+	// the snapshot-derived fingerprint Prepare would return; the on-disk tree is
+	// then mutated so any rescan would differ.
+	const builtIdentity = "snapshot-built-identity"
+	spy := &startupSpyPreparer{overrideFingerprint: builtIdentity}
+	if err := os.WriteFile(filepath.Join(root, "runtime-fn", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
+		t.Fatalf("rewrite source: %v", err)
 	}
-
-	// no-runtime: the supplied value stands even though the on-disk content
-	// changed, proving no scan happens.
-	const supplied = "supplied-external"
-	if err := os.WriteFile(filepath.Join(root, "external-fn", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
-		t.Fatalf("rewrite: %v", err)
-	}
-	if got := startupFinalFingerprint(externalFn, supplied, discardLogger()); got != supplied {
-		t.Fatalf("no-runtime final fingerprint = %q, want supplied %q", got, supplied)
-	}
-
-	// runtime: a stale supplied value is discarded in favor of a fresh scan.
-	onDisk, err := function.FingerprintFunction(runtimeFn.Dir, runtimeFn.Template)
+	onDisk, err := function.FingerprintFunction(filepath.Join(root, "runtime-fn"), startup[0].Function.Template)
 	if err != nil {
-		t.Fatalf("fingerprint: %v", err)
+		t.Fatalf("on-disk fingerprint: %v", err)
 	}
-	if got := startupFinalFingerprint(runtimeFn, "stale-supplied", discardLogger()); got != onDisk {
-		t.Fatalf("runtime final fingerprint = %q, want the on-disk %q", got, onDisk)
+	if onDisk == builtIdentity {
+		t.Fatal("test setup: the on-disk digest must differ from the built identity")
 	}
 
-	// A supplied "" always scans (total fallback for direct callers/tests).
-	if got := startupFinalFingerprint(externalFn, "", discardLogger()); got == "" {
-		t.Fatal("empty supplied fingerprint must fall back to a scan")
+	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
+	if err != nil {
+		t.Fatalf("state open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	st.RecordDiscovered(startup[0].Function)
+
+	prepareFunctions(context.Background(), spy, startup, st, discardLogger())
+
+	detail, ok := st.GetFunction("runtime-fn")
+	if !ok {
+		t.Fatal("expected a runtime-fn row")
+	}
+	if detail.Fingerprint != builtIdentity {
+		t.Fatalf("persisted active fingerprint = %q, want the built identity %q (not a post-build rescan %q)",
+			detail.Fingerprint, builtIdentity, onDisk)
+	}
+}
+
+// TestStartupSeedFingerprintsPrefersBuiltIdentity pins the seed-selection rule as
+// a pure function: the identity the image was actually built from wins over the
+// pre-prepare scan, and the scan is only the fallback when no built identity
+// exists (unavailable/no-runtime/hand-built). This is the rule Run uses to seed
+// the reconciler, factored out so it is asserted directly rather than inferred
+// from Run's inline wiring.
+func TestStartupSeedFingerprintsPrefersBuiltIdentity(t *testing.T) {
+	builtFn := function.Function{Name: "built"}
+	unavailFn := function.Function{Name: "unavailable"}
+	noRuntimeFn := function.Function{Name: "no-runtime"}
+
+	prepared := []*runner.PreparedFunction{
+		// A successfully built function: its built identity is authoritative.
+		runner.NewPrepared(builtFn, &runtime.Prepared{Name: "built", Image: "img-built", Fingerprint: "built-identity"}, nil),
+		// An unavailable build: no prepared handle, so the scan stands.
+		runner.NewUnavailable(unavailFn),
+		// A no-runtime/external-image function: no image identity, scan stands.
+		runner.NewPrepared(noRuntimeFn, &runtime.Prepared{Name: "no-runtime", Image: ""}, nil),
+	}
+	functions := []function.Function{builtFn, unavailFn, noRuntimeFn}
+	fingerprints := map[string]string{
+		"built":       "pre-prepare-scan",
+		"unavailable": "scan-unavail",
+		"no-runtime":  "scan-no-runtime",
+	}
+
+	seeds := startupSeedFingerprints(functions, fingerprints, prepared)
+
+	if seeds["built"] != "built-identity" {
+		t.Fatalf("built function seed = %q, want the built identity %q (not the pre-prepare scan)", seeds["built"], "built-identity")
+	}
+	if seeds["unavailable"] != "scan-unavail" {
+		t.Fatalf("unavailable function seed = %q, want the scan fallback %q", seeds["unavailable"], "scan-unavail")
+	}
+	if seeds["no-runtime"] != "scan-no-runtime" {
+		t.Fatalf("no-runtime function seed = %q, want the scan fallback %q", seeds["no-runtime"], "scan-no-runtime")
+	}
+	if len(seeds) != len(functions) {
+		t.Fatalf("seed map size = %d, want one entry per function %d", len(seeds), len(functions))
 	}
 }
 

@@ -135,8 +135,10 @@ agree.
 - Env-var names must match `[A-Za-z_][A-Za-z0-9_]*`; secret references must be
   lowercase letters/digits/`.`/`_`/`-`, ≤ 63 chars. A variable may not appear in
   both maps. `RELAY_HANDLER` is reserved and cannot be set.
-- **Never put secret values in `template.yaml`** — the template is part of the
-  build context and the fingerprint.
+- **Never put secret values in `template.yaml`** — the template participates in
+  the fingerprint and is read at reconcile time. (The template is deliberately
+  **never** copied into the runtime image build context, so env values and secret
+  references cannot leak into an image layer.)
 
 Injection and confidentiality — be precise about the boundaries:
 
@@ -183,6 +185,10 @@ Relay builds **one image per function**, versioned by source fingerprint:
 - The fingerprint hashes the function's selected source (files after applying
   the function's `.gitignore` rules) plus `template.yaml` **verbatim**; applicable
   `.gitignore` files are hashed too, so a rule edit counts as a source change.
+  The fingerprint and the image build context are derived from **one immutable
+  snapshot** of the selected source, so the image tag can never describe bytes
+  other than the ones baked into the image; `template.yaml` participates in the
+  fingerprint but is never copied into the image.
 - `resources` is deliberately **excluded** from the fingerprint. Editing only
   `resources` does **not** rebuild or retag the image; Relay rotates containers
   to the new limits instead (idle ones discarded immediately, busy ones drained
