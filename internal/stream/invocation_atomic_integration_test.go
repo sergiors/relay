@@ -155,7 +155,7 @@ func TestIntegrationAtomicTryStartExactlyOneConcurrentWinner(t *testing.T) {
 
 // TestIntegrationAtomicTryStartAttemptOnce pins that a confirmed claim
 // increments the attempt exactly once, and that the attempt count advances only
-// when the deadline has genuinely expired (a protected claim never increments).
+// when the deadline has genuinely elapsed (a protected claim never increments).
 func TestIntegrationAtomicTryStartAttemptOnce(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	store, stream, group, msgID := atomicStateStore(t, cli)
@@ -172,7 +172,7 @@ func TestIntegrationAtomicTryStartAttemptOnce(t *testing.T) {
 	if err != nil || started || loser.Attempt != 1 || wait <= 0 {
 		t.Fatalf("protected claim = (%v, %+v, %s, %v), want (false, attempt 1, >0, nil)", started, loser, wait, err)
 	}
-	// After the deadline expires the reclaim advances to attempt 2 with a FRESH
+	// After the deadline elapses the reclaim advances to attempt 2 with a FRESH
 	// token.
 	later := deadline.Add(time.Minute)
 	started, next, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", later, later.Add(time.Hour))
@@ -344,9 +344,9 @@ func TestIntegrationAtomicNormalRetryClaim(t *testing.T) {
 }
 
 // TestIntegrationAtomicStaleClaimCannotTransition pins the token CAS for every
-// active-claim-originated transition: once claim A's attempt-1 lease expires and
-// claim B reclaims as attempt 2, A's failure, success, exhaustion, and retry are
-// all refused (explicit false, no Redis error) and never disturb B's marker. A
+// active-claim-originated transition: once claim A's attempt-1 deadline elapses
+// and claim B reclaims as attempt 2, A's failure, success, exhaustion, and retry
+// are all refused (explicit false, no Redis error) and never disturb B's marker. A
 // same-attempt claim with a DIFFERENT token is likewise refused, proving the
 // token — not the attempt number — is the claim identity.
 func TestIntegrationAtomicStaleClaimCannotTransition(t *testing.T) {
@@ -505,49 +505,42 @@ func TestIntegrationAtomicTerminalExhaustionAndDLQ(t *testing.T) {
 	}
 }
 
-// TestIntegrationAtomicTTLCoversDeadlineAndRefreshes pins the TTL contract: an
-// active marker's key TTL must be at least the protected window plus the safety
-// margin (so the key can never expire before its deadline), and every mutation
-// refreshes the TTL in the same atomic step. Terminal writes use the normal TTL.
-func TestIntegrationAtomicTTLCoversDeadlineAndRefreshes(t *testing.T) {
+// TestIntegrationAtomicRecoverableStateIsPersistent pins the persistence
+// contract: every lifecycle mutation performed while the message is recoverable
+// leaves the invocation-state hash with NO TTL (regardless of how far the
+// deadline is), so a redelivery can never outlive its state. Go computes no TTL
+// for these writes; the scripts PERSIST the key instead.
+func TestIntegrationAtomicRecoverableStateIsPersistent(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	store, stream, group, msgID := atomicStateStore(t, cli)
 	ctx := context.Background()
 	key := invocationStateKey(stream, group, msgID)
 
-	// A running marker whose protected window exceeds the normal TTL. The key
-	// TTL must exceed the window+margin, never the terminal TTL.
+	// A very long deadline must NOT introduce a TTL: the key is persistent.
 	now := time.Now()
-	longTimeout := invocationStateTTL + 48*time.Hour
+	longTimeout := invocationRetentionTTL + 48*time.Hour
 	started, claim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(longTimeout))
 	if err != nil || !started {
 		t.Fatalf("tryStart = (%v,%+v,%v)", started, claim, err)
 	}
-	ttl, err := cli.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("pttl after tryStart: %v", err)
-	}
-	minTTL := longTimeout + invocationSafetyMargin - 5*time.Second // allow for elapsed time
-	if ttl < minTTL {
-		t.Fatalf("tryStart TTL = %s, want >= %s (window %s + margin %s)", ttl, minTTL, longTimeout, invocationSafetyMargin)
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("tryStart PTTL = %s (err %v), want -1 (persistent)", d, err)
 	}
 
-	// A short-deadline marker is floored at the normal terminal TTL.
+	// A second invocation's short-deadline marker also leaves the key persistent
+	// (the hash is shared, and recoverable state is never TTL'd).
 	shortNow := time.Now()
 	started, shortClaim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/short", shortNow, shortNow.Add(time.Second))
 	if err != nil || !started {
 		t.Fatalf("short tryStart = (%v,%+v,%v)", started, shortClaim, err)
 	}
-	ttl, err = cli.PTTL(ctx, key).Result()
-	if err != nil {
-		t.Fatalf("pttl after short tryStart: %v", err)
-	}
-	if ttl < invocationStateTTL-5*time.Second {
-		t.Fatalf("short-deadline TTL = %s, want the normal TTL %s", ttl, invocationStateTTL)
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("short tryStart PTTL = %s (err %v), want -1 (persistent)", d, err)
 	}
 
-	// Every later mutation refreshes the TTL (still positive, never -1).
-	mutateAndCheck := func(label string, fn func() error) {
+	// Every later mutation ALSO leaves the key persistent (never -2/missing, and
+	// never a positive TTL).
+	mutateAndCheckPersistent := func(label string, fn func() error) {
 		t.Helper()
 		if err := fn(); err != nil {
 			t.Fatalf("%s: %v", label, err)
@@ -556,38 +549,216 @@ func TestIntegrationAtomicTTLCoversDeadlineAndRefreshes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: pttl: %v", label, err)
 		}
-		if d <= 0 {
-			t.Fatalf("%s: key has no TTL (pttl=%s)", label, d)
+		if d != -1 {
+			t.Fatalf("%s: PTTL = %s, want -1 (persistent while recoverable)", label, d)
 		}
 	}
-	mutateAndCheck("finishFailure", func() error {
+	mutateAndCheckPersistent("finishFailure", func() error {
 		_, err := store.finishFailure(ctx, stream, group, msgID, "fn/h", claim, time.Minute, time.Now())
 		return err
 	})
-	mutateAndCheck("markComplete", func() error {
+	mutateAndCheckPersistent("markComplete", func() error {
 		_, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim)
 		return err
 	})
-	mutateAndCheck("markExhausted", func() error {
+	mutateAndCheckPersistent("markExhausted", func() error {
 		_, err := store.markExhausted(ctx, stream, group, msgID, "fn/ex", claim)
 		return err
 	})
-	mutateAndCheck("markExhaustedDLQ", func() error {
+	mutateAndCheckPersistent("markExhaustedDLQ", func() error {
 		_, err := store.markExhaustedDLQ(ctx, stream, group, msgID, "fn/ex", claim)
 		return err
 	})
-	mutateAndCheck("claimClassification", func() error {
+	mutateAndCheckPersistent("claimClassification", func() error {
 		_, err := store.claimClassification(ctx, stream, group, msgID)
 		return err
 	})
-	mutateAndCheck("recordTrace", func() error {
+	mutateAndCheckPersistent("recordTrace", func() error {
 		return store.recordTrace(ctx, stream, group, msgID, "fn/h", "00-trace-span-01")
 	})
 }
 
+// TestIntegrationAtomicRetainTerminalPinsTTLAndGuardsStaleWrites pins the
+// terminal-retention contract: once the message left the PEL, retainTerminal
+// writes the reserved terminal marker and applies the retention TTL in one step;
+// it is monotonic (a second call does not re-extend the TTL); and once retained,
+// a stale in-memory transition can neither mutate the retained state nor remove
+// the TTL (which would resurrect an unrecoverable hash).
+func TestIntegrationAtomicRetainTerminalPinsTTLAndGuardsStaleWrites(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	now := time.Now()
+	started, claim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(time.Hour))
+	if err != nil || !started {
+		t.Fatalf("tryStart = (%v,%+v,%v)", started, claim, err)
+	}
+	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim); err != nil || !ok {
+		t.Fatalf("markComplete = (%v,%v)", ok, err)
+	}
+
+	// Retain: the marker is present and the retention TTL is applied.
+	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if v, err := cli.HGet(ctx, key, terminalField).Result(); err != nil || v != "1" {
+		t.Fatalf("terminal field = %q (err %v), want \"1\"", v, err)
+	}
+	ttl, err := cli.PTTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("pttl after retain: %v", err)
+	}
+	if ttl <= 0 || ttl > invocationRetentionTTL {
+		t.Fatalf("retention PTTL = %s, want (0, %s]", ttl, invocationRetentionTTL)
+	}
+
+	// Monotonic: a second retain must NOT re-extend the TTL. Sleep enough to
+	// distinguish the two, then confirm the deadline moved no later.
+	before := time.Now().Add(ttl)
+	time.Sleep(300 * time.Millisecond)
+	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("second retainTerminal: %v", err)
+	}
+	ttl2, err := cli.PTTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("pttl after second retain: %v", err)
+	}
+	after := time.Now().Add(ttl2)
+	if after.After(before.Add(50 * time.Millisecond)) {
+		t.Fatalf("second retain extended the deadline: %v -> %v", before, after)
+	}
+
+	// A stale in-memory delivery's transitions are inert: none may mutate the
+	// retained state or remove the TTL.
+	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim); err != nil || ok {
+		t.Fatalf("markComplete after retain = (%v,%v), want (false,nil)", ok, err)
+	}
+	if ok, err := store.finishFailure(ctx, stream, group, msgID, "fn/h", claim, time.Minute, time.Now()); err != nil || ok {
+		t.Fatalf("finishFailure after retain = (%v,%v), want (false,nil)", ok, err)
+	}
+	if ok, err := store.markExhausted(ctx, stream, group, msgID, "fn/h", claim); err != nil || ok {
+		t.Fatalf("markExhausted after retain = (%v,%v), want (false,nil)", ok, err)
+	}
+	if _, err := store.claimClassification(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("claimClassification after retain: %v", err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d <= 0 {
+		t.Fatalf("PTTL after stale writes = %s (err %v), want a positive retention TTL", d, err)
+	}
+	// tryStart must not re-open a terminal-retained hash.
+	if s, _, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", time.Now(), time.Now().Add(time.Hour)); err != nil || s {
+		t.Fatalf("tryStart after retain = (%v,%v), want (false,nil)", s, err)
+	}
+	if v, err := cli.HGet(ctx, key, "fn/h").Result(); err != nil || v != "ok" {
+		t.Fatalf("marker after stale writes = %q (err %v), want ok", v, err)
+	}
+}
+
+// TestIntegrationAtomicRetentionTTLExpiresHash proves the terminal retention
+// mechanism's expiry path, not just its setup: the retain script applies the TTL
+// it is handed and Redis removes the hash once that TTL elapses. Production
+// hands the script invocationRetentionTTL, which is far too long to wait out in
+// a test, so this runs the SAME script with a short test TTL on a unique key and
+// polls until the key is gone. The configured production window is still pinned
+// here (and by TestRetentionTTLMillis), so a shortened production TTL cannot hide
+// behind the test TTL.
+func TestIntegrationAtomicRetentionTTLExpiresHash(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	if got := retentionTTLMillis(); got != int64(invocationRetentionTTL/time.Millisecond) || invocationRetentionTTL <= 0 {
+		t.Fatalf("production retention TTL = %dms (const %s), want %dms positive",
+			got, invocationRetentionTTL, int64(invocationRetentionTTL/time.Millisecond))
+	}
+
+	// Seed the hash as a real delivery would leave it, so expiry proves the TTL
+	// removes genuine state rather than an empty key.
+	now := time.Now()
+	if started, _, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(time.Hour)); err != nil || !started {
+		t.Fatalf("tryStart = (%v,%v)", started, err)
+	}
+
+	// Run the same script production uses, with a short test TTL.
+	const testTTL = 100 * time.Millisecond
+	if _, err := retainTerminalScript.Run(ctx, cli, []string{key}, terminalField, testTTL.Milliseconds()).Int64(); err != nil {
+		t.Fatalf("retainTerminalScript: %v", err)
+	}
+	if v, err := cli.HGet(ctx, key, terminalField).Result(); err != nil || v != "1" {
+		t.Fatalf("terminal field = %q (err %v), want \"1\"", v, err)
+	}
+	ttl, err := cli.PTTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("pttl after retain: %v", err)
+	}
+	if ttl <= 0 || ttl > testTTL {
+		t.Fatalf("retention PTTL = %s, want (0, %s]", ttl, testTTL)
+	}
+
+	// Poll until Redis expires the hash. No fixed sleep: the assertion is the
+	// expiry itself, bounded by a generous budget.
+	testutil.WaitFor(t, 5*time.Second, "terminal-retained hash to expire via its TTL", func() bool {
+		n, err := cli.Exists(ctx, key).Result()
+		return err == nil && n == 0
+	})
+}
+
+// TestIntegrationAtomicMakeRecoverableMigratesLegacyTTL pins the migration path:
+// a hash written with a legacy TTL (as a pre-persistence Relay would) becomes
+// persistent when makeRecoverable runs at the start of a delivery, but an
+// already terminal-retained hash is left untouched (its retention TTL is never
+// removed).
+func TestIntegrationAtomicMakeRecoverableMigratesLegacyTTL(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	// Seed a running marker with a legacy TTL, as an old Relay would.
+	if err := cli.HSet(ctx, key, "fn/h", runningValue(time.Now().Add(time.Hour), InvocationClaim{Attempt: 1, Token: "aabbccdd"})).Err(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := cli.PExpire(ctx, key, time.Hour).Err(); err != nil {
+		t.Fatalf("pexpire: %v", err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d <= 0 {
+		t.Fatalf("seeded PTTL = %s (err %v), want a positive legacy TTL", d, err)
+	}
+
+	if err := store.makeRecoverable(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("makeRecoverable: %v", err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("PTTL after makeRecoverable = %s (err %v), want -1 (persistent)", d, err)
+	}
+
+	// Retain, then assert makeRecoverable never removes terminal retention.
+	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if err := store.makeRecoverable(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("makeRecoverable after retain: %v", err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d <= 0 {
+		t.Fatalf("PTTL after makeRecoverable on a terminal hash = %s (err %v), want retention TTL preserved", d, err)
+	}
+
+	// A missing key is a no-op.
+	if err := cli.Del(ctx, key).Err(); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if err := store.makeRecoverable(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("makeRecoverable on a missing key: %v", err)
+	}
+}
+
 // TestIntegrationAtomicCrashReclaimAfterDeadline pins crash recovery: a running
-// marker that is never renewed simply expires at its deadline, after which a
-// reclaim starts the next attempt with a fresh token. There is no permanent lock.
+// marker that is never renewed does not expire out of Redis (its hash is
+// persistent), but its deadline simply elapses, after which a reclaim starts the
+// next attempt with a fresh token. There is no permanent lock.
 func TestIntegrationAtomicCrashReclaimAfterDeadline(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	store, stream, group, msgID := atomicStateStore(t, cli)
@@ -597,15 +768,15 @@ func TestIntegrationAtomicCrashReclaimAfterDeadline(t *testing.T) {
 	// A crashed attempt 1 whose deadline is 300ms out.
 	deadline := now.Add(300 * time.Millisecond)
 	seedMarker(t, cli, stream, group, msgID, "fn/h", runningValue(deadline, InvocationClaim{Attempt: 1, Token: "aabbccdd"}))
-	// Before expiry the marker protects.
+	// Before the deadline elapses the marker protects.
 	if s, c, w, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(time.Hour)); err != nil || s || c.Attempt != 1 || w <= 0 {
-		t.Fatalf("pre-expiry claim = (%v,%+v,%s,%v), want protected", s, c, w, err)
+		t.Fatalf("pre-deadline claim = (%v,%+v,%s,%v), want protected", s, c, w, err)
 	}
 	// At/after the deadline the reclaim starts attempt 2 with a fresh token.
 	after := deadline.Add(time.Millisecond)
 	s, claim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", after, after.Add(time.Hour))
 	if err != nil || !s || claim.Attempt != 2 {
-		t.Fatalf("post-expiry reclaim = (%v,%+v,%v), want (true, attempt 2, nil)", s, claim, err)
+		t.Fatalf("post-deadline reclaim = (%v,%+v,%v), want (true, attempt 2, nil)", s, claim, err)
 	}
 	if claim.Token == "aabbccdd" {
 		t.Fatalf("reclaim token reused the crashed claim's token %q", claim.Token)

@@ -47,12 +47,15 @@
 //     attempt is protected, "next_attempt_at:<deadline_ms>:<attempt>:<token>"
 //     while a failed attempt waits out its retry backoff, "exhausted:<attempt>:<token>"
 //     when terminal, or "exhausted:<attempt>:<token>:dlq" when terminal AND its
-//     DLQ entry is persisted; TTL'd; stream/group names are percent-encoded in
-//     the key) so a redelivered message skips handlers that already completed,
-//     are still within an active attempt deadline or retry backoff, or are
-//     exhausted; the message is acknowledged when all matching invocations are
-//     complete, and the invocation state key is eagerly cleared on completion or
-//     DLQ
+//     DLQ entry is persisted; stream/group names are percent-encoded in the key)
+//     so a redelivered message skips handlers that already completed, are still
+//     within an active attempt deadline or retry backoff, or are exhausted; the
+//     message is acknowledged when all matching invocations are complete.
+//     While the message is recoverable the key is PERSISTENT (no TTL); only
+//     after a successful ACK (success, obsolete schedule, or DLQ) does the state
+//     switch to terminal retention (a reserved marker plus the ~7-day
+//     invocationRetentionTTL) so a stale in-memory delivery can neither mutate
+//     nor resurrect it
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and
@@ -89,17 +92,19 @@
 // a message already routed to the DLQ). `handler_attempts` is the runner's
 // persisted attempt count (incremented only on a CONFIRMED TryStart claim),
 // distinct from the Redis stream delivery count. The trace lineage is a sibling
-// hash field (never part of the lifecycle value). Every mutation refreshes the
-// hash TTL atomically, and an active marker's TTL is at least
-// (deadline-now)+invocationSafetyMargin (and never less than the normal TTL), so
-// a key can never expire before its protected deadline — a reclaim therefore
-// always observes the just-expired marker and carries its attempt forward
-// instead of resetting the attempt count. A running marker that is not renewed
-// (a crash) simply expires at its deadline: reclaim then starts attempt n+1 with
-// a fresh token, so there is no permanent lock. Race ordering is defined by
-// Redis's single-threaded script execution: among simultaneous claims exactly
-// one sees the absent/expired marker and starts, and every later claim observes
-// the new marker.
+// hash field (never part of the lifecycle value). While the message is
+// recoverable (still in the PEL) every mutation keeps the hash PERSISTENT — no
+// TTL — so a reclaim always observes the marker and carries its attempt forward
+// instead of resetting the attempt count, no matter how long the message sat
+// pending. Only after a successful ACK does the state switch to terminal
+// retention (a reserved marker plus the ~7-day invocationRetentionTTL). A
+// running marker that is not renewed (a crash) does not expire out of Redis —
+// the persistent hash keeps it — but its deadline simply elapses, after which
+// TryStart treats the marker as eligible: reclaim then starts attempt n+1 with a
+// fresh token, so there is no permanent lock. Race ordering is defined by Redis's
+// single-threaded script execution: among simultaneous claims exactly one sees
+// the absent marker or a deadline that has elapsed and starts, and every later
+// claim observes the new marker.
 //
 // A Redis/transport error on TryStart is NOT failed open: the claim outcome is
 // unknown, so the runner leaves the message pending and does not execute the
@@ -118,11 +123,14 @@
 //     could ack a message another replica is still processing
 //   - Invocation state is at-least-once, not exactly-once: a crash between a
 //     handler's side effect and its MarkComplete re-runs the handler, so handlers
-//     must remain idempotent. Other state read/mark/clear failures are logged and
-//     fail open (re-run) rather than becoming a new failure source. The one
-//     exception is TryStart: an ambiguous claim (Redis/transport error) is NOT
-//     failed open — the message is left pending and the handler is not executed,
-//     because running a duplicate could race a replica that won the same claim.
+//     must remain idempotent. State read/mark/retain failures are logged and
+//     fail open (re-run) rather than becoming a new failure source; a retention
+//     failure leaves the hash persistent (a leak) rather than losing it. Two
+//     exceptions fail closed and leave the message pending (no handler run, no
+//     ACK): an ambiguous TryStart claim (Redis/transport error), because running
+//     a duplicate could race a replica that won the same claim, and a
+//     makeRecoverable failure, because a legacy-TTL hash that could not be made
+//     persistent may expire mid-delivery, so the state cannot be relied on.
 //   - A pending entry whose stream body no longer exists is data loss, not a
 //     success: it is counted as missing_payload_total, never run through a
 //     handler, and never turned into a fabricated payload or DLQ entry.

@@ -35,11 +35,33 @@ func activeToken(v string) string {
 // It exists so the consumer's invocation-state seam (newConsumer) and the
 // InvocationState wrapper can be exercised without Redis; the Redis-backed store
 // itself is covered by the integration suite. It models the per-claim
-// (attempt + token) compare-and-set identity, generating unique tokens.
+// (attempt + token) compare-and-set identity, generating unique tokens, and the
+// message-level terminal-retention marker (terminalField) that makes every
+// lifecycle transition inert once the message left the PEL.
 type fakeInvocationStore struct {
 	fields   map[string]string
 	readErr  error // when set, every read fails (fail-open paths)
 	tokenSeq int
+	// retained tracks the message-level terminal-retention state. It mirrors the
+	// reserved terminalField being present in fields; a separate bool keeps the
+	// "repeated retain is monotonic" assertion easy.
+	retained bool
+	// retainCalls counts retainTerminal invocations, so tests can assert the
+	// post-ACK retention ran exactly once per message.
+	retainCalls int
+	// recoverableCalls counts makeRecoverable invocations for non-terminal
+	// hashes, so tests can assert the legacy-TTL migration ran.
+	recoverableCalls int
+	// recoverableErr, when set, makes makeRecoverable fail like an unreachable
+	// Redis: the delivery must then leave the message pending (no handler, no
+	// ACK/DLQ) because the state hash may still carry its old TTL.
+	recoverableErr error
+}
+
+// terminalRetained reports whether the message-level terminal marker is present,
+// mirroring the scripts' HEXISTS guard.
+func (f *fakeInvocationStore) terminalRetained() bool {
+	return f.retained
 }
 
 func newFakeInvocationStore(values map[string]string) *fakeInvocationStore {
@@ -50,11 +72,13 @@ func newFakeInvocationStore(values map[string]string) *fakeInvocationStore {
 	return &fakeInvocationStore{fields: m}
 }
 
-// nextToken returns a fresh unique token, mirroring the crypto-random claim
-// token an EVAL would be supplied with.
+// nextToken returns a fresh unique token, mirroring the crypto-random hex claim
+// token an EVAL would be supplied with. It is lowercase hex (not an arbitrary
+// string) so it round-trips through activeToken/parseInvocationState exactly like
+// a real token; a non-hex token would make every CAS parse fail.
 func (f *fakeInvocationStore) nextToken() string {
 	f.tokenSeq++
-	return fmt.Sprintf("tok-%d", f.tokenSeq)
+	return fmt.Sprintf("aabb%04d", f.tokenSeq)
 }
 
 func (f *fakeInvocationStore) completed(_ context.Context, _, _, _, invocation string) (bool, error) {
@@ -79,6 +103,9 @@ func (f *fakeInvocationStore) terminal(_ context.Context, _, _, _, invocation st
 // against the current active marker, treats an already-"ok" marker as an
 // idempotent success, and preserves an exhausted marker.
 func (f *fakeInvocationStore) markComplete(_ context.Context, _, _, _, invocation string, claim InvocationClaim) (bool, error) {
+	if f.terminalRetained() {
+		return false, nil
+	}
 	v, ok := f.fields[invocation]
 	if !ok {
 		return false, nil
@@ -105,6 +132,9 @@ func (f *fakeInvocationStore) tryStart(
 	if f.readErr != nil {
 		return false, InvocationClaim{}, 0, f.readErr
 	}
+	if f.terminalRetained() {
+		return false, InvocationClaim{}, 0, nil
+	}
 	attempt := 0
 	if v, ok := f.fields[invocation]; ok {
 		kind, dl, n, parsed := parseInvocationState(v)
@@ -118,7 +148,7 @@ func (f *fakeInvocationStore) tryStart(
 				if now.Before(dl) {
 					return false, InvocationClaim{Attempt: n}, dl.Sub(now), nil
 				}
-				attempt = n // expired: eligible, carry the attempt forward
+				attempt = n // deadline elapsed: eligible, carry the attempt forward
 			}
 		}
 	}
@@ -138,6 +168,9 @@ func (f *fakeInvocationStore) finishFailure(
 ) (bool, error) {
 	if f.readErr != nil {
 		return false, f.readErr
+	}
+	if f.terminalRetained() {
+		return false, nil
 	}
 	v := f.fields[invocation]
 	kind, _, active, ok := parseInvocationState(v)
@@ -163,6 +196,9 @@ func (f *fakeInvocationStore) markExhausted(_ context.Context, _, _, _, invocati
 // writeExhausted models markExhaustedScript: it CASes the claim against the
 // current active marker and writes "exhausted:<attempt>:<token>".
 func (f *fakeInvocationStore) writeExhausted(invocation string, claim InvocationClaim) bool {
+	if f.terminalRetained() {
+		return false
+	}
 	v, ok := f.fields[invocation]
 	if !ok {
 		return false
@@ -182,6 +218,9 @@ func (f *fakeInvocationStore) writeExhausted(invocation string, claim Invocation
 // exhausted marker to the ":dlq" form only when its retained identity matches
 // the exhausted claim; an existing ":dlq" is monotonic.
 func (f *fakeInvocationStore) markExhaustedDLQ(_ context.Context, _, _, _, invocation string, claim InvocationClaim) (bool, error) {
+	if f.terminalRetained() {
+		return false, nil
+	}
 	v, ok := f.fields[invocation]
 	if !ok {
 		return false, nil
@@ -210,10 +249,15 @@ func (f *fakeInvocationStore) exhaustedState(_ context.Context, _, _, _, invocat
 
 // claimClassification models the Redis HSETNX claim: the first call sets the
 // reserved field and returns true; every later call returns false. A read error
-// is surfaced so the fail-closed classification path is exercisable.
+// is surfaced so the fail-closed classification path is exercisable. Once the
+// hash is terminal-retained the claim always reports "already taken" (mirroring
+// the script's HEXISTS guard), so a stale in-memory delivery cannot re-count.
 func (f *fakeInvocationStore) claimClassification(_ context.Context, _, _, _ string) (bool, error) {
 	if f.readErr != nil {
 		return false, f.readErr
+	}
+	if f.terminalRetained() {
+		return false, nil
 	}
 	if _, ok := f.fields[classificationField]; ok {
 		return false, nil
@@ -225,7 +269,8 @@ func (f *fakeInvocationStore) claimClassification(_ context.Context, _, _, _ str
 // traceReference/recordTrace model the reserved sibling trace field: recording
 // never disturbs the invocation's lifecycle value, and reading an absent field
 // is ("", nil). A read error is surfaced so the best-effort no-link path is
-// exercisable.
+// exercisable. A terminal-retained hash ignores records (mirroring the script's
+// HEXISTS guard).
 func (f *fakeInvocationStore) traceReference(_ context.Context, _, _, _, invocation string) (string, error) {
 	if f.readErr != nil {
 		return "", f.readErr
@@ -234,15 +279,40 @@ func (f *fakeInvocationStore) traceReference(_ context.Context, _, _, _, invocat
 }
 
 func (f *fakeInvocationStore) recordTrace(_ context.Context, _, _, _, invocation, lineage string) error {
-	if lineage == "" {
+	if lineage == "" || f.terminalRetained() {
 		return nil
 	}
 	f.fields[traceField(invocation)] = lineage
 	return nil
 }
 
-func (f *fakeInvocationStore) clear(_ context.Context, _, _, _ string) error {
-	f.fields = map[string]string{}
+// retainTerminal models retainTerminalScript: the message-level terminal marker
+// is set (monotonically) and the message is considered no longer recoverable.
+// Repeated calls are no-ops; a hash that never existed is not created.
+func (f *fakeInvocationStore) retainTerminal(_ context.Context, _, _, _ string) error {
+	if len(f.fields) == 0 && !f.retained {
+		// No hash to retain (mirrors the script's EXISTS guard).
+		return nil
+	}
+	f.retainCalls++
+	f.retained = true
+	return nil
+}
+
+// makeRecoverable models makeRecoverableScript: it marks a pre-existing,
+// non-terminal hash recoverable. The in-memory fake does not model TTLs, so it
+// only records that the migration was requested; it never clears terminal
+// retention. It is a no-op for a missing hash. When recoverableErr is set it
+// fails like an unreachable Redis, so the caller's fail-closed path (leave the
+// message pending, do not dispatch) can be exercised.
+func (f *fakeInvocationStore) makeRecoverable(_ context.Context, _, _, _ string) error {
+	if f.recoverableErr != nil {
+		return f.recoverableErr
+	}
+	if len(f.fields) == 0 || f.retained {
+		return nil
+	}
+	f.recoverableCalls++
 	return nil
 }
 
@@ -261,8 +331,8 @@ func consumerForStore(t *testing.T, store invocationStateStore) InvocationState 
 // eligibility matrix through the consumer's invocation-state seam: a complete or
 // exhausted field is terminal (started=false, wait=0), an in-flight running or
 // next_attempt_at marker is protected until its deadline (started=false,
-// wait>0), and an absent, expired, or unparseable field is eligible
-// (started=true).
+// wait>0), and an absent marker, one whose deadline has elapsed, or an
+// unparseable field is eligible (started=true).
 func TestInvocationTryStartEligibilityMatrix(t *testing.T) {
 	// The eligibility decisions below use the real clock (NewInvocationState
 	// defaults now to time.Now), so deadlines are computed from time.Now.
@@ -342,16 +412,16 @@ func TestInvocationTryStartEligibilityMatrix(t *testing.T) {
 	})
 }
 
-// TestInvocationTryStartExpiredMarkerIsEligible pins the expired half of the
+// TestInvocationTryStartElapsedDeadlineIsEligible pins the eligible half of the
 // matrix: a running/next_attempt_at marker whose deadline has passed is eligible,
-// and the new attempt carries the expired attempt count forward (n+1).
-func TestInvocationTryStartExpiredMarkerIsEligible(t *testing.T) {
+// and the new attempt carries the elapsed marker's attempt count forward (n+1).
+func TestInvocationTryStartElapsedDeadlineIsEligible(t *testing.T) {
 	now := time.Now()
 	// A deadline well in the past.
-	expired := now.Add(-time.Hour)
+	elapsed := now.Add(-time.Hour)
 	for name, field := range map[string]string{
-		"running":         runningValue(expired, InvocationClaim{Attempt: 2, Token: "ab"}),
-		"next_attempt_at": nextAttemptValue(expired, InvocationClaim{Attempt: 4, Token: "cd"}),
+		"running":         runningValue(elapsed, InvocationClaim{Attempt: 2, Token: "ab"}),
+		"next_attempt_at": nextAttemptValue(elapsed, InvocationClaim{Attempt: 4, Token: "cd"}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := newFakeInvocationStore(map[string]string{"fn/h": field})
@@ -361,18 +431,18 @@ func TestInvocationTryStartExpiredMarkerIsEligible(t *testing.T) {
 				t.Fatalf("TryStart error = %v, want nil", err)
 			}
 			if !started {
-				t.Fatal("started = false for an expired marker, want true (eligible)")
+				t.Fatal("started = false for a marker past its deadline, want true (eligible)")
 			}
 			if wait != 0 {
 				t.Fatalf("wait = %s, want 0 for a started invocation", wait)
 			}
-			// The expired attempt count (2 or 4) advances to n+1.
+			// The elapsed marker's attempt count (2 or 4) advances to n+1.
 			wantAttempt := 3
 			if name == "next_attempt_at" {
 				wantAttempt = 5
 			}
 			if claim.Attempt != wantAttempt {
-				t.Fatalf("attempt = %d, want %d (carried from the expired marker)", claim.Attempt, wantAttempt)
+				t.Fatalf("attempt = %d, want %d (carried from the elapsed marker)", claim.Attempt, wantAttempt)
 			}
 		})
 	}
@@ -562,5 +632,133 @@ func TestInvocationClaimClassificationFailsClosed(t *testing.T) {
 	}
 	if claimed {
 		t.Fatal("ClaimClassification on store error = true, want false")
+	}
+}
+
+// TestInvocationTerminalRetentionGuardsStaleWrites pins the message-level
+// terminal-retention guard end to end through the store seam: once the message
+// left the PEL and was retained, a stale in-memory delivery's transitions are all
+// inert, so retained state can neither be mutated nor re-counted.
+func TestInvocationTerminalRetentionGuardsStaleWrites(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeInvocationStore(nil)
+	p := consumerForStore(t, store)
+
+	started, claim, _, err := p.TryStart("fn/h", time.Hour)
+	if err != nil || !started {
+		t.Fatalf("TryStart = (%v,%+v,%v)", started, claim, err)
+	}
+	if !p.MarkComplete("fn/h", claim) {
+		t.Fatal("MarkComplete = false, want true")
+	}
+	if store.fields["fn/h"] != "ok" {
+		t.Fatalf("marker = %q, want ok", store.fields["fn/h"])
+	}
+
+	// The message leaves the PEL: retain.
+	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if !store.terminalRetained() {
+		t.Fatal("store not marked terminal-retained after retain")
+	}
+
+	// Every stale transition is now inert: no mutation, no counter change.
+	if s, _, _, err := p.TryStart("fn/h", time.Hour); err != nil || s {
+		t.Fatalf("TryStart after retain = (%v,%v), want (false,nil)", s, err)
+	}
+	if p.MarkComplete("fn/h", claim) {
+		t.Fatal("MarkComplete after retain = true, want false")
+	}
+	if p.RecordFailure("fn/h", claim, time.Minute) {
+		t.Fatal("RecordFailure after retain = true, want false")
+	}
+	if p.MarkExhausted("fn/h", claim) {
+		t.Fatal("MarkExhausted after retain = true, want false")
+	}
+	if got := store.fields["fn/h"]; got != "ok" {
+		t.Fatalf("marker changed by a stale transition: %q, want ok", got)
+	}
+
+	// Classification cannot be re-claimed once retained (would double-count).
+	if claimed, err := p.ClaimClassification(); err != nil || claimed {
+		t.Fatalf("ClaimClassification after retain = (%v,%v), want (false,nil)", claimed, err)
+	}
+	// Trace recording is likewise inert once retained.
+	p.RecordTrace("fn/h", "00-trace-span-01")
+	if got := store.fields[traceField("fn/h")]; got != "" {
+		t.Fatalf("trace recorded on a terminal-retained hash: %q", got)
+	}
+}
+
+// TestInvocationRetentionIsMonotonicAndNoopWhenAbsent pins the retention
+// contract through the store seam: retaining an absent hash is a no-op (no empty
+// key is created), and a repeated retain is monotonic — it does not clear the
+// terminal marker or otherwise change state.
+func TestInvocationRetentionIsMonotonicAndNoopWhenAbsent(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeInvocationStore{fields: map[string]string{}}
+
+	// Absent hash: no-op.
+	if err := store.retainTerminal(ctx, "s", "g", "missing"); err != nil {
+		t.Fatalf("retainTerminal(absent): %v", err)
+	}
+	if store.terminalRetained() {
+		t.Fatal("retainTerminal created retention for an absent hash")
+	}
+
+	// Present hash: retain, then a second retain keeps it retained.
+	store.fields["fn/h"] = "ok"
+	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("second retainTerminal: %v", err)
+	}
+	if !store.terminalRetained() {
+		t.Fatal("terminal retention was cleared by a repeated retain")
+	}
+	if got := store.retainCalls; got != 2 {
+		t.Fatalf("retainCalls = %d, want 2", got)
+	}
+}
+
+// TestInvocationMakeRecoverableMigratesNonTerminalOnly pins the legacy-TTL
+// migration seam: makeRecoverable is a no-op for an absent hash and for an
+// already terminal-retained hash (it must never remove terminal retention), and
+// it records a migration for a live, non-terminal hash.
+func TestInvocationMakeRecoverableMigratesNonTerminalOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeInvocationStore(nil)
+
+	// Absent: no-op.
+	if err := store.makeRecoverable(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("makeRecoverable(absent): %v", err)
+	}
+	if store.recoverableCalls != 0 {
+		t.Fatalf("recoverableCalls = %d for an absent hash, want 0", store.recoverableCalls)
+	}
+
+	// Live, non-terminal hash: migrated.
+	store.fields["fn/h"] = "ok"
+	if err := store.makeRecoverable(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("makeRecoverable: %v", err)
+	}
+	if store.recoverableCalls != 1 {
+		t.Fatalf("recoverableCalls = %d, want 1", store.recoverableCalls)
+	}
+
+	// Terminal-retained: never migrated again.
+	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if err := store.makeRecoverable(ctx, "s", "g", "m-0"); err != nil {
+		t.Fatalf("makeRecoverable(retained): %v", err)
+	}
+	if store.recoverableCalls != 1 {
+		t.Fatalf("recoverableCalls = %d after a retained hash, want 1 (never migrated)", store.recoverableCalls)
+	}
+	if !store.terminalRetained() {
+		t.Fatal("makeRecoverable cleared terminal retention")
 	}
 }

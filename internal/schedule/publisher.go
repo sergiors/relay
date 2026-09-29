@@ -19,7 +19,7 @@ import (
 // publication. It is far longer than any realistic scheduling/recovery window
 // (reclaim cadence is ~1m; invocation state TTL is 7 days), so a dedup key
 // outlives the window during which a redelivery could re-evaluate the same tick.
-// It is an internal constant, not env-configurable, matching invocationStateTTL.
+// It is an internal constant, not env-configurable, matching invocationRetentionTTL.
 const occurrenceTTL = 7 * 24 * time.Hour
 
 // dedupKey returns the Redis key holding one occurrence's publish-once marker:

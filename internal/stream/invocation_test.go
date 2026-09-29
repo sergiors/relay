@@ -177,32 +177,15 @@ func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
 	}
 }
 
-// TestActiveTTL pins the TTL floor: an active marker's key TTL is the larger of
-// the normal terminal TTL and (deadline-now)+safety margin, so a key can never
-// expire before its protected deadline (which would reset the attempt count).
-func TestActiveTTL(t *testing.T) {
-	now := time.UnixMilli(1757000000000)
-
-	// A short deadline is dominated by the normal TTL.
-	if got := activeTTL(now, now.Add(time.Minute)); got != invocationStateTTL {
-		t.Fatalf("activeTTL(short deadline) = %s, want the normal TTL %s", got, invocationStateTTL)
+// TestRetentionTTLMillis pins the terminal retention TTL conversion: the
+// retention window is expressed in integer milliseconds for the PEXPIRE the
+// retain script applies after a message leaves the PEL.
+func TestRetentionTTLMillis(t *testing.T) {
+	if got := retentionTTLMillis(); got != int64(invocationRetentionTTL/time.Millisecond) {
+		t.Fatalf("retentionTTLMillis() = %d, want %d", got, int64(invocationRetentionTTL/time.Millisecond))
 	}
-
-	// A deadline beyond the normal TTL yields deadline+margin, strictly greater
-	// than the deadline itself.
-	deadline := now.Add(invocationStateTTL + 48*time.Hour)
-	got := activeTTL(now, deadline)
-	want := deadline.Sub(now) + invocationSafetyMargin
-	if got != want {
-		t.Fatalf("activeTTL(long deadline) = %s, want %s", got, want)
-	}
-	if got <= deadline.Sub(now) {
-		t.Fatalf("activeTTL = %s, must exceed the protected window %s", got, deadline.Sub(now))
-	}
-
-	// A past deadline clamps to the normal TTL (never negative).
-	if got := activeTTL(now, now.Add(-time.Hour)); got != invocationStateTTL {
-		t.Fatalf("activeTTL(past deadline) = %s, want %s", got, invocationStateTTL)
+	if invocationRetentionTTL <= 0 {
+		t.Fatalf("invocationRetentionTTL = %s, want a positive retention window", invocationRetentionTTL)
 	}
 }
 

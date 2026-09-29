@@ -247,6 +247,23 @@ func (e *testEnv) waitGone(t *testing.T, id string) {
 	})
 }
 
+// waitRetained waits until the invocation-state key is TERMINAL-RETAINED: still
+// present, carrying the reserved terminal marker, and holding a positive
+// retention TTL. This is the post-ACK contract that replaced the old eager
+// clear: once the message left the PEL its state is kept for a bounded retention
+// window (and guarded against stale writes) instead of being deleted.
+func (e *testEnv) waitRetained(t *testing.T, key string) {
+	t.Helper()
+	testutil.WaitFor(t, 8*time.Second, "invocation state terminal-retained", func() bool {
+		v, err := e.client.HGet(context.Background(), key, terminalField).Result()
+		if err != nil || v != "1" {
+			return false
+		}
+		d, err := e.client.PTTL(context.Background(), key).Result()
+		return err == nil && d > 0
+	})
+}
+
 func TestIntegrationHandlerFailureStaysPending(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
@@ -519,11 +536,11 @@ func TestIntegrationDLQDeliveriesExceedHandlerAttempts(t *testing.T) {
 	testutil.WaitFor(t, 8*time.Second, "message reclaimed past the handler attempt count", func() bool {
 		return e.pending()[id] >= 3
 	})
-	// Expire the retry backoff by rewriting the marker with a past deadline and
+	// Put the retry backoff's deadline in the past by rewriting the marker with
 	// the persisted attempt count (1), so the next delivery carries the attempt
 	// forward and executes handler attempt 2, which exhausts.
 	if err := e.client.HSet(context.Background(), key, "fn/h", nextAttemptValue(time.Now().Add(-time.Hour), InvocationClaim{Attempt: 1, Token: "aabbccdd"})).Err(); err != nil {
-		t.Fatalf("expire retry marker: %v", err)
+		t.Fatalf("rewrite retry marker with elapsed deadline: %v", err)
 	}
 
 	testutil.WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
@@ -653,26 +670,28 @@ func TestIntegrationStateRetainedOnFailureClearedOnAck(t *testing.T) {
 	})
 
 	// The recovery loop reclaims the idle message; the handler sees the invocation
-	// already done and returns nil, so the message is acked and state cleared.
-	testutil.WaitFor(t, 8*time.Second, "message acked and invocation state cleared", func() bool {
+	// already done and returns nil, so the message is acked and its state is
+	// switched to terminal retention (never deleted).
+	testutil.WaitFor(t, 8*time.Second, "message acked", func() bool {
 		_, ok := e.pending()[id]
-		if ok {
-			return false
-		}
-		n, err := e.client.Exists(context.Background(), key).Result()
-		return err == nil && n == 0
+		return !ok
 	})
+	e.waitRetained(t, key)
 	e.stop(t)
 }
 
-func TestIntegrationStateClearedOnDLQ(t *testing.T) {
+// TestIntegrationStateRetainedOnDLQ pins that, after DLQ routing, the
+// invocation-state hash is switched to terminal retention (marker + TTL) rather
+// than deleted, so a stale in-memory delivery can neither mutate nor resurrect
+// it.
+func TestIntegrationStateRetainedOnDLQ(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
 	key := invocationStateKey(e.stream, e.group, id)
 
 	// The handler returns ErrInvocationExhausted to route the message to the
-	// DLQ. State must be cleared after the DLQ write + ACK.
+	// DLQ. Its state must be terminal-retained after the DLQ write + ACK.
 	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
 		if msgID == id {
 			if p, ok := InvocationStateFrom(ctx); ok {
@@ -688,19 +707,16 @@ func TestIntegrationStateClearedOnDLQ(t *testing.T) {
 		_, ok := e.dlq()[id]
 		return ok
 	})
-	testutil.WaitFor(t, 8*time.Second, "invocation state cleared after DLQ", func() bool {
-		n, err := e.client.Exists(context.Background(), key).Result()
-		return err == nil && n == 0
-	})
+	e.waitRetained(t, key)
 	e.stop(t)
 }
 
-// TestIntegrationProcessMessageClearsStateOnlyAfterAck drives the shared
+// TestIntegrationProcessMessageRetainsStateOnlyAfterAck drives the shared
 // processMessage path directly (no Consume loop) against a real Redis: a
 // message is XADDed and read into the group's PEL, then processMessage runs a
-// succeeding handler. The invocation-state key must be cleared only after the
-// ACK, and the message must be gone from the PEL.
-func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
+// succeeding handler. The invocation-state key must be switched to terminal
+// retention only AFTER the ACK, and the message must be gone from the PEL.
+func TestIntegrationProcessMessageRetainsStateOnlyAfterAck(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
@@ -725,7 +741,7 @@ func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
 	}
 
 	// Mark invocation state, then process with a succeeding handler: the message
-	// is acked and the invocation-state key cleared.
+	// is acked and the invocation-state key switched to terminal retention.
 	key := invocationStateKey(e.stream, e.group, id)
 	if err := e.client.HSet(context.Background(), key, "fn/h", "ok").Err(); err != nil {
 		t.Fatalf("hset invocation state: %v", err)
@@ -738,17 +754,145 @@ func TestIntegrationProcessMessageClearsStateOnlyAfterAck(t *testing.T) {
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked (gone from PEL)", id)
 	}
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
+	e.waitRetained(t, key)
+}
+
+// retainCountingStore decorates an invocationStateStore, recording how many
+// times retainTerminal is invoked while delegating every method to the wrapped
+// store. Because retainTerminal's only real effect can be observed through Redis
+// (which this test deliberately makes unreachable for the ACK), the count is
+// what proves the ordering contract directly: the failed-ACK path must never
+// even attempt terminal retention.
+type retainCountingStore struct {
+	invocationStateStore
+	retainCalls atomic.Int64
+}
+
+func (s *retainCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string) error {
+	s.retainCalls.Add(1)
+	return s.invocationStateStore.retainTerminal(ctx, stream, group, msgID)
+}
+
+// TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable pins
+// the failed-ACK half of the post-success contract against real Redis: the
+// handler's invocation-state mutations SUCCEED (TryStart then MarkComplete, the
+// completed marker the redelivery must observe), but the XACK fails, so the
+// message must stay in the PEL and its hash must remain RECOVERABLE — present,
+// still carrying the completed marker, PERSISTENT (PTTL == -1), and with NO
+// terminal marker. retainTerminal must NOT be attempted at all: it is only ever
+// called after a successful XACK, and running it here would apply the retention
+// TTL to state a redelivery still needs to skip the completed handler.
+//
+// The ACK failure is made deterministic by closing the consumer's Redis client
+// INSIDE the handler, after the state writes and before returning nil, so the
+// XAck that follows fails with redis.ErrClosed. Every post-close assertion goes
+// through a separate inspection client, because the consumer's own client is
+// closed.
+func TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable(t *testing.T) {
+	// A separate client for inspecting Redis after the consumer's client is
+	// closed. RequireRedis owns its lifecycle (closed last, after this test's
+	// cleanup), so it stays usable for the assertions.
+	inspect := testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	// Observe retainTerminal attempts directly: the closed client means a
+	// (buggy) retain attempt could not have any Redis effect, so the call count
+	// is the assertion that survives the outage.
+	store := &retainCountingStore{invocationStateStore: e.consumer.invStateStore}
+	e.consumer.invStateStore = store
+
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+	// newEnv's cleanup deletes the stream and invocation keys through the
+	// consumer's client, which this test closes; delete them through the live
+	// inspection client instead. Registered after newEnv so it runs first (LIFO),
+	// while `inspect` is still open.
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_ = inspect.Del(ctx, key, e.stream, e.consumer.dlqStream).Err()
+	})
+
+	// Read the message into the group's PEL so XAck has an entry to remove.
+	msg := e.readOneIntoPEL(t)
+	if msg.ID != id {
+		t.Fatalf("read message %s, want %s", msg.ID, id)
+	}
+
+	// The handler mirrors the runner's success path: it claims the invocation and
+	// marks it complete (persisting "ok"), then closes the consumer's client so
+	// the subsequent XAck cannot run, and returns nil (success).
+	closeErr := make(chan error, 1)
+	e.consumer.processMessage(context.Background(), msg, 1,
+		func(ctx context.Context, msgID string, ev map[string]any) error {
+			p, ok := InvocationStateFrom(ctx)
+			if !ok {
+				t.Errorf("no invocation state in ctx")
+				return fmt.Errorf("no invocation state in ctx")
+			}
+			started, claim, _, err := p.TryStart("fn/h", time.Hour)
+			if err != nil || !started {
+				t.Errorf("TryStart = (%v,%v), want a started claim", started, err)
+				return fmt.Errorf("TryStart failed: %w", err)
+			}
+			if !p.MarkComplete("fn/h", claim) {
+				t.Errorf("MarkComplete = false, want true")
+				return fmt.Errorf("MarkComplete refused")
+			}
+			// Deterministic ACK failure: the state writes above already succeeded,
+			// so closing the client here only breaks the XACK that follows.
+			closeErr <- e.client.Close()
+			return nil
+		})
+	if err := <-closeErr; err != nil {
+		t.Fatalf("close consumer client in handler: %v", err)
+	}
+
+	// The failed-ACK path must not even attempt terminal retention.
+	if got := store.retainCalls.Load(); got != 0 {
+		t.Fatalf("retainTerminal attempted %d times after a failed XACK; want 0", got)
+	}
+
+	// The XACK failed, so the message must still be pending. No Consume loop runs
+	// in this test, so nothing else can ack or redeliver it.
+	entries, err := inspect.XPendingExt(context.Background(), &redis.XPendingExtArgs{
+		Stream: e.stream, Group: e.group, Start: "-", End: "+", Count: 100,
+	}).Result()
+	if err != nil {
+		t.Fatalf("xpending after XACK failure: %v", err)
+	}
+	pending := false
+	for _, pe := range entries {
+		if pe.ID == id {
+			pending = true
+		}
+	}
+	if !pending {
+		t.Fatalf("message %s left the PEL despite the failed XACK; want it pending", id)
+	}
+
+	// The hash must survive the failed ACK and stay RECOVERABLE: the completed
+	// marker is preserved for the redelivery, no terminal marker was written, and
+	// the key remains persistent (no TTL).
+	if n, err := inspect.Exists(context.Background(), key).Result(); err != nil || n != 1 {
+		t.Fatalf("invocation-state key must survive a failed XACK (exists=%d err=%v)", n, err)
+	}
+	if v, err := inspect.HGet(context.Background(), key, "fn/h").Result(); err != nil || v != "ok" {
+		t.Fatalf("invocation marker = %q err=%v, want %q persisted for the redelivery", v, err, "ok")
+	}
+	if ok, err := inspect.HExists(context.Background(), key, terminalField).Result(); err != nil || ok {
+		t.Fatalf("retainTerminal must NOT run after a failed XACK: terminal marker present (ok=%v err=%v)", ok, err)
+	}
+	if d, err := inspect.PTTL(context.Background(), key).Result(); err != nil || d != -1 {
+		t.Fatalf("recoverable invocation state must be persistent; pttl=%s err=%v (want -1)", d, err)
 	}
 }
 
 // TestIntegrationDLQWriteFailureLeavesPendingAndRetainsState merges the two
-// former DLQ-write-failure tests and pins the clear-ordering contract through the
-// real processMessage path: when the DLQ XADD fails (the DLQ stream name is a
+// former DLQ-write-failure tests and pins the retention-ordering contract through
+// the real processMessage path: when the DLQ XADD fails (the DLQ stream name is a
 // wrong-type key) after an exhausted invocation, the original message stays
-// pending and its invocation-state key is retained; once the DLQ write succeeds,
-// the message is acked and the invocation-state key is cleared.
+// pending and its invocation-state key remains RECOVERABLE (persistent, no TTL,
+// no terminal marker); once the DLQ write succeeds, the message is acked and the
+// key is switched to terminal retention.
 func TestIntegrationDLQWriteFailureLeavesPendingAndRetainsState(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
@@ -784,12 +928,19 @@ func TestIntegrationDLQWriteFailureLeavesPendingAndRetainsState(t *testing.T) {
 	}
 	e.consumer.processMessage(context.Background(), msg, 1, exhausted)
 
-	// DLQ write failed: message stays pending and invocation state is retained.
+	// DLQ write failed: message stays pending and invocation state stays
+	// recoverable (present, persistent, no terminal marker).
 	if _, ok := e.pending()[id]; !ok {
 		t.Fatalf("message %s must stay pending when DLQ write fails", id)
 	}
 	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 1 {
 		t.Fatalf("invocation-state key must be retained on DLQ write failure (exists=%d err=%v)", n, err)
+	}
+	if ok, err := e.client.HExists(context.Background(), key, terminalField).Result(); err != nil || ok {
+		t.Fatalf("invocation-state key must NOT be terminal-retained while pending (hexists=%v err=%v)", ok, err)
+	}
+	if d, err := e.client.PTTL(context.Background(), key).Result(); err != nil || d != -1 {
+		t.Fatalf("pending invocation state must be persistent; pttl=%s err=%v", d, err)
 	}
 
 	// Now let the DLQ write succeed: delete the wrong-type key and re-process.
@@ -798,14 +949,11 @@ func TestIntegrationDLQWriteFailureLeavesPendingAndRetainsState(t *testing.T) {
 	}
 	e.consumer.processMessage(context.Background(), msg, 1, exhausted)
 
-	// DLQ write + ACK succeeded: message gone from PEL and invocation state
-	// cleared.
+	// DLQ write + ACK succeeded: message gone from PEL and state terminal-retained.
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked after successful DLQ write", id)
 	}
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after DLQ (exists=%d err=%v)", n, err)
-	}
+	e.waitRetained(t, key)
 }
 
 // TestIntegrationReclaimMissingPayloadSurfacedAndCleared pins the recovery-time
@@ -829,6 +977,14 @@ func TestIntegrationReclaimMissingPayloadSurfacedAndCleared(t *testing.T) {
 	e.readOneIntoPEL(t)
 	if _, err := e.client.XDel(context.Background(), e.stream, id).Result(); err != nil {
 		t.Fatalf("xdel: %v", err)
+	}
+	// Seed recoverable invocation state for the soon-to-be-body-less message, so
+	// the missing-payload cleanup's terminal retention is observable: without it,
+	// a persistent (no-TTL) hash would leak forever.
+	key := invocationStateKey(e.stream, e.group, id)
+	if err := e.client.HSet(context.Background(), key, "fn/h",
+		runningValue(time.Now().Add(time.Hour), InvocationClaim{Attempt: 1, Token: "aabbccdd"})).Err(); err != nil {
+		t.Fatalf("seed invocation state: %v", err)
 	}
 	// A second, live entry so the stream is not empty and the reclaim loop has
 	// something to scan past.
@@ -866,6 +1022,9 @@ func TestIntegrationReclaimMissingPayloadSurfacedAndCleared(t *testing.T) {
 	if got := len(e.dlqFor(id)); got != 0 {
 		t.Fatalf("DLQ entries for body-less entry = %d, want 0 (never dead-lettered, never fabricated)", got)
 	}
+	// The body-less message's invocation state must not leak: once its dangling
+	// PEL reference is gone its hash is terminal-retained (marker + TTL).
+	e.waitRetained(t, key)
 }
 
 // readOneIntoPEL reads exactly one message from the env stream into the group's
@@ -993,13 +1152,11 @@ func TestIntegrationPerInvocationDLQPartialWriteResumes(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("DLQ entries = %d, want 2 (seeded fnA + resumed fnB; no duplicate)", len(entries))
 	}
-	// The message is acked and state cleared after the resumed write.
+	// The message is acked and state terminal-retained after the resumed write.
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked after the resumed write", id)
 	}
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
-	}
+	e.waitRetained(t, key)
 }
 
 // TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent pins the retry
@@ -1043,9 +1200,7 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	if _, ok := e.pending()[id]; ok {
 		t.Fatalf("message %s should be acked on the idempotent retry", id)
 	}
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
-	}
+	e.waitRetained(t, key)
 }
 
 func TestIntegrationRestartResilience(t *testing.T) {
@@ -1290,7 +1445,7 @@ func TestIntegrationPendingGauge(t *testing.T) {
 // timeout-driven eligibility model end to end: a handler that claims the
 // invocation via TryStart (persisting a running deadline) and then blocks keeps
 // the invocation protected; a redelivery that calls TryStart again within the
-// deadline is skipped (the executor is not called). After the deadline expires,
+// deadline is skipped (the executor is not called). After the deadline elapses,
 // a later delivery executes it.
 func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 	testutil.RequireRedis(t)
@@ -1346,7 +1501,7 @@ func TestIntegrationInvocationRunningUntilBlocksReexecution(t *testing.T) {
 // TestIntegrationInvocationStateSurvivesRestart verifies that a running marker
 // persisted in Redis survives a consumer restart: a new consumer on the same
 // stream/group skips the invocation while within the deadline and runs it after
-// the deadline expires.
+// the deadline elapses.
 func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	testutil.RequireRedis(t)
 	prefix := fmt.Sprintf("restart-inv-%d", time.Now().UnixNano())
@@ -1379,7 +1534,8 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	envA.stop(t)
 
 	// Consumer B (new consumer, same stream/group) reclaims the idle message.
-	// Within the deadline it must skip the invocation; after expiry it runs it.
+	// Within the deadline it must skip the invocation; after the deadline elapses
+	// it runs it.
 	envB := newEnv(t, ConsumerConfig{
 		Stream: stream, Group: group, Consumer: "restart-inv-B",
 	})
@@ -1395,7 +1551,7 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 		if started, _, _, _ := p.TryStart("fn/h", time.Second); !started {
 			// Protected by the persisted deadline: skip execution but keep the
 			// message pending (return ErrInvocationNotEligible) so a later
-			// reclaim can run it once the deadline expires. This mirrors the
+			// reclaim can run it once the deadline elapses. This mirrors the
 			// runner's skip path without acknowledging a message whose
 			// invocation is still protected.
 			return ErrInvocationNotEligible
@@ -1406,20 +1562,51 @@ func TestIntegrationInvocationStateSurvivesRestart(t *testing.T) {
 	// B's reclaim loop must skip the invocation while the deadline is still in
 	// the future: poll that the executor is never called across the grace
 	// window rather than a fixed sleep.
-	waitSustained(t, "executor not called before deadline expiry on restart", 500*time.Millisecond, func() bool {
+	waitSustained(t, "executor not called before the deadline elapses on restart", 500*time.Millisecond, func() bool {
 		return calls.Load() == 0
 	})
-	// After the deadline expires, B executes it.
-	testutil.WaitFor(t, 8*time.Second, "invocation executed after deadline expiry on restart", func() bool {
+	// After the deadline elapses, B executes it.
+	testutil.WaitFor(t, 8*time.Second, "invocation executed after the deadline elapsed on restart", func() bool {
 		return calls.Load() >= 1
 	})
 	envB.stop(t)
 }
 
-// TestIntegrationSuccessThenCleanup verifies the success path: a successful
-// invocation marks "ok", the message is acked, and the invocation-state key is
-// cleared.
-func TestIntegrationSuccessThenCleanup(t *testing.T) {
+// TestIntegrationSuccessThenRetention verifies the success path: a successful
+// invocation marks "ok", the message is acked, and then the invocation-state key
+// is switched to terminal retention (marker + TTL) rather than deleted.
+func TestIntegrationSuccessThenRetention(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	id := e.xadd(t, `{"a":1}`)
+	key := invocationStateKey(e.stream, e.group, id)
+
+	acked := make(chan struct{})
+	e.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		if msgID == id {
+			if p, ok := InvocationStateFrom(ctx); ok {
+				if started, claim, _, _ := p.TryStart("fn/h", time.Hour); started {
+					p.MarkComplete("fn/h", claim)
+				}
+			}
+			close(acked)
+		}
+		return nil
+	})
+	<-acked
+	testutil.WaitFor(t, 8*time.Second, "message acked (gone from PEL)", func() bool {
+		_, ok := e.pending()[id]
+		return !ok
+	})
+	e.waitRetained(t, key)
+	e.stop(t)
+}
+
+// TestIntegrationSuccessWithoutStateLeavesNoKey pins that a successful
+// stateless delivery (no invocation state was ever written) retains nothing: the
+// retention step is a no-op for a missing hash, so it must not create an empty
+// key (which would itself be a leak).
+func TestIntegrationSuccessWithoutStateLeavesNoKey(t *testing.T) {
 	testutil.RequireRedis(t)
 	e := newEnv(t, ConsumerConfig{})
 	id := e.xadd(t, `{"a":1}`)
@@ -1437,17 +1624,17 @@ func TestIntegrationSuccessThenCleanup(t *testing.T) {
 		_, ok := e.pending()[id]
 		return !ok
 	})
-	testutil.WaitFor(t, 8*time.Second, "invocation-state key cleared after ack", func() bool {
-		n, err := e.client.Exists(context.Background(), key).Result()
-		return err == nil && n == 0
-	})
 	e.stop(t)
+	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
+		t.Fatalf("stateless delivery must leave no invocation-state key (exists=%d err=%v)", n, err)
+	}
 }
 
 // TestIntegrationClassificationClaimSurvivesRedelivery verifies the real Redis
 // HSETNX classification claim end to end: the first delivery of a message wins
 // the claim (ClaimClassification true), a redelivery of the SAME pending message
-// loses it (false), and the claim is cleaned up with the invocation-state key
+// loses it (false). The claim lives in the message's invocation-state hash, which
+// is persistent while the message is pending and switches to terminal retention
 // once the message is ACKed. This is what keeps
 // events_received == events_matched + events_unmatched across retries.
 func TestIntegrationClassificationClaimSurvivesRedelivery(t *testing.T) {
@@ -1490,8 +1677,9 @@ func TestIntegrationClassificationClaimSurvivesRedelivery(t *testing.T) {
 	waitSustained(t, "classification claimed exactly once across redeliveries", 500*time.Millisecond, func() bool {
 		return claims.Load() == 1
 	})
-	// Stop and clean up; the claim's cleanup-on-ack is covered by the fact that
-	// it lives in the same hash key as the invocation state (cleared on ack).
+	// Stop and clean up; the claim's cleanup follows the invocation-state key's
+	// terminal retention (the hash switch applies to the whole key, claim
+	// included).
 	e.stop(t)
 }
 
@@ -1739,8 +1927,8 @@ func TestIntegrationNextAttemptAtGatesExecution(t *testing.T) {
 	waitSustained(t, "executor not called while gated by next_attempt_at", 500*time.Millisecond, func() bool {
 		return calls.Load() == 0
 	})
-	// After the marker expires, the invocation executes.
-	testutil.WaitFor(t, 8*time.Second, "invocation executed after next_attempt_at expiry", func() bool {
+	// After the deadline elapses, the invocation executes.
+	testutil.WaitFor(t, 8*time.Second, "invocation executed after next_attempt_at deadline elapsed", func() bool {
 		return calls.Load() >= 1
 	})
 	e.stop(t)
@@ -1927,8 +2115,6 @@ func TestIntegrationMultiHandlerIndependence(t *testing.T) {
 	if fnBExec.Load() != 1 {
 		t.Fatalf("fnB executions = %d, want 1 (completed and skipped on redelivery)", fnBExec.Load())
 	}
-	// After ACK the invocation-state key is cleared.
-	if n, err := e.client.Exists(context.Background(), key).Result(); err != nil || n != 0 {
-		t.Fatalf("invocation-state key should be cleared after ACK (exists=%d err=%v)", n, err)
-	}
+	// After ACK the invocation-state key is terminal-retained.
+	e.waitRetained(t, key)
 }

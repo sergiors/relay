@@ -308,6 +308,27 @@ func (e *scheduleEnv) hasStateKey(msgID string) bool {
 	return err == nil && n == 1
 }
 
+// isRetained reports whether the message's invocation-state hash has been
+// switched to terminal retention (present + terminal marker + positive TTL),
+// the post-ACK contract that replaced the old eager delete.
+func (e *scheduleEnv) isRetained(msgID string) bool {
+	key := e.invocationKey(msgID)
+	v, err := e.client.HGet(context.Background(), key, "__terminal").Result()
+	if err != nil || v != "1" {
+		return false
+	}
+	d, err := e.client.PTTL(context.Background(), key).Result()
+	return err == nil && d > 0
+}
+
+// notLeaked reports whether a message left no RECOVERABLE invocation-state hash:
+// either no key at all (nothing was ever written, e.g. an obsolete occurrence
+// resolved before TryStart), or a key that is terminal-retained (marker + TTL).
+// A present, un-retained key would be a leak of persistent state.
+func (e *scheduleEnv) notLeaked(msgID string) bool {
+	return !e.hasStateKey(msgID) || e.isRetained(msgID)
+}
+
 // registerScheduleFn builds a runner with a single schedule function whose
 // handler is scheduleHandler carrying the given retry count.
 func registerScheduleFn(t *testing.T, exec Executor, retries int) *Runner {
@@ -419,13 +440,13 @@ func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 	}
 
 	// Release the second attempt: it succeeds, the message is ACKed (gone from
-	// the PEL), and the invocation-state key is cleared after the ACK.
+	// the PEL), and the invocation-state key is terminal-retained after the ACK.
 	close(release)
-	e.eventually("schedule message acked and invocation-state key cleared", func() bool {
+	e.eventually("schedule message acked and invocation-state key terminal-retained", func() bool {
 		if _, ok := e.pending(id); ok {
 			return false
 		}
-		return !e.hasStateKey(id)
+		return e.isRetained(id)
 	})
 
 	if got := exec.count(); got != 2 {
@@ -570,9 +591,9 @@ func TestIntegrationScheduleReclaimSkipsCompleted(t *testing.T) {
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0 (already-complete invocation skipped)", got)
 	}
-	// The key is cleared after the ACK.
-	e.eventually("invocation-state key cleared after ack", func() bool {
-		return !e.hasStateKey(id)
+	// The key is terminal-retained after the ACK.
+	e.eventually("invocation-state key terminal-retained after ack", func() bool {
+		return e.isRetained(id)
 	})
 }
 
@@ -625,8 +646,8 @@ func TestIntegrationScheduleRetryFailureLeavesPending(t *testing.T) {
 // TestIntegrationScheduleObsoleteFunctionRemoved publishes an occurrence for a
 // function, then REMOVES that function from the runner's registry before the
 // consumer starts. The occurrence must be treated as obsolete: ACKed (gone from
-// the PEL), never DLQ'd, and the invocation-state key cleared — never retried
-// forever.
+// the PEL), never DLQ'd, and the invocation-state key terminal-retained — never
+// retried forever.
 func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
 	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000} // would never succeed if it ran
@@ -651,9 +672,10 @@ func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
 		}
 		return !e.inDlq(id)
 	})
-	// The invocation-state key is cleared after the ACK.
-	e.eventually("obsolete schedule invocation-state key cleared", func() bool {
-		return !e.hasStateKey(id)
+	// Obsolete occurrences resolve before TryStart, so no recoverable state may
+	// remain (either no key, or a terminal-retained one).
+	e.eventually("obsolete schedule invocation-state key not leaked", func() bool {
+		return e.notLeaked(id)
 	})
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0 (removed function must not execute)", got)
@@ -698,8 +720,8 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 		}
 		return !e.inDlq(id)
 	})
-	e.eventually("obsolete handler-removed invocation-state key cleared", func() bool {
-		return !e.hasStateKey(id)
+	e.eventually("obsolete handler-removed invocation-state key not leaked", func() bool {
+		return e.notLeaked(id)
 	})
 	if got := exec.count(); got != 0 {
 		t.Fatalf("executor calls = %d, want 0 (removed handler must not execute)", got)

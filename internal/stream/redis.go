@@ -777,9 +777,15 @@ const missingPayloadUnknownDeliveries = int64(-1)
 //
 // deliveries is the Redis PEL delivery count when known
 // (missingPayloadUnknownDeliveries otherwise), reported for diagnosis only; it
-// is never converted into a handler attempt. Invocation state is deliberately
-// left alone (its TTL is the fallback cleanup): the invocation never completed,
-// and a handler on another replica may still hold the message in memory.
+// is never converted into a handler attempt.
+//
+// Invocation state: once the dangling PEL reference is gone (XACKed here, or
+// already purged by the server during the scan) the message is no longer
+// recoverable, so its state hash is switched to terminal retention. Without
+// that, a persistent hash written for a body-less invocation before this change
+// would leak forever. When the conservative XAck fails the entry may still be in
+// the PEL, so the state is deliberately left recoverable (persistent, no TTL):
+// a leak is safer than dropping state a redelivery might still need.
 func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessage, deliveries int64, ack bool) {
 	c.metrics.Inc(metrics.MetricMissingPayload)
 	attrs := []any{
@@ -790,11 +796,18 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 		attrs = append(attrs, "deliveries", deliveries)
 	}
 	c.log.Warn("Message: pending entry has no stream body (trimmed or deleted); not processed", attrs...)
-	if !ack {
-		return
+	if ack {
+		if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
+			// The reference may still be pending: keep state recoverable.
+			c.log.Warn("Message: ack missing-value entry failed", "message_id", msg.ID, "error", err)
+			return
+		}
 	}
-	if err := c.client.XAck(ctx, c.stream, c.group, msg.ID).Err(); err != nil {
-		c.log.Warn("Message: ack missing-value entry failed", "message_id", msg.ID, "error", err)
+	// The dangling PEL reference is gone: retain the (never-completing)
+	// invocation state under the retention TTL instead of leaking it.
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn("Message: retain invocation state for missing-value entry failed",
+			"message_id", msg.ID, "error", err)
 	}
 }
 
@@ -934,6 +947,26 @@ func (c *Consumer) processMessage(
 	// delivery attempt here would break the once-per-logical-event invariant on
 	// redeliveries.
 
+	// Migrate a legacy/pre-persistence state hash to persistent BEFORE the
+	// invocation-state handle is used: a hash written with an old fixed TTL must
+	// not expire under a redelivery. This is a no-op for an absent hash and for
+	// an already terminal-retained hash.
+	//
+	// A failure is a Redis-state failure, not a best-effort migration: the hash
+	// may still carry its old TTL and expire mid-delivery, so the state cannot be
+	// relied on. Do NOT dispatch the handler and do NOT ACK: the message is left
+	// pending (a later reclaim retries it), exactly like a transport failure on
+	// TryStart. This keeps the at-least-once contract intact; a transient Redis
+	// fault self-heals on the next delivery.
+	if err := c.invStateStore.makeRecoverable(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn("Message: make invocation state recoverable failed; leaving pending",
+			"message_id", msg.ID,
+			"delivery_attempt", deliveryNum,
+			"error", err,
+		)
+		return
+	}
+
 	// Inject a per-message invocation-state handle so the runner can skip
 	// invocations that already completed on a previous delivery or are protected
 	// by an active attempt deadline. The handle is bound to this (stream, group,
@@ -1014,14 +1047,15 @@ func (c *Consumer) processMessage(
 	}
 	ackSpan.End()
 	outcome = "acked"
-	// The message is fully processed and acknowledged: eagerly clear its
-	// invocation-state hash. Ordering matters — clear only AFTER a successful
-	// ACK. If the ACK failed (handled above) the message stays in the PEL and
-	// may be redelivered, so its state must remain for the redelivery to skip
-	// completed handlers. A clear failure is logged only; the TTL is the
-	// fallback cleanup.
-	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-		c.log.Warn("Message: clear invocation state failed", "message_id", msg.ID, "error", err)
+	// The message is fully processed and acknowledged: switch its invocation
+	// state to terminal retention. Ordering matters — retain only AFTER a
+	// successful ACK. If the ACK failed (handled above) the message stays in the
+	// PEL and may be redelivered, so its state must remain recoverable
+	// (persistent, no TTL) for the redelivery to skip completed handlers. A
+	// retention failure is logged only: the state is simply left persistent (a
+	// leak, never a premature loss).
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn("Message: retain invocation state failed", "message_id", msg.ID, "error", err)
 	}
 }
 
@@ -1050,6 +1084,23 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		"message_id", msgID,
 		"delivery_attempt", deliveryNum,
 	)
+
+	// Migrate a legacy/pre-persistence state hash to persistent BEFORE the
+	// handle is used, exactly like processMessage (see makeRecoverable).
+	//
+	// A failure is a Redis-state failure, not a best-effort migration: the hash
+	// may still carry its old TTL and expire mid-delivery, so the state cannot be
+	// relied on. Return a pending outcome so the caller does NOT ACK or DLQ the
+	// message: it stays pending in the PEL for a later reclaim, preserving the
+	// at-least-once contract while a transient Redis fault self-heals.
+	if err := c.invStateStore.makeRecoverable(ctx, c.stream, c.group, msgID); err != nil {
+		c.log.Warn("Schedule: make invocation state recoverable failed; leaving pending",
+			"message_id", msgID,
+			"delivery_attempt", deliveryNum,
+			"error", err,
+		)
+		return "pending", err
+	}
 
 	// Inject the same per-message context as processMessage: the delivery-attempt
 	// number and the invocation-state handle bound to this (stream, group, msgID).
@@ -1083,10 +1134,11 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// removed from the current configuration while the message was pending.
 		// That removal is an intentional configuration change, so the message is
 		// terminal but MUST NOT be retried or routed to the DLQ — acknowledge it
-		// (and then clear its invocation state), exactly like the success tail.
-		// Note the ordering: this must run BEFORE the exhaustion check, because
-		// an obsolete occurrence is never exhausted (exhaustion implies retries
-		// were attempted, which an obsolete occurrence never is).
+		// (and then switch its invocation state to terminal retention), exactly
+		// like the success tail. Note the ordering: this must run BEFORE the
+		// exhaustion check, because an obsolete occurrence is never exhausted
+		// (exhaustion implies retries were attempted, which an obsolete
+		// occurrence never is).
 		if errors.Is(err, ErrInvocationObsolete) {
 			c.log.Debug("Schedule: occurrence obsolete (function or schedule removed); acknowledging",
 				"message_id", msgID,
@@ -1099,11 +1151,11 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				c.noteOutcome(ackErr, 0)
 				return "pending", ackErr
 			}
-			// Clear the invocation-state hash after a successful ACK, exactly
-			// like the success tail. A clear failure is logged only; the TTL is
-			// the fallback cleanup.
-			if cerr := c.invStateStore.clear(ctx, c.stream, c.group, msgID); cerr != nil {
-				c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", cerr)
+			// Retain the invocation-state hash after a successful ACK, exactly
+			// like the success tail. A retention failure is logged only; the
+			// state is left persistent (a leak, never a premature loss).
+			if cerr := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID); cerr != nil {
+				c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", cerr)
 			}
 			return "acked", nil
 		}
@@ -1140,10 +1192,11 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		c.noteOutcome(err, 0)
 		return "pending", err
 	}
-	// Eagerly clear the invocation-state hash after a successful ACK, exactly
-	// like processMessage. A clear failure is logged only; the TTL is the fallback.
-	if err := c.invStateStore.clear(ctx, c.stream, c.group, msgID); err != nil {
-		c.log.Warn("Schedule: message clear invocation state failed", "message_id", msgID, "error", err)
+	// Switch the invocation-state hash to terminal retention after a successful
+	// ACK, exactly like processMessage. A retention failure is logged only; the
+	// state is left persistent (a leak, never a premature loss).
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID); err != nil {
+		c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", err)
 	}
 	return "acked", nil
 }
@@ -1318,14 +1371,15 @@ func (c *Consumer) routeToDLQ(
 		c.noteOutcome(err, 0)
 		return
 	}
-	// The message is dead-lettered and the original acked: eagerly clear its
-	// invocation-state hash. Ordering matters — clear only after BOTH every DLQ
-	// write and the ACK succeed. If the ACK failed (handled above) the message
-	// stays in the PEL and may be redelivered, so its state (including the
-	// per-invocation DLQ-persisted markers) must remain. A clear failure is
-	// logged only; the TTL is the fallback cleanup.
-	if err := c.invStateStore.clear(ctx, c.stream, c.group, msg.ID); err != nil {
-		c.log.Warn("Message: clear invocation state after DLQ failed", "message_id", msg.ID, "error", err)
+	// The message is dead-lettered and the original acked: switch its
+	// invocation-state hash to terminal retention. Ordering matters — retain only
+	// after BOTH every DLQ write and the ACK succeed. If the ACK failed (handled
+	// above) the message stays in the PEL and may be redelivered, so its state
+	// (including the per-invocation DLQ-persisted markers) must remain
+	// recoverable (persistent, no TTL). A retention failure is logged only; the
+	// state is left persistent (a leak, never a premature loss).
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+		c.log.Warn("Message: retain invocation state after DLQ failed", "message_id", msg.ID, "error", err)
 	}
 }
 

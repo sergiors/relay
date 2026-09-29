@@ -14,31 +14,21 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// invocationStateTTL is how long a message's invocation-state hash survives
-// after its last write. It is comfortably longer than the maximum pending
-// lifetime (a rule's 1+Retries attempts × reclaim cadence ~2m + idle headroom),
-// so a message that is abandoned or deleted from the stream is eventually
-// cleaned up by Redis even if the eager clear on completion never runs. The
-// eager clear (see processMessage/routeToDLQ) is the primary cleanup; the TTL
-// is the safety net for TERMINAL markers.
+// invocationRetentionTTL is how long a message's invocation-state hash survives
+// AFTER the message has left the PEL — a successful XACK on the success,
+// obsolete, or DLQ path, or a cleared missing-payload PEL reference. Recoverable
+// state (any hash whose message is still pending and can therefore be
+// redelivered) is deliberately PERSISTENT, with NO TTL: it must never expire out
+// from under a redelivery, which would reset the attempt/reclaim accounting. The
+// retention TTL is applied only by retainTerminal, atomically with the reserved
+// terminal marker, once the message is no longer recoverable.
 //
-// It is a FLOOR for active markers, never a ceiling: an active
-// running/next_attempt_at marker is written with a TTL of at least
-// activeTTL(now, deadline), i.e. max(invocationStateTTL,
-// (deadline-now)+invocationSafetyMargin). The key can therefore live longer
-// than deadline+margin, but can never expire before the marker's protected
-// deadline — so a reclaim always observes the expired marker (carrying the
-// attempt forward) instead of an absent field that would reset the attempt
-// count to 1 and silently discard the retry/exhaustion accounting.
-const invocationStateTTL = 7 * 24 * time.Hour
-
-// invocationSafetyMargin is the positive margin by which an active marker's key
-// expiry must exceed its protected deadline: keyTTL >= (deadline-now) +
-// invocationSafetyMargin for every running/next_attempt_at write. It is the
-// window in which a reclaim can still read the just-expired marker and carry its
-// attempt/token forward. It must stay far smaller than the minimum sensible
-// handler timeout.
-const invocationSafetyMargin = time.Minute
+// It is a retention window for terminal bookkeeping (so a completed/exhausted
+// marker survives long enough to be inspected) and a cleanup safety net: if the
+// post-ACK retention never runs (a crash in the ACK→retain gap), the hash is
+// simply leaked rather than lost — a persistent leak is strictly safer than
+// premature state loss.
+const invocationRetentionTTL = 7 * 24 * time.Hour
 
 // claimTokenBytes is the size of the crypto-random per-claim nonce. 16 bytes
 // (128 bits) makes a token collision between two independent claims
@@ -86,27 +76,27 @@ func newClaimToken() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// activeTTL returns the key TTL to apply alongside an active
-// running/next_attempt_at marker with the given protected deadline: the larger
-// of the normal terminal TTL and (deadline-now)+invocationSafetyMargin. It is
-// computed in Go from integer times, so it is exact; the script never does
-// timestamp arithmetic. The safety margin guarantees keyTTL > deadline, closing
-// the window in which an expired marker could vanish before a reclaim reads it.
-func activeTTL(now, deadline time.Time) time.Duration {
-	window := deadline.Sub(now)
-	if window < 0 {
-		window = 0
-	}
-	ttl := window + invocationSafetyMargin
-	if ttl < invocationStateTTL {
-		ttl = invocationStateTTL
-	}
-	return ttl
-}
-
 // ttlMillis converts a TTL to integer milliseconds for the PEXPIRE argument.
 func ttlMillis(d time.Duration) int64 {
 	return int64(d / time.Millisecond)
+}
+
+// terminalField is the reserved invocation-state hash field that marks a hash as
+// no longer recoverable: the message it belongs to has left the PEL (a
+// successful XACK on the success/obsolete/DLQ path, or a cleared/purged
+// missing-payload PEL reference), so retainTerminal switched the hash to
+// terminal retention (invocationRetentionTTL). While the field is present every
+// lifecycle script is inert: a stale transition from an in-memory delivery can
+// neither mutate the retained state nor remove the retention TTL (which would
+// resurrect an unrecoverable hash). Like classificationField and traceFieldPrefix
+// it cannot collide with a real invocation ID (a leading "__" is not a legal
+// function name).
+const terminalField = "__terminal"
+
+// retentionTTLMillis returns the terminal retention TTL in integer milliseconds
+// for the PEXPIRE argument passed to the retain script.
+func retentionTTLMillis() int64 {
+	return ttlMillis(invocationRetentionTTL)
 }
 
 // toInt64 coerces a value returned from a Lua EVAL reply (an int64 by default,
@@ -137,12 +127,12 @@ func toInt64(v any) int64 {
 
 // The lifecycle transitions below are implemented as atomic Lua scripts (EVAL)
 // rather than read-then-write pipelines. A pipeline is not atomic: two replicas
-// can both HGET "absent"/"expired" and both HSET a running marker, permitting a
+// can both HGET "absent"/"elapsed" and both HSET a running marker, permitting a
 // dual start, and a stale owner's failure can overwrite a newer attempt's marker
-// after the stale attempt's lease expired. Redis executes a script atomically
-// (single-threaded), so at most one concurrent EVAL observes an absent/expired
-// marker and claims it; every other caller observes the new marker and is
-// protected.
+// after the stale attempt's deadline elapsed. Redis executes a script atomically
+// (single-threaded), so at most one concurrent EVAL observes a marker that is
+// absent or past its deadline and claims it; every other caller observes the new
+// marker and is protected.
 //
 // Timestamps are integer Unix MILLISECONDS passed as decimal STRINGS end to end.
 // The eligibility comparison is a length-then-lexicographic compare of those
@@ -207,13 +197,20 @@ var (
 	// KEYS[1] = invocation-state hash;
 	// ARGV[1] = invocation field, ARGV[2] = now (unix-ms string),
 	// ARGV[3] = new running deadline (unix-ms string), ARGV[4] = new claim
-	// token, ARGV[5] = TTL ms.
+	// token, ARGV[5] = terminal marker field.
 	// Returns {started, attempt, deadline_or_0}: started 1 when claimed and
 	// attempt is the new 1-based attempt; otherwise attempt describes the
 	// existing marker (0 for "ok") and the third element is the existing
 	// deadline string when protected (so Go computes the exact wait in ms), or
 	// "0" when terminal.
+	//
+	// A winning claim PERSISTs the key: while the message is recoverable its
+	// state must never expire (a legacy TTL is removed in the same atomic step).
 	tryStartScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[5]) == 1 then
+  -- Terminal-retained (its message already left the PEL): never re-open it.
+  return {0, 0, '0'}
+end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 local now = ARGV[2]
 if v then
@@ -234,13 +231,13 @@ if v then
     -- Deadline reached (now >= deadline): eligible. Carry the attempt forward.
     local na = tonumber(a) + 1
     redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':'..na..':'..ARGV[4])
-    redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+    redis.call('PERSIST', KEYS[1])
     return {1, na, '0'}
   end
 end
 -- Absent/unparseable: a fresh claim starts at attempt 1.
 redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':1:'..ARGV[4])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+redis.call('PERSIST', KEYS[1])
 return {1, 1, '0'}
 `)
 
@@ -254,9 +251,14 @@ return {1, 1, '0'}
 	//
 	// KEYS[1] = invocation-state hash;
 	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
-	// ARGV[4] = next-attempt deadline (unix-ms string), ARGV[5] = TTL ms.
+	// ARGV[4] = next-attempt deadline (unix-ms string), ARGV[5] = terminal
+	// marker field.
 	// Returns 1 when the marker was written, 0 otherwise.
+	//
+	// A recorded failure keeps the key PERSISTENT (removing any legacy TTL): the
+	// message is still recoverable and its retry accounting must survive.
 	finishFailureScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[5]) == 1 then return 0 end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then return 0 end
 local dl, a, tok = parse_active(v, 'running')
@@ -264,7 +266,7 @@ if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
 if not dl then return 0 end
 if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], 'next_attempt_at:'..ARGV[4]..':'..a..':'..tok)
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
@@ -276,9 +278,14 @@ return 1
 	//
 	// KEYS[1] = invocation-state hash;
 	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
-	// ARGV[4] = TTL ms.
+	// ARGV[4] = terminal marker field.
 	// Returns 1 when complete (written or already ok), 0 when preserved/refused.
+	//
+	// The success marker is written while the message is still recoverable, so it
+	// keeps the key PERSISTENT (no TTL): retention is applied only after the
+	// successful XACK via retainTerminal.
 	markCompleteScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[4]) == 1 then return 0 end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if v == 'ok' then return 1 end
 if not v then return 0 end
@@ -287,7 +294,7 @@ if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
 if not dl then return 0 end
 if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], 'ok')
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
@@ -300,9 +307,14 @@ return 1
 	//
 	// KEYS[1] = invocation-state hash;
 	// ARGV[1] = invocation field, ARGV[2] = claim attempt, ARGV[3] = claim token,
-	// ARGV[4] = TTL ms.
+	// ARGV[4] = terminal marker field.
 	// Returns 1 when written, 0 otherwise.
+	//
+	// The exhaustion marker is written while the message is still recoverable
+	// (the DLQ entry may not be persisted and the XACK may not have run), so it
+	// keeps the key PERSISTENT: a redelivery must still observe the exhaustion.
 	markExhaustedScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[4]) == 1 then return 0 end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then return 0 end
 local dl, a, tok = parse_active(v, 'running')
@@ -310,7 +322,7 @@ if not dl then dl, a, tok = parse_active(v, 'next_attempt_at') end
 if not dl then return 0 end
 if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok)
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
@@ -323,9 +335,14 @@ return 1
 	//
 	// KEYS[1] = invocation-state hash;
 	// ARGV[1] = invocation field, ARGV[2] = exhausted attempt, ARGV[3] =
-	// exhausted token, ARGV[4] = TTL ms.
+	// exhausted token, ARGV[4] = terminal marker field.
 	// Returns 1 when the exhausted marker already/now records the DLQ, 0 else.
+	//
+	// The DLQ-persistence marker is written after the XADD but before the XACK,
+	// so it keeps the key PERSISTENT: a redelivery after a failed XACK must see
+	// it to stay idempotent.
 	markExhaustedDLQScript = redis.NewScript(luaInvocationHelpers + `
+if redis.call('HEXISTS', KEYS[1], ARGV[4]) == 1 then return 0 end
 local v = redis.call('HGET', KEYS[1], ARGV[1])
 if not v then return 0 end
 local a, tok, dlq = parse_exhausted(v)
@@ -333,32 +350,84 @@ if not a then return 0 end
 if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
 if dlq then return 1 end
 redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok..':dlq')
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
+redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
 	// claimClassificationScript atomically claims the one-time event
-	// classification with HSETNX and refreshes the TTL only when it actually
-	// wrote the field.
+	// classification with HSETNX and, only when it actually wrote the field,
+	// clears any legacy TTL (the message is still recoverable, so its state must
+	// be persistent).
 	//
 	// KEYS[1] = invocation-state hash;
-	// ARGV[1] = classification field, ARGV[2] = TTL ms.
+	// ARGV[1] = classification field, ARGV[2] = terminal marker field.
 	claimClassificationScript = redis.NewScript(`
+if redis.call('HEXISTS', KEYS[1], ARGV[2]) == 1 then
+  -- Terminal-retained: classification has already been settled; report the
+  -- claim as already taken so a stale caller never counts the event again.
+  return 0
+end
 local set = redis.call('HSETNX', KEYS[1], ARGV[1], '1')
 if set == 1 then
-  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+  redis.call('PERSIST', KEYS[1])
 end
 return set
 `)
 
 	// recordTraceScript atomically persists the compact trace lineage sibling
-	// field and refreshes the TTL in the same step.
+	// field and clears any legacy TTL in the same step. A terminal-retained hash
+	// is left untouched: retention only runs after the message left the PEL, so a
+	// stale in-memory delivery must not extend or re-open it.
 	//
 	// KEYS[1] = invocation-state hash;
-	// ARGV[1] = trace field, ARGV[2] = lineage, ARGV[3] = TTL ms.
+	// ARGV[1] = trace field, ARGV[2] = lineage, ARGV[3] = terminal marker field.
 	recordTraceScript = redis.NewScript(`
+if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then return 0 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
+redis.call('PERSIST', KEYS[1])
+return 1
+`)
+
+	// makeRecoverableScript clears any TTL from an existing invocation-state
+	// hash, making it persistent, but NEVER touches an already terminal-retained
+	// hash (its message left the PEL and its retention TTL must be preserved).
+	// A missing key is a no-op. It is the legacy/pre-persistence migration hook:
+	// a hash written with the old fixed TTL becomes persistent as soon as its
+	// message is processed again.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = terminal marker field.
+	// Returns 1 when the key is now recoverable (persistent), 0 when it is
+	// terminal-retained or absent.
+	makeRecoverableScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 0 end
+redis.call('PERSIST', KEYS[1])
+return 1
+`)
+
+	// retainTerminalScript switches a message's invocation-state hash to TERMINAL
+	// retention: it writes the reserved terminal marker and applies the retention
+	// TTL, both in one atomic step. It is called only AFTER the message is no
+	// longer recoverable (a successful XACK on the success/obsolete/DLQ path, or
+	// a cleared/purged missing-payload PEL reference).
+	//
+	// The marker makes every lifecycle script inert (see each script's HEXISTS
+	// guard), so a stale transition from an in-memory delivery can neither mutate
+	// the retained state nor PERSIST the key (which would remove the retention
+	// TTL and resurrect an unrecoverable hash). It is monotonic: an
+	// already-terminal hash is a no-op, so a repeated call (e.g. a redelivery
+	// that races the retention) never re-extends the TTL. A missing key (the
+	// retention already expired, or state was never written) returns 0.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = terminal marker field, ARGV[2] = retention TTL ms.
+	// Returns 1 when the hash is now terminal-retained, 0 when it does not exist.
+	retainTerminalScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 1 end
+redis.call('HSET', KEYS[1], ARGV[1], '1')
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
 return 1
 `)
 )
@@ -478,11 +547,33 @@ type invocationStateStore interface {
 	// was ever recorded. redis.Nil (field absent) is ("", nil).
 	traceReference(ctx context.Context, stream, group, msgID, invocation string) (string, error)
 	// recordTrace atomically persists the compact trace lineage of this
-	// invocation's most recent attempt under a reserved sibling field,
-	// refreshing the TTL in the same script. It never disturbs the invocation's
-	// lifecycle value.
+	// invocation's most recent attempt under a reserved sibling field, clearing
+	// any legacy TTL in the same script. It never disturbs the invocation's
+	// lifecycle value, and it is inert once the hash is terminal-retained.
 	recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error
-	clear(ctx context.Context, stream, group, msgID string) error
+	// retainTerminal switches the message's invocation-state hash to terminal
+	// retention: it writes the reserved terminal marker and applies the retention
+	// TTL in one atomic step. It must be called only AFTER the message is no
+	// longer recoverable (a successful XACK, or a cleared missing-payload PEL
+	// reference), because retention removes recoverability. It is monotonic and
+	// never re-extends an already-terminal hash. A retention failure is logged,
+	// never fatal: the hash is simply left persistent (a leak, never a premature
+	// loss).
+	retainTerminal(ctx context.Context, stream, group, msgID string) error
+	// makeRecoverable clears any legacy/recoverable-time TTL from an EXISTING
+	// invocation-state hash so it is PERSISTENT for as long as its message is
+	// pending. It is called at the start of processing a delivery, before the
+	// state is relied on, so a hash written by a pre-persistence Relay (with the
+	// old fixed TTL) cannot expire under a redelivery. It is a no-op for a
+	// missing hash and — critically — for an already terminal-retained hash (it
+	// must never remove terminal retention).
+	//
+	// An error is a Redis-state failure, not a best-effort migration: the hash
+	// may still carry its old TTL and could expire mid-delivery, so the caller
+	// must NOT rely on the state, dispatch the handler, or ACK the message. It
+	// leaves the message pending for a later reclaim instead, so a transient
+	// Redis fault self-heals without losing the message.
+	makeRecoverable(ctx context.Context, stream, group, msgID string) error
 }
 
 // classificationField is the reserved invocation-state hash field that records
@@ -546,6 +637,18 @@ func traceField(invocation string) string {
 // whose entry was already written, which makes retrying a partially-written
 // multi-entry DLQ (after an XACK failure or crash) idempotent.
 //
+// The hash also carries reserved sibling fields that are never invocation IDs:
+// classificationField (the once-per-event classification claim), terminalField
+// (the terminal-retention marker), and one traceFieldPrefix field per invocation
+// (the last attempt's compact lineage).
+//
+// Lifetime: while the message is still recoverable (present in the PEL and
+// therefore redeliverable) the hash is PERSISTENT — no TTL. Only once the
+// message has left the PEL (a successful XACK on the success/obsolete/DLQ path,
+// or a cleared/purged missing-payload PEL reference) does retainTerminal switch
+// it to invocationRetentionTTL. A hash that never gets retained is leaked, never
+// prematurely expired: safe by construction.
+//
 // It is the stream layer's domain (Redis), but the runner decides which
 // invocations match, so the store is exposed to the runner through the
 // InvocationState interface carried in the delivery context.
@@ -604,8 +707,8 @@ func (store *invocationStore) terminal(
 // terminal invocation and could resurrect a message already routed to the DLQ)
 // and a stale owner must never overwrite a newer attempt. It returns false for
 // both refusals (an explicit stale result, never a Redis error). The HSET and
-// PEXPIRE happen in the same script, so the field is never mutated without
-// refreshing the TTL.
+// PERSIST happen in the same script, so the completed marker keeps the hash
+// PERSISTENT (recoverable); the retention TTL is applied only after the XACK.
 func (store *invocationStore) markComplete(
 	ctx context.Context,
 	stream,
@@ -622,7 +725,7 @@ func (store *invocationStore) markComplete(
 		invocation,
 		claim.Attempt,
 		claim.Token,
-		ttlMillis(invocationStateTTL),
+		terminalField,
 	).Int64()
 	if err != nil {
 		return false, err
@@ -633,11 +736,14 @@ func (store *invocationStore) markComplete(
 // tryStart attempts to claim the invocation for a new execution via one atomic
 // Lua script. Go generates a crypto-random claim token BEFORE the EVAL; the
 // script checks eligibility, then writes "running:<deadline_ms>:<n>:<token>" and
-// PEXPIREs with a TTL that covers the deadline, all in the SAME script. So
-// concurrent callers cannot both observe an absent/expired marker: exactly one
-// EVAL claims it (with its unique token), and every other caller sees the new
-// running marker and is protected (started=false, wait>0). There is no separate
-// TTL command, so a claim can never be left without a TTL.
+// PERSISTs the key, all in the SAME script. So concurrent callers cannot both
+// observe a marker that is absent or past its deadline: exactly one EVAL claims
+// it (with its unique token), and every other caller sees the new running marker
+// and is protected (started=false, wait>0). There is no separate TTL command, so
+// a claim can never be left without a TTL.
+//
+// A hash already switched to terminal retention (its message left the PEL) is
+// never re-opened: the script reports it terminal without writing.
 //
 // Eligibility is exact integer-millisecond: a running/next_attempt_at marker is
 // protected iff now_ms < deadline_ms and eligible iff now_ms >= deadline_ms,
@@ -650,8 +756,9 @@ func (store *invocationStore) markComplete(
 //	"running|next_attempt_at:<dl_ms>:<n>:<token>" with now < dl
 //	                             → a protected attempt is in flight or waiting
 //	                               out its backoff; not started, wait = dl-now (ms)
-//	absent, expired, or unparseable → eligible: claim with a fresh token at
-//	                               attempt n+1 (or 1) and report started
+//	terminal-retained hash       → not started (attempt 0, no wait)
+//	absent, deadline elapsed, or unparseable → eligible: claim with a fresh
+//	                               token at attempt n+1 (or 1) and report started
 //
 // A new claim token is generated with crypto/rand; a generation failure is
 // returned (NOT failed open) so the runner leaves the message pending rather
@@ -677,7 +784,7 @@ func (store *invocationStore) tryStart(
 		strconv.FormatInt(now.UnixMilli(), 10),
 		strconv.FormatInt(deadline.UnixMilli(), 10),
 		token,
-		ttlMillis(activeTTL(now, deadline)),
+		terminalField,
 	).Slice()
 	if err != nil {
 		return false, InvocationClaim{}, 0, err
@@ -720,18 +827,18 @@ func (store *invocationStore) tryStart(
 //
 //   - writes next_attempt_at ONLY when the current running/next-attempt marker
 //     is owned by the caller's exact claim (attempt AND token). A stale owner
-//     whose running lease expired and whose invocation was re-claimed by a newer
-//     claim CASes against a different attempt/token and is a no-op, so it can
-//     never overwrite the newer marker;
+//     whose running deadline elapsed and whose invocation was re-claimed by a
+//     newer claim CASes against a different attempt/token and is a no-op, so it
+//     can never overwrite the newer marker;
 //   - preserves a terminal "ok" or exhausted marker, and an absent/unparseable
 //     marker, as a no-op (returns false);
 //
 // The returned bool reports whether the transition was applied. A false is an
-// explicit stale/terminal result, NOT a Redis error. The HSET and PEXPIRE happen
-// in the same script, and the TTL covers the retry deadline, so the marker is
-// never left without a TTL and can never expire before its deadline. A transport
-// error is returned so the caller can leave the field as-is (immediately
-// eligible — at-least-once).
+// explicit stale/terminal result, NOT a Redis error. The HSET and PERSIST happen
+// in the same script, so the backoff marker keeps the hash PERSISTENT (the
+// message is still recoverable and must not expire before its deadline). A
+// transport error is returned so the caller can leave the field as-is
+// (immediately eligible — at-least-once).
 func (store *invocationStore) finishFailure(
 	ctx context.Context,
 	stream,
@@ -752,7 +859,7 @@ func (store *invocationStore) finishFailure(
 		claim.Attempt,
 		claim.Token,
 		strconv.FormatInt(next.UnixMilli(), 10),
-		ttlMillis(activeTTL(now, next)),
+		terminalField,
 	).Int64()
 	if err != nil {
 		return false, err
@@ -784,7 +891,7 @@ func (store *invocationStore) markExhausted(
 		invocation,
 		claim.Attempt,
 		claim.Token,
-		ttlMillis(invocationStateTTL),
+		terminalField,
 	).Int64()
 	if err != nil {
 		return false, err
@@ -817,7 +924,7 @@ func (store *invocationStore) markExhaustedDLQ(
 		invocation,
 		claim.Attempt,
 		claim.Token,
-		ttlMillis(invocationStateTTL),
+		terminalField,
 	).Int64()
 	if err != nil {
 		return false, err
@@ -857,11 +964,41 @@ func (store *invocationStore) exhaustedState(
 	return exClaim, dlq, true, nil
 }
 
-// clear deletes the message's invocation-state hash entirely. It is called
-// eagerly on completion (successful ACK or DLQ routing) so the key does not
-// linger.
-func (store *invocationStore) clear(ctx context.Context, stream, group, msgID string) error {
-	return store.client.Del(ctx, invocationStateKey(stream, group, msgID)).Err()
+// retainTerminal switches the message's invocation-state hash to terminal
+// retention via the atomic retainTerminal script: it writes the reserved
+// terminal marker and applies the retention TTL in one step. It is called only
+// AFTER the message is no longer recoverable — a successful XACK on the
+// success/obsolete/DLQ path, or a cleared/purged missing-payload PEL reference —
+// because retention removes recoverability. The marker makes every lifecycle
+// script inert, so a stale in-memory delivery cannot mutate the retained state
+// or remove the TTL. The upgrade is monotonic: a repeated call never re-extends
+// an already-terminal hash. A missing key is a no-op (nothing to retain).
+func (store *invocationStore) retainTerminal(ctx context.Context, stream, group, msgID string) error {
+	_, err := retainTerminalScript.Run(ctx, store.client,
+		[]string{invocationStateKey(stream, group, msgID)},
+		terminalField,
+		retentionTTLMillis(),
+	).Int64()
+	return err
+}
+
+// makeRecoverable clears any TTL from the message's invocation-state hash so it
+// is PERSISTENT while the message is pending. It is the migration hook for a
+// hash written by a pre-persistence Relay (or any legacy fixed-TTL write): a
+// message that sat pending longer than the old TTL would otherwise lose its
+// attempt/reclaim accounting on redelivery. It is a no-op for a missing hash and
+// for an already terminal-retained hash (retention must never be removed).
+//
+// An error is returned to the caller as a Redis-state failure, never swallowed:
+// the hash may still carry its old TTL and could expire mid-delivery, so the
+// caller must not rely on it, run the handler, or ACK the message. The caller
+// leaves the message pending so a later reclaim retries it.
+func (store *invocationStore) makeRecoverable(ctx context.Context, stream, group, msgID string) error {
+	_, err := makeRecoverableScript.Run(ctx, store.client,
+		[]string{invocationStateKey(stream, group, msgID)},
+		terminalField,
+	).Int64()
+	return err
 }
 
 // claimClassification atomically claims this message's one-time logical-event
@@ -871,15 +1008,15 @@ func (store *invocationStore) clear(ctx context.Context, stream, group, msgID st
 // delivery of the same message sees the field present and receives false. The
 // claim is written before the runner classifies, so a crash between the claim
 // and the metric increment can only LOSE a count for that event — it can never
-// double-count one. The TTL is refreshed in the same script, but only when the
+// double-count one. The key is PERSISTed in the same script, but only when the
 // claim actually wrote the field, so repeated losers add no writes.
 //
-// The claim lives and dies with the message's invocation-state hash: terminal
-// paths (successful ACK or DLQ routing) clear that hash only after the message
-// leaves the PEL, so no redelivery can follow a clear. The claim also cannot
-// outlive the invocationStateTTL; a message left pending longer than the TTL
-// could in principle be re-classified, but that TTL is comfortably longer than
-// the maximum pending lifetime (see invocationStateTTL).
+// The claim lives and dies with the message's invocation-state hash: a terminal
+// path (successful ACK, obsolete ACK, or DLQ routing) switches that hash to
+// terminal retention only after the message leaves the PEL, and the retention
+// marker makes a stale claim request report "already taken". While the message
+// is recoverable the hash is persistent, so the claim can never expire out from
+// under a redelivery and re-classify the same logical event.
 //
 // On a Redis error it returns (false, err): the caller must NOT count the
 // event, because it cannot prove the claim. Failing open here would risk
@@ -889,7 +1026,7 @@ func (store *invocationStore) claimClassification(ctx context.Context, stream, g
 	key := invocationStateKey(stream, group, msgID)
 	set, err := claimClassificationScript.Run(ctx, store.client, []string{key},
 		classificationField,
-		int64(invocationStateTTL/time.Millisecond),
+		terminalField,
 	).Int()
 	if err != nil {
 		return false, err
@@ -914,9 +1051,10 @@ func (store *invocationStore) traceReference(ctx context.Context, stream, group,
 
 // recordTrace persists the compact trace lineage of this invocation's most
 // recent attempt under the reserved sibling field, via one atomic Lua script
-// that also refreshes the TTL. Only the lifecycle hash field is touched; the
-// invocation's lifecycle value is never disturbed. An empty lineage is a no-op
-// (nothing to record).
+// that also clears any legacy TTL (the message is recoverable, so its state must
+// be persistent). Only the lifecycle hash field is touched; the invocation's
+// lifecycle value is never disturbed, and a terminal-retained hash is left
+// untouched. An empty lineage is a no-op (nothing to record).
 func (store *invocationStore) recordTrace(ctx context.Context, stream, group, msgID, invocation, lineage string) error {
 	if lineage == "" {
 		return nil
@@ -925,7 +1063,7 @@ func (store *invocationStore) recordTrace(ctx context.Context, stream, group, ms
 	_, err := recordTraceScript.Run(ctx, store.client, []string{key},
 		traceField(invocation),
 		lineage,
-		int64(invocationStateTTL/time.Millisecond),
+		terminalField,
 	).Int64()
 	return err
 }
@@ -1101,14 +1239,22 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 //	exhausted       → "exhausted:<n>:<token>"               (MarkExhausted, CASed on the claim)
 //	DLQ persisted   → "exhausted:<n>:<token>:dlq"           (MarkExhaustedDLQ, CASed on the exhausted claim)
 //
-// A crash mid-attempt leaves "running:<deadline_ms>:<n>:<token>", which
-// self-expires at its deadline; recovery waits it out (bounded staleness of at
-// most one timeout) and then reclaims it as attempt n+1 with a FRESH token. A
-// failed attempt's "next_attempt_at" marker similarly self-expires if the worker
-// crashes before the message is reclaimed. Terminal "ok" and exhausted markers
-// are never re-opened, and every transition that originates from an active claim
-// CASes BOTH the attempt and the token, so a stale owner can never overwrite a
-// newer claim's marker even if the attempt count happens to match.
+// A crash mid-attempt leaves "running:<deadline_ms>:<n>:<token>", whose deadline
+// simply elapses (the persistent hash keeps the marker; nothing expires out of
+// Redis); recovery waits it out (bounded staleness of at most one timeout) and
+// then reclaims it as attempt n+1 with a FRESH token. A failed attempt's
+// "next_attempt_at" marker behaves the same way: if the worker crashes before
+// the message is reclaimed, the marker's deadline elapses and the invocation
+// becomes eligible again. Terminal "ok" and exhausted markers are never
+// re-opened, and every transition that originates from an active claim CASes
+// BOTH the attempt and the token, so a stale owner can never overwrite a newer
+// claim's marker even if the attempt count happens to match.
+//
+// Lifetime: none of these writes sets a TTL. While the message is recoverable
+// (still in the PEL) the hash is PERSISTENT, so a redelivery always observes the
+// marker regardless of how long the message sat pending. Only after the message
+// leaves the PEL does the stream layer switch the hash to terminal retention
+// (invocationRetentionTTL) via the reserved terminal marker.
 type InvocationState interface {
 	IsComplete(invocation string) bool
 	// MarkComplete records the invocation complete, CASed on the claim returned

@@ -534,7 +534,7 @@ export async function slow(event) {
 	// The DEL below is test-only: it clears the marker so the invocation is
 	// immediately eligible instead of waiting out the remaining ~25s. This keeps
 	// the test focused on message recovery; it does not exercise the production
-	// path where an expired marker carries its attempt forward.
+	// path where a marker past its deadline carries its attempt forward.
 	_ = env.client.Del(context.Background(), invKey).Err()
 
 	var bCalls atomic.Int64

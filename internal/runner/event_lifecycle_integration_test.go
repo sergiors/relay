@@ -197,9 +197,18 @@ func (e *eventEnv) stateField(msgID, invocation string) (string, error) {
 	return e.client.HGet(context.Background(), e.invocationKey(msgID), invocation).Result()
 }
 
-func (e *eventEnv) hasStateKey(msgID string) bool {
-	n, err := e.client.Exists(context.Background(), e.invocationKey(msgID)).Result()
-	return err == nil && n == 1
+// isRetained reports whether the message's invocation-state hash has been
+// switched to terminal retention: still present, carrying the reserved terminal
+// marker, and holding a positive retention TTL. This is the post-ACK contract
+// that replaced the old eager delete.
+func (e *eventEnv) isRetained(msgID string) bool {
+	key := e.invocationKey(msgID)
+	v, err := e.client.HGet(context.Background(), key, "__terminal").Result()
+	if err != nil || v != "1" {
+		return false
+	}
+	d, err := e.client.PTTL(context.Background(), key).Result()
+	return err == nil && d > 0
 }
 
 // eventually polls pred until it holds, failing with what on timeout.
@@ -284,8 +293,8 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 		_, ok := e.pending(id)
 		return !ok
 	})
-	e.eventually("invocation-state key cleared after DLQ", func() bool {
-		return !e.hasStateKey(id)
+	e.eventually("invocation-state key terminal-retained after DLQ", func() bool {
+		return e.isRetained(id)
 	})
 
 	// The successful handler was never re-run; each handler executed exactly its
@@ -364,8 +373,8 @@ func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing
 		_, ok := e.pending(id)
 		return !ok
 	})
-	e.eventually("invocation-state key cleared after DLQ", func() bool {
-		return !e.hasStateKey(id)
+	e.eventually("invocation-state key terminal-retained after DLQ", func() bool {
+		return e.isRetained(id)
 	})
 
 	// Each handler executed exactly once and was never re-run after exhaustion.
@@ -453,8 +462,8 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 		_, ok := e.pending(id)
 		return !ok
 	})
-	e.eventually("invocation-state key cleared after DLQ", func() bool {
-		return !e.hasStateKey(id)
+	e.eventually("invocation-state key terminal-retained after DLQ", func() bool {
+		return e.isRetained(id)
 	})
 
 	// Neither handler re-ran: A completed once, B exhausted once.
@@ -526,8 +535,8 @@ func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T)
 		_, ok := e.pending(id)
 		return !ok
 	})
-	e.eventually("invocation-state key cleared after ack", func() bool {
-		return !e.hasStateKey(id)
+	e.eventually("invocation-state key terminal-retained after ack", func() bool {
+		return e.isRetained(id)
 	})
 	if _, ok := e.dlqEntry(id); ok {
 		t.Fatalf("recovered event must never be DLQ'd")

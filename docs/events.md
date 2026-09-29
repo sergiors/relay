@@ -159,6 +159,20 @@ once, so handlers must be idempotent.
   message stays pending, because running a duplicate could race a replica that
   won the same claim.
 
+### Invocation state persistence
+
+Per-message invocation state is a Redis hash keyed by message and
+`<function>/<handler>`. While the message is still pending (recoverable — it can
+be redelivered from the PEL) that hash is **persistent with no TTL**, so however
+long a message sits pending its `running`/`next_attempt_at`/terminal markers are
+still there when a reclaim reads them. Only after the message has left the PEL —
+a successful XACK on the success, obsolete-schedule, or DLQ path, or a cleared
+missing-payload PEL reference — is the hash switched to **terminal retention**:
+a reserved marker plus a ~7-day TTL. Once retained, every lifecycle transition
+from a stale in-memory delivery is inert, so it can neither mutate the retained
+state nor remove the retention TTL. A hash left un-retained (for example a crash
+in the ACK→retain window) is simply leaked, never prematurely expired.
+
 ## Dead-letter queue
 
 When **all** non-complete matched invocations are exhausted, the message is

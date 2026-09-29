@@ -232,19 +232,26 @@ at startup.
 
 - Consumer group is created with `MKSTREAM` at position `0`; a new group over an
   existing stream replays its backlog.
-- Per-invocation state is a TTL'd Redis hash keyed by message and
+- Per-invocation state is a Redis hash keyed by message and
   `<function>/<handler>` with forms `ok`, `running:<deadline>`, `
 next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
   transition is one atomic Lua script; active-claim transitions CAS both attempt
   and claim token, so a stale claim can never overwrite a newer claim or a
-  terminal marker. Keys expire after 7 days as a fallback for abandoned messages.
+  terminal marker. While the message is pending the hash is **persistent**;
+  only after it leaves the PEL (successful XACK or a cleared
+  missing-payload reference) does it switch to terminal retention with a ~7-day
+  TTL. A hash whose retention never runs is leaked, never prematurely expired.
 - Deadlines are integer Unix milliseconds, compared exactly (`now_ms <
 deadline_ms` is protected).
 - Recovery reclaims idle pending messages (`XAUTOCLAIM`, default 1m) as a
   message-level backstop, not the retry timer.
 - Redis outages are survived with bounded, jittered backoff (1s…30s cap).
 - State, metrics, and cleanup failures are logged, never fatal. Transport errors
-  leave messages pending (fail open); an ambiguous `TryStart` claim fails closed.
+  leave messages pending (fail open); two failures fail closed and leave the
+  message pending with no handler run and no ACK — an ambiguous `TryStart` claim
+  (it could race a replica that won) and a `makeRecoverable` failure (a legacy-TTL
+  hash that could not be made persistent may expire mid-delivery, so its state
+  cannot be relied on).
 
 ## DLQ controls
 

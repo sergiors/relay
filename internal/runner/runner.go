@@ -2597,7 +2597,7 @@ func (r *Runner) recordFailure(
 	}
 	// Retryable: schedule a retry backoff and count the retry. The claim
 	// (attempt + token) is passed as a compare-and-set guard so a stale owner
-	// (whose running lease expired and whose invocation was re-claimed by a
+	// (whose running deadline elapsed and whose invocation was re-claimed by a
 	// newer claim) cannot overwrite the newer claim's marker. If the store
 	// refuses (stale claim or terminal marker), this delivery does not own the
 	// invocation: leave the message pending rather than schedule a retry on a
