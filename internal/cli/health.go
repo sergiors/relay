@@ -2,105 +2,84 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"time"
 
-	"github.com/moby/moby/client"
-	"github.com/redis/go-redis/v9"
 	"github.com/urfave/cli/v3"
 
-	"relay/internal/config"
+	"relay/internal/worker"
 )
 
-// healthTimeout bounds each dependency probe so a hung daemon or Redis does not
-// stall the healthcheck indefinitely.
-const healthTimeout = 2 * time.Second
-
-// healthCommand builds the `relay health` subcommand. It checks the two
-// dependencies the worker needs at startup — Redis connectivity and Docker
-// daemon connectivity — and exits 0 when both are reachable, 1 otherwise. It
-// never starts consumption, loads functions, builds images, or touches the
-// state database; it only creates clients and pings.
-func healthCommand(logger *slog.Logger) *cli.Command {
+// healthCommand builds the `relay health` subcommand. It reports whether the
+// RUNNING worker is healthy by dialing the worker's control socket
+// (worker.CheckReady) — the same socket `function inspect` and `stats reset`
+// use — and exits 0 only when the worker reports ready with its live
+// dependencies healthy, 1 otherwise. It is the single user-facing
+// health/readiness query.
+//
+// It deliberately loads no configuration and instantiates no Redis or Docker
+// client in the CLI process: the answer comes entirely from the worker over its
+// socket. There is no fallback — with no running worker (an unreachable socket)
+// health fails even if Redis and Docker happen to be healthy, because
+// dependency health is only meaningful as observed by the worker that owns
+// them.
+func healthCommand(deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:  "health",
-		Usage: "Check Relay dependencies",
-		Description: "Check that the dependencies Relay needs at startup — Redis connectivity " +
-			"and the Docker daemon — are reachable. Exits 0 when both are healthy, 1 otherwise.",
+		Usage: "Check whether the running worker is healthy",
+		Description: "Ask the running worker (over its control socket) whether it is ready " +
+			"to consume. Exits 0 when ready, 1 when not: no worker is running, the worker " +
+			"is still starting or shutting down, or its live dependencies (Redis consumer, " +
+			"Docker, configured NETWORKS) are currently failing.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("health: too many arguments", 2)
 			}
-			return runHealthCommand(ctx, cmd.Writer, logger)
+			return runHealthCommand(ctx, cmd.Writer, deps.SocketPath)
 		},
 	}
 }
 
-// runHealthCommand implements the `relay health` subcommand body. Dependency
-// probes derive their timeouts from the incoming ctx rather than a fresh
-// background context, so callers control how long a hung dependency may stall.
-func runHealthCommand(ctx context.Context, w io.Writer, logger *slog.Logger) error {
-	// The health command loads the full configuration via config.Load(logger),
-	// the same entry point the worker's `relay start` uses. A missing required
-	// variable (REDIS_URI/REDIS_STREAM/REDIS_GROUP) or an unresolvable hostname
-	// returns an error that propagates to cmd/main.go, which prints it once and
-	// exits 1: the healthcheck fails hard rather than probing with nothing (or
-	// half) configured. This IS a behavior change — `relay health` now requires
-	// REDIS_STREAM and REDIS_GROUP to be set too, even though the health command
-	// only pings Redis — and it is intentional, since health's job is to verify
-	// the worker's actual startup configuration, not a hand-picked subset. A
-	// malformed DSN is surfaced by RedisOptions below.
-	redisCheck := func() error {
-		cfg, err := config.Load(logger)
-		if err != nil {
-			return fmt.Errorf("config: %w", err)
-		}
-		redisOpts, err := config.RedisOptions(cfg.RedisURI)
-		if err != nil {
-			return fmt.Errorf("redis config: %w", err)
-		}
-		cli := redis.NewClient(redisOpts)
-		defer cli.Close()
-		pctx, cancel := context.WithTimeout(ctx, healthTimeout)
-		defer cancel()
-		if err := cli.Ping(pctx).Err(); err != nil {
-			return fmt.Errorf("redis unavailable: %w", err)
-		}
-		return nil
-	}
-
-	dockerCheck := func() error {
-		cli, err := client.New(client.FromEnv)
-		if err != nil {
-			return fmt.Errorf("docker unavailable: %w", err)
-		}
-		defer cli.Close()
-		pctx, cancel := context.WithTimeout(ctx, healthTimeout)
-		defer cancel()
-		if _, err := cli.Ping(pctx, client.PingOptions{}); err != nil {
-			return fmt.Errorf("docker unavailable: %w", err)
-		}
-		return nil
-	}
-
-	return checkHealth(w, redisCheck, dockerCheck)
-}
-
-// checkHealth runs the two dependency checks in a fixed order (redis then
-// docker) and reports the first failure. It is separated from the real
-// implementation so unit tests can inject fakes without Redis or Docker.
+// runHealthCommand implements `relay health` against the worker socket at path.
+// It writes "healthy" and returns nil only for a genuinely ready worker with
+// healthy live dependencies. Every other outcome is an error (the root
+// ExitErrHandler prints the message once and exits 1), with a concise, useful
+// reason:
 //
-// On success it writes "healthy" to w. On failure it returns the wrapped error
-// (never printing it here — the root ExitErrHandler prints it once).
-func checkHealth(w io.Writer, redisCheck, dockerCheck func() error) error {
-	if err := redisCheck(); err != nil {
-		return err
+//   - an unreachable socket (no worker, a stale socket, or a failed exchange)
+//     is "worker not running";
+//   - a worker that answered not-ready surfaces its own short reason, which
+//     names the phase or failed dependency (e.g. "worker starting",
+//     "worker shutting down", "redis consumer unhealthy", "docker unavailable",
+//     a missing NETWORKS network).
+func runHealthCommand(ctx context.Context, w io.Writer, path string) error {
+	ready, reason, err := worker.CheckReady(ctx, path)
+	if err == nil {
+		if !ready {
+			// Defensive: CheckReady reports not-ready as an error, so this is
+			// unreachable in practice.
+			return fmt.Errorf("health: worker not ready")
+		}
+		fmt.Fprintln(w, "healthy")
+		return nil
 	}
-	if err := dockerCheck(); err != nil {
-		return err
+	switch {
+	case errors.Is(err, worker.ErrReadyUnavailable):
+		// No worker answered: no socket, a stale socket, or a failed exchange.
+		// Worker health is only meaningful as observed by the worker that owns
+		// the dependencies, so this is a failure even if Redis/Docker are up.
+		return fmt.Errorf("health: worker not running")
+	case errors.Is(err, worker.ErrNotReady):
+		// The worker answered not-ready. Surface its own short reason, which
+		// names the phase or failed dependency ("worker starting", "worker
+		// shutting down", "redis consumer unhealthy", "docker unavailable", a
+		// missing network, ...).
+		if reason == "" {
+			reason = "not ready"
+		}
+		return fmt.Errorf("health: %s", reason)
+	default:
+		return fmt.Errorf("health: %w", err)
 	}
-	fmt.Fprintln(w, "healthy")
-	return nil
 }

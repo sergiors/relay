@@ -19,10 +19,10 @@ a usage error naming the full command path.
 
 ## Prerequisites per command
 
-| Command                              | Needs Redis | Needs Docker | Needs a running worker | Reads/writes                                  |
-| ------------------------------------ | ----------- | ------------ | ---------------------- | --------------------------------------------- |
-| `start`                              | yes         | yes          | —                      | runtime                                       |
-| `health`                             | yes (ping)  | yes (ping)   | no                     | nothing                                       |
+| Command                              | Needs Redis | Needs Docker          | Needs a running worker | Reads/writes                                  |
+| ------------------------------------ | ----------- | --------------------- | ---------------------- | --------------------------------------------- |
+| `start`                              | yes         | yes                   | —                      | runtime                                       |
+| `health`                             | no          | no                    | **yes**                | worker socket                                 |
 | `stats`                              | no          | no           | no                     | state DB (read)                               |
 | `stats reset`                        | no          | no           | optional (socket)      | state DB (write); worker socket when running  |
 | `function ls` / `inspect`            | no          | no           | optional (inspect)     | state DB (read); socket for live pool gauges  |
@@ -45,8 +45,30 @@ taken metrics/webhook port).
 
 ## relay health
 
-Pings Redis and the Docker daemon and exits `0` when both are reachable, `1`
-otherwise. Used as the container healthcheck.
+```
+relay health
+```
+
+Asks the **running worker** — over the same Unix control socket `function
+inspect` and `stats reset` use — whether it is healthy: ready to consume with
+its live dependencies healthy. Exits `0` when healthy, `1` otherwise. It requires
+no `REDIS_*`/Docker configuration in the CLI process and never creates a Redis or
+Docker client itself; the answer comes entirely from the worker over its socket
+(see [operations.md](operations.md) for details). Used as the container
+healthcheck.
+
+- No running worker, a worker still starting, or a shutting-down worker is **not
+  healthy**. Readiness is set only at the ready-to-consume boundary (after the
+  dependency preflight, function load/preparation, and the socket/listener/loop
+  wiring, immediately before consumption) and cleared first on shutdown; it is
+  bound to the worker lifecycle, so a lifecycle cancellation that precedes the
+  clear also reports not-healthy.
+- In steady state the worker answers from **live** dependency health: Redis
+  consumer health, a bounded Docker ping, and `NETWORKS` verification. A
+  dependency failing reports not-healthy, and recovery reports healthy again — no
+  restart required. `SQLite`, optional tracing, and asynchronous service
+  convergence/housekeeping are not blockers, and a per-function
+  `degraded`/`unavailable`/`invalid` status does not change worker health.
 
 ## relay stats
 
@@ -60,7 +82,7 @@ Events matched:      152934
 Events unmatched:    66
 Handler successes:   152801
 Handler failures:    133
-Retries:             82
+Message reclaims:    82
 DLQ entries:         4
 Pending entries:     17
 Oldest pending age:  2m14s
@@ -69,6 +91,14 @@ Updated:             10s ago
 
 Reads the persisted snapshot only; works when the runtime is down. A fresh
 database renders zeroes with `Updated: never`. Backlog gauges are global.
+
+`Message reclaims` is `relay_retries_total`: stream messages reclaimed and
+re-delivered, **not** handler retries (`relay_function_retries_total`, rendered
+per function by `relay function inspect` as `Handler retries`). `DLQ entries`
+is `relay_dlq_entries_total`: successful writes to the Redis DLQ stream (one per
+exhausted invocation, plus a placeholder per malformed message), **not** the
+count of invocations that exhausted their retries (that is
+`relay_function_dlq_total`, rendered per function as `Invocations exhausted`).
 
 ```
 relay stats reset
@@ -108,6 +138,14 @@ per-container `Resources`, per-function stats, `Events`, `Schedules`, `Services`
 starting) are resolved live from an in-process provider or the worker socket;
 without a reachable worker they render `unknown`, while the cumulative
 warm/cold/discarded counters always come from the persisted snapshot.
+
+The per-function stats rows are `Handler retries` (handler retry attempts,
+`relay_function_retries_total`) and `Invocations exhausted` (invocations that
+exhausted their retry budget, `relay_function_dlq_total`) — **not** a count of
+successfully written DLQ entries. `Last exhaustion` is the last retry exhaustion
+(the exhaustion commit), not a successful DLQ write. The global `relay stats`
+labels `Message reclaims` and `DLQ entries` mean different things; see
+[relay stats](#relay-stats).
 
 ### relay function invoke
 

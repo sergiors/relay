@@ -123,7 +123,7 @@ func printStats(w io.Writer, st *state.State) {
 	fmt.Fprintf(tw, "Events unmatched:\t%d\n", s.EventsUnmatchedTotal)
 	fmt.Fprintf(tw, "Handler successes:\t%d\n", s.HandlerSuccessTotal)
 	fmt.Fprintf(tw, "Handler failures:\t%d\n", s.HandlerFailureTotal)
-	fmt.Fprintf(tw, "Retries:\t%d\n", s.RetryTotal)
+	fmt.Fprintf(tw, "Message reclaims:\t%d\n", s.RetryTotal)
 	fmt.Fprintf(tw, "DLQ entries:\t%d\n", s.DLQTotal)
 	fmt.Fprintf(tw, "Pending entries:\t%d\n", s.PendingEntries)
 	fmt.Fprintf(tw, "Oldest pending age:\t%s\n", humanAge(s.OldestPendingAgeSeconds))

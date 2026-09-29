@@ -428,6 +428,21 @@ func (m *Manager) Logger() *slog.Logger {
 	return m.log
 }
 
+// Ping performs one bounded Docker daemon ping through the manager's client,
+// honoring ctx (the caller supplies its own deadline). It is the live
+// dependency check the worker's readiness probe uses in steady state: the
+// manager's startup ping happened once at construction, but readiness must
+// reflect whether the daemon is still reachable. It deliberately does NOT use
+// the manager lifecycle or an internal timeout — the caller owns the bound, so
+// a readiness query can never stall and a cancelled query aborts promptly.
+func (m *Manager) Ping(ctx context.Context) error {
+	if m == nil || m.cli == nil {
+		return fmt.Errorf("docker client unavailable")
+	}
+	_, err := m.cli.Ping(ctx, client.PingOptions{})
+	return err
+}
+
 // resolveManagerOptions applies the options in order and normalizes a
 // non-positive idle timeout to the package default, so NewManager never starts
 // the maintenance loop with a disabled eviction window. It is a pure function

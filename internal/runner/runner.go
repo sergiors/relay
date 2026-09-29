@@ -2562,11 +2562,14 @@ func (r *Runner) recordFailure(
 		// delivery does not own the invocation's resolution: do NOT report
 		// exhaustion (which would dead-letter a message whose newer claim may
 		// still resolve), leave the message pending, and let the newer claim or a
-		// later terminal-skip delivery drive the DLQ decision. This is the DLQ
-		// attribution point: the invocation exhausted its retries and the message
-		// is being routed to the DLQ, so last_dlq_at is stamped HERE — not on
-		// every failure, and not again on the later terminal-skip redeliveries of
-		// the same invocation.
+		// later terminal-skip delivery drive the DLQ decision. This is the
+		// exhaustion-commit attribution point: the invocation exhausted its
+		// retries and its terminal exhausted marker is now persisted, so
+		// function_dlq_total and last_dlq_at are stamped HERE — not on every
+		// failure, not again on the later terminal-skip redeliveries of the same
+		// invocation, and not at the message-level DLQ write (which happens later
+		// in the stream layer, only after all exhausted siblings resolve, and
+		// only if the XADD succeeds).
 		if !invState.MarkExhausted(invocation, claim) {
 			r.log.Warn("Function handler: exhaustion superseded; leaving pending",
 				"function", fnName,

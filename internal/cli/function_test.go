@@ -251,8 +251,8 @@ func TestFunctionInspectStatsSection(t *testing.T) {
 		"Events matched: 12493",
 		"Handler successes: 12470",
 		"Handler failures: 23",
-		"Retries: 17",
-		"DLQ entries: 2",
+		"Handler retries: 17",
+		"Invocations exhausted: 2",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -282,8 +282,8 @@ func TestFunctionInspectStatsZeroWithoutRow(t *testing.T) {
 		"Events matched: 0",
 		"Handler successes: 0",
 		"Handler failures: 0",
-		"Retries: 0",
-		"DLQ entries: 0",
+		"Handler retries: 0",
+		"Invocations exhausted: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -772,7 +772,7 @@ func TestFunctionCommandHelp(t *testing.T) {
 }
 
 // The Stats section renders the four per-function execution-history timestamps
-// as relative ages ("2s ago"-style rows) after the DLQ entries line.
+// as relative ages ("2s ago"-style rows) after the Invocations exhausted line.
 func TestFunctionInspectStatsTimestamps(t *testing.T) {
 	st, _ := seedTestState(t)
 	exec := time.Now().Add(-2 * time.Second).UTC()
@@ -801,18 +801,18 @@ func TestFunctionInspectStatsTimestamps(t *testing.T) {
 		"Last execution: 2s ago",
 		"Last success: 2s ago",
 		"Last failure: 1m ago",
-		"Last DLQ: 2d ago",
+		"Last exhaustion: 2d ago",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
 	}
-	// The rows come after "DLQ entries:".
-	after := strings.Index(out, "DLQ entries:")
-	for _, row := range []string{"Last execution:", "Last success:", "Last failure:", "Last DLQ:"} {
+	// The rows come after "Invocations exhausted:".
+	after := strings.Index(out, "Invocations exhausted:")
+	for _, row := range []string{"Last execution:", "Last success:", "Last failure:", "Last exhaustion:"} {
 		i := strings.Index(out, row)
 		if i == -1 || i < after {
-			t.Errorf("%s must follow DLQ entries (order):\n%s", row, out)
+			t.Errorf("%s must follow Invocations exhausted (order):\n%s", row, out)
 		}
 	}
 }
@@ -833,7 +833,7 @@ func TestFunctionInspectStatsTimestampsNever(t *testing.T) {
 		"Last execution: never",
 		"Last success: never",
 		"Last failure: never",
-		"Last DLQ: never",
+		"Last exhaustion: never",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)

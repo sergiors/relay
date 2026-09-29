@@ -159,14 +159,30 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - `relay start` runs in the foreground, holds a process lock, and never
   daemonizes, forks, or writes a PID file. Shutdown cancels the lifecycle first,
   then runs bounded, ordered steps; the process lock and Redis are released last.
-- Tree: `start`; `health`; `stats` (`reset`); `function` (`ls`, `inspect`,
-  `invoke`); `dlq` (`ls`, `inspect`, `replay`, `rm`); `secret` (`ls`, `set`,
-  `rm`); `git` (`keygen`, `set`, `sync`, `status`, `remove`). Grouping commands
-  show help when bare and return a usage error on an unknown subcommand.
-- `stats`/`function ls|inspect` read SQLite only; `invoke`, `dlq replay`, and a
-  running `stats reset` use the worker socket; `dlq` is the one command needing
-  Redis. Persistent state is under `/var/lib/relay`, ephemeral lock/socket state
-  under `/run/relay`; `/functions` is written only by `git sync`.
+- A worker-owned readiness flag (`internal/worker/readiness.go`) starts false,
+  is set true only at the ready-to-consume boundary (after the preflight,
+  function load/prepare, and socket/listener/loop and consumer/schedule/
+  reconciler/scheduler wiring, immediately before `Consume`), and is cleared as
+  the first instruction of the shutdown defer, before lifecycle cancellation.
+  It is bound to the worker lifecycle context, so a lifecycle cancellation that
+  precedes that clear also reports not-ready. `relay health` queries it over the
+  existing control socket; a false flag is not-ready, and in steady state the
+  query reflects live Redis consumer health plus a bounded Docker ping and
+  `NETWORKS` verification. Per-function status, SQLite, tracing, and
+  asynchronous service/housekeeping convergence do not gate readiness.
+- Tree: `start`; `health`; `stats` (`reset`); `function` (`ls`,
+  `inspect`, `invoke`); `dlq` (`ls`, `inspect`, `replay`, `rm`); `secret` (`ls`,
+  `set`, `rm`); `git` (`keygen`, `set`, `sync`, `status`, `remove`). Grouping
+  commands show help when bare and return a usage error on an unknown
+  subcommand.
+- `health` is worker health over the socket: it asks the RUNNING worker whether
+  it is ready with its live dependencies healthy, and needs no Redis/Docker
+  configuration or clients in the CLI process (with no running worker it fails).
+  `stats`/`function ls|inspect` read SQLite only; `health`, `invoke`,
+  `dlq replay`, and a running `stats reset` use the worker socket; `dlq` is the
+  one command needing Redis. Persistent state is under `/var/lib/relay`,
+  ephemeral lock/socket state under `/run/relay`; `/functions` is written only by
+  `git sync`.
 
 ## Conventions
 

@@ -3,7 +3,7 @@
 // in internal/worker (see `relay start`). Errors are RETURNED, never printed or
 // turned into os.Exit here: cmd/main.go prints the returned error exactly once
 // and owns the process exit. Run receives the context from main, so signal
-// cancellation propagates into ctx-aware paths like health probes.
+// cancellation propagates into ctx-aware paths like the worker health query.
 package cli
 
 import (
@@ -37,7 +37,7 @@ type DLQStore interface {
 // tree never reads environment variables or constructs Redis clients itself,
 // and tests (or an embedding host) can inject a fake without mutable globals.
 // Production wires openRedisDLQStore, which follows the same config.Load +
-// config.RedisOptions conventions as `relay health`.
+// config.RedisOptions conventions as `relay start`.
 type OpenDLQStore func(logger *slog.Logger) (store DLQStore, cleanup func(), err error)
 
 // StartRun is the narrow seam `relay start` delegates to for the long-running
@@ -60,8 +60,12 @@ type Dependencies struct {
 	// (function inspect, stats) only read, while `stats reset` writes (zeroing
 	// the cumulative counters in place). Production: state.DBPath.
 	StatePath string
-	// SocketPath is the live worker query socket `relay function inspect`
-	// dials for the live runtime-pool gauges. Production: worker.SocketPath.
+	// SocketPath is the live worker control socket: `relay health` dials it to
+	// ask whether the running worker is healthy (worker readiness plus live
+	// dependency health), `relay function inspect` dials it for the live
+	// runtime-pool gauges, `relay function invoke` and `relay dlq replay` dial
+	// it to run against the live runtime, and a running `relay stats reset`
+	// dials it to reset the worker's statistics. Production: worker.SocketPath.
 	SocketPath string
 	// LockPath is the process-level lock file `relay start` holds for its
 	// lifetime; its parent directory is created before the lock is acquired.
@@ -115,7 +119,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 			secretCommand(),
 			gitCommand(),
 			statsCommand(deps),
-			healthCommand(logger),
+			healthCommand(deps),
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if !cmd.Args().Present() {

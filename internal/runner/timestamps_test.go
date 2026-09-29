@@ -129,8 +129,8 @@ func TestRetryAttemptsUpdateTimestampsThenSuccessPreservesFailure(t *testing.T) 
 }
 
 // TestExhaustedAttemptSetsDLQOnlyOnExhaustion pins the DLQ attribution point:
-// retryable failures never set last_dlq; the attempt that exhausts (and routes
-// the message to the DLQ) does — once.
+// retryable failures never set last_dlq; the attempt that commits exhaustion
+// (returning the exhaustion signal the stream layer acts on) does — once.
 func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{fail: true}
@@ -147,7 +147,9 @@ func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 		t.Fatalf("retryable attempt must not set LastDLQ: %+v", s)
 	}
 
-	// Attempt 2: exhausts → the message routes to the DLQ → LastDLQ is stamped.
+	// Attempt 2: exhausts → the exhaustion is committed and the exhaustion
+	// signal is returned → LastDLQ is stamped. (The stream layer performs the
+	// actual DLQ write; a later write/XACK failure must not change attribution.)
 	prog.advance(retryBackoff(1))
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("attempt 2 error = %v, want ErrInvocationExhausted", err)
@@ -245,7 +247,8 @@ func TestInvokeHandlerTimestamps(t *testing.T) {
 // TestInvokeHandlerExhaustedSetsDLQ pins the schedule path's exhaustion:
 // schedFn carries a zero-retry schedule (not parsed from YAML, so no default),
 // meaning maxAttempts = 1 and the FIRST failure exhausts — a schedule has
-// exactly ONE invocation, so the message is terminal and is routed to the DLQ;
+// exactly ONE invocation, so the message is terminal and exhaustion is
+// committed (the stream layer is expected to perform the DLQ write);
 // last_dlq must be stamped at that point.
 func TestInvokeHandlerExhaustedSetsDLQ(t *testing.T) {
 	m := metrics.New()

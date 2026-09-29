@@ -17,12 +17,15 @@ import (
 // It is classified once per logical event across redeliveries. A handler
 // failure does not move the event out of the matched class.
 // HandlerSuccessTotal/HandlerFailureTotal are per rule execution.
-// RetryTotal counts every failing rule execution (a retry driver);
-// DLQTotal counts a function once when its failing rule execution is the one
-// that exhausts its retry budget and the invocation is marked terminal for the
-// DLQ. It is counted at that exhaustion commit, which may precede the actual
-// message-level DLQ write (that happens after every exhausted sibling
-// invocation in the same delivery has finished).
+// RetryTotal counts every failing rule execution (a handler retry, not a
+// stream message reclaim); DLQTotal counts the exhaustion COMMIT for an
+// invocation: a function is counted once when its failing rule execution is
+// the one that exhausts its retry budget and the invocation's terminal
+// exhausted marker is committed. It is counted at that exhaustion commit,
+// which may precede the actual message-level DLQ write (that happens after
+// every exhausted sibling invocation in the same delivery has finished) and
+// which may never be followed by one if that write fails — so it counts
+// invocations exhausted, not successfully written DLQ entries.
 //
 // The four Last*At fields are per-function execution-history timestamps in the
 // RFC3339 convention of UpdatedAt (empty string = never observed):
@@ -30,10 +33,10 @@ import (
 // claimed attempt is an execution); LastSuccessAt / LastFailureAt the last
 // successful / failed handler execution (a failed attempt that will retry
 // counts as a failure); LastDLQAt the last invocation that exhausted its
-// retries and was ROUTED TO THE DLQ (the actual DLQ attribution point, not
-// every failure). They are reset by nothing but a genuine removal: unlike the
-// counters, an incoming empty value must never clobber a persisted timestamp
-// (see mergeFunctionStatsTimestamps).
+// retries (the exhaustion commit — the last retry exhaustion, not a
+// successfully written DLQ entry, and not every failure). They are reset by
+// nothing but a genuine removal: unlike the counters, an incoming empty value
+// must never clobber a persisted timestamp (see mergeFunctionStatsTimestamps).
 //
 // WarmAcquiresTotal / ColdStartsTotal / DiscardedTotal are the cumulative
 // warm-container pool counters (see runtime.PoolSnapshot): warm acquires served

@@ -200,12 +200,12 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 	fmt.Fprintf(sw, "  Events matched:\t%d\n", fs.EventsMatchedTotal)
 	fmt.Fprintf(sw, "  Handler successes:\t%d\n", fs.HandlerSuccessTotal)
 	fmt.Fprintf(sw, "  Handler failures:\t%d\n", fs.HandlerFailureTotal)
-	fmt.Fprintf(sw, "  Retries:\t%d\n", fs.RetryTotal)
-	fmt.Fprintf(sw, "  DLQ entries:\t%d\n", fs.DLQTotal)
+	fmt.Fprintf(sw, "  Handler retries:\t%d\n", fs.RetryTotal)
+	fmt.Fprintf(sw, "  Invocations exhausted:\t%d\n", fs.DLQTotal)
 	fmt.Fprintf(sw, "  Last execution:\t%s\n", lastAgo(fs.LastExecutionAt))
 	fmt.Fprintf(sw, "  Last success:\t%s\n", lastAgo(fs.LastSuccessAt))
 	fmt.Fprintf(sw, "  Last failure:\t%s\n", lastAgo(fs.LastFailureAt))
-	fmt.Fprintf(sw, "  Last DLQ:\t%s\n", lastAgo(fs.LastDLQAt))
+	fmt.Fprintf(sw, "  Last exhaustion:\t%s\n", lastAgo(fs.LastDLQAt))
 	sw.Flush()
 
 	if len(detail.Handlers) > 0 {

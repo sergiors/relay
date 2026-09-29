@@ -86,12 +86,29 @@ degraded without stopping the worker.
 `compose.dev.yaml` mounts a named volume at `/var/lib/relay`, so state, secrets,
 and git material survive container restarts. Deleting the volume deletes them.
 
-## Health and stats
+## Health and readiness
 
-`relay health` is the container healthcheck: it pings Redis and the Docker
-daemon (2s each) and exits `0` when both are reachable, `1` otherwise. It needs
-the required `REDIS_*` variables but never starts the runtime, loads functions,
-or touches state.
+`relay health` reports whether the **running worker** is healthy by asking it,
+over its Unix control socket, whether it is ready to consume with its live
+dependencies healthy (the container healthcheck). It exits `0` when healthy, `1`
+otherwise, and needs no Redis or Docker configuration in the CLI process: it
+creates no dependency clients and loads no configuration, so the answer comes
+entirely from the worker. With no running worker it fails — worker health is only
+meaningful as observed by the worker that owns the dependencies.
+
+Readiness is worker-owned: the flag starts false and is set true only at the
+ready-to-consume boundary (after the external-dependency preflight, function
+loading/preparation, and the socket/listener/loop and
+consumer/schedule/reconciler/scheduler wiring, just before consumption), and
+cleared first on shutdown; it is bound to the worker lifecycle context, so a
+lifecycle cancellation that precedes the clear also reports not-ready. In steady
+state the answer reflects live Redis consumer health, a bounded Docker ping, and
+`NETWORKS` verification, so a dependency failing reports unhealthy and recovery
+reports healthy again. Per-function degraded/unavailable/invalid status, SQLite,
+optional tracing, and asynchronous service convergence/housekeeping do not gate
+worker health.
+
+There is no HTTP health/readiness endpoint; health is a CLI command.
 
 `relay stats` reads the persisted global snapshot from SQLite (no Redis, Docker,
 or worker needed; works when the runtime is down). It may lag live Prometheus by
@@ -119,9 +136,15 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   `relay_handler_failure_total`, `relay_retries_total`, `relay_dlq_entries_total`,
   `relay_handler_invocations_total{outcome,function,handler}`,
   `relay_handler_duration_seconds{function,handler}`.
+  `relay_retries_total` counts stream **message reclaims** (redeliveries), not
+  handler retries. `relay_dlq_entries_total` counts successful **DLQ entry
+  writes** (one per exhausted invocation, plus a placeholder per malformed
+  message).
 - **Per-function:** `relay_function_events_matched_total{function}`,
-  `relay_function_handler_*_total{function}`, `relay_function_retries_total`,
-  `relay_function_dlq_total`, `relay_function_status{function,status}`.
+  `relay_function_handler_*_total{function}`, `relay_function_retries_total`
+  (handler retry attempts), `relay_function_dlq_total` (invocations that
+  exhausted their retry budget — the exhaustion commit, **not** a successful DLQ
+  write), `relay_function_status{function,status}`.
 - **Backlog/concurrency:** `relay_pending_entries`,
   `relay_pending_oldest_age_seconds` (sampled from `XPENDING` every 15s),
   `relay_buffered_events`, `relay_in_flight_invocations`,

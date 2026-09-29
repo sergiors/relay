@@ -1,51 +1,63 @@
 //go:build integration
 
-// This file exercises the `relay health` command's real path against reachable
-// Redis and Docker.
+// This file exercises the `relay health` command's real path — the CLI dialing
+// the worker's control socket — end to end.
 //
-// This file is excluded from the default suite by the integration build tag.
-// Running it (`go test -tags=integration ./...`) REQUIRES both a reachable
-// Docker daemon AND Redis at REDIS_TEST_ADDR (default localhost:6379, matching
-// compose.dev.yaml); a missing dependency fails the affected tests rather than
-// skipping them. Start the documented dev dependencies with
-// `docker compose -f compose.dev.yaml up -d`. The Docker daemon is located via
-// client.FromEnv, so DOCKER_HOST, the local socket, and a socket proxy are all
-// respected.
+// It is excluded from the default suite by the integration build tag. Unlike
+// the other integration tests it REQUIRES no external dependency: no Redis, no
+// Docker, and no live deployment. `relay health` owns no dependency clients in
+// the CLI process any more, so the worker socket is the only seam and a real
+// SocketServer with a deterministic readiness checker is enough to drive it.
 package cli
 
 import (
-	"bytes"
-	"context"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 
-	"relay/internal/testutil"
+	"relay/internal/worker"
 )
 
-// TestIntegrationHealthRealPath verifies the real `relay health` path exits 0
-// when both Redis and Docker are reachable, and exits 1 when Redis is not.
-func TestIntegrationHealthRealPath(t *testing.T) {
-	testutil.RequireRedis(t)
-	testutil.RequireDocker(t)
+// TestIntegrationHealthSocketBacked pins the real `relay health` path over a
+// real worker socket: it is healthy while the worker answers ready, and fails
+// with "worker not running" once the socket is gone — with no Redis or Docker
+// involved at any point, proving the CLI no longer probes dependencies itself.
+func TestIntegrationHealthSocketBacked(t *testing.T) {
+	deps := testDeps(t)
 
-	// The health command loads full config via config.Load, which RETURNS an
-	// error when a required REDIS_* variable is missing, so provide a discard
-	// logger and set all three required variables (REDIS_STREAM and
-	// REDIS_GROUP need only be non-empty; only REDIS_URI is pinged).
-	logger := testutil.DiscardLogger()
-	redisURI := testutil.EnvOr("REDIS_TEST_ADDR", "localhost:6379")
-	t.Setenv("REDIS_URI", redisURI)
-	t.Setenv("REDIS_STREAM", "health-itest-stream")
-	t.Setenv("REDIS_GROUP", "health-itest-group")
+	s, err := worker.NewSocketServer(
+		deps.SocketPath,
+		fakePoolSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetReadiness(fakeReadinessChecker{ready: true})
 
-	// Point the command at the test Redis.
-	var writer bytes.Buffer
-	if err := runHealthCommand(context.Background(), &writer, logger); err != nil {
-		t.Fatalf("health with reachable redis+docker failed: %v", err)
+	out, _, err := runCLIWithDeps(t, deps, "", "health")
+	if err != nil {
+		t.Fatalf("health with a ready worker failed: %v", err)
+	}
+	if out != "healthy\n" {
+		t.Fatalf("health stdout = %q, want %q", out, "healthy\n")
 	}
 
-	// A dead Redis address must fail the redis check.
-	t.Setenv("REDIS_URI", "127.0.0.1:1")
-	if err := runHealthCommand(context.Background(), &writer, logger); err == nil {
-		t.Fatal("health with unreachable redis should have failed")
+	// Stop the worker: health must now fail with the socket-based reason and
+	// must not fall back to any direct dependency probe.
+	if err := s.Close(); err != nil {
+		t.Fatalf("close socket: %v", err)
+	}
+	_, _, err = runCLIWithDeps(t, deps, "", "health")
+	if err == nil {
+		t.Fatal("health with no worker must fail")
+	}
+	if !strings.Contains(err.Error(), "worker not running") {
+		t.Fatalf("error = %q, want the socket-based worker not running error", err)
+	}
+	if strings.Contains(err.Error(), "redis") || strings.Contains(err.Error(), "docker") {
+		t.Fatalf("error = %q must not mention direct dependency probes", err)
 	}
 }

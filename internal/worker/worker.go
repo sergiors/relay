@@ -354,6 +354,14 @@ func Run(logger *slog.Logger) error {
 	// aggregate budget); a step failure or timeout is logged with its name and
 	// never stops the sequence.
 	shutdown := &shutdownRegistry{}
+	// The worker's readiness state. Its flag starts false and is set true only at
+	// the ready-to-consume boundary (just before Consume, once every listener and
+	// loop is wired) and cleared as the FIRST instruction of the shutdown defer.
+	// It is bound to the worker lifecycle context so a lifecycle cancellation
+	// that precedes the deferred clear (a signal during the final startup wiring,
+	// or just before Consume returns) already reports not-ready.
+	// It backs the `relay health` socket query; see internal/worker/readiness.go.
+	workerReady := newReadiness(ctx)
 	// Redis is acquired first and released last; a wedged client close must not
 	// hang teardown.
 	shutdown.register(shutdownStep{
@@ -375,7 +383,13 @@ func Run(logger *slog.Logger) error {
 	// builds observe cancellation before teardown joins them. The root span is
 	// ended BEFORE the registry (and its tracing shutdown step) runs, so an
 	// early-return startup failure still flushes its trace.
+	//
+	// Readiness is cleared as the VERY FIRST instruction, before the lifecycle
+	// is cancelled: a `relay health` that races shutdown must observe not-ready
+	// rather than a stale true. Everything after that (lifecycle cancellation,
+	// span end, ordered bounded teardown) is the normal shutdown sequence.
 	defer func() {
+		workerReady.setNotReady()
 		stop()
 		startupSpan.End()
 		shutdown.run(logger)
@@ -626,6 +640,12 @@ func Run(logger *slog.Logger) error {
 		return fmt.Errorf("runtime state socket: start failed: %w", err)
 	}
 	socketSpan.End()
+	// The readiness query (`relay health`) answers from the worker's readiness
+	// state. It is wired now, before the socket serves a request, so the socket
+	// always has a checker; the checker's live dependency probe is installed at
+	// the ready-to-consume boundary below, and until then its flag is false and
+	// it reports not-ready.
+	rtSocket.SetReadiness(workerReady)
 	// rtSocket.Close takes no context; the shutdown registry bounds its wait.
 	shutdown.register(shutdownStep{
 		name:    shutdownStepSocket,
@@ -1103,6 +1123,17 @@ func Run(logger *slog.Logger) error {
 	// before Consume. Everything before it is a child of the root; consumption
 	// then establishes its own per-message spans.
 	startupSpan.End()
+
+	// Ready-to-consume boundary: install the live dependency probe (Redis
+	// consumer health + a bounded Docker ping + NETWORKS verification) and mark
+	// the worker ready. This is the LAST step before Consume, and it is reached
+	// only after the external preflight, function load/prepare, the socket,
+	// required listeners and loops, and the consumer/schedule/reconciler/
+	// scheduler wiring are all complete. It deliberately does not wait on
+	// asynchronous service convergence/housekeeping, optional tracing, SQLite,
+	// or per-function success.
+	workerReady.startReady(consumer, manager, cfg.Networks)
+	logger.Info("Worker ready to consume")
 
 	logger.Info("Consuming stream",
 		"stream", cfg.RedisStream,

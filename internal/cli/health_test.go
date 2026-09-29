@@ -1,76 +1,161 @@
 package cli
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
+
+	"relay/internal/worker"
 )
 
-// checkHealth reports the first failing check (redis first) and writes
-// "healthy" only when both pass.
-func TestCheckHealth(t *testing.T) {
-	ok := func() error { return nil }
-	fail := func() error { return errors.New("boom") }
+// fakeReadinessChecker is a deterministic worker.ReadinessChecker for CLI
+// health tests.
+type fakeReadinessChecker struct {
+	ready  bool
+	reason string
+}
 
-	tests := []struct {
-		name    string
-		redis   func() error
-		docker  func() error
-		wantErr bool
-		wantOut string
-	}{
-		{"both pass", ok, ok, false, "healthy\n"},
-		{"redis fails", fail, ok, true, ""},
-		{"docker fails", ok, fail, true, ""},
-		{"both fail reports redis", fail, fail, true, ""},
+func (f fakeReadinessChecker) Ready(context.Context) (bool, string) { return f.ready, f.reason }
+
+// startHealthSocket starts a real worker query socket at path with the given
+// readiness checker wired, so `relay health` is exercised end to end against a
+// real socket without Redis or Docker.
+func startHealthSocket(t *testing.T, path string, checker worker.ReadinessChecker) {
+	t.Helper()
+	s, err := worker.NewSocketServer(
+		path,
+		fakePoolSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
 	}
-	for _, c := range tests {
-		t.Run(c.name, func(t *testing.T) {
-			var w bytes.Buffer
-			err := checkHealth(&w, c.redis, c.docker)
-			if (err != nil) != c.wantErr {
-				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
+	s.SetReadiness(checker)
+	t.Cleanup(func() { _ = s.Close() })
+}
+
+// `relay health` reports healthy and exits 0 when the worker answers ready.
+func TestHealthCommandHealthy(t *testing.T) {
+	deps := testDeps(t)
+	startHealthSocket(t, deps.SocketPath, fakeReadinessChecker{ready: true})
+
+	out, _, err := runCLIWithDeps(t, deps, "", "health")
+	if err != nil {
+		t.Fatalf("health: err = %v, want nil", err)
+	}
+	if out != "healthy\n" {
+		t.Fatalf("health stdout = %q, want %q", out, "healthy\n")
+	}
+}
+
+// `relay health` fails with "worker not running" when no worker socket answers,
+// even with no Redis or Docker involved: worker health requires a running
+// worker.
+func TestHealthCommandNoWorker(t *testing.T) {
+	deps := testDeps(t)
+	// No socket server is started at deps.SocketPath: the dial fails.
+
+	_, _, err := runCLIWithDeps(t, deps, "", "health")
+	if err == nil {
+		t.Fatal("health with no worker must error")
+	}
+	if !strings.Contains(err.Error(), "worker not running") {
+		t.Fatalf("error = %q, want it to name that the worker is not running", err)
+	}
+	if strings.Contains(err.Error(), "redis") || strings.Contains(err.Error(), "docker") {
+		t.Fatalf("error = %q, must not mention direct dependency probes", err)
+	}
+}
+
+// `relay health` fails with the worker's own reason when the worker is not
+// ready: a still-starting worker and a degraded worker are distinguished, and
+// the reason is surfaced.
+func TestHealthCommandNotReady(t *testing.T) {
+	tests := []struct {
+		name       string
+		checker    worker.ReadinessChecker
+		wantSubstr []string
+	}{
+		{
+			name:       "worker starting",
+			checker:    fakeReadinessChecker{ready: false, reason: "worker starting"},
+			wantSubstr: []string{"health:", "worker starting"},
+		},
+		{
+			name:       "worker shutting down",
+			checker:    fakeReadinessChecker{ready: false, reason: "worker shutting down"},
+			wantSubstr: []string{"health:", "worker shutting down"},
+		},
+		{
+			name:       "degraded dependency",
+			checker:    fakeReadinessChecker{ready: false, reason: "redis consumer unhealthy"},
+			wantSubstr: []string{"health:", "redis consumer unhealthy"},
+		},
+		{
+			name:       "docker unavailable",
+			checker:    fakeReadinessChecker{ready: false, reason: "docker unavailable"},
+			wantSubstr: []string{"health:", "docker unavailable"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := testDeps(t)
+			startHealthSocket(t, deps.SocketPath, tc.checker)
+
+			_, _, err := runCLIWithDeps(t, deps, "", "health")
+			if err == nil {
+				t.Fatal("health with a not-ready worker must error")
 			}
-			if w.String() != c.wantOut {
-				t.Fatalf("stdout = %q, want %q", w.String(), c.wantOut)
-			}
-			if c.wantErr && err.Error() != "boom" {
-				t.Fatalf("err = %q, want %q", err.Error(), "boom")
+			for _, want := range tc.wantSubstr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want it to contain %q", err, want)
+				}
 			}
 		})
 	}
 }
 
-// TestHealthRedisConfigErrorRedactsCredentials pins that a malformed REDIS_URI
-// DSN reported by `relay health` never leaks the password. The redis config
-// error path (RedisOptions) is redacted, and this test exercises the full
-// runHealthCommand path to guard the wiring end to end.
-func TestHealthRedisConfigErrorRedactsCredentials(t *testing.T) {
-	// runHealthCommand loads full config via config.Load(logger), which RETURNS
-	// an error when a required REDIS_* variable is missing, so set all three
-	// required variables. REDIS_STREAM/REDIS_GROUP only need to be non-empty;
-	// the malformed REDIS_URI DSN below is what drives the RedisOptions failure
-	// after Load succeeds (the password-redaction assertion works because
-	// RedisOptions(cfg.RedisURI) rejects the bad DSN).
-	t.Setenv("REDIS_URI", "redis://default:s3cr3t-pw@:63799x")
-	t.Setenv("REDIS_STREAM", "stream")
-	t.Setenv("REDIS_GROUP", "group")
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+// A socket with no readiness checker wired answers not-ready (a worker that
+// cannot prove readiness is not healthy), and health surfaces the reason.
+func TestHealthCommandNoChecker(t *testing.T) {
+	deps := testDeps(t)
+	startHealthSocket(t, deps.SocketPath, nil)
 
-	var w bytes.Buffer
-	err := runHealthCommand(context.Background(), &w, logger)
+	_, _, err := runCLIWithDeps(t, deps, "", "health")
 	if err == nil {
-		t.Fatal("expected an error from a malformed REDIS_URI")
+		t.Fatal("health with an unwired checker must error")
 	}
-	if strings.Contains(err.Error(), "s3cr3t-pw") {
-		t.Fatalf("error leaks password: %q", err.Error())
+	if !strings.Contains(err.Error(), "readiness unavailable") {
+		t.Fatalf("error = %q, want it to surface the worker's not-ready reason", err)
 	}
-	if !strings.Contains(err.Error(), "redis config") {
-		t.Fatalf("error missing redis config message: %q", err.Error())
+}
+
+// TestHealthCommandUsesSocketOnly pins that `relay health` fails without any
+// external configuration or dependency clients when no worker is running: the
+// old one-shot Redis/Docker probe (which required REDIS_* config) is gone and
+// there is no fallback.
+func TestHealthCommandUsesSocketOnly(t *testing.T) {
+	// Explicitly scrub REDIS_* so a config-dependent implementation would fail
+	// differently (a config error) rather than the expected socket error.
+	t.Setenv("REDIS_URI", "")
+	t.Setenv("REDIS_STREAM", "")
+	t.Setenv("REDIS_GROUP", "")
+
+	deps := testDeps(t)
+	// No worker socket at deps.SocketPath.
+
+	_, _, err := runCLIWithDeps(t, deps, "", "health")
+	if err == nil {
+		t.Fatal("health with no worker must error")
+	}
+	if strings.Contains(err.Error(), "config") || strings.Contains(err.Error(), "REDIS") {
+		t.Fatalf("health must not load external config: %q", err)
+	}
+	if !strings.Contains(err.Error(), "worker not running") {
+		t.Fatalf("error = %q, want the socket-based worker not running error", err)
 	}
 }
 
@@ -79,5 +164,16 @@ func TestHealthArgError(t *testing.T) {
 	_, _, err := runCLI(t, "", "health", "extra")
 	if err == nil || !strings.Contains(err.Error(), "health: too many arguments") {
 		t.Fatalf("returned error missing usage error: %v", err)
+	}
+}
+
+// `relay ready` is no longer a command: it is an unknown command.
+func TestReadyCommandRemoved(t *testing.T) {
+	_, _, err := runCLI(t, "", "ready")
+	if err == nil {
+		t.Fatal("removed ready command must not be accepted")
+	}
+	if !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("error = %q, want an unknown command error", err)
 	}
 }

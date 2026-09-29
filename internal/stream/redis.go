@@ -248,8 +248,9 @@ var _ groupCreator = (*redis.Client)(nil)
 // Healthy reports whether the consumer's last observed Redis operation
 // succeeded: true while Redis is reachable, false during an outage. It is an
 // in-process readiness accessor for embedders and orchestrators that run the
-// consumer themselves; the `relay health` command does not use it (that command
-// probes Redis with a direct PING from a separate process).
+// consumer themselves; the worker's own `relay health` probe consults it in
+// steady state. `relay health` itself never touches Redis: it asks the running
+// worker over its control socket.
 func (c *Consumer) Healthy() bool {
 	return c.healthy.Load()
 }
@@ -816,10 +817,10 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 // consumer and replays it. Whether the message's invocations actually execute
 // (and whether they are exhausted) is decided at run time from per-invocation
 // state, so there is no message-level attempt pre-check here. The stream-level
-// retries_total counter counts message redeliveries (actual re-delivery events,
-// not executions): a reclaim is a retry event even when the invocation is
-// skipped as protected, because a redelivery DID occur. This is distinct from
-// the per-function function_retries_total (runner), which counts failed
+// retries_total counter counts message reclaims (actual re-delivery events, not
+// executions): a reclaim is counted even when the invocation is skipped as
+// protected, because a redelivery DID occur. This is distinct from the
+// per-function function_retries_total (runner), which counts failed handler
 // executions only.
 //
 // Backpressure: the reclaimed message also counts against the bounded local

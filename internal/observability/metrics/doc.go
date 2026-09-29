@@ -81,6 +81,15 @@
 // the invocation-state hash; a handler failure stays "matched". Schedule
 // occurrences bypass event matching and are not counted here.
 //
+// Retries vs DLQ: relay_retries_total counts stream MESSAGE reclaims
+// (redeliveries), while relay_function_retries_total counts failed handler
+// executions that will be retried ("Handler retries"). relay_dlq_entries_total
+// counts successful DLQ entry WRITES to Redis (one per exhausted invocation,
+// plus a placeholder per malformed message), while relay_function_dlq_total
+// counts invocations that exhausted their retry budget (the exhaustion commit,
+// which may precede the write). The two per-family counters answer different
+// questions and are deliberately not interchangeable.
+//
 // Cardinality is bounded: labels are limited to function/handler/outcome plus
 // the small closed runtime-pool value sets (state=idle|busy|starting,
 // outcome=warm|cold, and the finite discard reasons) plus the closed

@@ -170,12 +170,14 @@ const (
 //     (received == matched + unmatched) and are claimed exactly once per
 //     logical event across redeliveries/retries, so they must be documented
 //     together.
-//   - MetricRetries counts stream MESSAGE redeliveries (reclaims), not handler
-//     retries; MetricFunctionRetries counts failed handler executions that will
-//     be retried. They answer different questions.
-//   - MetricDLQEntries counts one entry per exhausted INVOCATION (a message
-//     matching several handlers dead-letters one entry each), counted after the
-//     DLQ write succeeds.
+//   - MetricRetries counts stream MESSAGE reclaims (a reclaimed message the
+//     consumer re-delivers), not handler retries; MetricFunctionRetries counts
+//     failed handler executions that will be retried. They answer different
+//     questions.
+//   - MetricDLQEntries counts successful Redis DLQ entry WRITES (one per
+//     exhausted invocation, plus a placeholder for a malformed message), not
+//     invocations that exhausted their retries; MetricFunctionDLQ counts the
+//     exhaustion commit, which may precede the actual write.
 //   - The handler invocation counters are per rule EXECUTION, not per logical
 //     event, and span the event, schedule, and manual invocation paths.
 var metricHelp = map[string]string{
@@ -183,8 +185,8 @@ var metricHelp = map[string]string{
 	MetricEventsMatched:   "Logical incoming events for which at least one function rule matched, classified exactly once per logical event across redeliveries/retries. A handler failure does not move an event out of this class.",
 	MetricEventsUnmatched: "Logical incoming events for which no function rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
 
-	MetricRetries:                      "Message redeliveries performed by the stream consumer when it reclaims idle pending entries; a reclaim counts once even when the message is not processed (buffer full) or every invocation is skipped as protected. Distinct from function_retries_total, which counts failed handler executions.",
-	MetricDLQEntries:                   "Dead-letter entries written when an invocation exhausts its retry budget; one entry per exhausted invocation, counted only after the DLQ write succeeds.",
+	MetricRetries:                      "Message reclaims: idle pending entries the stream consumer reclaimed and re-delivered, counted once per reclaim even when the message is not processed (buffer full) or every invocation is skipped as protected. This is a redelivery counter, not handler retries; distinct from function_retries_total, which counts failed handler executions.",
+	MetricDLQEntries:                   "Successful dead-letter writes: entries actually written to the Redis DLQ stream, counted once per successful XADD. One write per exhausted invocation, plus one placeholder write for a malformed message that never reached a handler. A failed DLQ write is not counted, and invocation exhaustion is counted separately by function_dlq_total.",
 	MetricHandlerSuccess:               "Successful handler executions across event, schedule, and manual invocations, counted once per handler attempt.",
 	MetricHandlerFailure:               "Failed handler attempts across event, schedule, and manual invocations, counted once per attempt; a failed attempt that will retry is counted here too.",
 	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-function).",
@@ -200,8 +202,8 @@ var metricHelp = map[string]string{
 	MetricFunctionEventsMatched:           "Logical events for which at least one of this function's rules matched, counted once per logical event per function across redeliveries/retries (deduped across the function's matching rules). A handler failure does not move an event out of this class.",
 	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the function, counted once per handler attempt across event, schedule, and manual invocations.",
 	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the function, counted once per attempt; a failed attempt that will retry is counted here too.",
-	MetricFunctionRetries:                 "Failed handler attempts attributed to the function that will be retried according to the rule's retry budget.",
-	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. Counted when exhaustion is committed for the invocation; the message-level DLQ write happens later, after every exhausted sibling invocation in the same delivery has finished.",
+	MetricFunctionRetries:                 "Handler retries: failed handler attempts attributed to the function that will be retried according to the rule's retry budget (handler retries, not stream message reclaims).",
+	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. This counts the exhaustion COMMIT, not a successful DLQ write: it is incremented when the invocation's terminal exhausted marker is committed, which happens before the message-level DLQ XADD (that write occurs after every exhausted sibling invocation in the same delivery has finished and is counted by dlq_entries_total only on success).",
 	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by function and outcome; warm leases an existing idle container, cold starts a fresh container.",
 	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by function and finite teardown reason.",
 	MetricRuntimeContainerWaits:           "Warm-container pool acquires that had to block at the pool's capacity bound, regardless of eventual success.",
@@ -350,9 +352,10 @@ const (
 	// reserved for DLQ-routed failures).
 	FunctionTimestampFailure
 	// FunctionTimestampDLQ is the last invocation that exhausted its retries
-	// and was routed to the DLQ. It is the DLQ attribution point, set only
-	// where the runner routes an exhausted invocation to the DLQ — not on
-	// every failure.
+	// (the exhaustion commit), i.e. the last retry exhaustion, not a
+	// successfully written DLQ entry. It is the DLQ attribution point, set
+	// only where the runner commits an exhausted invocation — not on every
+	// failure, and not on a message-level DLQ write.
 	FunctionTimestampDLQ
 
 	// functionTimestampCount bounds the kind space (array size below).
@@ -517,10 +520,12 @@ func New() *Registry {
 	// MetricFunctionRetries counts every failing rule execution that will be
 	// retried (a retry driver); MetricFunctionDLQ counts a function once when
 	// its failing rule execution is the one that exhausts the rule's retry
-	// budget (attempt >= 1+retries, per-invocation) and the invocation is marked
-	// terminal for the DLQ. It is incremented at that exhaustion commit, which
-	// may precede the actual message-level DLQ write (that happens after all
-	// exhausted siblings in the same delivery finish).
+	// budget (attempt >= 1+retries, per-invocation) and the invocation's
+	// terminal exhausted marker is committed. It is incremented at that
+	// exhaustion commit, which may precede the actual message-level DLQ write
+	// (that happens after all exhausted siblings in the same delivery finish)
+	// and may never be followed by one if that write fails — so it counts
+	// exhaustions, not successfully written DLQ entries (dlq_entries_total).
 	for _, name := range []string{
 		MetricFunctionEventsMatched,
 		MetricFunctionHandlerSuccess,
@@ -946,7 +951,13 @@ func (r *Registry) Counter(name string) int64 {
 // function_* CounterVecs. It is the metrics-side view the worker maps into the
 // state layer's function_stats table.
 type FunctionStat struct {
-	Function            string
+	Function string
+	// EventsMatchedTotal counts a function once per logical event at least one
+	// of its rules matched. HandlerSuccessTotal/HandlerFailureTotal are per rule
+	// execution. RetriesTotal counts failed handler attempts that will retry
+	// (handler retries, not stream message reclaims). DLQTotal counts the
+	// exhaustion COMMIT for an invocation — not a successful DLQ entry write
+	// (that is dlq_entries_total).
 	EventsMatchedTotal  int64
 	HandlerSuccessTotal int64
 	HandlerFailureTotal int64
@@ -970,9 +981,9 @@ type FunctionStat struct {
 	//     since every claimed attempt is an execution).
 	//   - LastSuccess / LastFailure: the last successful / failed handler
 	//     execution (a failed attempt that will retry counts as a failure).
-	//   - LastDLQ: the last invocation that exhausted its retries and was
-	//     routed to the DLQ (the actual DLQ attribution point, NOT every
-	//     failure).
+	//   - LastDLQ: the last invocation that exhausted its retries (the
+	//     exhaustion commit, NOT a successfully written DLQ entry and NOT
+	//     every failure).
 	LastExecution int64
 	LastSuccess   int64
 	LastFailure   int64

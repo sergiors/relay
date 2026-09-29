@@ -26,12 +26,15 @@ import (
 // This file implements the worker-owned LIVE runtime-pool query socket at
 // /run/relay/relay.sock, alongside the process lock this worker runs under.
 //
-// It carries four semantic operations: the live warm-container pool gauges
+// It carries five semantic operations: the live warm-container pool gauges
 // (capacity and container counts by lease state), the operator-facing
 // "reset stats" command, the synchronous manual function invocation
-// (`relay function invoke`), and the synchronous DLQ replay
+// (`relay function invoke`), the synchronous DLQ replay
 // (`relay dlq replay`), which re-executes one dead-lettered entry's exact
-// recorded function/handler once against the live registry. The cumulative
+// recorded function/handler once against the live registry, and the worker
+// readiness query (`relay health`), which answers whether the worker is ready to
+// consume and, in steady state, reflects live Redis consumer health plus a
+// bounded Docker ping and NETWORKS verification. The cumulative
 // acquire/discard counters are
 // PERSISTED per function under /var/lib/relay (state.FunctionStats) and read
 // there by the standalone CLI; they are deliberately never sent over the
@@ -58,8 +61,10 @@ import (
 // SocketPath is the fixed live query socket `relay function inspect` dials for
 // live runtime-pool gauges, `relay stats reset` dials to reset a running
 // worker's statistics, `relay function invoke` dials to run a function's
-// matching handlers synchronously against the live runtime, and `relay dlq
-// replay` dials to re-execute one dead-lettered handler. It lives beside the
+// matching handlers synchronously against the live runtime, `relay dlq
+// replay` dials to re-execute one dead-lettered handler, and `relay health`
+// dials for worker health (readiness plus live dependency health). It lives
+// beside the
 // process lock in the ephemeral runtime directory
 // (internal/processlock.DefaultDir), NOT under the persisted /var/lib/relay
 // state volume: a socket is process state that can neither outlive the worker
@@ -152,6 +157,7 @@ const (
 	cmdResetStats     = "reset_stats"
 	cmdInvokeFunction = "invoke_function"
 	cmdReplayDLQ      = "replay_dlq"
+	cmdReady          = "ready"
 )
 
 // ErrRuntimeStateUnavailable reports that the live worker query socket could not
@@ -200,6 +206,21 @@ var ErrInvokeUnavailable = errors.New("function invocation unavailable")
 // error text is preserved (the CLI prints it) and no handler count is reported.
 var ErrInvokeFailed = errors.New("function invocation failed")
 
+// ErrNotReady reports that the worker answered the readiness query and is not
+// ready to consume: it is still starting, is shutting down, or its live
+// dependencies (Redis consumer, Docker daemon, or a configured NETWORKS network)
+// are currently failing. `relay health` maps it to a non-zero exit. It is
+// deliberately distinct from ErrRuntimeStateUnavailable: the worker IS running
+// and answered; it is simply not ready.
+var ErrNotReady = errors.New("worker not ready")
+
+// ErrReadyUnavailable reports that the readiness query could not be completed
+// because the worker socket could not be reached — no worker is running, the
+// socket is stale, or the exchange failed. `relay health` treats it as not
+// healthy (a running worker is required), but classifies it separately so an
+// operator can tell "no worker" from "worker answered not-ready".
+var ErrReadyUnavailable = errors.New("readiness unavailable")
+
 // RuntimeState is the live, worker-local runtime-pool gauge view returned by the
 // query socket. Every field is a valid zero for a function with an existing but
 // empty pool, so callers must key "known" on the query succeeding, never on the
@@ -219,6 +240,16 @@ type InvokeResult struct {
 	Invoked int `json:"invoked"`
 }
 
+// ReadyResult is the readiness answer returned by the query socket. Ready is
+// always present for a readiness response (no omitempty) so a NOT-ready
+// steady-state answer is explicitly representable; Reason carries a short fixed
+// explanation when Ready is false and is empty when it is true. It never carries
+// a dependency's raw error text.
+type ReadyResult struct {
+	Ready  bool   `json:"ready"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // socketRequest is the newline-JSON request frame. Command selects the
 // operation: cmdRuntimeState requests function's live pool gauges (Function is
 // required); cmdResetStats asks the worker to reset its Relay statistics;
@@ -227,7 +258,8 @@ type InvokeResult struct {
 // JSON event object); cmdReplayDLQ re-executes one DLQ entry's exact
 // function/handler (Function and Handler are required, Event carries the
 // replayed payload, and Trace optionally carries the entry's compact lineage so
-// the replay can link back to the original failed invocation). A frame carries
+// the replay can link back to the original failed invocation); cmdReady asks
+// whether the worker is ready to consume. A frame carries
 // exactly one command, and an absent or unknown command is malformed.
 //
 // Trace is deliberately a SIBLING of Event, not part of it: the trace lineage is
@@ -243,13 +275,15 @@ type socketRequest struct {
 
 // socketResponse is the newline-JSON response frame. Exactly one of the
 // embedded RuntimeState (success), Error (failure), ResetStats=true
-// (reset success), or *InvokeResult (manual-invocation success) is present.
-// Message optionally carries human-readable detail for an Error, so the CLI can
-// surface a clear cause (e.g. a handler failure reason) while Error remains the
-// stable machine code it classifies on.
+// (reset success), *InvokeResult (manual-invocation success), or *ReadyResult
+// (readiness answer, ready or not) is present. Message optionally carries
+// human-readable detail for an Error, so the CLI can surface a clear cause (e.g.
+// a handler failure reason) while Error remains the stable machine code it
+// classifies on.
 type socketResponse struct {
 	*RuntimeState
 	*InvokeResult
+	*ReadyResult
 	ResetStats bool   `json:"reset_stats,omitempty"`
 	Replayed   bool   `json:"replayed,omitempty"`
 	Error      string `json:"error,omitempty"`
@@ -303,6 +337,15 @@ type HandlerReplayer interface {
 	ReplayDLQ(ctx context.Context, name, handler string, event []byte, trace string) error
 }
 
+// ReadinessChecker is the narrow worker-readiness view the health command
+// needs: whether the worker is ready to consume, plus a short fixed reason when
+// it is not. *readiness (internal/worker/readiness.go) satisfies it; the worker
+// wires it via SetReadiness immediately after constructing the socket, so a
+// query that beats the wiring answers not-ready rather than claiming readiness.
+type ReadinessChecker interface {
+	Ready(ctx context.Context) (bool, string)
+}
+
 // SocketServer is the worker-owned live query socket. It accepts one request
 // per connection, answers with a single newline-JSON frame, and is stopped as a
 // unit: Close stops accepting, closes every in-flight connection (each already
@@ -324,7 +367,12 @@ type SocketServer struct {
 	// SetReplayer; a nil replayer answers invoke_unavailable (there is no
 	// offline fallback). Both the setter and the handler read it under s.mu.
 	replayer HandlerReplayer
-	ln       net.Listener
+	// readiness answers the readiness query. It is wired via SetReadiness and
+	// read under s.mu; a nil checker answers not-ready (a worker with no
+	// readiness source is not ready). It is installed by Run before the socket
+	// starts serving, so a query always sees a checker.
+	readiness ReadinessChecker
+	ln        net.Listener
 
 	// baseCtx is cancelled by Close, so an in-flight manual invocation (whose
 	// own context bounds it to invokeTimeout) is cancelled promptly on shutdown
@@ -430,6 +478,28 @@ func (s *SocketServer) SetReplayer(replayer HandlerReplayer) {
 	s.mu.Lock()
 	s.replayer = replayer
 	s.mu.Unlock()
+}
+
+// SetReadiness wires the worker's readiness state that answers the readiness
+// query. It is called before the socket starts serving; passing nil answers
+// not-ready (a worker with no readiness source cannot claim readiness). The
+// assignment is mutex-guarded so a request racing the wiring reads either nil
+// or the checker.
+func (s *SocketServer) SetReadiness(checker ReadinessChecker) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.readiness = checker
+	s.mu.Unlock()
+}
+
+// currentReadiness returns the wired readiness checker, or nil when none is
+// set. It takes the mutex so a concurrent SetReadiness is race-free.
+func (s *SocketServer) currentReadiness() ReadinessChecker {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readiness
 }
 
 // currentReplayer returns the wired DLQ replayer, or nil when none is set. It
@@ -549,6 +619,8 @@ func (s *SocketServer) handle(conn net.Conn) {
 		s.handleInvokeFunction(conn, req.Function, req.Event)
 	case cmdReplayDLQ:
 		s.handleReplayDLQ(conn, req.Function, req.Handler, req.Event, req.Trace)
+	case cmdReady:
+		s.handleReady(conn)
 	default:
 		s.respond(conn, socketResponse{Error: errCodeMalformedRequest})
 	}
@@ -712,6 +784,27 @@ func (s *SocketServer) handleReplayDLQ(conn net.Conn, function, handler string, 
 		return
 	}
 	s.respond(conn, socketResponse{Replayed: true})
+}
+
+// handleReady answers the readiness query. A nil checker (the socket was
+// never wired) answers not-ready with a fixed reason: a worker with no readiness
+// source must never claim readiness. A ready worker answers ready=true; a
+// not-ready worker answers ready=false with the checker's short reason and NO
+// error code, so the CLI can distinguish "worker answered not-ready" from "no
+// worker answered". It never terminates or mutates the worker.
+func (s *SocketServer) handleReady(conn net.Conn) {
+	checker := s.currentReadiness()
+	if checker == nil {
+		s.respond(conn, socketResponse{ReadyResult: &ReadyResult{Ready: false, Reason: "readiness unavailable"}})
+		return
+	}
+	// The readiness probe is bounded by readinessProbeTimeout, which can exceed
+	// the short query deadline set at the top of handle; extend it so a
+	// slow-but-bounded probe's response is not cut off. The probe is still
+	// bounded independently, so a hung dependency cannot hold the handler open.
+	_ = conn.SetDeadline(time.Now().Add(readinessProbeTimeout + runtimeStateRequestTimeout))
+	ready, reason := checker.Ready(s.baseCtx)
+	s.respond(conn, socketResponse{ReadyResult: &ReadyResult{Ready: ready, Reason: reason}})
 }
 
 // replayErrorCode maps a runner DLQ-replay error onto a stable wire code. The
@@ -1030,6 +1123,59 @@ func ReplayDLQ(ctx context.Context, path, function, handler string, event []byte
 		return fmt.Errorf("%w: empty response", ErrInvokeUnavailable)
 	}
 	return nil
+}
+
+// CheckReady dials the live worker at path and asks whether it is ready to
+// consume. It is the CLI's `relay health` client surface. It returns
+// (true, "", nil) for a ready worker; for a worker that answered not-ready
+// (still starting, shutting down, or its live dependencies are currently
+// failing) it returns (false, reason, err) with err wrapping ErrNotReady; and
+// for a socket that cannot be reached or an exchange that fails it returns
+// (false, "", err) with err wrapping ErrReadyUnavailable. The two error classes
+// are distinct so a caller can tell "no worker answered" from "worker answered
+// not-ready".
+//
+// ctx bounds the CLI side (a cancelled ctx, e.g. Ctrl-C, closes the connection
+// so the command aborts promptly). The worker's own readiness probe is bounded
+// independently, so a hung dependency can never hold the query open.
+func CheckReady(ctx context.Context, path string) (bool, string, error) {
+	dialer := net.Dialer{Timeout: runtimeStateDialTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", path)
+	if err != nil {
+		return false, "", fmt.Errorf("%w: %v", ErrReadyUnavailable, err)
+	}
+	defer conn.Close()
+	// The worker's readiness probe is bounded by its own timeout; the client
+	// deadline adds a short exchange margin so a wedged peer still cannot hold
+	// the command open indefinitely.
+	_ = conn.SetDeadline(time.Now().Add(readinessQueryTimeout()))
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+
+	if err := json.NewEncoder(conn).Encode(socketRequest{Command: cmdReady}); err != nil {
+		return false, "", fmt.Errorf("%w: %v", ErrReadyUnavailable, err)
+	}
+	var resp socketResponse
+	if err := json.NewDecoder(io.LimitReader(conn, runtimeStateMaxResponse)).Decode(&resp); err != nil {
+		if ctx.Err() != nil {
+			return false, "", fmt.Errorf("%w: %v", ErrReadyUnavailable, ctx.Err())
+		}
+		return false, "", fmt.Errorf("%w: %v", ErrReadyUnavailable, err)
+	}
+	if resp.ReadyResult == nil {
+		return false, "", fmt.Errorf("%w: empty response", ErrReadyUnavailable)
+	}
+	if !resp.ReadyResult.Ready {
+		return false, resp.ReadyResult.Reason, fmt.Errorf("%w: %s", ErrNotReady, messageOr(resp.ReadyResult.Reason, "not ready"))
+	}
+	return true, "", nil
+}
+
+// readinessQueryTimeout is the client-side bound for one readiness exchange: the
+// worker's own probe bound plus the short request margin, so the client always
+// outlasts a slow-but-bounded worker probe rather than cutting it off.
+func readinessQueryTimeout() time.Duration {
+	return readinessProbeTimeout + runtimeStateRequestTimeout
 }
 
 // messageOr returns msg when it is non-empty, else fallback. It keeps the wire

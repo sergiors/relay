@@ -932,6 +932,92 @@ func TestRuntimeSocketReplayDLQNoReplayer(t *testing.T) {
 	}
 }
 
+// fakeReadiness is a deterministic ReadinessChecker for socket tests.
+type fakeReadiness struct {
+	ready  bool
+	reason string
+}
+
+func (f fakeReadiness) Ready(context.Context) (bool, string) { return f.ready, f.reason }
+
+// startTestSocketWithReadiness starts a SocketServer with the given readiness
+// checker wired, so the readiness command can be exercised.
+func startTestSocketWithReadiness(t *testing.T, path string, checker ReadinessChecker) *SocketServer {
+	t.Helper()
+	s, err := NewSocketServer(
+		path,
+		&fakeSnapshotter{pools: nil},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatalf("NewSocketServer: %v", err)
+	}
+	s.SetReadiness(checker)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestRuntimeSocketReadyDelegates verifies the readiness command asks the wired
+// checker and answers ready=true with no reason on success.
+func TestRuntimeSocketReadyDelegates(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocketWithReadiness(t, path, fakeReadiness{ready: true})
+
+	ready, reason, err := CheckReady(context.Background(), path)
+	if err != nil {
+		t.Fatalf("CheckReady: %v", err)
+	}
+	if !ready || reason != "" {
+		t.Fatalf("ready/reason = %v/%q, want true/\"\"", ready, reason)
+	}
+}
+
+// TestRuntimeSocketReadyNotReady verifies a not-ready answer is surfaced as
+// ErrNotReady with the checker's reason, distinct from an unreachable worker.
+func TestRuntimeSocketReadyNotReady(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocketWithReadiness(t, path, fakeReadiness{ready: false, reason: "redis consumer unhealthy"})
+
+	ready, reason, err := CheckReady(context.Background(), path)
+	if ready {
+		t.Fatal("ready = true, want false")
+	}
+	if !errors.Is(err, ErrNotReady) {
+		t.Fatalf("error = %v, want ErrNotReady", err)
+	}
+	if errors.Is(err, ErrReadyUnavailable) {
+		t.Fatalf("a not-ready answer must not look unreachable: %v", err)
+	}
+	if reason != "redis consumer unhealthy" {
+		t.Fatalf("reason = %q, want the checker's reason", reason)
+	}
+}
+
+// TestRuntimeSocketReadyNoChecker verifies a socket with no checker wired
+// answers not_ready rather than falsely reporting readiness.
+func TestRuntimeSocketReadyNoChecker(t *testing.T) {
+	path := testSocketPath(t)
+	startTestSocket(t, path, nil)
+
+	ready, _, err := CheckReady(context.Background(), path)
+	if ready {
+		t.Fatal("ready = true, want false for an unwired checker")
+	}
+	if !errors.Is(err, ErrNotReady) {
+		t.Fatalf("error = %v, want ErrNotReady", err)
+	}
+}
+
+// TestCheckReadyNoSocket verifies the standalone no-worker case is reported as
+// ErrReadyUnavailable (not ErrNotReady): no worker answered at all.
+func TestCheckReadyNoSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.sock")
+	if _, _, err := CheckReady(context.Background(), path); !errors.Is(err, ErrReadyUnavailable) {
+		t.Fatalf("error = %v, want ErrReadyUnavailable", err)
+	}
+}
+
 // TestRuntimeSocketReplayDLQMalformed verifies the wire validation: empty
 // function/handler and an absent payload are rejected without invoking the
 // replayer.
