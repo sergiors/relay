@@ -95,6 +95,12 @@ The handler contract is the same for events and schedules: the container gets
 code decides success (`0`) or failure (non-zero). See [events.md](events.md) and
 [schedules.md](schedules.md).
 
+Event handler names must be **unique across a function's event rules**,
+regardless of pattern, timeout, or retries: the invocation identity is
+`(function, handler)`, so a repeated handler is a template error (it would race
+for the same per-invocation retry/DLQ state). Schedule handler names are not
+constrained by this rule.
+
 ### Timeouts and retries
 
 - `timeout` bounds one invocation of that rule (default `6s`). It must be
@@ -188,11 +194,13 @@ Relay builds **one image per function**, versioned by source fingerprint:
   builds **no function image at all**; its fingerprint is computed over
   `template.yaml` alone, and Relay does not scan the source tree for it.
 
-Relay manages only its own `relay-fn-*` / `relay-dep-*` images and never prunes
-other images or layers. Dependency images are content-addressed and shared
-across functions; the fingerprint keys on the base image **tag**, not its digest,
-so a newer pull of the same tag reuses the cached layer (operators wanting a
-refresh must remove those images).
+Relay manages only its own labeled images in the `relay-fn-*` / `relay-dep-*`
+namespaces (ownership is the strict `relay.type=function`/`dependency` label, not
+the name) and never prunes other images or layers. An unlabeled image that merely
+looks like a Relay image is left alone. Dependency images are content-addressed
+and shared across functions; the fingerprint keys on the base image **tag**, not
+its digest, so a newer pull of the same tag reuses the cached layer (operators
+wanting a refresh must remove those images).
 
 ### Warm execution containers
 

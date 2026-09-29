@@ -11,10 +11,13 @@ import (
 )
 
 // relayRepoPrefix is the repository name prefix shared by every Relay-owned
-// function image (also the prefix ImageRef emits). It is the single namespace
-// guard for all image lifecycle operations: nothing outside this prefix is ever
-// touched, so a stray non-Relay image on the daemon can never be removed or
-// considered a Relay version.
+// function image (also the prefix ImageRef emits). The prefix NAMES the
+// namespace but is no longer the ownership decision: an image is a Relay
+// function image only when it also carries the strict managed-image labels
+// (relay.type=function, and a relay.function agreeing with the repository name).
+// Nothing outside the prefix is ever touched, and a prefix-only image (a
+// pre-labels build, or a foreign image merely named "relay-fn-*") is never
+// removed or considered a Relay version.
 const relayRepoPrefix = "relay-fn-"
 
 // tagPrefixLen is the number of hex fingerprint characters used as the docker
@@ -85,12 +88,20 @@ func functionNameFromImage(image string) (string, bool) {
 	return nameFromRepo(repo)
 }
 
-// relayTags lists every local image RepoTag carrying the Relay namespace prefix,
-// returning name -> set of full tags. It lists all images and filters client-side
-// rather than using server-side filters: single client implementation reused by
-// every cleanup path, no dependency on a specific Engine API filter version. It
-// is lifecycle-owned (see beginRemovalOperation): once shutdown begins the
-// listing is refused, and a listing in flight is joined before the client closes.
+// relayTags lists every local image that is a MANAGED Relay function image,
+// returning name -> set of full tags. Ownership is strict and label-derived: an
+// image qualifies only when its relay.type is ImageTypeFunction AND its
+// relay.function label is present and equals the function name encoded in its
+// relay-fn-<name> repository. It lists all images and filters client-side rather
+// than using server-side filters: a single client implementation reused by every
+// cleanup path, no dependency on a specific Engine API filter version.
+//
+// A prefix-only image (no managed-image labels — a pre-labels Relay build, or a
+// foreign image merely named "relay-fn-*") is NEVER returned, so it can never be
+// retired, garbage-collected, or considered a Relay version. This matches the
+// strict label model the dependency GC already uses. It is lifecycle-owned (see
+// beginRemovalOperation): once shutdown begins the listing is refused, and a
+// listing in flight is joined before the client closes.
 func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}, error) {
 	opCtx, finish, err := m.beginRemovalOperation(ctx)
 	if err != nil {
@@ -108,7 +119,7 @@ func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}
 			if !ok {
 				continue
 			}
-			name, ok := nameFromRepo(repo)
+			name, ok := managedFunctionImageName(repo, img.Labels)
 			if !ok {
 				continue
 			}
@@ -119,6 +130,33 @@ func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}
 		}
 	}
 	return byName, nil
+}
+
+// managedFunctionImageName classifies one image (its repository and its full
+// label set) as a managed Relay function image. It reports the owning function
+// name only when all of the following hold, and otherwise ("", false):
+//
+//   - the repository is exactly "relay-fn-<name>" (the Relay function namespace);
+//   - relay.type == ImageTypeFunction (the strict managed-image classification);
+//   - relay.function is present and equals that repository-derived <name>, so a
+//     mislabeled or spoofed image whose label points at a different function is
+//     never treated as the repository's owner.
+//
+// This is the single ownership predicate for function-image discovery, GC,
+// retirement, and cleanup. Repository names alone are never sufficient, so an
+// unlabeled "relay-fn-*" image and an external image are both left alone.
+func managedFunctionImageName(repo string, labels map[string]string) (string, bool) {
+	name, ok := nameFromRepo(repo)
+	if !ok {
+		return "", false
+	}
+	if labels[labelType] != ImageTypeFunction {
+		return "", false
+	}
+	if labels[labelFunction] != name {
+		return "", false
+	}
+	return name, true
 }
 
 // listImagesForRemoval lists all local images through the lifecycle-owned

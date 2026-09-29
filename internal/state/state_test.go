@@ -608,7 +608,7 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 	writeFunctionsDir(t, root)
 	dir := filepath.Join(root, "demo")
 
-	fn, err := function.LoadSingle(dir, "demo")
+	fn, err := function.LoadSingle(root, "demo")
 	if err != nil {
 		t.Fatalf("load single: %v", err)
 	}

@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -113,12 +115,44 @@ func newScriptedDockerClient(t *testing.T, routes ...dockerRoute) *client.Client
 	return cli
 }
 
-// imageListJSON renders a minimal /images/json response for the given
-// repo tag sets, mirroring the fields relayTags reads.
+// imageListJSON renders a minimal /images/json response for the given repo tag
+// sets, mirroring the fields relayTags reads. It emits images with NO labels (a
+// pre-labels/foreign image shape); use labeledImageListJSON for managed images.
 func imageListJSON(tags ...string) string {
 	var items []string
 	for _, tag := range tags {
 		items = append(items, fmt.Sprintf(`{"RepoTags":[%q],"Id":"sha256:%s"}`, tag, strings.Repeat("0", 4)))
+	}
+	return "[" + strings.Join(items, ",") + "]"
+}
+
+// scriptedImage is one image in a scripted /images/json response, with an
+// optional full label set so tests can exercise the strict managed-image
+// classification (relay.type=function + a matching relay.function).
+type scriptedImage struct {
+	tags   []string
+	labels map[string]string
+}
+
+// labeledImageListJSON renders a scripted image list honoring each image's
+// labels. Images with no labels render with no "Labels" field, matching the
+// daemon's shape for an unlabeled image.
+func labeledImageListJSON(images ...scriptedImage) string {
+	var items []string
+	for _, img := range images {
+		tags := make([]string, 0, len(img.tags))
+		for _, t := range img.tags {
+			tags = append(tags, strconv.Quote(t))
+		}
+		item := fmt.Sprintf(`{"RepoTags":[%s],"Id":"sha256:%s"`, strings.Join(tags, ","), strings.Repeat("0", 4))
+		if len(img.labels) > 0 {
+			labels, err := json.Marshal(img.labels)
+			if err != nil {
+				panic(err) // static test construction; a map[string]string cannot fail
+			}
+			item += `,"Labels":` + string(labels)
+		}
+		items = append(items, item+"}")
 	}
 	return "[" + strings.Join(items, ",") + "]"
 }

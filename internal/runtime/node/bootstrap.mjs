@@ -37,10 +37,15 @@ const { context, propagation } = createRequire("/app/package.json")(
 // Must match the Relay-side constant "@@RELAY@@" (internal/runtime/protocol.go).
 const SENTINEL = "@@RELAY@@";
 
-// Response error strings are operator log text only; bound them. The cap keeps
-// the whole response frame well under Relay's 4 KiB stdout line cap, so a frame
-// is never split mid-line by the demuxer.
-const MAX_ERROR_BYTES = 3 * 1024;
+// Response error strings are operator log text only; bound them. The cap is the
+// UTF-8 byte length of the WHOLE response frame — the sentinel, the JSON
+// envelope, and the error — so a frame can never exceed the cap and be split
+// mid-line by Relay's 4 KiB stdout line demuxer (Go's maxPending). It matches the
+// Go bootstrap-side cap maxResponseFrame (3 KiB), leaving ~1 KiB of margin under
+// the demuxer limit. Truncation is applied on a Unicode code-point boundary, so a
+// multibyte message can never be cut mid-character and the emitted frame is
+// always valid UTF-8.
+const MAX_FRAME_BYTES = 3 * 1024;
 
 // moduleCache caches, per resolved file path, the dynamic import() promise so
 // a module is imported exactly once and its state persists.
@@ -142,9 +147,52 @@ async function loadModule(modPath) {
 function respond(id, ok, error) {
   const frame = { id, ok };
   if (!ok) {
-    frame["error"] = String(error ?? "").slice(0, MAX_ERROR_BYTES);
+    frame["error"] = boundErrorFrame(id, String(error ?? ""));
   }
   process.stdout.write(SENTINEL + JSON.stringify(frame) + "\n");
+}
+
+// boundErrorFrame returns an error string such that the whole serialized
+// response frame (sentinel + JSON envelope + error) fits in MAX_FRAME_BYTES
+// UTF-8 bytes, while always remaining valid UTF-8.
+//
+// The budget is the frame cap minus the exact size of the sentinel, the envelope
+// with an empty error, and the trailing newline. The message is then accumulated
+// one Unicode code point at a time (for...of iterates code points, never UTF-16
+// halves, so a surrogate pair or multibyte character is never split). Each code
+// point's contribution is its EXACT serialized length — including any JSON
+// escaping of quotes, backslashes, and control characters — computed with
+// JSON.stringify, so the frame is bounded precisely and the result always
+// round-trips through JSON.stringify (the emitted frame is parseable).
+function boundErrorFrame(id, message) {
+  const overhead = Buffer.byteLength(
+    SENTINEL + JSON.stringify({ id, ok: false, error: "" }) + "\n",
+    "utf8",
+  );
+  const budget = MAX_FRAME_BYTES - overhead;
+  if (budget <= 0) {
+    return "";
+  }
+  let msg = "";
+  let used = 0;
+  for (const cp of message) {
+    const n = jsonEscapedBytes(cp);
+    if (used + n > budget) {
+      break;
+    }
+    msg += cp;
+    used += n;
+  }
+  return msg;
+}
+
+// jsonEscapedBytes is the number of UTF-8 bytes one code point contributes
+// inside a JSON string (its escaped form, without the surrounding quotes).
+// JSON escaping is per-character, so summing these is exactly the error field's
+// serialized contribution.
+function jsonEscapedBytes(cp) {
+  const quoted = JSON.stringify(cp);
+  return Buffer.byteLength(quoted.slice(1, -1), "utf8");
 }
 
 async function handle(line) {

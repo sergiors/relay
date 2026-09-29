@@ -5,8 +5,9 @@ import (
 )
 
 // MatchingEventRules returns every event rule whose pattern matches the event,
-// in declaration order. Multiple rules may match; no deduplication is performed,
-// so two matching rules referencing the same handler are both returned.
+// in declaration order. Multiple rules may match; no deduplication is performed.
+// A parsed template never contains two rules with the same handler (rejected at
+// parse time), so each matched rule is a distinct invocation.
 func (t *Template) MatchingEventRules(event map[string]any) []EventRule {
 	var matched []EventRule
 	for _, r := range t.Events {

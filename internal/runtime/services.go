@@ -418,9 +418,10 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	if _, err := m.cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		// Created but never started; never leaves a live service behind, so
-		// remove the created container before returning. removeContainer treats
-		// not-found/conflict as benign.
-		_ = removeContainer(m.cli, id)
+		// remove the created container before returning. removeContainerContext
+		// honors the caller's cancellation/deadline (bounded by containerOpTimeout)
+		// and treats not-found/conflict as benign.
+		_ = removeContainerContext(ctx, m.cli, id)
 		return "", fmt.Errorf("service: start container: %w", err)
 	}
 
@@ -541,11 +542,25 @@ func (m *Manager) VerifyNetworks(ctx context.Context, networks []string) (string
 // best-effort: per-container failures are logged and do not abort, and the first
 // error is returned at the end (matching SweepOrphanContainers' style). A
 // non-running container is removed without a stop call (stopping an exited
-// container errors on docker). Removal uses removeContainer, which treats
-// not-found/conflict as benign.
+// container errors on docker). Removal uses removeContainerContext, which
+// respects the caller's cancellation/deadline (bounded by its own
+// containerOpTimeout cap) and treats not-found/conflict as benign, so a caller
+// that passes a short-lived reconcile bound never issues an unbounded removal.
+//
+// The loop stops promptly once ctx is done: ContainerStop and
+// removeContainerContext both observe ctx, and the loop checks it before each
+// container so a cancelled/deadline-expired caller is not charged another
+// round trip. The first context error is returned (via the removal/stop error)
+// like any other failure.
 func (m *Manager) StopServiceContainers(ctx context.Context, containers []ServiceContainer) error {
 	var firstErr error
 	for _, c := range containers {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		if c.State == container.StateRunning {
 			timeout := 10
 			if _, err := m.cli.ContainerStop(ctx, c.ID, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
@@ -561,7 +576,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				continue
 			}
 		}
-		if err := removeContainer(m.cli, c.ID); err != nil {
+		if err := removeContainerContext(ctx, m.cli, c.ID); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}

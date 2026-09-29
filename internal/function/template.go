@@ -589,6 +589,13 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		return nil, fmt.Errorf("unsupported runtime %q", t.Runtime)
 	}
 
+	// Event handler names must be unique within a function: the invocation
+	// identity is (function, handler), so two event rules sharing a handler
+	// would race for the same per-invocation state key and could not be
+	// retried, exhausted, or dead-lettered independently. Uniqueness is by
+	// handler name alone — the pattern, timeout, and retries are irrelevant —
+	// so a duplicate is rejected regardless of order or options.
+	seenHandlers := make(map[string]bool, len(raw.Events))
 	for _, ev := range raw.Events {
 		if ev.Handler == "" {
 			return nil, fmt.Errorf("rule is missing a handler")
@@ -599,6 +606,10 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		if err := validateHandler(ev.Handler); err != nil {
 			return nil, err
 		}
+		if seenHandlers[ev.Handler] {
+			return nil, fmt.Errorf("duplicate event handler %q: each handler may be declared only once per function", ev.Handler)
+		}
+		seenHandlers[ev.Handler] = true
 		timeout, err := resolveTimeout(ev.Timeout)
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: %w", ev.Handler, err)

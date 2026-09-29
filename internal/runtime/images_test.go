@@ -105,21 +105,30 @@ func TestNameFromRepoRejectsBarePrefix(t *testing.T) {
 	}
 }
 
-// TestRelayTagsFiltersToRelayNamespace verifies the client-side listing filter:
-// only relay-fn-<name> RepoTags are collected, grouped by function name, and a
-// foreign or untagged tag is ignored. It drives the real relayTags call over a
+// TestRelayTagsFiltersToStrictManagedImages verifies the client-side listing
+// filter is strict and label-derived: only images carrying relay.type=function
+// AND a relay.function agreeing with their relay-fn-<name> repository are
+// collected, grouped by function name. A prefix-only image (no managed labels),
+// a mislabeled image (label names another function), a dependency image, and a
+// foreign image are all ignored. It drives the real relayTags call over a
 // scripted daemon so the URL/decoding path is exercised too.
-func TestRelayTagsFiltersToRelayNamespace(t *testing.T) {
+func TestRelayTagsFiltersToStrictManagedImages(t *testing.T) {
 	cli := newScriptedDockerClient(t, dockerRoute{
 		method: http.MethodGet,
 		path:   "/images/json",
-		body: imageListJSON(
-			"relay-fn-a:aaaaaaaaaaaaaaaa",
-			"relay-fn-a:bbbbbbbbbbbbbbbb",
-			"relay-fn-b:cccccccccccccccc",
-			"relay-dep-deadbeef:latest",
-			"python:3.14-slim",
-			"untagged",
+		body: labeledImageListJSON(
+			scriptedImage{tags: []string{"relay-fn-a:aaaaaaaaaaaaaaaa"}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{"relay-fn-a:bbbbbbbbbbbbbbbb"}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{"relay-fn-b:cccccccccccccccc"}, labels: functionLabels("b")},
+			// Prefix-only: no managed labels -> never Relay-owned.
+			scriptedImage{tags: []string{"relay-fn-legacy:dddddddddddddddd"}},
+			// Mislabeled: relay.function says "other" but the repo is a -> not
+			// the repository's owner.
+			scriptedImage{tags: []string{"relay-fn-a:eeeeeeeeeeeeeeee"}, labels: functionLabels("other")},
+			// relay.type=function but no relay.function -> not owned.
+			scriptedImage{tags: []string{"relay-fn-a:ffffffffffffffff"}, labels: map[string]string{labelType: ImageTypeFunction}},
+			scriptedImage{tags: []string{"relay-dep-deadbeef:latest"}, labels: map[string]string{labelType: ImageTypeDependency}},
+			scriptedImage{tags: []string{"python:3.14-slim"}},
 		),
 	})
 	m := &Manager{cli: cli}
@@ -139,20 +148,54 @@ func TestRelayTagsFiltersToRelayNamespace(t *testing.T) {
 	}
 }
 
+// functionLabels builds the strict managed function-image label set for name
+// (relay.type=function + relay.function=name), matching what the builder stamps.
+func functionLabels(name string) map[string]string {
+	return map[string]string{labelType: ImageTypeFunction, labelFunction: name}
+}
+
+// TestManagedFunctionImageName pins the single ownership predicate directly:
+// prefix + relay.type=function + a matching relay.function are all required.
+func TestManagedFunctionImageName(t *testing.T) {
+	cases := []struct {
+		name   string
+		repo   string
+		labels map[string]string
+		want   string
+		wantOK bool
+	}{
+		{"managed", "relay-fn-a", functionLabels("a"), "a", true},
+		{"prefix only", "relay-fn-a", nil, "", false},
+		{"untyped labels", "relay-fn-a", map[string]string{labelFunction: "a"}, "", false},
+		{"mislabeled function", "relay-fn-a", functionLabels("b"), "", false},
+		{"missing function label", "relay-fn-a", map[string]string{labelType: ImageTypeFunction}, "", false},
+		{"dependency type", "relay-dep-x", map[string]string{labelType: ImageTypeDependency}, "", false},
+		{"foreign repo", "python", functionLabels("python"), "", false},
+	}
+	for _, tc := range cases {
+		got, ok := managedFunctionImageName(tc.repo, tc.labels)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("managedFunctionImageName(%q) = %q, %v; want %q, %v", tc.repo, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
 // TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages pins the GC
 // ownership rule at the production retirement primitives (FunctionImageTags ->
 // RemoveImageNow, the sequence the runner's function-removal path drives):
-// FunctionImageTags returns only Relay's own relay-fn-<name> tags, so an
-// external `image`-source service's reference (referenced by a running service
-// container) and another function's repo are never removal candidates. The
-// scripted daemon has no DELETE route for the external reference; the transport
-// fails the test if one is sent.
+// FunctionImageTags returns only Relay's own relay-fn-<name> tags carrying the
+// strict managed-image labels, so an external `image`-source service's reference
+// (referenced by a running service container), another function's repo, and a
+// prefix-only "relay-fn-*" image with no labels are never removal candidates.
+// The scripted daemon has no DELETE route for the external reference; the
+// transport fails the test if one is sent.
 func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.T) {
 	const (
 		fn      = "svc-ext"
 		extRef  = "ghcr.io/acme/api:1.2"
 		ownTag  = "relay-fn-svc-ext:0000000000000000"
 		otherFn = "relay-fn-other:1111111111111111"
+		legacy  = "relay-fn-svc-ext:9999999999999999"
 	)
 	containers := `[{"Id":"c1","Labels":{"relay.type":"service","relay.function":"` + fn + `",` +
 		`"relay.identity":"` + extRef + `","relay.image":"` + extRef + `"}}]`
@@ -162,7 +205,15 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 		// referencing extRef, so a mistaken attempt to remove extRef is refused
 		// before any DELETE.
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: containers},
-		dockerRoute{method: http.MethodGet, path: "/images/json", body: imageListJSON(ownTag, otherFn, extRef, "python:3.14-slim")},
+		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
+			scriptedImage{tags: []string{ownTag}, labels: functionLabels(fn)},
+			scriptedImage{tags: []string{otherFn}, labels: functionLabels("other")},
+			// A prefix-only image named for the SAME function but with no
+			// managed labels: never a candidate.
+			scriptedImage{tags: []string{legacy}},
+			scriptedImage{tags: []string{extRef}},
+			scriptedImage{tags: []string{"python:3.14-slim"}},
+		)},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
@@ -171,9 +222,9 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 	if err != nil {
 		t.Fatalf("FunctionImageTags: %v", err)
 	}
-	// The only candidate is the function's own tag (ownTag); extRef is a running
-	// service's external reference and otherFn is another function's repo, so
-	// neither is ever returned.
+	// The only candidate is the function's own LABELED tag (ownTag); extRef is a
+	// running service's external reference, otherFn is another function's repo,
+	// and legacy is a prefix-only image, so none is ever returned.
 	if len(tags) != 1 || tags[0] != ownTag {
 		t.Fatalf("FunctionImageTags = %v, want exactly [%s]", tags, ownTag)
 	}
@@ -190,5 +241,65 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 	}
 	if dels != 1 {
 		t.Fatalf("DELETE calls = %d, want exactly 1 (the function's own tag)", dels)
+	}
+}
+
+// TestRemoveImagesExceptStrictOwnership pins the startup sweep's ownership
+// scope: only strict managed function images are removal candidates, an active
+// labeled image in the keep set is preserved, a stale labeled image is removed,
+// and prefix-only or external images are never touched.
+func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
+	const (
+		active   = "relay-fn-a:0000000000000000"
+		stale    = "relay-fn-a:1111111111111111"
+		legacy   = "relay-fn-legacy:2222222222222222"
+		external = "ghcr.io/acme/api:1.2"
+	)
+	var deleted []string
+	cli := newScriptedDockerClient(t,
+		// The container-reference guard lists containers; none reference the
+		// stale image, so it is removable.
+		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
+		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
+			scriptedImage{tags: []string{active}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{stale}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{legacy}},
+			scriptedImage{tags: []string{external}},
+		)},
+		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { deleted = append(deleted, "x") }},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+
+	removed, err := m.RemoveImagesExcept(context.Background(), map[string]bool{active: true})
+	if err != nil {
+		t.Fatalf("RemoveImagesExcept: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want exactly the one stale labeled image", removed)
+	}
+	if len(deleted) != 1 {
+		t.Fatalf("DELETE calls = %d, want exactly 1 (the stale labeled image)", len(deleted))
+	}
+}
+
+// TestRemoveImagesExceptKeepsLabeledActive pins that a labeled function image in
+// the keep set is never removed even though it matches the ownership predicate.
+func TestRemoveImagesExceptKeepsLabeledActive(t *testing.T) {
+	const active = "relay-fn-a:0000000000000000"
+	deletes := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
+			scriptedImage{tags: []string{active}, labels: functionLabels("a")},
+		)},
+		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { deletes++ }},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
+
+	removed, err := m.RemoveImagesExcept(context.Background(), map[string]bool{active: true})
+	if err != nil {
+		t.Fatalf("RemoveImagesExcept: %v", err)
+	}
+	if removed != 0 || deletes != 0 {
+		t.Fatalf("removed=%d deletes=%d, want 0/0 (active image must be kept)", removed, deletes)
 	}
 }

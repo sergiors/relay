@@ -30,14 +30,15 @@ import (
 //
 // Repository names are never the sole classification signal. An image with NO
 // relay.type label is unmanaged and ignored entirely, whether its name looks
-// like relay-dep-* or relay-fn-*: a legacy dependency image built before this
-// label model existed has no label, so it is left alone forever (inert garbage;
-// backward compat for pre-label builds is explicitly out of scope), and the
-// legacy function-image cleanup paths already handle unlabeled relay-fn-* images
-// by name. A dependency image that carries the dependency label but NO tagged
-// RepoTag (a dangling image a failed build can leave behind) is also skipped:
-// GC deliberately keeps its scope tight to tagged, labeled dependency images,
-// so it can always remove by reference.
+// like relay-dep-* or relay-fn-*: a legacy image built before this label model
+// existed has no label, so it is left alone forever (inert garbage; backward
+// compat for pre-label builds is explicitly out of scope). The function-image
+// cleanup paths (relayTags / FunctionImageTags / RemoveImagesExcept) apply the
+// same strict, label-derived rule, so an unlabeled relay-fn-* image is likewise
+// never retired. A dependency image that carries the dependency label but NO
+// tagged RepoTag (a dangling image a failed build can leave behind) is also
+// skipped: GC deliberately keeps its scope tight to tagged, labeled dependency
+// images, so it can always remove by reference.
 //
 // A candidate is removed only when it is absent from the referenced set. Before
 // removing, the daemon itself is the second line of defense: a dependency image

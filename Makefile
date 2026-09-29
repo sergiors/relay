@@ -31,7 +31,7 @@ vet:
 	GOCACHE=$(GOCACHE) $(GO) vet ./...
 
 up:
-	docker compose -f compose.dev.yaml up -d --build
+	docker compose up -d --build
 
 down:
-	docker compose -f compose.dev.yaml down
+	docker compose down

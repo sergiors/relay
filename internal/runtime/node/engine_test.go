@@ -556,3 +556,125 @@ func TestPlanTSDoesNotInjectTsconfig(t *testing.T) {
 		}
 	}
 }
+
+// TestShellQuoteArg pins the POSIX shell-word contract used for every dynamic
+// value interpolated into the generated RUN: ordinary path bytes stay bare,
+// while every metacharacter (or quote/whitespace/non-ASCII byte) forces
+// single-quote quoting, with the sole escape being for an embedded single quote.
+func TestShellQuoteArg(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/app/src/order.ts", "/app/src/order.ts"},
+		{"esbuild@0.28.2", "esbuild@0.28.2"},
+		{"node24", "node24"},
+		{"", "''"},
+		{"a b", "'a b'"},
+		{"$HOME", "'$HOME'"},
+		{"`id`", "'`id`'"},
+		{"a;b", "'a;b'"},
+		{"a|b", "'a|b'"},
+		{"a>b", "'a>b'"},
+		{"(x)", "'(x)'"},
+		{"it's", `'it'\''s'`},
+		{"tab\there", "'tab\there'"},
+		{"café.ts", "'café.ts'"},
+	}
+	for _, tc := range cases {
+		if got := shellQuoteArg(tc.in); got != tc.want {
+			t.Errorf("shellQuoteArg(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestPlanShellQuotesHandlerDerivedPaths pins that every handler-derived value in
+// the generated esbuild RUN is a single shell argument: a source/output path
+// containing shell metacharacters ($, $(), backticks, ;, |, >, parentheses,
+// spaces, quotes) is single-quote quoted, so the shell can neither expand nor
+// split it nor start a new command. Nested TS/JS paths remain byte-identical to
+// the previous bare form when they contain no metacharacters.
+func TestPlanShellQuotesHandlerDerivedPaths(t *testing.T) {
+	const source = "export function handler(e) {}\n"
+	cases := []struct {
+		name   string
+		rel    string
+		module string
+		// wantArg is the exact quoted argument expected after --bundle.
+		wantArg string
+	}{
+		{"plain nested", "src/order.ts", "src.order", "/app/src/order.ts"},
+		{"dollar", "costs$total.ts", "costs$total", `'/app/costs$total.ts'`},
+		{"command substitution", "cmd$(id).ts", "cmd$(id)", `'/app/cmd$(id).ts'`},
+		{"backticks", "tick`id`.ts", "tick`id`", "'/app/tick`id`.ts'"},
+		{"semicolon", "semi;rm.ts", "semi;rm", "'/app/semi;rm.ts'"},
+		{"pipe", "pipe|cat.ts", "pipe|cat", "'/app/pipe|cat.ts'"},
+		{"redirect", "redir>out.ts", "redir>out", "'/app/redir>out.ts'"},
+		{"parens", "paren(a).ts", "paren(a)", "'/app/paren(a).ts'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSource(t, dir, tc.rel, source)
+			p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{tc.module})
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			cmd := requireInstall(t, p)
+			if !strings.Contains(cmd, "--bundle "+tc.wantArg) {
+				t.Errorf("expected --bundle %s in:\n%s", tc.wantArg, cmd)
+			}
+			// The output path mirrors the source with the extension replaced;
+			// it must be quoted too.
+			outExt := strings.TrimSuffix(tc.rel, ".ts") + ".mjs"
+			wantOut := shellQuoteArg("/app/" + outExt)
+			if !strings.Contains(cmd, "--outfile="+wantOut) {
+				t.Errorf("expected --outfile=%s in:\n%s", wantOut, cmd)
+			}
+		})
+	}
+}
+
+// TestPlanShellQuoteNestedJSAndTSUnchanged pins that the added quoting does not
+// perturb ordinary nested paths: an all-safe source/output path is emitted bare,
+// exactly as before.
+func TestPlanShellQuoteNestedJSAndTSUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "src/deep/order.ts", "export function handler(e) {}\n")
+
+	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"src.deep.order"})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	cmd := requireInstall(t, p)
+	for _, want := range []string{
+		"--bundle /app/src/deep/order.ts",
+		"--outfile=/app/src/deep/order.mjs",
+		"npm install --prefix /tmp/relay-esbuild",
+		"--cache /tmp/relay-npm-cache",
+		"rm -rf /tmp/relay-esbuild /tmp/relay-npm-cache",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("command missing unchanged %q:\n%s", want, cmd)
+		}
+	}
+}
+
+// TestPlanTraversalStillRejected pins that path traversal is rejected before any
+// filesystem access, so the shell-safety work never widens the addressable path
+// set. A metacharacter-bearing traversal is rejected by module validation, not
+// merely quoted.
+func TestPlanTraversalStillRejected(t *testing.T) {
+	for _, module := range []string{"../etc/passwd", "a/../../etc/passwd", "..", "a..b"} {
+		t.Run(module, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{module})
+			if err == nil {
+				t.Fatal("expected a traversal/invalid-module rejection")
+			}
+			if !strings.Contains(err.Error(), "invalid handler module") {
+				t.Errorf("error = %q, want an invalid-handler-module error", err)
+			}
+		})
+	}
+}

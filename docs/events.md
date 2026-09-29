@@ -105,8 +105,9 @@ map itself is missing.
   can match absence).
 - Extra event fields are ignored.
 - Each rule's pattern is evaluated independently: multiple rules may match the
-  same event and there is no deduplication, so two rules referencing the same
-  handler both run.
+  same event and there is no deduplication, so every matching rule runs. Event
+  handler names are unique within a function, so each matching rule is a
+  distinct handler invocation.
 
 Example: `status: [COMPLETED, FAILED]` matches either value; `id: { prefix:
 ["user_"] }` matches `user_123` but not `123`.

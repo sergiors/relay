@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -540,38 +541,47 @@ func (r *Reconciler) reconcileAll() {
 // per name by the pump; when called directly (Reconcile/reconcileAll) callers
 // coordinate it.
 func (r *Reconciler) reconcileFunction(name string) {
-	dir := filepath.Join(r.root, name)
-
-	// Directory gone -> remove from registry. In-flight invocations keep the old
-	// snapshot; they are not killed.
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		r.remove(name)
-		return
-	} else if err != nil {
-		// Unexpected stat error (permissions, I/O): don't drop the function on a
-		// flaky read, but surface it so staleness isn't silently ignored.
-		r.log.Warn(
-			"Function: stat error; retaining previous version",
-			"function", name,
-			"error", err,
-		)
-		return
-	}
-
-	fn, err := function.LoadSingle(dir, name)
+	// LoadSingle enforces the SAME path policy as startup discovery (a legal
+	// single-element name, a real direct child of the root, never a symlink), so
+	// a reload can never read, fingerprint, or build a path the startup loader
+	// would have rejected. A missing directory wraps fs.ErrNotExist (a removal);
+	// an invalid path is ErrInvalidPath and RETAINS the previously-loaded
+	// version rather than letting an invalid path remove or replace a healthy
+	// function.
+	fn, err := function.LoadSingle(r.root, name)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// Directory gone -> remove from registry. In-flight invocations keep
+			// the old snapshot; they are not killed.
+			r.remove(name)
+			return
+		}
 		if errors.Is(err, function.ErrNotReady) {
 			// Directory exists but template isn't there yet (mid-copy); wait for
 			// more events rather than dropping a previously-active function.
 			return
 		}
+		if errors.Is(err, function.ErrInvalidPath) {
+			// An invalid path (bad name, symlink, non-directory, not a direct
+			// child) can never be a function; retain any previously-loaded
+			// version rather than removing or replacing it.
+			r.log.Warn(
+				"Function: invalid path; retaining previous version",
+				"function", name,
+				"error", err,
+			)
+			return
+		}
+		// A flaky read/stat (permissions, I/O) is not a removal: don't drop the
+		// function, but surface it so staleness isn't silently ignored.
 		r.log.Warn(
-			"Function: template invalid; retaining previous version",
+			"Function: load error; retaining previous version",
 			"function", name,
 			"error", err,
 		)
 		return
 	}
+	dir := fn.Dir
 
 	// Compute the fingerprint AND (for a runtime-backed function) the resolved
 	// source selection in ONE traversal, then carry BOTH into the rebuild below.

@@ -208,9 +208,17 @@ events:
 	}
 }
 
-func TestMatchingEventRulesSameHandler(t *testing.T) {
-	// Two matching rules referencing the same handler: both are returned.
-	tmpl := mustParse(t, `
+// Event handler names are unique within a function: a template whose event
+// rules repeat a handler is rejected at parse time, naming the handler. This
+// replaces the old behavior where two same-handler rules both ran.
+func TestParseDuplicateEventHandlerRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "same handler and pattern",
+			yaml: `
 runtime: python3.14
 events:
   - handler: handler.notify
@@ -219,13 +227,70 @@ events:
   - handler: handler.notify
     pattern:
       status: [COMPLETED]
-`)
-	rules := tmpl.MatchingEventRules(map[string]any{"status": "COMPLETED"})
-	if len(rules) != 2 {
-		t.Fatalf("expected 2 matching rules, got %d", len(rules))
+`,
+		},
+		{
+			name: "same handler different patterns",
+			yaml: `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.notify
+    pattern:
+      status: [FAILED]
+`,
+		},
+		{
+			name: "same handler different timeout and retries",
+			yaml: `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+    timeout: 20s
+    retries: 2
+`,
+		},
 	}
-	if rules[0].Handler != "handler.notify" || rules[1].Handler != "handler.notify" {
-		t.Errorf("expected both to be handler.notify, got %q and %q", rules[0].Handler, rules[1].Handler)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected error for duplicate event handler")
+			}
+			if !strings.Contains(err.Error(), `duplicate event handler "handler.notify": each handler may be declared only once per function`) {
+				t.Fatalf("err = %v, want it to name the duplicated handler", err)
+			}
+		})
+	}
+}
+
+// Distinct event handlers parse valid regardless of pattern, timeout, or
+// retries: uniqueness is by handler name alone.
+func TestParseDistinctEventHandlersValid(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.failed
+    pattern:
+      status: [FAILED]
+    timeout: 20s
+    retries: 2
+`)
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("expected 2 rules, got %d", len(tmpl.Events))
+	}
+	if tmpl.Events[0].Handler != "handler.notify" || tmpl.Events[1].Handler != "handler.failed" {
+		t.Errorf("handlers = %q, %q", tmpl.Events[0].Handler, tmpl.Events[1].Handler)
 	}
 }
 

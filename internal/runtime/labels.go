@@ -126,11 +126,11 @@ const (
 // The relay.type values for managed IMAGES. Every managed image carries exactly
 // one; the absence of a type (or an unknown type) means an image is NOT managed
 // — an unlabeled "relay-fn-*" or "relay-dep-*" image from a pre-labels build is
-// unmanaged for classification purposes, and the dependency GC deliberately
-// never touches it (function-image cleanup handles legacy function images by
-// name; an inert, unlabeled legacy dependency image is left alone and documented
-// as out of scope for GC). These are exported so the builder stamps them without
-// a stringly-typed duplicate.
+// unmanaged for classification purposes. Both the dependency GC and the
+// function-image cleanup paths (relayTags, FunctionImageTags, RemoveImagesExcept)
+// are strict and label-derived: an unlabeled image is never removed or
+// considered a Relay version. These are exported so the builder stamps them
+// without a stringly-typed duplicate.
 const (
 	ImageTypeFunction   = "function"
 	ImageTypeDependency = "dependency"

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 
 	"relay/internal/observability/tracing"
@@ -37,13 +38,13 @@ import (
 const relayProtocolSentinel = "@@RELAY@@"
 
 // maxResponseFrame is the size bound every response frame is guaranteed to
-// respect. The bootstraps truncate their error strings to maxResponseError
-// (3 KiB) so a frame always stays below the demuxer's maxPending (4 KiB) line
-// cap: an oversized line would be split off as user output mid-frame and the
-// response would be destroyed. Keeping frame < maxPending is therefore a
-// protocol invariant, not an optimization.
+// respect. The bootstraps bound the WHOLE serialized frame (sentinel + JSON
+// envelope + error) to this many UTF-8 bytes, so a frame always stays below the
+// demuxer's maxPending (4 KiB) line cap: an oversized line would be split off as
+// user output mid-frame and the response would be destroyed. Keeping frame <
+// maxPending is therefore a protocol invariant, not an optimization.
 const (
-	maxResponseFrame = 3 << 10 // 3 KiB — bootstrap-side truncation cap
+	maxResponseFrame = 3 << 10 // 3 KiB — bootstrap-side frame cap
 	maxResponseError = maxResponseFrame - 256
 )
 
@@ -117,15 +118,17 @@ type invokeResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// clampResponseError bounds a response error string to maxResponseError so the
-// whole frame stays below the demuxer's 4 KiB line cap (see maxResponseFrame).
-// The Go side truncates what the bootstraps already bound: belt and braces for
-// hand-written or future bootstraps.
+// clampResponseError bounds a response error string to maxResponseError bytes so
+// a frame built from it stays below the demuxer's 4 KiB line cap (see
+// maxResponseFrame). The Go side truncates what the bootstraps already bound:
+// belt and braces for hand-written or future bootstraps. Truncation happens on a
+// Unicode code-point boundary so the result is always valid UTF-8 (a byte-slice
+// could otherwise split a multibyte character).
 func clampResponseError(s string) string {
-	if len(s) > maxResponseError {
-		return s[:maxResponseError]
+	if len(s) <= maxResponseError {
+		return s
 	}
-	return s
+	return strings.ToValidUTF8(s[:maxResponseError], "")
 }
 
 // protocolDemuxer is the stdout demultiplexer for a reused execution container:

@@ -13,6 +13,12 @@
 //   - A healthy function is never replaced until its replacement is ready
 //   - A previously-failed (unavailable) build is retried when its fingerprint
 //     is stable, so a broken function recovers without further edits
+//   - Live/periodic reload applies the SAME discovery path policy as startup
+//     (function.LoadSingle): a legal single-element name and a real direct-child
+//     directory of the root, never a symlink. An invalid path (bad name, symlink
+//     — even to an in-root or outside target, non-directory) RETAINS the
+//     previously-loaded function rather than removing or replacing it; only a
+//     truly missing directory is a removal.
 //
 // Usage: New, then PrepareWatch (establish change detection synchronously),
 // then Seed each startup function with its already-computed fingerprint, then

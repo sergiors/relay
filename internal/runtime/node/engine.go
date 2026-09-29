@@ -323,24 +323,71 @@ func firstExisting(fnDir string, candidates []string) string {
 // unconditionally ESM, which the bootstrap imports dynamically; --target is the
 // runtime spec name (e.g. node24) so the emitted syntax matches the managed Node.
 // --tsconfig is added only when the function ships a tsconfig.json.
+//
+// Shell safety: every value interpolated into the RUN is passed through
+// shellQuoteArg, so a handler-derived path (a user may name a source file with
+// shell metacharacters, e.g. "o$rder.ts" or "a;b.ts") is always a single
+// argument and is never expanded, split, or executed by the build shell. The
+// fixed prefixes/caches/versions are constants and pass through quoted-or-bare
+// like any other value.
 func esbuildCommand(specName string, sources []handlerSource, tsconfig bool) string {
 	parts := []string{
-		"npm install --prefix " + esbuildPrefix +
-			" --no-save --cache " + esbuildCache +
-			" --silent esbuild@" + esbuildVersion,
+		"npm install --prefix " + shellQuoteArg(esbuildPrefix) +
+			" --no-save --cache " + shellQuoteArg(esbuildCache) +
+			" --silent esbuild@" + shellQuoteArg(esbuildVersion),
 	}
 	tsconfigFlag := ""
 	if tsconfig {
-		tsconfigFlag = " --tsconfig=" + path.Join(workDir, tsconfigFile)
+		tsconfigFlag = " --tsconfig=" + shellQuoteArg(path.Join(workDir, tsconfigFile))
 	}
 	for _, s := range sources {
 		parts = append(parts, fmt.Sprintf(
 			"%s --bundle %s --outfile=%s --format=esm --platform=node --target=%s --packages=external%s --log-level=warning",
-			esbuildBin, s.srcPath(), s.outPath(), specName, tsconfigFlag,
+			shellQuoteArg(esbuildBin),
+			shellQuoteArg(s.srcPath()),
+			shellQuoteArg(s.outPath()),
+			shellQuoteArg(specName),
+			tsconfigFlag,
 		))
 	}
-	parts = append(parts, "rm -rf "+esbuildPrefix+" "+esbuildCache)
+	parts = append(parts, "rm -rf "+shellQuoteArg(esbuildPrefix)+" "+shellQuoteArg(esbuildCache))
 	return strings.Join(parts, " && ")
+}
+
+// shellQuoteArg renders s as exactly one POSIX shell word. A string made only of
+// unambiguously safe bytes (ASCII letters/digits and the conservative set
+// "_@%+=:,./-") is emitted bare so ordinary absolute paths keep their familiar,
+// readable form; ANY other byte — every shell metacharacter ("$", backtick,
+// ";", "|", "&", "(", ")", "<", ">", "*", "?", "[", "]", "{", "}", "!", "~",
+// "#", double quote, single quote, backslash, whitespace, and every non-ASCII
+// byte) — forces POSIX single-quote quoting. The only escape needed inside a
+// single-quoted word is for an embedded single quote. Inside single quotes the
+// shell performs no expansion, splitting, or command substitution, so the value
+// can never escape its argument position.
+func shellQuoteArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if isShellSafeArg(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// isShellSafeArg reports whether every byte of s is in the conservative
+// shell-safe set. It is deliberately strict: a byte outside the set always
+// triggers quoting rather than relying on positional shell behavior.
+func isShellSafeArg(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_', c == '@', c == '%', c == '+', c == '=', c == ':', c == ',', c == '.', c == '/', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func stat(fnDir, name string) error {

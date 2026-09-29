@@ -1,6 +1,8 @@
 package function
 
 import (
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -248,6 +250,109 @@ events:
 	}
 	if fns[0].Name != "good" {
 		t.Errorf("expected 'good', got %q", fns[0].Name)
+	}
+}
+
+// TestLoadSingleAppliesSharedPathPolicy pins the path policy LoadSingle and
+// Loader.Load share: a legal name and a real direct-child directory are
+// required, a symlink is never accepted (even when the target is a real
+// directory inside the root, and especially when it points outside), and a
+// missing directory is reported as not-exist so a caller treats it as a removal.
+func TestLoadSingleAppliesSharedPathPolicy(t *testing.T) {
+	root := t.TempDir()
+	writeTemplate(t, root, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+
+	t.Run("valid direct child", func(t *testing.T) {
+		fn, err := LoadSingle(root, "valid")
+		if err != nil {
+			t.Fatalf("LoadSingle(valid) = %v", err)
+		}
+		if fn.Name != "valid" || fn.Dir != filepath.Join(root, "valid") {
+			t.Fatalf("loaded %+v, want name/dir of valid", fn)
+		}
+	})
+
+	t.Run("missing directory is not-exist", func(t *testing.T) {
+		if _, err := LoadSingle(root, "absent"); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("LoadSingle(absent) = %v, want fs.ErrNotExist", err)
+		}
+	})
+
+	t.Run("invalid name", func(t *testing.T) {
+		for _, name := range []string{"", "Upper", "has space", ".hidden", "a/b", ".."} {
+			if _, err := LoadSingle(root, name); !errors.Is(err, ErrInvalidPath) {
+				t.Errorf("LoadSingle(%q) = %v, want ErrInvalidPath", name, err)
+			}
+		}
+	})
+
+	t.Run("symlink to an inside directory is rejected", func(t *testing.T) {
+		link := filepath.Join(root, "link-inside")
+		if err := os.Symlink(filepath.Join(root, "valid"), link); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		if _, err := LoadSingle(root, "link-inside"); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("LoadSingle(symlink) = %v, want ErrInvalidPath", err)
+		}
+	})
+
+	t.Run("symlink to an outside target is rejected", func(t *testing.T) {
+		outside := t.TempDir()
+		writeTemplate(t, outside, "outside", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+		if err := os.Symlink(filepath.Join(outside, "outside"), filepath.Join(root, "link-outside")); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		// The outside target has a valid template; the link must STILL be
+		// rejected rather than followed.
+		if _, err := LoadSingle(root, "link-outside"); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("LoadSingle(outside symlink) = %v, want ErrInvalidPath", err)
+		}
+	})
+
+	t.Run("not a directory", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(root, "afile"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		if _, err := LoadSingle(root, "afile"); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("LoadSingle(file) = %v, want ErrInvalidPath", err)
+		}
+	})
+}
+
+// TestLoadRejectsSymlinkedFunctionDir pins that startup discovery applies the
+// same no-follow policy: a symlinked directory entry is skipped even when its
+// target (inside or outside the root) holds a valid template.
+func TestLoadRejectsSymlinkedFunctionDir(t *testing.T) {
+	root := t.TempDir()
+	writeTemplate(t, root, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	if err := os.Symlink(filepath.Join(root, "valid"), filepath.Join(root, "aliased")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	loader := NewLoader(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	fns, err := loader.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "valid" {
+		t.Fatalf("Load = %+v, want only the real 'valid' directory", fns)
 	}
 }
 

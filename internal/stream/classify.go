@@ -135,11 +135,11 @@ func dlqEntrySpecs(reason error) []dlqEntrySpec {
 	specs := make([]dlqEntrySpec, 0, len(invocations))
 	seen := make(map[string]bool, len(invocations))
 	for _, iv := range invocations {
-		// Two matching rules may share a handler (a legal template), so the same
-		// "<function>/<handler>" can appear more than once in the aggregate.
-		// Deduplicate so exactly one entry per invocation is produced; the
-		// persistence-marker skip would also cover it, but deduping keeps the
-		// contract ("one entry per exhausted invocation") explicit.
+		// Duplicate "<function>/<handler>" metadata in the aggregate collapses
+		// to one entry: a parsed template rejects duplicate event handlers, but
+		// this defensive dedup keeps the contract ("one entry per exhausted
+		// invocation") explicit. The persistence-marker skip would also cover
+		// it.
 		if seen[iv.Invocation()] {
 			continue
 		}

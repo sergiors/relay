@@ -66,10 +66,15 @@ sys.path.insert(0, "/app")
 
 SENTINEL = "@@RELAY@@"
 
-# Response error strings are operator log text only; bound them. The cap keeps
-# the whole response frame well under Relay's 4 KiB stdout line cap, so a frame
-# is never split mid-line by the demuxer.
-MAX_ERROR_BYTES = 3 * 1024
+# Response error strings are operator log text only; bound them. The cap is the
+# UTF-8 byte length of the WHOLE response frame — the sentinel, the JSON
+# envelope, and the error — so a frame can never exceed the cap and be split
+# mid-line by Relay's 4 KiB stdout line demuxer (Go's maxPending). It matches the
+# Go bootstrap-side cap maxResponseFrame (3 KiB), leaving ~1 KiB of margin under
+# the demuxer limit. Truncation is applied on a Unicode code-point boundary, so a
+# multibyte message can never be cut mid-character and the emitted frame is
+# always valid UTF-8.
+MAX_FRAME_BYTES = 3 * 1024
 
 # User print() output must reach Relay live (and BEFORE the protocol response
 # of the invocation that printed it): force line buffering on the text layer.
@@ -124,6 +129,43 @@ def apply_env(env):
         _applied.add(key)
 
 
+def _json_escaped_bytes(ch):
+    """Number of UTF-8 bytes one Unicode character contributes inside a JSON
+    string (its escaped form, without the surrounding quotes). JSON escaping is
+    per-character, so summing these is exactly the error field's serialized
+    contribution."""
+    return len(json.dumps(ch)[1:-1].encode("utf-8"))
+
+
+def _bound_error_frame(req_id, message):
+    """Return an error string such that the whole serialized response frame
+    (sentinel + JSON envelope + error) fits in MAX_FRAME_BYTES UTF-8 bytes,
+    while always remaining valid UTF-8.
+
+    The budget is the frame cap minus the exact size of the sentinel, the
+    envelope with an empty error, and the trailing newline. The message is then
+    accumulated one Unicode character at a time (including any JSON escaping of
+    quotes, backslashes, and control characters), so the frame is bounded
+    precisely, a multibyte character is never cut mid-byte, and the result always
+    round-trips through json.dumps (the emitted frame is parseable).
+    """
+    overhead = len(
+        (SENTINEL + json.dumps({"id": req_id, "ok": False, "error": ""})).encode("utf-8")
+    ) + 1  # +1 for the trailing newline respond writes
+    budget = MAX_FRAME_BYTES - overhead
+    if budget <= 0:
+        return ""
+    parts = []
+    used = 0
+    for ch in message:
+        n = _json_escaped_bytes(ch)
+        if used + n > budget:
+            break
+        parts.append(ch)
+        used += n
+    return "".join(parts)
+
+
 def respond(req_id, ok, error=None):
     # Flush pending user-layer output first so the byte order on stdout keeps
     # user print lines ahead of the protocol frame.
@@ -133,7 +175,7 @@ def respond(req_id, ok, error=None):
         pass
     frame = {"id": req_id, "ok": ok}
     if error is not None:
-        frame["error"] = str(error)[:MAX_ERROR_BYTES]
+        frame["error"] = _bound_error_frame(req_id, str(error))
     sys.stdout.buffer.write(SENTINEL.encode() + json.dumps(frame).encode() + b"\n")
     sys.stdout.buffer.flush()
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 // testResponse builds one wire format response line (no newline).
@@ -252,7 +253,8 @@ func TestDemuxerStderrForwarding(t *testing.T) {
 // invariant the clamp exists for: a response frame (sentinel + JSON envelope +
 // error) built from a clamped error always fits under the demuxer's maxPending
 // line cap, so it can never be split as user output mid-frame. It also verifies
-// a short error is passed through unchanged.
+// a short error is passed through unchanged and that clamping is UTF-8 safe (a
+// multibyte character is never split).
 func TestClampResponseErrorKeepsFramesUnderDemuxerLineCap(t *testing.T) {
 	if short := "boom"; clampResponseError(short) != short {
 		t.Errorf("clampResponseError(%q) = %q, want unchanged", short, clampResponseError(short))
@@ -268,5 +270,16 @@ func TestClampResponseErrorKeepsFramesUnderDemuxerLineCap(t *testing.T) {
 	frame := testResponse("id", false, clamped)
 	if len(frame) >= maxPending {
 		t.Errorf("response frame length %d must stay below maxPending %d", len(frame), maxPending)
+	}
+
+	// A multibyte error (4-byte runes) clamped at a byte boundary must remain
+	// valid UTF-8: the clamp drops a partial trailing rune rather than emitting
+	// an invalid byte sequence.
+	multi := clampResponseError(strings.Repeat("\U0001F600", 1<<18))
+	if !utf8.ValidString(multi) {
+		t.Error("clamped multibyte error must be valid UTF-8")
+	}
+	if len(multi) > maxResponseError {
+		t.Errorf("clamped multibyte length %d exceeds maxResponseError %d", len(multi), maxResponseError)
 	}
 }

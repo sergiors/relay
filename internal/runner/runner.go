@@ -2630,10 +2630,11 @@ func (r *Runner) recordFailure(
 }
 
 // dedupeExhausted returns the exhausted invocations deduplicated by
-// "<function>/<handler>", preserving first-seen order. Two event rules in one
-// template may share a handler (a legal configuration), so the same invocation
-// can appear more than once in the aggregate; the DLQ contract is one entry per
-// exhausted invocation, so the duplicate metadata is collapsed here.
+// "<function>/<handler>", preserving first-seen order. This is a defensive
+// backstop: a parsed template rejects duplicate event handlers, so the same
+// invocation should not appear twice in the aggregate, but hand-built
+// templates and legacy aggregates may still carry duplicate metadata; the DLQ
+// contract is one entry per exhausted invocation, so it is collapsed here.
 func dedupeExhausted(invocations []stream.ExhaustedInvocation) []stream.ExhaustedInvocation {
 	if len(invocations) < 2 {
 		return invocations

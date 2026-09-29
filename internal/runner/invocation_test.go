@@ -947,9 +947,11 @@ func TestHandleMultipleExhaustionsCarryPerInvocationMetadata(t *testing.T) {
 	}
 }
 
-// TestDedupeExhaustedCollapsesSameInvocation pins that two rules sharing the
-// same handler (a legal template) collapse to a single exhausted invocation, so
-// the DLQ contract stays one entry per invocation.
+// TestDedupeExhaustedCollapsesSameInvocation pins that duplicate invocation
+// metadata in an exhaustion aggregate collapses to a single exhausted
+// invocation, so the DLQ contract stays one entry per invocation. A parsed
+// template rejects duplicate event handlers, but this defensive collapse
+// remains for aggregates that still carry duplicates.
 func TestDedupeExhaustedCollapsesSameInvocation(t *testing.T) {
 	in := []stream.ExhaustedInvocation{
 		{Function: "fn", Handler: "notify", Attempts: 3},

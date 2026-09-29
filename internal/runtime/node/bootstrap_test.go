@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 // relaySentinel is the protocol response prefix. It is hardcoded here (rather
@@ -616,5 +617,73 @@ func TestNodeRuntimeFrameShape(t *testing.T) {
 	}
 	if !json.Valid([]byte(strings.TrimPrefix(r.Frame, relaySentinel))) {
 		t.Errorf("response frame payload %q must be valid JSON", r.Frame)
+	}
+}
+
+// goFrameCap is the Go bootstrap-side frame cap (internal/runtime
+// maxResponseFrame = 3 KiB), hardcoded here to avoid an import cycle. A
+// bootstrap response frame must always fit within it in UTF-8 bytes.
+const goFrameCap = 3 << 10
+
+// TestNodeRuntimeErrorFrameBound pins the error-frame byte cap across ASCII,
+// multibyte, emoji, accented, and control/escaped text: the emitted frame is at
+// most the Go cap in UTF-8 bytes, is valid UTF-8, is still parseable JSON with
+// the expected id, and remains a handler error (ok:false) rather than a
+// malformed response.
+func TestNodeRuntimeErrorFrameBound(t *testing.T) {
+	skipIfNoNode(t)
+	root := appRoot(t)
+	writeModule(t, root, "index.mjs", `
+export function short() { throw new Error("short ascii"); }
+export function long() { throw new Error("x".repeat(20000)); }
+export function multi() { throw new Error("é".repeat(20000)); }
+export function emoji() { throw new Error("😀".repeat(8000)); }
+export function accented() { throw new Error("àéîõü".repeat(5000)); }
+export function control() { throw new Error("\t\n\u0000\u0007".repeat(5000)); }
+`)
+	p := startNode(t, root)
+
+	for _, tc := range []struct {
+		name    string
+		handler string
+	}{
+		{"short ascii", "index.short"},
+		{"long ascii", "index.long"},
+		{"multibyte", "index.multi"},
+		{"emoji", "index.emoji"},
+		{"accented", "index.accented"},
+		{"control", "index.control"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := p.invoke(t, tc.handler, `{}`, nil)
+			if r.OK {
+				t.Fatal("expected the raising handler to fail the invocation")
+			}
+			if len(r.Frame) > goFrameCap {
+				t.Fatalf("frame length %d exceeds the Go cap %d", len(r.Frame), goFrameCap)
+			}
+			if !utf8.ValidString(r.Frame) {
+				t.Fatal("frame must be valid UTF-8")
+			}
+			payload := strings.TrimPrefix(r.Frame, relaySentinel)
+			if !json.Valid([]byte(payload)) {
+				t.Fatalf("frame payload must be valid JSON: %q", payload)
+			}
+			var resp respFrame
+			if err := json.Unmarshal([]byte(payload), &resp); err != nil {
+				t.Fatalf("frame payload must unmarshal: %v", err)
+			}
+			if resp.ID == "" || resp.OK {
+				t.Fatalf("resp = %+v, want a non-empty id and ok:false for the handler error", resp)
+			}
+			if resp.Error == "" {
+				t.Fatal("expected a non-empty bounded error string")
+			}
+			// The process must stay healthy after an oversized error.
+			ok := p.invoke(t, "index.short", `{}`, nil)
+			if ok.OK {
+				t.Fatal("expected the short handler to also fail")
+			}
+		})
 	}
 }
