@@ -130,6 +130,14 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Both service source kinds share one reconciler and lifecycle; the desired
   source is resolved before any container action, so an unresolvable source
   preserves the existing healthy containers.
+- Replacement is start-before-stop per replica slot. Identity is the SourceRef
+  alone, so a source change is a removal plus an addition: a removed identity's
+  containers are stopped LAST, and only after the desired set fully converged —
+  if any desired service failed (resolution, routing/network, create/start,
+  non-running) they are preserved as the last usable generation under that
+  grouping. A pass superseded by a newer desired state never stops the old
+  generation it was about to replace; it removes only its own provisional
+  replacement and leaves convergence to the newer request.
 - Containers are replaced when image content, port, effective environment,
   resources, or routing labels change, otherwise preserved; external image
   freshness is checked at most hourly per identity, in memory only.

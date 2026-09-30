@@ -1,9 +1,16 @@
 // The service reconciler (services.go) reconciles a function's persistent
 // service containers to its template. At startup and on every reconcile of the
-// owning function, it lists the daemon's service containers, classifies each as
-// desired/stale, stops the stale (and any removed services' and excess
-// replicas') containers, and starts whatever replicas are missing — converging
-// the running set to the template's declared services and replica counts.
+// owning function, it lists the daemon's service containers, classifies each
+// against the desired configuration, and converges the running set to the
+// template's declared services and replica counts.
+//
+// Replacement is ZERO-DOWNTIME-BY-CONSTRUCTION: for every desired replica slot
+// the reconciler starts the replacement and requires StartService to confirm it
+// RUNNING before stopping the superseded generation for that same logical slot.
+// A failed create/start/inspect leaves the old generation running and the slot
+// keeps serving; the next reconcile retries. Old generations, excess replicas,
+// and removed services are stopped only after the desired slots have converged,
+// so a service is never taken to zero replicas by a failed replacement.
 //
 // The component is deliberately small and the owning layer (worker wiring) is
 // what decides when to invoke it. Containers owned by OTHER functions are never
@@ -13,6 +20,13 @@
 // longer exists. ShutdownCleanup is the graceful-shutdown counterpart: it
 // removes service containers owned by this worker only; startup convergence
 // remains the crash-recovery path when shutdown cleanup did not execute.
+//
+// Identity is the configured source descriptor (function.Service.SourceRef) and
+// the replica slot is relay.replica; both are label-derived and are the only
+// grouping keys. An identity change is therefore indistinguishable from a
+// removal plus an addition at this layer (see Reconcile's comment on that
+// edge), which is why removed-service cleanup is deferred until after every
+// desired service has converged.
 //
 // Ordering guarantees relied on by the worker:
 //   - Reconcile is idempotent: when already converged it lists containers once
@@ -28,10 +42,14 @@
 //     TRAEFIK_HOST_OVERRIDE mapping) must be a valid hostname, and the routing
 //     network must exist (Relay never creates it); a routed service failing
 //     routing validation is reported and skipped, not half-reconciled.
+//   - A source that cannot be resolved (a failed pull, a missing image, an
+//     unlaunchable entrypoint), an unresolvable environment/secret, or a
+//     missing routing network is reported and leaves the existing containers
+//     untouched: nothing is stopped or started for that service.
 //   - Reconcile takes the LIFECYCLE context and derives a FRESH normal-operation
 //     bound (the injected reconcileTimeout) for each Docker operation itself. The
 //     routing/source-resolution phase and the post-resolution phase (env
-//     resolution, stale stops, replica starts) run on separate bounds, so one
+//     resolution, replacement starts, stale stops) run on separate bounds, so one
 //     operation cannot consume another's budget. A caller must never wrap the
 //     whole pass in one short deadline.
 package reconciler
@@ -68,6 +86,13 @@ type Docker interface {
 		svc function.Service,
 		functionImage string,
 	) (runtime.ServiceImage, error)
+	// StartService creates and starts one service replica and returns only
+	// after Docker confirms it is RUNNING. A non-nil error (create/start
+	// failure, or a started container that inspects as not running) means the
+	// replacement is not viable: the reconciler preserves the old generation
+	// for that slot. The runtime Manager implements the running gate; a fake
+	// that returns nil without confirming running is asserting convergence it
+	// has not proven.
 	StartService(ctx context.Context, spec runtime.ServiceSpec, replica int) (string, error)
 	ServiceContainerList(ctx context.Context) ([]runtime.ServiceContainer, error)
 	StopServiceContainers(ctx context.Context, containers []runtime.ServiceContainer) error
@@ -127,6 +152,39 @@ func BuildEnv(
 	return env, nil
 }
 
+// reconcileAuthorityKey is the private context key carrying a supersession
+// check. It is deliberately an unexported type so no other package can install
+// a check under a colliding key.
+type reconcileAuthorityKey struct{}
+
+// withReconcileAuthority attaches a supersession check to ctx. current reports
+// whether the request that owns ctx is still the authoritative desired state
+// for its function. Reconcile consults it at the commit boundary — immediately
+// before it would stop a superseded generation — so a request a newer desired
+// state has already superseded does NOT stop the old generation it was about to
+// replace (the last usable generation), and instead cleans only the provisional
+// replacements it started. A nil current leaves ctx unchanged (no authority
+// check), which is what a direct Apply caller gets; the coordinator wires an
+// authority that consults its own desired-state token.
+//
+// It is package-private on purpose: the only producer is the coordinator in
+// this package, and a direct Apply caller keeps the exact pre-existing
+// behavior. The check belongs to the request's own lifecycle; Reconcile reads
+// it at each commit boundary and never caches the answer.
+func withReconcileAuthority(ctx context.Context, current func() bool) context.Context {
+	if current == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, reconcileAuthorityKey{}, current)
+}
+
+// reconcileAuthorityFrom returns the supersession check carried by ctx, or nil
+// when the caller attached none (a direct Apply).
+func reconcileAuthorityFrom(ctx context.Context) func() bool {
+	current, _ := ctx.Value(reconcileAuthorityKey{}).(func() bool)
+	return current
+}
+
 // Reconcile converges the set of fnName's running service containers to
 // tmpl.Services (with the freshly prepared image). It is a best-effort pass:
 // per-operation failures are logged by the caller-facing style and the first
@@ -155,6 +213,26 @@ func BuildEnv(
 // already running with the correct image, port, and replica count — returns
 // (false, nil). Callers can use this to distinguish a no-op verification pass
 // from a pass that actually changed state (e.g. for log-level selection).
+//
+// Replacement ordering: for each desired replica slot the reconciler attempts
+// the replacement BEFORE stopping the slot's old generation, and stops that
+// generation only once StartService has confirmed the replacement is running.
+// Old generations of a slot whose replacement failed are preserved (the slot
+// keeps serving) and retried on a later pass. Excess replicas (scale-down) and
+// removed services are stopped only after every desired slot has converged, so
+// convergence never removes every old replica before replacements exist.
+//
+// Identity edge — an identity CHANGE is a removal plus an addition. A service's
+// identity is its SourceRef (entrypoint file or image reference), the sole
+// grouping key; the template has no separate stable service name. Changing a
+// source descriptor (e.g. an external image tag, or an entrypoint path) makes
+// the old identity absent from the desired set and the new identity appear, so
+// the old containers are treated as removed. The reconciler deliberately stops
+// removed services LAST (after desired starts), which gives the new identity and
+// the old one a brief overlap, but it cannot pair them: it has no evidence the
+// two identities are "the same service". Reliable cross-SourceRef pairing would
+// require a stable service identity (an index or explicit name) that the
+// template model does not have, so it is out of scope here.
 //
 // Container ownership is always label-derived. A container belongs to fnName
 // when its Function == fnName; containers of other functions are never touched.
@@ -237,15 +315,59 @@ func reconcileWithObserver(
 		}
 	}
 
+	// bounded derives a fresh normal-operation bound rooted in the lifecycle
+	// context, matching the per-phase bounds Reconcile already uses. Supersession
+	// cleanup (removing this pass's provisional replacements) uses it so it never
+	// inherits an exhausted phase budget.
+	bounded := func() (context.Context, context.CancelFunc) {
+		if reconcileTimeout > 0 {
+			return context.WithTimeout(ctx, reconcileTimeout)
+		}
+		return context.WithCancel(ctx)
+	}
+
+	// Supersession: a request a newer desired state has replaced must not commit
+	// (stop) the old generation it was about to supersede, or a newer request
+	// could find its last usable generation already gone. authority is attached
+	// only by the ServiceCoordinator; a direct Apply has none and its behavior is
+	// unchanged. superseded is evaluated at EACH commit boundary because a newer
+	// enqueue can arrive at any point during a long pass.
+	authority := reconcileAuthorityFrom(ctx)
+	superseded := func() bool { return authority != nil && !authority() }
+
+	// desiredFailed records that at least one desired service did not converge
+	// this pass (a routing/source/env resolution failure, or a replacement that
+	// could not be confirmed running). Under SourceRef grouping an identity
+	// change is a removal plus an addition, so a removed identity's running
+	// containers may be the ONLY usable generation for the service the new
+	// identity replaces; when the desired set did not converge they are preserved
+	// rather than stopped (see the removal cleanup below).
+	desiredFailed := false
+
+	// abortPass is set when the request is discovered to be superseded: no
+	// further service is converged and no removed-service cleanup runs.
+	abortPass := false
+
+	// provisional collects the replacement containers THIS pass started that a
+	// later slot failed to commit, or that a supersession abandoned before
+	// commit. They are this pass's own creations (their IDs are known only here),
+	// so removing them cannot touch another generation — in particular it never
+	// stops a running old generation.
+	var provisional []runtime.ServiceContainer
+
 	desired := make(map[string]function.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
 		desired[svc.SourceRef()] = svc
 	}
 
 	// Classify this function's containers by service. Containers whose service
-	// is no longer in the template (removed service) are stopped OUTRIGHT.
-	// Desired services' containers are grouped for the per-service pass further
-	// down.
+	// is no longer in the template (removed service) are collected and stopped
+	// only AFTER every desired service has converged below: start-before-stop
+	// ordering means a service whose identity changed (an identity change is
+	// indistinguishable from a removal plus an addition under SourceRef
+	// grouping) does not have its old generation torn down before the new
+	// service's replicas are running.
+	var removed []runtime.ServiceContainer
 	byService := make(map[string][]runtime.ServiceContainer)
 	for _, ctr := range containers {
 		if ctr.Function != fnName {
@@ -253,20 +375,7 @@ func reconcileWithObserver(
 			continue
 		}
 		if _, ok := desired[ctr.Identity]; !ok {
-			changed = true
-			// A removed service's container is about to be stopped: this is
-			// corrective work. Publish reconciling here.
-			corrective = true
-			notifyReconcile()
-			stopCtx, stopCancel := ctx, func() {}
-			if reconcileTimeout > 0 {
-				stopCtx, stopCancel = context.WithTimeout(ctx, reconcileTimeout)
-			}
-			err := docker.StopServiceContainers(stopCtx, []runtime.ServiceContainer{ctr})
-			stopCancel()
-			if err != nil {
-				fail(fmt.Errorf("service %q removed: %w", ctr.Identity, err))
-			}
+			removed = append(removed, ctr)
 			continue
 		}
 		byService[ctr.Identity] = append(byService[ctr.Identity], ctr)
@@ -275,6 +384,17 @@ func reconcileWithObserver(
 	for _, svc := range tmpl.Services {
 		identity := svc.SourceRef()
 		existing := byService[identity]
+
+		// Supersession check at the top of each service: if a newer desired
+		// state replaced this request while a previous service was converging,
+		// do no further container work for the remaining services. Every
+		// earlier service already committed atomically (its old generations
+		// stopped only after its replacements were confirmed), so abandoning
+		// here cannot leave a service with no generation.
+		if abortPass || superseded() {
+			abortPass = true
+			break
+		}
 
 		// The pre-resolution phase runs on its own fresh normal-operation bound
 		// rooted in the lifecycle context (never the caller's ctx), so a caller
@@ -298,6 +418,7 @@ func reconcileWithObserver(
 				preCancel()
 				err := fmt.Errorf("service %q: %w", identity, err)
 				fail(err)
+				desiredFailed = true
 				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
@@ -311,6 +432,7 @@ func reconcileWithObserver(
 				preCancel()
 				err := fmt.Errorf("service %q: %w", identity, err)
 				fail(err)
+				desiredFailed = true
 				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
@@ -322,6 +444,7 @@ func reconcileWithObserver(
 				preCancel()
 				err := fmt.Errorf("service %q: check routing network: %w", identity, err)
 				fail(err)
+				desiredFailed = true
 				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
@@ -329,6 +452,7 @@ func reconcileWithObserver(
 				preCancel()
 				err := fmt.Errorf("service %q: %w", identity, routing.MissingNetwork(traefik.Network))
 				fail(err)
+				desiredFailed = true
 				log.Warn("Service: routing validation failed", "service", identity, "error", err)
 				continue
 			}
@@ -371,6 +495,7 @@ func reconcileWithObserver(
 		preCancel()
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", identity, err))
+			desiredFailed = true
 			log.Warn("Service: cannot resolve source; keeping existing containers",
 				"service", identity, "error", err)
 			continue
@@ -389,6 +514,7 @@ func reconcileWithObserver(
 		if err != nil {
 			postCancel()
 			fail(fmt.Errorf("service %q: %w", identity, err))
+			desiredFailed = true
 			log.Warn("Service: cannot start replicas", "service", identity, "error", err)
 			continue
 		}
@@ -419,21 +545,20 @@ func reconcileWithObserver(
 		desiredNetworkSet := runtime.NetworkSet(append(append([]string(nil), serviceNetworks...), routeNetwork))
 		desiredNetworks := runtime.NetworksLabel(desiredNetworkSet...)
 
-		// A container is a keep candidate only when it is both healthy (running)
-		// and currently configured correctly (image, image content, port,
-		// effective environment, and Docker networks all match the desired
-		// values) and carries a real replica label. Anything else —
+		// A container is CONVERGED (a keep candidate) only when it is both
+		// healthy (running) and currently configured correctly (image, image
+		// content, port, effective environment, and Docker networks all match
+		// the desired values) and carries a real replica label. Anything else —
 		// exited/dead/removing, a changed image, a moved external tag (image
 		// content changed), a changed port, a changed env/secret (env hash
 		// mismatch), a changed network set, or an unlabeled legacy container
-		// (Replica == -1) — is stale and must be replaced. In addition, the
-		// container's labels must match the desired routing label set exactly: a
-		// changed host/path/port leaves stale Traefik labels pointing traffic at
-		// whatever the old container served, so the container is replaced.
-		var candidates []runtime.ServiceContainer
-		var stale []runtime.ServiceContainer
-		for _, ctr := range existing {
-			if ctr.State == container.StateRunning &&
+		// (Replica == -1) — is a non-converged generation that a converged
+		// replacement supersedes. In addition, the container's labels must
+		// match the desired routing label set exactly: a changed host/path/port
+		// leaves stale Traefik labels pointing traffic at whatever the old
+		// container served, so the container is replaced.
+		converged := func(ctr runtime.ServiceContainer) bool {
+			return ctr.State == container.StateRunning &&
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
@@ -441,50 +566,13 @@ func reconcileWithObserver(
 				ctr.Resources == resourceHash &&
 				ctr.Networks == desiredNetworks &&
 				ctr.Replica >= 0 &&
-				routingLabelsMatch(routeLabels, ctr.Labels) {
-				candidates = append(candidates, ctr)
-			} else {
-				stale = append(stale, ctr)
-			}
+				routingLabelsMatch(routeLabels, ctr.Labels)
 		}
 
-		// Prefer keeping the LOWEST replica indexes, so scale-down retains the
-		// longest-running lowest-numbered replicas. A candidate already occupies
-		// its own slot (Replica), and we only keep candidates whose slot is a
-		// desired replica slot in [0, desired); any candidate with a slot >=
-		// desired, or a duplicate slot, is excess and becomes stale. Kept
-		// candidates are recorded in occupied; the start loop below starts every
-		// desired slot that no candidate holds.
-		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Replica < candidates[j].Replica })
-		occupied := make(map[int]bool, svc.Replicas)
-		for _, ctr := range candidates {
-			if ctr.Replica < svc.Replicas && !occupied[ctr.Replica] {
-				occupied[ctr.Replica] = true
-				continue
-			}
-			stale = append(stale, ctr)
-		}
-
-		// Stop every stale/excess container for this service.
-		if len(stale) > 0 {
-			changed = true
-			corrective = true
-			notifyReconcile()
-			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
-				fail(fmt.Errorf("service %q stale: %w", identity, err))
-			}
-		}
-
-		// Start the deficit: every desired slot 0..Replicas-1 that no kept
-		// container occupies.
-		for slot := 0; slot < svc.Replicas; slot++ {
-			if occupied[slot] {
-				continue
-			}
-			changed = true
-			corrective = true
-			notifyReconcile()
-			spec := runtime.ServiceSpec{
+		// The replacement spec is built once per service and reused for every
+		// deficit slot below.
+		newSpec := func() runtime.ServiceSpec {
+			return runtime.ServiceSpec{
 				Function:  fnName,
 				Identity:  identity,
 				Port:      svc.Port,
@@ -496,14 +584,301 @@ func reconcileWithObserver(
 				Labels:    routeLabels,
 				Networks:  desiredNetworkSet,
 			}
-			if _, err := docker.StartService(postCtx, spec, slot); err != nil {
+		}
+
+		// Group this service's existing containers by their logical replica
+		// slot. A container with no valid replica label (Replica < 0, e.g. a
+		// pre-label legacy container) is never a slot occupant: it is always
+		// replaced and is cleaned up after the desired slots converge.
+		slotGroups := make(map[int][]runtime.ServiceContainer)
+		var legacy []runtime.ServiceContainer
+		for _, ctr := range existing {
+			if ctr.Replica < 0 {
+				legacy = append(legacy, ctr)
+				continue
+			}
+			slotGroups[ctr.Replica] = append(slotGroups[ctr.Replica], ctr)
+		}
+
+		// stale collects every container to stop AFTER the desired slots have
+		// been converged (start-before-stop). A running fallback whose
+		// replacement failed is simply never added to stale, so the slot keeps
+		// serving until the next reconcile retries.
+		var stale []runtime.ServiceContainer
+		started := 0
+
+		// For each desired replica slot, ensure a converged replacement is
+		// running BEFORE the old generation for that same logical slot is
+		// stopped. Group members are ordered deterministically by container ID
+		// (never by Docker list order), so a pass with duplicate A+B
+		// generations converges identically every time.
+		for slot := 0; slot < svc.Replicas; slot++ {
+			group := slotGroups[slot]
+			sort.Slice(group, func(i, j int) bool { return group[i].ID < group[j].ID })
+			var matches, olds []runtime.ServiceContainer
+			for _, ctr := range group {
+				if converged(ctr) {
+					matches = append(matches, ctr)
+				} else {
+					olds = append(olds, ctr)
+				}
+			}
+
+			if len(matches) > 0 {
+				// A converged replica already holds the slot: keep the lowest-ID
+				// one (stable, list-order independent) and clean up every other
+				// matching duplicate plus every superseded generation in the
+				// slot. The desired replica is already running, so stopping the
+				// rest cannot take the slot down.
+				stale = append(stale, matches[1:]...)
+				stale = append(stale, olds...)
+				continue
+			}
+
+			// No converged replica holds the slot. The lowest-ID usable
+			// (running or restarting) non-converged generation in the slot is
+			// the fallback: the replacement is started first, and the fallback
+			// is stopped only once StartService has confirmed the replacement
+			// is running.
+			var fallback *runtime.ServiceContainer
+			for i := range olds {
+				if usableServiceContainer(olds[i]) {
+					fallback = &olds[i]
+					break
+				}
+			}
+
+			changed = true
+			corrective = true
+			notifyReconcile()
+			startedID, err := docker.StartService(postCtx, newSpec(), slot)
+			if err != nil {
 				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))
+				desiredFailed = true
+				if fallback != nil {
+					// The replacement failed: preserve the slot's usable old
+					// generation(s) so the service keeps serving, and retry on
+					// the next reconcile. Leaving them out of stale is the
+					// suppression: they are not stopped this pass.
+					log.Warn("Service: replacement failed; keeping old replica",
+						"function", fnName, "service", identity, "replica", slot, "error", err)
+				} else {
+					// No old fallback for this slot: retain unavailable
+					// semantics and retry on the next reconcile.
+					log.Warn("Service: replica unavailable",
+						"function", fnName, "service", identity, "replica", slot, "error", err)
+				}
+				// Usable olds stay as fallbacks; a non-usable old can never
+				// serve, so it is cleaned up even when the replacement failed.
+				for i := range olds {
+					if !usableServiceContainer(olds[i]) {
+						stale = append(stale, olds[i])
+					}
+				}
+				continue
+			}
+			// StartService confirmed the replacement is running: the old
+			// generations in this slot are now safe to stop.
+			started++
+			// A replacement that superseded a usable old generation is
+			// uncommitted until this service's stale stop runs. Record it so a
+			// supersession discovered at that commit boundary can remove this
+			// pass's own provisional container while preserving the old one; a
+			// slot with NO usable fallback is deliberately not recorded (there
+			// the replacement is the only running generation).
+			if fallback != nil && startedID != "" {
+				provisional = append(provisional, runtime.ServiceContainer{
+					ID: startedID, Function: fnName, Identity: identity,
+					State: container.StateRunning,
+				})
+			}
+			stale = append(stale, olds...)
+		}
+
+		// Every slot at or above the desired replica count is excess: a
+		// scale-down replica or a duplicate slot. They are cleaned up only
+		// after the desired slots above converged, so a replacement is never
+		// preempted by removing old replicas first. Slots are walked in
+		// ascending order for deterministic stop ordering.
+		var excessSlots []int
+		for slot := range slotGroups {
+			if slot >= svc.Replicas {
+				excessSlots = append(excessSlots, slot)
 			}
 		}
+		sort.Ints(excessSlots)
+		for _, slot := range excessSlots {
+			stale = append(stale, slotGroups[slot]...)
+		}
+		sort.Slice(legacy, func(i, j int) bool { return legacy[i].ID < legacy[j].ID })
+		stale = append(stale, legacy...)
+
+		// Safety net: never take a desired service from at least one running
+		// replica to none because every running generation would be stopped.
+		// Survivors are the replacements confirmed running this pass plus every
+		// existing usable (running/restarting) container not scheduled for a
+		// stop (a kept converged replica or an unclaimed generation). If that
+		// count is zero, keep the lowest-ID usable stale container as a fallback
+		// and retry next pass. It is deterministic and a no-op whenever a
+		// replacement succeeded or any converged replica remains.
+		surviving := started
+		for _, ctr := range existing {
+			if usableServiceContainer(ctr) && !containsStaleID(stale, ctr.ID) {
+				surviving++
+			}
+		}
+		if svc.Replicas > 0 && surviving == 0 {
+			if keep, ok := lowestUsableStale(stale); ok {
+				stale = removeStaleID(stale, keep.ID)
+				log.Warn("Service: no replacement could be confirmed; keeping a running replica",
+					"function", fnName, "service", identity, "replica", keep.Replica)
+			}
+		}
+
+		// Supersession commit boundary: this is the first point at which this
+		// service would stop its old generations. If a newer desired state has
+		// replaced this request in the meantime, do NOT stop them — the newer
+		// request must find the old generation still running. Clean up only the
+		// provisional replacements THIS pass started (their IDs are known only
+		// here, so no other generation can be touched), then abandon the rest of
+		// the pass for the newer request to converge.
+		if superseded() {
+			log.Info("Service: pass superseded; preserving old generation",
+				"function", fnName, "service", identity)
+			cleanupProvisional(bounded, docker, fnName, identity, provisional, log)
+			provisional = nil
+			abortPass = true
+			postCancel()
+			break
+		}
+
+		// Stop the stale/excess generations now that the desired slots are
+		// running.
+		if len(stale) > 0 {
+			changed = true
+			corrective = true
+			notifyReconcile()
+			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
+				fail(fmt.Errorf("service %q stale: %w", identity, err))
+			}
+		}
+		// The service committed: its provisional replacements are now the
+		// running generation and are no longer removable by a later supersession.
+		provisional = nil
 		postCancel()
 	}
 
+	// Removed services are stopped LAST: their containers are no longer desired,
+	// but deferring the stop until every desired service has converged means an
+	// identity change (which is indistinguishable from a removal plus an
+	// addition under SourceRef grouping) cannot have its old generation torn
+	// down before the new service's replicas are running. Removed-service and
+	// removed-function cleanup still removes every generation.
+	//
+	// They are skipped entirely when the pass was superseded or a desired service
+	// did not converge. Under SourceRef grouping a changed source is a removal
+	// plus an addition, so a removed identity's running containers can be the
+	// ONLY usable generation for the service the new identity replaces; stopping
+	// them then would destroy the last usable generation. A subsequent reconcile
+	// (the coalesced newer desired state, or the next periodic pass) retries the
+	// removal once the desired set converges.
+	if abortPass || superseded() {
+		log.Info("Service: pass superseded; preserving removed services",
+			"function", fnName, "removed", len(removed))
+	} else if len(removed) > 0 && desiredFailed {
+		log.Warn("Service: desired services did not converge; preserving removed services",
+			"function", fnName, "removed", len(removed))
+	} else if len(removed) > 0 {
+		sort.Slice(removed, func(i, j int) bool { return removed[i].ID < removed[j].ID })
+		changed = true
+		corrective = true
+		notifyReconcile()
+		stopCtx, stopCancel := ctx, func() {}
+		if reconcileTimeout > 0 {
+			stopCtx, stopCancel = context.WithTimeout(ctx, reconcileTimeout)
+		}
+		if err := docker.StopServiceContainers(stopCtx, removed); err != nil {
+			fail(fmt.Errorf("service removed: %w", err))
+		}
+		stopCancel()
+	}
+
 	return changed, firstErr
+}
+
+// cleanupProvisional removes the replacement containers a single pass started
+// but never committed (a slot whose later cleanup found the request superseded).
+// It removes ONLY the listed ids — this pass's own creations — so it can never
+// stop a running old generation. Failures are logged, never fatal: a leftover
+// provisional container is a non-converged generation the next reconcile
+// replaces, exactly like any other stale candidate.
+func cleanupProvisional(
+	bounded func() (context.Context, context.CancelFunc),
+	docker Docker,
+	fnName, identity string,
+	provisional []runtime.ServiceContainer,
+	log *slog.Logger,
+) {
+	if len(provisional) == 0 {
+		return
+	}
+	stopCtx, stopCancel := bounded()
+	defer stopCancel()
+	if err := docker.StopServiceContainers(stopCtx, provisional); err != nil {
+		log.Warn("Service: remove provisional replacement failed",
+			"function", fnName, "service", identity, "count", len(provisional), "error", err)
+	}
+}
+
+// usableServiceContainer reports whether a non-converged container may still be
+// serving and can therefore back a slot while a replacement is retried: running,
+// or restarting (Docker is bringing it back). Exited/dead/removing/created
+// containers are not usable and are safe to clean even when a replacement
+// failed.
+func usableServiceContainer(ctr runtime.ServiceContainer) bool {
+	return ctr.State == container.StateRunning || ctr.State == container.StateRestarting
+}
+
+// containsStaleID reports whether stale already holds the container id.
+func containsStaleID(stale []runtime.ServiceContainer, id string) bool {
+	for _, c := range stale {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// removeStaleID returns stale without the container id (a no-op when absent).
+// It may reuse the backing array; the caller must not alias the original.
+func removeStaleID(stale []runtime.ServiceContainer, id string) []runtime.ServiceContainer {
+	out := stale[:0]
+	for _, c := range stale {
+		if c.ID == id {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// lowestUsableStale returns the lowest-ID usable (running or restarting)
+// container in stale and whether one was found. It is the deterministic pick for
+// the last-resort fallback guard.
+func lowestUsableStale(stale []runtime.ServiceContainer) (runtime.ServiceContainer, bool) {
+	var best runtime.ServiceContainer
+	found := false
+	for i := range stale {
+		st := stale[i].State
+		if st != container.StateRunning && st != container.StateRestarting {
+			continue
+		}
+		if !found || stale[i].ID < best.ID {
+			best = stale[i]
+			found = true
+		}
+	}
+	return best, found
 }
 
 // routingLabelsMatch reports whether a container's actual label set matches the

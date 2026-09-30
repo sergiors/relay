@@ -761,3 +761,59 @@ func TestIntegrationExternalImageService(t *testing.T) {
 	}
 	waitForContainerRunning(t, ctx, cli, id)
 }
+
+// TestIntegrationServiceStartRunningGateAndNameOverlap proves the two runtime
+// guarantees the reconciler's zero-downtime replacement depends on, against a
+// real daemon:
+//
+//   - StartService returns only once Docker reports the container RUNNING (the
+//     running gate); and
+//   - two starts for the SAME logical slot coexist, because the physical name
+//     is unique per start (Docker would reject a duplicate name otherwise).
+//
+// The image is the test's own function image with a stop-responsive long-lived
+// command, so the container stays up.
+func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	m, _ := newManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	t.Cleanup(func() {
+		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-overlap")
+		cleanupImagePrefixes(cli, "relay-fn-svc-overlap:")()
+	})
+
+	_, image := buildServiceHost(t, ctx, "svc-overlap")
+
+	// Start two replicas of the SAME logical slot: both must succeed (unique
+	// physical names) and both must be running the instant StartService returns.
+	first, err := m.StartService(ctx, ServiceSpec{
+		Function: "svc-overlap", Identity: "app/service.js", Port: 3000,
+		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("first StartService: %v", err)
+	}
+	second, err := m.StartService(ctx, ServiceSpec{
+		Function: "svc-overlap", Identity: "app/service.js", Port: 3000,
+		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("second StartService for the same slot: %v", err)
+	}
+	if first == second {
+		t.Fatal("two starts for one slot returned the same container id")
+	}
+	for _, id := range []string{first, second} {
+		insp, err := cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+		if err != nil {
+			t.Fatalf("inspect %s: %v", id, err)
+		}
+		if insp.Container.State == nil || !insp.Container.State.Running {
+			t.Fatalf("container %s is not running immediately after StartService returned (the running gate failed)", id)
+		}
+	}
+}

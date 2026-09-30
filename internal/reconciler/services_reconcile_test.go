@@ -49,11 +49,19 @@ type fakeDocker struct {
 	ctrs            map[string]*fakeContainer
 	stops           []string        // container ids stopped (in order), for ordering assertions
 	failStopFor     string          // when non-empty, StopServiceContainers errors for this id
+	failStart       map[int]error   // slot -> error injected into StartService, for replacement-failure tests
+	events          []string        // ordered "start:<replica>" / "stop:<id>" / "remove:<fn>" transitions
 	missingNetworks map[string]bool // NetworkExists reports false for these
 	networkLookups  []string        // network names passed to NetworkExists, in order
 	resolveErr      map[string]error
 	resolveCalls    []string // identities passed to ResolveServiceImage, in order
 	resolvedImages  map[string]string
+	// startGate, when non-nil, is called AFTER a container is created and BEFORE
+	// StartService returns, with the lock released. It lets a test park a
+	// replacement at the exact post-start/pre-commit boundary (e.g. to enqueue a
+	// newer desired state and prove supersession). It must not be set for tests
+	// that do not want the block.
+	startGate func(id string, spec runtime.ServiceSpec, replica int)
 }
 
 func newFakeDocker() *fakeDocker {
@@ -62,8 +70,12 @@ func newFakeDocker() *fakeDocker {
 		missingNetworks: map[string]bool{},
 		resolveErr:      map[string]error{},
 		resolvedImages:  map[string]string{},
+		failStart:       map[int]error{},
 	}
 }
+
+// recordEvent appends one ordered transition. It is called with f.mu held.
+func (f *fakeDocker) recordEvent(ev string) { f.events = append(f.events, ev) }
 
 // ResolveServiceImage mirrors the production resolution shape without Docker:
 // entrypoint sources resolve through runtime.ServiceEntry, and image sources
@@ -95,7 +107,11 @@ func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmp
 
 func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, replica int) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.recordEvent(fmt.Sprintf("start:%d", replica))
+	if err := f.failStart[replica]; err != nil {
+		f.mu.Unlock()
+		return "", err
+	}
 	f.nextID++
 	id := fmt.Sprintf("id-%d", f.nextID)
 	f.ctrs[id] = &fakeContainer{
@@ -120,6 +136,11 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		labels:    spec.Labels,
 		networks:  append([]string(nil), spec.Networks...),
 		hostname:  defaultFakeHostname,
+	}
+	gate := f.startGate
+	f.mu.Unlock()
+	if gate != nil {
+		gate(id, spec, replica)
 	}
 	return id, nil
 }
@@ -169,6 +190,7 @@ func (f *fakeDocker) StopServiceContainers(_ context.Context, containers []runti
 		}
 		if c, ok := f.ctrs[sc.ID]; ok {
 			f.stops = append(f.stops, c.id)
+			f.recordEvent("stop:" + c.id)
 			delete(f.ctrs, sc.ID)
 		}
 	}
@@ -182,6 +204,7 @@ func (f *fakeDocker) RemoveFunctionServiceContainers(_ context.Context, fnName s
 	for id, c := range f.ctrs {
 		if c.function == fnName {
 			f.stops = append(f.stops, c.id)
+			f.recordEvent("remove:" + c.id)
 			toRemove = append(toRemove, id)
 		}
 	}
@@ -198,6 +221,37 @@ func (f *fakeDocker) setState(id string, st container.ContainerState) {
 	if c, ok := f.ctrs[id]; ok {
 		c.state = st
 	}
+}
+
+// order returns the recorded transition sequence (start/stop/remove), so tests
+// can assert the create/start-before-stop ordering of replacement.
+func (f *fakeDocker) order() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.events...)
+}
+
+// indexOfEvent returns the index of the first exact event, or -1.
+func (f *fakeDocker) indexOfEvent(ev string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, got := range f.events {
+		if got == ev {
+			return i
+		}
+	}
+	return -1
+}
+
+// containerByID returns a copy of the named container and whether it exists.
+func (f *fakeDocker) containerByID(id string) (fakeContainer, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.ctrs[id]
+	if !ok {
+		return fakeContainer{}, false
+	}
+	return *c, true
 }
 
 // runningCount returns how many of fn/service's containers are running.

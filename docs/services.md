@@ -114,6 +114,19 @@ to the template.
   (global `NETWORKS` + routing network for a routed service) participates in
   this comparison order-independently: reordering or repeating a network never
   replaces a container, but adding/removing/switching one does.
+- A replacement is **start-before-stop**: for each replica slot Relay starts the
+  new container and requires Docker to confirm it running before stopping the
+  superseded one, so a failed replacement leaves the old generation serving and
+  is retried on the next pass. A service is never taken to zero running replicas
+  by a failed replacement.
+- A changed **source** (a new `relay.identity`: a different entrypoint file, or a
+  different image reference) is a removal plus an addition under SourceRef
+  grouping, so the old identity's containers are treated as removed and are
+  stopped **last**. If the new identity does not converge — pull/resolution,
+  routing or network, create/start, or a started-but-not-running container — the
+  old identity's containers are **preserved**, because under this grouping they
+  can be the only usable generation for the service the new identity replaces.
+  The removal is retried by a later reconcile once the desired set converges.
 - Environment comparison is what makes a changed template `env` value or a
   **rotated secret value** replace a service's container: the image reference and
   fingerprint do not change for either, but a long-lived container would
@@ -132,6 +145,14 @@ to the template.
   that worker (scoped by `relay.hostname`); containers left by a crashed process
   are swept at the next startup.
 
+Changes to a function's services are serialized per function and only the latest
+desired state is applied. A pass that a newer desired state superseded (a live
+reload, or a periodic self-heal arriving mid-pass) does not stop the old
+generation it was about to replace: it removes only the replacement containers it
+started itself and leaves the old generation running, so the newer desired state
+always finds a usable generation to replace. The coalesced newer request then
+converges and commits the replacement.
+
 **External image freshness:** for an `image` service Relay checks the registry
 **at most once per hour per independent service** (per function + identity). A
 successful remote check is recorded in memory; the window is not persisted, and
@@ -141,7 +162,10 @@ check does not advance the window, so it retries at the next reconcile.
 Containers are identified by deterministic Relay-owned labels
 (`relay.type=service`, `relay.function`, `relay.identity`, plus image content id,
 port, replica slot, `relay.env_hash`, `relay.resources`, `relay.networks`), never
-by name alone.
+by name alone. The Docker container name is greppable and derived from the
+function/identity/replica, but carries a per-start uniqueness token so a
+replacement can be created while the container it replaces is still running;
+ownership, grouping, and the replica slot always come from the labels.
 `relay.identity` is the configured source descriptor; service containers carry no
 `relay.handler` label — the source **is** the service.
 

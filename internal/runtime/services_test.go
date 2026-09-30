@@ -206,6 +206,155 @@ func TestServiceContainerNameDeterministic(t *testing.T) {
 	}
 }
 
+// TestServiceContainerNameForStartUniqueAndBounded pins the physical-name
+// contract the zero-downtime replacement relies on: the logical name stays
+// deterministic (serviceContainerName), while the per-start physical name keeps
+// that logical name as a greppable prefix and appends a token, so two starts for
+// the SAME logical slot can coexist (Docker rejects duplicate names). The
+// physical name always stays under the Docker-safe cap.
+func TestServiceContainerNameForStartUniqueAndBounded(t *testing.T) {
+	logical := serviceContainerName("fn", "service.js", 0)
+	first := serviceContainerNameForStart("fn", "service.js", 0)
+	second := serviceContainerNameForStart("fn", "service.js", 0)
+	if first == second {
+		t.Fatalf("two starts for one slot produced the same physical name %q; a replacement could not coexist", first)
+	}
+	if !strings.HasPrefix(first, logical+"-") || !strings.HasPrefix(second, logical+"-") {
+		t.Fatalf("physical names %q/%q must keep the logical prefix %q", first, second, logical)
+	}
+	for _, n := range []string{first, second} {
+		if len(n) > serviceContainerNamePhysicalLenCap {
+			t.Fatalf("physical name %q length %d exceeds cap %d", n, len(n), serviceContainerNamePhysicalLenCap)
+		}
+	}
+	// A long identity stays bounded for the physical name too.
+	long := serviceContainerNameForStart("fn", strings.Repeat("x", 300), 7)
+	if len(long) > serviceContainerNamePhysicalLenCap {
+		t.Fatalf("long physical name length %d exceeds cap %d", len(long), serviceContainerNamePhysicalLenCap)
+	}
+}
+
+// TestStartServiceConfirmsRunningBeforeReturn pins the running gate: StartService
+// inspects the started container and only returns success when Docker reports it
+// running.
+func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
+	inspected := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
+			onBody: func([]byte) {}},
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
+			body:    `{"Id":"cid-1","State":{"Running":true}}`,
+			onMatch: func() { inspected++ }},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	id, err := m.StartService(context.Background(), ServiceSpec{
+		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+	}, 0)
+	if err != nil {
+		t.Fatalf("StartService: %v", err)
+	}
+	if id != "cid-1" {
+		t.Fatalf("id = %q, want cid-1", id)
+	}
+	if inspected != 1 {
+		t.Fatalf("inspect calls = %d, want exactly 1 (no polling/sleep)", inspected)
+	}
+}
+
+// TestStartServiceNonRunningInspectDiscardsAndFails pins the failure side of the
+// running gate: a container that started but inspects as not running is removed
+// (best-effort) and StartService errors, so the caller never stops the old
+// generation for a dead replacement.
+func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
+	removed := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
+			body: `{"Id":"cid-1","State":{"Running":false,"Status":"exited"}}`},
+		dockerRoute{method: http.MethodDelete, path: "/containers/cid-1", body: `{}`,
+			onMatch: func() { removed++ }},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	id, err := m.StartService(context.Background(), ServiceSpec{
+		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+	}, 0)
+	if err == nil {
+		t.Fatal("a non-running started container must fail StartService")
+	}
+	if id != "" {
+		t.Fatalf("id = %q, want empty on failure", id)
+	}
+	if !strings.Contains(err.Error(), "not running") {
+		t.Fatalf("error = %v, want it to mention the running gate", err)
+	}
+	if removed != 1 {
+		t.Fatalf("discard removals = %d, want 1", removed)
+	}
+}
+
+// TestStartServiceInspectErrorDiscardsAndFails pins that an inspect failure
+// (daemon blip) is also fatal to the start: the container is discarded rather
+// than reported as a viable replacement.
+func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
+	removed := 0
+	cli := newScriptedDockerClient(t,
+		dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`},
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json",
+			status: http.StatusInternalServerError, body: `{"message":"daemon blip"}`},
+		dockerRoute{method: http.MethodDelete, path: "/containers/cid-1", body: `{}`,
+			onMatch: func() { removed++ }},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	if _, err := m.StartService(context.Background(), ServiceSpec{
+		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+	}, 0); err == nil {
+		t.Fatal("an inspect failure must fail StartService")
+	}
+	if removed != 1 {
+		t.Fatalf("discard removals = %d, want 1", removed)
+	}
+}
+
+// TestStartServiceCreateSendsUniquePhysicalName pins that the name sent to
+// /containers/create is the unique physical name (logical name + token), so two
+// starts never collide. The container name travels as the create request's
+// `name` query parameter, not in the body.
+func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
+	var names []string
+	route := dockerRoute{method: http.MethodPost, path: "/containers/create", body: `{"Id":"cid-1"}`,
+		onRequest: func(req *http.Request) {
+			names = append(names, req.URL.Query().Get("name"))
+		}}
+	cli := newScriptedDockerClient(t,
+		route,
+		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
+	)
+	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
+	for i := 0; i < 2; i++ {
+		if _, err := m.StartService(context.Background(), ServiceSpec{
+			Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+		}, 0); err != nil {
+			t.Fatalf("StartService %d: %v", i, err)
+		}
+	}
+	if len(names) != 2 {
+		t.Fatalf("captured %d create names, want 2", len(names))
+	}
+	if names[0] == names[1] {
+		t.Fatalf("both creates used the same name %q; a replacement could not coexist", names[0])
+	}
+	logical := serviceContainerName("fn", "service.js", 0)
+	for _, n := range names {
+		if !strings.HasPrefix(n, logical+"-") {
+			t.Fatalf("create name %q does not keep the logical prefix %q", n, logical)
+		}
+	}
+}
+
 func TestValidateServiceEntrypoint(t *testing.T) {
 	for _, tc := range []struct {
 		entrypoint string
@@ -506,7 +655,8 @@ func TestServiceLabelsResourcesFingerprint(t *testing.T) {
 // captureServiceCreate drives the real StartService client path against the
 // scripted daemon and returns the JSON body of the /containers/create request,
 // so a test can assert the container's Docker Config.Env and labels without a
-// daemon. Start is scripted so the create+start sequence completes.
+// daemon. Create, start, and the post-start running INSPECT are scripted so the
+// full create+start+confirm sequence completes.
 func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 	t.Helper()
 	var createBody []byte
@@ -517,6 +667,8 @@ func captureServiceCreate(t *testing.T, spec ServiceSpec) []byte {
 			onBody: func(b []byte) { createBody = append([]byte(nil), b...) },
 		},
 		dockerRoute{method: http.MethodPost, path: "/start", body: `{}`},
+		// The running gate inspects the started container and requires Running.
+		dockerRoute{method: http.MethodGet, path: "/containers/cid-1/json", body: `{"Id":"cid-1","State":{"Running":true}}`},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
 	if _, err := m.StartService(context.Background(), spec, 0); err != nil {

@@ -469,6 +469,15 @@ func (c *ServiceCoordinator) run(name string) {
 		if req.lease != nil {
 			applyCtx = runtime.WithImageLease(applyCtx, req.lease)
 		}
+		// Supersession authority: while this pass runs, a newer desired state for
+		// this function (a live reload, or a periodic self-heal that inherited a
+		// newer token) makes it stale. Reconcile consults this at its commit
+		// boundaries, so a superseded pass never stops the old generation it was
+		// about to replace; it cleans only its own provisional replacements and
+		// lets the coalesced newer request converge. The check reads the same
+		// desired-state token currentRequest already uses for status authority,
+		// so container convergence and status agree on who is current.
+		applyCtx = withReconcileAuthority(applyCtx, func() bool { return c.currentRequest(req) })
 		err := c.services.ApplyWithStatus(applyCtx, req.name, req.tmpl, req.image, req.preparedEnv, reconcileStarted)
 		if req.onComplete != nil && c.currentRequest(req) {
 			req.onComplete(err)

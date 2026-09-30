@@ -121,12 +121,19 @@ type ServiceContainer struct {
 	Labels map[string]string
 }
 
-// serviceContainerLabelName is the deterministic, docker-safe container name for
-// one service replica. Ownership is always derived from labels, never from this
-// name (names are not guaranteed unique/stable across restarts), so this is
+// serviceContainerNameLenCap caps the deterministic (logical) container name of
+// one service replica. Ownership is always derived from labels, never from a
+// name (names are not guaranteed unique/stable across restarts), so the name is
 // purely for human greppability. The service identity part is sanitized to
-// [A-Za-z0-9_.-] and the total is capped well under docker's name length limit.
+// [A-Za-z0-9_.-] and the total is kept well under Docker's name length limit.
 const serviceContainerNameLenCap = 100
+
+// serviceContainerNameTokenCap bounds the per-start uniqueness token appended
+// to the PHYSICAL container name (see serviceContainerNameForStart). It keeps
+// the physical name (serviceContainerNameLenCap + 1 + token cap) far below
+// Docker's 255-byte name limit. The actual token is newRequestID's
+// fixed-length random hex string (12 chars), comfortably inside this cap.
+const serviceContainerNameTokenCap = 16
 
 // serviceIdentityHashLen is the number of hex characters in the
 // collision-resistant suffix appended to a generated service container name. 16
@@ -156,15 +163,22 @@ func sanitizeContainerNamePart(s string) string {
 	return b.String()
 }
 
-// serviceContainerName derives the deterministic container name for a replica:
-// relay-svc-<function>-<identity>-<hash>-<replica>. Function names are already
-// validated; the identity part (an entrypoint file or image reference) is
-// sanitized. The name ends with a collision-resistant hash suffix
+// serviceContainerName derives the deterministic LOGICAL container name for a
+// replica: relay-svc-<function>-<identity>-<hash>-<replica>. Function names are
+// already validated; the identity part (an entrypoint file or image reference)
+// is sanitized. The name ends with a collision-resistant hash suffix
 // derived from the FULL function name and identity, so distinct identities that
 // sanitize to the same readable base (e.g. "ghcr.io/acme/a/b:1" and
 // "ghcr.io/acme/a-b:1") or that would truncate to the same prefix still get
 // distinct names. The readable base is trimmed to make room for the suffix, so
 // the suffix and the replica index are never lost to the cap.
+//
+// This is the stable, human-greppable logical name of a replica slot. It is NOT
+// the physical name a container is created with: a replacement generation must
+// be able to coexist with the generation it replaces (create/start/inspect the
+// new container before the old one is stopped), and Docker rejects duplicate
+// container names. StartService therefore creates the container under
+// serviceContainerNameForStart, which appends a per-start uniqueness token.
 func serviceContainerName(functionName, identity string, replica int) string {
 	suffix := "-" + serviceIdentityHash(functionName, identity) + "-" + strconv.Itoa(replica)
 	base := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(identity)
@@ -177,6 +191,31 @@ func serviceContainerName(functionName, identity string, replica int) string {
 	}
 	return base + suffix
 }
+
+// serviceContainerNameForStart returns the PHYSICAL Docker name for one
+// StartService create: the deterministic logical name (serviceContainerName)
+// plus a per-start uniqueness token. The token lets a replacement container
+// coexist with the container it replaces during a zero-downtime swap (Docker
+// refuses duplicate names otherwise) and is discarded with the container.
+//
+// The token is random (newRequestID) — never derived from configuration — so
+// the resulting name is deliberately NOT stable across starts. That is safe
+// because Relay never derives ownership, grouping, or a replica slot from a
+// container name: every predicate is label-derived (relay.type, relay.function,
+// relay.identity, relay.replica). The physical name remains greppable (it keeps
+// the logical prefix and replica suffix) and is bounded Docker-safe: the
+// logical name is capped at serviceContainerNameLenCap and the token at
+// serviceContainerNameTokenCap, so the physical name is always shorter than
+// Docker's name limit.
+func serviceContainerNameForStart(functionName, identity string, replica int) string {
+	return serviceContainerName(functionName, identity, replica) + "-" + newRequestID()
+}
+
+// serviceContainerNamePhysicalLenCap is the upper bound on a physical service
+// container name: the logical cap plus the separator and the token cap. It is
+// the value the uniqueness test asserts against, and it stays far below
+// Docker's 255-byte name limit.
+const serviceContainerNamePhysicalLenCap = serviceContainerNameLenCap + 1 + serviceContainerNameTokenCap
 
 // serviceIdentityHash returns the fixed-length hex collision-resistant suffix
 // for a service identity. It hashes the FULL function name and the FULL identity
@@ -351,8 +390,24 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // EXCEPT AutoRemove is deliberately FALSE: a service container is persistent and
 // long-lived, so the reconciler owns its removal, never the daemon. The internal
 // port is exposed as metadata only (ExposedPorts) with NO HostConfig.PortBindings
-// — no host port is published this iteration. On any error after create but
-// before a successful start, the container is removed via removeContainer.
+// — no host port is published this iteration.
+//
+// After ContainerStart, StartService performs a synchronous, deterministic Docker
+// INSPECT and requires the container to report State.Running. Return only after
+// that confirmation: the service reconciler uses a successful StartService as
+// the gate for stopping the generation it replaces, so a container that created
+// and exited immediately (a crash-on-boot, a bad command) must NEVER be treated
+// as a viable replacement. No sleep or polling is involved — a single inspect
+// is the daemon's authoritative answer at that instant.
+//
+// On any error after create (create→start failure, or a start that reports
+// success but inspects as non-running/absent), the created container is removed
+// best-effort: a removal failure is logged but never replaces the more
+// important create/start/inspect error, so the caller keeps the old generation.
+// Removal uses removeContainerContext, which honors the caller's
+// cancellation/deadline and treats not-found/conflict as benign. The physical
+// name is unique per start (serviceContainerNameForStart) so a replacement can
+// coexist with the container it replaces during a zero-downtime swap.
 //
 // Service containers deliberately do NOT go through the per-function execution
 // containerCache: they are not leased, pooled, warmed, or generation-drained.
@@ -420,7 +475,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// resolved resource limits apply exactly as they do to an invocation
 		// container.
 		HostConfig: hardenedHostConfig(false, spec.Resources),
-		Name:       serviceContainerName(spec.Function, spec.Identity, replica),
+		// A unique physical name per start, so the replacement generation can
+		// be created while the generation it replaces is still running.
+		Name: serviceContainerNameForStart(spec.Function, spec.Identity, replica),
 	}
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
@@ -441,13 +498,40 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	}
 	id := createResp.ID
 
+	// Best-effort cleanup of a created-but-not-confirmed container. It never
+	// masks the primary error: a removal failure is logged so a partial
+	// replacement is observable, and the next reconcile can clean it up (it is
+	// a non-running relay.identity/relay.replica container, so it classifies as
+	// stale).
+	discard := func(reason string, cause error) error {
+		if rmErr := removeContainerContext(ctx, m.cli, id); rmErr != nil {
+			m.log.Warn("Service: discard failed container",
+				"function", spec.Function,
+				"service", spec.Identity,
+				"replica", replica,
+				"container", id,
+				"reason", reason,
+				"error", rmErr,
+			)
+		}
+		return cause
+	}
+
 	if _, err := m.cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
-		// Created but never started; never leaves a live service behind, so
-		// remove the created container before returning. removeContainerContext
-		// honors the caller's cancellation/deadline (bounded by containerOpTimeout)
-		// and treats not-found/conflict as benign.
-		_ = removeContainerContext(ctx, m.cli, id)
-		return "", fmt.Errorf("service: start container: %w", err)
+		// Created but never started; never leaves a live service behind.
+		return "", discard("start_error", fmt.Errorf("service: start container: %w", err))
+	}
+
+	// The running gate: confirm the started container is actually running before
+	// reporting success. A container that created and started but immediately
+	// exited (crash-on-boot) must not be handed back as a replacement, or the
+	// reconciler would stop the old generation and take the service down.
+	insp, err := m.cli.ContainerInspect(ctx, id, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", discard("inspect_error", fmt.Errorf("service: inspect started container: %w", err))
+	}
+	if insp.Container.State == nil || !insp.Container.State.Running {
+		return "", discard("not_running", fmt.Errorf("service: started container is not running"))
 	}
 
 	m.log.Info("Service: started",
