@@ -54,6 +54,25 @@ func (l *ImageLease) Image() string {
 	return l.image
 }
 
+// Entitles reports whether this lease is a LIVE admitted reference to exactly
+// image, so a caller may treat it as that image's admission entitlement. It is
+// the predicate every "use the lease carried on ctx" path must consult before
+// relying on it: the lease must be non-nil, must not have been released by its
+// holder, and must pin exactly image.
+//
+// A nil lease, a lease pinning a DIFFERENT image, and a lease the holder already
+// released all report false. A caller that needs an entitlement and is handed a
+// lease that does not entitle the image must acquire a FRESH independent lease
+// (which a retirement in progress rejects with ErrImageRetiring) instead of
+// trusting a token that no longer protects the image — otherwise the use would
+// slip past the retirement gate the lease exists to close.
+func (l *ImageLease) Entitles(image string) bool {
+	if l == nil || l.coord == nil || image == "" || l.released.Load() {
+		return false
+	}
+	return l.image == image
+}
+
 // Release drops this reference. It is idempotent and nil-safe. When the last
 // reference to a retiring image is dropped, the coordinator signals the removal
 // waiter.
@@ -74,6 +93,11 @@ func (l *ImageLease) Release() {
 // A released or nil lease shares nothing (returns nil). The check and the
 // reference increment are atomic with the coordinator lock, so a share can
 // never race a release and extend the image's lifetime past the drain point.
+//
+// A shared lease belongs to the SAME coordinator as its source. A caller
+// deciding whether a carried lease entitles an image it is about to use must
+// check both Entitles (the exact image, still live) and that the lease's
+// coordinator is its own; Manager.admitLease is that decision point.
 func (l *ImageLease) Share() *ImageLease {
 	if l == nil || l.coord == nil {
 		return nil

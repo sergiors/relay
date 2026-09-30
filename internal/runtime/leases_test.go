@@ -189,6 +189,29 @@ func TestManagerIsImageRetiring(t *testing.T) {
 	}
 }
 
+// TestManagerLeaseCoordSingleAuthority pins the single-per-manager invariant:
+// a zero-value Manager lazily owns exactly ONE coordinator, so every admission
+// and every removal is gated by the same authority, and a nil Manager is a
+// programming error that panics rather than silently minting an unowned
+// coordinator no shutdown would ever join.
+func TestManagerLeaseCoordSingleAuthority(t *testing.T) {
+	m := &Manager{}
+	first := m.leaseCoord()
+	if first == nil {
+		t.Fatal("a zero-value Manager must lazily own a coordinator")
+	}
+	if again := m.leaseCoord(); again != first {
+		t.Fatal("leaseCoord must return the one coordinator it owns, not a fresh one per call")
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("leaseCoord on a nil Manager must panic, not mint an unowned coordinator")
+		}
+	}()
+	(*Manager)(nil).leaseCoord()
+}
+
 // TestImageCoordinatorBeginShutdownGatesRemoval pins the lifecycle gate at the
 // primitive level: before shutdown beginRemoval owns the removal; after
 // beginShutdown it is refused with ErrManagerShuttingDown, so no new removal can

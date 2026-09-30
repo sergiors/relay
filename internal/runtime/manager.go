@@ -1404,18 +1404,20 @@ func (m *Manager) Execute(
 	// Pin the image for the whole execution. An execution admitted before the
 	// image's retirement carries that admitted lease on ctx (the runner passes a
 	// registry snapshot's publication lease), so it holds admitted authority
-	// even while retirement drains. A direct caller that carries no lease
-	// acquires its own independent one, which a retirement in progress rejects
-	// with a retryable ErrImageRetiring rather than letting the execution race
-	// ImageRemove. A nil lease (no-runtime image, fake executor) is transparent.
-	if ImageLeaseFrom(ctx) == nil {
-		owned, err := m.AcquireImageLease(prepared.Image)
-		if err != nil {
-			return fmt.Errorf("execute %s: %w", prepared.Name, err)
-		}
-		if owned != nil {
-			defer owned.Release()
-		}
+	// even while retirement drains. admitLease validates that entitlement: the
+	// carried lease must actually be live and pin THIS image, and the execution
+	// takes its OWN share of it, so the reference is held for the execution's
+	// whole duration even if the caller drops its lease concurrently. A direct
+	// caller that carries no (or no matching) lease acquires its own independent
+	// one, which a retirement in progress rejects with a retryable
+	// ErrImageRetiring rather than letting the execution race ImageRemove. A nil
+	// lease (no-runtime image, fake executor) is transparent.
+	owned, err := m.admitLease(ctx, prepared.Image)
+	if err != nil {
+		return fmt.Errorf("execute %s: %w", prepared.Name, err)
+	}
+	if owned != nil {
+		defer owned.Release()
 	}
 
 	// Creation-time identity meta: per-invocation fields (Handler, MessageID,

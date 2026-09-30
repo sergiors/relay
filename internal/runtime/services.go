@@ -443,23 +443,19 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	// Pin the service image for the whole create+start window. For a Relay-owned
 	// image (an entrypoint-source service runs the function image) this prevents
 	// a concurrent retirement from committing removal between the caller's
-	// reference check and the container create. The pin prefers the request's
-	// admitted lease carried on ctx (a service pass that enqueued with a lease):
-	// a child SHARE of it keeps the image admitted even while retirement drains.
-	// A direct caller with no lease acquires its own; a retirement in progress
-	// rejects it with a retryable ErrImageRetiring. External images (never
-	// Relay-owned) are not leased at all — Relay must never GC them.
-	var lease *ImageLease
+	// reference check and the container create. admitLease uses the request's
+	// admitted lease carried on ctx (a service pass that enqueued with a lease)
+	// only when it actually ENTITLES spec.Image, and the service takes its OWN
+	// child SHARE of it: the image stays admitted even while retirement drains,
+	// and even if the caller releases concurrently. A lease for a different
+	// image, or a released one, does not entitle this service, so an independent
+	// lease is acquired instead; a retirement in progress then rejects it with a
+	// retryable ErrImageRetiring. External images (never Relay-owned) are not
+	// leased at all — Relay must never GC them.
 	if IsRelayImage(spec.Image) {
-		if reqLease := ImageLeaseFrom(ctx); reqLease != nil {
-			lease = reqLease.Share()
-		}
-		if lease == nil {
-			owned, err := m.AcquireImageLease(spec.Image)
-			if err != nil {
-				return "", fmt.Errorf("service: %w", err)
-			}
-			lease = owned
+		lease, err := m.admitLease(ctx, spec.Image)
+		if err != nil {
+			return "", fmt.Errorf("service: %w", err)
 		}
 		if lease != nil {
 			defer lease.Release()

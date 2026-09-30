@@ -63,12 +63,20 @@ func (m *Manager) removalContext(ctx context.Context) (context.Context, func()) 
 	return merged, stop
 }
 
-// leaseCoord returns the manager's image-lease coordinator, creating it on
-// first use so a Manager constructed directly by tests (bypassing NewManager)
-// still has the single ownership authority. It is safe for concurrent use.
+// leaseCoord returns the manager's image-lease coordinator, lazily initializing
+// it on first use. Exactly one coordinator exists per Manager and it lives for
+// the manager's whole lifetime: it is the single ownership authority every
+// admission and every removal is gated by, so a retirement observed by one use
+// is observed by all of them. Lazy initialization is what lets a Manager built
+// without NewManager (a zero-value/test-constructed one) still own that single
+// authority. It is safe for concurrent use.
+//
+// A nil receiver is a programming error, not a supported state: there is no
+// manager to own the coordinator, and minting one per call would hide the
+// missing manager behind an authority no shutdown ever joins.
 func (m *Manager) leaseCoord() *imageCoordinator {
 	if m == nil {
-		return newImageCoordinator()
+		panic("runtime: nil Manager")
 	}
 	m.leaseInit.Do(func() {
 		if m.leases == nil {
@@ -124,6 +132,45 @@ func (m *Manager) AcquireImageLease(image string) (*ImageLease, error) {
 // the execution path; a nil lease leaves ctx unchanged (see WithImageLease).
 func WithSnapshotLease(ctx context.Context, lease *ImageLease) context.Context {
 	return WithImageLease(ctx, lease)
+}
+
+// admitLease returns a live admitted reference to image for work that is about
+// to use it. It derives that reference from the lease carried on ctx when that
+// lease actually ENTITLES image (see ImageLease.Entitles), and acquires a fresh
+// independent reference otherwise.
+//
+// An entitlement is only authoritative for the coordinator that owns it: the
+// carried lease must also have been admitted by THIS manager's image coordinator
+// (the single authority that gates this manager's removals). A lease minted by a
+// different manager does not protect this manager's image, so it is ignored and a
+// fresh independent reference is acquired rather than trusting a token another
+// coordinator's drain does not observe.
+//
+// The carried-entitlement path is what lets work ADMITTED BEFORE an image's
+// retirement — a registry snapshot pinning a superseded published image, a
+// service pass converging to it — hand its authority to a child use: the child
+// takes its OWN share of the carried lease, so the use stays admitted even while
+// a retirement drains and even if the original holder releases its lease
+// concurrently. That share is admitted while the image is retiring by design:
+// the work it protects was admitted before retirement. Holding an independent
+// share also means the removal cannot proceed until this use concludes, rather
+// than trusting a token the caller may drop mid-use.
+//
+// When the carried lease is absent, already released, pins a DIFFERENT image, or
+// belongs to another coordinator, the caller is NOT entitled and this acquires a
+// fresh independent reference, which a retirement in progress rejects with a
+// retryable ErrImageRetiring so the use defers rather than racing ImageRemove.
+// The returned lease (nil for an image outside Relay's namespaces, e.g. a
+// no-runtime function or an external service image) must be released by the
+// caller.
+func (m *Manager) admitLease(ctx context.Context, image string) (*ImageLease, error) {
+	coord := m.leaseCoord()
+	if carried := ImageLeaseFrom(ctx); carried.Entitles(image) && carried.coord == coord {
+		if shared := coord.shareLease(carried); shared != nil {
+			return shared, nil
+		}
+	}
+	return m.AcquireImageLease(image)
 }
 
 // RetireImageLease is the single authority-aware image-removal entry point for
