@@ -85,33 +85,42 @@ const statsFlushInterval = 5 * time.Second
 // bound (shutdownStepTimeout), not this constant.
 const reconcileTimeout = 30 * time.Second
 
-// shutdownServiceTimeout bounds the service-container join and cleanup during
-// graceful shutdown: joining the coordinator and stopping/removing this
-// worker's persistent service containers must not block shutdown forever.
+// shutdownServiceTimeout is the per-step bound shared by the services-join
+// barrier and the service-cleanup step during graceful shutdown. For the barrier
+// it is only the wait-before-diagnostic threshold: on expiry the join is
+// cancelled and then strictly joined for real, so draining the coordinator and
+// its in-flight Applys may take longer. For the cleanup step it bounds the
+// best-effort stop/removal of this worker's persistent service containers, so a
+// hung Docker call cannot hold shutdown open.
 const shutdownServiceTimeout = 30 * time.Second
 
-// shutdownStepTimeout bounds the shutdown steps that gracefully stop a server
-// (scheduler, metrics, webhook). The shutdown registry derives a fresh
+// shutdownStepTimeout is the per-step bound for the steps that gracefully stop a
+// server (scheduler, metrics, webhook). The shutdown registry derives a fresh
 // context.Background bound from it per step, so one slow step can never consume
-// another step's budget.
+// another step's budget. For the scheduler barrier it is only the
+// wait-before-diagnostic threshold: the step is then cancelled and strictly
+// joined, so it may exceed this bound. For metrics and webhook (best-effort
+// cleanup) it is the actual bound.
 const shutdownStepTimeout = 5 * time.Second
 
-// shutdownAggregateTimeout is the whole graceful-shutdown budget, an internal
-// constant with no user knob. The shutdown registry gives every step a context
-// bounded by min(its own cap, the budget remaining), and runs each step in a
-// goroutine so a step that ignores its context can never hang the registry: the
-// registry logs the timeout and moves on to the next step. The budget is
-// deliberately generous (2m) relative to the per-step caps (5-30s): with
-// cooperative steps it is never reached, and if one or more steps hang the
-// aggregate still bounds process exit. A single step can therefore never consume
-// another step's budget. The one deliberate exception is a barrier step (see
-// shutdownStep.barrier): its timeout is observed and logged like any other, but
-// the registry then joins the step's real operation before advancing, so a
-// wedged dependency-holding operation may extend the shutdown past the
-// aggregate. That is a safety-over-latency trade: a later step must never close
-// the runtime manager or state DB while a reconcile or service pass is still
-// using it. Every barrier's joined operation is rooted in the worker lifecycle
-// and individually bounded, so it still terminates.
+// shutdownAggregateTimeout is the aggregate budget for the BEST-EFFORT shutdown
+// steps, an internal constant with no user knob. The shutdown registry gives
+// every step a context bounded by min(its own cap, what remains of this budget),
+// and runs each step in its own goroutine so a step that ignores its context can
+// never hang the registry: a best-effort step that misses its deadline is logged
+// and the registry moves on to the next step. The budget is deliberately
+// generous (2m) relative to the per-step caps (2-30s): with cooperative steps it
+// is never reached, and it is the ceiling on how long best-effort cleanup may
+// take.
+//
+// It is NOT a hard cap on process exit. A quiescence barrier step (see
+// shutdownStep.barrier) that misses its bound is cancelled and then STRICTLY
+// JOINED, so a wedged dependency-holding operation may extend the shutdown past
+// this budget. That is a safety-over-latency trade: a later step must never
+// close the runtime manager, state DB, or Redis while a reconcile, service pass,
+// sweep, loop, or scheduler publisher callback may still be using it. Every
+// barrier's joined operation is rooted in the worker lifecycle and individually
+// bounded, so it still terminates.
 const shutdownAggregateTimeout = 2 * time.Minute
 
 // effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
@@ -357,9 +366,12 @@ func Run(logger *slog.Logger) error {
 	// resource acquired early (Redis) is released last and ordering never
 	// depends on registration/LIFO. The defer is registered BEFORE the first
 	// fallible resource-owning step, so even a secrets-provider failure releases
-	// the Redis client. Every step is bounded by min(its own cap, the remaining
-	// aggregate budget); a step failure or timeout is logged with its name and
-	// never stops the sequence.
+	// the Redis client. Best-effort cleanup steps are bounded by min(their own
+	// cap, the remaining aggregate budget); their failure or timeout is logged
+	// with the step name and never stops the sequence. Quiescence barriers
+	// (scheduler, reconciler, housekeeping, services-join, loops) are logged on
+	// timeout and then strictly joined before any later step runs, so the
+	// aggregate budget bounds cleanup work, not process exit.
 	shutdown := &shutdownRegistry{}
 	// The worker's readiness state. Its flag starts false and is set true only at
 	// the ready-to-consume boundary (just before Consume, once every listener and
@@ -394,7 +406,8 @@ func Run(logger *slog.Logger) error {
 	// Readiness is cleared as the VERY FIRST instruction, before the lifecycle
 	// is cancelled: a `relay health` that races shutdown must observe not-ready
 	// rather than a stale true. Everything after that (lifecycle cancellation,
-	// span end, ordered bounded teardown) is the normal shutdown sequence.
+	// span end, ordered graceful teardown with strict dependency barriers) is
+	// the normal shutdown sequence.
 	defer func() {
 		workerReady.setNotReady()
 		stop()
@@ -678,18 +691,27 @@ func Run(logger *slog.Logger) error {
 	// and validates TRAEFIK_NETWORK per routed service; wiring only forwards the
 	// configured value. The same worker-global NETWORKS set applied to execution
 	// containers is forwarded too, so every service container joins it.
-	svcCtrl := reconciler.NewServiceReconciler(manager, secretProvider, routing.TraefikConfig{
-		Network:      cfg.TraefikNetwork,
-		EntryPoints:  cfg.TraefikEntryPoints,
-		CertResolver: cfg.TraefikCertResolver,
-		Priority:     cfg.TraefikPriority,
-		HostOverride: cfg.TraefikHostOverride,
-	}, logger, reconcileTimeout, reconciler.WithMetrics(metricsInstance), reconciler.WithNetworks(cfg.Networks))
+	svcCtrl := reconciler.NewServiceReconciler(
+		manager,
+		secretProvider,
+		routing.TraefikConfig{
+			Network:      cfg.TraefikNetwork,
+			EntryPoints:  cfg.TraefikEntryPoints,
+			CertResolver: cfg.TraefikCertResolver,
+			Priority:     cfg.TraefikPriority,
+			HostOverride: cfg.TraefikHostOverride,
+		},
+		logger,
+		reconcileTimeout,
+		reconciler.WithMetrics(metricsInstance),
+		reconciler.WithNetworks(cfg.Networks),
+	)
 	services := reconciler.NewServiceCoordinator(svcCtrl)
 	services.Start(ctx)
 	// Joining the coordinator releases its workers and waiters and drains
-	// in-flight Applys; the hostname-scoped container cleanup runs right after,
-	// in the same shutdown bound.
+	// in-flight Applys; the join is a strict barrier whose per-step bound is only
+	// the wait-before-diagnostic threshold, while the hostname-scoped container
+	// cleanup that runs right after is a separate bounded best-effort step.
 	shutdown.register(servicesJoinBarrierStep(services.Join))
 	shutdown.register(shutdownStep{
 		name:    shutdownStepServiceCleanup,
@@ -823,7 +845,9 @@ func Run(logger *slog.Logger) error {
 		metricsLogger := metrics.NewMetricsLogger(
 			metricsInstance,
 			metrics.DefaultLogInterval,
-			func(format string, args ...any) { logger.Debug(fmt.Sprintf(format, args...)) },
+			func(format string, args ...any) {
+				logger.Debug(fmt.Sprintf(format, args...))
+			},
 		)
 		done := make(chan struct{})
 		metricsLoggerDone = done
@@ -1173,6 +1197,27 @@ const (
 // invoking the registry, so background loops, the coordinator, and rooted
 // builds observe cancellation before teardown joins them. A step that was never
 // registered (an optional resource that never started) is simply skipped.
+//
+// Each step is one of two kinds, not a per-step choice made at random:
+//
+//   - QUIESCENCE BARRIER (shutdownStep.barrier): joins a background operation
+//     that holds a shared dependency a LATER step tears down. Missed bound is
+//     logged, the context is cancelled, and the step is then strictly joined
+//     before the registry advances, so it may exceed both its own bound and the
+//     aggregate budget. Barriers:
+//     scheduler (joins publisher callbacks before Redis closes), reconciler
+//     (writes state, drives the manager), housekeeping (startup sweeps use the
+//     manager and state DB), services-join (coordinator workers use manager and
+//     state DB), loops (the stats and retention loops use the state DB and
+//     Redis).
+//   - BEST-EFFORT CLEANUP (everything else): bounded, logged on timeout or
+//     failure, and never joined past its bound. Cleanup:
+//     socket, service-cleanup, stats-flush, metrics, webhook, manager, state,
+//     tracing, redis.
+//
+// Only barrier steps gate shared-dependency teardown. A cleanup step that
+// ignores its context is surfaced as a timeout and left running by design; none
+// of them is a join of a resource-holding operation.
 var shutdownStepOrder = []string{
 	shutdownStepSocket,
 	shutdownStepScheduler,
@@ -1198,19 +1243,32 @@ var shutdownStepOrder = []string{
 // steps. A step that ignores its context is surfaced as a timeout rather than
 // allowed to hang the registry (the registry runs each step in its own
 // goroutine).
+//
+// A step is either a best-effort cleanup step (barrier false) or a quiescence
+// barrier (barrier true); see shutdownStepOrder for the full classification.
 type shutdownStep struct {
 	name    string
 	timeout time.Duration
 	// barrier marks a QUIESCENCE BARRIER: a join of a background operation that
-	// holds a shared dependency the LATER steps tear down (the runtime manager
-	// or the state DB). An ordinary step that times out is left running while
-	// teardown continues (best-effort cleanup); a barrier step that times out
-	// has its context cancelled and is then joined for real before the registry
+	// holds a shared dependency the LATER steps tear down (the runtime manager,
+	// the state DB, or Redis). A best-effort cleanup step that times out is left
+	// running while teardown continues; a barrier step that times out has its
+	// context cancelled and is then joined for real before the registry
 	// advances. Cancellation alone is insufficient: a non-cooperative reconcile
 	// or service pass would keep using the dependency while it is closed. Only
 	// steps that gate shared-dependency teardown set this.
 	barrier bool
 	run     func(context.Context) error
+}
+
+// kind labels the step in diagnostics: a quiescence barrier (strictly joined
+// past its bound) versus a best-effort cleanup step (logged and skipped on
+// timeout). It keeps the timeout log actionable without a second log line.
+func (s shutdownStep) kind() string {
+	if s.barrier {
+		return "barrier"
+	}
+	return "cleanup"
 }
 
 // shutdownRegistry is the small ordered teardown the worker runs on every
@@ -1365,32 +1423,40 @@ func (r *shutdownRegistry) register(step shutdownStep) {
 	r.steps = append(r.steps, step)
 }
 
-// run executes every registered step in shutdownStepOrder under ONE aggregate
-// deadline (shutdownAggregateTimeout), then logs the completion marker. Each
-// step gets a fresh context bounded by min(its own timeout, the remaining
-// budget), so one slow step cannot consume another's budget while the whole
-// teardown still cannot exceed the aggregate. Every step is invoked in its own
-// goroutine and the registry selects on its result vs. the step deadline, so a
-// step whose real operation ignores context cannot hang the shutdown: the
-// timeout is observed, logged at Warn as "Shutdown: step timed out", and the
-// remaining steps still run. A step failure is logged as
-// "Shutdown: step failed" and likewise never stops the sequence. The result
-// channel is buffered so a non-cooperative step that later returns can always
-// send without leaking on a blocked send. A step that PANICS is recovered at
-// this boundary and converted into a step failure (with the step name and
-// duration), so a broken cleanup cannot crash the process and skip the
+// run executes every registered step in shutdownStepOrder, then logs the
+// completion marker. Each step gets a fresh context bounded by min(its own
+// timeout, the remaining aggregate budget), so one slow step cannot consume
+// another's budget. Every step is invoked in its own goroutine and the registry
+// selects on its result vs. the step deadline, so a step whose real operation
+// ignores context cannot hang the shutdown: the timeout is observed, logged at
+// Warn as "Shutdown: step timed out", and the remaining steps still run. A step
+// failure is logged as "Shutdown: step failed" and likewise never stops the
+// sequence. The result channel is buffered so a non-cooperative step that later
+// returns can always send without leaking on a blocked send. A step that PANICS
+// is recovered at this boundary and converted into a step failure (with the step
+// name and duration), so a broken cleanup cannot crash the process and skip the
 // remaining steps: ordered continuation is a core shutdown contract.
+//
+// The aggregate budget therefore bounds the BEST-EFFORT cleanup steps, not the
+// whole teardown: every step is ATTEMPTED, the budget is never a reason to skip
+// one, and a barrier (below) may still extend the shutdown past it.
 //
 // A barrier step (shutdownStep.barrier) is the exception to the
 // move-on-after-timeout policy: when its deadline fires the registry cancels
 // the step's context and then WAITS for the step's goroutine to actually return
 // before advancing, so a later step can never tear down a shared dependency
-// (manager, state DB) while a reconcile or service pass is still using it. The
-// per-step timeout still bounds how long the registry waits before declaring
-// the barrier timed out (and cancelling it); the strict join may then extend
-// the shutdown past that bound, deliberately trading teardown latency for
-// safety. The barrier's timeout is logged exactly as an ordinary timeout, so
-// the normal diagnostics are preserved.
+// (manager, state DB, Redis) while a reconcile, sweep, loop, or publisher
+// callback is still using it. The barrier's timeout is logged exactly as a
+// cleanup timeout — with `kind=barrier` and the exhausted `bound` — so the
+// diagnostics stay actionable and there is no duplicate log, then the strict
+// join may extend the shutdown past that bound, deliberately trading teardown
+// latency for safety.
+//
+// Every step logs exactly one timeout line, carrying `kind` (barrier vs
+// cleanup) and `bound` (whether the step's own cap or the aggregate budget was
+// what expired); a genuine error after a barrier timeout is the one additional
+// line, and only when the joined operation does not merely report its context
+// error.
 func (r *shutdownRegistry) run(logger *slog.Logger) {
 	steps := make(map[string]shutdownStep, len(r.steps))
 	for _, step := range r.steps {
@@ -1411,10 +1477,13 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 		// exhausted: the step is still invoked (with an already-expired context
 		// if the budget is gone) so a cooperative cleanup gets its chance, and
 		// the registry logs it as timed out rather than silently skipping it.
+		// A barrier is never skipped by exhaustion either; it is still joined.
 		deadline := budget
+		bound := "aggregate"
 		if step.timeout > 0 {
 			if own := time.Now().Add(step.timeout); own.Before(deadline) {
 				deadline = own
+				bound = "step"
 			}
 		}
 		stepCtx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -1446,12 +1515,15 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 			case ctxErr != nil && errors.Is(err, ctxErr):
 				logger.Warn("Shutdown: step timed out",
 					"step", step.name,
+					"kind", step.kind(),
+					"bound", bound,
 					"error", err,
 					"duration", time.Since(stepStart),
 				)
 			default:
 				logger.Warn("Shutdown: step failed",
 					"step", step.name,
+					"kind", step.kind(),
 					"error", err,
 					"duration", time.Since(stepStart),
 				)
@@ -1462,14 +1534,16 @@ func (r *shutdownRegistry) run(logger *slog.Logger) {
 			cancel()
 			logger.Warn("Shutdown: step timed out",
 				"step", step.name,
+				"kind", step.kind(),
+				"bound", bound,
 				"error", stepCtx.Err(),
 				"duration", time.Since(stepStart),
 			)
 			if step.barrier {
-				// Strict join: do NOT advance to a later step (manager/state
-				// teardown) until the operation this barrier joins has actually
-				// returned. This is the one place shutdown may exceed the
-				// per-step bound, by design.
+				// Strict join: do NOT advance to a later step (manager/state/
+				// Redis teardown) until the operation this barrier joins has
+				// actually returned. This is where shutdown may exceed both the
+				// step bound and the aggregate budget, by design.
 				if err := <-done; err != nil && !errors.Is(err, context.Canceled) &&
 					!errors.Is(err, context.DeadlineExceeded) {
 					logger.Warn("Shutdown: barrier step failed after timeout",

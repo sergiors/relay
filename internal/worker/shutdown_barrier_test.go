@@ -159,8 +159,9 @@ func TestShutdownRegistryBarrierStrictlyJoinsBeforeAdvancing(t *testing.T) {
 
 // TestShutdownRegistryBarrierTimeoutStillLogged pins that the strict join
 // preserves the normal timeout diagnostic: the barrier's expired bound is still
-// logged as "Shutdown: step timed out" with the structured step name, even
-// though the registry then waits for the real join.
+// logged as "Shutdown: step timed out" with the structured step name, tagged as
+// a barrier and as a per-step bound, even though the registry then waits for the
+// real join.
 func TestShutdownRegistryBarrierTimeoutStillLogged(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -212,8 +213,197 @@ func TestShutdownRegistryBarrierTimeoutStillLogged(t *testing.T) {
 	if !strings.Contains(out, "step="+shutdownStepServicesJoin) {
 		t.Errorf("barrier timeout log missing the structured step name:\n%s", out)
 	}
+	if !strings.Contains(out, "kind=barrier") {
+		t.Errorf("barrier timeout log missing kind=barrier:\n%s", out)
+	}
+	if !strings.Contains(out, "bound=step") {
+		t.Errorf("barrier timeout log missing bound=step:\n%s", out)
+	}
+	// Exactly one timeout line: the strict join must not duplicate it.
+	if n := strings.Count(out, "Shutdown: step timed out"); n != 1 {
+		t.Errorf("timeout logged %d times, want exactly 1:\n%s", n, out)
+	}
 	if !strings.Contains(out, "Shutdown complete") {
 		t.Errorf("missing completion marker:\n%s", out)
+	}
+}
+
+// TestShutdownRegistryAggregateExhaustedCleanupStillInvoked proves a best-effort
+// cleanup step is still ATTEMPTED once the aggregate budget is gone: it is
+// invoked with an already-expired context (no per-step cap) and the registry
+// logs it as an aggregate-bound timeout rather than silently skipping it. The
+// first step deliberately consumes the whole budget by waiting for its own
+// context to expire (channel-driven, no sleep), so the later step's context is
+// already expired at invocation.
+func TestShutdownRegistryAggregateExhaustedCleanupStillInvoked(t *testing.T) {
+	exhausterEntered := make(chan struct{})
+	exhausterExited := make(chan struct{})
+	laterEntered := make(chan struct{})
+	laterExpired := make(chan struct{})
+
+	exhauster := shutdownStep{
+		name: shutdownStepSocket,
+		// No per-step cap: only the aggregate bounds it.
+		run: func(ctx context.Context) error {
+			close(exhausterEntered)
+			<-ctx.Done()
+			close(exhausterExited)
+			return ctx.Err()
+		},
+	}
+	later := shutdownStep{
+		name: shutdownStepServiceCleanup,
+		// No per-step cap either, so its deadline is the (already passed)
+		// aggregate.
+		run: func(ctx context.Context) error {
+			// Close the expiry signal BEFORE the entry signal, so observing
+			// laterEntered guarantees laterExpired is already closed (no
+			// non-blocking check race).
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				close(laterExpired)
+			}
+			close(laterEntered)
+			// Return the expired bound so the outcome is logged as an
+			// aggregate-bound timeout regardless of which of done/ctx the
+			// registry selects on first.
+			return ctx.Err()
+		},
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg := &shutdownRegistry{budget: 40 * time.Millisecond}
+	reg.register(exhauster)
+	reg.register(later)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reg.run(logger)
+	}()
+
+	select {
+	case <-exhausterEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exhauster never entered")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registry did not advance after the aggregate budget was exhausted")
+	}
+	// The later step was attempted despite the exhausted aggregate, with an
+	// already-expired context.
+	select {
+	case <-laterEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later cleanup step was not attempted after aggregate exhaustion")
+	}
+	select {
+	case <-laterExpired:
+	default:
+		t.Fatal("later cleanup step did not receive an expired context")
+	}
+	out := logs.String()
+	if !strings.Contains(out, "step="+shutdownStepServiceCleanup) ||
+		!strings.Contains(out, "kind=cleanup") ||
+		!strings.Contains(out, "bound=aggregate") {
+		t.Errorf("exhausted cleanup step not surfaced as an aggregate-bound timeout:\n%s", out)
+	}
+	if !strings.Contains(out, "Shutdown complete") {
+		t.Errorf("missing completion marker:\n%s", out)
+	}
+}
+
+// TestShutdownRegistryAggregateExhaustedBarrierStillJoined proves a quiescence
+// barrier is neither skipped nor downgraded once the aggregate budget is gone:
+// it is invoked with an already-expired context, and when it ignores that
+// context the registry still strictly joins it before advancing (so a later
+// step cannot tear down the dependency it guards). Channel-driven, no sleeps.
+func TestShutdownRegistryAggregateExhaustedBarrierStillJoined(t *testing.T) {
+	exhausterDone := make(chan struct{})
+	barrierEntered := make(chan struct{})
+	barrierRelease := make(chan struct{})
+	managerStarted := make(chan struct{})
+	var barrierOnce sync.Once
+
+	exhauster := shutdownStep{
+		name: shutdownStepSocket,
+		// Consume the whole budget by honoring its own deadline.
+		run: func(ctx context.Context) error {
+			<-ctx.Done()
+			close(exhausterDone)
+			return ctx.Err()
+		},
+	}
+	// A barrier that ignores its expired context until released: the strict
+	// join must hold the registry here.
+	barrier := shutdownStep{
+		name:    shutdownStepScheduler,
+		barrier: true,
+		run: func(context.Context) error {
+			barrierOnce.Do(func() { close(barrierEntered) })
+			<-barrierRelease
+			return nil
+		},
+	}
+	manager := shutdownStep{
+		name:    shutdownStepManager,
+		timeout: 2 * time.Second,
+		run: func(context.Context) error {
+			close(managerStarted)
+			return nil
+		},
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg := &shutdownRegistry{budget: 40 * time.Millisecond}
+	reg.register(exhauster)
+	reg.register(barrier)
+	reg.register(manager)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reg.run(logger)
+	}()
+
+	select {
+	case <-exhausterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exhauster did not finish")
+	}
+	select {
+	case <-barrierEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("barrier was not attempted after aggregate exhaustion")
+	}
+	// The barrier's context is expired, but it is still in flight: the registry
+	// must not advance to manager teardown.
+	select {
+	case <-managerStarted:
+		t.Fatal("manager teardown began before the exhausted-aggregate barrier was joined")
+	case <-done:
+		t.Fatal("registry advanced past the barrier before it was joined")
+	case <-time.After(120 * time.Millisecond):
+	}
+	close(barrierRelease)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registry did not return after the barrier was released")
+	}
+	select {
+	case <-managerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manager teardown did not run after the barrier was joined")
+	}
+	out := logs.String()
+	if !strings.Contains(out, "step="+shutdownStepScheduler) ||
+		!strings.Contains(out, "kind=barrier") ||
+		!strings.Contains(out, "bound=aggregate") {
+		t.Errorf("exhausted barrier not surfaced as an aggregate-bound barrier timeout:\n%s", out)
 	}
 }
 
@@ -273,26 +463,29 @@ func TestShutdownRegistryBarrierAggregateBudgetAlsoStrict(t *testing.T) {
 	}
 }
 
-// TestShutdownRegistryOrdinaryStepDoesNotStrictlyJoin proves the strict join is
-// a barrier-only behavior: an ordinary (non-barrier) step whose bound expires is
+// TestShutdownRegistryCleanupStepDoesNotStrictlyJoin proves the strict join is
+// a barrier-only behavior: a best-effort cleanup step whose bound expires is
 // surfaced as timed out and the registry advances WITHOUT waiting for its real
 // operation, preserving the existing best-effort cleanup policy. The blocked
 // step is released afterward so its goroutine does not leak.
-func TestShutdownRegistryOrdinaryStepDoesNotStrictlyJoin(t *testing.T) {
+func TestShutdownRegistryCleanupStepDoesNotStrictlyJoin(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	recorded := make(chan struct{})
+	cancelled := make(chan struct{})
 	var once sync.Once
 	var mu sync.Mutex
 	var order []string
 	blocked := shutdownStep{
-		name:    shutdownStepScheduler,
+		name:    shutdownStepServiceCleanup,
 		timeout: 30 * time.Millisecond,
-		run: func(context.Context) error {
+		run: func(ctx context.Context) error {
 			once.Do(func() { close(entered) })
+			<-ctx.Done()
+			close(cancelled)
 			<-release
 			mu.Lock()
-			order = append(order, shutdownStepScheduler)
+			order = append(order, shutdownStepServiceCleanup)
 			mu.Unlock()
 			close(recorded)
 			return nil
@@ -320,19 +513,27 @@ func TestShutdownRegistryOrdinaryStepDoesNotStrictlyJoin(t *testing.T) {
 	}()
 	<-entered
 
-	// The ordinary step's bound expired; the registry must advance to the later
-	// step without joining the blocked operation.
+	// The cleanup step's bound fires, its context is cancelled so a
+	// cooperative cleanup can observe the deadline...
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup step's context was not cancelled at its bound")
+	}
+
+	// ...and the registry advances to the later step without joining the
+	// blocked operation.
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("registry did not advance past an ordinary timed-out step")
+		t.Fatal("registry did not advance past a best-effort timed-out step")
 	}
 
 	mu.Lock()
 	got := append([]string(nil), order...)
 	mu.Unlock()
 	if len(got) != 1 || got[0] != shutdownStepState {
-		t.Fatalf("order = %v, want only [%s] (ordinary step must not be joined before advancing)",
+		t.Fatalf("order = %v, want only [%s] (cleanup step must not be joined before advancing)",
 			got, shutdownStepState)
 	}
 
@@ -340,12 +541,12 @@ func TestShutdownRegistryOrdinaryStepDoesNotStrictlyJoin(t *testing.T) {
 	select {
 	case <-recorded:
 	case <-time.After(2 * time.Second):
-		t.Fatal("released ordinary step did not record itself")
+		t.Fatal("released cleanup step did not record itself")
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(order) != 2 || order[1] != shutdownStepScheduler {
-		t.Fatalf("released ordinary step did not record itself: %v", order)
+	if len(order) != 2 || order[1] != shutdownStepServiceCleanup {
+		t.Fatalf("released cleanup step did not record itself: %v", order)
 	}
 }
 

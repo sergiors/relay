@@ -21,7 +21,7 @@ Scheduled workloads and persistent services use the same runtime and container i
 - **Resource controls** — per-container memory, CPU, and PID limits.
 - **Configuration and secrets** — environment values and secret references shared across functions, schedules, and services.
 - **Observability** — persisted statistics, Prometheus metrics, structured logs, and OpenTelemetry tracing.
-- **Operations** — health checks, manual invocation, DLQ inspection/replay, Git synchronization, and graceful bounded shutdown.
+- **Operations** — health checks, manual invocation, DLQ inspection/replay, Git synchronization, and ordered teardown in which an aggregate deadline caps best-effort cleanup while dependency barriers have their own per-step bound.
 - **One runtime process** — `relay start` runs in the foreground and leaves supervision to Docker, systemd, Kubernetes, or another process manager.
 
 ## How it works
@@ -72,7 +72,7 @@ Relay is designed around explicit delivery and recovery semantics.
 - **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
 - **Resource limits are per container.** Increasing function concurrency or service replicas multiplies the possible aggregate resource usage.
-- **Shutdown is bounded.** Relay performs ordered graceful shutdown without allowing one non-cooperative component to block termination indefinitely.
+- **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.
 
 ## Quick start
 

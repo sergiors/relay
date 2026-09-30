@@ -335,14 +335,17 @@ func TestShutdownRegistryOrderingInvariants(t *testing.T) {
 	}
 }
 
-// TestShutdownRegistryTimedOutStepContinues proves the registry's central new
-// safety property: a step whose real operation ignores its context (blocks past
-// its bound) is surfaced as "Shutdown: step timed out" and does NOT stop the
-// sequence — later steps still run. The blocking step's goroutine is released
-// after the assertion, and its buffered result channel is never leaked.
+// TestShutdownRegistryTimedOutStepContinues proves the registry's central
+// safety property for best-effort cleanup: a step whose real operation ignores
+// its context (blocks past its bound) is surfaced as "Shutdown: step timed out"
+// and does NOT stop the sequence — later steps still run. Its context is
+// cancelled at the bound so a cooperative cleanup can observe the deadline, but
+// the registry does not join it. The blocking step's goroutine is released after
+// the assertion, and its buffered result channel is never leaked.
 func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 	release := make(chan struct{})
 	blockedEntered := make(chan struct{})
+	blockedCancelled := make(chan struct{})
 	blockedReturned := make(chan struct{})
 	var mu sync.Mutex
 	var order []string
@@ -353,12 +356,14 @@ func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 	}
 
 	blocker := shutdownStep{
-		name:    shutdownStepScheduler,
+		name:    shutdownStepServiceCleanup,
 		timeout: 40 * time.Millisecond,
-		run: func(context.Context) error {
-			record(shutdownStepScheduler)
+		run: func(ctx context.Context) error {
+			record(shutdownStepServiceCleanup)
 			close(blockedEntered)
-			<-release // ignores the context entirely
+			<-ctx.Done()
+			close(blockedCancelled)
+			<-release // ignores the rest of the deadline
 			close(blockedReturned)
 			return nil
 		},
@@ -392,17 +397,27 @@ func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 	default:
 		t.Fatal("blocking step never entered")
 	}
+	// The timeout cancelled the cleanup step's context, but the registry
+	// advanced without joining it.
+	select {
+	case <-blockedCancelled:
+	default:
+		t.Fatal("timed-out cleanup step's context was not cancelled")
+	}
 	// The later step ran despite the timeout.
 	mu.Lock()
 	got := append([]string(nil), order...)
 	mu.Unlock()
-	if len(got) != 2 || got[0] != shutdownStepScheduler || got[1] != shutdownStepState {
+	if len(got) != 2 || got[0] != shutdownStepServiceCleanup || got[1] != shutdownStepState {
 		t.Fatalf("order = %v, want [%s %s] (later step must run after a timeout)",
-			got, shutdownStepScheduler, shutdownStepState)
+			got, shutdownStepServiceCleanup, shutdownStepState)
 	}
 	out := logs.String()
-	if !strings.Contains(out, "Shutdown: step timed out") || !strings.Contains(out, "step="+shutdownStepScheduler) {
+	if !strings.Contains(out, "Shutdown: step timed out") || !strings.Contains(out, "step="+shutdownStepServiceCleanup) {
 		t.Errorf("missing structured timeout log:\n%s", out)
+	}
+	if !strings.Contains(out, "kind=cleanup") || !strings.Contains(out, "bound=step") {
+		t.Errorf("cleanup timeout log missing kind/bound tags:\n%s", out)
 	}
 	if !strings.Contains(out, "Shutdown complete") {
 		t.Errorf("missing completion marker after a timeout:\n%s", out)
@@ -412,11 +427,11 @@ func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 	<-blockedReturned
 }
 
-// TestShutdownRegistryAggregateBudgetCapsTotal proves the registry bounds the
-// WHOLE teardown with one aggregate budget: a step that ignores its context and
-// blocks past the aggregate is cut off, the registry returns at (approximately)
-// the aggregate, and later steps are still attempted (with the expired budget)
-// rather than the teardown running forever.
+// TestShutdownRegistryAggregateBudgetCapsTotal proves the aggregate budget
+// bounds BEST-EFFORT cleanup work: a cleanup step that ignores its context and
+// blocks past the aggregate is cut off (kind=cleanup, bound=aggregate), the
+// registry returns at (approximately) the aggregate, and later steps are still
+// attempted (with the expired budget) rather than the teardown running forever.
 func TestShutdownRegistryAggregateBudgetCapsTotal(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
@@ -459,8 +474,15 @@ func TestShutdownRegistryAggregateBudgetCapsTotal(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("a later step was never attempted after the aggregate budget was exhausted")
 	}
-	if !strings.Contains(logs.String(), "Shutdown: step timed out") {
-		t.Errorf("missing timeout log for the aggregate-capped step:\n%s", logs.String())
+	out := logs.String()
+	if !strings.Contains(out, "Shutdown: step timed out") {
+		t.Errorf("missing timeout log for the aggregate-capped step:\n%s", out)
+	}
+	if !strings.Contains(out, "kind=cleanup") {
+		t.Errorf("aggregate-capped cleanup step not tagged kind=cleanup:\n%s", out)
+	}
+	if !strings.Contains(out, "bound=aggregate") {
+		t.Errorf("aggregate-capped cleanup step not tagged bound=aggregate:\n%s", out)
 	}
 }
 

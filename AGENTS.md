@@ -192,7 +192,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   started.
 - `relay start` runs in the foreground, holds a process lock, and never
   daemonizes, forks, or writes a PID file. Shutdown cancels the lifecycle first,
-  then runs bounded, ordered steps; the process lock and Redis are released last.
+  then runs ordered teardown steps; the process lock and Redis are released last.
+  An aggregate budget bounds the best-effort cleanup steps; quiescence barriers
+  (scheduler, reconciler, housekeeping, services-join, loops) are logged on a
+  missed bound and then strictly joined, so the budget bounds cleanup work, not
+  process exit.
 - A worker-owned readiness flag (`internal/worker/readiness.go`) starts false,
   is set true only at the ready-to-consume boundary (after the preflight,
   function load/prepare, and socket/listener/loop and consumer/schedule/

@@ -40,12 +40,18 @@ rebuild keeps the previous working version; a 30s periodic pass is the backstop
 for missed watch events. `/functions` is read-only to Relay; all builds happen in
 temporary contexts.
 
-Shutdown cancels the lifecycle first, then runs ordered, bounded teardown steps
-(socket, scheduler, reconciler, housekeeping, services join/cleanup, loops, stats
-flush, metrics, webhook, manager, state, tracing, Redis last). Each step is
-bounded; a step failure or timeout is logged and never aborts the sequence. A
-graceful shutdown performs a final bounded stats flush. The process lock is held
-for the whole run and released last (the kernel releases it if the process dies).
+Shutdown cancels the lifecycle first, then runs ordered teardown steps (socket,
+scheduler, reconciler, housekeeping, services join/cleanup, loops, stats flush,
+metrics, webhook, manager, state, tracing, Redis last). Best-effort cleanup
+steps are bounded by an aggregate shutdown budget; a step failure or timeout is
+logged and never aborts the sequence. Steps that gate a shared dependency (the
+scheduler, reconciler, startup housekeeping, the service coordinator, and the
+background loops) are quiescence barriers: on a missed bound they are logged,
+cancelled, and then joined for real before later steps tear that dependency
+down, so they may exceed the budget by design rather than close a resource an
+operation is still using. A graceful shutdown performs a final bounded stats
+flush. The process lock is held for the whole run and released last (the kernel
+releases it if the process dies).
 
 ## State paths and persistence
 
