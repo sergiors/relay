@@ -26,6 +26,7 @@ import (
 func schOcc() schedule.Occurrence {
 	return schedule.Occurrence{
 		Function:    "courses",
+		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	}
@@ -52,14 +53,15 @@ type scriptedRunner struct {
 }
 
 type scheduleOccCall struct {
-	fn      string
-	handler string
-	payload []byte
+	fn       string
+	schedule string
+	handler  string
+	payload  []byte
 }
 
-func (r *scriptedRunner) Run(ctx context.Context, msgID, fn, handler string, payload []byte) error {
+func (r *scriptedRunner) Run(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
 	r.mu.Lock()
-	r.calls = append(r.calls, scheduleOccCall{fn: fn, handler: handler, payload: append([]byte(nil), payload...)})
+	r.calls = append(r.calls, scheduleOccCall{fn: fn, schedule: scheduleName, handler: handler, payload: append([]byte(nil), payload...)})
 	failErr := r.failErr
 	exhaust := r.exhaust
 	r.mu.Unlock()
@@ -165,10 +167,10 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 	rr := &scriptedRunner{failErr: fmt.Errorf("boom")}
 	// The runner fails only its first invocation.
 	var attempts atomic.Int64
-	runner := func(ctx context.Context, msgID, fn, handler string, payload []byte) error {
+	runner := func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
 		n := attempts.Add(1)
 		_ = n
-		return rr.Run(ctx, msgID, fn, handler, payload)
+		return rr.Run(ctx, msgID, fn, scheduleName, handler, payload)
 	}
 	e := newEnv(t, ConsumerConfig{
 		ScheduleRunner:  runner,
@@ -242,7 +244,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 	testutil.RequireRedis(t)
 	neo := schOcc()
 	env := newEnv(t, ConsumerConfig{
-		ScheduleRunner: func(ctx context.Context, msgID, fn, handler string, payload []byte) error {
+		ScheduleRunner: func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
 			return ErrInvocationNotEligible
 		},
 		MinPendingIdle:  300 * time.Millisecond,
@@ -273,7 +275,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 	testutil.RequireRedis(t)
 	env := newEnv(t, ConsumerConfig{
-		ScheduleRunner: func(ctx context.Context, msgID, fn, handler string, payload []byte) error {
+		ScheduleRunner: func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
 			return fmt.Errorf("%w: removed", ErrInvocationObsolete)
 		},
 		MinPendingIdle:  300 * time.Millisecond,

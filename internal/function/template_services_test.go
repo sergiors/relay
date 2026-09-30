@@ -33,7 +33,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
 `)
 	if len(tmpl.Services) != 1 {
 		t.Fatalf("expected 1 service, got %d", len(tmpl.Services))
@@ -59,7 +60,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
     replicas: 2
 `)
@@ -84,9 +86,11 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: api.js
+  - name: api
+    entrypoint: api.js
     port: 3000
-  - entrypoint: worker.js
+  - name: worker
+    entrypoint: worker.js
     port: 4000
     replicas: 3
 `)
@@ -125,7 +129,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: ` + tc.port + `
 `))
 			if err == nil {
@@ -134,7 +139,7 @@ services:
 			if !strings.Contains(err.Error(), "port") {
 				t.Errorf("expected error to mention port, got: %v", err)
 			}
-			if !strings.Contains(err.Error(), "service.js") {
+			if !strings.Contains(err.Error(), "service") {
 				t.Errorf("expected error to name the service, got: %v", err)
 			}
 		})
@@ -163,7 +168,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     replicas: ` + tc.replicas + `
 `))
 			if err == nil {
@@ -172,7 +178,7 @@ services:
 			if !strings.Contains(err.Error(), "replicas") {
 				t.Errorf("expected error to mention replicas, got: %v", err)
 			}
-			if !strings.Contains(err.Error(), "service.js") {
+			if !strings.Contains(err.Error(), "service") {
 				t.Errorf("expected error to name the service, got: %v", err)
 			}
 		})
@@ -189,10 +195,84 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - port: 3000
+  - name: web
+    port: 3000
 `))
-	if err == nil || !strings.Contains(err.Error(), "service is missing a source") {
+	if err == nil || !strings.Contains(err.Error(), `service "web" is missing a source`) {
 		t.Fatalf("err = %v, want missing-source error", err)
+	}
+}
+
+// A service without a name is rejected: the name is its mandatory identity.
+func TestParseServiceMissingName(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - entrypoint: service.js
+`))
+	if err == nil || !strings.Contains(err.Error(), "service is missing a name") {
+		t.Fatalf("err = %v, want missing-name error", err)
+	}
+}
+
+// An invalid service name is rejected with the shared conservative name rule.
+func TestParseServiceInvalidName(t *testing.T) {
+	for _, bad := range []string{"Web", "_x", "with space", "trailing.", "a/b"} {
+		t.Run(bad, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: node24
+services:
+  - name: "` + bad + `"
+    entrypoint: service.js
+`))
+			if err == nil || !strings.Contains(err.Error(), "invalid service name") {
+				t.Fatalf("name %q: err = %v, want invalid-name rejection", bad, err)
+			}
+		})
+	}
+}
+
+// Duplicate service NAMES within the services list are rejected: the name is the
+// service identity, so duplicates would be ambiguous for reconciliation.
+func TestParseServiceDuplicateName(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+services:
+  - name: web
+    entrypoint: service.js
+  - name: web
+    entrypoint: other.js
+`))
+	if err == nil || !strings.Contains(err.Error(), `duplicate service name "web"`) {
+		t.Fatalf("err = %v, want duplicate-service-name rejection", err)
+	}
+}
+
+// Two services with DISTINCT names may share the same source descriptor: the
+// source is the implementation, not the identity.
+func TestParseServiceSameSourceDistinctNames(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: node24
+services:
+  - name: api
+    entrypoint: service.js
+    port: 3000
+  - name: worker
+    entrypoint: service.js
+    port: 4000
+`)
+	if len(tmpl.Services) != 2 {
+		t.Fatalf("services = %d, want 2", len(tmpl.Services))
+	}
+	if tmpl.Services[0].SourceRef() != tmpl.Services[1].SourceRef() {
+		t.Fatalf("both services should share the source descriptor")
+	}
+	if tmpl.Services[0].Name == tmpl.Services[1].Name {
+		t.Fatalf("distinct names expected")
 	}
 }
 
@@ -206,7 +286,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     image: nginx:1.27
 `))
 	if err == nil || !strings.Contains(err.Error(), "multiple sources") {
@@ -221,10 +302,11 @@ services:
 func TestParseServiceUnknownBuildRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 services:
-  - build: Dockerfile
+  - name: web
+    build: Dockerfile
     port: 3000
 `))
-	if err == nil || !strings.Contains(err.Error(), "service is missing a source") {
+	if err == nil || !strings.Contains(err.Error(), `service "web" is missing a source`) {
 		t.Fatalf("err = %v, want missing-source rejection for an unknown build source", err)
 	}
 }
@@ -237,43 +319,11 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: "my service.js"
+  - name: my-service
+    entrypoint: "my service.js"
 `))
 	if err == nil || !strings.Contains(err.Error(), "contains whitespace") {
 		t.Fatalf("err = %v, want whitespace rejection", err)
-	}
-}
-
-// Duplicate service identities within the services list are rejected: the
-// configured source descriptor is the service identity, and duplicates would be
-// ambiguous for reconciliation — regardless of source kind.
-func TestParseServiceDuplicateIdentity(t *testing.T) {
-	_, err := ParseTemplate([]byte(`
-runtime: node24
-events:
-  - handler: index.main
-    pattern:
-      status: [COMPLETED]
-services:
-  - entrypoint: service.js
-  - entrypoint: service.js
-`))
-	if err == nil || !strings.Contains(err.Error(), `duplicate service "service.js"`) {
-		t.Fatalf("err = %v, want duplicate-service rejection", err)
-	}
-	// The same applies to image references with identical descriptor text.
-	_, err = ParseTemplate([]byte(`
-runtime: node24
-events:
-  - handler: index.main
-    pattern:
-      status: [COMPLETED]
-services:
-  - image: nginx:1.27
-  - image: nginx:1.27
-`))
-	if err == nil || !strings.Contains(err.Error(), `duplicate service "nginx:1.27"`) {
-		t.Fatalf("err = %v, want duplicate image-service rejection", err)
 	}
 }
 
@@ -289,7 +339,8 @@ events:
     pattern:
       event_name: [MODIFY]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
     replicas: 2
 `)
@@ -314,10 +365,12 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: 0 3 * * *
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 8080
 `)
 	if len(tmpl.Events) != 1 {
@@ -340,9 +393,11 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: min.js
+  - name: min
+    entrypoint: min.js
     port: 1
-  - entrypoint: max.js
+  - name: max
+    entrypoint: max.js
     port: 65535
 `)
 	if tmpl.Services[0].Port != 1 || tmpl.Services[1].Port != 65535 {
@@ -356,7 +411,8 @@ func TestParseServicesOnlyTemplate(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
     replicas: 2
 `))
@@ -397,8 +453,8 @@ func TestExampleUsersAPITemplateParses(t *testing.T) {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Entrypoint != "service.js" || s.Port != 3000 || s.Replicas != 1 {
-		t.Fatalf("service = %+v, want {service.js 3000 1}", s)
+	if s.Name != "web" || s.Entrypoint != "service.js" || s.Port != 3000 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want {web service.js 3000 1}", s)
 	}
 }
 
@@ -420,8 +476,8 @@ func TestExampleFastAPITemplateParses(t *testing.T) {
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Entrypoint != "app/main.py" || s.Host != "api.example.com" || s.Port != 8000 || s.Replicas != 1 {
-		t.Fatalf("service = %+v, want {app/main.py api.example.com 8000 1}", s)
+	if s.Name != "api" || s.Entrypoint != "app/main.py" || s.Host != "api.example.com" || s.Port != 8000 || s.Replicas != 1 {
+		t.Fatalf("service = %+v, want {api app/main.py api.example.com 8000 1}", s)
 	}
 }
 
@@ -437,7 +493,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: `+ep+`
+  - name: ep
+    entrypoint: `+ep+`
     port: 3000
 `)
 			if len(tmpl.Services) != 1 || tmpl.Services[0].Entrypoint != ep {
@@ -460,11 +517,14 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: routed.js
+  - name: routed
+    entrypoint: routed.js
     host: api.example.com
-  - entrypoint: blank.js
+  - name: blank
+    entrypoint: blank.js
     host: ""
-  - entrypoint: plain.js
+  - name: plain
+    entrypoint: plain.js
 `)
 	if len(tmpl.Services) != 3 {
 		t.Fatalf("services = %d, want 3", len(tmpl.Services))
@@ -506,13 +566,14 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: "` + tc.host + `"
 `))
 			if err == nil {
 				t.Fatalf("expected error for host %q", tc.host)
 			}
-			if !strings.Contains(err.Error(), "service.js") {
+			if !strings.Contains(err.Error(), "service") {
 				t.Errorf("expected error to name the service, got: %v", err)
 			}
 			if !strings.Contains(err.Error(), "host") {
@@ -539,11 +600,14 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: long.js
+  - name: long
+    entrypoint: long.js
     host: "`+host253+`"
-  - entrypoint: short.js
+  - name: short
+    entrypoint: short.js
     host: api
-  - entrypoint: numeric.js
+  - name: numeric
+    entrypoint: numeric.js
     host: 123.io
 `)
 	if tmpl.Services[0].Host != host253 {
@@ -564,13 +628,16 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - entrypoint: routed.js
+  - name: routed
+    entrypoint: routed.js
     host: api.example.com
     path: /v2
-  - entrypoint: blank.js
+  - name: blank
+    entrypoint: blank.js
     host: api.example.com
     path: ""
-  - entrypoint: plain.js
+  - name: plain
+    entrypoint: plain.js
     host: api.example.com
 `)
 	if len(tmpl.Services) != 3 {
@@ -603,7 +670,8 @@ func TestParseServicePathCanonicalization(t *testing.T) {
 			tmpl := mustParse(t, `
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: "`+tc.in+`"
 `)
@@ -634,14 +702,15 @@ func TestParseServicePathRejected(t *testing.T) {
 			_, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: "` + tc.path + `"
 `))
 			if err == nil {
 				t.Fatalf("expected error for path %q", tc.path)
 			}
-			if !strings.Contains(err.Error(), "service.js") {
+			if !strings.Contains(err.Error(), "service") {
 				t.Errorf("expected error to name the service, got: %v", err)
 			}
 			if !strings.Contains(err.Error(), "path") {
@@ -657,7 +726,8 @@ func TestParseServicePathWithoutHostRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     path: /v2
 `))
 	if err == nil {
@@ -674,23 +744,27 @@ func TestParseServicePathWithoutHostAfterHostedService(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - entrypoint: routed.js
+  - name: routed
+    entrypoint: routed.js
     host: api.example.com
     path: /v1
-  - entrypoint: bad.js
+  - name: bad
+    entrypoint: bad.js
     path: /v2
 `))
-	if err == nil || !strings.Contains(err.Error(), "service \"bad.js\": path requires host") {
-		t.Fatalf("err = %v, want service \"bad.js\": path requires host", err)
+	if err == nil || !strings.Contains(err.Error(), "service \"bad\": path requires host") {
+		t.Fatalf("err = %v, want service \"bad\": path requires host", err)
 	}
 }
 
-// An `image` source parses: the reference is the service identity and it needs
-// no runtime (the image carries its own ENTRYPOINT/CMD).
+// An `image` source parses: the reference is the service's source descriptor
+// (its identity is the name "api") and it needs no runtime (the image carries
+// its own ENTRYPOINT/CMD).
 func TestParseServiceImageSourceNoRuntime(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
 services:
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 8080
     replicas: 3
 `))
@@ -701,29 +775,31 @@ services:
 		t.Fatalf("services = %d, want 1", len(tmpl.Services))
 	}
 	s := tmpl.Services[0]
-	if s.Source() != ServiceSourceImage || s.SourceRef() != "ghcr.io/acme/api:1.2" {
-		t.Fatalf("service = %+v, want an image source with identity ghcr.io/acme/api:1.2", s)
+	if s.Name != "api" || s.Source() != ServiceSourceImage || s.SourceRef() != "ghcr.io/acme/api:1.2" {
+		t.Fatalf("service = %+v, want name api with an image source ghcr.io/acme/api:1.2", s)
 	}
 	if s.Image != "ghcr.io/acme/api:1.2" || s.Entrypoint != "" {
 		t.Fatalf("service source fields = %+v, want only Image set", s)
 	}
 }
 
-// An `entrypoint` source parses with its file as identity and requires a runtime
-// (Relay launches it with a runtime-specific command).
+// An `entrypoint` source parses with its file as the source descriptor
+// (identity is the name "service") and requires a runtime (Relay launches it
+// with a runtime-specific command).
 func TestParseServiceEntrypointSourceWithRuntime(t *testing.T) {
 	tmpl, err := ParseTemplate([]byte(`
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
 `))
 	if err != nil {
 		t.Fatalf("entrypoint template must parse: %v", err)
 	}
 	s := tmpl.Services[0]
-	if s.Source() != ServiceSourceEntrypoint || s.SourceRef() != "service.js" {
-		t.Fatalf("service = %+v, want an entrypoint source with identity service.js", s)
+	if s.Name != "service" || s.Source() != ServiceSourceEntrypoint || s.SourceRef() != "service.js" {
+		t.Fatalf("service = %+v, want name service with entrypoint source service.js", s)
 	}
 	if s.Entrypoint != "service.js" || s.Image != "" {
 		t.Fatalf("service source fields = %+v, want only Entrypoint set", s)
@@ -738,7 +814,8 @@ services:
 func TestParseServiceEntrypointRequiresRuntime(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
 `))
 	if err == nil || !strings.Contains(err.Error(), "runtime is required") {
 		t.Fatalf("err = %v, want runtime-required", err)
@@ -754,7 +831,8 @@ events:
     pattern:
       status: [COMPLETED]
 services:
-  - image: nginx:1.27
+  - name: nginx
+    image: nginx:1.27
 `))
 	if err == nil || !strings.Contains(err.Error(), "runtime is required") {
 		t.Fatalf("err = %v, want runtime-required for a mixed template", err)
@@ -767,7 +845,8 @@ func TestParseServiceImageUnsupportedRuntimeRejected(t *testing.T) {
 	_, err := ParseTemplate([]byte(`
 runtime: rust
 services:
-  - image: nginx:1.27
+  - name: nginx
+    image: nginx:1.27
 `))
 	if err == nil || !strings.Contains(err.Error(), `unsupported runtime "rust"`) {
 		t.Fatalf("err = %v, want unsupported-runtime rejection", err)
@@ -781,8 +860,8 @@ func TestParseServiceImageValidation(t *testing.T) {
 		svc     string
 		wantErr string
 	}{
-		{"whitespace image", "  - image: \"bad image\"\n", "contains whitespace"},
-		{"malformed image", "  - image: \"-leading\"\n", "not a valid container image reference"},
+		{"whitespace image", "  - name: img\n    image: \"bad image\"\n", "contains whitespace"},
+		{"malformed image", "  - name: img\n    image: \"-leading\"\n", "not a valid container image reference"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -800,9 +879,11 @@ func TestParseServiceIdentityAcrossKinds(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
-  - image: nginx:1.27
+  - name: nginx
+    image: nginx:1.27
     port: 8080
 `)
 	if len(tmpl.Services) != 2 {

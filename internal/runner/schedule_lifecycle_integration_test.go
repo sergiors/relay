@@ -78,6 +78,7 @@ func markerAttempt(v string) int {
 func scheduleOcc(scheduledAt time.Time) schedule.Occurrence {
 	return schedule.Occurrence{
 		Function:    scheduleFnName,
+		Schedule:    scheduleHandler,
 		Handler:     scheduleHandler,
 		ScheduledAt: scheduledAt,
 	}
@@ -350,6 +351,7 @@ func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleT
 				Runtime: "node24",
 				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: scheduleTimeout, Retries: function.DefaultRetries}},
 				Schedules: []function.Schedule{{
+					Name:     handler,
 					Handler:  handler,
 					Cron:     "0 3 * * *",
 					Location: time.UTC,

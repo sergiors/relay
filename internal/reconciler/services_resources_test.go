@@ -19,7 +19,8 @@ import (
 // (empty to omit).
 func noRuntimeImageTemplate(resources string) string {
 	body := `services:
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 8080
     replicas: 1
 `
@@ -69,7 +70,7 @@ func TestReconcileNoRuntimeExternalImageResourceHotChange(t *testing.T) {
 		}
 	})
 	const externalRef = "ghcr.io/acme/api:1.2"
-	identity := externalRef // the service identity is its image source descriptor
+	identity := "api" // the service name (its stable identity); externalRef is its source
 
 	// Discovery: no image is prepared beyond the one the no-runtime function
 	// resolves to (the fake's placeholder), and one service container runs on the
@@ -164,8 +165,8 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 		name string
 		spec function.Service
 	}{
-		{name: "entrypoint", spec: function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}},
-		{name: "image", spec: function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1}},
+		{name: "entrypoint", spec: function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		{name: "image", spec: function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeDocker()
@@ -213,7 +214,7 @@ func TestReconcileResourceChangeReplacesContainer(t *testing.T) {
 // never replaces the container: the periodic reconcile stays a no-op.
 func TestReconcileUnchangedResourcesNoChurn(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	tmpl.Resources = function.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
@@ -239,7 +240,7 @@ func TestReconcileLegacyContainerWithoutResourcesReplaced(t *testing.T) {
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), // env correct, resources label absent
 	}
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

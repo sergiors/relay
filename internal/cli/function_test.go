@@ -347,9 +347,11 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
-  - handler: jobs.report.handler
+  - name: jobs.report.handler
+    handler: jobs.report.handler
     cron: "0 8 * * 1-5"
     timezone: Europe/Rome
     timeout: 20s
@@ -371,8 +373,8 @@ schedules:
 		t.Fatalf("Schedules should follow Events:\n%s", out)
 	}
 	for _, want := range []string{
-		`jobs.cleanup.handler   cron="0 3 * * *" (At 03:00) timezone=UTC timeout=6s`,
-		`jobs.report.handler    cron="0 8 * * 1-5" (At 08:00, Monday through Friday) timezone=Europe/Rome timeout=20s`,
+		`jobs.cleanup.handler   handler=jobs.cleanup.handler cron="0 3 * * *" (At 03:00) timezone=UTC timeout=6s`,
+		`jobs.report.handler    handler=jobs.report.handler cron="0 8 * * 1-5" (At 08:00, Monday through Friday) timezone=Europe/Rome timeout=20s`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
@@ -418,7 +420,8 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "30 0 0 * * *"
 `))
 	if err == nil || !strings.Contains(err.Error(), "6-field (seconds) cron is not supported") {
@@ -429,7 +432,8 @@ schedules:
 // Descriptions always use 24-hour time: the 08:30 schedule must not contain
 // AM/PM.
 func TestFunctionInspectSchedulesNoAMPM(t *testing.T) {
-	out := inspectSchedules(t, `  - handler: jobs.report.handler
+	out := inspectSchedules(t, `  - name: report
+    handler: jobs.report.handler
     cron: "30 8 * * 1-5"
 `)
 	if !strings.Contains(out, `cron="30 8 * * 1-5" (At 08:30, Monday through Friday) timezone=UTC`) {
@@ -443,10 +447,12 @@ func TestFunctionInspectSchedulesNoAMPM(t *testing.T) {
 // The description is independent of the schedule's timezone: two rows that
 // differ only in timezone render the identical description text.
 func TestFunctionInspectSchedulesTimezoneIndependence(t *testing.T) {
-	out := inspectSchedules(t, `  - handler: jobs.a.handler
+	out := inspectSchedules(t, `  - name: a
+    handler: jobs.a.handler
     cron: "0 0 * * *"
     timezone: America/Sao_Paulo
-  - handler: jobs.b.handler
+  - name: b
+    handler: jobs.b.handler
     cron: "0 0 * * *"
     timezone: Europe/Rome
 `)
@@ -468,10 +474,11 @@ func TestFunctionInspectSchedulesDescriptionFallback(t *testing.T) {
 	describeCronFunc = func(string) (string, bool) { return "", false }
 	defer func() { describeCronFunc = orig }()
 
-	out := inspectSchedules(t, `  - handler: jobs.cleanup.handler
+	out := inspectSchedules(t, `  - name: cleanup
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 `)
-	if !strings.Contains(out, `jobs.cleanup.handler   cron="0 3 * * *" timezone=UTC timeout=6s`) {
+	if !strings.Contains(out, `cleanup   handler=jobs.cleanup.handler cron="0 3 * * *" timezone=UTC timeout=6s`) {
 		t.Errorf("inspect fallback output missing raw cron row:\n%s", out)
 	}
 	// The schedule row must not carry a parenthesized description. (Note: the
@@ -500,9 +507,10 @@ func TestFunctionInspectNoSchedulesHeader(t *testing.T) {
 // after Events when no schedules) and before Environment, showing the effective
 // entrypoint file, port, and replica count (defaults applied).
 func TestFunctionInspectServicesSection(t *testing.T) {
-	out := inspectServicesWithEnv(t, `  - entrypoint: service.js
+	out := inspectServicesWithEnv(t, `  - name: service
+    entrypoint: service.js
 `, true)
-	for _, want := range []string{"Services:", "service.js", "port=80", "replicas=1"} {
+	for _, want := range []string{"Services:", "service", "source=service.js", "port=80", "replicas=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
@@ -518,11 +526,12 @@ func TestFunctionInspectServicesSection(t *testing.T) {
 
 // Explicit port/replicas override the defaults.
 func TestFunctionInspectServicesExplicit(t *testing.T) {
-	out := inspectServices(t, `  - entrypoint: api.js
+	out := inspectServices(t, `  - name: api
+    entrypoint: api.js
     port: 3000
     replicas: 3
 `)
-	for _, want := range []string{"Services:", "api.js", "port=3000", "replicas=3"} {
+	for _, want := range []string{"Services:", "api", "source=api.js", "port=3000", "replicas=3"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inspect output missing %q\n%s", want, out)
 		}
@@ -532,11 +541,13 @@ func TestFunctionInspectServicesExplicit(t *testing.T) {
 // A configured path renders alongside port/replicas; a host-only service keeps
 // the pre-path rendering with no path token.
 func TestFunctionInspectServicesPath(t *testing.T) {
-	out := inspectServices(t, `  - entrypoint: v2.js
+	out := inspectServices(t, `  - name: v2
+    entrypoint: v2.js
     host: api.example.com
     path: /v2
     port: 3000
-  - entrypoint: plain.js
+  - name: plain
+    entrypoint: plain.js
     port: 80
 `)
 	if !strings.Contains(out, "path=/v2") {
@@ -560,10 +571,12 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
 `))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
@@ -869,7 +882,8 @@ events:
 	// A template whose only workload is an image-backed service: the runtime may
 	// be omitted entirely, so the persisted Runtime is empty.
 	tmpl, err := function.ParseTemplate([]byte(`services:
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 8080
 `))
 	if err != nil {
@@ -933,9 +947,11 @@ events:
     pattern:
       event_name: [INSERT]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 9090
 `))
 	if err != nil {

@@ -89,15 +89,17 @@ type ConsumerConfig struct {
 	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
 	MaxBufferedEvents int
 	// ScheduleRunner, when set, executes messages identified as schedule
-	// occurrences directly against the named function/handler, bypassing event
-	// matching. msgID is the message's real Redis stream ID, so the runner can
-	// stamp it on the execution container's relay.message_id label (the same
-	// identity the invocation-state machinery uses). The stream layer stays the
-	// same consumer-group/PEL/recovery machinery for both message kinds. It is
-	// wired by the worker to runner.InvokeHandler. A nil value means schedule
-	// messages are treated as normal events (the safe fallback for tests that do
-	// not wire it).
-	ScheduleRunner func(ctx context.Context, msgID, fnName, handler string, payload []byte) error
+	// occurrences directly against the named function/schedule/handler,
+	// bypassing event matching. msgID is the message's real Redis stream ID, so
+	// the runner can stamp it on the execution container's relay.message_id
+	// label (the same identity the invocation-state machinery uses). The runner
+	// resolves the schedule by its stable name, so a handler change under the
+	// same schedule is picked up on delivery. The stream layer stays the same
+	// consumer-group/PEL/recovery machinery for both message kinds. It is wired
+	// by the worker to runner.InvokeHandler. A nil value means schedule messages
+	// are treated as normal events (the safe fallback for tests that do not wire
+	// it).
+	ScheduleRunner func(ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte) error
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -130,7 +132,7 @@ type Consumer struct {
 	capacity int
 	// scheduleRunner is the ScheduleRunner seam (see ConsumerConfig). When nil,
 	// schedule-occurrence messages are treated as normal events.
-	scheduleRunner func(ctx context.Context, msgID, fnName, handler string, payload []byte) error
+	scheduleRunner func(ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte) error
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -1079,6 +1081,7 @@ func (c *Consumer) processMessage(
 func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) (string, error) {
 	c.log.Debug("Schedule: executing occurrence",
 		"function", occ.Function,
+		"schedule", occ.Schedule,
 		"handler", occ.Handler,
 		"occurrence_id", occ.ID(),
 		"scheduled_at", occ.ScheduledAt.UTC().Format(time.RFC3339),
@@ -1114,7 +1117,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))
 
-	err := c.scheduleRunner(handlerCtx, msgID, occ.Function, occ.Handler, occ.Payload())
+	err := c.scheduleRunner(handlerCtx, msgID, occ.Function, occ.Schedule, occ.Handler, occ.Payload())
 	if err != nil {
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {

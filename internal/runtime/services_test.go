@@ -19,15 +19,17 @@ import (
 
 func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	got := serviceLabels(ServiceSpec{
-		Function: "user-events",
-		Identity: "service.js",
-		Port:     3000,
-		Image:    "relay-fn-user-events:632aca75fa306911",
+		Function:  "user-events",
+		Name:      "api",
+		SourceRef: "service.js",
+		Port:      3000,
+		Image:     "relay-fn-user-events:632aca75fa306911",
 	}, "worker-1", 2)
 
 	want := map[string]string{
 		labelType:     ContainerTypeService,
 		labelFunction: "user-events",
+		labelService:  "api",
 		labelIdentity: "service.js",
 		labelImage:    "relay-fn-user-events:632aca75fa306911",
 		labelHostname: "worker-1",
@@ -55,13 +57,13 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 			t.Errorf("relay.type must be %q, got %q", ContainerTypeService, got[k])
 		}
 	}
-	// Service containers carry relay.identity and NO relay.handler and NO
-	// relay.service label.
+	// Service containers carry relay.service (their stable name) and
+	// relay.identity (their source descriptor), and NO relay.handler.
 	if _, ok := got[labelHandler]; ok {
 		t.Errorf("service labels must NOT carry relay.handler, got %v", got)
 	}
-	if _, ok := got["relay.service"]; ok {
-		t.Errorf("service labels must NOT carry relay.service, got %v", got)
+	if got[labelService] != "api" {
+		t.Errorf("service labels must carry relay.service = the service name, got %v", got)
 	}
 }
 
@@ -72,7 +74,7 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 // the same entries in a different order are a different effective env.
 func TestServiceLabelsEnvHashPinsEffectiveEnv(t *testing.T) {
 	spec := func(env []string) ServiceSpec {
-		return ServiceSpec{Function: "fn", Identity: "svc.js", Port: 80, Image: "img", Env: env}
+		return ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc.js", Port: 80, Image: "img", Env: env}
 	}
 	base := serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)
 	if base[labelEnvHash] != EnvHash([]string{"A=1", "B=2"}) {
@@ -132,18 +134,18 @@ func TestEnvHashDeterministicAcrossProcesses(t *testing.T) {
 
 func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		function   string
-		entrypoint string
-		replica    int
-		wantPrefix string
+		name        string
+		function    string
+		serviceName string
+		replica     int
+		wantPrefix  string
 	}{
-		{"plain", "user-events", "service.js", 0, "relay-svc-user-events-service.js-"},
-		{"nested", "fn", "app/service.js", 0, "relay-svc-fn-app-service.js-"},
-		{"sanitize entrypoint", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-"},
+		{"plain", "user-events", "api", 0, "relay-svc-user-events-api-"},
+		{"nested", "fn", "app-service", 0, "relay-svc-fn-app-service-"},
+		{"sanitize name", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := serviceContainerName(tc.function, tc.entrypoint, tc.replica)
+			got := serviceContainerName(tc.function, tc.serviceName, tc.replica)
 			if len(got) > serviceContainerNameLenCap {
 				t.Fatalf("name length %d exceeds cap %d", len(got), serviceContainerNameLenCap)
 			}
@@ -153,13 +155,13 @@ func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 			if !strings.HasSuffix(got, "-"+strconv.Itoa(tc.replica)) {
 				t.Errorf("name = %q, want the -%d replica suffix", got, tc.replica)
 			}
-			if !strings.Contains(got, serviceIdentityHash(tc.function, tc.entrypoint)) {
-				t.Errorf("name = %q, want the identity hash %q", got, serviceIdentityHash(tc.function, tc.entrypoint))
+			if !strings.Contains(got, serviceNameHash(tc.function, tc.serviceName)) {
+				t.Errorf("name = %q, want the name hash %q", got, serviceNameHash(tc.function, tc.serviceName))
 			}
 		})
 	}
-	// A long identity still yields a name within the cap, keeps the replica
-	// suffix, and retains the identity hash.
+	// A long name still yields a name within the cap, keeps the replica
+	// suffix, and retains the name hash.
 	got := serviceContainerName("averylongfunctionname", strings.Repeat("x", 200), 99)
 	if len(got) > serviceContainerNameLenCap {
 		t.Fatalf("long name length %d exceeds cap %d", len(got), serviceContainerNameLenCap)
@@ -167,31 +169,31 @@ func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 	if !strings.HasSuffix(got, "-99") {
 		t.Fatalf("long name = %q, want the -99 replica suffix preserved", got)
 	}
-	if !strings.Contains(got, serviceIdentityHash("averylongfunctionname", strings.Repeat("x", 200))) {
-		t.Fatalf("long name = %q lost the identity hash", got)
+	if !strings.Contains(got, serviceNameHash("averylongfunctionname", strings.Repeat("x", 200))) {
+		t.Fatalf("long name = %q lost the name hash", got)
 	}
 }
 
 // TestServiceContainerNameCollisionResistant pins the reviewer finding for the
-// generated container name: distinct identities that sanitize to the same
+// generated container name: distinct service names that sanitize to the same
 // readable base (or that truncate to the same prefix) must still get distinct
 // names.
 func TestServiceContainerNameCollisionResistant(t *testing.T) {
-	a := serviceContainerName("fn", "ghcr.io/acme/a/b:1", 0)
-	b := serviceContainerName("fn", "ghcr.io/acme/a-b:1", 0)
+	a := serviceContainerName("fn", "api/v1", 0)
+	b := serviceContainerName("fn", "api-v1", 0)
 	if a == b {
-		t.Fatalf("distinct identities collided in the container name: %q", a)
+		t.Fatalf("distinct names collided in the container name: %q", a)
 	}
-	if !strings.Contains(a, serviceIdentityHash("fn", "ghcr.io/acme/a/b:1")) ||
-		!strings.Contains(b, serviceIdentityHash("fn", "ghcr.io/acme/a-b:1")) {
-		t.Fatalf("container names lack the full-identity hash: %q / %q", a, b)
+	if !strings.Contains(a, serviceNameHash("fn", "api/v1")) ||
+		!strings.Contains(b, serviceNameHash("fn", "api-v1")) {
+		t.Fatalf("container names lack the full-name hash: %q / %q", a, b)
 	}
-	// Long identities truncated to the same readable prefix stay distinct.
-	long := strings.Repeat("deep/nested/path/", 15)
-	x := serviceContainerName("fn", long+"one.js", 0)
-	y := serviceContainerName("fn", long+"two.js", 0)
+	// Long names truncated to the same readable prefix stay distinct.
+	long := strings.Repeat("deep.nested.path.", 15)
+	x := serviceContainerName("fn", long+"one", 0)
+	y := serviceContainerName("fn", long+"two", 0)
 	if x == y {
-		t.Fatalf("truncated identities collided in the container name: %q", x)
+		t.Fatalf("truncated names collided in the container name: %q", x)
 	}
 	if len(x) > serviceContainerNameLenCap || len(y) > serviceContainerNameLenCap {
 		t.Fatalf("names exceed the cap: %d / %d", len(x), len(y))
@@ -199,8 +201,8 @@ func TestServiceContainerNameCollisionResistant(t *testing.T) {
 }
 
 func TestServiceContainerNameDeterministic(t *testing.T) {
-	a := serviceContainerName("fn", "service.js", 3)
-	b := serviceContainerName("fn", "service.js", 3)
+	a := serviceContainerName("fn", "api", 3)
+	b := serviceContainerName("fn", "api", 3)
 	if a != b {
 		t.Fatalf("name not deterministic: %q vs %q", a, b)
 	}
@@ -213,9 +215,9 @@ func TestServiceContainerNameDeterministic(t *testing.T) {
 // the SAME logical slot can coexist (Docker rejects duplicate names). The
 // physical name always stays under the Docker-safe cap.
 func TestServiceContainerNameForStartUniqueAndBounded(t *testing.T) {
-	logical := serviceContainerName("fn", "service.js", 0)
-	first := serviceContainerNameForStart("fn", "service.js", 0)
-	second := serviceContainerNameForStart("fn", "service.js", 0)
+	logical := serviceContainerName("fn", "api", 0)
+	first := serviceContainerNameForStart("fn", "api", 0)
+	second := serviceContainerNameForStart("fn", "api", 0)
 	if first == second {
 		t.Fatalf("two starts for one slot produced the same physical name %q; a replacement could not coexist", first)
 	}
@@ -227,7 +229,7 @@ func TestServiceContainerNameForStartUniqueAndBounded(t *testing.T) {
 			t.Fatalf("physical name %q length %d exceeds cap %d", n, len(n), serviceContainerNamePhysicalLenCap)
 		}
 	}
-	// A long identity stays bounded for the physical name too.
+	// A long name stays bounded for the physical name too.
 	long := serviceContainerNameForStart("fn", strings.Repeat("x", 300), 7)
 	if len(long) > serviceContainerNamePhysicalLenCap {
 		t.Fatalf("long physical name length %d exceeds cap %d", len(long), serviceContainerNamePhysicalLenCap)
@@ -249,7 +251,9 @@ func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
-		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0)
 	if err != nil {
 		t.Fatalf("StartService: %v", err)
@@ -278,7 +282,9 @@ func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
-		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0)
 	if err == nil {
 		t.Fatal("a non-running started container must fail StartService")
@@ -309,7 +315,9 @@ func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
-		Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0); err == nil {
 		t.Fatal("an inspect failure must fail StartService")
 	}
@@ -336,7 +344,9 @@ func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	for i := 0; i < 2; i++ {
 		if _, err := m.StartService(context.Background(), ServiceSpec{
-			Function: "fn", Identity: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
+			Function:  "fn",
+			Name:      "svc",
+			SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 		}, 0); err != nil {
 			t.Fatalf("StartService %d: %v", i, err)
 		}
@@ -347,7 +357,7 @@ func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
 	if names[0] == names[1] {
 		t.Fatalf("both creates used the same name %q; a replacement could not coexist", names[0])
 	}
-	logical := serviceContainerName("fn", "service.js", 0)
+	logical := serviceContainerName("fn", "svc", 0)
 	for _, n := range names {
 		if !strings.HasPrefix(n, logical+"-") {
 			t.Fatalf("create name %q does not keep the logical prefix %q", n, logical)
@@ -449,7 +459,7 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 // even though they carry relay.function + relay.hostname and would otherwise be
 // Relay-owned — a service must never be swept as an orphan.
 func TestSweepSkipsServiceContainers(t *testing.T) {
-	svc := serviceLabels(ServiceSpec{Function: "f", Identity: "svc", Image: "img"}, "test-host", 0)
+	svc := serviceLabels(ServiceSpec{Function: "f", Name: "svc", SourceRef: "svc", Image: "img"}, "test-host", 0)
 	if !sweepSkips(svc) {
 		t.Error("sweepSkips(service labels) = false, want true (services are persistent, reconciler-owned)")
 	}
@@ -476,10 +486,10 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 // non-service container (including one with no labels at all) is excluded safely.
 // The client-call path is exercised without a real Docker daemon.
 func TestServiceContainerListParsing(t *testing.T) {
-	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
+	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2",` +
 		`"relay.env_hash":"0123456789abcdef"}`
-	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.identity":"svc.js",` +
+	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
 		`{"Id":"c2","Labels":` + c2Labels + `},` +
@@ -501,8 +511,8 @@ func TestServiceContainerListParsing(t *testing.T) {
 	}
 
 	c1 := byID["c1"]
-	if c1.Function != "fn-a" || c1.Identity != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
-		t.Errorf("c1 identity = %+v, want the label-derived identity", c1)
+	if c1.Function != "fn-a" || c1.Name != "svcname" || c1.SourceRef != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
+		t.Errorf("c1 identity = %+v, want the label-derived name + source", c1)
 	}
 	if c1.Replica != 2 {
 		t.Errorf("c1 replica = %d, want the parsed 2", c1.Replica)
@@ -542,9 +552,9 @@ func TestServiceContainerListParsing(t *testing.T) {
 func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	spec := ServiceSpec{
 		Function: "user-events",
-		Identity: "service.js",
-		Port:     3000,
-		Image:    "relay-fn-user-events:deadbeef",
+		Name:     "svc", SourceRef: "service.js",
+		Port:  3000,
+		Image: "relay-fn-user-events:deadbeef",
 		Labels: map[string]string{
 			"traefik.enable": "true",
 			// Attempted spoof of Relay ownership keys.
@@ -594,14 +604,18 @@ func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
 		{
 			name: "entrypoint",
 			spec: ServiceSpec{
-				Function: "fn", Identity: "service.js", Port: 3000, Image: "relay-fn-fn:tag",
+				Function:  "fn",
+				Name:      "svc",
+				SourceRef: "service.js", Port: 3000, Image: "relay-fn-fn:tag",
 				Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"}, Resources: limits,
 			},
 		},
 		{
 			name: "image",
 			spec: ServiceSpec{
-				Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000,
+				Function:  "fn",
+				Name:      "svc",
+				SourceRef: "ghcr.io/acme/api:1.2", Port: 3000,
 				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: []string{"PORT=3000"}, Resources: limits,
 			},
 		},
@@ -637,7 +651,7 @@ func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
 // defaults so a legacy/unlabeled container is replaced once.
 func TestServiceLabelsResourcesFingerprint(t *testing.T) {
 	spec := func(r function.ResourceLimits) ServiceSpec {
-		return ServiceSpec{Function: "fn", Identity: "svc", Image: "img", Port: 80, Resources: r}
+		return ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc", Image: "img", Port: 80, Resources: r}
 	}
 	a := serviceLabels(spec(function.DefaultResourceLimits()), "h", 0)[labelResources]
 	b := serviceLabels(spec(function.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}), "h", 0)[labelResources]
@@ -717,14 +731,18 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 		{
 			name: "entrypoint",
 			spec: ServiceSpec{
-				Function: "fn", Identity: "service.js", Port: 3000,
+				Function:  "fn",
+				Name:      "svc",
+				SourceRef: "service.js", Port: 3000,
 				Image: "relay-fn-fn:tag", Entry: []string{"node", "/app/service.js"}, Env: env,
 			},
 		},
 		{
 			name: "image",
 			spec: ServiceSpec{
-				Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000,
+				Function:  "fn",
+				Name:      "svc",
+				SourceRef: "ghcr.io/acme/api:1.2", Port: 3000,
 				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: env,
 			},
 		},
@@ -757,7 +775,9 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 // leaves it empty so the image's own ENTRYPOINT/CMD is preserved.
 func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	entry := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
-		Function: "fn", Identity: "service.js", Port: 3000,
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 3000,
 		Image: "img", Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}))
 	if len(entry.Entrypoint) != 2 || entry.Entrypoint[0] != "node" || entry.Entrypoint[1] != "/app/service.js" {
@@ -765,7 +785,9 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	}
 
 	image := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
-		Function: "fn", Identity: "ghcr.io/acme/api:1.2", Port: 3000, Image: "ghcr.io/acme/api:1.2", Env: []string{"PORT=3000"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "ghcr.io/acme/api:1.2", Port: 3000, Image: "ghcr.io/acme/api:1.2", Env: []string{"PORT=3000"},
 	}))
 	if len(image.Entrypoint) != 0 {
 		t.Fatalf("image-source Entrypoint = %v, want none (preserve image ENTRYPOINT)", image.Entrypoint)
@@ -837,7 +859,9 @@ func TestStartServiceNetworkingConfig(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-				Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
+				Function:  "fn",
+				Name:      "svc",
+				SourceRef: "service.js", Port: 3000, Image: "img",
 				Env: []string{"PORT=3000"}, Networks: tc.spec,
 			}))
 			assertServiceEndpoints(t, req, tc.want...)
@@ -912,7 +936,9 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
 
 	_, err := m.StartService(context.Background(), ServiceSpec{
-		Function: "fn", Identity: "service.js", Port: 3000, Image: "img",
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 3000, Image: "img",
 		Env: []string{"PORT=3000"}, Networks: []string{"backend"},
 	}, 0)
 	if err == nil {
@@ -927,20 +953,24 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 // deduped, and omitted when empty. It also pins that a caller-supplied label can
 // never spoof it.
 func TestServiceLabelsNetworks(t *testing.T) {
-	base := serviceLabels(ServiceSpec{Function: "fn", Identity: "svc", Image: "img"}, "h", 0)
+	base := serviceLabels(ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc", Image: "img"}, "h", 0)
 	if _, ok := base[labelNetworks]; ok {
 		t.Fatalf("no networks must omit relay.networks, got %q", base[labelNetworks])
 	}
 
 	got := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img", Networks: []string{"proxy"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "svc", Image: "img", Networks: []string{"proxy"},
 	}, "h", 0)
 	if got[labelNetworks] != "proxy" {
 		t.Fatalf("relay.networks = %q, want proxy", got[labelNetworks])
 	}
 
 	spoof := serviceLabels(ServiceSpec{
-		Function: "fn", Identity: "svc", Image: "img", Networks: []string{"real"},
+		Function:  "fn",
+		Name:      "svc",
+		SourceRef: "svc", Image: "img", Networks: []string{"real"},
 		Labels: map[string]string{labelNetworks: "spoofed"},
 	}, "h", 0)
 	if spoof[labelNetworks] != "real" {

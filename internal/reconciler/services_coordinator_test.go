@@ -69,7 +69,7 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
@@ -114,7 +114,7 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 func TestServiceCoordinatorStatusAuthority(t *testing.T) {
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -181,7 +181,7 @@ func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
 		cancel()
 		_ = coordinator.Join(context.Background())
 	}()
-	tmpl := &function.Template{Runtime: "node24", Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}}}
+	tmpl := &function.Template{Runtime: "node24", Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}}}
 	oldDone := make(chan struct{}, 1)
 	newDone := make(chan struct{}, 1)
 	coordinator.EnqueueWithStatus("alpha", tmpl, "img-1", nil, nil, func(error) { oldDone <- struct{}{} })
@@ -244,7 +244,7 @@ func TestServiceCoordinatorWaitCancelsPromptlyWhileBusy(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is now busy in ResolveServiceImage
@@ -274,7 +274,7 @@ func TestServiceCoordinatorJoinBoundedThenDrains(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
@@ -505,7 +505,7 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 		Runtime:  "node24",
 		Env:      map[string]string{"A": "1"},
 		Secrets:  map[string]function.SecretRef{"S": "ref-1"},
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img", []string{"PLAN=1"})
 
@@ -513,7 +513,7 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	tmpl.Env["A"] = "mutated"
 	tmpl.Secrets["S"] = "mutated-ref"
 	tmpl.Services[0].Port = 9999
-	tmpl.Services = append(tmpl.Services, function.Service{Entrypoint: "extra.js", Port: 81, Replicas: 1})
+	tmpl.Services = append(tmpl.Services, function.Service{Name: "extra.js", Entrypoint: "extra.js", Port: 81, Replicas: 1})
 
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
@@ -636,7 +636,7 @@ func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	// The initial desired state settles before housekeeping starts.
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
@@ -716,7 +716,7 @@ func TestServiceCoordinatorRunExclusiveCancelledBarrierSkipsCallback(t *testing.
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is busy, so the barrier cannot clear

@@ -50,26 +50,50 @@ func ValidSecretName(name string) error {
 	return nil
 }
 
+// validateNameRule reports whether name satisfies the conservative resource
+// name rule shared by function names and service/schedule names: non-empty, at
+// most maxNameLen characters, matching namePattern, and not ending in '.'. It
+// returns a rule description (without the offending value) so each caller can
+// wrap it with its own kind label. The rule is deliberately identical across
+// kinds so a valid function name is always a valid service/schedule name, and
+// vice versa.
+func validateNameRule(name string) error {
+	if name == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("must be at most %d characters", maxNameLen)
+	}
+	if !namePattern.MatchString(name) {
+		return fmt.Errorf("must match [a-z0-9][a-z0-9._-]*")
+	}
+	// The pattern permits a trailing dot, but docker rejects tags that end in a
+	// dot, and a name like "jobs." is a namespace-with-empty-version in disguise.
+	// Reject it explicitly so every valid name maps to a legal docker tag.
+	if name[len(name)-1] == '.' {
+		return fmt.Errorf("must not end with '.'")
+	}
+	return nil
+}
+
 // ValidName reports whether name is a legal function name, returning nil when it
 // is and a descriptive error otherwise. Names are validated at load time (never
 // sanitized), so the value used for the docker image tag is guaranteed to be
 // already safe for that use — this is what lets imageRef stay a simple
 // concatenation.
 func ValidName(name string) error {
-	if name == "" {
-		return fmt.Errorf("invalid function name %q: must match [a-z0-9][a-z0-9._-]*", name)
+	if err := validateNameRule(name); err != nil {
+		return fmt.Errorf("invalid function name %q: %w", name, err)
 	}
-	if len(name) > maxNameLen {
-		return fmt.Errorf("invalid function name %q: must be at most %d characters", name, maxNameLen)
-	}
-	if !namePattern.MatchString(name) {
-		return fmt.Errorf("invalid function name %q: must match [a-z0-9][a-z0-9._-]*", name)
-	}
-	// The pattern permits a trailing dot, but docker rejects tags that end in a
-	// dot, and a name like "jobs." is a namespace-with-empty-version in disguise.
-	// Reject it explicitly so every valid name maps to a legal docker tag.
-	if name[len(name)-1] == '.' {
-		return fmt.Errorf("invalid function name %q: must not end with '.'", name)
+	return nil
+}
+
+// validServiceScheduleName reports whether name is a legal service or schedule
+// name. It applies the same conservative rule as a function name (see
+// validateNameRule); kind ("service"/"schedule") only shapes the error message.
+func validServiceScheduleName(kind, name string) error {
+	if err := validateNameRule(name); err != nil {
+		return fmt.Errorf("invalid %s name %q: %w", kind, name, err)
 	}
 	return nil
 }

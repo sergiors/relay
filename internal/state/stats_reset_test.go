@@ -20,10 +20,12 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 services:
-  - entrypoint: api.js
+  - name: api
+    entrypoint: api.js
     port: 3000
     replicas: 2
 `

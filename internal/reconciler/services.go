@@ -21,12 +21,15 @@
 // removes service containers owned by this worker only; startup convergence
 // remains the crash-recovery path when shutdown cleanup did not execute.
 //
-// Identity is the configured source descriptor (function.Service.SourceRef) and
-// the replica slot is relay.replica; both are label-derived and are the only
-// grouping keys. An identity change is therefore indistinguishable from a
-// removal plus an addition at this layer (see Reconcile's comment on that
-// edge), which is why removed-service cleanup is deferred until after every
-// desired service has converged.
+// Identity is the service's stable template name (function.Service.Name) and the
+// replica slot is relay.replica; both are label-derived and are the only
+// grouping keys. The configured source descriptor (relay.identity) is compared
+// as the desired IMPLEMENTATION, never as identity: a source change under the
+// same name (a new entrypoint file or image reference) is the SAME logical
+// service, so it replaces the same replica slots through the normal
+// start-before-stop path. A NAME change is a removal plus an addition at this
+// layer (see Reconcile's comment on that edge), which is why removed-service
+// cleanup is deferred until after every desired service has converged.
 //
 // Ordering guarantees relied on by the worker:
 //   - Reconcile is idempotent: when already converged it lists containers once
@@ -222,17 +225,16 @@ func reconcileAuthorityFrom(ctx context.Context) func() bool {
 // removed services are stopped only after every desired slot has converged, so
 // convergence never removes every old replica before replacements exist.
 //
-// Identity edge — an identity CHANGE is a removal plus an addition. A service's
-// identity is its SourceRef (entrypoint file or image reference), the sole
-// grouping key; the template has no separate stable service name. Changing a
-// source descriptor (e.g. an external image tag, or an entrypoint path) makes
-// the old identity absent from the desired set and the new identity appear, so
-// the old containers are treated as removed. The reconciler deliberately stops
-// removed services LAST (after desired starts), which gives the new identity and
-// the old one a brief overlap, but it cannot pair them: it has no evidence the
-// two identities are "the same service". Reliable cross-SourceRef pairing would
-// require a stable service identity (an index or explicit name) that the
-// template model does not have, so it is out of scope here.
+// Identity edge — a NAME change is a removal plus an addition. A service's
+// identity is its stable template name (relay.service), the sole grouping key;
+// the source descriptor is compared as the desired implementation, not as
+// identity. Renaming a service makes the old name absent from the desired set
+// and the new name appear, so the old containers are treated as removed. The
+// reconciler deliberately stops removed services LAST (after desired starts), so
+// the old name's containers are preserved until the new name's service has fully
+// converged; a FAILED new service preserves the old name's running containers
+// (see the removal cleanup below). Changing only the source under the same name
+// is NOT a rename: it replaces the same replica slots via start-before-stop.
 //
 // Container ownership is always label-derived. A container belongs to fnName
 // when its Function == fnName; containers of other functions are never touched.
@@ -337,11 +339,11 @@ func reconcileWithObserver(
 
 	// desiredFailed records that at least one desired service did not converge
 	// this pass (a routing/source/env resolution failure, or a replacement that
-	// could not be confirmed running). Under SourceRef grouping an identity
-	// change is a removal plus an addition, so a removed identity's running
-	// containers may be the ONLY usable generation for the service the new
-	// identity replaces; when the desired set did not converge they are preserved
-	// rather than stopped (see the removal cleanup below).
+	// could not be confirmed running). A removed name's running containers may be
+	// the ONLY usable generation for the service the new name replaces (a rename
+	// is indistinguishable from a removal plus an addition); when the desired set
+	// did not converge they are preserved rather than stopped (see the removal
+	// cleanup below).
 	desiredFailed := false
 
 	// abortPass is set when the request is discovered to be superseded: no
@@ -357,16 +359,16 @@ func reconcileWithObserver(
 
 	desired := make(map[string]function.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
-		desired[svc.SourceRef()] = svc
+		desired[svc.Name] = svc
 	}
 
-	// Classify this function's containers by service. Containers whose service
-	// is no longer in the template (removed service) are collected and stopped
-	// only AFTER every desired service has converged below: start-before-stop
-	// ordering means a service whose identity changed (an identity change is
-	// indistinguishable from a removal plus an addition under SourceRef
-	// grouping) does not have its old generation torn down before the new
-	// service's replicas are running.
+	// Classify this function's containers by service NAME. Containers whose
+	// service name is no longer in the template (removed service, or an old name
+	// after a rename) are collected and stopped only AFTER every desired service
+	// has converged below: start-before-stop ordering means a service whose
+	// source changed under the same name has already swapped in place, and a
+	// renamed service's old containers are not torn down before the new name's
+	// replicas are running.
 	var removed []runtime.ServiceContainer
 	byService := make(map[string][]runtime.ServiceContainer)
 	for _, ctr := range containers {
@@ -374,16 +376,17 @@ func reconcileWithObserver(
 			// Another function owns this container; its reconcile handles it.
 			continue
 		}
-		if _, ok := desired[ctr.Identity]; !ok {
+		if _, ok := desired[ctr.Name]; !ok {
 			removed = append(removed, ctr)
 			continue
 		}
-		byService[ctr.Identity] = append(byService[ctr.Identity], ctr)
+		byService[ctr.Name] = append(byService[ctr.Name], ctr)
 	}
 
 	for _, svc := range tmpl.Services {
-		identity := svc.SourceRef()
-		existing := byService[identity]
+		name := svc.Name
+		sourceRef := svc.SourceRef()
+		existing := byService[name]
 
 		// Supersession check at the top of each service: if a newer desired
 		// state replaced this request while a previous service was converging,
@@ -416,10 +419,10 @@ func reconcileWithObserver(
 		if svc.Host != "" {
 			if err := traefik.Validate(); err != nil {
 				preCancel()
-				err := fmt.Errorf("service %q: %w", identity, err)
+				err := fmt.Errorf("service %q: %w", name, err)
 				fail(err)
 				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", identity, "error", err)
+				log.Warn("Service: routing validation failed", "service", name, "error", err)
 				continue
 			}
 			// The per-service effective host (declared host, or the override
@@ -430,10 +433,10 @@ func reconcileWithObserver(
 			// no-op on an already-validated template host.
 			if err := traefik.ValidateHost(svc.Host); err != nil {
 				preCancel()
-				err := fmt.Errorf("service %q: %w", identity, err)
+				err := fmt.Errorf("service %q: %w", name, err)
 				fail(err)
 				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", identity, "error", err)
+				log.Warn("Service: routing validation failed", "service", name, "error", err)
 				continue
 			}
 			// The routing network (e.g. the Traefik network) is infrastructure
@@ -442,21 +445,21 @@ func reconcileWithObserver(
 			ok, err := docker.NetworkExists(preCtx, traefik.Network)
 			if err != nil {
 				preCancel()
-				err := fmt.Errorf("service %q: check routing network: %w", identity, err)
+				err := fmt.Errorf("service %q: check routing network: %w", name, err)
 				fail(err)
 				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", identity, "error", err)
+				log.Warn("Service: routing validation failed", "service", name, "error", err)
 				continue
 			}
 			if !ok {
 				preCancel()
-				err := fmt.Errorf("service %q: %w", identity, routing.MissingNetwork(traefik.Network))
+				err := fmt.Errorf("service %q: %w", name, routing.MissingNetwork(traefik.Network))
 				fail(err)
 				desiredFailed = true
-				log.Warn("Service: routing validation failed", "service", identity, "error", err)
+				log.Warn("Service: routing validation failed", "service", name, "error", err)
 				continue
 			}
-			routeLabels = routing.TraefikLabels(fnName, identity, svc.Host, svc.Path, svc.Port, traefik)
+			routeLabels = routing.TraefikLabels(fnName, name, svc.Host, svc.Path, svc.Port, traefik)
 			routeNetwork = traefik.Network
 			// Optional routing values log only when set, omitting empty
 			// ones; the generated labels themselves are never logged.
@@ -479,7 +482,7 @@ func reconcileWithObserver(
 			log.Debug("Service: routing configured",
 				append([]any{
 					"function", fnName,
-					"service", identity,
+					"service", name,
 					"host", svc.Host,
 					"network", routeNetwork,
 				}, attrs...)...)
@@ -494,10 +497,10 @@ func reconcileWithObserver(
 		resolved, err := docker.ResolveServiceImage(preCtx, fnName, tmpl, svc, functionImage)
 		preCancel()
 		if err != nil {
-			fail(fmt.Errorf("service %q: %w", identity, err))
+			fail(fmt.Errorf("service %q: %w", name, err))
 			desiredFailed = true
 			log.Warn("Service: cannot resolve source; keeping existing containers",
-				"service", identity, "error", err)
+				"service", name, "error", err)
 			continue
 		}
 
@@ -513,9 +516,9 @@ func reconcileWithObserver(
 		env, err := BuildEnv(postCtx, tmpl, svc.Port, preparedEnv, secrets)
 		if err != nil {
 			postCancel()
-			fail(fmt.Errorf("service %q: %w", identity, err))
+			fail(fmt.Errorf("service %q: %w", name, err))
 			desiredFailed = true
-			log.Warn("Service: cannot start replicas", "service", identity, "error", err)
+			log.Warn("Service: cannot start replicas", "service", name, "error", err)
 			continue
 		}
 		// envHash is the desired effective environment's content hash. It is
@@ -546,19 +549,23 @@ func reconcileWithObserver(
 		desiredNetworks := runtime.NetworksLabel(desiredNetworkSet...)
 
 		// A container is CONVERGED (a keep candidate) only when it is both
-		// healthy (running) and currently configured correctly (image, image
-		// content, port, effective environment, and Docker networks all match
-		// the desired values) and carries a real replica label. Anything else —
-		// exited/dead/removing, a changed image, a moved external tag (image
-		// content changed), a changed port, a changed env/secret (env hash
-		// mismatch), a changed network set, or an unlabeled legacy container
-		// (Replica == -1) — is a non-converged generation that a converged
-		// replacement supersedes. In addition, the container's labels must
-		// match the desired routing label set exactly: a changed host/path/port
-		// leaves stale Traefik labels pointing traffic at whatever the old
-		// container served, so the container is replaced.
+		// healthy (running) and currently configured correctly (source reference,
+		// image, image content, port, effective environment, and Docker networks
+		// all match the desired values) and carries a real replica label.
+		// Anything else — exited/dead/removing, a changed source, a changed image,
+		// a moved external tag (image content changed), a changed port, a changed
+		// env/secret (env hash mismatch), a changed network set, or an unlabeled
+		// legacy container (Replica == -1) — is a non-converged generation that a
+		// converged replacement supersedes. In addition, the container's labels
+		// must match the desired routing label set exactly: a changed host/path/
+		// port leaves stale Traefik labels pointing traffic at whatever the old
+		// container served, so the container is replaced. SourceRef comparison
+		// matters for an `image` source whose two references resolve to the same
+		// bytes: the container still carries the old relay.identity and must be
+		// replaced so its label reflects the configured source.
 		converged := func(ctr runtime.ServiceContainer) bool {
 			return ctr.State == container.StateRunning &&
+				ctr.SourceRef == sourceRef &&
 				ctr.Image == resolved.Ref &&
 				ctr.ImageID == resolved.ID &&
 				ctr.Port == svc.Port &&
@@ -574,7 +581,8 @@ func reconcileWithObserver(
 		newSpec := func() runtime.ServiceSpec {
 			return runtime.ServiceSpec{
 				Function:  fnName,
-				Identity:  identity,
+				Name:      name,
+				SourceRef: sourceRef,
 				Port:      svc.Port,
 				Image:     resolved.Ref,
 				ImageID:   resolved.ID,
@@ -653,7 +661,7 @@ func reconcileWithObserver(
 			notifyReconcile()
 			startedID, err := docker.StartService(postCtx, newSpec(), slot)
 			if err != nil {
-				fail(fmt.Errorf("service %q replica %d: %w", identity, slot, err))
+				fail(fmt.Errorf("service %q replica %d: %w", name, slot, err))
 				desiredFailed = true
 				if fallback != nil {
 					// The replacement failed: preserve the slot's usable old
@@ -661,12 +669,12 @@ func reconcileWithObserver(
 					// the next reconcile. Leaving them out of stale is the
 					// suppression: they are not stopped this pass.
 					log.Warn("Service: replacement failed; keeping old replica",
-						"function", fnName, "service", identity, "replica", slot, "error", err)
+						"function", fnName, "service", name, "replica", slot, "error", err)
 				} else {
 					// No old fallback for this slot: retain unavailable
 					// semantics and retry on the next reconcile.
 					log.Warn("Service: replica unavailable",
-						"function", fnName, "service", identity, "replica", slot, "error", err)
+						"function", fnName, "service", name, "replica", slot, "error", err)
 				}
 				// Usable olds stay as fallbacks; a non-usable old can never
 				// serve, so it is cleaned up even when the replacement failed.
@@ -688,7 +696,7 @@ func reconcileWithObserver(
 			// the replacement is the only running generation).
 			if fallback != nil && startedID != "" {
 				provisional = append(provisional, runtime.ServiceContainer{
-					ID: startedID, Function: fnName, Identity: identity,
+					ID: startedID, Function: fnName, Name: name,
 					State: container.StateRunning,
 				})
 			}
@@ -731,7 +739,7 @@ func reconcileWithObserver(
 			if keep, ok := lowestUsableStale(stale); ok {
 				stale = removeStaleID(stale, keep.ID)
 				log.Warn("Service: no replacement could be confirmed; keeping a running replica",
-					"function", fnName, "service", identity, "replica", keep.Replica)
+					"function", fnName, "service", name, "replica", keep.Replica)
 			}
 		}
 
@@ -744,8 +752,8 @@ func reconcileWithObserver(
 		// the pass for the newer request to converge.
 		if superseded() {
 			log.Info("Service: pass superseded; preserving old generation",
-				"function", fnName, "service", identity)
-			cleanupProvisional(bounded, docker, fnName, identity, provisional, log)
+				"function", fnName, "service", name)
+			cleanupProvisional(bounded, docker, fnName, name, provisional, log)
 			provisional = nil
 			abortPass = true
 			postCancel()
@@ -759,7 +767,7 @@ func reconcileWithObserver(
 			corrective = true
 			notifyReconcile()
 			if err := docker.StopServiceContainers(postCtx, stale); err != nil {
-				fail(fmt.Errorf("service %q stale: %w", identity, err))
+				fail(fmt.Errorf("service %q stale: %w", name, err))
 			}
 		}
 		// The service committed: its provisional replacements are now the
@@ -769,16 +777,16 @@ func reconcileWithObserver(
 	}
 
 	// Removed services are stopped LAST: their containers are no longer desired,
-	// but deferring the stop until every desired service has converged means an
-	// identity change (which is indistinguishable from a removal plus an
-	// addition under SourceRef grouping) cannot have its old generation torn
-	// down before the new service's replicas are running. Removed-service and
-	// removed-function cleanup still removes every generation.
+	// but deferring the stop until every desired service has converged means a
+	// RENAME (which is indistinguishable from a removal plus an addition under
+	// name grouping) cannot have its old generation torn down before the new
+	// name's replicas are running. Removed-service and removed-function cleanup
+	// still removes every generation.
 	//
 	// They are skipped entirely when the pass was superseded or a desired service
-	// did not converge. Under SourceRef grouping a changed source is a removal
-	// plus an addition, so a removed identity's running containers can be the
-	// ONLY usable generation for the service the new identity replaces; stopping
+	// did not converge. A removed name's running containers can be the ONLY
+	// usable generation for the service the new name replaces (a rename), or, for
+	// an ordinary removal, a failed desired service may be transient; stopping
 	// them then would destroy the last usable generation. A subsequent reconcile
 	// (the coalesced newer desired state, or the next periodic pass) retries the
 	// removal once the desired set converges.
@@ -815,7 +823,7 @@ func reconcileWithObserver(
 func cleanupProvisional(
 	bounded func() (context.Context, context.CancelFunc),
 	docker Docker,
-	fnName, identity string,
+	fnName, name string,
 	provisional []runtime.ServiceContainer,
 	log *slog.Logger,
 ) {
@@ -826,7 +834,7 @@ func cleanupProvisional(
 	defer stopCancel()
 	if err := docker.StopServiceContainers(stopCtx, provisional); err != nil {
 		log.Warn("Service: remove provisional replacement failed",
-			"function", fnName, "service", identity, "count", len(provisional), "error", err)
+			"function", fnName, "service", name, "count", len(provisional), "error", err)
 	}
 }
 

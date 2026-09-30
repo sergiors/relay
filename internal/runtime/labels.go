@@ -8,18 +8,19 @@ package runtime
 //	schedule — a one-shot invocation container for a schedule occurrence
 //	          (runner.InvokeHandler). relay.handler is the schedule handler.
 //	service  — a persistent, long-lived service container (Manager.StartService).
-//	          relay.identity is the service identity: the configured source
-//	          descriptor (entrypoint file or external image
-//	          reference). Service containers carry relay.identity and NO
-//	          relay.handler and NO relay.service label: the source IS the
-//	          service.
+//	          relay.service is the service identity: the template's stable
+//	          service name. relay.identity additionally records the configured
+//	          source descriptor (entrypoint file or external image reference),
+//	          used only for source resolution and implementation comparison.
+//	          Service containers carry relay.service and relay.identity and NO
+//	          relay.handler.
 //
 // relay.handler identifies the handler for event/schedule containers only
 // (the one-shot invocation form); service containers instead carry
-// relay.identity (the configured source descriptor). There is no
-// relay.service label. The sweep and reconciliation predicates rely on
-// relay.type being strict: an unknown or missing type is treated as NOT
-// Relay-owned, so the strict label set is the single mechanism that keeps
+// relay.service (their stable name) and relay.identity (their source
+// descriptor). The sweep and reconciliation predicates rely on relay.type
+// being strict: an unknown or missing type is treated as NOT Relay-owned, so
+// the strict label set is the single mechanism that keeps
 // event/schedule/service populations distinguishable and non-Relay containers
 // untouchable. (Backward compatibility with labels from Relay processes older
 // than this model is deliberately NOT required: a restart simply treats such
@@ -45,12 +46,16 @@ const (
 	labelHostname  = "relay.hostname"
 	labelImage     = "relay.image"
 
-	// labelIdentity is the persistent service's identity: the configured source
-	// descriptor (entrypoint file or external image reference). It replaces the
-	// former relay.entrypoint label so every source kind has an honest identity.
-	// labelImageID records the local content ID a
-	// service container was started from (empty for content-addressed Relay
-	// tags), so a moved external tag is detected.
+	// labelService is the persistent service's stable identity: the template's
+	// service name. It is the grouping key for containers and the logical
+	// replica identity; a source change under the same name replaces the same
+	// replicas.
+	labelService = "relay.service"
+
+	// labelIdentity records the persistent service's configured source
+	// descriptor (entrypoint file or external image reference). It is used only
+	// for image/entry resolution and desired-implementation comparison, never to
+	// identify a service (that is relay.service).
 	labelIdentity = "relay.identity"
 	labelImageID  = "relay.image_id"
 	labelPort     = "relay.port"

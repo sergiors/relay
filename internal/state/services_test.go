@@ -11,10 +11,12 @@ events:
     pattern:
       event_name: [INSERT]
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: /v2
-  - entrypoint: api.js
+  - name: api
+    entrypoint: api.js
     port: 3000
     replicas: 3
 `
@@ -35,14 +37,14 @@ func TestServiceRoundTrip(t *testing.T) {
 	if len(detail.Services) != 2 {
 		t.Fatalf("services = %d, want 2", len(detail.Services))
 	}
-	// Rows are ordered by entrypoint, so api.js sorts before service.js.
+	// Rows are ordered by NAME: api sorts before service.
 	s0 := detail.Services[0]
-	if s0.Entrypoint != "api.js" || s0.Port != 3000 || s0.Replicas != 3 || s0.Path != "" {
-		t.Fatalf("service 0 = %+v, want api.js port=3000 replicas=3 path=\"\"", s0)
+	if s0.Name != "api" || s0.Entrypoint != "api.js" || s0.Port != 3000 || s0.Replicas != 3 || s0.Path != "" {
+		t.Fatalf("service 0 = %+v, want api: api.js port=3000 replicas=3 path=\"\"", s0)
 	}
 	s1 := detail.Services[1]
-	if s1.Entrypoint != "service.js" || s1.Port != 80 || s1.Replicas != 1 || s1.Path != "/v2" {
-		t.Fatalf("service 1 = %+v, want path=/v2 defaults port=80 replicas=1", s1)
+	if s1.Name != "service" || s1.Entrypoint != "service.js" || s1.Port != 80 || s1.Replicas != 1 || s1.Path != "/v2" {
+		t.Fatalf("service 1 = %+v, want service: path=/v2 defaults port=80 replicas=1", s1)
 	}
 }
 
@@ -59,7 +61,8 @@ events:
     pattern:
       event_name: [INSERT]
 services:
-  - entrypoint: api.js
+  - name: api
+    entrypoint: api.js
     host: api.example.com
     path: /v3
     port: 8080
@@ -109,24 +112,20 @@ func TestServiceEmptyStored(t *testing.T) {
 
 const sourceServicesTmpl = `runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     port: 3000
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 9090
 `
 
-// stateServiceIdentity derives a persisted service's identity from its source
-// fields — whichever of entrypoint/image is set — mirroring
-// function.Service.SourceRef.
-func stateServiceIdentity(s Service) string {
-	if s.Image != "" {
-		return s.Image
-	}
-	return s.Entrypoint
-}
+// stateServiceName returns a persisted service's name (its stable identity).
+// The persisted row stores it directly now.
+func stateServiceName(s Service) string { return s.Name }
 
 // TestServiceSourceKindsRoundTrip seeds a template whose services use both
-// source kinds and asserts each row round-trips its source and keyed identity.
+// source kinds and asserts each row round-trips its name, source, and key.
 func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, sourceServicesTmpl)
@@ -139,16 +138,16 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	if len(detail.Services) != 2 {
 		t.Fatalf("services = %d, want 2", len(detail.Services))
 	}
-	// Rows are ordered by source.
-	byIdentity := map[string]Service{}
+	// Rows are ordered by name: api sorts before service.
+	byName := map[string]Service{}
 	for _, s := range detail.Services {
-		byIdentity[stateServiceIdentity(s)] = s
+		byName[stateServiceName(s)] = s
 	}
-	ep, ok := byIdentity["service.js"]
+	ep, ok := byName["service"]
 	if !ok || ep.Entrypoint != "service.js" || ep.Image != "" || ep.Port != 3000 {
 		t.Fatalf("entrypoint service = %+v", ep)
 	}
-	im, ok := byIdentity["ghcr.io/acme/api:1.2"]
+	im, ok := byName["api"]
 	if !ok || im.Image != "ghcr.io/acme/api:1.2" || im.Entrypoint != "" || im.Port != 9090 {
 		t.Fatalf("image service = %+v", im)
 	}

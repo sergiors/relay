@@ -137,11 +137,12 @@ type Handler struct {
 	Retries int           `json:"retries"`
 }
 
-// Schedule is one cron schedule's handler, its verbatim cron expression, the
-// effective timezone name (e.g. "UTC", "Europe/Rome"), its resolved
-// per-invocation timeout, and its retry count (the same retry budget as event
-// rules).
+// Schedule is one cron schedule's stable name, the handler it invokes, its
+// verbatim cron expression, the effective timezone name (e.g. "UTC",
+// "Europe/Rome"), its resolved per-invocation timeout, and its retry count (the
+// same retry budget as event rules). Name is the schedule's identity.
 type Schedule struct {
+	Name     string        `json:"name"`
 	Handler  string        `json:"handler"`
 	Cron     string        `json:"cron"`
 	Timezone string        `json:"timezone"`
@@ -149,13 +150,13 @@ type Schedule struct {
 	Retries  int           `json:"retries"`
 }
 
-// Service is one persistent service's effective configuration as persisted
-// from the template: its source (exactly one of the entrypoint file or the
-// external image reference), the optional routing host and path prefix, its
-// internal TCP port, and the desired replica count. Its identity is the
-// configured source descriptor (SourceRef), i.e. whichever of
-// Entrypoint/Image is set; it is derived, never stored as a separate field.
+// Service is one persistent service's stable name plus its effective
+// configuration as persisted from the template: its source (exactly one of the
+// entrypoint file or the external image reference), the optional routing host
+// and path prefix, its internal TCP port, and the desired replica count. Name is
+// the service's identity; the source is its implementation, not its identity.
 type Service struct {
+	Name       string `json:"name"`
 	Entrypoint string `json:"entrypoint,omitempty"`
 	Image      string `json:"image,omitempty"`
 	Host       string `json:"host,omitempty"`
@@ -1210,9 +1211,10 @@ func snapshotHandlers(tmpl *function.Template) []Handler {
 	return out
 }
 
-// snapshotSchedules renders the template's cron schedules with their verbatim
-// expression, effective location name, resolved timeout, and retry count. It
-// mirrors the former schedules table ordering (ORDER BY handler, cron).
+// snapshotSchedules renders the template's cron schedules with their stable
+// name, verbatim expression, effective location name, resolved timeout, and
+// retry count. It is ordered by name (the schedule identity), mirroring the
+// identity the cron registration and occurrence dedup use.
 func snapshotSchedules(tmpl *function.Template) []Schedule {
 	if len(tmpl.Schedules) == 0 {
 		return nil
@@ -1222,6 +1224,7 @@ func snapshotSchedules(tmpl *function.Template) []Schedule {
 		// time.Location.String() is nil-safe (a nil location reports "UTC"),
 		// matching the persisted timezone semantics of the former table.
 		out = append(out, Schedule{
+			Name:     s.Name,
 			Handler:  s.Handler,
 			Cron:     s.Cron,
 			Timezone: s.Location.String(),
@@ -1229,19 +1232,13 @@ func snapshotSchedules(tmpl *function.Template) []Schedule {
 			Retries:  s.Retries,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Handler != out[j].Handler {
-			return out[i].Handler < out[j].Handler
-		}
-		return out[i].Cron < out[j].Cron
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// snapshotServices renders the template's persistent services with their source
-// (exactly one of entrypoint/image), routing host/path, effective port, and
-// desired replicas. It mirrors the former services table ordering (ORDER BY
-// entrypoint, image), so a source-kind service keeps a deterministic position.
+// snapshotServices renders the template's persistent services with their stable
+// name, source (exactly one of entrypoint/image), routing host/path, effective
+// port, and desired replicas. It is ordered by name (the service identity).
 func snapshotServices(tmpl *function.Template) []Service {
 	if len(tmpl.Services) == 0 {
 		return nil
@@ -1249,6 +1246,7 @@ func snapshotServices(tmpl *function.Template) []Service {
 	out := make([]Service, 0, len(tmpl.Services))
 	for _, s := range tmpl.Services {
 		out = append(out, Service{
+			Name:       s.Name,
 			Entrypoint: s.Entrypoint,
 			Image:      s.Image,
 			Host:       s.Host,
@@ -1257,12 +1255,7 @@ func snapshotServices(tmpl *function.Template) []Service {
 			Replicas:   s.Replicas,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Entrypoint != out[j].Entrypoint {
-			return out[i].Entrypoint < out[j].Entrypoint
-		}
-		return out[i].Image < out[j].Image
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

@@ -43,18 +43,21 @@ events:
       event_name: [INSERT]
     timeout: 6s
 schedules:
-  - handler: jobs.report.handler
+  - name: jobs.report.handler
+    handler: jobs.report.handler
     cron: "0 8 * * 1-5"
     timezone: Europe/Rome
     timeout: 20s
     retries: 3
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: /v2
     port: 3000
     replicas: 2
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 9090
 `
 
@@ -145,12 +148,12 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("handler[1] = %+v", detail.Handlers[1])
 	}
 
-	// Schedules: timezone, timeout, retries.
+	// Schedules: name, timezone, timeout, retries.
 	if len(detail.Schedules) != 1 {
 		t.Fatalf("schedules = %+v", detail.Schedules)
 	}
 	s := detail.Schedules[0]
-	if s.Handler != "jobs.report.handler" || s.Cron != "0 8 * * 1-5" || s.Timezone != "Europe/Rome" || s.Timeout != 20*time.Second || s.Retries != 3 {
+	if s.Name != "jobs.report.handler" || s.Handler != "jobs.report.handler" || s.Cron != "0 8 * * 1-5" || s.Timezone != "Europe/Rome" || s.Timeout != 20*time.Second || s.Retries != 3 {
 		t.Fatalf("schedule = %+v", s)
 	}
 
@@ -158,15 +161,15 @@ func TestFunctionSnapshotRoundTrip(t *testing.T) {
 	if len(detail.Services) != 2 {
 		t.Fatalf("services = %+v", detail.Services)
 	}
-	byEntry := map[string]Service{}
+	byName := map[string]Service{}
 	for _, svc := range detail.Services {
-		byEntry[svc.Entrypoint+svc.Image] = svc
+		byName[svc.Name] = svc
 	}
-	ep := byEntry["service.js"]
-	if ep.Host != "api.example.com" || ep.Path != "/v2" || ep.Port != 3000 || ep.Replicas != 2 {
+	ep := byName["service"]
+	if ep.Entrypoint != "service.js" || ep.Host != "api.example.com" || ep.Path != "/v2" || ep.Port != 3000 || ep.Replicas != 2 {
 		t.Fatalf("entrypoint service = %+v", ep)
 	}
-	if im := byEntry["ghcr.io/acme/api:1.2"]; im.Image != "ghcr.io/acme/api:1.2" || im.Port != 9090 {
+	if im := byName["api"]; im.Image != "ghcr.io/acme/api:1.2" || im.Port != 9090 {
 		t.Fatalf("image service = %+v", im)
 	}
 
@@ -202,7 +205,8 @@ events:
       status: [COMPLETED]
     timeout: 30s
 services:
-  - entrypoint: api.js
+  - name: api
+    entrypoint: api.js
     port: 7000
     replicas: 4
 `)
@@ -221,7 +225,7 @@ services:
 	if len(detail.Schedules) != 0 {
 		t.Fatalf("stale schedules survived: %+v", detail.Schedules)
 	}
-	if len(detail.Services) != 1 || detail.Services[0].Entrypoint != "api.js" || detail.Services[0].Port != 7000 || detail.Services[0].Replicas != 4 {
+	if len(detail.Services) != 1 || detail.Services[0].Name != "api" || detail.Services[0].Entrypoint != "api.js" || detail.Services[0].Port != 7000 || detail.Services[0].Replicas != 4 {
 		t.Fatalf("services not replaced: %+v", detail.Services)
 	}
 	if detail.Env != nil || detail.Secrets != nil {

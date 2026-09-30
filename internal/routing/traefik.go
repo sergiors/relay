@@ -228,11 +228,11 @@ func MissingNetwork(network string) error {
 //	traefik.http.routers.<id>.middlewares                       = <middleware>
 //	traefik.http.middlewares.<middleware>.stripprefix.prefixes  = <path>
 //
-// <middleware> is PathMiddlewareID(functionName, identity): the deterministic
+// <middleware> is PathMiddlewareID(functionName, serviceName): the deterministic
 // service id plus the "-path" infix and the same collision-resistant hash
 // suffix. It is distinct from <id>, so adding a path can never overwrite the
 // router/service slices, and it is per-service (the id already encodes function
-// + identity), so two services on the same host with different paths get
+// + service name), so two services on the same host with different paths get
 // distinct middleware names. An empty path adds NOTHING — the host-only label
 // set is byte-for-byte the pre-path behavior.
 //
@@ -260,115 +260,125 @@ func MissingNetwork(network string) error {
 // unaffected. host itself is passed by value and never mutated, so the
 // template's original host is preserved for callers. An empty host still
 // yields a NIL map regardless of the override: unrouted means unrouted.
-func TraefikLabels(functionName, identity, host, path string, port int, cfg TraefikConfig) map[string]string {
+func TraefikLabels(
+	functionName, serviceName, host, path string, port int, cfg TraefikConfig,
+) map[string]string {
 	if host == "" {
 		return nil
 	}
-	id := ServiceProviderID(functionName, identity)
+
+	id := ServiceProviderID(functionName, serviceName)
 	rule := fmt.Sprintf("Host(`%s`)", cfg.OverrideHost(host))
 	if path != "" {
 		rule = fmt.Sprintf("%s && PathPrefix(`%s`)", rule, path)
 	}
+
 	labels := map[string]string{
 		"traefik.enable": "true",
 		fmt.Sprintf("traefik.http.routers.%s.rule", id):                      rule,
 		fmt.Sprintf("traefik.http.services.%s.loadbalancer.server.port", id): strconv.Itoa(port),
 	}
+
 	if path != "" {
-		middleware := PathMiddlewareID(functionName, identity)
+		middleware := PathMiddlewareID(functionName, serviceName)
 		labels[fmt.Sprintf("traefik.http.routers.%s.middlewares", id)] = middleware
 		labels[fmt.Sprintf("traefik.http.middlewares.%s.stripprefix.prefixes", middleware)] = path
 	}
+
 	if cfg.Network != "" {
 		labels["traefik.docker.network"] = cfg.Network
 	}
+
 	if cfg.EntryPoints != "" {
 		labels[fmt.Sprintf("traefik.http.routers.%s.entrypoints", id)] = cfg.EntryPoints
 	}
+
 	if cfg.CertResolver != "" {
 		labels[fmt.Sprintf("traefik.http.routers.%s.tls", id)] = "true"
 		labels[fmt.Sprintf("traefik.http.routers.%s.tls.certresolver", id)] = cfg.CertResolver
 	}
+
 	if cfg.Priority != nil {
 		labels[fmt.Sprintf("traefik.http.routers.%s.priority", id)] = strconv.Itoa(*cfg.Priority)
 	}
+
 	return labels
 }
 
 // PathMiddlewareID derives the deterministic, Traefik-safe StripPrefix
-// middleware name for a routed service with a path: the service identity id
-// plus the stable "-path" infix and the same collision-resistant hash suffix as
+// middleware name for a routed service with a path: the service id plus the
+// stable "-path" infix and the same collision-resistant hash suffix as
 // ServiceProviderID. The infix keeps the middleware name in a distinct
 // namespace from the router/service slices on the same service (so adding a
 // path never clobbers them) and makes the name self-describing.
 //
 // The name is capped at 100 characters like ServiceProviderID. The hash suffix
-// is preserved by trimming the readable base first, so a long identity never
+// is preserved by trimming the readable base first, so a long name never
 // absorbs the suffix at the cap and always remains collision-resistant (see
 // ServiceProviderID). Only [a-z0-9-] characters result, so the name is safe in
 // Traefik's label grammar.
-func PathMiddlewareID(functionName, identity string) string {
-	return serviceProviderID(functionName, identity, "path")
+func PathMiddlewareID(functionName, serviceName string) string {
+	return serviceProviderID(functionName, serviceName, "path")
 }
 
 // ServiceProviderID derives the deterministic, Traefik-safe router/service id
-// for one service: `relay-<function>-<identity>-<hash>`.
+// for one service: `relay-<function>-<service>-<hash>`.
 //
 // Traefik router/service names appearing in labels must be identifier-safe, but
-// the service identity parts are NOT: a function name may contain dots, and an
-// identity is a file path ("app/main.py") or image reference
-// ("ghcr.io/acme/api:1.2") containing "/", ".", and ":" characters that would
-// break Traefik's label grammar. So every character outside [a-z0-9-] is
-// sanitized to "-" and consecutive "-" are collapsed, per part. The id must be
-// deterministic so reconciliation produces stable labels across passes
-// (identical labels keep a container a keep candidate instead of stale).
+// the function name and service name are NOT guaranteed to be: a function or
+// service name may contain dots. So every character outside [a-z0-9-] is
+// sanitized to "-" and consecutive "-" are collapsed, per part. The id is keyed
+// on the service's STABLE NAME, never its source: a source change under the same
+// name keeps the same routing id, so a replacement container swaps in place
+// rather than orphaning the old router. The id must be deterministic so
+// reconciliation produces stable labels across passes (identical labels keep a
+// container a keep candidate instead of stale).
 //
-// Sanitizing and capping alone is NOT injective: distinct valid identities can
+// Sanitizing and capping alone is NOT injective: distinct valid names can
 // collapse to the same readable base, either because differing characters
-// sanitize to the same "-" (e.g. "ghcr.io/acme/a/b:1" and "ghcr.io/acme/a-b:1")
-// or because a long identity is truncated at the cap. The id therefore ends
-// with a fixed-length hex suffix derived from the FULL, unmodified function name
-// and identity, which makes distinct identities distinct ids with overwhelming
-// probability while leaving the readable prefix intact. The suffix is always
-// preserved at the cap: the readable base is trimmed to make room.
-func ServiceProviderID(functionName, identity string) string {
-	return serviceProviderID(functionName, identity, "")
+// sanitize to the same "-" or because a long name is truncated at the cap. The
+// id therefore ends with a fixed-length hex suffix derived from the FULL,
+// unmodified function name and service name, which makes distinct names distinct
+// ids with overwhelming probability while leaving the readable prefix intact.
+// The suffix is always preserved at the cap: the readable base is trimmed to
+// make room.
+func ServiceProviderID(functionName, serviceName string) string {
+	return serviceProviderID(functionName, serviceName, "")
 }
 
 // serviceProviderID builds a Traefik-safe identifier from the readable
-// `relay-<function>-<identity>` base plus a collision-resistant hash suffix.
+// `relay-<function>-<service>` base plus a collision-resistant hash suffix.
 // infix, when non-empty (e.g. "path"), is inserted between the base and the
 // hash so the middleware namespace stays distinct from the router/service one
 // while both remain collision-safe. The readable base is trimmed to fit the cap
 // before the suffix is appended, so the suffix (and therefore collision
 // resistance) is never lost to truncation.
-func serviceProviderID(functionName, identity, infix string) string {
-	base := strings.Trim("relay-"+traefikSafePart(functionName)+"-"+traefikSafePart(identity), "-")
+func serviceProviderID(functionName, serviceName, infix string) string {
+	base := strings.Trim("relay-"+traefikSafePart(functionName)+"-"+traefikSafePart(serviceName), "-")
 	if base == "" {
 		base = "relay"
 	}
-	suffix := "-" + identityHash(functionName, identity)
+
+	suffix := "-" + identityHash(functionName, serviceName)
 	if infix != "" {
 		suffix = "-" + infix + suffix
 	}
-	maxBase := serviceProviderIDMaxLen - len(suffix)
-	if maxBase < 0 {
-		maxBase = 0
-	}
+
+	maxBase := max(0, serviceProviderIDMaxLen-len(suffix))
 	if len(base) > maxBase {
 		base = strings.TrimRight(base[:maxBase], "-")
 	}
+
 	return base + suffix
 }
 
 // identityHash returns the fixed-length hex collision-resistant suffix for a
-// service identity. It hashes the FULL function name and the FULL identity
-// (never the sanitized or truncated base) with a NUL separator, so the two
-// inputs cannot run together across the join. The separator and the full inputs
-// are exactly what makes distinct identities hash apart even when their
-// sanitized bases coincide.
-func identityHash(functionName, identity string) string {
-	sum := sha256.Sum256([]byte(functionName + "\x00" + identity))
+// service. It hashes the FULL function name and the FULL service name (never the
+// sanitized or truncated base) with a NUL separator, so the two inputs cannot
+// run together across the join. The separator and the full inputs are exactly
+// what makes distinct names hash apart even when their sanitized bases coincide.
+func identityHash(functionName, serviceName string) string {
+	sum := sha256.Sum256([]byte(functionName + "\x00" + serviceName))
 	return hex.EncodeToString(sum[:])[:identityHashLen]
 }
 

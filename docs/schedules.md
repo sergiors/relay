@@ -15,16 +15,25 @@ is not a valid template (see [functions.md](functions.md)).
 
 ## Cron expressions
 
-Each entry requires `handler` and `cron`:
+Each entry requires a stable `name`, a `handler`, and `cron`:
 
 ```yaml
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: nightly-cleanup # stable identity (mandatory, unique per function)
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *" # minute hour day-of-month month day-of-week
     timezone: Europe/Rome # optional IANA timezone, default UTC
     timeout: 20s # optional, same rules as event rules
     retries: 2 # optional, same rules as event rules
 ```
+
+`name` is the schedule's stable identity: it keys the cron job, the occurrence
+identity, and the runner's configuration resolution. It follows the same
+conservative rule as a function name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no
+trailing `.`) and must be unique among a function's schedules. **Multiple
+schedules may share a handler** (the same job at different times); each name is
+an independently addressable schedule. Editing a schedule's cron, handler,
+timezone, timeout, or retries under the same `name` replaces only that job.
 
 Accepted forms, at **minute granularity**:
 
@@ -56,10 +65,13 @@ UTC and encodes the zone in the expression, so DST and offset changes are
 handled by Go and the cron parser. `Local` is rejected.
 
 An occurrence's identity is deterministic —
-`schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>` — derived from the
-absolute instant normalized to **UTC**, never from a timezone representation.
+`schedule:<function>:<schedule name>:<scheduled_at RFC3339 UTC>` — derived from
+the absolute instant normalized to **UTC**, never from a timezone representation.
 The configured timezone therefore affects **when** a schedule fires, never the
-identity, so DST and offset changes cannot split or merge occurrences.
+identity, so DST and offset changes cannot split or merge occurrences. The
+handler is not part of the identity: a handler change under the same schedule
+name keeps the same occurrence id and the next delivery runs the name's current
+handler (occurrences are at-least-once).
 
 The due instant is derived from the schedule as the latest occurrence at or
 before the callback time (using the same parser semantics used for
@@ -79,8 +91,7 @@ worker's simultaneous evaluation of the same tick is a clean no-op.
 - Dedup keys live under `relay:schedule:<occurrence_id>` with a **7-day TTL**.
   They are history only and are never deleted on completion, so a worker whose
   callback runs later cannot re-publish an occurrence the fleet already
-  completed. Dedup applies to **publication**, not to handler execution.
-- Once the stream entry exists it is an ordinary Relay message: the consumer
+  completed. Dedup applies to **publication**, not to handler execution.- Once the stream entry exists it is an ordinary Relay message: the consumer
   group delivers it to one worker, and PEL / `XAUTOCLAIM` recovery, retries,
   exhaustion, and DLQ apply exactly as for an event.
 - A duplicate publication is a successful no-op.
@@ -111,16 +122,19 @@ A tick is not a single best-effort publish:
 
 ## Live changes
 
-Adding, changing, or removing schedules (or a schedule's handler/cron/timezone/
-timeout) converges live through the reconciler: the worker's cron jobs are
-replaced in place, so **future** occurrences use the current definition. Already
-published occurrences are not purged from Redis; they expire via the dedup TTL
-and stream retention.
+Adding, changing, or removing schedules converges live through the reconciler:
+the worker's cron jobs are replaced in place under their stable names, so
+**future** occurrences use the current definition. Editing one schedule (its
+handler, cron, timezone, timeout, or retries) replaces only that name's job, even
+when another schedule shares its handler; removing one name never obsoletes
+another. Already published occurrences are not purged from Redis; they expire via
+the dedup TTL and stream retention.
 
-An occurrence still pending when its function or schedule handler is removed is
-treated as **obsolete**: it is acknowledged (terminal) rather than retried
+An occurrence still pending when its function or its **schedule name** is removed
+is treated as **obsolete**: it is acknowledged (terminal) rather than retried
 forever or dead-lettered, because its removal was an intentional configuration
-change.
+change. A handler change under the same name is **not** obsolete — the next
+delivery runs the name's current handler.
 
 ## The guarantee
 

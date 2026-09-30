@@ -1907,13 +1907,13 @@ func unavailableMatchError(invocations []string) error {
 }
 
 // obsoleteOccurrence is the terminal error returned when a schedule occurrence
-// names a function or handler that is no longer in the configuration. The stream
-// layer recognizes ErrInvocationObsolete and ACKs the message: an obsolete
-// occurrence is never retried or dead-lettered.
-func obsoleteOccurrence(fnName, handler string) error {
+// names a function or schedule that is no longer in the configuration. The
+// stream layer recognizes ErrInvocationObsolete and ACKs the message: an
+// obsolete occurrence is never retried or dead-lettered.
+func obsoleteOccurrence(fnName, scheduleName string) error {
 	return fmt.Errorf(
-		"%w: schedule function %q handler %q no longer in configuration",
-		stream.ErrInvocationObsolete, fnName, handler,
+		"%w: schedule function %q schedule %q no longer in configuration",
+		stream.ErrInvocationObsolete, fnName, scheduleName,
 	)
 }
 
@@ -1922,11 +1922,22 @@ func obsoleteOccurrence(fnName, handler string) error {
 // template (single source of truth), capped at the configured maximum exactly
 // like Handle caps rule timeouts, and passed BOTH to TryStart and to
 // context.WithTimeout so the persisted running deadline matches the local kill
-// timer. A handler with a schedule entry resolves from it; a state-free caller
-// replaying an event-rule handler (the DLQ replay path) resolves from that exact
-// event rule. It reuses the exact event execution path: registry snapshot lookup,
-// the global + per-function concurrency slots, per-invocation secret
-// resolution, the panic boundary, and the same handler metrics.
+// timer.
+//
+// The schedule is resolved by its STABLE NAME, never by handler: scheduleName is
+// looked up in the function's current template, and the schedule's CURRENT
+// handler, timeout, and retries are used. A handler change under the same name
+// therefore takes effect on the next delivery (the occurrence is at-least-once,
+// so it runs the name's current handler), and a pending occurrence is obsolete
+// only when its SCHEDULE NAME is gone — removing one schedule never obsoletes
+// another that shares its handler. When scheduleName is empty (the state-free
+// DLQ-replay path, which knows only a recorded function/handler), resolution
+// falls back to the first schedule entry matching the handler, then to that
+// exact event rule (never event matching).
+//
+// It reuses the exact event execution path: registry snapshot lookup, the
+// global + per-function concurrency slots, per-invocation secret resolution, the
+// panic boundary, and the same handler metrics.
 //
 // InvokeHandler participates in the SAME per-invocation invocation-state
 // lifecycle as Handle: when the stream injects an InvocationState into ctx
@@ -1939,7 +1950,9 @@ func obsoleteOccurrence(fnName, handler string) error {
 // retry-backoff/exhaustion decision from the template's schedule Retries. The
 // stream layer (via ConsumerConfig.ScheduleRunner) drives retry, backoff,
 // invocation state, and DLQ around this single invocation.
-func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler string, payload []byte) error {
+func (r *Runner) InvokeHandler(
+	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
+) error {
 	// Invocation state (when present) distinguishes the production stream path
 	// from direct callers/tests: obsolete-removal is only treated as terminal
 	// on the production path. See the availability checks below.
@@ -1968,9 +1981,9 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 		if hasState {
 			r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
 				"function", fnName,
-				"handler", handler,
+				"schedule", scheduleName,
 			)
-			return obsoleteOccurrence(fnName, handler)
+			return obsoleteOccurrence(fnName, scheduleName)
 		}
 		r.log.Warn("Schedule: function is not available", "function", fnName)
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
@@ -1983,41 +1996,54 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 
-	// Resolve the handler's timeout AND retry count from the function's CURRENT
-	// template — the single source of truth, so a hot-swapped template's new
-	// values apply to future occurrences automatically. The template's FIRST
-	// matching schedule entry provides both; multiple entries sharing a handler
-	// behave identically (occurrence identity distinguishes them by scheduled_at).
-	// On the production (state-carrying) path, a missing schedule entry means the
-	// handler was removed from the template while the occurrence was pending →
-	// obsolete.
+	// Resolve the schedule's timeout, retry count, and CURRENT handler from the
+	// function's CURRENT template — the single source of truth, so a hot-swapped
+	// template's new values apply to future occurrences automatically. On the
+	// production path the schedule is resolved by its STABLE NAME; a missing name
+	// means the schedule was removed from the template while the occurrence was
+	// pending → obsolete. The name's current handler is authoritative: a handler
+	// change under the same schedule runs the new handler on the next delivery.
 	timeout := function.DefaultTimeout
 	retries := function.DefaultRetries
 	found := false
-	for _, sch := range pf.fn.Template.Schedules {
-		if sch.Handler == handler {
-			timeout = sch.Timeout
-			retries = sch.Retries
-			found = true
-			break
+	if scheduleName != "" {
+		for _, sch := range pf.fn.Template.Schedules {
+			if sch.Name == scheduleName {
+				timeout = sch.Timeout
+				retries = sch.Retries
+				handler = sch.Handler
+				found = true
+				break
+			}
+		}
+		if hasState && !found {
+			r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
+				"function", fnName,
+				"schedule", scheduleName,
+			)
+			return obsoleteOccurrence(fnName, scheduleName)
 		}
 	}
-	if hasState && !found {
-		r.log.Warn("Schedule: occurrence obsolete; schedule handler no longer in template; acknowledging",
-			"function", fnName,
-			"handler", handler,
-		)
-		return obsoleteOccurrence(fnName, handler)
-	}
-	// No schedule entry: on the state-free path — the DLQ replay, or a direct
-	// single-handler caller — the handler may instead be an event-rule handler,
-	// so resolve its CURRENT event rule's timeout/retries by exact handler match.
-	// This is never event matching: it selects by handler string alone, so no
-	// other rule can run. The production schedule path is always state-carrying,
-	// so this fallback can never turn a removed schedule handler into an
+	// The state-free fallback (the DLQ replay, or a direct single-handler caller)
+	// carries no schedule name. Resolve by exact handler: first among the current
+	// schedules (the first matching entry's timeout/retries; multiple entries
+	// sharing a handler behave identically for this purpose), then among event
+	// rules. This is never event matching: it selects by handler string alone, so
+	// no other rule can run. The production schedule path always carries a
+	// schedule name, so this fallback can never turn a removed schedule into an
 	// executable one. A non-positive rule timeout (only reachable from a
 	// hand-built template, since ParseTemplate guarantees a positive value) keeps
 	// the default rather than imposing an immediate deadline.
+	if !found {
+		for _, sch := range pf.fn.Template.Schedules {
+			if sch.Handler == handler {
+				timeout = sch.Timeout
+				retries = sch.Retries
+				found = true
+				break
+			}
+		}
+	}
 	if !found {
 		for _, rule := range pf.fn.Template.Events {
 			if rule.Handler == handler {
@@ -2193,7 +2219,9 @@ func (r *Runner) InvokeHandler(ctx context.Context, msgID, fnName, handler strin
 // match validation, so an invalid function, an unavailable function, or a
 // no-match invocation is still traced (with its error recorded) without changing
 // any return semantics.
-func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[string]any) (count int, err error) {
+func (r *Runner) InvokeFunction(
+	ctx context.Context, name string, event map[string]any,
+) (count int, err error) {
 	// A worker-side root operation span around the whole manual invocation, so
 	// an operator `relay function invoke` is traced on the worker without the
 	// CLI carrying any trace context. It is a NEW root regardless of the
@@ -2290,7 +2318,10 @@ func (r *Runner) InvokeFunction(ctx context.Context, name string, event map[stri
 			})
 
 			start := time.Now()
-			panicked, panicValue, err := r.runInvocation(pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv, pin, invocationTrace{})
+			panicked, panicValue, err := r.runInvocation(
+				pf, invokeCtx, cancel, rule.Handler, eventJSON, extraEnv,
+				pin, invocationTrace{},
+			)
 			elapsed := time.Since(start)
 			if panicked {
 				r.log.Error("Function invoke: handler PANICKED",
@@ -2397,7 +2428,7 @@ func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []
 	// TryStart/complete/retry/exhaustion, and no DLQ accounting. The opt-out
 	// makes the guarantee explicit even when the caller's context came from the
 	// stream delivery path.
-	return r.InvokeHandler(stream.WithoutInvocationState(opCtx), "", fnName, handler, event)
+	return r.InvokeHandler(stream.WithoutInvocationState(opCtx), "", fnName, "", handler, event)
 }
 
 // templateHasHandler reports whether handler is present in the template's

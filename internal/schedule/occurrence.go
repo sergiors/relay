@@ -6,18 +6,28 @@ import (
 	"time"
 )
 
-// Occurrence is one logical firing of a cron schedule: the function and handler
-// it invokes and the scheduled instant it belongs to. Two workers evaluating
-// the same cron tick produce the same Occurrence, so they contend on exactly
-// one publish-if-new.
+// Occurrence is one logical firing of a cron schedule: the function, the
+// schedule's stable name, the handler it invokes, and the scheduled instant it
+// belongs to. Two workers evaluating the same cron tick produce the same
+// Occurrence, so they contend on exactly one publish-if-new.
+//
+// Schedule is the schedule's stable configuration identity (template
+// `schedules[].name`); Handler is the current handler that schedule invokes.
+// Identity is (function, schedule name, scheduled instant): a schedule keeps its
+// identity across a handler change, and two schedules sharing a handler are
+// distinct occurrences. Handler travels in the envelope so the consumer can
+// resolve the schedule by name and invoke its CURRENT handler (a name's handler
+// may have changed since publication, in which case the fresh handler runs —
+// there is no other handler to run for that schedule).
 type Occurrence struct {
 	Function    string
+	Schedule    string
 	Handler     string
 	ScheduledAt time.Time // the scheduled instant, UTC
 }
 
 // ID returns the deterministic occurrence identity:
-// "schedule:<function>:<handler>:<scheduled_at RFC3339 UTC>".
+// "schedule:<function>:<schedule name>:<scheduled_at RFC3339 UTC>".
 // ScheduledAt is normalized to UTC and truncated to the second so DST offsets
 // and timezone representation never change the ID: the configured timezone
 // affects when the schedule fires, never the identity.
@@ -32,13 +42,13 @@ func (o Occurrence) ID() string {
 	// minute-truncated due instant — seconds schedules are rejected at template
 	// validation), so two distinct whole seconds would still be distinct.
 	t := o.ScheduledAt.UTC().Truncate(time.Second)
-	return "schedule:" + o.Function + ":" + o.Handler + ":" + t.Format(time.RFC3339)
+	return "schedule:" + o.Function + ":" + o.Schedule + ":" + t.Format(time.RFC3339)
 }
 
 // Payload returns the handler payload exactly as before the stream change:
 // {"source":"relay.schedule","scheduled_at":"<RFC3339 UTC>"}. Only these two
 // fields are exposed to the function; internal coordination fields (function,
-// handler, occurrence_id) are never part of the handler payload.
+// schedule, handler, occurrence_id) are never part of the handler payload.
 func (o Occurrence) Payload() []byte {
 	t := o.ScheduledAt.UTC().Truncate(time.Second)
 	b, _ := json.Marshal(map[string]string{
@@ -58,6 +68,7 @@ func (o Occurrence) Envelope() ([]byte, error) {
 	return json.Marshal(map[string]string{
 		"source":        "relay.schedule",
 		"function":      o.Function,
+		"schedule":      o.Schedule,
 		"handler":       o.Handler,
 		"scheduled_at":  t.Format(time.RFC3339),
 		"occurrence_id": o.ID(),
@@ -65,14 +76,15 @@ func (o Occurrence) Envelope() ([]byte, error) {
 }
 
 // ParseEnvelope decodes a stream envelope into its Occurrence. It validates
-// non-empty function/handler and a parseable scheduled_at (normalized to UTC),
-// and RECOMPUTES the ID from those fields rather than trusting the stored
-// occurrence_id. Identity is derived, never trusted from the wire: a malformed
-// or forged occurrence_id cannot redirect an invocation — the recomputed ID is
-// what the consumer and the invocation-state keying use.
+// non-empty function/schedule/handler and a parseable scheduled_at (normalized
+// to UTC), and RECOMPUTES the ID from those fields rather than trusting the
+// stored occurrence_id. Identity is derived, never trusted from the wire: a
+// malformed or forged occurrence_id cannot redirect an invocation — the
+// recomputed ID is what the consumer and the invocation-state keying use.
 func ParseEnvelope(raw string) (Occurrence, error) {
 	var e struct {
 		Function     string `json:"function"`
+		Schedule     string `json:"schedule"`
 		Handler      string `json:"handler"`
 		ScheduledAt  string `json:"scheduled_at"`
 		OccurrenceID string `json:"occurrence_id"`
@@ -83,6 +95,9 @@ func ParseEnvelope(raw string) (Occurrence, error) {
 	if e.Function == "" {
 		return Occurrence{}, fmt.Errorf("parse schedule envelope: function is empty")
 	}
+	if e.Schedule == "" {
+		return Occurrence{}, fmt.Errorf("parse schedule envelope: schedule is empty")
+	}
 	if e.Handler == "" {
 		return Occurrence{}, fmt.Errorf("parse schedule envelope: handler is empty")
 	}
@@ -90,18 +105,19 @@ func ParseEnvelope(raw string) (Occurrence, error) {
 	if err != nil {
 		return Occurrence{}, fmt.Errorf("parse schedule envelope: scheduled_at: %w", err)
 	}
-	return Occurrence{Function: e.Function, Handler: e.Handler, ScheduledAt: t.UTC()}, nil
+	return Occurrence{Function: e.Function, Schedule: e.Schedule, Handler: e.Handler, ScheduledAt: t.UTC()}, nil
 }
 
 // IsScheduleEvent reports whether a decoded event map is a schedule message and,
 // when it is, returns the parsed Occurrence. Schedule messages are recognized by
-// the envelope's "source" == "relay.schedule" plus string function/handler/
-// occurrence_id fields present in the DECODED event map. Absence of the source
-// marker (or any missing field) returns (zero, false), so normal events are
-// untouched. An ordinary user event carrying source==relay.schedule AND a valid
-// occurrence_id is a deliberate claim of schedule identity, which is acceptable
-// and documented: the occurrence_id is re-derived from the fields, so a forged
-// value cannot redirect the invocation (identity is derived, never trusted).
+// the envelope's "source" == "relay.schedule" plus string function/schedule/
+// handler/scheduled_at fields present in the DECODED event map. Absence of the
+// source marker (or any missing field) returns (zero, false), so normal events
+// are untouched. An ordinary user event carrying source==relay.schedule AND the
+// schedule fields is a deliberate claim of schedule identity, which is
+// acceptable and documented: the occurrence id is re-derived from the fields, so
+// a forged value cannot redirect the invocation (identity is derived, never
+// trusted).
 func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
 	src, ok := event["source"].(string)
 	if !ok || src != "relay.schedule" {
@@ -109,6 +125,10 @@ func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
 	}
 	fn, ok := event["function"].(string)
 	if !ok || fn == "" {
+		return Occurrence{}, false
+	}
+	scheduleName, ok := event["schedule"].(string)
+	if !ok || scheduleName == "" {
 		return Occurrence{}, false
 	}
 	handler, ok := event["handler"].(string)
@@ -123,5 +143,5 @@ func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
 	if err != nil {
 		return Occurrence{}, false
 	}
-	return Occurrence{Function: fn, Handler: handler, ScheduledAt: t.UTC()}, true
+	return Occurrence{Function: fn, Schedule: scheduleName, Handler: handler, ScheduledAt: t.UTC()}, true
 }

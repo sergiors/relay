@@ -152,11 +152,11 @@ keep_alive()
 
 	id, err := m.StartService(ctx, ServiceSpec{
 		Function: "svc-py-svc",
-		Identity: "app/main.py",
-		Port:     8000,
-		Image:    prepared.Image,
-		Entry:    entry,
-		Env:      []string{"PORT=8000"},
+		Name:     "svc", SourceRef: "app/main.py",
+		Port:  8000,
+		Image: prepared.Image,
+		Entry: entry,
+		Env:   []string{"PORT=8000"},
 	}, 0)
 	if err != nil {
 		t.Fatalf("start service: %v", err)
@@ -229,11 +229,11 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	for i := 0; i < replicas; i++ {
 		if _, err := m.StartService(ctx, ServiceSpec{
 			Function: "svc-lifecycle",
-			Identity: "app/service.js",
-			Port:     3000,
-			Image:    image,
-			Entry:    []string{"node", "/app/app/service.js"},
-			Env:      []string{"PORT=3000"},
+			Name:     "svc", SourceRef: "app/service.js",
+			Port:  3000,
+			Image: image,
+			Entry: []string{"node", "/app/app/service.js"},
+			Env:   []string{"PORT=3000"},
 		}, i); err != nil {
 			t.Fatalf("start replica %d: %v", i, err)
 		}
@@ -274,6 +274,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 		want := map[string]string{
 			labelType:     ContainerTypeService,
 			labelFunction: "svc-lifecycle",
+			labelService:  "svc",
 			labelIdentity: "app/service.js",
 			labelImage:    image,
 			labelHostname: "test-host",
@@ -285,12 +286,13 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 				t.Errorf("container %s label %q = %q, want %q", id, k, got, v)
 			}
 		}
-		// Service containers must carry NO relay.handler and NO relay.service.
+		// Service containers carry relay.service (their name) and relay.identity
+		// (their source descriptor) and NO relay.handler.
 		if _, ok := insp.Container.Config.Labels[labelHandler]; ok {
 			t.Errorf("container %s must NOT carry relay.handler, got %v", id, insp.Container.Config.Labels)
 		}
-		if _, ok := insp.Container.Config.Labels["relay.service"]; ok {
-			t.Errorf("container %s must NOT carry relay.service, got %v", id, insp.Container.Config.Labels)
+		if insp.Container.Config.Labels[labelService] != "svc" {
+			t.Errorf("container %s must carry relay.service=svc, got %v", id, insp.Container.Config.Labels)
 		}
 		// Hardening assertions.
 		assertHardenedHostConfig(t, insp.Container.HostConfig)
@@ -383,7 +385,9 @@ events:
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	svc1, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Identity: "service.js", Port: 3000,
+		Function:  "svc-retire",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
@@ -420,7 +424,9 @@ events:
 	// depends on", start a NEW replica of v2 and retire -> v2 kept, v1 removed.
 	// Re-start v2 replica so it references v2Ref.
 	svc2, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-retire", Identity: "service.js", Port: 3000,
+		Function:  "svc-retire",
+		Name:      "svc",
+		SourceRef: "service.js", Port: 3000,
 		Image: v2Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
@@ -494,7 +500,9 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	if _, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-wait", Identity: "app/service.js", Port: 3000,
+		Function:  "svc-wait",
+		Name:      "svc",
+		SourceRef: "app/service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0); err != nil {
 		t.Fatalf("start v1 replica: %v", err)
@@ -635,7 +643,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	// Traefik label; assert both reach the container.
 	id, err := m.StartService(ctx, ServiceSpec{
 		Function: "svc-network",
-		Identity: "app/service.js",
+		Name:     "svc", SourceRef: "app/service.js",
 		Port:     3000,
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
@@ -677,7 +685,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	// Negative: a nonexistent network fails and leaves NO container behind.
 	_, err = m.StartService(ctx, ServiceSpec{
 		Function: "svc-network",
-		Identity: "app/service.js",
+		Name:     "svc", SourceRef: "app/service.js",
 		Port:     3000,
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
@@ -753,7 +761,7 @@ func TestIntegrationExternalImageService(t *testing.T) {
 	}
 
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-external", Identity: ref, Port: 80,
+		Function: "svc-external", Name: "svc", SourceRef: ref, Port: 80,
 		Image: got.Ref, ImageID: got.ID, Env: []string{"PORT=80"},
 	}, 0)
 	if err != nil {
@@ -791,14 +799,18 @@ func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
 	// Start two replicas of the SAME logical slot: both must succeed (unique
 	// physical names) and both must be running the instant StartService returns.
 	first, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-overlap", Identity: "app/service.js", Port: 3000,
+		Function:  "svc-overlap",
+		Name:      "svc",
+		SourceRef: "app/service.js", Port: 3000,
 		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {
 		t.Fatalf("first StartService: %v", err)
 	}
 	second, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-overlap", Identity: "app/service.js", Port: 3000,
+		Function:  "svc-overlap",
+		Name:      "svc",
+		SourceRef: "app/service.js", Port: 3000,
 		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
 	}, 0)
 	if err != nil {

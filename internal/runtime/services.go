@@ -25,19 +25,25 @@ import (
 // never confuse the two populations.
 
 // ServiceSpec describes one desired service replica's container. The service
-// identity is its configured source descriptor (function.Service.SourceRef):
-// relay.identity is stamped with it (there is no separate relay.service label,
-// and services carry no relay.handler), and it is what Reconcile uses to group a
-// function's containers by service. The identity is honest for every source —
-// an entrypoint file or an external image reference — never a synthetic
-// entrypoint.
+// IDENTITY is its stable template name (function.Service.Name): relay.service is
+// stamped with it and it is what Reconcile uses to group a function's containers
+// by service, so a source change under the same name replaces the same replicas.
+// relay.identity additionally records the configured source descriptor
+// (function.Service.SourceRef) — the entrypoint file or image reference — which
+// is used only to resolve the container image/entry and to compare the desired
+// IMPLEMENTATION; it never identifies a service.
 type ServiceSpec struct {
 	Function string
-	// Identity is the service's stable identity: the configured source
-	// descriptor (entrypoint file or image reference).
-	Identity string
-	Port     int
-	Image    string
+	// Name is the service's stable identity (relay.service): the template's
+	// service name. It is the container grouping key and the logical replica
+	// identity.
+	Name string
+	// SourceRef is the configured source descriptor (relay.identity): the
+	// entrypoint file or image reference. It is honest for every source kind and
+	// is used only for source resolution and implementation comparison.
+	SourceRef string
+	Port      int
+	Image     string
 	// ImageID is the local content ID of Image (relay.image_id), or "" when the
 	// reference itself encodes the content (a Relay-built image tag). It lets
 	// Reconcile detect a moved external tag pointing at different bytes and
@@ -83,10 +89,15 @@ type ServiceSpec struct {
 type ServiceContainer struct {
 	ID       string
 	Function string
-	// Identity is the service's identity, parsed from its relay.identity label:
-	// the configured source descriptor. It is the grouping key Reconcile uses.
-	Identity string
-	Image    string
+	// Name is the service's stable identity, parsed from its relay.service
+	// label: the template's service name. It is the grouping key Reconcile uses
+	// and the logical replica identity.
+	Name string
+	// SourceRef is the container's configured source descriptor, parsed from its
+	// relay.identity label (the entrypoint file or image reference). It is used
+	// only to compare the desired implementation; it never identifies a service.
+	SourceRef string
+	Image     string
 	// ImageID is the local content ID of Image, parsed from relay.image_id ("").
 	ImageID  string
 	Hostname string
@@ -164,14 +175,13 @@ func sanitizeContainerNamePart(s string) string {
 }
 
 // serviceContainerName derives the deterministic LOGICAL container name for a
-// replica: relay-svc-<function>-<identity>-<hash>-<replica>. Function names are
-// already validated; the identity part (an entrypoint file or image reference)
-// is sanitized. The name ends with a collision-resistant hash suffix
-// derived from the FULL function name and identity, so distinct identities that
-// sanitize to the same readable base (e.g. "ghcr.io/acme/a/b:1" and
-// "ghcr.io/acme/a-b:1") or that would truncate to the same prefix still get
-// distinct names. The readable base is trimmed to make room for the suffix, so
-// the suffix and the replica index are never lost to the cap.
+// replica: relay-svc-<function>-<name>-<hash>-<replica>. Function and service
+// names are both validated to a legal docker repo charset, so the name part is
+// sanitized only defensively. The name ends with a collision-resistant hash
+// suffix derived from the FULL function name and service name, so distinct names
+// that sanitize to the same readable base still get distinct names. The readable
+// base is trimmed to make room for the suffix, so the suffix and the replica
+// index are never lost to the cap.
 //
 // This is the stable, human-greppable logical name of a replica slot. It is NOT
 // the physical name a container is created with: a replacement generation must
@@ -179,9 +189,9 @@ func sanitizeContainerNamePart(s string) string {
 // new container before the old one is stopped), and Docker rejects duplicate
 // container names. StartService therefore creates the container under
 // serviceContainerNameForStart, which appends a per-start uniqueness token.
-func serviceContainerName(functionName, identity string, replica int) string {
-	suffix := "-" + serviceIdentityHash(functionName, identity) + "-" + strconv.Itoa(replica)
-	base := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(identity)
+func serviceContainerName(functionName, serviceName string, replica int) string {
+	suffix := "-" + serviceNameHash(functionName, serviceName) + "-" + strconv.Itoa(replica)
+	base := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(serviceName)
 	maxBase := serviceContainerNameLenCap - len(suffix)
 	if maxBase < 0 {
 		maxBase = 0
@@ -202,13 +212,13 @@ func serviceContainerName(functionName, identity string, replica int) string {
 // the resulting name is deliberately NOT stable across starts. That is safe
 // because Relay never derives ownership, grouping, or a replica slot from a
 // container name: every predicate is label-derived (relay.type, relay.function,
-// relay.identity, relay.replica). The physical name remains greppable (it keeps
+// relay.service, relay.replica). The physical name remains greppable (it keeps
 // the logical prefix and replica suffix) and is bounded Docker-safe: the
 // logical name is capped at serviceContainerNameLenCap and the token at
 // serviceContainerNameTokenCap, so the physical name is always shorter than
 // Docker's name limit.
-func serviceContainerNameForStart(functionName, identity string, replica int) string {
-	return serviceContainerName(functionName, identity, replica) + "-" + newRequestID()
+func serviceContainerNameForStart(functionName, serviceName string, replica int) string {
+	return serviceContainerName(functionName, serviceName, replica) + "-" + newRequestID()
 }
 
 // serviceContainerNamePhysicalLenCap is the upper bound on a physical service
@@ -217,13 +227,13 @@ func serviceContainerNameForStart(functionName, identity string, replica int) st
 // Docker's 255-byte name limit.
 const serviceContainerNamePhysicalLenCap = serviceContainerNameLenCap + 1 + serviceContainerNameTokenCap
 
-// serviceIdentityHash returns the fixed-length hex collision-resistant suffix
-// for a service identity. It hashes the FULL function name and the FULL identity
+// serviceNameHash returns the fixed-length hex collision-resistant suffix for a
+// service name. It hashes the FULL function name and the FULL service name
 // (never the sanitized or truncated base) with a NUL separator, so the two
-// inputs cannot run together across the join and distinct identities hash apart
-// even when their sanitized bases coincide.
-func serviceIdentityHash(functionName, identity string) string {
-	sum := sha256.Sum256([]byte(functionName + "\x00" + identity))
+// inputs cannot run together across the join and distinct names hash apart even
+// when their sanitized bases coincide.
+func serviceNameHash(functionName, serviceName string) string {
+	sum := sha256.Sum256([]byte(functionName + "\x00" + serviceName))
 	return hex.EncodeToString(sum[:])[:serviceIdentityHashLen]
 }
 
@@ -321,8 +331,10 @@ func EnvHash(env []string) string {
 // container: relay.type=service plus relay.function + relay.hostname make a
 // service container recognizable to Relay while the strict relay.type guard
 // lets sweeps/reconcilers distinguish the service population from one-shot
-// invocation containers. relay.identity is the service identity (the configured
-// source descriptor) — there is no relay.service label there, and service
+// invocation containers. relay.service is the service IDENTITY (the template's
+// stable service name) and is the grouping key Reconcile uses; relay.identity
+// additionally records the configured source descriptor (entrypoint file or
+// image reference) for implementation comparison and image resolution. Service
 // containers carry no relay.handler. relay.image_id records the local content ID
 // the container was started from (empty when the reference itself is
 // content-addressed), so a moved external tag is detected. relay.env_hash pins
@@ -339,7 +351,8 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	labels := map[string]string{
 		labelType:      ContainerTypeService,
 		labelFunction:  spec.Function,
-		labelIdentity:  spec.Identity,
+		labelService:   spec.Name,
+		labelIdentity:  spec.SourceRef,
 		labelImage:     spec.Image,
 		labelHostname:  hostname,
 		labelPort:      strconv.Itoa(spec.Port),
@@ -358,7 +371,8 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	}
 	labels[labelType] = ContainerTypeService
 	labels[labelFunction] = spec.Function
-	labels[labelIdentity] = spec.Identity
+	labels[labelService] = spec.Name
+	labels[labelIdentity] = spec.SourceRef
 	labels[labelImage] = spec.Image
 	labels[labelHostname] = hostname
 	labels[labelPort] = strconv.Itoa(spec.Port)
@@ -477,7 +491,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		HostConfig: hardenedHostConfig(false, spec.Resources),
 		// A unique physical name per start, so the replacement generation can
 		// be created while the generation it replaces is still running.
-		Name: serviceContainerNameForStart(spec.Function, spec.Identity, replica),
+		Name: serviceContainerNameForStart(spec.Function, spec.Name, replica),
 	}
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
@@ -507,7 +521,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		if rmErr := removeContainerContext(ctx, m.cli, id); rmErr != nil {
 			m.log.Warn("Service: discard failed container",
 				"function", spec.Function,
-				"service", spec.Identity,
+				"service", spec.Name,
 				"replica", replica,
 				"container", id,
 				"reason", reason,
@@ -536,7 +550,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 	m.log.Info("Service: started",
 		"function", spec.Function,
-		"service", spec.Identity,
+		"service", spec.Name,
 		"replica", replica,
 		"container", id,
 	)
@@ -585,7 +599,8 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 		out = append(out, ServiceContainer{
 			ID:        c.ID,
 			Function:  c.Labels[labelFunction],
-			Identity:  c.Labels[labelIdentity],
+			Name:      c.Labels[labelService],
+			SourceRef: c.Labels[labelIdentity],
 			Image:     c.Labels[labelImage],
 			ImageID:   c.Labels[labelImageID],
 			Hostname:  c.Labels[labelHostname],
@@ -680,7 +695,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				m.log.Warn("Service: stop container failed",
 					"container", c.ID,
 					"function", c.Function,
-					"service", c.Identity,
+					"service", c.Name,
 					"error", err,
 				)
 				continue
@@ -693,7 +708,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 			m.log.Warn("Service: remove container failed",
 				"container", c.ID,
 				"function", c.Function,
-				"service", c.Identity,
+				"service", c.Name,
 				"error", err,
 			)
 		}

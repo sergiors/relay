@@ -34,7 +34,7 @@ func TestServiceCoordinatorSupersededPassPreservesOldGeneration(t *testing.T) {
 	// are the SAME SourceRef identity and therefore the SAME replica slot: B and C
 	// both replace A in place.
 	base := func(env string) *function.Template {
-		tmpl := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+		tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 		tmpl.Env = map[string]string{"MODE": env}
 		return tmpl
 	}
@@ -152,11 +152,11 @@ func TestServiceCoordinatorSupersededPassPreservesRemovedSourceRef(t *testing.T)
 	defer cancel()
 	coordinator.Start(lifecycle)
 
-	tmplA := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 1})
-	tmplB := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
+	tmplA := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1", Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 1})
+	tmplB := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:2", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
 	// C returns to A's SourceRef but with a changed env, so C has corrective work
 	// (a replacement for the same slot) and can be parked before its commit.
-	tmplC := serviceTemplate("", function.Service{Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 1})
+	tmplC := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1", Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 1})
 	tmplC.Env = map[string]string{"MODE": "c"}
 
 	// Phase 1: converge generation A.

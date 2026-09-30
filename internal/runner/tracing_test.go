@@ -592,7 +592,7 @@ func TestInvokeHandlerScheduleRetryLinksItsOwnLineage(t *testing.T) {
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Delivery 1 fails (retryable), leaving the schedule message pending.
-	if err := r.InvokeHandler(ctx, "m-1", "fn", "index.run", []byte(`{}`)); err == nil {
+	if err := r.InvokeHandler(ctx, "m-1", "fn", "sched", "index.run", []byte(`{}`)); err == nil {
 		t.Fatal("schedule delivery 1 unexpectedly succeeded")
 	}
 	if prog.TraceReference("fn/index.run") == "" {
@@ -601,7 +601,7 @@ func TestInvokeHandlerScheduleRetryLinksItsOwnLineage(t *testing.T) {
 
 	// Delivery 2 (after the backoff): the retry succeeds and links to attempt 1.
 	prog.advance(2 * time.Minute)
-	if err := r.InvokeHandler(ctx, "m-1", "fn", "index.run", []byte(`{}`)); err != nil {
+	if err := r.InvokeHandler(ctx, "m-1", "fn", "sched", "index.run", []byte(`{}`)); err != nil {
 		t.Fatalf("schedule delivery 2: %v", err)
 	}
 

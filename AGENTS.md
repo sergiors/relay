@@ -58,9 +58,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - `runtime` is `python3.14` or `node24`; required for events/schedules and
   `entrypoint` services, optional for image-only service templates.
 - `events[]` `handler`/`pattern`/optional `timeout`/`retries`; `schedules[]`
-  `handler` + minute-granularity `cron` + optional `timezone`/`timeout`;
-  `services[]` exactly one of `entrypoint` or `image`, optional `port`/`replicas`
-  /`host`/`path` (path requires host).
+  mandatory unique `name` + `handler` + minute-granularity `cron` + optional
+  `timezone`/`timeout`; `services[]` mandatory unique `name` + exactly one of
+  `entrypoint` or `image`, optional `port`/`replicas`/`host`/`path` (path
+  requires host). Event identity is the handler; service/schedule identity is the
+  name.
 - `concurrency`, `resources` (memory/CPU/PIDs), `env`, `secrets` (references
   only; a name may not be in both; `RELAY_HANDLER` reserved); operators
   `equals`, `prefix`, `suffix`, `exists`, `gt`/`gte`/`lt`/`lte`. Names
@@ -114,33 +116,47 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 - Every worker evaluates schedules locally, but publication is deduplicated
   atomically, so exactly one stream entry exists per logical occurrence.
-- Occurrence identity derives from function, handler, and the absolute scheduled
-  instant normalized to UTC; timezone affects when a schedule fires, never the
-  identity, so DST cannot split or merge occurrences. Dedup keys expire by TTL.
+- Occurrence identity derives from function, schedule NAME, and the absolute
+  scheduled instant normalized to UTC; timezone affects when a schedule fires,
+  never the identity, so DST cannot split or merge occurrences. The handler is not
+  part of the identity. Dedup keys expire by TTL.
+- Schedule names are mandatory and unique per function; multiple schedules may
+  share a handler. Cron jobs, occurrence identity, and runner config resolution
+  are all keyed by the stable name, so editing a schedule under the same name
+  replaces only that job and removing one name never obsoletes another sharing its
+  handler.
 - Only minute-granularity schedules are accepted; sub-minute and relative forms
   are rejected because their identity is not deterministic across workers.
 - Publication failures retry the same occurrence with a bounded backoff; startup
   catch-up republishes only the latest missed occurrence within a bounded horizon.
 - Once published it reuses the stream retry/claim/DLQ machinery, so handler
-  execution stays at-least-once; removing a function or schedule makes its
-  pending occurrences obsolete (acked, never retried or dead-lettered).
+  execution stays at-least-once; a delivery resolves the schedule by NAME and runs
+  its CURRENT handler, so a handler change is not obsolete. Removing a function or
+  a schedule NAME makes its pending occurrences obsolete (acked, never retried or
+  dead-lettered).
 
 ## Services and routing boundaries
 
 - Both service source kinds share one reconciler and lifecycle; the desired
   source is resolved before any container action, so an unresolvable source
   preserves the existing healthy containers.
-- Replacement is start-before-stop per replica slot. Identity is the SourceRef
-  alone, so a source change is a removal plus an addition: a removed identity's
-  containers are stopped LAST, and only after the desired set fully converged —
-  if any desired service failed (resolution, routing/network, create/start,
-  non-running) they are preserved as the last usable generation under that
-  grouping. A pass superseded by a newer desired state never stops the old
-  generation it was about to replace; it removes only its own provisional
-  replacement and leaves convergence to the newer request.
-- Containers are replaced when image content, port, effective environment,
-  resources, or routing labels change, otherwise preserved; external image
-  freshness is checked at most hourly per identity, in memory only.
+- Service names are mandatory and unique per function; the name is the identity
+  (relay.service) that keys container grouping, routing ids, and the persisted
+  snapshot. The SourceRef (relay.identity) is used only for image/entry
+  resolution and desired-implementation comparison; two names may share one
+  source, and a source change under the same name is the same service (in-place
+  replacement), not a removal plus an addition.
+- Replacement is start-before-stop per replica slot. A NAME change (rename) is a
+  removal plus an addition: the old name's containers are stopped LAST, and only
+  after the desired set fully converged — if any desired service failed
+  (resolution, routing/network, create/start, non-running) they are preserved as
+  the last usable generation. A pass superseded by a newer desired state never
+  stops the old generation it was about to replace; it removes only its own
+  provisional replacement and leaves convergence to the newer request.
+- Containers are replaced when the source descriptor, image content, port,
+  effective environment, resources, or routing labels change, otherwise
+  preserved; external image freshness is checked at most hourly per source
+  reference, in memory only.
 - Persistent service containers receive their environment (including resolved
   secrets) at process start — the one documented place a secret value reaches the
   Docker daemon; invocation secrets never enter Docker config, labels, metrics,
@@ -223,7 +239,10 @@ integration suite with Redis and Node.
 - Never weaken claim atomicity: CAS attempt+token, keep terminal markers
   monotonic, never downgrade a completed or exhausted marker.
 - Never silently drop a pending/PEL reference; a missing payload is an anomaly.
-- Never change schedule occurrence identity or add sub-minute granularity.
+- Never change schedule occurrence identity (function + schedule name + absolute
+  instant) or add sub-minute granularity.
+- Never identify a service or schedule by anything but its mandatory name (never
+  a source descriptor, handler, or index); never make a name optional.
 - Never move secret values outside their documented surfaces.
 - Never widen image/container GC beyond Relay-owned labels; retire images only
   after service convergence and reference guards.

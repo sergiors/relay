@@ -151,7 +151,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 
 // serviceReconcileTemplate renders a node24 template declaring one service.
 func serviceReconcileTemplate(port, replicas int) string {
-	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
+	return "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: " + strconv.Itoa(replicas) + "\n"
 }
 
 // TestServicesReconcileEnvChangeReplacesContainer proves against a real daemon
@@ -176,7 +176,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	writeTemplate := func(version string) {
-		tmpl := "runtime: node24\nenv:\n  APP_VERSION: " + version + "\nservices:\n  - entrypoint: app/service.js\n    port: 3000\n    replicas: 1\n"
+		tmpl := "runtime: node24\nenv:\n  APP_VERSION: " + version + "\nservices:\n  - name: app-service\n    entrypoint: app/service.js\n    port: 3000\n    replicas: 1\n"
 		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmpl), 0o644); err != nil {
 			t.Fatalf("write template: %v", err)
 		}
@@ -374,20 +374,20 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
 	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
 		Function: fn1,
-		Identity: "svc.js",
-		Port:     80,
-		Image:    "node:24-alpine",
-		Entry:    stopResponsive,
+		Name:     "svc.js", SourceRef: "svc.js",
+		Port:  80,
+		Image: "node:24-alpine",
+		Entry: stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w1 service: %v", err)
 	}
 	id2, err := m2.StartService(context.Background(), runtime.ServiceSpec{
 		Function: fn2,
-		Identity: "svc.js",
-		Port:     80,
-		Image:    "node:24-alpine",
-		Entry:    stopResponsive,
+		Name:     "svc.js", SourceRef: "svc.js",
+		Port:  80,
+		Image: "node:24-alpine",
+		Entry: stopResponsive,
 	}, 0)
 	if err != nil {
 		t.Fatalf("start w2 service: %v", err)

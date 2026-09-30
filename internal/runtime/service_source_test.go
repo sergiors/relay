@@ -77,9 +77,9 @@ func TestPullDueClockSeam(t *testing.T) {
 	if !m.pullDue("fn", "nginx:1") {
 		t.Fatal("pull-due at the interval boundary")
 	}
-	// A different identity (independent service) has its own window.
+	// A different source reference (independent image) has its own window.
 	if !m.pullDue("fn", "nginx:2") {
-		t.Fatal("an unseen identity must be pull-due")
+		t.Fatal("an unseen source reference must be pull-due")
 	}
 	// A different function has its own window.
 	if !m.pullDue("other", "nginx:1") {
@@ -89,7 +89,7 @@ func TestPullDueClockSeam(t *testing.T) {
 
 // TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange pins the
 // full external-image policy with a counting scripted daemon: the first resolve
-// pulls, an immediate second resolve does not, a source identity change pulls
+// pulls, an immediate second resolve does not, a changed source reference pulls
 // immediately, and after the interval another pull occurs.
 func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -123,7 +123,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 		t.Fatalf("pulls within the freshness window = %d, want still 1", pulls)
 	}
 
-	// A changed source identity (a different image) is checked immediately.
+	// A changed source reference (a different image) is checked immediately.
 	changed := function.Service{Image: "ghcr.io/acme/api:1.3", Port: 80, Replicas: 1}
 	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, changed, ""); err != nil {
 		t.Fatalf("changed resolve: %v", err)
@@ -132,7 +132,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 		t.Fatalf("pulls after a source change = %d, want 2 (immediate)", pulls)
 	}
 
-	// After the interval, the original identity is checked again.
+	// After the interval, the original source reference is checked again.
 	now = base.Add(serviceImagePullInterval)
 	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err != nil {
 		t.Fatalf("post-interval resolve: %v", err)
@@ -281,7 +281,7 @@ func TestForgetServicePullChecks(t *testing.T) {
 // fingerprint, without attempting a build.
 func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:1.27\n    port: 80\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - name: web\n    image: nginx:1.27\n    port: 80\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
 	tmpl := &function.Template{Services: []function.Service{{Image: "nginx:1.27", Port: 80, Replicas: 1}}}
@@ -306,7 +306,7 @@ func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 // a template edit must still change it.
 func TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly(t *testing.T) {
 	dir := t.TempDir()
-	const tmplYAML = "services:\n  - image: nginx:1.27\n    port: 80\n"
+	const tmplYAML = "services:\n  - name: web\n    image: nginx:1.27\n    port: 80\n"
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(tmplYAML), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}

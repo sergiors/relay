@@ -71,10 +71,11 @@ func cleanupScheduleKeys(ctx context.Context, cli *redis.Client, prefix string) 
 // the dedup key (`relay:schedule:<prefix>:...`) never collides with another
 // test's and cleanup can be scoped to that prefix. The ScheduledAt instant is a
 // fixed, second-aligned test instant; occurrences derived within a test differ by
-// instant or handler (see TestIntegrationDifferentOccurrencesPublishIndependently).
+// instant or schedule name (see TestIntegrationDifferentOccurrencesPublishIndependently).
 func newUniqueOccurrence(prefix string) Occurrence {
 	return Occurrence{
 		Function:    prefix,
+		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	}
@@ -145,8 +146,8 @@ func TestIntegrationDifferentOccurrencesPublishIndependently(t *testing.T) {
 	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	o1 := newUniqueOccurrence(e.prefix)
-	o2 := Occurrence{Function: e.prefix, Handler: "jobs.cleanup.handler", ScheduledAt: o1.ScheduledAt.Add(time.Minute)}
-	o3 := Occurrence{Function: e.prefix, Handler: "jobs.other.handler", ScheduledAt: o1.ScheduledAt}
+	o2 := Occurrence{Function: e.prefix, Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: o1.ScheduledAt.Add(time.Minute)}
+	o3 := Occurrence{Function: e.prefix, Schedule: "other", Handler: "jobs.other.handler", ScheduledAt: o1.ScheduledAt}
 
 	ctx := context.Background()
 	for _, o := range []Occurrence{o1, o2, o3} {

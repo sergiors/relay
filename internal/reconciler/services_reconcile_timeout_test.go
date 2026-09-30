@@ -160,7 +160,7 @@ func (d *phaseDocker) startCount() int {
 func slowResolveServiceTemplate() *function.Template {
 	return &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}},
 	}
 }
 

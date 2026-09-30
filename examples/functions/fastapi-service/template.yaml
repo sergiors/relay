@@ -1,7 +1,8 @@
 runtime: python3.14
 
 services:
-  - entrypoint: app/main.py
+  - name: api
+    entrypoint: app/main.py
     host: api.example.com
     port: 8000
     replicas: 1

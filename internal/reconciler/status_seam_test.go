@@ -29,7 +29,7 @@ import (
 func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 	t.Run("entrypoint service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		entryTmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+		entryTmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -45,7 +45,7 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 
 	t.Run("image service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		imgTmpl := serviceTemplate("", function.Service{Image: "nginx:1.27", Port: 80, Replicas: 1})
+		imgTmpl := serviceTemplate("", function.Service{Name: "nginx:1.27", Image: "nginx:1.27", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -72,7 +72,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -91,7 +91,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 // fires reconciling exactly once before converging the container.
 func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)

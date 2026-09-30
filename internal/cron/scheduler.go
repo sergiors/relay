@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,15 +24,21 @@ type Publisher interface {
 }
 
 // registeredSchedule is one function schedule Relay has registered: the
-// function and handler it invokes plus the schedule parsed with the SAME
-// parser gocron uses, so occurrence derivation (both the callback path and the
-// startup catch-up) matches gocron's firing exactly. Entries are recorded by
-// ReplaceFunction (mutex-protected) and read by CatchUp; they never drive the
-// live gocron jobs (those remain gocron's responsibility).
+// function, the schedule's stable name, the handler it invokes, the
+// registration-relevant configuration (cron expression and effective timezone)
+// alongside the schedule parsed with the SAME parser gocron uses, so occurrence
+// derivation (both the callback path and the startup catch-up) matches gocron's
+// firing exactly. Entries are recorded by ReplaceFunction (mutex-protected) and
+// read by CatchUp; they never drive the live gocron jobs (those remain gocron's
+// responsibility). ReplaceFunction compares handler/cron/location to decide
+// whether an existing job can be retained, while parsed serves catch-up.
 type registeredSchedule struct {
-	fn      string
-	handler string
-	parsed  robfigcron.Schedule
+	fn       string
+	name     string
+	handler  string
+	cron     string
+	location string
+	parsed   robfigcron.Schedule
 }
 
 // Scheduler wraps a gocron scheduler to run a function's template schedules.
@@ -110,33 +115,55 @@ func waitContext(ctx context.Context, d time.Duration) bool {
 }
 
 // functionTag is the tag that identifies every job belonging to a function, so
-// ReplaceFunction and RemoveFunction can converge/remove a whole function's
-// schedules in one RemoveByTags call.
+// RemoveFunction can remove a whole function's schedules in one RemoveByTags
+// call. ReplaceFunction no longer removes by this tag: it reconciles per stable
+// schedule name via jobTag so unrelated schedules keep their jobs.
 func functionTag(name string) string { return "function:" + name }
 
-// jobTag uniquely identifies one schedule slot of a function. The index suffix
-// distinguishes duplicate handler entries in the template.
-func jobTag(fnName, handler string, i int) string {
-	return "schedule:" + fnName + "/" + handler + "#" + strconv.Itoa(i)
+// jobTag uniquely identifies one schedule of a function by its stable name, so
+// RemoveByTags can remove a single schedule without touching another schedule
+// that shares its handler.
+func jobTag(fnName, scheduleName string) string {
+	return "schedule:" + fnName + "/" + scheduleName
 }
 
 // ReplaceFunction converges the scheduler's jobs for name to the template's
-// schedules. It is the single reconcile entry point, called when a function is
-// discovered, updated, or hot-swapped. A skipped tick during the swap is
-// acceptable (a schedule is recreated atomically enough). Templates are
-// validated at parse, so a NewJob error here is defensive and merely logged.
+// schedules, keyed by the stable function+schedule name.
+//
+// Reconcile semantics (each name independent of every other name):
+//   - A name declared by both the previous and the new template whose gocron-
+//     relevant fields — handler, cron expression, effective timezone — are
+//     unchanged keeps its existing job untouched. Timeout and retries are runner
+//     configuration, not cron configuration, so changing only those does not
+//     replace the job.
+//   - A name whose handler/cron/timezone changed, or a newly declared name,
+//     removes and re-registers only that name's job.
+//   - A name the template no longer declares (removed or renamed) removes only
+//     that name's job.
+//
+// Unrelated schedules of the same function therefore never lose their jobs on a
+// single-name edit. RemoveFunction is the only whole-function removal. A skipped
+// tick during a single job's replacement is acceptable. Templates are validated
+// at parse, so a NewJob error here is defensive and merely logged.
 func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
 		return
 	}
-	s.g.RemoveByTags(functionTag(name))
-	// Converge the parsed-schedule record for this function alongside the
-	// gocron jobs, so the startup catch-up sees exactly the schedules registered
-	// before Start. Entries are dropped for skipped/invalid schedules below.
-	s.schedules = dropFunctionSchedules(s.schedules, name)
-	for i, sch := range tmpl.Schedules {
+	// Index the function's recorded schedules by stable name so each desired
+	// schedule can be compared against what is already registered, and carry
+	// every other function's records through unchanged.
+	existing := make(map[string]registeredSchedule)
+	next := make([]registeredSchedule, 0, len(s.schedules))
+	for _, e := range s.schedules {
+		if e.fn == name {
+			existing[e.name] = e
+			continue
+		}
+		next = append(next, e)
+	}
+	for _, sch := range tmpl.Schedules {
 		// Copy the loop variable into a local so the closure captures this
 		// iteration's schedule, not the loop variable.
 		sch := sch
@@ -145,7 +172,7 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// here as it is in template validation. gocron would otherwise accept it
 		// even with withSeconds=false.
 		if trimmed := strings.TrimSpace(sch.Cron); trimmed == "@every" || strings.HasPrefix(trimmed, "@every ") {
-			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler,
+			s.log.Warn("Cron: register schedule failed", "function", name, "schedule", sch.Name, "handler", sch.Handler,
 				"error", "`@every` relative schedules are not supported")
 			continue
 		}
@@ -153,14 +180,31 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// CRON_TZ-aware ParseStandard) so occurrence derivation matches firing.
 		parsed, err := parseSchedule(sch.Cron, sch.Location)
 		if err != nil {
-			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler, "error", err)
+			s.log.Warn("Cron: register schedule failed", "function", name, "schedule", sch.Name, "handler", sch.Handler, "error", err)
 			continue
 		}
+		rec := registeredSchedule{fn: name, name: sch.Name, handler: sch.Handler, cron: sch.Cron, location: sch.Location.String(), parsed: parsed}
+		// Retain the live job when this name is already registered with the same
+		// handler, cron, and timezone. Only those fields reach the gocron job;
+		// timeout/retries are resolved by the runner, so a change confined to
+		// them must not churn the job (and its next run).
+		if prev, ok := existing[sch.Name]; ok && prev.handler == sch.Handler && prev.cron == sch.Cron && prev.location == sch.Location.String() {
+			delete(existing, sch.Name)
+			next = append(next, rec)
+			continue
+		}
+		// Changed or new: remove only this name's job, then re-register it, so
+		// another schedule sharing this function (or even this handler) keeps its
+		// job and job ID.
+		s.g.RemoveByTags(jobTag(name, sch.Name))
 		// Always prepend the zone (UTC included explicitly) so the job runs in
 		// the schedule's effective timezone while the scheduler stays pinned to
 		// UTC; NextRun returns a UTC instant regardless.
 		spec := "CRON_TZ=" + sch.Location.String() + " " + sch.Cron
-		jobName := name + "/" + sch.Handler + "#" + strconv.Itoa(i)
+		// The job name is the stable schedule name (function/name), not a
+		// handler+index slot: a schedule's identity survives a handler change,
+		// and two schedules sharing a handler remain distinct.
+		jobName := name + "/" + sch.Name
 		// withSeconds=false pins registration to the 5-field minute form (plus
 		// calendar descriptors), exactly matching template validation. Seconds
 		// schedules are rejected at parse time because gocron's callback exposes
@@ -168,17 +212,28 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// identified deterministically across workers.
 		_, err = s.g.NewJob(
 			gocron.CronJob(spec, false),
-			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Handler, parsed) }),
-			gocron.WithTags(functionTag(name), jobTag(name, sch.Handler, i)),
+			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Name, sch.Handler, parsed) }),
+			gocron.WithTags(functionTag(name), jobTag(name, sch.Name)),
 			gocron.WithName(jobName),
 			gocron.WithSingletonMode(gocron.LimitModeReschedule),
 		)
 		if err != nil {
-			s.log.Warn("Cron: register schedule failed", "function", name, "handler", sch.Handler, "error", err)
+			// The old job for this name was already removed and no record is
+			// appended, so the name is dropped like any other unregisterable
+			// schedule rather than left half-applied.
+			s.log.Warn("Cron: register schedule failed", "function", name, "schedule", sch.Name, "handler", sch.Handler, "error", err)
 			continue
 		}
-		s.schedules = append(s.schedules, registeredSchedule{fn: name, handler: sch.Handler, parsed: parsed})
+		delete(existing, sch.Name)
+		next = append(next, rec)
 	}
+	// Remove any name the new template no longer declares (removed or renamed),
+	// each by its own tag. A name whose re-registration failed also lands here
+	// (it was never deleted from existing), so no stale job survives.
+	for staleName := range existing {
+		s.g.RemoveByTags(jobTag(name, staleName))
+	}
+	s.schedules = next
 	s.log.Debug("Cron: registered schedules", "function", name, "count", len(tmpl.Schedules))
 }
 
@@ -286,7 +341,7 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 // Retries are bounded (see publishRetryDelays) and observe ctx, so a shutdown
 // aborts promptly. The schedule-path at-least-once contract after publication is
 // unchanged: the stream layer drives delivery, per-invocation retry, and DLQ.
-func (s *Scheduler) fire(ctx context.Context, fnName, handler string, parsed robfigcron.Schedule) {
+func (s *Scheduler) fire(ctx context.Context, fnName, scheduleName, handler string, parsed robfigcron.Schedule) {
 	now := s.now()
 	due, ok := latestOccurrence(parsed, now, occurrenceHorizon)
 	if !ok {
@@ -297,11 +352,11 @@ func (s *Scheduler) fire(ctx context.Context, fnName, handler string, parsed rob
 		// dropped, exactly like a missed occurrence older than the startup
 		// catch-up horizon. It cannot happen for a normal on-time callback.
 		s.log.Warn("Schedule: tick has no occurrence within the recovery horizon; dropping",
-			"function", fnName, "handler", handler,
+			"function", fnName, "schedule", scheduleName, "handler", handler,
 			"now", now.UTC().Format(time.RFC3339),
 		)
 		return
 	}
-	o := schedule.Occurrence{Function: fnName, Handler: handler, ScheduledAt: due}
+	o := schedule.Occurrence{Function: fnName, Schedule: scheduleName, Handler: handler, ScheduledAt: due}
 	_, _ = s.publishOccurrence(ctx, o, false)
 }

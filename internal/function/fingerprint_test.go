@@ -35,7 +35,7 @@ func fp(t *testing.T, dir string) string {
 // still detected. A runtime template keeps the full selected-source digest.
 func TestFingerprintFunctionNarrowsRuntimeLessToTemplate(t *testing.T) {
 	dir := t.TempDir()
-	const tmplYAML = "services:\n  - image: nginx:1.27\n    port: 80\n"
+	const tmplYAML = "services:\n  - name: web\n    image: nginx:1.27\n    port: 80\n"
 	writeFile(t, filepath.Join(dir, "template.yaml"), tmplYAML)
 	tmpl, err := ParseTemplate([]byte(tmplYAML))
 	if err != nil {
@@ -180,7 +180,8 @@ func TestFingerprintServicePathChangeDetected(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: /v1
 `)
@@ -188,7 +189,8 @@ services:
 
 	writeFile(t, filepath.Join(dir, "template.yaml"), `runtime: node24
 services:
-  - entrypoint: service.js
+  - name: service
+    entrypoint: service.js
     host: api.example.com
     path: /v2
 `)
@@ -407,7 +409,8 @@ events:
 	// Template-only (no-runtime) path.
 	noRuntimeDir := t.TempDir()
 	noRuntimeBase := `services:
-  - image: nginx:1.27
+  - name: nginx
+    image: nginx:1.27
 resources:
   memory: 128MiB
 `

@@ -58,7 +58,7 @@ func withServiceHooks(rec *servicesRecorder) func(*Config) {
 	}
 }
 
-const servicesTemplate = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - entrypoint: service.js\n    port: 3000\n"
+const servicesTemplate = "runtime: node24\nevents:\n  - handler: index.hi\n    pattern:\n      event_name: [INSERT]\nservices:\n  - name: service\n    entrypoint: service.js\n    port: 3000\n"
 
 // writeServicesDir writes a function directory whose template declares a service.
 func writeServicesDir(t *testing.T, root, name string) string {

@@ -136,6 +136,7 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 	ctx, span := tracing.Start(ctx, "schedule.publish",
 		trace.WithAttributes(
 			attribute.String("relay.function", o.Function),
+			attribute.String("relay.schedule", o.Schedule),
 			attribute.String("relay.handler", o.Handler),
 			attribute.Bool("relay.catchup", catchUp),
 		),
@@ -145,6 +146,7 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 	id := o.ID()
 	log := s.log.With(
 		"function", o.Function,
+		"schedule", o.Schedule,
 		"handler", o.Handler,
 		"scheduled_at", o.ScheduledAt.UTC().Format(time.RFC3339),
 		"occurrence_id", id,
@@ -252,7 +254,7 @@ func (s *Scheduler) CatchUp(ctx context.Context) int {
 		// worker already published it) additionally increments the duplicate
 		// counter, so the two are independent.
 		s.metrics.Inc(metrics.MetricScheduleCatchUp)
-		o := schedule.Occurrence{Function: e.fn, Handler: e.handler, ScheduledAt: due}
+		o := schedule.Occurrence{Function: e.fn, Schedule: e.name, Handler: e.handler, ScheduledAt: due}
 		if pub, resolved := s.publishOccurrence(ctx, o, true); resolved && pub {
 			published++
 		}

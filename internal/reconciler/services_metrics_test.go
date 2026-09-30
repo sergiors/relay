@@ -15,7 +15,7 @@ import (
 // changed outcome and one duration observation for the function, exactly once.
 func TestServiceReconcilerMetricsChanged(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	m := metrics.New()
 
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
@@ -39,7 +39,7 @@ func TestServiceReconcilerMetricsChanged(t *testing.T) {
 // pass records an unchanged outcome (no double counting of changed).
 func TestServiceReconcilerMetricsUnchanged(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	m := metrics.New()
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout, WithMetrics(m))
 
@@ -66,7 +66,7 @@ func TestServiceReconcilerMetricsUnchanged(t *testing.T) {
 // distinct — no raw error label.
 func TestServiceReconcilerMetricsError(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	f.resolveErr["service.js"] = errServiceConverge
 	m := metrics.New()
 
@@ -90,7 +90,7 @@ func TestServiceReconcilerMetricsError(t *testing.T) {
 // metrics wiring (the default, existing callers) works exactly as before.
 func TestServiceReconcilerMetricsNilRegistryNoPanic(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
 	if err := c.Apply(context.Background(), "fn", tmpl, "img", nil); err != nil {
 		t.Fatalf("apply: %v", err)

@@ -51,11 +51,11 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 	noRuntimeFn := function.Function{
 		Name:     "no-runtime-fn",
 		Dir:      t.TempDir(),
-		Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
+		Template: &function.Template{Services: []function.Service{{Name: "web", Image: "nginx:alpine"}}},
 	}
 	if err := os.WriteFile(
 		filepath.Join(noRuntimeFn.Dir, "template.yaml"),
-		[]byte("services:\n  - image: nginx:alpine\n    port: 80\n"),
+		[]byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"),
 		0o644,
 	); err != nil {
 		t.Fatalf("write no-runtime template: %v", err)

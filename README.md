@@ -179,7 +179,8 @@ Using a managed runtime entrypoint:
 runtime: python3.14
 
 services:
-  - entrypoint: app/main.py
+  - name: api
+    entrypoint: app/main.py
     port: 8000
 ```
 
@@ -187,7 +188,8 @@ Or an external image:
 
 ```yaml
 services:
-  - image: nginx:latest
+  - name: gateway
+    image: nginx:latest
     port: 80
 ```
 

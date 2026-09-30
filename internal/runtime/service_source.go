@@ -13,12 +13,13 @@ import (
 
 // serviceImagePullInterval bounds how often Relay performs a REMOTE pull check
 // for an external service image. A successful check is recorded in memory (per
-// worker, per independent service) and suppresses further remote checks for this
+// worker, per independent source) and suppresses further remote checks for this
 // window; a failed check does not advance the clock, so it is retried at the
 // next reconcile and a transient registry outage recovers promptly. Changing a
-// service's configured source (a new identity) has no recorded check and is
-// therefore checked immediately. The window is deliberately not configurable and
-// never persisted: it is a runtime freshness policy, not state.
+// service's configured source (under the same name or not) is a new
+// independent source with no recorded check, so it is checked immediately. The
+// window is deliberately not configurable and never persisted: it is a runtime
+// freshness policy, not state.
 const serviceImagePullInterval = time.Hour
 
 // ServiceImage is a resolved service source ready to start a container from.
@@ -72,57 +73,58 @@ func (m *Manager) ResolveServiceImage(
 // image and, when the freshness policy allows, pull it from its registry.
 //
 // The remote check runs at most once per serviceImagePullInterval per
-// independent service, measured from the last SUCCESSFUL check; a failed check
-// does not advance that instant (it is retried at the next reconcile). A source
-// with no recorded check — a first sighting, a changed identity, or a worker
-// restart (the map is in-memory only) — is checked immediately. A pull failure
-// is always surfaced so the caller preserves whatever containers it already has;
-// a missing local image with no successful pull cannot start a replica at all.
+// independent source (function + image reference), measured from the last
+// SUCCESSFUL check; a failed check does not advance that instant (it is retried
+// at the next reconcile). A source with no recorded check — a first sighting, a
+// changed reference, or a worker restart (the map is in-memory only) — is
+// checked immediately. A pull failure is always surfaced so the caller preserves
+// whatever containers it already has; a missing local image with no successful
+// pull cannot start a replica at all.
 //
 // It reuses the shared imageInspectContent helper, so the external path never
 // requires Relay labels: an image whose inspect response carries none still
 // yields its local content ID (relay.image_id), which is what the reconciler uses
 // to detect a moved tag.
-func (m *Manager) resolveExternalServiceImage(ctx context.Context, fnName, identity string) (ServiceImage, error) {
-	id, _, present, err := m.imageInspectContent(ctx, identity)
+func (m *Manager) resolveExternalServiceImage(ctx context.Context, fnName, sourceRef string) (ServiceImage, error) {
+	id, _, present, err := m.imageInspectContent(ctx, sourceRef)
 	if err != nil {
 		// Any non-not-found inspect failure is inconclusive: surface it rather
 		// than guessing, so a broken daemon never leads to a spurious pull or a
 		// container decision on unknown state.
-		return ServiceImage{}, fmt.Errorf("inspect image %q: %w", identity, err)
+		return ServiceImage{}, fmt.Errorf("inspect image %q: %w", sourceRef, err)
 	}
 
 	// A missing local image is pulled immediately regardless of the freshness
 	// window: there is no healthy container to preserve, so waiting would only
 	// leave the service unable to start. For a present image the window governs,
 	// so a healthy service is never re-pulled more than once per interval.
-	if !present || m.pullDue(fnName, identity) {
-		if err := m.pullImage(ctx, identity); err != nil {
-			return ServiceImage{}, fmt.Errorf("pull image %q: %w", identity, err)
+	if !present || m.pullDue(fnName, sourceRef) {
+		if err := m.pullImage(ctx, sourceRef); err != nil {
+			return ServiceImage{}, fmt.Errorf("pull image %q: %w", sourceRef, err)
 		}
-		m.recordPullCheck(fnName, identity, m.clock())
+		m.recordPullCheck(fnName, sourceRef, m.clock())
 		// Re-inspect after a successful pull: a moved tag may now point at
 		// different bytes, and the container must be replaced when it does.
-		id, _, present, err = m.imageInspectContent(ctx, identity)
+		id, _, present, err = m.imageInspectContent(ctx, sourceRef)
 		if err != nil {
-			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", identity, err)
+			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", sourceRef, err)
 		}
 		if !present {
-			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", identity, cerrdefs.ErrNotFound)
+			return ServiceImage{}, fmt.Errorf("inspect image %q after pull: %w", sourceRef, cerrdefs.ErrNotFound)
 		}
 	}
-	return ServiceImage{Ref: identity, ID: id}, nil
+	return ServiceImage{Ref: sourceRef, ID: id}, nil
 }
 
 // pullDue reports whether a remote pull check is due for fnName's service image
-// identity: true when no successful check is recorded (first sighting, changed
-// identity, or worker restart) or when at least one interval has elapsed since
-// the last successful one. The check record is updated only on success, so a
-// failed pull keeps this true and retries next pass.
-func (m *Manager) pullDue(fnName, identity string) bool {
+// source reference: true when no successful check is recorded (first sighting,
+// changed reference, or worker restart) or when at least one interval has
+// elapsed since the last successful one. The check record is updated only on
+// success, so a failed pull keeps this true and retries next pass.
+func (m *Manager) pullDue(fnName, sourceRef string) bool {
 	m.pullMu.Lock()
 	defer m.pullMu.Unlock()
-	last, ok := m.pullChecks[pullCheckKey(fnName, identity)]
+	last, ok := m.pullChecks[pullCheckKey(fnName, sourceRef)]
 	if !ok {
 		return true
 	}
@@ -130,13 +132,13 @@ func (m *Manager) pullDue(fnName, identity string) bool {
 }
 
 // recordPullCheck stamps a successful pull check at t.
-func (m *Manager) recordPullCheck(fnName, identity string, t time.Time) {
+func (m *Manager) recordPullCheck(fnName, sourceRef string, t time.Time) {
 	m.pullMu.Lock()
 	defer m.pullMu.Unlock()
 	if m.pullChecks == nil {
 		m.pullChecks = map[string]time.Time{}
 	}
-	m.pullChecks[pullCheckKey(fnName, identity)] = t
+	m.pullChecks[pullCheckKey(fnName, sourceRef)] = t
 }
 
 // forgetServicePullChecks drops every pull-check record for a function. It is
@@ -154,12 +156,15 @@ func (m *Manager) forgetServicePullChecks(fnName string) {
 	}
 }
 
-// pullCheckKey is the per-independent-service pull-check key: the function and
-// the service identity, so two functions never share a freshness window and the
-// two identity parts cannot collide (the NUL separator is not valid in either a
-// function name or an image reference).
-func pullCheckKey(fnName, identity string) string {
-	return fnName + "\x00" + identity
+// pullCheckKey is the per-independent-source pull-check key: the function and
+// the service's source reference, so two functions never share a freshness
+// window, a changed source reference is a new independent source, and the two
+// parts cannot collide (the NUL separator is not valid in either a function name
+// or an image reference). The key is deliberately the SOURCE reference, not the
+// service name: freshness is a property of the image bytes, shared by two
+// distinct services that reference the same image.
+func pullCheckKey(fnName, sourceRef string) string {
+	return fnName + "\x00" + sourceRef
 }
 
 // pullImage pulls exactly one image reference (`All` is false: only the tag or

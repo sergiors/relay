@@ -33,7 +33,7 @@ func newUnitPublisher(t *testing.T, m *metrics.Registry, res int, scriptErr erro
 }
 
 func unitOccurrence() Occurrence {
-	return Occurrence{Function: "courses", Handler: "jobs.cleanup.handler", ScheduledAt: fixedInstant}
+	return Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: fixedInstant}
 }
 
 // TestPublishOccurrenceBranchMatrix drives the three result branches of the

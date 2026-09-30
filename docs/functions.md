@@ -40,14 +40,16 @@ events: # rules that consume stream events
     retries: 4 # optional, additional attempts, default 4
 
 schedules: # cron-triggered handlers
-  - handler: jobs.cleanup.handler
+  - name: nightly-cleanup # mandatory stable identity, unique per function
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     timezone: Europe/Rome # optional, default UTC
     timeout: 20s
     retries: 4
 
 services: # persistent long-running containers
-  - entrypoint: service.js
+  - name: web # mandatory stable identity, unique per function
+    entrypoint: service.js
     port: 3000
     replicas: 2
 ```
@@ -99,7 +101,11 @@ Event handler names must be **unique across a function's event rules**,
 regardless of pattern, timeout, or retries: the invocation identity is
 `(function, handler)`, so a repeated handler is a template error (it would race
 for the same per-invocation retry/DLQ state). Schedule handler names are not
-constrained by this rule.
+constrained by this rule, but every schedule and every service must carry a
+unique **name** (see [schedules.md](schedules.md) and [services.md](services.md)):
+those names are their stable identities. A schedule or service name follows the
+same conservative rule as a function name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars,
+no trailing `.`).
 
 ### Timeouts and retries
 

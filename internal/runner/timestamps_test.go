@@ -214,7 +214,7 @@ func TestInvokeHandlerTimestamps(t *testing.T) {
 	// Success case.
 	m := metrics.New()
 	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "alpha", &countingExecutor{}, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
-	if err := r.InvokeHandler(context.Background(), "1-0", "alpha", "index.run", []byte(`{}`)); err != nil {
+	if err := r.InvokeHandler(context.Background(), "1-0", "alpha", "sched", "index.run", []byte(`{}`)); err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}
 	s := execStats(m, "alpha")
@@ -232,7 +232,7 @@ func TestInvokeHandlerTimestamps(t *testing.T) {
 	// Failure case (retryable: the schedule carries the default retry count).
 	m2 := metrics.New()
 	r2 := NewWithMetrics([]*PreparedFunction{schedFn(t, "beta", &countingExecutor{fail: true}, function.DefaultTimeout)}, testutil.DiscardLogger(), m2)
-	if err := r2.InvokeHandler(context.Background(), "1-1", "beta", "index.run", []byte(`{}`)); err == nil {
+	if err := r2.InvokeHandler(context.Background(), "1-1", "beta", "sched", "index.run", []byte(`{}`)); err == nil {
 		t.Fatal("expected InvokeHandler to fail")
 	}
 	fs := execStats(m2, "beta")
@@ -256,7 +256,7 @@ func TestInvokeHandlerExhaustedSetsDLQ(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	err := r.InvokeHandler(ctx, "1-0", "alpha", "index.run", []byte(`{}`))
+	err := r.InvokeHandler(ctx, "1-0", "alpha", "sched", "index.run", []byte(`{}`))
 	if err == nil {
 		t.Fatal("expected InvokeHandler to fail")
 	}

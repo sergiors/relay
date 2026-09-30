@@ -54,6 +54,7 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	rec := withSpanRecorder(t)
 	occ := schedule.Occurrence{
 		Function:    "courses",
+		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
 	}
@@ -67,7 +68,7 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	c := processMessageConsumer(store)
 
 	calls := 0
-	c.scheduleRunner = func(context.Context, string, string, string, []byte) error {
+	c.scheduleRunner = func(context.Context, string, string, string, string, []byte) error {
 		calls++
 		return nil
 	}

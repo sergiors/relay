@@ -151,7 +151,7 @@ func testLogger() *slog.Logger {
 
 func schedTemplate(handler, cron, timezone, timeout string) *function.Template {
 	t := &function.Template{Runtime: "node24"}
-	sch := function.Schedule{Handler: handler, Cron: cron, Location: time.UTC, Timeout: function.DefaultTimeout}
+	sch := function.Schedule{Name: handler, Handler: handler, Cron: cron, Location: time.UTC, Timeout: function.DefaultTimeout}
 	if timezone != "" {
 		loc, err := time.LoadLocation(timezone)
 		if err != nil {
@@ -172,8 +172,8 @@ func schedTemplate(handler, cron, timezone, timeout string) *function.Template {
 
 func twoSchedules() *function.Template {
 	return &function.Template{Runtime: "node24", Schedules: []function.Schedule{
-		{Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
-		{Handler: "jobs.b", Cron: "0 4 * * *", Location: time.UTC, Timeout: 20 * time.Second},
+		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 4 * * *", Location: time.UTC, Timeout: 20 * time.Second},
 	}}
 }
 
@@ -222,8 +222,8 @@ func TestReplaceFunctionSkipsUnregisterableSchedule(t *testing.T) {
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
-		{Handler: "jobs.good", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
-		{Handler: "jobs.bad", Cron: "not a cron", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "good", Handler: "jobs.good", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "bad", Handler: "jobs.bad", Cron: "not a cron", Location: time.UTC, Timeout: function.DefaultTimeout},
 	}})
 
 	if n := s.JobCount(); n != 1 {
@@ -233,8 +233,8 @@ func TestReplaceFunctionSkipsUnregisterableSchedule(t *testing.T) {
 	for _, j := range s.g.Jobs() {
 		names[j.Name()] = true
 	}
-	if !names["fn/jobs.good#0"] || names["fn/jobs.bad#1"] {
-		t.Fatalf("registered jobs = %v, want only fn/jobs.good#0", names)
+	if !names["fn/good"] || names["fn/bad"] {
+		t.Fatalf("registered jobs = %v, want only fn/good", names)
 	}
 	if !strings.Contains(logBuf.String(), "register schedule failed") {
 		t.Fatalf("expected a Warn about the unregisterable schedule:\n%s", logBuf.String())
@@ -252,8 +252,8 @@ func TestReplaceFunctionSkipsSixFieldSchedule(t *testing.T) {
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
-		{Handler: "jobs.five", Cron: "0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
-		{Handler: "jobs.six", Cron: "30 0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "five", Handler: "jobs.five", Cron: "0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "six", Handler: "jobs.six", Cron: "30 0 0 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
 	}})
 	if n := s.JobCount(); n != 1 {
 		t.Fatalf("jobs = %d, want 1 (seconds schedule skipped, five-field kept)", n)
@@ -262,8 +262,8 @@ func TestReplaceFunctionSkipsSixFieldSchedule(t *testing.T) {
 	for _, j := range s.g.Jobs() {
 		names[j.Name()] = true
 	}
-	if !names["fn/jobs.five#0"] || names["fn/jobs.six#1"] {
-		t.Fatalf("registered jobs = %v, want only fn/jobs.five#0", names)
+	if !names["fn/five"] || names["fn/six"] {
+		t.Fatalf("registered jobs = %v, want only fn/five", names)
 	}
 	if !strings.Contains(logBuf.String(), "register schedule failed") {
 		t.Fatalf("expected a Warn about the unregisterable six-field schedule:\n%s", logBuf.String())
@@ -299,7 +299,7 @@ func TestFireSendsPayload(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 8 * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	if !fp.waitFired(1) {
 		t.Fatal("occurrence not published")
 	}
@@ -371,7 +371,7 @@ func TestTwoWorkersDedupSameTick(t *testing.T) {
 	// Fire both workers' jobs for the same logical tick before awaiting either,
 	// so they genuinely race on the shared dedup set.
 	for _, s := range workers {
-		fireNow(t, s, "fn/jobs.a#0")
+		fireNow(t, s, "fn/jobs.a")
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for pub.total() < 2 && time.Now().Before(deadline) {
@@ -413,7 +413,7 @@ func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
 		s.now = func() time.Time { return pin }
 		s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 		s.Start()
-		fireNow(t, s, "fn/jobs.a#0")
+		fireNow(t, s, "fn/jobs.a")
 		if !fp.waitFired(1) {
 			t.Fatalf("worker %d: occurrence not published", i)
 		}
@@ -459,8 +459,8 @@ func TestMultipleSchedulesFireIndependently(t *testing.T) {
 	s.ReplaceFunction("fn", twoSchedules())
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
-	fireNow(t, s, "fn/jobs.b#1")
+	fireNow(t, s, "fn/jobs.a")
+	fireNow(t, s, "fn/jobs.b")
 	if !fp.waitFired(2) {
 		t.Fatal("two occurrences not published")
 	}
@@ -487,7 +487,7 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	// The publisher is called with bounded retries even though every attempt
 	// errors; the fire path must not panic or otherwise fail the scheduler. The
 	// budget is attempt(1) + len(publishRetryDelays) retries.
@@ -518,7 +518,7 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 	defer func() { _ = s2.Stop(context.Background()) }()
 	s2.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s2.Start()
-	fireNow(t, s2, "fn/jobs.a#0")
+	fireNow(t, s2, "fn/jobs.a")
 	if !fp2.waitFired(1) {
 		t.Fatal("occurrence not attempted")
 	}
@@ -648,7 +648,7 @@ func TestStopCancelsInFlightPublish(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	// Wait for the publish to begin blocking (it must not complete on its own,
 	// and the fired channel stays empty).
 	select {
@@ -693,5 +693,292 @@ func TestStopIdempotentAndNoOpsAfterStop(t *testing.T) {
 	s.Start()
 	if got := s.JobCount(); got != 0 {
 		t.Fatalf("jobs after Stop = %d, want 0 (no new jobs after stop)", got)
+	}
+}
+
+// TestReplaceFunctionScheduleNameStableAcrossHandlerChange pins that a schedule's
+// job identity is its STABLE NAME: changing only the handler under the same name
+// replaces the same job (job name fn/<name>, one job), never creating a second
+// job or dropping the schedule.
+func TestReplaceFunctionScheduleNameStableAcrossHandlerChange(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "cleanup", Handler: "jobs.old", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs = %d, want 1", n)
+	}
+	if got := s.g.Jobs()[0].Name(); got != "fn/cleanup" {
+		t.Fatalf("job name = %q, want fn/cleanup (stable name)", got)
+	}
+
+	// Same name, new handler: still one job, same job name.
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "cleanup", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs after handler change = %d, want 1", n)
+	}
+	if got := s.g.Jobs()[0].Name(); got != "fn/cleanup" {
+		t.Fatalf("job name after handler change = %q, want fn/cleanup", got)
+	}
+
+	// Register the new handler and fire it: the occurrence carries the name and
+	// the CURRENT handler.
+	fireNow(t, s, "fn/cleanup")
+	if !fp.waitFired(1) {
+		t.Fatal("occurrence not published")
+	}
+	o := fp.got()[0]
+	if o.Schedule != "cleanup" || o.Handler != "jobs.new" {
+		t.Fatalf("occurrence = %+v, want schedule=cleanup handler=jobs.new", o)
+	}
+}
+
+// TestReplaceFunctionSameHandlerMultipleNames pins that multiple schedule names
+// sharing a handler coexist as distinct jobs, and editing/removing one name never
+// touches another.
+func TestReplaceFunctionSameHandlerMultipleNames(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	shared := func(names ...string) *function.Template {
+		var scheds []function.Schedule
+		for _, n := range names {
+			scheds = append(scheds, function.Schedule{Name: n, Handler: "jobs.shared", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout})
+		}
+		return &function.Template{Runtime: "node24", Schedules: scheds}
+	}
+
+	s.ReplaceFunction("fn", shared("morning", "evening"))
+	if n := s.JobCount(); n != 2 {
+		t.Fatalf("jobs = %d, want 2 (same handler, distinct names)", n)
+	}
+	names := map[string]bool{}
+	for _, j := range s.g.Jobs() {
+		names[j.Name()] = true
+	}
+	if !names["fn/morning"] || !names["fn/evening"] {
+		t.Fatalf("job names = %v, want fn/morning and fn/evening", names)
+	}
+
+	// Remove one name: the other survives.
+	s.ReplaceFunction("fn", shared("evening"))
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs after removing one name = %d, want 1", n)
+	}
+	if got := s.g.Jobs()[0].Name(); got != "fn/evening" {
+		t.Fatalf("surviving job = %q, want fn/evening", got)
+	}
+}
+
+// jobIDs returns the gocron job ID of every registered job, keyed by the full
+// job name (fn/<schedule>). Comparing IDs before and after a reconciliation
+// proves whether a job was retained (same ID) or replaced (new ID).
+func jobIDs(s *Scheduler) map[string]string {
+	ids := map[string]string{}
+	for _, j := range s.g.Jobs() {
+		ids[j.Name()] = j.ID().String()
+	}
+	return ids
+}
+
+// TestReplaceFunctionRetainsUnchangedJobIDs pins the core per-name contract: a
+// single-name edit (cron or handler) replaces ONLY that name's job, leaving
+// every unrelated schedule's job — and its job ID — untouched.
+func TestReplaceFunctionRetainsUnchangedJobIDs(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	// Two schedules sharing one handler, distinct names.
+	s.ReplaceFunction("fn", twoSchedules())
+	before := jobIDs(s)
+	if len(before) != 2 {
+		t.Fatalf("jobs = %d, want 2", len(before))
+	}
+
+	// Change only jobs.b's cron. jobs.a must keep its exact job (same ID).
+	changed := &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 9 * * *", Location: time.UTC, Timeout: 20 * time.Second},
+	}}
+	s.ReplaceFunction("fn", changed)
+
+	after := jobIDs(s)
+	if len(after) != 2 {
+		t.Fatalf("jobs after cron change = %d, want 2", len(after))
+	}
+	if after["fn/jobs.a"] != before["fn/jobs.a"] {
+		t.Fatalf("fn/jobs.a job ID changed on an unrelated edit: %q -> %q", before["fn/jobs.a"], after["fn/jobs.a"])
+	}
+	if after["fn/jobs.b"] == before["fn/jobs.b"] {
+		t.Fatalf("fn/jobs.b job ID did not change on its cron edit: %q", after["fn/jobs.b"])
+	}
+
+	// Change only jobs.a's handler. jobs.b must now keep its (new) ID.
+	beforeHandler := jobIDs(s)
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "jobs.a", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "jobs.b", Handler: "jobs.b", Cron: "0 9 * * *", Location: time.UTC, Timeout: 20 * time.Second},
+	}})
+	afterHandler := jobIDs(s)
+	if afterHandler["fn/jobs.b"] != beforeHandler["fn/jobs.b"] {
+		t.Fatalf("fn/jobs.b job ID changed when only jobs.a's handler changed: %q -> %q", beforeHandler["fn/jobs.b"], afterHandler["fn/jobs.b"])
+	}
+	if afterHandler["fn/jobs.a"] == beforeHandler["fn/jobs.a"] {
+		t.Fatalf("fn/jobs.a job ID did not change on its handler edit: %q", afterHandler["fn/jobs.a"])
+	}
+	// The replaced job keeps its stable name and now fires the new handler.
+	fireNow(t, s, "fn/jobs.a")
+	if !fp.waitFired(1) {
+		t.Fatal("occurrence not published")
+	}
+	if got := fp.got()[0].Handler; got != "jobs.new" {
+		t.Fatalf("published handler = %q, want jobs.new", got)
+	}
+}
+
+// TestReplaceFunctionTimeoutOnlyChangeRetainsJobID pins that timeout/retries are
+// runner configuration, not cron configuration: changing only those under the
+// same name must NOT replace the gocron job (its ID and next run survive).
+func TestReplaceFunctionTimeoutOnlyChangeRetainsJobID(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	before := jobIDs(s)
+	nextBefore, err := s.g.Jobs()[0].NextRun()
+	if err != nil {
+		t.Fatalf("NextRun: %v", err)
+	}
+
+	// Same handler, cron, and timezone; only timeout and retries change.
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: 45 * time.Second, Retries: 2},
+	}})
+
+	if n := s.JobCount(); n != 1 {
+		t.Fatalf("jobs = %d, want 1", n)
+	}
+	if after := jobIDs(s); after["fn/jobs.a"] != before["fn/jobs.a"] {
+		t.Fatalf("job ID changed on a timeout/retries-only edit: %q -> %q", before["fn/jobs.a"], after["fn/jobs.a"])
+	}
+	nextAfter, err := s.g.Jobs()[0].NextRun()
+	if err != nil {
+		t.Fatalf("NextRun: %v", err)
+	}
+	if !nextAfter.Equal(nextBefore) {
+		t.Fatalf("next run changed on a timeout/retries-only edit: %v -> %v", nextBefore, nextAfter)
+	}
+}
+
+// TestReplaceFunctionRemovesOnlyNamedSchedule pins that dropping one name
+// removes only that name's job; a sibling schedule keeps its exact job and ID.
+func TestReplaceFunctionRemovesOnlyNamedSchedule(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	s.ReplaceFunction("fn", twoSchedules())
+	before := jobIDs(s)
+
+	// Drop jobs.b, keep jobs.a.
+	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+
+	after := jobIDs(s)
+	if len(after) != 1 {
+		t.Fatalf("jobs after removal = %v, want only fn/jobs.a", after)
+	}
+	if _, ok := after["fn/jobs.b"]; ok {
+		t.Fatalf("fn/jobs.b survived removal: %v", after)
+	}
+	if after["fn/jobs.a"] != before["fn/jobs.a"] {
+		t.Fatalf("fn/jobs.a job ID changed when only fn/jobs.b was removed: %q -> %q", before["fn/jobs.a"], after["fn/jobs.a"])
+	}
+}
+
+// TestReplaceFunctionRenameRemovesOldOnly pins that a rename (old name dropped,
+// new name added) removes only the old name's job and adds the new name's,
+// leaving every other schedule untouched.
+func TestReplaceFunctionRenameRemovesOldOnly(t *testing.T) {
+	fp := newFakePublisher(4)
+	s := New(fp, testLogger())
+	defer func() { _ = s.Stop(context.Background()) }()
+	s.Start()
+
+	s.ReplaceFunction("fn", twoSchedules())
+	before := jobIDs(s)
+
+	// Rename jobs.b -> jobs.c (same handler, same cron).
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "jobs.a", Handler: "jobs.a", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "jobs.c", Handler: "jobs.b", Cron: "0 4 * * *", Location: time.UTC, Timeout: 20 * time.Second},
+	}})
+
+	after := jobIDs(s)
+	if len(after) != 2 {
+		t.Fatalf("jobs after rename = %v, want fn/jobs.a and fn/jobs.c", after)
+	}
+	if _, ok := after["fn/jobs.b"]; ok {
+		t.Fatalf("old name fn/jobs.b survived the rename: %v", after)
+	}
+	if _, ok := after["fn/jobs.c"]; !ok {
+		t.Fatalf("new name fn/jobs.c missing after the rename: %v", after)
+	}
+	if after["fn/jobs.a"] != before["fn/jobs.a"] {
+		t.Fatalf("unrelated fn/jobs.a job ID changed on a rename: %q -> %q", before["fn/jobs.a"], after["fn/jobs.a"])
+	}
+}
+
+// TestReplaceFunctionKeepsCatchUpRecordsCoherent pins that the parsed-schedule
+// records driving startup catch-up converge per name alongside the jobs: after
+// an update, catch-up reflects the current handler/cron for surviving names,
+// drops removed names, and never resurrects a renamed one.
+func TestReplaceFunctionKeepsCatchUpRecordsCoherent(t *testing.T) {
+	now := time.Date(2026, 7, 2, 10, 2, 0, 0, time.UTC)
+	fp := newFakePublisher(8)
+	s := New(fp, testLogger())
+	s.now = func() time.Time { return now }
+	s.wait = noWait
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	s.ReplaceFunction("fn", twoSchedules())
+	// Update: jobs.a keeps its name but changes handler and cron; jobs.b is
+	// removed; jobs.c is added.
+	s.ReplaceFunction("fn", &function.Template{Runtime: "node24", Schedules: []function.Schedule{
+		{Name: "jobs.a", Handler: "jobs.a2", Cron: "0 5 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+		{Name: "jobs.c", Handler: "jobs.c", Cron: "0 6 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+	}})
+
+	if n := s.CatchUp(context.Background()); n != 2 {
+		t.Fatalf("catch-up published = %d, want 2 (jobs.a and jobs.c)", n)
+	}
+	got := map[string]schedule.Occurrence{}
+	for _, o := range fp.got() {
+		got[o.Schedule] = o
+	}
+	if len(got) != 2 {
+		t.Fatalf("catch-up schedules = %v, want jobs.a and jobs.c only", got)
+	}
+	if o, ok := got["jobs.a"]; !ok || o.Handler != "jobs.a2" {
+		t.Fatalf("catch-up jobs.a = %+v, want handler jobs.a2", o)
+	}
+	wantA := time.Date(2026, 7, 2, 5, 0, 0, 0, time.UTC)
+	if !got["jobs.a"].ScheduledAt.Equal(wantA) {
+		t.Fatalf("catch-up jobs.a scheduled_at = %v, want %v", got["jobs.a"].ScheduledAt, wantA)
+	}
+	if _, ok := got["jobs.b"]; ok {
+		t.Fatalf("catch-up resurrected the removed name jobs.b: %v", got)
 	}
 }

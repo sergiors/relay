@@ -297,7 +297,8 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 // a successful prepare produces NO function image (PreparedAt is the only usable
 // generation marker).
 const noRuntimeServiceTmpl = `services:
-  - image: ghcr.io/acme/api:1.2
+  - name: api
+    image: ghcr.io/acme/api:1.2
     port: 8080
 `
 

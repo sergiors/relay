@@ -227,7 +227,8 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 			if desc, ok := describeCronFunc(s.Cron); ok {
 				fmt.Fprintf(
 					sw,
-					"  %s\tcron=%q (%s) timezone=%s timeout=%s\n",
+					"  %s\thandler=%s cron=%q (%s) timezone=%s timeout=%s\n",
+					s.Name,
 					s.Handler,
 					s.Cron,
 					desc,
@@ -238,7 +239,8 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 			}
 			fmt.Fprintf(
 				sw,
-				"  %s\tcron=%q timezone=%s timeout=%s\n",
+				"  %s\thandler=%s cron=%q timezone=%s timeout=%s\n",
+				s.Name,
 				s.Handler,
 				s.Cron,
 				s.Timezone,
@@ -262,7 +264,8 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 			if svc.Path != "" {
 				fmt.Fprintf(
 					srw,
-					"  %s\tport=%d replicas=%d path=%s\n",
+					"  %s\tsource=%s port=%d replicas=%d path=%s\n",
+					svc.Name,
 					source,
 					svc.Port,
 					svc.Replicas,
@@ -270,7 +273,7 @@ func printInspect(w io.Writer, st *state.State, detail state.Detail) state.Funct
 				)
 				continue
 			}
-			fmt.Fprintf(srw, "  %s\tport=%d replicas=%d\n", source, svc.Port, svc.Replicas)
+			fmt.Fprintf(srw, "  %s\tsource=%s port=%d replicas=%d\n", svc.Name, source, svc.Port, svc.Replicas)
 		}
 		srw.Flush()
 	}

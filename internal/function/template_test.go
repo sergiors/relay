@@ -771,3 +771,54 @@ events:
 		t.Error("expected no match for PENDING")
 	}
 }
+
+// TestEventMatchingUnaffectedByScheduleAndServiceNames pins that adding schedule
+// and service names (and a service sharing a source) does not change event
+// matching: events remain keyed by handler and matched purely by pattern. This is
+// the event-behavior regression guard for the name-identity change.
+func TestEventMatchingUnaffectedByScheduleAndServiceNames(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+  - handler: events.updated.handler
+    pattern:
+      event_name: [MODIFY]
+schedules:
+  - name: cleanup
+    handler: events.created.handler
+    cron: "0 3 * * *"
+  - name: report
+    handler: events.created.handler
+    cron: "0 4 * * *"
+services:
+  - name: api
+    entrypoint: service.js
+  - name: worker
+    entrypoint: service.js
+`)
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("events = %d, want 2", len(tmpl.Events))
+	}
+	insert := tmpl.MatchingEventRules(map[string]any{"event_name": "INSERT"})
+	if len(insert) != 1 || insert[0].Handler != "events.created.handler" {
+		t.Fatalf("INSERT matches = %+v, want the created handler", insert)
+	}
+	modify := tmpl.MatchingEventRules(map[string]any{"event_name": "MODIFY"})
+	if len(modify) != 1 || modify[0].Handler != "events.updated.handler" {
+		t.Fatalf("MODIFY matches = %+v, want the updated handler", modify)
+	}
+	if got := tmpl.MatchingEventRules(map[string]any{"event_name": "REMOVE"}); len(got) != 0 {
+		t.Fatalf("REMOVE matches = %+v, want none", got)
+	}
+	// A schedule sharing an event handler must NOT turn that schedule into an
+	// event rule: the event rule set is exactly the two declared events.
+	if len(tmpl.Schedules) != 2 {
+		t.Fatalf("schedules = %d, want 2", len(tmpl.Schedules))
+	}
+	if len(tmpl.Services) != 2 {
+		t.Fatalf("services = %d, want 2", len(tmpl.Services))
+	}
+}

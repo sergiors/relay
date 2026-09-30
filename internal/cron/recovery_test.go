@@ -50,7 +50,7 @@ func TestFireRetriesSameOccurrenceThenSucceeds(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 8 * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	deadline := time.Now().Add(3 * time.Second)
 	for fp.callCount() < 3 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -60,7 +60,7 @@ func TestFireRetriesSameOccurrenceThenSucceeds(t *testing.T) {
 	}
 	// Every attempt targeted the same occurrence ID.
 	wantDue := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	wantID := schedule.Occurrence{Function: "fn", Handler: "jobs.a", ScheduledAt: wantDue}.ID()
+	wantID := schedule.Occurrence{Function: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: wantDue}.ID()
 	if n := fp.callsFor(wantID); n != 3 {
 		t.Fatalf("attempts for occurrence %q = %d, want 3 (ID must not be recomputed)", wantID, n)
 	}
@@ -84,7 +84,7 @@ func TestFireSuccessPathSingleAttempt(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	if !fp.waitFired(1) {
 		t.Fatal("occurrence not published")
 	}
@@ -111,7 +111,7 @@ func TestPublishCancellationStopsRetries(t *testing.T) {
 	if !ok {
 		t.Fatal("no occurrence found")
 	}
-	o := schedule.Occurrence{Function: "fn", Handler: "jobs.a", ScheduledAt: due}
+	o := schedule.Occurrence{Function: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: due}
 
 	// A pre-cancelled context stops before the first attempt.
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -151,7 +151,7 @@ func TestFireRetriesShareOneTrace(t *testing.T) {
 	s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 	s.Start()
 
-	fireNow(t, s, "fn/jobs.a#0")
+	fireNow(t, s, "fn/jobs.a")
 	deadline := time.Now().Add(3 * time.Second)
 	for fp.callCount() < 3 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)

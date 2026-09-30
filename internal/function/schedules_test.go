@@ -34,7 +34,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: 0 3 * * *
 `)
 	if len(tmpl.Schedules) != 1 {
@@ -65,13 +66,16 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler-2
+    handler: jobs.cleanup.handler
     cron: "0 8 * * 1-5"
     timezone: Europe/Rome
     timeout: 20s
-  - handler: jobs.report.handler
+  - name: jobs.report.handler
+    handler: jobs.report.handler
     cron: "0 4 * * *"
     timezone: America/New_York
 `)
@@ -103,10 +107,93 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - cron: "0 3 * * *"
+  - name: cleanup
+    cron: "0 3 * * *"
 `))
-	if err == nil || !strings.Contains(err.Error(), "schedule is missing a handler") {
+	if err == nil || !strings.Contains(err.Error(), "schedule \"cleanup\" is missing a handler") {
 		t.Fatalf("err = %v, want missing-handler error", err)
+	}
+}
+
+// A schedule without a name is rejected: the name is its mandatory identity.
+func TestParseScheduleMissingName(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+`))
+	if err == nil || !strings.Contains(err.Error(), "schedule is missing a name") {
+		t.Fatalf("err = %v, want missing-name error", err)
+	}
+}
+
+// Duplicate schedule NAMES are rejected, but multiple schedules MAY share a
+// handler (each name is an independent schedule).
+func TestParseScheduleDuplicateNameAndSharedHandler(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - name: cleanup
+    handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+  - name: cleanup
+    handler: jobs.cleanup.handler
+    cron: "0 4 * * *"
+`))
+	if err == nil || !strings.Contains(err.Error(), `duplicate schedule name "cleanup"`) {
+		t.Fatalf("err = %v, want duplicate-schedule-name rejection", err)
+	}
+
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - name: morning
+    handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+  - name: evening
+    handler: jobs.cleanup.handler
+    cron: "0 20 * * *"
+`)
+	if len(tmpl.Schedules) != 2 {
+		t.Fatalf("schedules = %d, want 2 (same handler, distinct names)", len(tmpl.Schedules))
+	}
+	if tmpl.Schedules[0].Name == tmpl.Schedules[1].Name {
+		t.Fatal("distinct schedule names expected")
+	}
+}
+
+// An invalid schedule name is rejected with the shared conservative name rule.
+func TestParseScheduleInvalidName(t *testing.T) {
+	for _, bad := range []string{"Cleanup", "trailing.", "a/b"} {
+		t.Run(bad, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+schedules:
+  - name: "` + bad + `"
+    handler: jobs.cleanup.handler
+    cron: "0 3 * * *"
+`))
+			if err == nil || !strings.Contains(err.Error(), "invalid schedule name") {
+				t.Fatalf("name %q: err = %v, want invalid-name rejection", bad, err)
+			}
+		})
 	}
 }
 
@@ -118,7 +205,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
 `))
 	if err == nil || !strings.Contains(err.Error(), "cron is required") {
 		t.Fatalf("err = %v, want cron-required error", err)
@@ -138,7 +226,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "` + cron + `"
 `))
 		if err == nil || !strings.Contains(err.Error(), "jobs.cleanup.handler") ||
@@ -161,7 +250,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "` + cron + `"
 `))
 		if err == nil {
@@ -185,7 +275,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "` + cron + `"
 `))
 		if err == nil || !strings.Contains(err.Error(), "jobs.cleanup.handler") ||
@@ -206,7 +297,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "`+cron+`"
 `)
 		if len(tmpl.Schedules) != 1 {
@@ -238,7 +330,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "CRON_TZ=UTC 0 3 * * *"
 `))
 	if err == nil || !strings.Contains(err.Error(), "must not embed TZ=") {
@@ -255,9 +348,11 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.a.handler
+  - name: jobs.a.handler
+    handler: jobs.a.handler
     cron: "0 3 * * *"
-  - handler: jobs.b.handler
+  - name: jobs.b.handler
+    handler: jobs.b.handler
     cron: "0 3 * * *"
     timezone: UTC
 `)
@@ -277,7 +372,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 8 * * *"
     timezone: Europe/Rome
 `)
@@ -295,7 +391,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     timezone: ` + tz + `
 `))
@@ -315,9 +412,11 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.a.handler
+  - name: jobs.a.handler
+    handler: jobs.a.handler
     cron: "0 3 * * *"
-  - handler: jobs.b.handler
+  - name: jobs.b.handler
+    handler: jobs.b.handler
     cron: "0 4 * * *"
     timeout: 20s
 `)
@@ -336,7 +435,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     timeout: ` + bad + `
 `))
@@ -360,7 +460,8 @@ events:
       event_name: [MODIFY]
     timeout: 20s
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 `)
 	if len(tmpl.Events) != 2 {
@@ -383,7 +484,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: nohandler
+  - name: nohandler
+    handler: nohandler
     cron: "0 3 * * *"
 `))
 	if err == nil || !strings.Contains(err.Error(), "nohandler") {
@@ -401,7 +503,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
 `)
 	if got := tmpl.Schedules[0].Retries; got != DefaultRetries {
@@ -419,7 +522,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     retries: 2
 `)
@@ -434,7 +538,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     retries: 0
 `)
@@ -465,7 +570,8 @@ events:
     pattern:
       status: [COMPLETED]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
     retries: ` + tc.retries + `
 `))

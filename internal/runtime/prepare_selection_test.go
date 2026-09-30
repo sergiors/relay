@@ -201,10 +201,10 @@ func TestPrepareComputesDependencyFingerprintOnce(t *testing.T) {
 // fingerprint and a nil selection (no tree is walked or staged).
 func TestSelectAndFingerprintFunctionsNoRuntimeNoSelection(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:alpine\n    port: 80\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	tmpl, err := function.ParseTemplate([]byte("services:\n  - image: nginx:alpine\n    port: 80\n"))
+	tmpl, err := function.ParseTemplate([]byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

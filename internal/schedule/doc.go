@@ -12,10 +12,11 @@
 // occurrence follows Relay's normal at-least-once delivery, retry, invocation
 // state, and DLQ semantics.
 //
-// An Occurrence identifies one logical firing by function, handler, and
-// scheduled instant. ScheduledAt is normalized to UTC before its deterministic
-// ID is derived, so workers evaluating the same logical tick produce the same
-// identity regardless of timezone representation or callback timing.
+// An Occurrence identifies one logical firing by function, SCHEDULE NAME, and
+// scheduled instant; the handler is carried but is not part of the identity.
+// ScheduledAt is normalized to UTC before its deterministic ID is derived, so
+// workers evaluating the same logical tick produce the same identity regardless
+// of timezone representation or callback timing.
 //
 // Deduplication and stream publication happen in one Redis Lua script. The
 // dedup key and XADD therefore succeed or fail as one atomic operation: Relay

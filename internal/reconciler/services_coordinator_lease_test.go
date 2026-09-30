@@ -35,7 +35,7 @@ func TestServiceCoordinatorLeasedRequestHoldsLeaseThroughRun(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.EnqueueLeased("alpha", tmpl, "relay-fn-a:v1", nil, lease)
 	<-docker.entered
@@ -72,7 +72,7 @@ func TestServiceCoordinatorCoalescedRequestReleasesLease(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 
 	// Occupy BOTH workers so this function's request stays pending.
@@ -123,7 +123,7 @@ func TestServiceCoordinatorCancellationReleasesPendingLease(t *testing.T) {
 
 	tmpl := &function.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 
 	mgr := &runtime.Manager{}

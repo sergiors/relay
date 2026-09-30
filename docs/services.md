@@ -6,22 +6,33 @@ event/schedule invocations that exit after one request.
 
 ## Source model
 
-Each service declares **exactly one source**, and the configured source
-descriptor is the service's identity (it keys containers, routing, and persisted
-rows; there is no synthetic entrypoint):
+Every service declares a **mandatory `name`** — its stable identity within the
+function — and **exactly one source**:
 
 ```yaml
 runtime: node24
 
 services:
-  - entrypoint: service.js # a runtime-managed application entrypoint file
+  - name: web # stable identity: keys containers, routing, state
+    entrypoint: service.js # a runtime-managed application entrypoint file
     port: 3000
     replicas: 2
 
-  - image: nginx:1.27-alpine # an external image reference
+  - name: gateway
+    image: nginx:1.27-alpine # an external image reference
     port: 80
     replicas: 1
 ```
+
+`name` is the service's identity: it keys the container grouping, the Traefik
+router/service id, and the persisted snapshot. It follows the same conservative
+rule as a function name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no trailing `.`) and
+must be unique among the function's services. Two services **may** share the
+same source — they are distinct services running the same implementation. A
+changed source under the same name is the same logical service: it replaces the
+same replica slots (start-before-stop), so it is **not** a removal plus an
+addition. Renaming a service **is** a removal plus an addition (see
+Convergence below).
 
 - `entrypoint` is an application entrypoint **file** started as the long-lived
   process (e.g. `service.js`, `app/main.py`) — not the `module.function` event
@@ -35,8 +46,6 @@ services:
   elapsed; the image's own `ENTRYPOINT`/`CMD` are preserved. An `image` service
   does not need a `runtime`. **Relay never removes external images** — cleanup
   only ever touches its own `relay-fn-*` / `relay-dep-*` namespaces.
-
-Source descriptors must be unique within a function.
 
 ## Port, host, path, replicas
 
@@ -107,26 +116,28 @@ to the template.
   unresolved secret), the pass reports the failure and **preserves the existing
   healthy containers** rather than tearing them down. A transient registry
   outage therefore never degrades a working service.
-- Containers whose image (or, for an external tag, image **content**), port,
-  effective environment (`relay.env_hash`), per-container resources
-  (`relay.resources`), or routing labels no longer match are **replaced**.
-  Others are preserved — no unnecessary restarts. The joined network **set**
-  (global `NETWORKS` + routing network for a routed service) participates in
-  this comparison order-independently: reordering or repeating a network never
-  replaces a container, but adding/removing/switching one does.
+- Containers whose source descriptor, image (or, for an external tag, image
+  **content**), port, effective environment (`relay.env_hash`), per-container
+  resources (`relay.resources`), or routing labels no longer match are
+  **replaced**. Others are preserved — no unnecessary restarts. The joined
+  network **set** (global `NETWORKS` + routing network for a routed service)
+  participates in this comparison order-independently: reordering or repeating a
+  network never replaces a container, but adding/removing/switching one does.
 - A replacement is **start-before-stop**: for each replica slot Relay starts the
   new container and requires Docker to confirm it running before stopping the
   superseded one, so a failed replacement leaves the old generation serving and
   is retried on the next pass. A service is never taken to zero running replicas
   by a failed replacement.
-- A changed **source** (a new `relay.identity`: a different entrypoint file, or a
-  different image reference) is a removal plus an addition under SourceRef
-  grouping, so the old identity's containers are treated as removed and are
-  stopped **last**. If the new identity does not converge — pull/resolution,
-  routing or network, create/start, or a started-but-not-running container — the
-  old identity's containers are **preserved**, because under this grouping they
-  can be the only usable generation for the service the new identity replaces.
-  The removal is retried by a later reconcile once the desired set converges.
+- Changing only the **source** under the same `name` (a different entrypoint
+  file, or a different image reference) is the same logical service: the new
+  generation replaces the same replica slots via start-before-stop.
+- **Renaming** a service (a new `name`) is a removal plus an addition: the old
+  name's containers are treated as removed and are stopped **last**. If the new
+  service does not converge — pull/resolution, routing or network, create/start,
+  or a started-but-not-running container — the old name's containers are
+  **preserved**, because they can be the only usable generation for the service
+  the new name replaces. The removal is retried by a later reconcile once the
+  desired set converges.
 - Environment comparison is what makes a changed template `env` value or a
   **rotated secret value** replace a service's container: the image reference and
   fingerprint do not change for either, but a long-lived container would
@@ -154,20 +165,22 @@ always finds a usable generation to replace. The coalesced newer request then
 converges and commits the replacement.
 
 **External image freshness:** for an `image` service Relay checks the registry
-**at most once per hour per independent service** (per function + identity). A
-successful remote check is recorded in memory; the window is not persisted, and
-changing the configured source (a new identity) is checked immediately. A failed
-check does not advance the window, so it retries at the next reconcile.
+**at most once per hour per independent source** (per function + image
+reference). A successful remote check is recorded in memory; the window is not
+persisted, and changing the configured source reference is checked immediately.
+A failed check does not advance the window, so it retries at the next reconcile.
 
 Containers are identified by deterministic Relay-owned labels
-(`relay.type=service`, `relay.function`, `relay.identity`, plus image content id,
-port, replica slot, `relay.env_hash`, `relay.resources`, `relay.networks`), never
-by name alone. The Docker container name is greppable and derived from the
-function/identity/replica, but carries a per-start uniqueness token so a
-replacement can be created while the container it replaces is still running;
-ownership, grouping, and the replica slot always come from the labels.
-`relay.identity` is the configured source descriptor; service containers carry no
-`relay.handler` label — the source **is** the service.
+(`relay.type=service`, `relay.function`, `relay.service`, `relay.identity`, plus
+image content id, port, replica slot, `relay.env_hash`, `relay.resources`,
+`relay.networks`), never by name alone. `relay.service` is the service's stable
+name (the grouping key); `relay.identity` is its configured source descriptor,
+used only to resolve the image/entry command and to detect a changed
+implementation. Service containers carry no `relay.handler` label. The Docker
+container name is greppable and derived from the function/name/replica, but
+carries a per-start uniqueness token so a replacement can be created while the
+container it replaces is still running; ownership, grouping, and the replica slot
+always come from the labels.
 
 ## Traefik routing (optional)
 
@@ -210,10 +223,11 @@ Requirements:
   per-service.
 
 `<id>` is a deterministic Traefik-safe router/service id derived from the
-function name + source identity (never the host or path):
-`relay-<function>-<identity>-<hash>`, sanitized to `[a-z0-9-]`, capped at 100
+function name + **service name** (never the host, path, or source):
+`relay-<function>-<name>-<hash>`, sanitized to `[a-z0-9-]`, capped at 100
 characters, where `<hash>` is a 64-bit suffix hashed from the full untruncated
-function and identity. Stable ids mean reconciliation produces stable labels.
+function and service name. Stable ids mean reconciliation produces stable labels
+and a source change under the same name keeps the same route.
 
 Changing `host`, `path`, `port`, or any routing value makes the running container
 stale and it is replaced with updated labels. Removing `host` replaces the routed

@@ -11,9 +11,11 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.cleanup.handler
+  - name: jobs.cleanup.handler
+    handler: jobs.cleanup.handler
     cron: "0 3 * * *"
-  - handler: jobs.report.handler
+  - name: jobs.report.handler
+    handler: jobs.report.handler
     cron: "0 8 * * 1-5"
     timezone: Europe/Rome
     timeout: 20s
@@ -21,7 +23,7 @@ schedules:
 
 // TestScheduleRoundTrip seeds a template with schedules through
 // RecordReconcileSuccess and asserts GetFunction returns the resolved rows
-// (handler, verbatim cron, effective timezone name, resolved timeout).
+// (name, handler, verbatim cron, effective timezone name, resolved timeout).
 func TestScheduleRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
@@ -34,15 +36,16 @@ func TestScheduleRoundTrip(t *testing.T) {
 	if len(detail.Schedules) != 2 {
 		t.Fatalf("schedules = %d, want 2", len(detail.Schedules))
 	}
+	// Rows are ordered by NAME.
 	s0 := detail.Schedules[0]
-	if s0.Handler != "jobs.cleanup.handler" || s0.Cron != "0 3 * * *" || s0.Timezone != "UTC" {
+	if s0.Name != "jobs.cleanup.handler" || s0.Handler != "jobs.cleanup.handler" || s0.Cron != "0 3 * * *" || s0.Timezone != "UTC" {
 		t.Fatalf("schedule 0 = %+v", s0)
 	}
 	if s0.Timeout != 6*time.Second {
 		t.Fatalf("schedule 0 timeout = %s, want default 6s", s0.Timeout)
 	}
 	s1 := detail.Schedules[1]
-	if s1.Handler != "jobs.report.handler" || s1.Cron != "0 8 * * 1-5" || s1.Timezone != "Europe/Rome" {
+	if s1.Name != "jobs.report.handler" || s1.Handler != "jobs.report.handler" || s1.Cron != "0 8 * * 1-5" || s1.Timezone != "Europe/Rome" {
 		t.Fatalf("schedule 1 = %+v", s1)
 	}
 	if s1.Timeout != 20*time.Second {
@@ -63,7 +66,8 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: jobs.report.handler
+  - name: jobs.report.handler
+    handler: jobs.report.handler
     cron: "0 4 * * *"
     timezone: America/New_York
 `)
@@ -77,7 +81,7 @@ schedules:
 		t.Fatalf("schedules = %d, want 1 after replacement", len(detail.Schedules))
 	}
 	s := detail.Schedules[0]
-	if s.Handler != "jobs.report.handler" || s.Cron != "0 4 * * *" || s.Timezone != "America/New_York" {
+	if s.Name != "jobs.report.handler" || s.Handler != "jobs.report.handler" || s.Cron != "0 4 * * *" || s.Timezone != "America/New_York" {
 		t.Fatalf("schedule after change = %+v", s)
 	}
 	if s.Timeout != 6*time.Second {

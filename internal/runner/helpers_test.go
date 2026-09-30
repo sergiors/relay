@@ -447,7 +447,8 @@ func schedFn(t *testing.T, name string, executor Executor, scheduleTimeout time.
 }
 
 // schedFnRetries returns a prepared function with a single schedule entry for
-// handler "index.run" carrying the given timeout and retry count.
+// handler "index.run" (schedule name "sched") carrying the given timeout and
+// retry count.
 func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration, retries int) *PreparedFunction {
 	t.Helper()
 	rule := alwaysMatchRule(scheduleTimeout)
@@ -455,6 +456,7 @@ func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeou
 		name:  name,
 		rules: []function.EventRule{rule},
 		schedules: []function.Schedule{{
+			Name:     "sched",
 			Handler:  "index.run",
 			Cron:     "0 3 * * *",
 			Location: time.UTC,

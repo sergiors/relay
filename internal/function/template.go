@@ -125,15 +125,24 @@ type Template struct {
 	Resources ResourceLimits
 }
 
-// Schedule is one cron schedule from the template's `schedules` list: the
-// handler it invokes, a MINUTE-granularity cron expression (verbatim), the
-// effective IANA timezone (always non-nil after ParseTemplate; omitted
-// timezones resolve to UTC), and the resolved per-invocation timeout and retry
-// count (same rules as event rules). The expression is either the standard
-// 5-field `minute hour day-of-month month day-of-week` form or a calendar
-// descriptor (@hourly/@daily/@weekly/@monthly/@yearly); the 6-field (seconds)
-// form and `@every` relative schedules are rejected (see validateCron).
+// Schedule is one cron schedule from the template's `schedules` list: its
+// stable name, the handler it invokes, a MINUTE-granularity cron expression
+// (verbatim), the effective IANA timezone (always non-nil after ParseTemplate;
+// omitted timezones resolve to UTC), and the resolved per-invocation timeout
+// and retry count (same rules as event rules). The expression is either the
+// standard 5-field `minute hour day-of-month month day-of-week` form or a
+// calendar descriptor (@hourly/@daily/@weekly/@monthly/@yearly); the 6-field
+// (seconds) form and `@every` relative schedules are rejected (see
+// validateCron).
+//
+// Name is the schedule's stable identity within the function: it keys the cron
+// job, the occurrence identity, and the runner's config resolution. It is
+// mandatory and unique among a function's schedules, so multiple schedules may
+// legitimately share a handler (for example the same job at two different
+// times) and each remains independently addressable. Handlers are the event
+// invocation identity; a schedule's identity is its name.
 type Schedule struct {
+	Name     string
 	Handler  string
 	Cron     string
 	Location *time.Location
@@ -169,14 +178,20 @@ const (
 // maintains. Port and Replicas are always effective (non-zero) after
 // ParseTemplate.
 //
-// The configured source descriptor (SourceRef) is the service's stable
-// identity: the entrypoint file or the external image reference. It is
-// deliberately NOT a synthetic entrypoint string, so every source kind has an
-// honest identity that survives reconciliation across restarts. It is the
+// Name is the service's stable identity within the function: it is the
 // grouping key for containers, the routing id input, and the persisted service
-// key. Source descriptors are unique within a function (rejected at parse
-// time), because they must key containers and routing deterministically.
+// key. It is mandatory and unique among a function's services. The configured
+// source descriptor is deliberately NOT the identity: SourceRef (the entrypoint
+// file or the external image reference) is used only for source/image and
+// entry-command resolution and for comparing the desired IMPLEMENTATION, so a
+// service keeps its identity (and therefore its replacement pairing) when its
+// source changes, and two distinct names may reference the same source.
 type Service struct {
+	// Name is the service's stable identity within the function. It follows
+	// the same conservative name rule as a function name
+	// ([a-z0-9][a-z0-9._-]*, <= 63 chars, no trailing '.'), is mandatory, and
+	// is unique among the function's services.
+	Name string
 	// Entrypoint is the runtime-managed entrypoint source: an application
 	// entrypoint file (e.g. "service.js" or "app/main.py"), a relative path
 	// inside the application directory, NOT the module.function handler form.
@@ -243,9 +258,9 @@ func (s Service) Source() ServiceSource {
 
 // SourceRef returns the configured source's descriptor: the entrypoint file or
 // the external image reference. It is the value that identifies the source
-// bytes, and it is also the service's stable identity — the container grouping
-// key, routing id input, and persisted key (see Service's type comment).
-// Callers derive identity from this, never from a separate field.
+// bytes; the service's stable IDENTITY is Service.Name. Callers resolve an
+// image/entry-command from this and compare desired implementations with it —
+// never to group or identify a service.
 func (s Service) SourceRef() string {
 	if s.Source() == ServiceSourceImage {
 		return s.Image
@@ -500,6 +515,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Retries any `yaml:"retries"`
 		} `yaml:"events"`
 		Schedules []struct {
+			Name     string `yaml:"name"`
 			Handler  string `yaml:"handler"`
 			Cron     string `yaml:"cron"`
 			Timezone string `yaml:"timezone"`
@@ -511,6 +527,7 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			Retries any `yaml:"retries"`
 		} `yaml:"schedules"`
 		Services []struct {
+			Name       string `yaml:"name"`
 			Entrypoint string `yaml:"entrypoint"`
 			// Image is the optional external image source reference. Exactly one
 			// of Entrypoint/Image must be set.
@@ -630,49 +647,66 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 	}
 
 	// Parse and validate the optional cron schedules. Each entry requires a
-	// handler (module.function) and a minute-granularity cron expression
-	// (5-field or calendar descriptor; seconds/`@every` rejected — see
-	// validateCron). The timezone is optional (defaults to UTC); the timeout
-	// follows the same rules as event rules. Schedules are optional — a template
-	// with events and no schedules key parses exactly as before.
+	// stable NAME (the schedule identity), a handler (module.function) and a
+	// minute-granularity cron expression (5-field or calendar descriptor;
+	// seconds/`@every` rejected — see validateCron). The timezone is optional
+	// (defaults to UTC); the timeout follows the same rules as event rules.
+	// Names must be unique within a function: the occurrence identity is
+	// (function, schedule name, scheduled instant), so two schedules sharing a
+	// name could not be addressed independently. Multiple schedules MAY share a
+	// handler — they are distinct schedules at different times. Schedules are
+	// optional — a template with events and no schedules key parses exactly as
+	// before.
+	seenScheduleNames := make(map[string]bool, len(raw.Schedules))
 	for _, s := range raw.Schedules {
+		if s.Name == "" {
+			return nil, fmt.Errorf("schedule is missing a name")
+		}
+		if err := validServiceScheduleName("schedule", s.Name); err != nil {
+			return nil, err
+		}
+		if seenScheduleNames[s.Name] {
+			return nil, fmt.Errorf("duplicate schedule name %q: each schedule name may be declared only once per function", s.Name)
+		}
+		seenScheduleNames[s.Name] = true
 		if s.Handler == "" {
-			return nil, fmt.Errorf("schedule is missing a handler")
+			return nil, fmt.Errorf("schedule %q is missing a handler", s.Name)
 		}
 		if err := validateHandler(s.Handler); err != nil {
-			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+			return nil, fmt.Errorf("schedule %q: %w", s.Name, err)
 		}
 		if s.Cron == "" {
-			return nil, fmt.Errorf("schedule %q: cron is required", s.Handler)
+			return nil, fmt.Errorf("schedule %q: cron is required", s.Name)
 		}
 		// Timezone is a separate template field: an embedded TZ=/CRON_TZ=
 		// prefix would silently override it, so reject the ambiguity outright.
 		if strings.Contains(s.Cron, "TZ=") {
-			return nil, fmt.Errorf("schedule %q: cron expression must not embed TZ=/CRON_TZ=; use the timezone field", s.Handler)
+			return nil, fmt.Errorf("schedule %q: cron expression must not embed TZ=/CRON_TZ=; use the timezone field", s.Name)
 		}
 		loc := time.UTC
 		if s.Timezone != "" {
 			if s.Timezone == "Local" {
-				return nil, fmt.Errorf("schedule %q: timezone %q must be an IANA location", s.Handler, s.Timezone)
+				return nil, fmt.Errorf("schedule %q: timezone %q must be an IANA location", s.Name, s.Timezone)
 			}
 			l, err := time.LoadLocation(s.Timezone)
 			if err != nil {
-				return nil, fmt.Errorf("schedule %q: invalid timezone %q: %w", s.Handler, s.Timezone, err)
+				return nil, fmt.Errorf("schedule %q: invalid timezone %q: %w", s.Name, s.Timezone, err)
 			}
 			loc = l
 		}
 		timeout, err := resolveTimeout(s.Timeout)
 		if err != nil {
-			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+			return nil, fmt.Errorf("schedule %q: %w", s.Name, err)
 		}
 		retries, err := resolveRetries(s.Retries)
 		if err != nil {
-			return nil, fmt.Errorf("schedule %q: %w", s.Handler, err)
+			return nil, fmt.Errorf("schedule %q: %w", s.Name, err)
 		}
 		if err := validateCron(s.Cron, loc); err != nil {
-			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Handler, s.Cron, err)
+			return nil, fmt.Errorf("schedule %q: invalid cron expression %q: %w", s.Name, s.Cron, err)
 		}
 		t.Schedules = append(t.Schedules, Schedule{
+			Name:     s.Name,
 			Handler:  s.Handler,
 			Cron:     s.Cron,
 			Location: loc,
@@ -681,20 +715,33 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 		})
 	}
 
-	// Parse and validate the optional persistent services. Each entry requires
-	// EXACTLY ONE source: `entrypoint` (a runtime-managed application entrypoint
-	// file, e.g. "service.js" or "app/main.py", NOT the module.function
-	// event-handler form, so validateHandler is intentionally NOT applied) or
-	// `image` (an external image reference). The source descriptor is the
-	// service's identity: duplicates within the function would be ambiguous for
-	// reconciliation, so they are rejected. Port and replicas are optional with
-	// defaults (DefaultServicePort / DefaultServiceReplicas). Host and path are
-	// optional and independently omitted-preserving: an omitted/empty path
-	// leaves the service routed by host alone, and a path without a host is
-	// rejected. Services are optional — a template without the `services` key
-	// parses exactly as before.
-	seen := make(map[string]bool, len(raw.Services))
+	// Parse and validate the optional persistent services. Each entry requires a
+	// stable NAME (the service identity) and EXACTLY ONE source: `entrypoint` (a
+	// runtime-managed application entrypoint file, e.g. "service.js" or
+	// "app/main.py", NOT the module.function event-handler form, so
+	// validateHandler is intentionally NOT applied) or `image` (an external
+	// image reference). Names must be unique within a function: the container
+	// grouping, routing id, and persisted key are all derived from the name, so
+	// a duplicate name could not be addressed independently. Two names MAY share
+	// the same source descriptor — they are distinct services running the same
+	// implementation. Port and replicas are optional with defaults
+	// (DefaultServicePort / DefaultServiceReplicas). Host and path are optional
+	// and independently omitted-preserving: an omitted/empty path leaves the
+	// service routed by host alone, and a path without a host is rejected.
+	// Services are optional — a template without the `services` key parses
+	// exactly as before.
+	seenServiceNames := make(map[string]bool, len(raw.Services))
 	for _, s := range raw.Services {
+		if s.Name == "" {
+			return nil, fmt.Errorf("service is missing a name")
+		}
+		if err := validServiceScheduleName("service", s.Name); err != nil {
+			return nil, err
+		}
+		if seenServiceNames[s.Name] {
+			return nil, fmt.Errorf("duplicate service name %q: each service name may be declared only once per function", s.Name)
+		}
+		seenServiceNames[s.Name] = true
 		entrypoint, image := s.Entrypoint, s.Image
 		set := 0
 		for _, v := range []string{entrypoint, image} {
@@ -703,10 +750,10 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			}
 		}
 		if set == 0 {
-			return nil, fmt.Errorf("service is missing a source (entrypoint or image)")
+			return nil, fmt.Errorf("service %q is missing a source (entrypoint or image)", s.Name)
 		}
 		if set > 1 {
-			return nil, fmt.Errorf("service declares multiple sources: exactly one of entrypoint or image is allowed")
+			return nil, fmt.Errorf("service %q declares multiple sources: exactly one of entrypoint or image is allowed", s.Name)
 		}
 		// A source descriptor is a single whitespace-free token for every kind:
 		// an entrypoint is a path and an image reference is a registry
@@ -716,40 +763,37 @@ func parseTemplateWithClock(data []byte, now func() time.Time) (*Template, error
 			source = image
 		}
 		if strings.ContainsAny(source, " \t\r\n") {
-			return nil, fmt.Errorf("service %q: source contains whitespace", source)
+			return nil, fmt.Errorf("service %q: source contains whitespace", s.Name)
 		}
-		if seen[source] {
-			return nil, fmt.Errorf("duplicate service %q", source)
-		}
-		seen[source] = true
 		if image != "" {
 			if err := validateServiceImage(image); err != nil {
-				return nil, fmt.Errorf("service %q: %w", image, err)
+				return nil, fmt.Errorf("service %q: %w", s.Name, err)
 			}
 		}
 		port, err := resolveServicePort(s.Port)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", source, err)
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		replicas, err := resolveServiceReplicas(s.Replicas)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", source, err)
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		if err := validateServiceHost(s.Host); err != nil {
-			return nil, fmt.Errorf("service %q: %w", source, err)
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		// A configured path only makes sense with a host: PathPrefix alone is
 		// not an externally addressable route, and preserving the existing
 		// no-host behavior (an unrouted, label-free service) requires rejecting
 		// the combination rather than silently ignoring the path.
 		if s.Path != "" && s.Host == "" {
-			return nil, fmt.Errorf("service %q: path requires host", source)
+			return nil, fmt.Errorf("service %q: path requires host", s.Name)
 		}
 		path, err := canonicalizeServicePath(s.Path)
 		if err != nil {
-			return nil, fmt.Errorf("service %q: %w", source, err)
+			return nil, fmt.Errorf("service %q: %w", s.Name, err)
 		}
 		t.Services = append(t.Services, Service{
+			Name:       s.Name,
 			Entrypoint: entrypoint,
 			Image:      image,
 			Host:       s.Host,

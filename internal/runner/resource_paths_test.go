@@ -24,7 +24,8 @@ events:
     pattern:
       event_name: [INSERT]
 schedules:
-  - handler: index.run
+  - name: index.run
+    handler: index.run
     cron: "0 3 * * *"
 `
 	pf := invokeFn(t, "fn", tmpl, exec)
@@ -54,7 +55,7 @@ schedules:
 	// Schedule path (InvokeHandler, state-free form). The scheduled_at payload is
 	// what the scheduler publishes.
 	payload := []byte(`{"source":"relay.schedule","scheduled_at":"2026-09-28T00:00:00Z"}`)
-	if err := r.InvokeHandler(context.Background(), "2-0", "fn", "index.run", payload); err != nil {
+	if err := r.InvokeHandler(context.Background(), "2-0", "fn", "sched", "index.run", payload); err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}
 	if got := exec.gotPrepared(); got != shared {

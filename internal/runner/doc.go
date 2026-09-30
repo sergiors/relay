@@ -72,9 +72,11 @@
 // message directly to InvokeHandler, bypassing event matching. Schedules ride
 // the normal stream machinery: retry, backoff, exhaustion, DLQ, and
 // invocation-state semantics apply exactly like any other stream message. The
-// handler timeout is resolved from the function's CURRENT template (single
-// source of truth), so a hot-swapped template's new timeout applies to future
-// occurrences; the scheduled container is attributable via the relay.type=
+// schedule is resolved by its stable NAME from the function's CURRENT template
+// (single source of truth), and its current handler, timeout, and retries are
+// used, so a hot-swapped template under the same name applies to future
+// occurrences; a pending occurrence is obsolete only when its name is gone. The
+// scheduled container is attributable via the relay.type=
 // schedule label (message id stamped on relay.message_id). Handler execution
 // remains at-least-once.
 package runner
