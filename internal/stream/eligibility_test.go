@@ -159,6 +159,91 @@ func (f *fakeInvocationStore) tryStart(
 	return true, claim, 0, nil
 }
 
+// scheduleDescriptor models the reserved scheduleField read: a value that does
+// not decode is treated as absent, exactly like the real store.
+func (f *fakeInvocationStore) scheduleDescriptor(_ context.Context, _, _, _ string) (ScheduleDescriptor, bool, error) {
+	if f.readErr != nil {
+		return ScheduleDescriptor{}, false, f.readErr
+	}
+	desc, ok := decodeScheduleDescriptor(f.fields[scheduleField])
+	return desc, ok, nil
+}
+
+// tryStartScheduled models tryStartScheduledScript: it pins the supplied
+// descriptor only when none is pinned (atomically with the claim) and hands back
+// a pinned descriptor for adoption when the caller supplies a different one or
+// none. It mirrors the exact outcome codes so the InvocationState adoption loop
+// is exercised against the in-memory seam.
+func (f *fakeInvocationStore) tryStartScheduled(
+	_ context.Context,
+	_, _, _, invocation string,
+	now, deadline time.Time,
+	desc ScheduleDescriptor,
+	known bool,
+) (scheduleStartResult, error) {
+	if f.readErr != nil {
+		return scheduleStartResult{}, f.readErr
+	}
+	pinnedStr := f.fields[scheduleField]
+	pinned, hasPinned := decodeScheduleDescriptor(pinnedStr)
+	proposed := ""
+	if known {
+		proposed = encodeScheduleDescriptor(desc)
+	}
+	// replyDescriptor mirrors the script's "pinned or proposed" reply: the
+	// descriptor the reply carries, and whether the reply carries one at all.
+	replyDescriptor := func() (ScheduleDescriptor, bool) {
+		if hasPinned {
+			return pinned, true
+		}
+		if proposed != "" {
+			return desc, true
+		}
+		return ScheduleDescriptor{}, false
+	}
+	if f.terminalRetained() {
+		d, ok := replyDescriptor()
+		return scheduleStartResult{outcome: scheduleStartTerminal, pinned: d, hasPinned: ok}, nil
+	}
+	if hasPinned {
+		if proposed == "" || proposed != pinnedStr {
+			return scheduleStartResult{outcome: scheduleStartConflict, pinned: pinned, hasPinned: true}, nil
+		}
+	} else if proposed == "" {
+		return scheduleStartResult{outcome: scheduleStartNoAdmission}, nil
+	}
+	// Eligibility mirrors tryStart.
+	attempt := 0
+	if v, ok := f.fields[invocation]; ok {
+		kind, dl, n, parsed := parseInvocationState(v)
+		if parsed {
+			switch kind {
+			case kindComplete:
+				d, ok := replyDescriptor()
+				return scheduleStartResult{outcome: scheduleStartTerminal, pinned: d, hasPinned: ok}, nil
+			case kindExhausted:
+				d, ok := replyDescriptor()
+				return scheduleStartResult{outcome: scheduleStartTerminal, claim: InvocationClaim{Attempt: n}, pinned: d, hasPinned: ok}, nil
+			case kindRunning, kindNextAttempt:
+				if now.Before(dl) {
+					d, ok := replyDescriptor()
+					return scheduleStartResult{outcome: scheduleStartProtected, claim: InvocationClaim{Attempt: n}, wait: dl.Sub(now), pinned: d, hasPinned: ok}, nil
+				}
+				attempt = n
+			}
+		}
+	}
+	if !hasPinned {
+		f.fields[scheduleField] = proposed
+		pinned, hasPinned = desc, true
+	}
+	attempt++
+	token := f.nextToken()
+	claim := InvocationClaim{Attempt: attempt, Token: token}
+	f.fields[invocation] = runningValue(deadline, claim)
+	return scheduleStartResult{outcome: scheduleStartStarted, claim: claim, pinned: pinned, hasPinned: hasPinned}, nil
+}
+
 func (f *fakeInvocationStore) finishFailure(
 	_ context.Context,
 	_, _, _, invocation string,

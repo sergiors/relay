@@ -11,6 +11,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
@@ -766,4 +767,213 @@ func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
 	if !wasPending {
 		t.Fatalf("message must stay pending (never acked) while the function is temporarily unavailable")
 	}
+}
+
+// scheduleFnNamed builds a prepared function with ONE schedule whose stable NAME
+// is `name` and whose handler is `handler`, so a handler change under the SAME
+// name can be exercised end to end.
+func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, scheduleTimeout time.Duration, retries int) *PreparedFunction {
+	t.Helper()
+	return NewPrepared(
+		function.Function{
+			Name: scheduleFnName,
+			Template: &function.Template{
+				Runtime: "node24",
+				Schedules: []function.Schedule{{
+					Name:     name,
+					Handler:  handler,
+					Cron:     "0 3 * * *",
+					Location: time.UTC,
+					Timeout:  scheduleTimeout,
+					Retries:  retries,
+				}},
+			},
+		},
+		&runtime.Prepared{Name: scheduleFnName, Image: "x"},
+		exec,
+	)
+}
+
+// namedOcc builds an occurrence for a schedule NAME and envelope handler.
+func namedOcc(name, handler string, at time.Time) schedule.Occurrence {
+	return schedule.Occurrence{Function: scheduleFnName, Schedule: name, Handler: handler, ScheduledAt: at}
+}
+
+// stateFieldFor reads an arbitrary invocation field from a message's state hash.
+func (e *scheduleEnv) stateFieldFor(msgID, invocation string) (string, error) {
+	return e.client.HGet(context.Background(), e.invocationKey(msgID), invocation).Result()
+}
+
+// descriptorField reads the pinned schedule admission descriptor value.
+func (e *scheduleEnv) descriptorField(msgID string) (string, error) {
+	return e.client.HGet(context.Background(), e.invocationKey(msgID), "__schedule").Result()
+}
+
+// TestIntegrationScheduleAdmissionPinsCurrentHandlerBeforeStart pins the
+// pre-admission handler change end to end: the occurrence's envelope names a
+// STALE handler, but by the time the consumer runs, the template's schedule NAME
+// resolves to a NEW handler. The occurrence is admitted under the NEW handler and
+// its descriptor is pinned with it.
+func TestIntegrationScheduleAdmissionPinsCurrentHandlerBeforeStart(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := NewWithMetrics(
+		[]*PreparedFunction{scheduleFnNamed(t, "sched", "jobs.new", exec, time.Second, 0)},
+		testutil.DiscardLogger(), nil)
+	e := newScheduleEnv(t, r)
+	// Envelope carries the OLD handler under the SAME schedule name.
+	id := e.xadd(namedOcc("sched", "jobs.old", time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)))
+	e.start()
+
+	// Wait for the occurrence to be ADMITTED (descriptor pinned) and executed,
+	// before asserting the ACK: `pending` is also false before XREADGROUP reads
+	// the entry, so the execution marker is the real progress signal.
+	e.eventually("occurrence admitted and executed", func() bool {
+		if exec.count() != 1 {
+			return false
+		}
+		v, err := e.descriptorField(id)
+		return err == nil && v != ""
+	})
+	e.eventually("occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	v, err := e.descriptorField(id)
+	if err != nil {
+		t.Fatalf("read pinned descriptor: %v", err)
+	}
+	desc, ok := streamDecodeDescriptor(t, v)
+	if !ok {
+		t.Fatalf("descriptor %q did not decode", v)
+	}
+	if desc.Handler != "jobs.new" {
+		t.Fatalf("pinned handler = %q, want the CURRENT template handler jobs.new", desc.Handler)
+	}
+	if desc.Schedule != "sched" {
+		t.Fatalf("pinned schedule = %q, want sched", desc.Schedule)
+	}
+}
+
+// TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes pins the
+// post-admission removal end to end: an occurrence's first attempt fails (so the
+// descriptor is pinned and a retry is scheduled), then the schedule NAME is
+// REMOVED from the template while the message is pending. The reclaim must still
+// run the ADMITTED handler and complete — never treat the admitted occurrence as
+// obsolete.
+func TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes(t *testing.T) {
+	_ = redisAvailable(t)
+	failing := &firstFailExecutor{failFirst: 1}
+	// retries: 4 so the first failure is retryable (does not exhaust).
+	r := NewWithMetrics(
+		[]*PreparedFunction{scheduleFnNamed(t, "sched", scheduleHandler, failing, time.Second, 4)},
+		testutil.DiscardLogger(), nil)
+	e := newScheduleEnv(t, r)
+	id := e.xadd(namedOcc("sched", scheduleHandler, time.Date(2026, 9, 2, 9, 0, 0, 0, time.UTC)))
+	e.start()
+
+	// First delivery fails: the descriptor is pinned and a next_attempt_at marker
+	// is recorded for the admitted handler.
+	e.eventually("first attempt failed and descriptor pinned", func() bool {
+		v, err := e.stateFieldFor(id, scheduleFnName+"/"+scheduleHandler)
+		if err != nil || !strings.HasPrefix(v, "next_attempt_at:") {
+			return false
+		}
+		_, derr := e.descriptorField(id)
+		return derr == nil
+	})
+
+	// Remove the schedule NAME from the template, and force the pending retry to
+	// be eligible NOW (delete the backoff marker) so a reclaim runs immediately.
+	r.Registry().Replace(scheduleFnName, NewPrepared(
+		function.Function{
+			Name: scheduleFnName,
+			Template: &function.Template{
+				Runtime: "node24",
+				// No Schedules: the admitted name is gone.
+			},
+		},
+		&runtime.Prepared{Name: scheduleFnName, Image: "x"},
+		failing,
+	))
+	if err := e.client.HDel(context.Background(), e.invocationKey(id), scheduleFnName+"/"+scheduleHandler).Err(); err != nil {
+		t.Fatalf("hdel state: %v", err)
+	}
+
+	e.eventually("admitted occurrence completes after its schedule was removed", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := failing.count(); got < 2 {
+		t.Fatalf("executor calls = %d, want >= 2 (admitted retry ran)", got)
+	}
+	if e.inDlq(id) {
+		t.Fatal("an admitted occurrence must not be dead-lettered")
+	}
+}
+
+// firstFailExecutor fails the first failFirst calls and then succeeds, counting
+// every call.
+type firstFailExecutor struct {
+	mu        sync.Mutex
+	calls     int
+	failFirst int
+}
+
+func (e *firstFailExecutor) Execute(context.Context, *runtime.Prepared, string, []byte, []string) error {
+	e.mu.Lock()
+	n := e.calls
+	e.calls++
+	e.mu.Unlock()
+	if n < e.failFirst {
+		return fmt.Errorf("injected failure")
+	}
+	return nil
+}
+
+func (e *firstFailExecutor) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+// streamDecodeDescriptor decodes a pinned descriptor value using the stream
+// package's grammar through its exported round-trip: encode/decode are
+// unexported, so this reconstructs the fields by parsing the known layout.
+func streamDecodeDescriptor(t *testing.T, v string) (streamScheduleDescriptor, bool) {
+	t.Helper()
+	parts := strings.Split(v, ":")
+	if len(parts) != 5 || parts[0] != "sd1" {
+		return streamScheduleDescriptor{}, false
+	}
+	timeoutMs, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return streamScheduleDescriptor{}, false
+	}
+	retries, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return streamScheduleDescriptor{}, false
+	}
+	schedule, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return streamScheduleDescriptor{}, false
+	}
+	handler, err := base64.RawURLEncoding.DecodeString(parts[4])
+	if err != nil {
+		return streamScheduleDescriptor{}, false
+	}
+	return streamScheduleDescriptor{
+		Schedule: string(schedule),
+		Handler:  string(handler),
+		Timeout:  time.Duration(timeoutMs) * time.Millisecond,
+		Retries:  retries,
+	}, true
+}
+
+// streamScheduleDescriptor mirrors the stream package's descriptor for assertions.
+type streamScheduleDescriptor struct {
+	Schedule string
+	Handler  string
+	Timeout  time.Duration
+	Retries  int
 }

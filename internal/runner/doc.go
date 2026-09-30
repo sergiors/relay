@@ -71,12 +71,23 @@
 // (atomic publish-if-new), and the consumer routes that single schedule
 // message directly to InvokeHandler, bypassing event matching. Schedules ride
 // the normal stream machinery: retry, backoff, exhaustion, DLQ, and
-// invocation-state semantics apply exactly like any other stream message. The
-// schedule is resolved by its stable NAME from the function's CURRENT template
-// (single source of truth), and its current handler, timeout, and retries are
-// used, so a hot-swapped template under the same name applies to future
-// occurrences; a pending occurrence is obsolete only when its name is gone. The
-// scheduled container is attributable via the relay.type=
-// schedule label (message id stamped on relay.message_id). Handler execution
-// remains at-least-once.
+// invocation-state semantics apply exactly like any other stream message.
+//
+// Schedule admission boundary: BEFORE ADMISSION an occurrence resolves the
+// function's CURRENT template by its stable schedule NAME on every delivery, so
+// a handler/timeout/retries change under the same name applies and the name's
+// current handler runs; a removed NAME with nothing admitted yet is obsolete.
+// Because an occurrence may block for a long time waiting for a concurrency
+// slot, that config snapshot is refreshed from the registry AFTER the slot is
+// admitted and immediately before the atomic first claim, so a reload completed
+// during the wait is observed. AT ADMISSION the first successful claim atomically
+// pins an immutable ScheduleDescriptor (schedule name, handler, CAPPED timeout,
+// retry budget) in the message's invocation-state hash, so concurrent replicas —
+// or a reload racing the post-slot refresh — cannot diverge: the Redis
+// first-writer wins and every other delivery adopts the pinned descriptor.
+// AFTER ADMISSION the pinned descriptor is the single source of truth even if the
+// schedule was renamed, retimed, or removed, so an admitted invocation completes
+// its retry/DLQ lifecycle instead of being cancelled by a config change. The
+// schedule name remains the occurrence/dedup identity; invocation/DLQ
+// attribution stays handler-based. Handler execution remains at-least-once.
 package runner

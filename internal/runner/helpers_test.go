@@ -497,7 +497,12 @@ type fakeInvocationState struct {
 	// startErr, when non-nil, is returned by TryStart so the ambiguous-claim
 	// (leave pending, no handler execution) path is exercisable.
 	startErr error
-	now      func() time.Time
+	// scheduleDesc is the pinned schedule admission descriptor for this message,
+	// or nil when none is pinned. It models the reserved scheduleField: it is
+	// written once, atomically with the first successful schedule admission, and
+	// is never changed while the message is recoverable.
+	scheduleDesc *stream.ScheduleDescriptor
+	now          func() time.Time
 	// failures records the backoff passed to RecordFailure, for tests to assert
 	// the retry schedule.
 	failures []time.Duration
@@ -595,6 +600,76 @@ func (p *fakeInvocationState) TryStart(invocation string, timeout time.Duration)
 	p.claimTokens[invocation] = token
 	p.running[invocation] = p.now().Add(timeout)
 	return true, stream.InvocationClaim{Attempt: attempt, Token: token}, 0, nil
+}
+
+// ScheduleDescriptor returns the pinned schedule admission descriptor, or
+// ok=false when none is pinned, mirroring the reserved scheduleField read.
+func (p *fakeInvocationState) ScheduleDescriptor() (stream.ScheduleDescriptor, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.scheduleDesc == nil {
+		return stream.ScheduleDescriptor{}, false
+	}
+	return *p.scheduleDesc, true
+}
+
+// TryStartScheduled models the atomic schedule admission: it pins the caller's
+// descriptor on the first successful admission (only if none is pinned), and
+// adopts a descriptor already pinned by another delivery. It mirrors the real
+// handle's bounded adoption loop, including the conflict/adopt path, so runner
+// tests exercise the same single-winner semantics.
+func (p *fakeInvocationState) TryStartScheduled(
+	desc stream.ScheduleDescriptor,
+	known bool,
+	invocationFor func(stream.ScheduleDescriptor) string,
+) (stream.ScheduleAdmission, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.startErr != nil {
+		return stream.ScheduleAdmission{}, p.startErr
+	}
+	if p.scheduleDesc != nil {
+		// A descriptor is pinned by an earlier delivery: it always wins. If the
+		// caller does not supply exactly it, adopt it and retry with it.
+		if !known || *p.scheduleDesc != desc {
+			desc = *p.scheduleDesc
+			known = true
+		}
+	}
+	if !known {
+		// Nothing is pinned and the caller has no descriptor: obsolete.
+		return stream.ScheduleAdmission{Obsolete: true}, nil
+	}
+	invocation := invocationFor(desc)
+	// Reuse the TryStart marker semantics (complete/exhausted/protected/eligible).
+	if p.done[invocation] {
+		return stream.ScheduleAdmission{Claim: stream.InvocationClaim{}, Descriptor: desc}, nil
+	}
+	if n, ok := p.exhausted[invocation]; ok {
+		return stream.ScheduleAdmission{Claim: stream.InvocationClaim{Attempt: n}, Descriptor: desc}, nil
+	}
+	if dl, ok := p.running[invocation]; ok && p.now().Before(dl) {
+		return stream.ScheduleAdmission{Claim: stream.InvocationClaim{Attempt: p.attempts[invocation]}, Wait: dl.Sub(p.now()), Descriptor: desc}, nil
+	}
+	if dl, ok := p.nextAt[invocation]; ok && p.now().Before(dl) {
+		return stream.ScheduleAdmission{Claim: stream.InvocationClaim{Attempt: p.attempts[invocation]}, Wait: dl.Sub(p.now()), Descriptor: desc}, nil
+	}
+	// Eligible: pin (first admission) and claim.
+	if p.scheduleDesc == nil {
+		pinned := desc
+		p.scheduleDesc = &pinned
+	}
+	attempt := p.attempts[invocation] + 1
+	p.attempts[invocation] = attempt
+	p.tokenSeq++
+	token := fmt.Sprintf("tok-%d", p.tokenSeq)
+	p.claimTokens[invocation] = token
+	p.running[invocation] = p.now().Add(desc.Timeout)
+	return stream.ScheduleAdmission{
+		Started:    true,
+		Claim:      stream.InvocationClaim{Attempt: attempt, Token: token},
+		Descriptor: desc,
+	}, nil
 }
 
 // RecordFailure records the retry backoff for a failed attempt, gating the

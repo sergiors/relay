@@ -70,8 +70,10 @@ the absolute instant normalized to **UTC**, never from a timezone representation
 The configured timezone therefore affects **when** a schedule fires, never the
 identity, so DST and offset changes cannot split or merge occurrences. The
 handler is not part of the identity: a handler change under the same schedule
-name keeps the same occurrence id and the next delivery runs the name's current
-handler (occurrences are at-least-once).
+name keeps the same occurrence id, and the next **not-yet-admitted** delivery
+runs the name's current handler (occurrences are at-least-once; see
+[Live changes](#live-changes) for the admission boundary that freezes an
+admitted occurrence's handler/timeout/retries).
 
 The due instant is derived from the schedule as the latest occurrence at or
 before the callback time (using the same parser semantics used for
@@ -130,11 +132,37 @@ when another schedule shares its handler; removing one name never obsoletes
 another. Already published occurrences are not purged from Redis; they expire via
 the dedup TTL and stream retention.
 
-An occurrence still pending when its function or its **schedule name** is removed
-is treated as **obsolete**: it is acknowledged (terminal) rather than retried
-forever or dead-lettered, because its removal was an intentional configuration
-change. A handler change under the same name is **not** obsolete — the next
-delivery runs the name's current handler.
+An occurrence still pending when its function or schedule is removed is
+treated as **obsolete** if it has not yet been admitted: it is acknowledged
+as terminal rather than retried forever or dead-lettered, because the
+referenced configuration was intentionally removed.
+
+A schedule is resolved by its stable **name**, and its execution contract is
+frozen at the occurrence's **first successful admission**:
+
+- **Before admission** (the message has never been claimed), every delivery
+  resolves the **current** template by name. A handler change under the same
+  name is **not** obsolete — the next delivery uses the schedule's current
+  handler, timeout, and retry configuration. If the schedule name no longer
+  exists and the occurrence has never been admitted, the occurrence is
+  obsolete and is acknowledged.
+- **At admission**, the first claim atomically pins an immutable execution
+  descriptor — schedule name, admitted handler, capped timeout, and retry
+  budget — alongside the per-invocation state. Concurrent replicas cannot
+  independently admit different executions: exactly one descriptor wins, and
+  subsequent deliveries adopt it.
+- **After admission**, the pinned descriptor is authoritative for that
+  invocation. Later changes to the handler, timeout, or retry budget — or
+  removal of the schedule name entirely — do not reset the claim or attempts
+  and do not cancel the invocation. It completes its retry, backoff, ACK, or
+  DLQ lifecycle under the contract with which it was admitted.
+
+The handler is not part of the schedule occurrence identity. Occurrences are
+identified by the schedule resource, while execution remains tied to the
+`function/handler` invocation that was actually admitted and run. The pinned
+descriptor preserves the admitted schedule context and execution contract;
+per-invocation state and DLQ attribution remain keyed by that
+`function/handler`.
 
 ## The guarantee
 

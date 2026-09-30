@@ -55,7 +55,13 @@
 //     after a successful ACK (success, obsolete schedule, or DLQ) does the state
 //     switch to terminal retention (a reserved marker plus the ~7-day
 //     invocationRetentionTTL) so a stale in-memory delivery can neither mutate
-//     nor resurrect it
+//     nor resurrect it. A schedule occurrence additionally pins an immutable
+//     admission descriptor under the reserved "__schedule" field, atomically
+//     with its first successful claim (see ScheduleDescriptor and
+//     TryStartScheduled), so the handler/timeout/retries it was admitted under
+//     are stable through retry/reclaim/DLQ even if the schedule is later changed
+//     or removed; the descriptor is a sibling field, never an invocation ID, and
+//     it is never a DLQ/attribution key.
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and

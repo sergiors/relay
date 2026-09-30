@@ -14,6 +14,8 @@ package stream
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -951,4 +953,253 @@ func TestIntegrationAtomicStoreFailureKeepsMessagePendingAndSkipsHandler(t *test
 	if n := executed.Load(); n != 0 {
 		t.Fatalf("handler executed %d times despite the claim error; want 0", n)
 	}
+}
+
+// pinnedDescriptor reads the reserved scheduleField value from a message's
+// invocation-state hash ("" when absent).
+func pinnedDescriptor(t *testing.T, cli *redis.Client, stream, group, msgID string) string {
+	t.Helper()
+	v, err := cli.HGet(context.Background(), invocationStateKey(stream, group, msgID), scheduleField).Result()
+	if err == redis.Nil {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("hget schedule field: %v", err)
+	}
+	return v
+}
+
+// TestIntegrationAtomicScheduleAdmissionExactlyOneWinner drives many simultaneous
+// schedule admissions for the same message through separate Redis clients
+// (simulating replicas with potentially different templates), each proposing a
+// DIFFERENT descriptor. Exactly one proposal is pinned, every other caller adopts
+// it, exactly one handler's invocation field is ever claimed, and a subsequent
+// admission with the winning descriptor is protected (not a second start).
+func TestIntegrationAtomicScheduleAdmissionExactlyOneWinner(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	_, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+
+	// Each caller proposes a handler that identifies it, so we can assert exactly
+	// one handler field is claimed.
+	const n = 12
+	clients := make([]*redis.Client, n)
+	for i := range clients {
+		c := redis.NewClient(&redis.Options{Addr: cli.Options().Addr})
+		clients[i] = c
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	stores := make([]invocationStateStore, n)
+	for i := range stores {
+		stores[i] = &invocationStore{client: clients[i]}
+	}
+
+	now := time.Now()
+	start := make(chan struct{})
+	type result struct {
+		res scheduleStartResult
+		err error
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			desc := ScheduleDescriptor{
+				Schedule: "cleanup",
+				Handler:  fmt.Sprintf("jobs.h%d", i),
+				Timeout:  30 * time.Second,
+				Retries:  4,
+			}
+			res, err := stores[i].tryStartScheduled(ctx, stream, group, msgID, "fn/"+desc.Handler, now, now.Add(desc.Timeout), desc, true)
+			results[i] = result{res, err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	started := 0
+	var winner ScheduleDescriptor
+	winnerField := ""
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("caller %d: %v", i, r.err)
+		}
+		if !r.res.hasPinned {
+			t.Fatalf("caller %d: no pinned descriptor in the reply", i)
+		}
+		if r.res.pinned.Schedule != "cleanup" {
+			t.Fatalf("caller %d: pinned schedule = %q", i, r.res.pinned.Schedule)
+		}
+		if r.res.outcome == scheduleStartStarted {
+			started++
+			winner = r.res.pinned
+			winnerField = "fn/" + r.res.pinned.Handler
+		}
+	}
+	if started != 1 {
+		t.Fatalf("started callers = %d, want exactly 1", started)
+	}
+	// The persisted descriptor is the winner's.
+	got := pinnedDescriptor(t, cli, stream, group, msgID)
+	if got != encodeScheduleDescriptor(winner) {
+		t.Fatalf("persisted descriptor = %q, want the winner's %q", got, encodeScheduleDescriptor(winner))
+	}
+	// Exactly the winner's invocation field exists; no parallel handler field.
+	fields, err := cli.HKeys(ctx, invocationStateKey(stream, group, msgID)).Result()
+	if err != nil {
+		t.Fatalf("hkeys: %v", err)
+	}
+	var invocationFields []string
+	for _, f := range fields {
+		if f != scheduleField {
+			invocationFields = append(invocationFields, f)
+		}
+	}
+	if len(invocationFields) != 1 || invocationFields[0] != winnerField {
+		t.Fatalf("claimed invocation fields = %v, want [%s]", invocationFields, winnerField)
+	}
+}
+
+// TestIntegrationAtomicScheduleAdmissionAdoptsPinnedWithoutReclaim pins the
+// adopt-without-claim contract: once a descriptor is pinned, a delivery with no
+// descriptor (its schedule was removed) adopts it and, while the invocation is
+// protected, does not re-claim. Only the pinned handler's field is ever written.
+func TestIntegrationAtomicScheduleAdmissionAdoptsPinnedWithoutReclaim(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	now := time.Now()
+
+	pinned := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: time.Hour, Retries: 4}
+	first, err := store.tryStartScheduled(ctx, stream, group, msgID, "fn/jobs.old", now, now.Add(pinned.Timeout), pinned, true)
+	if err != nil || first.outcome != scheduleStartStarted {
+		t.Fatalf("first admission = (%+v,%v), want started", first, err)
+	}
+
+	// A delivery that can no longer resolve the schedule (known=false) is told to
+	// adopt the pinned descriptor; after adopting it, the delivery is protected
+	// (the invocation is still in flight) and does not re-claim.
+	adopt, err := store.tryStartScheduled(ctx, stream, group, msgID, "", now, now, ScheduleDescriptor{}, false)
+	if err != nil {
+		t.Fatalf("adopt admission: %v", err)
+	}
+	if adopt.outcome != scheduleStartConflict || !adopt.hasPinned || adopt.pinned.Handler != "jobs.old" {
+		t.Fatalf("adopt outcome = (%v,%+v), want conflict on the pinned jobs.old", adopt.outcome, adopt.pinned)
+	}
+	second, err := store.tryStartScheduled(ctx, stream, group, msgID, "fn/jobs.old", now, now, adopt.pinned, true)
+	if err != nil {
+		t.Fatalf("second admission: %v", err)
+	}
+	if second.outcome != scheduleStartProtected {
+		t.Fatalf("second outcome = %v, want protected (adopted, not started)", second.outcome)
+	}
+	if !second.hasPinned || second.pinned.Handler != "jobs.old" {
+		t.Fatalf("adopted descriptor = %+v, want the pinned jobs.old", second.pinned)
+	}
+	// Only the pinned handler's field exists.
+	fields, err := cli.HKeys(ctx, invocationStateKey(stream, group, msgID)).Result()
+	if err != nil {
+		t.Fatalf("hkeys: %v", err)
+	}
+	for _, f := range fields {
+		if f != scheduleField && f != "fn/jobs.old" {
+			t.Fatalf("unexpected invocation field %q (parallel handler claimed)", f)
+		}
+	}
+}
+
+// TestIntegrationAtomicScheduleAdmissionNoDescriptorNoProposalObsolete pins the
+// never-admitted-removed case against real Redis: no descriptor pinned + no
+// proposal reports no-admission and writes nothing.
+func TestIntegrationAtomicScheduleAdmissionNoDescriptorNoProposalObsolete(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+
+	res, err := store.tryStartScheduled(ctx, stream, group, msgID, "", time.Now(), time.Now(), ScheduleDescriptor{}, false)
+	if err != nil {
+		t.Fatalf("tryStartScheduled: %v", err)
+	}
+	if res.outcome != scheduleStartNoAdmission {
+		t.Fatalf("outcome = %v, want no-admission", res.outcome)
+	}
+	if n, err := cli.Exists(ctx, invocationStateKey(stream, group, msgID)).Result(); err != nil || n != 0 {
+		t.Fatalf("obsolete admission wrote state: exists=%d err=%v", n, err)
+	}
+}
+
+// TestIntegrationAtomicScheduleDescriptorSurvivesRetentionAndStaysImmutable pins
+// the descriptor's lifetime on the real store: it is written atomically with the
+// first claim, it is immutable while recoverable (a different proposal adopts and
+// does not overwrite), and after the message leaves the PEL the hash retains it
+// under the terminal-retention TTL, where a stale admission neither re-pins nor
+// re-opens the invocation.
+func TestIntegrationAtomicScheduleDescriptorSurvivesRetentionAndStaysImmutable(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	now := time.Now()
+
+	pinned := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.old", Timeout: time.Hour, Retries: 4}
+	if _, err := store.tryStartScheduled(ctx, stream, group, msgID, "fn/jobs.old", now, now.Add(pinned.Timeout), pinned, true); err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	// Immutable: a different proposal adopts the pinned one and does not overwrite.
+	other := ScheduleDescriptor{Schedule: "cleanup", Handler: "jobs.new", Timeout: time.Minute, Retries: 0}
+	res, err := store.tryStartScheduled(ctx, stream, group, msgID, "fn/jobs.new", now, now.Add(other.Timeout), other, true)
+	if err != nil {
+		t.Fatalf("conflicting admission: %v", err)
+	}
+	if res.outcome != scheduleStartConflict || res.pinned.Handler != "jobs.old" {
+		t.Fatalf("conflict = (%v,%+v), want conflict on jobs.old", res.outcome, res.pinned)
+	}
+	if got := pinnedDescriptor(t, cli, stream, group, msgID); got != encodeScheduleDescriptor(pinned) {
+		t.Fatalf("descriptor overwritten: %q, want %q", got, encodeScheduleDescriptor(pinned))
+	}
+	// Complete the running marker, ACK-retain, then a stale delivery: the
+	// descriptor stays readable and the terminal-retained hash is never reopened.
+	running := marker(t, cli, stream, group, msgID, "fn/jobs.old")
+	claim := InvocationClaim{Attempt: markerAttemptOf(t, running), Token: activeToken(running)}
+	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/jobs.old", claim); err != nil || !ok {
+		t.Fatalf("markComplete = (%v,%v)", ok, err)
+	}
+	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+		t.Fatalf("retainTerminal: %v", err)
+	}
+	if got := pinnedDescriptor(t, cli, stream, group, msgID); got != encodeScheduleDescriptor(pinned) {
+		t.Fatalf("descriptor after retention = %q, want the pinned one", got)
+	}
+	stale, err := store.tryStartScheduled(ctx, stream, group, msgID, "", time.Now(), time.Now(), ScheduleDescriptor{}, false)
+	if err != nil {
+		t.Fatalf("stale admission: %v", err)
+	}
+	if stale.outcome != scheduleStartTerminal {
+		t.Fatalf("stale outcome = %v, want terminal (never re-opened)", stale.outcome)
+	}
+}
+
+// markerAttemptOf extracts the attempt number from a well-formed active marker
+// ("running|next_attempt_at:<deadline>:<attempt>:<token>"). It returns 0 when the
+// marker cannot be parsed.
+func markerAttemptOf(t *testing.T, v string) int {
+	t.Helper()
+	rest := ""
+	switch {
+	case strings.HasPrefix(v, "running:"):
+		rest = strings.TrimPrefix(v, "running:")
+	case strings.HasPrefix(v, "next_attempt_at:"):
+		rest = strings.TrimPrefix(v, "next_attempt_at:")
+	default:
+		t.Fatalf("marker %q is not an active marker", v)
+	}
+	_, rest, _ = strings.Cut(rest, ":")
+	attemptStr, _, _ := strings.Cut(rest, ":")
+	n, err := strconv.Atoi(attemptStr)
+	if err != nil {
+		t.Fatalf("marker %q attempt parse: %v", v, err)
+	}
+	return n
 }

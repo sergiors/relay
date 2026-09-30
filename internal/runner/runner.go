@@ -1918,44 +1918,57 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 }
 
 // InvokeHandler executes a single schedule-occurrence invocation routed through
-// the stream. The handler's timeout is read from the function's current
-// template (single source of truth), capped at the configured maximum exactly
-// like Handle caps rule timeouts, and passed BOTH to TryStart and to
-// context.WithTimeout so the persisted running deadline matches the local kill
-// timer.
+// the stream. Its admission boundary is deliberate and documented here:
 //
-// The schedule is resolved by its STABLE NAME, never by handler: scheduleName is
-// looked up in the function's current template, and the schedule's CURRENT
-// handler, timeout, and retries are used. A handler change under the same name
-// therefore takes effect on the next delivery (the occurrence is at-least-once,
-// so it runs the name's current handler), and a pending occurrence is obsolete
-// only when its SCHEDULE NAME is gone — removing one schedule never obsoletes
-// another that shares its handler. When scheduleName is empty (the state-free
-// DLQ-replay path, which knows only a recorded function/handler), resolution
-// falls back to the first schedule entry matching the handler, then to that
-// exact event rule (never event matching).
+// BEFORE ADMISSION (no descriptor pinned for the message): the occurrence
+// resolves the CURRENT template by its STABLE schedule NAME on every delivery, so
+// a handler/timeout/retries change under the same name takes effect and the
+// name's current handler is what runs. Because an occurrence may block for a long
+// time waiting for a concurrency slot, this config snapshot is refreshed from the
+// registry AFTER the slot is admitted and immediately before the atomic first
+// claim, so a reload that completed during the wait is observed. A missing NAME
+// means the schedule was removed while the occurrence was pending; if nothing was
+// ever pinned the occurrence is OBSOLETE, and — with invocation state — the
+// stream ACKs it (never retried, never dead-lettered).
 //
-// It reuses the exact event execution path: registry snapshot lookup, the
-// global + per-function concurrency slots, per-invocation secret resolution, the
-// panic boundary, and the same handler metrics.
+// AT ADMISSION (the first successful claim): the resolved descriptor — schedule
+// name, handler, the CAPPED timeout, and the retry budget — is pinned ATOMICALLY
+// with the claim (stream.InvocationState.TryStartScheduled), so a concurrent
+// replica with a different template, or a reload racing the post-slot refresh,
+// can never diverge: exactly one descriptor wins and every other delivery adopts
+// it. Redis is therefore the global first-writer: a reload concurrent with that
+// atomic first claim is treated as a competing proposal, and whichever descriptor
+// the script persists is authoritative.
 //
-// InvokeHandler participates in the SAME per-invocation invocation-state
-// lifecycle as Handle: when the stream injects an InvocationState into ctx
-// (via stream.WithInvocationState), it reserves concurrency slots before
-// TryStart (a slot timeout is never an attempt and persists no state), claims
-// the "<function>/<handler>" invocation with TryStart using the capped timeout,
-// skips already-complete redeliveries (stream ACKs), leaves pending under a
-// protected running/backoff marker, marks the invocation complete on success
-// (before the success metrics), and on failure drives recordFailure for the
-// retry-backoff/exhaustion decision from the template's schedule Retries. The
-// stream layer (via ConsumerConfig.ScheduleRunner) drives retry, backoff,
-// invocation state, and DLQ around this single invocation.
+// AFTER ADMISSION (a descriptor is pinned): the descriptor is the single source
+// of truth. The pinned handler, timeout, and retries are used EVEN IF the current
+// schedule was renamed, retimed, or REMOVED, so an admitted invocation completes
+// its retry/DLQ lifecycle instead of being cancelled by a config change. The
+// schedule name remains the occurrence/dedup identity, but a pinned message no
+// longer consults the current template for execution.
+//
+// The handler timeout is capped at the configured maximum exactly like Handle
+// caps rule timeouts, and the CAPPED value is passed BOTH to admission (persisted
+// as the running deadline) and to context.WithTimeout so the persisted deadline
+// matches the local kill timer. The capped value is what the descriptor pins, so
+// it stays stable across attempts.
+//
+// It reuses the exact event execution path: registry snapshot lookup, the global
+// + per-function concurrency slots, per-invocation secret resolution, the panic
+// boundary, and the same handler metrics. Invocation/DLQ attribution stays
+// handler-based ("<function>/<handler>"); the descriptor adds schedule provenance
+// only.
+//
+// When scheduleName is empty (the state-free DLQ-replay path, which knows only a
+// recorded function/handler), resolution falls back to the first schedule entry
+// matching the handler, then to that exact event rule (never event matching), and
+// the no-state path executes a single attempt exactly as before.
 func (r *Runner) InvokeHandler(
 	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
 ) error {
 	// Invocation state (when present) distinguishes the production stream path
-	// from direct callers/tests: obsolete-removal is only treated as terminal
-	// on the production path. See the availability checks below.
+	// from direct callers/tests: obsolete-removal and descriptor pinning only
+	// apply on the production path. See the availability checks below.
 	invState, hasState := stream.InvocationStateFrom(ctx)
 
 	// Find the function in the current registry. GetByName returns nil only when
@@ -1965,18 +1978,23 @@ func (r *Runner) InvokeHandler(
 	//   - absent (removed): an intentional configuration change, so an occurrence
 	//     for it is OBSOLETE and terminal (ACKed, never retried/DLQ'd) — but only
 	//     on the production state-carrying path; direct callers/tests keep the
-	//     legacy plain error.
+	//     legacy plain error. This holds even for an already-admitted occurrence:
+	//     with no function there is no image or executor to run, so it cannot
+	//     complete. (The schedule NAME, not the function, is what admission pins;
+	//     a still-present function whose schedule was removed is NOT obsolete once
+	//     admitted — see the descriptor path below.)
 	//   - present but unavailable: temporary (build failed at startup/reconcile),
 	//     retryable exactly as today.
 	//
 	// The lookup PINS the function's published image (a share of its publication
 	// lease, acquired under the registry lock), held until this invocation
 	// returns, so a concurrent retirement cannot remove the image between this
-	// lookup and the handler's execution.
+	// lookup and the handler's execution. An UNADMITTED schedule occurrence
+	// re-reads the current entry after the slot wait below and swaps in that
+	// entry's pin (see the refresh there); the closure releases whichever lease
+	// `pin` holds at return, so the stale lookup's lease is not leaked.
 	pf, pin := r.reg.getByNamePinned(fnName)
-	if pin != nil {
-		defer pin.Release()
-	}
+	defer func() { pin.Release() }()
 	if pf == nil {
 		if hasState {
 			r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
@@ -1996,81 +2014,14 @@ func (r *Runner) InvokeHandler(
 		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
 	}
 
-	// Resolve the schedule's timeout, retry count, and CURRENT handler from the
-	// function's CURRENT template — the single source of truth, so a hot-swapped
-	// template's new values apply to future occurrences automatically. On the
-	// production path the schedule is resolved by its STABLE NAME; a missing name
-	// means the schedule was removed from the template while the occurrence was
-	// pending → obsolete. The name's current handler is authoritative: a handler
-	// change under the same schedule runs the new handler on the next delivery.
-	timeout := function.DefaultTimeout
-	retries := function.DefaultRetries
-	found := false
-	if scheduleName != "" {
-		for _, sch := range pf.fn.Template.Schedules {
-			if sch.Name == scheduleName {
-				timeout = sch.Timeout
-				retries = sch.Retries
-				handler = sch.Handler
-				found = true
-				break
-			}
-		}
-		if hasState && !found {
-			r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
-				"function", fnName,
-				"schedule", scheduleName,
-			)
-			return obsoleteOccurrence(fnName, scheduleName)
-		}
-	}
-	// The state-free fallback (the DLQ replay, or a direct single-handler caller)
-	// carries no schedule name. Resolve by exact handler: first among the current
-	// schedules (the first matching entry's timeout/retries; multiple entries
-	// sharing a handler behave identically for this purpose), then among event
-	// rules. This is never event matching: it selects by handler string alone, so
-	// no other rule can run. The production schedule path always carries a
-	// schedule name, so this fallback can never turn a removed schedule into an
-	// executable one. A non-positive rule timeout (only reachable from a
-	// hand-built template, since ParseTemplate guarantees a positive value) keeps
-	// the default rather than imposing an immediate deadline.
-	if !found {
-		for _, sch := range pf.fn.Template.Schedules {
-			if sch.Handler == handler {
-				timeout = sch.Timeout
-				retries = sch.Retries
-				found = true
-				break
-			}
-		}
-	}
-	if !found {
-		for _, rule := range pf.fn.Template.Events {
-			if rule.Handler == handler {
-				if rule.Timeout > 0 {
-					timeout = rule.Timeout
-				}
-				retries = rule.Retries
-				break
-			}
-		}
-	}
-
-	// Cap the schedule timeout at the configured maximum, exactly like Handle
-	// caps each rule's timeout (defense in depth; template validation enforces
-	// it at load).
-	if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && timeout > cap {
-		timeout = cap
-	}
-
-	invocation := fnName + "/" + handler
-
-	// Reserve the worker-global and per-function concurrency slots BEFORE
-	// TryStart so a blocked invocation is never counted as an attempt and does
-	// not persist state (same ordering as Handle's event path). A slot timeout
-	// means the invocation is unresolved: with invocation state it returns a
-	// "not eligible" skip (the stream leaves the message pending with no retry
-	// accounting); without state it preserves the legacy plain error.
+	// Reserve the worker-global and per-function concurrency slots BEFORE the
+	// admission claim so a blocked invocation is never counted as an attempt and
+	// does not persist state (same ordering as Handle's event path). A slot
+	// timeout means the invocation is unresolved: with invocation state it
+	// returns a "not eligible" skip (the stream leaves the message pending with no
+	// retry accounting); without state it preserves the legacy plain error. The
+	// reservation is made for both the state-free and state-carrying paths, so a
+	// held function slot also bounds a direct/no-state caller.
 	releaseSlots, _ := r.reserveSlots(ctx, fnName, pf.fn.Template.Concurrency)
 	if releaseSlots == nil {
 		r.log.Warn("Schedule: concurrency slot wait timed out", "function", fnName, "handler", handler)
@@ -2081,108 +2032,258 @@ func (r *Runner) InvokeHandler(
 	}
 	defer releaseSlots()
 
-	if hasState {
-		// Fast path: an already-completed ("ok") invocation on redelivery means a
-		// previous delivery succeeded but the ACK failed (or is racing). The
-		// message should be ACKed, not re-run and not DLQ'd — return nil so the
-		// stream ACKs and then clears state.
-		if invState.IsComplete(invocation) {
+	// The state-free path (direct callers/tests, DLQ replay) preserves the legacy
+	// single-attempt behavior exactly: resolve the current schedule, cap the
+	// timeout, and execute once. No descriptor, no broker lifecycle.
+	if !hasState {
+		desc := resolveScheduleDescriptor(pf.fn.Template, scheduleName, handler)
+		if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && desc.Timeout > cap {
+			desc.Timeout = cap
+		}
+		return r.invokeOnce(ctx, pf, desc.Handler, payload, desc.Timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
+	}
+
+	// Read the pinned schedule descriptor ONCE (a Redis read, and the
+	// authoritative source for an already-admitted occurrence). A descriptor
+	// pinned by an earlier first admission is immutable while the message is
+	// recoverable, so this read is stable for the rest of the delivery.
+	desc, known := invState.ScheduleDescriptor()
+
+	// An UNADMITTED schedule occurrence (scheduleName != "" and no pinned
+	// descriptor) resolves its template by the stable schedule NAME, and it may
+	// have waited arbitrarily long for a concurrency slot while a reload
+	// hot-swapped or removed the function. The lookup above is stale for that
+	// occurrence: refresh it from the registry under the lock and pin the NEWEST
+	// entry, dropping the stale pin, so the descriptor proposed for the atomic
+	// first admission comes from the CURRENT config. A reload racing AFTER this
+	// fresh snapshot is a concurrent proposal: the atomic descriptor write in
+	// TryStartScheduled remains the global first-winner boundary. A pinned
+	// descriptor is authoritative and is NEVER re-resolved (its admitted schedule
+	// may already be gone), but the function's availability is still rechecked.
+	if scheduleName != "" && !known {
+		// getByNamePinned returns a FRESH share of the current entry's
+		// publication lease (always a distinct lease object, or nil when the
+		// entry has none), so release the stale lookup's pin and adopt the fresh
+		// one unconditionally — even when fresh is nil, so a function removed
+		// while the occurrence waited drops the stale pin with it.
+		fresh, freshPin := r.reg.getByNamePinned(fnName)
+		pin.Release()
+		pf, pin = fresh, freshPin
+	}
+	if pf == nil {
+		r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
+			"function", fnName,
+			"schedule", scheduleName,
+		)
+		return obsoleteOccurrence(fnName, scheduleName)
+	}
+	if pf.Prepared() == nil {
+		// The function exists but its image could not be built yet: temporarily
+		// unavailable, so the occurrence is retryable (not obsolete — the
+		// function is still configured).
+		r.log.Warn("Schedule: function is temporarily unavailable", "function", fnName)
+		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+	}
+
+	// Resolve the descriptor that owns this message. A pinned descriptor (read
+	// above) is authoritative and survives a later template change or the
+	// schedule's removal; otherwise resolve the CURRENT template by schedule NAME
+	// (the production path) or by handler (the state-carrying fallback).
+	if !known {
+		desc = resolveScheduleDescriptor(pf.fn.Template, scheduleName, handler)
+		// The production path carries a schedule NAME. When the function is
+		// present but that NAME is gone, the occurrence may have been admitted by
+		// ANOTHER replica whose template still had it, so we must NOT pre-empt the
+		// atomic admission: pass no descriptor (known=false) and let the script
+		// hand back the pinned one to adopt, or report it obsolete.
+		if scheduleName != "" && !scheduleNameExists(pf.fn.Template, scheduleName) {
+			known = false
+		} else {
+			// A resolved name, or the state-carrying handler fallback: a descriptor
+			// is known (a fallback with no matching entry keeps the defaults).
+			known = true
+		}
+	}
+	// Cap the timeout exactly like Handle caps each rule's timeout (defense in
+	// depth; template validation enforces the cap at load). When the descriptor is
+	// pinned, its timeout was already capped at admission, so re-capping is a
+	// no-op that keeps a hand-built/oversized pinned value safe.
+	if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && desc.Timeout > cap {
+		desc.Timeout = cap
+	}
+
+	// Atomically pin the descriptor (only when none is pinned) and claim the
+	// invocation. A lost descriptor race is resolved inside the handle: the
+	// pinned descriptor is adopted and the admission retried, so the winning
+	// handler/timeout/retries is what executes and no second invocation field is
+	// ever claimed.
+	admission, err := invState.TryStartScheduled(desc, known, func(d stream.ScheduleDescriptor) string {
+		return fnName + "/" + d.Handler
+	})
+	if err != nil {
+		// The claim outcome is unknown (Redis/transport or token-generation
+		// error): do NOT run the handler and leave the message pending so a later
+		// delivery retries the claim. No handler attempt was confirmed. The error
+		// wraps ErrInvocationNotEligible (the stream's pending/no-ACK contract)
+		// plus ErrInvocationClaimUnconfirmed so the cause is distinguishable.
+		r.log.Warn("Schedule: claim failed (outcome unknown); leaving pending without executing",
+			"function", fnName,
+			"handler", desc.Handler,
+			"error", err,
+		)
+		return fmt.Errorf("%w: %v: %w: %w",
+			stream.ErrInvocationNotEligible, fnName+"/"+desc.Handler,
+			stream.ErrInvocationClaimUnconfirmed, err)
+	}
+	if admission.Obsolete {
+		r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
+			"function", fnName,
+			"schedule", scheduleName,
+		)
+		return obsoleteOccurrence(fnName, scheduleName)
+	}
+
+	// The descriptor that owns the message (adopted on a lost race, else our own).
+	ed := admission.Descriptor
+	handler = ed.Handler
+	timeout := ed.Timeout
+	retries := ed.Retries
+	invocation := fnName + "/" + handler
+
+	if !admission.Started {
+		if admission.Wait > 0 {
+			// Protected by an active running deadline or a retry backoff. The
+			// message must stay pending: the protected invocation may still
+			// complete or fail on its own, so this is a "not eligible" skip, never
+			// an ACK.
+			r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
+				"function", fnName,
+				"handler", handler,
+				"handler_attempt", admission.Claim.Attempt,
+				"next_attempt_in", admission.Wait,
+			)
+			return stream.ErrInvocationNotEligible
+		}
+		// Terminal. Attempt 0 is a complete (or terminal-retained) invocation, so
+		// the message is ACKed. A positive attempt is an exhausted invocation: a
+		// schedule has exactly ONE invocation, so the message is terminal and must
+		// route to the DLQ, with the persisted exhausted attempt carried on the
+		// typed error for DLQ attribution.
+		if admission.Claim.Attempt == 0 {
 			r.log.Debug("Schedule: invocation already succeeded; skipping (stream ACKs)",
 				"function", fnName,
 				"handler", handler,
 			)
 			return nil
 		}
-		// Claim the invocation for this execution before running it. TryStart
-		// atomically persists an absolute running deadline (now + the capped
-		// timeout), the attempt, and a fresh claim token, and returns
-		// started=false when the invocation is already exhausted or protected by
-		// an active attempt deadline or a retry backoff (this or another replica
-		// may be executing it, or it is waiting out its backoff).
-		started, claim, wait, startErr := invState.TryStart(invocation, timeout)
-		if startErr != nil {
-			// The claim outcome is unknown (Redis/transport or token-generation
-			// error): do NOT run the handler and leave the message pending so a
-			// later delivery retries the claim. No handler attempt was confirmed.
-			// The error wraps ErrInvocationNotEligible (the stream's pending/no-ACK
-			// contract) plus ErrInvocationClaimUnconfirmed so the cause is
-			// distinguishable.
-			r.log.Warn("Schedule: claim failed (outcome unknown); leaving pending without executing",
-				"function", fnName,
-				"handler", handler,
-				"error", startErr,
-			)
-			return fmt.Errorf("%w: %v: %w: %w",
-				stream.ErrInvocationNotEligible, invocation,
-				stream.ErrInvocationClaimUnconfirmed, startErr)
+		r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
+			"function", fnName,
+			"handler", handler,
+			"handler_attempt", admission.Claim.Attempt,
+		)
+		return &stream.HandlerExhaustedError{
+			Invocations: []stream.ExhaustedInvocation{{
+				Function: fnName,
+				Handler:  handler,
+				Attempts: admission.Claim.Attempt,
+			}},
 		}
-		if !started {
-			if wait > 0 {
-				// Protected by an active running deadline or a retry backoff. The
-				// message must stay pending: the protected invocation may still
-				// complete or fail on its own, so this is a "not eligible" skip,
-				// never an ACK.
-				r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
-					"function", fnName,
-					"handler", handler,
-					"handler_attempt", claim.Attempt,
-					"next_attempt_in", wait,
-				)
-				return stream.ErrInvocationNotEligible
-			}
-			// Terminal skip: the invocation is already exhausted. A schedule has
-			// exactly ONE invocation, so a terminal skip means the message is
-			// terminal and must route to the DLQ. claim.Attempt is the exhausted
-			// count read back from the invocation state (TryStart), so it is
-			// carried on the typed error for the stream layer's DLQ attribution.
-			r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
-				"function", fnName,
-				"handler", handler,
-				"handler_attempt", claim.Attempt,
-			)
-			return &stream.HandlerExhaustedError{
-				Invocations: []stream.ExhaustedInvocation{{
-					Function: fnName,
-					Handler:  handler,
-					Attempts: claim.Attempt,
-				}},
-			}
-		}
-		err := r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, claim, msgID)
-		if err != nil {
-			// A stale completion (the claim was superseded or the marker is
-			// already terminal) is not a handler failure: do NOT ACK a superseded
-			// claim's outcome — leave the message pending so a later delivery
-			// resolves it.
-			if errors.Is(err, stream.ErrInvocationNotEligible) {
-				return err
-			}
-			// A failed attempt — resolve extra env, marshal, execution, or
-			// timeout failures all land here. recordFailure decides retry vs
-			// exhaustion using the template's schedule Retries: a retryable
-			// failure schedules a backoff and returns a plain error (the stream
-			// leaves the message pending, gated by next_attempt_at); an exhausted
-			// attempt marks the invocation terminal and returns a typed
-			// *stream.HandlerExhaustedError (which already wraps
-			// stream.ErrInvocationExhausted and carries the exhausted handler
-			// attempt). A schedule has exactly ONE invocation (this one), so the
-			// message is terminal and the stream routes it to the DLQ.
-			outcome, retErr := r.recordFailure(invState, invocation, claim, retries, fnName, handler, msgID, err)
-			if outcome == outcomePendingSkip {
-				// A stale transition (the claim was superseded, or the marker is
-				// already terminal): do NOT ACK a superseded claim's outcome —
-				// leave the message pending so a later delivery resolves it.
-				return stream.ErrInvocationNotEligible
-			}
-			return retErr
-		}
-		return nil
 	}
 
-	// No invocation state (direct callers/tests): preserve the legacy behavior
-	// exactly — execute the single handler and return the plain error (or nil on
-	// success). MarkComplete/success metrics still emit inside invokeOnce.
-	return r.invokeOnce(ctx, pf, handler, payload, timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
+	err = r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, admission.Claim, msgID)
+	if err != nil {
+		// A stale completion (the claim was superseded or the marker is already
+		// terminal) is not a handler failure: do NOT ACK a superseded claim's
+		// outcome — leave the message pending so a later delivery resolves it.
+		if errors.Is(err, stream.ErrInvocationNotEligible) {
+			return err
+		}
+		// A failed attempt — resolve extra env, marshal, execution, or timeout
+		// failures all land here. recordFailure decides retry vs exhaustion using
+		// the ADMITTED descriptor's retry budget: a retryable failure schedules a
+		// backoff and returns a plain error (the stream leaves the message pending,
+		// gated by next_attempt_at); an exhausted attempt marks the invocation
+		// terminal and returns a typed *stream.HandlerExhaustedError (which already
+		// wraps stream.ErrInvocationExhausted and carries the exhausted handler
+		// attempt). A schedule has exactly ONE invocation (this one), so the message
+		// is terminal and the stream routes it to the DLQ.
+		outcome, retErr := r.recordFailure(invState, invocation, admission.Claim, retries, fnName, handler, msgID, err)
+		if outcome == outcomePendingSkip {
+			// A stale transition (the claim was superseded, or the marker is
+			// already terminal): do NOT ACK a superseded claim's outcome — leave
+			// the message pending so a later delivery resolves it.
+			return stream.ErrInvocationNotEligible
+		}
+		return retErr
+	}
+	return nil
+}
+
+// resolveScheduleDescriptor resolves a schedule occurrence's descriptor from the
+// function's CURRENT template. When scheduleName is non-empty the schedule is
+// resolved by its STABLE NAME (the production identity); a handler change under
+// the same name is picked up, and a missing NAME leaves the envelope handler with
+// the defaults (the caller decides whether that is obsolete). When scheduleName
+// is empty (the state-free DLQ-replay path) it resolves by exact handler: first
+// among the current schedules, then among event rules. This is never event
+// matching — it selects by handler string alone, so no other rule can run. The
+// returned descriptor's Timeout is NOT capped here; the caller caps it (and the
+// capped value is what gets pinned).
+func resolveScheduleDescriptor(tmpl *function.Template, scheduleName, handler string) stream.ScheduleDescriptor {
+	desc := stream.ScheduleDescriptor{
+		Handler: handler,
+		Timeout: function.DefaultTimeout,
+		Retries: function.DefaultRetries,
+	}
+	found := false
+	if scheduleName != "" {
+		for _, sch := range tmpl.Schedules {
+			if sch.Name == scheduleName {
+				desc.Schedule = scheduleName
+				desc.Handler = sch.Handler
+				desc.Timeout = sch.Timeout
+				desc.Retries = sch.Retries
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		for _, sch := range tmpl.Schedules {
+			if sch.Handler == handler {
+				desc.Handler = handler
+				desc.Timeout = sch.Timeout
+				desc.Retries = sch.Retries
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		for _, rule := range tmpl.Events {
+			if rule.Handler == handler {
+				if rule.Timeout > 0 {
+					desc.Timeout = rule.Timeout
+				}
+				desc.Retries = rule.Retries
+				break
+			}
+		}
+	}
+	return desc
+}
+
+// scheduleNameExists reports whether the template still declares a schedule with
+// the given stable name. The production path uses it only to decide whether a
+// first-time (unpinned) occurrence can be admitted locally, never to cancel an
+// already-admitted one.
+func scheduleNameExists(tmpl *function.Template, scheduleName string) bool {
+	for _, sch := range tmpl.Schedules {
+		if sch.Name == scheduleName {
+			return true
+		}
+	}
+	return false
 }
 
 // InvokeFunction executes every event rule of the named function whose pattern

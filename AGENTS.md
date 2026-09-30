@@ -130,10 +130,20 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Publication failures retry the same occurrence with a bounded backoff; startup
   catch-up republishes only the latest missed occurrence within a bounded horizon.
 - Once published it reuses the stream retry/claim/DLQ machinery, so handler
-  execution stays at-least-once; a delivery resolves the schedule by NAME and runs
-  its CURRENT handler, so a handler change is not obsolete. Removing a function or
-  a schedule NAME makes its pending occurrences obsolete (acked, never retried or
-  dead-lettered).
+  execution stays at-least-once. The execution contract is frozen at the
+  occurrence's FIRST successful admission: before admission a delivery resolves
+  the schedule by NAME and runs its CURRENT handler (so a handler change under the
+  same name is not obsolete); the first claim atomically pins an immutable
+  descriptor (schedule name, admitted handler, capped timeout, retry budget) in
+  the message's invocation-state hash under the reserved `__schedule` field, so
+  concurrent replicas cannot both admit and any other delivery adopts the winner.
+  After admission that descriptor is authoritative — a later template change, or
+  the schedule NAME's removal, can no longer reset the claim/attempts or cancel
+  the invocation, which completes its retry/DLQ lifecycle under the admitted
+  contract. The handler is not part of occurrence identity; the descriptor is
+  provenance only and DLQ attribution stays handler-based.
+- Removing a function (or a schedule NAME that was never admitted) makes its
+  pending occurrences obsolete (acked, never retried or dead-lettered).
 
 ## Services and routing boundaries
 

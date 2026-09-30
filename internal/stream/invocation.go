@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -74,6 +75,156 @@ func newClaimToken() (string, error) {
 		return "", fmt.Errorf("generate invocation claim token: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// ScheduleDescriptor is the immutable admission contract of ONE schedule
+// occurrence: the schedule's stable NAME, the exact handler it admitted, the
+// capped handler timeout, and the retry budget. It is NOT sensitive (no secret,
+// no payload) and is persisted in the invocation-state hash, so it may be read
+// back on any delivery.
+//
+// It exists to freeze a schedule occurrence's execution contract at its FIRST
+// admission. Before admission the occurrence resolves the CURRENT template by
+// schedule NAME on every delivery (a handler change under the same name takes
+// effect, and a removed name is obsolete). After the first successful admission
+// the descriptor pins handler/timeout/retries, so a later template change (or the
+// schedule's removal) can no longer reset the claim/attempts or cancel an
+// invocation that is mid-retry/DLQ: it completes under the contract it started
+// with. The schedule NAME remains the occurrence/dedup identity; the descriptor
+// is execution provenance only, and invocation/DLQ attribution stays
+// handler-based ("<function>/<handler>").
+type ScheduleDescriptor struct {
+	// Schedule is the schedule's stable name (the template schedules[].name).
+	Schedule string
+	// Handler is the exact handler admitted ("module.function").
+	Handler string
+	// Timeout is the capped per-invocation handler timeout.
+	Timeout time.Duration
+	// Retries is the retry budget (additional attempts after the first).
+	Retries int
+}
+
+// scheduleDescriptorPrefix versions the encoded descriptor grammar. A value that
+// does not decode (a corrupt, future, or legacy value in the reserved field) is
+// treated as absent, so a foreign marker can never be mistaken for a descriptor.
+const scheduleDescriptorPrefix = "sd1"
+
+// encodeScheduleDescriptor renders a descriptor as the opaque value stored in the
+// reserved scheduleField. The names are base64url-encoded so the ":"-separated
+// grammar is unambiguous regardless of name contents; the timeout is integer
+// milliseconds and the retries a non-negative integer.
+func encodeScheduleDescriptor(d ScheduleDescriptor) string {
+	return scheduleDescriptorPrefix + ":" +
+		strconv.FormatInt(d.Timeout.Milliseconds(), 10) + ":" +
+		strconv.Itoa(d.Retries) + ":" +
+		base64.RawURLEncoding.EncodeToString([]byte(d.Schedule)) + ":" +
+		base64.RawURLEncoding.EncodeToString([]byte(d.Handler))
+}
+
+// decodeScheduleDescriptor parses the encoded descriptor value. ok=false for any
+// malformed value (wrong prefix, missing/extra fields, non-canonical timeout or
+// retries, bad base64), so a corrupt field degrades to "no pinned descriptor"
+// rather than being misread.
+func decodeScheduleDescriptor(v string) (ScheduleDescriptor, bool) {
+	rest, found := strings.CutPrefix(v, scheduleDescriptorPrefix+":")
+	if !found {
+		return ScheduleDescriptor{}, false
+	}
+	parts := strings.Split(rest, ":")
+	if len(parts) != 4 {
+		return ScheduleDescriptor{}, false
+	}
+	timeoutMs, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || timeoutMs < 0 || !canonicalUint(parts[0]) {
+		return ScheduleDescriptor{}, false
+	}
+	retries, err := strconv.Atoi(parts[1])
+	if err != nil || retries < 0 || !canonicalUint(parts[1]) {
+		return ScheduleDescriptor{}, false
+	}
+	schedule, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return ScheduleDescriptor{}, false
+	}
+	handler, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return ScheduleDescriptor{}, false
+	}
+	return ScheduleDescriptor{
+		Schedule: string(schedule),
+		Handler:  string(handler),
+		Timeout:  time.Duration(timeoutMs) * time.Millisecond,
+		Retries:  retries,
+	}, true
+}
+
+// scheduleStartOutcome classifies one evaluation of the schedule admission
+// boundary. It is internal: the conflict case is resolved by the
+// InvocationState.TryStartScheduled adoption loop and never reaches the runner.
+type scheduleStartOutcome int
+
+const (
+	// scheduleStartStarted means the invocation was claimed for a new attempt.
+	scheduleStartStarted scheduleStartOutcome = iota
+	// scheduleStartProtected means the invocation is protected by an active
+	// running deadline or retry backoff (this or another replica).
+	scheduleStartProtected
+	// scheduleStartTerminal means the invocation is complete, exhausted, or its
+	// hash is terminal-retained: never eligible again.
+	scheduleStartTerminal
+	// scheduleStartConflict means the caller's proposed descriptor differs from
+	// one already pinned by another delivery; no claim was made. The caller must
+	// adopt the returned pinned descriptor and retry within the same store call.
+	scheduleStartConflict
+	// scheduleStartNoAdmission means no descriptor is pinned AND the caller
+	// proposed none (its schedule NAME is gone): the occurrence was never
+	// admitted, so it is obsolete.
+	scheduleStartNoAdmission
+)
+
+// scheduleStartResult is the store-level result of ONE atomic schedule-admission
+// attempt (see invocationStore.tryStartScheduled). hasPinned distinguishes a
+// genuinely pinned descriptor from "none pinned" even when the descriptor's
+// schedule name is empty (the state-free fallback path).
+type scheduleStartResult struct {
+	outcome   scheduleStartOutcome
+	claim     InvocationClaim
+	wait      time.Duration
+	pinned    ScheduleDescriptor
+	hasPinned bool
+}
+
+// maxScheduleAdoptionAttempts bounds the descriptor adoption loop: at most one
+// conflict can be observed because the pinned descriptor is immutable while the
+// message is recoverable, so two rounds always suffice. The bound is defensive.
+const maxScheduleAdoptionAttempts = 4
+
+// ScheduleAdmission is the resolved result of the schedule admission boundary as
+// seen by the runner: the descriptor that owns the message, whether this caller
+// claimed the invocation, and whether the occurrence is obsolete (never admitted
+// and no longer configured). A zero ScheduleAdmission with Obsolete=false and
+// Started=false means the invocation is protected or terminal (Claim/Wait carry
+// the marker details, exactly like TryStart).
+type ScheduleAdmission struct {
+	// Started is true when the caller should execute the handler for this attempt.
+	Started bool
+	// Claim is the confirmed claim when Started, or the existing marker's claim
+	// (Attempt 0 for complete/terminal-retained, >0 for exhausted/protected) when
+	// not started.
+	Claim InvocationClaim
+	// Wait is the duration until the invocation becomes eligible again; > 0 means
+	// it is protected by an active running deadline or a retry backoff.
+	Wait time.Duration
+	// Descriptor is the immutable descriptor that owns the message: the pinned
+	// one (adopted if this caller's proposal lost a race), or the caller's
+	// proposal on a successful first pin. It is the single source of truth for
+	// the handler, capped timeout, and retry budget for this message from now on,
+	// and is always set unless Obsolete is true.
+	Descriptor ScheduleDescriptor
+	// Obsolete is true when no descriptor was ever pinned for this message and
+	// the caller had no current schedule to propose (its schedule NAME is gone):
+	// the occurrence is obsolete and must be ACKed, never retried or DLQ'd.
+	Obsolete bool
 }
 
 // ttlMillis converts a TTL to integer milliseconds for the PEXPIRE argument.
@@ -239,6 +390,103 @@ end
 redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':1:'..ARGV[4])
 redis.call('PERSIST', KEYS[1])
 return {1, 1, '0'}
+`)
+
+	// tryStartScheduledScript atomically performs the SCHEDULE admission: it pins
+	// the caller's ScheduleDescriptor (if none is pinned yet) and claims the
+	// invocation in the SAME script, so the descriptor, the attempt, and the
+	// claim token become visible together. It is used only by the schedule path;
+	// the event path uses tryStartScript unchanged.
+	//
+	// KEYS[1] = invocation-state hash;
+	// ARGV[1] = invocation field (the one derived from the descriptor the caller
+	//           will run), ARGV[2] = now (unix-ms string), ARGV[3] = new running
+	//           deadline (unix-ms string, computed by Go from the descriptor it
+	//           executes), ARGV[4] = new claim token, ARGV[5] = terminal marker
+	//           field, ARGV[6] = schedule-descriptor field, ARGV[7] = the caller's
+	//           descriptor (its own proposal, or the one it already pinned and
+	//           verified; "" when it has none).
+	//
+	// Returns a 4-element reply {outcome, attempt, deadline, pinned}:
+	//
+	//	0 started       attempt = new 1-based attempt; pinned = owning descriptor
+	//	1 protected     attempt = existing; deadline = existing deadline string;
+	//	                pinned = owning descriptor
+	//	2 terminal      attempt = existing (0 for "ok"/retained); pinned = owning
+	//	                descriptor (or "")
+	//	3 conflict      pinned = the descriptor already pinned, which the caller
+	//	                must adopt and retry (it either had none, or disagreed);
+	//	                no claim was made
+	//	4 no admission  no descriptor is pinned and the caller has none → the
+	//	                occurrence was never admitted and its schedule is gone
+	//	                (obsolete)
+	//
+	// The claim is made ONLY when the caller supplies the exact descriptor it will
+	// execute (proposed == pinned, or it is the first to pin proposed). This keeps
+	// the persisted running deadline consistent with the descriptor: Go derives
+	// the deadline from the descriptor it executes, so the caller must know it
+	// before claiming. A caller that only knows the pinned descriptor by adopting
+	// it re-enters with it, which terminates because the pinned descriptor is
+	// immutable while the message is recoverable.
+	tryStartScheduledScript = redis.NewScript(luaInvocationHelpers + `
+local function claim(v, now)
+  -- Shared eligibility/claim decision over the caller's invocation field value.
+  -- Returns one of:
+  --   {'started', attempt}
+  --   {'protected', attempt, deadline}
+  --   {'terminal', attempt}
+  --   {'eligible', attempt}   (absent/unparseable: fresh claim at attempt 1)
+  if v then
+    if v == 'ok' then return {'terminal', 0} end
+    local ea = parse_exhausted(v)
+    if ea then return {'terminal', tonumber(ea)} end
+    local dl, a = parse_active(v, 'running')
+    if not dl then dl, a = parse_active(v, 'next_attempt_at') end
+    if dl then
+      if lt_uint(now, dl) then return {'protected', tonumber(a), dl} end
+      return {'eligible', tonumber(a)}
+    end
+  end
+  return {'eligible', 0}
+end
+
+if redis.call('HEXISTS', KEYS[1], ARGV[5]) == 1 then
+  -- Terminal-retained (its message already left the PEL): never re-open it.
+  return {2, 0, '0', redis.call('HGET', KEYS[1], ARGV[6]) or ''}
+end
+
+local pinned = redis.call('HGET', KEYS[1], ARGV[6])
+local proposed = ARGV[7]
+
+if pinned then
+  -- A descriptor is already pinned by an earlier delivery. Only a caller that
+  -- supplies EXACTLY that descriptor may claim; anyone else (no descriptor, or a
+  -- different proposal) adopts it and retries, so an admitted occurrence is never
+  -- cancelled and never re-admitted under another handler.
+  if proposed == '' or proposed ~= pinned then
+    return {3, 0, '0', pinned}
+  end
+elseif proposed == '' then
+  -- No descriptor pinned and the caller has none to propose: the occurrence was
+  -- never admitted and its schedule is gone — obsolete.
+  return {4, 0, '0', ''}
+end
+
+local decision = claim(redis.call('HGET', KEYS[1], ARGV[1]), ARGV[2])
+if decision[1] == 'protected' then
+  return {1, decision[2], decision[3], pinned or proposed}
+end
+if decision[1] == 'terminal' then
+  return {2, decision[2], '0', pinned or proposed}
+end
+-- Eligible: pin the descriptor (only if absent) and claim, atomically.
+if not pinned then
+  redis.call('HSET', KEYS[1], ARGV[6], proposed)
+end
+local na = tonumber(decision[2]) + 1
+redis.call('HSET', KEYS[1], ARGV[1], 'running:'..ARGV[3]..':'..na..':'..ARGV[4])
+redis.call('PERSIST', KEYS[1])
+return {0, na, '0', pinned or proposed}
 `)
 
 	// finishFailureScript atomically records a failed attempt's retry backoff,
@@ -502,6 +750,24 @@ type invocationStateStore interface {
 		stream, group, msgID, invocation string,
 		now, deadline time.Time,
 	) (started bool, claim InvocationClaim, wait time.Duration, err error)
+	// tryStartScheduled is the schedule-path admission: it atomically pins the
+	// caller's descriptor (when none is pinned) and claims the invocation in one
+	// script. desc is the descriptor the caller would execute under; known reports
+	// whether the caller actually knows a descriptor (false when it could neither
+	// read a pinned one nor resolve a current schedule). When known is false the
+	// invocation string is ignored and the script either hands back the pinned
+	// descriptor to adopt (conflict) or reports no admission (obsolete). It
+	// returns the raw scheduleStartResult for ONE script evaluation; the
+	// InvocationState handle wraps it in the bounded adoption loop. A
+	// store/transport error is returned (NOT failed open) so no handler runs on an
+	// ambiguous claim.
+	tryStartScheduled(
+		ctx context.Context,
+		stream, group, msgID, invocation string,
+		now, deadline time.Time,
+		desc ScheduleDescriptor,
+		known bool,
+	) (scheduleStartResult, error)
 	// finishFailure CASes the caller's claim against the current active marker
 	// and, on a match, writes the retry backoff marker at now+backoff. It returns
 	// ok=false (an explicit stale/terminal result, never an error) when the claim
@@ -546,7 +812,10 @@ type invocationStateStore interface {
 	// invocation by its most recent attempt (see RecordTrace), or "" when none
 	// was ever recorded. redis.Nil (field absent) is ("", nil).
 	traceReference(ctx context.Context, stream, group, msgID, invocation string) (string, error)
-	// recordTrace atomically persists the compact trace lineage of this
+	// scheduleDescriptor reads the message's pinned schedule admission descriptor
+	// from the reserved scheduleField, or ok=false when none is pinned or the
+	// value does not decode. redis.Nil (field absent) is (zero, false, nil).
+	scheduleDescriptor(ctx context.Context, stream, group, msgID string) (ScheduleDescriptor, bool, error) // recordTrace atomically persists the compact trace lineage of this
 	// invocation's most recent attempt under a reserved sibling field, clearing
 	// any legacy TTL in the same script. It never disturbs the invocation's
 	// lifecycle value, and it is inert once the hash is terminal-retained.
@@ -592,6 +861,21 @@ const classificationField = "__classification"
 // compact traceparent[|tracestate] form (see tracing.SpanContextToString) and
 // never contains baggage.
 const traceFieldPrefix = "__trace:"
+
+// scheduleField is the reserved invocation-state hash field that pins a schedule
+// occurrence's admission contract (see ScheduleDescriptor). Like
+// classificationField and traceFieldPrefix it cannot collide with a real
+// invocation ID (a leading "__" is not a legal function name), and it is a
+// sibling of the lifecycle values rather than part of them, so pinning a
+// descriptor never disturbs eligibility parsing.
+//
+// It is written exactly once, atomically with the FIRST successful schedule
+// claim (see tryStartScheduledScript), so concurrent replicas with different
+// templates cannot both pin: exactly one proposal wins and every other delivery
+// adopts it. While the message is recoverable the field persists (the hash has no
+// TTL); terminal retention applies its TTL to the whole hash after the ACK,
+// exactly like every other field.
+const scheduleField = "__schedule"
 
 // traceField returns the reserved hash field holding invocation's persisted
 // trace lineage.
@@ -818,6 +1102,101 @@ func (store *invocationStore) tryStart(
 		}
 	}
 	return false, claim, wait, nil
+}
+
+// tryStartScheduled is the schedule-path atomic admission. It runs
+// tryStartScheduledScript, which in ONE EVAL pins the caller's descriptor (only
+// when none is pinned) and claims the invocation, so the descriptor and the claim
+// become visible together and exactly one of two racing proposals wins. A caller
+// with no descriptor (known=false: its schedule NAME is gone and nothing was
+// pinned) either adopts the pinned descriptor or is told the occurrence was never
+// admitted (obsolete).
+//
+// It returns the raw ONE-evaluation result; the bounded adoption loop lives in
+// invocationState.TryStartScheduled. The pinned descriptor is returned on every
+// outcome so the caller can adopt a winning proposal it lost the race to.
+//
+// desc/known describe what the caller knows: known=false means it could neither
+// read a pinned descriptor nor resolve the current schedule, so it supplies no
+// proposal and the script either hands back the pinned descriptor (conflict) or
+// reports no admission (obsolete). invocation is the invocation ID derived from
+// desc and is ignored when known is false.
+func (store *invocationStore) tryStartScheduled(
+	ctx context.Context,
+	stream,
+	group,
+	msgID,
+	invocation string,
+	now,
+	deadline time.Time,
+	desc ScheduleDescriptor,
+	known bool,
+) (scheduleStartResult, error) {
+	token, err := newClaimToken()
+	if err != nil {
+		return scheduleStartResult{}, err
+	}
+	encoded := ""
+	if known {
+		encoded = encodeScheduleDescriptor(desc)
+	}
+	key := invocationStateKey(stream, group, msgID)
+	res, err := tryStartScheduledScript.Run(ctx, store.client, []string{key},
+		invocation,
+		strconv.FormatInt(now.UnixMilli(), 10),
+		strconv.FormatInt(deadline.UnixMilli(), 10),
+		token,
+		terminalField,
+		scheduleField,
+		encoded,
+	).Slice()
+	if err != nil {
+		return scheduleStartResult{}, err
+	}
+	if len(res) < 4 {
+		// The script always returns four elements; a short reply is a protocol
+		// violation, so treat the claim as unconfirmed rather than guess.
+		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected script reply of length %d", len(res))
+	}
+	outcomeCode := toInt64(res[0])
+	attempt := int(toInt64(res[1]))
+	dlStr, ok := res[2].(string)
+	if !ok {
+		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected deadline reply type %T", res[2])
+	}
+	pinnedStr, ok := res[3].(string)
+	if !ok {
+		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected pinned reply type %T", res[3])
+	}
+	pinned, hasPinned := decodeScheduleDescriptor(pinnedStr)
+
+	out := scheduleStartResult{claim: InvocationClaim{Attempt: attempt}, pinned: pinned, hasPinned: hasPinned}
+	switch outcomeCode {
+	case 0: // started
+		out.outcome = scheduleStartStarted
+		out.claim = InvocationClaim{Attempt: attempt, Token: token}
+	case 1: // protected
+		out.outcome = scheduleStartProtected
+		if dlStr != "0" {
+			dlMs, perr := strconv.ParseInt(dlStr, 10, 64)
+			if perr != nil {
+				return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: bad deadline reply %q: %w", dlStr, perr)
+			}
+			out.wait = time.Duration(dlMs-now.UnixMilli()) * time.Millisecond
+			if out.wait < time.Millisecond {
+				out.wait = time.Millisecond
+			}
+		}
+	case 2: // terminal
+		out.outcome = scheduleStartTerminal
+	case 3: // conflict: adopt the pinned descriptor
+		out.outcome = scheduleStartConflict
+	case 4: // no admission
+		out.outcome = scheduleStartNoAdmission
+	default:
+		return scheduleStartResult{}, fmt.Errorf("tryStartScheduled: unexpected outcome code %d", outcomeCode)
+	}
+	return out, nil
 }
 
 // finishFailure records a failed attempt by CASing the caller's claim against
@@ -1047,6 +1426,22 @@ func (store *invocationStore) traceReference(ctx context.Context, stream, group,
 		return "", err
 	}
 	return value, nil
+}
+
+// scheduleDescriptor reads the message's pinned schedule admission descriptor
+// from the reserved scheduleField. redis.Nil (field absent) and a value that does
+// not decode both report ok=false (no pinned descriptor), so a foreign or corrupt
+// marker degrades to "resolve the current template" rather than being misread.
+func (store *invocationStore) scheduleDescriptor(ctx context.Context, stream, group, msgID string) (ScheduleDescriptor, bool, error) {
+	value, err := store.client.HGet(ctx, invocationStateKey(stream, group, msgID), scheduleField).Result()
+	if err == redis.Nil {
+		return ScheduleDescriptor{}, false, nil
+	}
+	if err != nil {
+		return ScheduleDescriptor{}, false, err
+	}
+	desc, ok := decodeScheduleDescriptor(value)
+	return desc, ok, nil
 }
 
 // recordTrace persists the compact trace lineage of this invocation's most
@@ -1280,6 +1675,39 @@ type InvocationState interface {
 	// deliberately not failed open, because an ambiguous claim could run a
 	// duplicate of an invocation another replica just claimed.
 	TryStart(invocation string, timeout time.Duration) (started bool, claim InvocationClaim, wait time.Duration, err error)
+	// ScheduleDescriptor returns the immutable admission descriptor pinned for
+	// this message's schedule occurrence, or ok=false when none is pinned yet.
+	// While no descriptor is pinned the occurrence resolves the CURRENT template
+	// by schedule NAME on every delivery; once pinned the descriptor is the
+	// single source of truth (handler, capped timeout, retries) and survives the
+	// schedule's removal. A read error fails open to (zero, false): the caller
+	// then resolves the current template, and the atomic admission below still
+	// guarantees a single winning descriptor.
+	ScheduleDescriptor() (ScheduleDescriptor, bool)
+	// TryStartScheduled is the schedule-occurrence admission boundary. It
+	// atomically pins the caller's proposed descriptor (only when none is pinned)
+	// and claims the invocation, so the descriptor, the attempt, and the claim
+	// token become visible together and exactly one of two racing proposals wins.
+	//
+	// proposed is the descriptor resolved from the CURRENT template by schedule
+	// NAME (handler, capped timeout, retries); propose=false means the schedule
+	// NAME is gone, so nothing can be proposed. invocationFor maps a descriptor to
+	// its "<function>/<handler>" invocation ID: on a lost race the winning
+	// descriptor owns the message and its handler (not the caller's) is invoked,
+	// so the callback is re-evaluated for the adopted descriptor. The loop is
+	// bounded and terminates because a pinned descriptor is immutable while the
+	// message is recoverable.
+	//
+	// It returns a ScheduleAdmission. Obsolete is true only when nothing was ever
+	// pinned and the caller proposed nothing (the occurrence was never admitted
+	// and its schedule is gone → the stream ACKs, never retries or DLQs). An error
+	// is a Redis/transport failure (or token-generation failure): the claim
+	// outcome is unknown, so the caller leaves the message pending and does not
+	// execute.
+	//
+	// desc/known describe what the caller knows: known=false means it could
+	// neither read a pinned descriptor nor resolve the current schedule.
+	TryStartScheduled(desc ScheduleDescriptor, known bool, invocationFor func(ScheduleDescriptor) string) (ScheduleAdmission, error)
 	// RecordFailure persists a failed attempt's retry backoff so the invocation
 	// is gated until now+backoff. The claim is the one this caller confirmed via
 	// TryStart; the store CASes attempt+token against the active marker so a
@@ -1652,6 +2080,101 @@ func (state *invocationState) TryStart(invocation string, timeout time.Duration)
 		return false, InvocationClaim{}, 0, err
 	}
 	return started, claim, wait, nil
+}
+
+// ScheduleDescriptor returns the descriptor pinned for this message's schedule
+// occurrence, or ok=false when none is pinned (or the value is unreadable). A
+// read error fails open to (zero, false): the runner then resolves the current
+// template by name, and the atomic TryStartScheduled still guarantees exactly one
+// descriptor wins.
+func (state *invocationState) ScheduleDescriptor() (ScheduleDescriptor, bool) {
+	desc, ok, err := state.store.scheduleDescriptor(state.ctx, state.stream, state.group, state.msgID)
+	if err != nil {
+		state.log.Debug("Invocation state: schedule descriptor read failed; resolving current template", "error", err)
+		return ScheduleDescriptor{}, false
+	}
+	return desc, ok
+}
+
+// TryStartScheduled is the schedule-occurrence admission boundary. It atomically
+// pins the descriptor (only when none is pinned) and claims the invocation,
+// retrying with the winning descriptor if the message already carries one it did
+// not have. See InvocationState.TryStartScheduled for the contract.
+func (state *invocationState) TryStartScheduled(
+	desc ScheduleDescriptor,
+	known bool,
+	invocationFor func(ScheduleDescriptor) string,
+) (ScheduleAdmission, error) {
+	for attempt := 0; attempt < maxScheduleAdoptionAttempts; attempt++ {
+		invocation := ""
+		now := state.now()
+		deadline := now
+		if known {
+			invocation = invocationFor(desc)
+			deadline = now.Add(desc.Timeout)
+		}
+		res, err := state.store.tryStartScheduled(
+			state.ctx, state.stream, state.group, state.msgID, invocation,
+			now, deadline, desc, known,
+		)
+		if err != nil {
+			// The claim outcome is unknown: do NOT execute and leave the message
+			// pending. No attempt was confirmed, so no retry/exhaustion accounting.
+			state.log.Debug("Invocation state: scheduled try-start failed; claim not confirmed; leaving pending",
+				"invocation", invocation, "error", err)
+			return ScheduleAdmission{}, err
+		}
+		switch res.outcome {
+		case scheduleStartStarted:
+			d, _ := pinnedOr(res, desc)
+			return ScheduleAdmission{
+				Started:    true,
+				Claim:      res.claim,
+				Descriptor: d,
+			}, nil
+		case scheduleStartProtected:
+			d, _ := pinnedOr(res, desc)
+			return ScheduleAdmission{
+				Claim:      res.claim,
+				Wait:       res.wait,
+				Descriptor: d,
+			}, nil
+		case scheduleStartTerminal:
+			d, _ := pinnedOr(res, desc)
+			return ScheduleAdmission{
+				Claim:      res.claim,
+				Descriptor: d,
+			}, nil
+		case scheduleStartNoAdmission:
+			// Nothing was ever pinned and the caller has no descriptor: the
+			// occurrence was never admitted and its schedule is gone (obsolete).
+			return ScheduleAdmission{Obsolete: true}, nil
+		case scheduleStartConflict:
+			// The message carries a descriptor the caller did not supply: adopt it
+			// and retry. A pinned descriptor is immutable while the message is
+			// recoverable, so the retry observes it as the winner and cannot loop.
+			if !res.hasPinned {
+				return ScheduleAdmission{}, fmt.Errorf(
+					"invocation state: schedule conflict without a pinned descriptor for %q", state.msgID)
+			}
+			desc = res.pinned
+			known = true
+			continue
+		default:
+			return ScheduleAdmission{}, fmt.Errorf("invocation state: unexpected schedule outcome %d", res.outcome)
+		}
+	}
+	return ScheduleAdmission{}, fmt.Errorf("invocation state: schedule admission did not converge for %q", invocationFor(desc))
+}
+
+// pinnedOr returns the pinned descriptor when the script reported one, otherwise
+// the fallback (the caller's own proposal). The pinned descriptor always wins on
+// a successful admission because it is the one the script persisted.
+func pinnedOr(res scheduleStartResult, fallback ScheduleDescriptor) (ScheduleDescriptor, bool) {
+	if res.hasPinned {
+		return res.pinned, true
+	}
+	return fallback, false
 }
 
 // RecordFailure persists a failed attempt's retry backoff so a later delivery
