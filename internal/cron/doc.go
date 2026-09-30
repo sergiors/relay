@@ -14,7 +14,9 @@
 //
 // New constructs the scheduler without starting it. ReplaceFunction converges a
 // function's jobs, RemoveFunction removes them, Start begins firing, and Stop
-// performs bounded shutdown.
+// stops firing and strictly joins every in-flight publisher callback (including
+// callbacks gocron's own bounded shutdown may have abandoned), so no callback
+// can still be touching Redis once Stop returns.
 //
 // Publication retries always reuse the same logical occurrence and therefore the
 // same deduplication identity. Retries are bounded and stop on success, a clean

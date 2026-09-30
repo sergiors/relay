@@ -41,6 +41,69 @@ type registeredSchedule struct {
 	parsed   robfigcron.Schedule
 }
 
+// callbackTracker tracks the in-flight Relay publisher callbacks — the
+// Redis-facing part of a gocron task body — so shutdown can join them
+// independently of gocron's own bounded stop.
+//
+// gocron's Shutdown is bounded by WithStopTimeout and its executor returns
+// ErrStopJobsTimedOut while a task goroutine is still running, so a Relay
+// callback may still be inside Publisher.PublishOccurrence (and therefore
+// touching Redis) after g.Shutdown has returned. The worker must not close
+// Redis until every such callback has returned; this tracker is that join.
+type callbackTracker struct {
+	mu      sync.Mutex
+	closing bool
+	wg      sync.WaitGroup
+	// done is created by close and closed once every admitted callback has
+	// returned. It lets Stop wait for the join under a caller context instead
+	// of blocking unbounded.
+	done chan struct{}
+}
+
+// begin admits one in-flight callback, returning false once shutdown has closed
+// admission. closing and the Add share mu, so the join can never race an Add:
+// after close returns, begin always reports false and wg is only ever
+// decremented.
+func (c *callbackTracker) begin() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return false
+	}
+	c.wg.Add(1)
+	return true
+}
+
+// end reports one admitted callback as returned.
+func (c *callbackTracker) end() { c.wg.Done() }
+
+// close stops admitting new callbacks and starts the join watcher. It is
+// idempotent and safe for concurrent callers. The watcher goroutine terminates
+// as soon as the last admitted callback returns.
+//
+// The watcher is started only after closing is set under mu, so no Add can race
+// it: begin observes closing and never increments the WaitGroup again.
+func (c *callbackTracker) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return
+	}
+	c.closing = true
+	c.done = make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(c.done)
+	}()
+}
+
+// doneCh returns the join-completion channel, or nil when close has not run.
+func (c *callbackTracker) doneCh() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.done
+}
+
 // Scheduler wraps a gocron scheduler to run a function's template schedules.
 type Scheduler struct {
 	log *slog.Logger
@@ -52,6 +115,16 @@ type Scheduler struct {
 	metrics *metrics.Registry
 	mu      sync.Mutex
 	stopped bool
+	// callbacks tracks in-flight publisher callbacks so Stop can strictly join
+	// them before Redis closes (see callbackTracker). begin is taken at the top
+	// of every gocron task body.
+	callbacks callbackTracker
+	// shutdownDone is closed once the single gocron Shutdown launched by Stop
+	// returns, and shutdownErr holds its result. Repeated Stop calls (the
+	// worker's barrier re-invokes Stop after its bound expires) join the SAME
+	// shutdown instead of returning early.
+	shutdownDone chan struct{}
+	shutdownErr  error
 	// schedules records the parsed schedules registered so far, used only by
 	// the once-per-Scheduler startup CatchUp. It is replaced per function by
 	// ReplaceFunction so it converges alongside the gocron jobs.
@@ -212,7 +285,17 @@ func (s *Scheduler) ReplaceFunction(name string, tmpl *function.Template) {
 		// identified deterministically across workers.
 		_, err = s.g.NewJob(
 			gocron.CronJob(spec, false),
-			gocron.NewTask(func(ctx context.Context) { s.fire(ctx, name, sch.Name, sch.Handler, parsed) }),
+			gocron.NewTask(func(ctx context.Context) {
+				// Admit the callback before it can touch Redis. If shutdown has
+				// already closed admission, the scheduler is stopping: do not
+				// start a new publish (gocron would not have run it either, but
+				// a task already dequeued can still reach here).
+				if !s.callbacks.begin() {
+					return
+				}
+				defer s.callbacks.end()
+				s.fire(ctx, name, sch.Name, sch.Handler, parsed)
+			}),
 			gocron.WithTags(functionTag(name), jobTag(name, sch.Name)),
 			gocron.WithName(jobName),
 			gocron.WithSingletonMode(gocron.LimitModeReschedule),
@@ -287,29 +370,73 @@ func (s *Scheduler) JobCount() int {
 	return len(s.g.Jobs())
 }
 
-// Stop performs a bounded graceful shutdown of the scheduler. gocron cannot be
-// restarted after Shutdown, and Shutdown itself is already bounded by
-// WithStopTimeout; this additionally honors ctx so a caller's deadline wins
-// even if gocron's internal bound misbehaves. It is idempotent and nil-safe: a
-// second (or concurrent) call is a no-op, and a call after a prior Stop returns
-// nil immediately.
+// Stop performs a bounded graceful shutdown of the scheduler and then STRICTLY
+// JOINS its Relay publisher callbacks.
+//
+// gocron cannot be restarted after Shutdown, and Shutdown itself is bounded by
+// WithStopTimeout; this additionally honors ctx so a caller's deadline wins even
+// if gocron's internal bound misbehaves. Crucially, gocron's executor returns
+// (ErrStopJobsTimedOut) while a task goroutine may still be running, and a Relay
+// task's Redis-facing publish can therefore outlive g.Shutdown. Stop closes the
+// callback admission first, launches the single Shutdown, and returns only once
+// BOTH that Shutdown and every admitted callback have returned — so a caller
+// (the worker's barrier step) can guarantee no callback touches Redis after Stop
+// returns.
+//
+// It is idempotent and safe for concurrent/repeated calls: the first call starts
+// the one Shutdown, and every later call joins the SAME shutdown and callback
+// set instead of returning early. Under an expiring ctx it returns ctx.Err()
+// while the join continues in the background; a barrier re-invocation (with a
+// fresh context) then waits for the real completion. A nil scheduler is a no-op.
 func (s *Scheduler) Stop(ctx context.Context) error {
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		return nil
+	if !s.stopped {
+		s.stopped = true
+		g := s.g
+		// Close callback admission BEFORE requesting the gocron shutdown: no
+		// callback may begin (and touch Redis) once Stop has started, and the
+		// watcher below joins those already admitted.
+		s.callbacks.close()
+		done := make(chan struct{})
+		s.shutdownDone = done
+		if g == nil {
+			close(done)
+			s.mu.Unlock()
+			return nil
+		}
+		go func() {
+			err := g.Shutdown()
+			s.mu.Lock()
+			s.shutdownErr = err
+			s.mu.Unlock()
+			close(done)
+		}()
 	}
-	s.stopped = true
-	g := s.g
+	done := s.shutdownDone
+	callbacksDone := s.callbacks.doneCh()
 	s.mu.Unlock()
-	if g == nil {
-		return nil
-	}
-	done := make(chan error, 1)
-	go func() { done <- g.Shutdown() }()
-	select {
-	case err := <-done:
+
+	if err := waitShutdown(ctx, done, callbacksDone); err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.shutdownErr
+}
+
+// waitShutdown waits under ctx for the gocron shutdown and every admitted Relay
+// callback to complete. It returns ctx.Err() while either is still outstanding,
+// so a bounded caller (the worker's barrier step) can re-invoke Stop for the
+// strict join.
+func waitShutdown(ctx context.Context, shutdownDone, callbacksDone <-chan struct{}) error {
+	select {
+	case <-shutdownDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-callbacksDone:
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}

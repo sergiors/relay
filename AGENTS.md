@@ -256,6 +256,11 @@ integration suite with Redis and Node.
 - Never move secret values outside their documented surfaces.
 - Never widen image/container GC beyond Relay-owned labels; retire images only
   after service convergence and reference guards.
+- Never close the runtime manager or state DB while a reconcile, service pass,
+  or startup sweep may still use it, and never close Redis while a scheduler
+  publisher callback may still be running: their shutdown steps are strict-join
+  barriers, so a bound expiry cancels the step and then waits for its real
+  operation before teardown advances.
 
 ## References
 
