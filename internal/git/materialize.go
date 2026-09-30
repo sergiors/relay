@@ -78,7 +78,10 @@ func discoverFunctions(selection *source.Selection) ([]string, error) {
 //   - Any pre-existing DIRECTORY in dstDir whose name is not in the new set is
 //     removed, so /functions reflects exactly the configured source (the
 //     deterministic-replace rule). Only directories are removed, never files,
-//     and nothing outside dstDir is ever touched.
+//     and nothing outside dstDir is ever touched. A Relay-owned transient
+//     staging directory (function.IsReservedDir) is not governed by this rule:
+//     the creator owns its lifecycle, so it is never reported as removed nor
+//     deleted here.
 //
 // REMOVED are treated by removal of the directory. The returned values are the
 // names materialized (sorted) and removed (sorted) for the sync summary.
@@ -130,6 +133,15 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 		if !e.IsDir() {
 			continue
 		}
+		if function.IsReservedDir(e.Name()) {
+			// A Relay-owned transient staging directory (git's ".sync-*") is
+			// not a materialized function and is not governed by the
+			// deterministic-removal rule: the creator owns its lifecycle (it is
+			// renamed away on success and cleaned up on failure). Skipping it
+			// here avoids reporting a transient stage as a removed function and
+			// avoids deleting a stage a concurrent sync is still filling.
+			continue
+		}
 		if want[e.Name()] {
 			continue
 		}
@@ -143,14 +155,16 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 }
 
 // copyFunctionDir copies the whole tree at selection into dst/name
-// atomically-ish: the tree is first copied to a temp directory created beside
-// dst, then the existing dst/name is removed and the temp renamed into place, so
-// the reconciler never observes a partially-written function directory. Files the
+// atomically-ish: the tree is first copied to a temp directory (named with
+// function.StagingPrefix, Relay's reserved staging prefix that discovery
+// ignores) created beside dst, then the existing dst/name is removed and the
+// temp renamed into place, so the reconciler never observes a partially-written
+// function directory. Files the
 // source-selection policy excludes are not copied; the applicable .gitignore
 // files are (they are the policy and must travel with the function). File modes
 // are preserved.
 func copyFunctionDir(selection *source.Selection, dst, name string) error {
-	tmp, err := os.MkdirTemp(dst, ".sync-*")
+	tmp, err := os.MkdirTemp(dst, function.StagingPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("git: create temp dir: %w", err)
 	}

@@ -11,6 +11,81 @@ import (
 	"relay/internal/state"
 )
 
+// TestPersistStartupDiscoveryIgnoresStagingDir pins the startup state phase
+// against a Relay-owned staging directory (git's ".sync-*"): it is never
+// recorded as a discovery or an invalid desired definition, and a stale reserved
+// row left by a previous bad discovery is pruned. Valid neighbors and genuinely
+// invalid user directories keep their normal behavior.
+func TestPersistStartupDiscoveryIgnoresStagingDir(t *testing.T) {
+	st := openTempState(t)
+	root := t.TempDir()
+
+	// A valid neighbor and a genuinely invalid user directory on disk.
+	writeWorkerFunction(t, root, "good", "def handler(e): return 1\n")
+	badDir := filepath.Join(root, "bad")
+	if err := os.MkdirAll(badDir, 0o755); err != nil {
+		t.Fatalf("mkdir bad: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(badDir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
+		t.Fatalf("write bad template: %v", err)
+	}
+	// A staging directory with a valid-looking template: must be invisible.
+	stageDir := filepath.Join(root, ".sync-abc")
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		t.Fatalf("mkdir stage: %v", err)
+	}
+	// A stale reserved row from a previous bad discovery.
+	st.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), stateFunction(".sync-old", filepath.Join(root, ".sync-old")))
+
+	good := stateFunction("good", filepath.Join(root, "good"))
+	discovered := []state.DiscoveredFunction{{Function: good, Fingerprint: "fp-good"}}
+	// A reserved issue injected directly (defense in depth) must also be ignored.
+	issues := []function.LoadIssue{
+		{Name: "bad", Err: errors.New(`function "bad": template must contain at least one event rule or one service`)},
+		{Name: ".sync-abc", Err: errors.New(`function ".sync-abc": read template: no such file`)},
+	}
+
+	if err := persistStartupDiscovery(st, root, discovered, issues, discardLogger()); err != nil {
+		t.Fatalf("persistStartupDiscovery: %v", err)
+	}
+
+	if _, ok := st.GetFunction(".sync-abc"); ok {
+		t.Fatal("a staging directory must never be persisted (not even invalid)")
+	}
+	if _, ok := st.GetFunction(".sync-old"); ok {
+		t.Fatal("a stale reserved row must be pruned by the startup sweep")
+	}
+	if got, ok := st.GetFunction("good"); !ok || got.Status != state.StatusPreparing {
+		t.Fatalf("good = %+v ok=%v, want preparing", got, ok)
+	}
+	if got, ok := st.GetFunction("bad"); !ok || got.Status != state.StatusUnavailable {
+		t.Fatalf("bad = %+v ok=%v, want unavailable (invalid user behavior preserved)", got, ok)
+	}
+}
+
+// TestLoaderIgnoresStagingDirAtStartup pins the worker's startup loader path: a
+// staging directory alongside a valid function yields exactly the valid function
+// with no issue for the staging name.
+func TestLoaderIgnoresStagingDirAtStartup(t *testing.T) {
+	root := t.TempDir()
+	writeWorkerFunction(t, root, "good", "def handler(e): return 1\n")
+	if err := os.MkdirAll(filepath.Join(root, ".sync-xyz"), 0o755); err != nil {
+		t.Fatalf("mkdir stage: %v", err)
+	}
+
+	loader := function.NewLoader(root, discardLogger())
+	fns, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "good" {
+		t.Fatalf("valid functions = %+v, want only good", fns)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want none (staging is not an invalid desired definition)", issues)
+	}
+}
+
 // TestPersistStartupDiscoveryRecordsInvalidPresent pins the worker startup state
 // phase: valid discovery persists as before, and each PRESENT-but-invalid desired
 // definition from the loader diagnostics is persisted as an invalid view

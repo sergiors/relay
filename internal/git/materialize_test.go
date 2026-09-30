@@ -97,6 +97,40 @@ func TestMaterializeDiscoveryIgnoresNonFunctions(t *testing.T) {
 	}
 }
 
+// TestMaterializeDoesNotRemoveStagingDir pins that the deterministic-removal
+// pass leaves a Relay-owned staging directory in the target alone: it is not a
+// materialized function, so it is neither reported as removed nor deleted (the
+// creator owns its lifecycle), while a genuine stale function dir is still
+// removed.
+func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "keep", "template.yaml"), "runtime: node24\n")
+
+	funcs := t.TempDir()
+	// A transient staging directory in the target (as git leaves it mid-copy).
+	stage := filepath.Join(funcs, ".sync-live")
+	writeFile(t, filepath.Join(stage, "template.yaml"), "runtime: node24\n")
+	// A genuinely stale function directory.
+	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: node24\n")
+
+	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	if len(mat) != 1 || mat[0] != "keep" {
+		t.Fatalf("materialized = %v, want [keep]", mat)
+	}
+	if len(rem) != 1 || rem[0] != "stale" {
+		t.Fatalf("removed = %v, want [stale] (the staging dir is not removed)", rem)
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("staging dir must be left in place: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(funcs, "stale")); !os.IsNotExist(err) {
+		t.Fatal("stale function dir was not removed")
+	}
+}
+
 // TestMaterializeHonorsIgnoreRules proves the shared policy drives
 // materialization: a function directory excluded by the source root's
 // .gitignore is not copied, while an included sibling is; and a .gitignore

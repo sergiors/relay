@@ -534,3 +534,98 @@ events:
 		t.Errorf("expected 'good', got %q", fns[0].Name)
 	}
 }
+
+// TestIsReservedDir pins the shared predicate: only the exact Relay-owned
+// staging prefix is reserved. A broader "hidden directory" rule would swallow
+// genuinely invalid user names (and the invalid-name diagnostics they must
+// still produce), so that is explicitly rejected.
+func TestIsReservedDir(t *testing.T) {
+	reserved := []string{".sync-abc123", ".sync-", ".sync-0"}
+	for _, name := range reserved {
+		if !IsReservedDir(name) {
+			t.Errorf("IsReservedDir(%q) = false, want true", name)
+		}
+	}
+	notReserved := []string{"valid", ".hidden", "sync-abc", "a.sync-1", "", ".SYNC-1", "..sync"}
+	for _, name := range notReserved {
+		if IsReservedDir(name) {
+			t.Errorf("IsReservedDir(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestLoadIgnoresStagingDir pins that a Relay-owned staging directory directly
+// under the root — as internal/git creates via os.MkdirTemp(dst, ".sync-*") —
+// is skipped entirely by discovery: it is not a function, not a LoadIssue, and
+// not logged. A valid neighbor still loads and a genuinely invalid user
+// directory still produces its warning, so the narrow reservation does not
+// weaken either normal discovery or invalid-name diagnostics.
+func TestLoadIgnoresStagingDir(t *testing.T) {
+	dir := t.TempDir()
+	writeTemplate(t, dir, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	// A staging directory mid-copy, with no template.yaml yet (as git creates
+	// it, then copies into it): must be invisible to the loader.
+	if err := os.MkdirAll(filepath.Join(dir, ".sync-123456"), 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	// A genuinely invalid user directory: still an invalid desired definition.
+	writeTemplate(t, dir, "bad-yaml", "events: [unclosed")
+
+	var buf bytes.Buffer
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(&buf, nil)))
+	fns, issues, err := loader.LoadWithDiagnostics()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "valid" {
+		t.Fatalf("valid functions = %+v, want only 'valid'", fns)
+	}
+	for _, issue := range issues {
+		if issue.Name == ".sync-123456" {
+			t.Fatalf("staging directory must not be reported as an issue: %+v", issue)
+		}
+	}
+	if len(issues) != 1 || issues[0].Name != "bad-yaml" {
+		t.Fatalf("issues = %+v, want only 'bad-yaml'", issues)
+	}
+	if logs := buf.String(); strings.Contains(logs, ".sync-") {
+		t.Fatalf("staging directory must not be logged, logs = %q", logs)
+	}
+}
+
+// TestLoadIgnoresStagingDirThatLooksValid pins that even a staging directory
+// that happens to contain a valid template.yaml is never loaded as a function:
+// the prefix, not the contents, decides reservedness.
+func TestLoadIgnoresStagingDirThatLooksValid(t *testing.T) {
+	dir := t.TempDir()
+	writeTemplate(t, dir, "valid", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+	// A stage dir a partial copy may have already populated with a template.
+	writeTemplate(t, dir, ".sync-abc", `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      event_name: [MODIFY]
+`)
+
+	loader := NewLoader(dir, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	fns, err := loader.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(fns) != 1 || fns[0].Name != "valid" {
+		t.Fatalf("Load = %+v, want only 'valid' (a staged tree is never a function)", fns)
+	}
+}

@@ -424,7 +424,11 @@ func (r *Reconciler) eventLoop() {
 				r.Enqueue(name)
 			}
 			// Maintain watches on created/renamed directories (recursive watch).
-			if ev.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+			// A Relay-owned reserved directory (git's ".sync-*") is never
+			// watched, and neither will addWatchRecursive descend into it, so a
+			// dynamic Create for a stage dir spends no handle; addWatchRecursive
+			// itself also prunes reserved subtrees defensively.
+			if ev.Op&(fsnotify.Create|fsnotify.Rename) != 0 && !r.isReservedDirPath(ev.Name) {
 				if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
 					r.addWatchRecursive(ev.Name)
 				}
@@ -449,9 +453,24 @@ func (r *Reconciler) eventLoop() {
 }
 
 // functionForPath maps an event path to the affected function name: the first
-// path segment under the root.
+// path segment under the root. A Relay-owned transient staging directory
+// (function.IsReservedDir, e.g. git's ".sync-*") is never a function, so its
+// events are filtered here and no debounce timer is ever armed for it.
 func (r *Reconciler) functionForPath(path string) (string, bool) {
-	rel, err := filepath.Rel(r.root, path)
+	name, ok := r.rootChildName(path)
+	if !ok || function.IsReservedDir(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// rootChildName returns the first path segment of p relative to the functions
+// root, and whether p is at or below the root with a non-empty relative path.
+// It is the shared basis for mapping an event path to a function name and for
+// deciding whether a path lies inside a reserved root child, so the two can
+// never disagree about which root child a path belongs to.
+func (r *Reconciler) rootChildName(p string) (string, bool) {
+	rel, err := filepath.Rel(r.root, p)
 	if err != nil {
 		return "", false
 	}
@@ -464,12 +483,29 @@ func (r *Reconciler) functionForPath(path string) (string, bool) {
 	return rel, true
 }
 
+// isReservedDirPath reports whether p is, or is inside, a Relay-owned reserved
+// directory directly under the functions root (function.IsReservedDir). The
+// check is on the FIRST path segment under r.root, so a reserved ROOT CHILD and
+// all of its descendants are skipped, while a nested real directory whose name
+// merely looks reserved (e.g. root/<valid-fn>/.sync-x) is not.
+func (r *Reconciler) isReservedDirPath(p string) bool {
+	name, ok := r.rootChildName(p)
+	return ok && function.IsReservedDir(name)
+}
+
 // addWatchRecursive watches root and every subdirectory so events beneath nested
-// dirs are seen. Symlinked directories are deliberately not followed: WalkDir
-// does not follow links (d.IsDir() is false for a symlink entry), so a symlink
-// loop inside the tree cannot make this unbounded — this is why we use the
-// DirEntry (not os.Stat) form of the walk. A symlinked dir is simply never
-// watched, which is acceptable.
+// dirs are seen. A Relay-owned reserved directory directly under the root
+// (function.IsReservedDir, git's ".sync-*") and its whole subtree are
+// deliberately NOT watched: such a directory is never a function, so watching it
+// would only consume inotify handles and surface events that functionForPath
+// immediately discards. filepath.WalkDir is used with SkipDir to prune the
+// reserved subtree, which also means its descendants are never visited.
+//
+// Symlinked directories are likewise not followed: WalkDir does not follow links
+// (d.IsDir() is false for a symlink entry), so a symlink loop inside the tree
+// cannot make this unbounded — this is why we use the DirEntry (not os.Stat)
+// form of the walk. A symlinked dir is simply never watched, which is
+// acceptable.
 func (r *Reconciler) addWatchRecursive(path string) {
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -477,6 +513,13 @@ func (r *Reconciler) addWatchRecursive(path string) {
 		}
 		if !d.IsDir() {
 			return nil
+		}
+		// Prune a reserved root child's whole subtree, including the child
+		// itself, so no watch handle is spent there. isReservedDirPath keys on
+		// the first segment under the root, so a nested real directory whose
+		// name merely looks reserved (root/<valid-fn>/.sync-x) is NOT pruned.
+		if p != r.root && r.isReservedDirPath(p) {
+			return filepath.SkipDir
 		}
 		if _, ok := r.watches.Load(p); ok {
 			return nil
@@ -529,6 +572,13 @@ func (r *Reconciler) reconcileAll() {
 		if !e.IsDir() {
 			continue
 		}
+		if function.IsReservedDir(e.Name()) {
+			// A Relay-owned transient staging directory (git's ".sync-*") is
+			// never a function and never a desired definition: it is neither
+			// dispatched for reconcile nor recorded as seen, so it cannot
+			// produce a warning or an invalid state row while it briefly exists.
+			continue
+		}
 		seen[e.Name()] = true
 		r.dispatch(e.Name())
 	}
@@ -544,6 +594,15 @@ func (r *Reconciler) reconcileAll() {
 // per name by the pump; when called directly (Reconcile/reconcileAll) callers
 // coordinate it.
 func (r *Reconciler) reconcileFunction(name string) {
+	// A Relay-owned transient staging directory (git's ".sync-*") is never a
+	// function and never a desired definition. It is filtered before dispatch
+	// (functionForPath, reconcileAll), but guard here too so a direct/stale
+	// caller can never turn a stage directory into a warning, an invalid state
+	// row, or a removal of a healthy function. It is deliberately not treated as
+	// ErrInvalidPath (which would record an invalid desired definition).
+	if function.IsReservedDir(name) {
+		return
+	}
 	// LoadSingle enforces the SAME path policy as startup discovery (a legal
 	// single-element name, a real direct child of the root, never a symlink), so
 	// a reload can never read, fingerprint, or build a path the startup loader

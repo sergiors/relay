@@ -747,6 +747,65 @@ func TestRelativeAgo(t *testing.T) {
 	}
 }
 
+// TestPruneRemovedSweepsReservedStagingRow pins the buggy-discovery cleanup: a
+// persisted row for a Relay-owned staging name (git's ".sync-*") is stale debris
+// and is pruned even when a transient directory of that name exists on disk. A
+// genuinely present normal function survives, and the reserved prune removes its
+// function_stats too.
+func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
+	c := openTestState(t)
+	tmpl := mustTemplate(t, twoHandlerTmpl)
+
+	// A reserved name that (from a previous bad discovery) has a state row and
+	// function_stats, plus a transient stage directory on disk.
+	c.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), fnFor(t, ".sync-old", tmpl))
+	c.RecordFunctionStats(FunctionStats{Function: ".sync-old", EventsMatchedTotal: 3})
+	// A normal function that must survive.
+	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), fnFor(t, "kept", tmpl))
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".sync-old"), 0o755); err != nil {
+		t.Fatalf("mkdir stage: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
+		t.Fatalf("mkdir kept: %v", err)
+	}
+
+	c.PruneRemoved(root)
+
+	if _, ok := c.GetFunction(".sync-old"); ok {
+		t.Fatal("a reserved staging row must be pruned (stale debris), even while the dir exists")
+	}
+	if _, ok := c.FunctionStats(".sync-old"); ok {
+		t.Fatal("a reserved staging row's function_stats must be pruned too")
+	}
+	if _, ok := c.GetFunction("kept"); !ok {
+		t.Fatal("a normal function must survive the reserved prune")
+	}
+}
+
+// TestPruneRemovedDoesNotDropRealHiddenInvalidDir pins that the reservation is
+// narrow: a persisted row for a genuinely invalid user directory (a hidden name
+// that merely looks similar) is NOT unconditionally pruned by the reserved
+// branch; it is pruned only by the normal filesystem rule (dir absent). Here the
+// directory exists, so the row survives.
+func TestPruneRemovedDoesNotDropRealHiddenInvalidDir(t *testing.T) {
+	c := openTestState(t)
+
+	c.RecordInvalidDesired(".hidden", &boomErr{})
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".hidden"), 0o755); err != nil {
+		t.Fatalf("mkdir hidden: %v", err)
+	}
+
+	c.PruneRemoved(root)
+
+	if _, ok := c.GetFunction(".hidden"); !ok {
+		t.Fatal("a non-reserved hidden directory present on disk must not be pruned as reserved")
+	}
+}
+
 // PruneRemoved removes state for functions missing from the authoritative dir,
 // INCLUDING their snapshot and function_stats, while keeping functions that
 // still exist on disk and leaving the global stats row untouched.

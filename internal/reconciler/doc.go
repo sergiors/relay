@@ -19,6 +19,12 @@
 //     — even to an in-root or outside target, non-directory) RETAINS the
 //     previously-loaded function rather than removing or replacing it; only a
 //     truly missing directory is a removal.
+//   - Relay-owned transient staging directories (function.IsReservedDir, e.g.
+//     git's ".sync-*" created directly under the functions root during
+//     materialization) are never functions: their events and periodic entries
+//     are filtered before a debounce/reconcile is armed, so a live sync cannot
+//     surface a warning, a state write, or a degraded/unavailable transition for
+//     a directory that is merely mid-copy.
 //
 // Usage: New, then PrepareWatch (establish change detection synchronously),
 // then Seed each startup function with its already-computed fingerprint, then

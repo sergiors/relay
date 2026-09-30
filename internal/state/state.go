@@ -947,8 +947,12 @@ func (st *State) RecordRemoved(name string) {
 // its function_stats. The filesystem is the source of truth; this only removes
 // rows for functions genuinely absent from disk. Transient stat errors
 // (permissions/I/O) are skipped — a flaky read must not drop a function that is
-// still on disk, mirroring the reconciler's removal tolerance. The global
-// single-row stats table is deliberately untouched. It is intended to run at
+// still on disk, mirroring the reconciler's removal tolerance. A row for a
+// Relay-owned staging name (function.IsReservedDir, e.g. git's ".sync-*") is
+// stale debris from a buggy discovery and is removed unconditionally, even if a
+// transient directory of that name happens to exist; no legitimate function name
+// can be reserved. The global single-row stats table is deliberately untouched.
+// It is intended to run at
 // startup, before the fresh registry's counters are seeded from the persisted
 // function_stats (restorePersistedStats), so a function removed while the worker
 // was down is pruned before its stale function_stats row could be re-seeded into
@@ -977,6 +981,22 @@ func (st *State) PruneRemoved(dir string) {
 	_ = rows.Close()
 
 	for _, name := range names {
+		// A reserved Relay-owned staging name (git's ".sync-*") is
+		// definitionally not a function, so any persisted row for it is stale
+		// debris from a buggy discovery and must be pruned even if a (transient)
+		// directory of that name happens to exist. No legitimate function name
+		// can be reserved (ValidName forbids a leading '.'), so this can never
+		// drop a real function.
+		if function.IsReservedDir(name) {
+			if rerr := st.rebuildTx(ctx, func(tx *sql.Tx) error {
+				return removeTx(ctx, tx, name)
+			}); rerr != nil {
+				st.log.Warn("State: prune reserved row failed", "function", name, "error", rerr)
+			} else {
+				st.notifyStatus(name, "")
+			}
+			continue
+		}
 		if _, err := os.Stat(filepath.Join(dir, name)); os.IsNotExist(err) {
 			// Reuse the same single-function removal path as RecordRemoved so the
 			// live reconciler and the startup sweep behave identically.

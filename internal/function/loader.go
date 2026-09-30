@@ -7,10 +7,34 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Dir is the fixed application-convention root the loader reads functions from.
 const Dir = "/functions"
+
+// StagingPrefix prefixes Relay's own transient staging directories created
+// directly under the functions root by git materialization
+// (internal/git/materialize.go: os.MkdirTemp(dst, StagingPrefix+"*")). Such a
+// directory holds a function tree only while it is being copied into place and
+// is renamed to the function's real name before materialization returns, so it
+// is never a function and never a desired definition. The constant lives here,
+// at the discovery boundary, so the creator (internal/git) and every
+// discovery/reload path (internal/function, internal/reconciler, internal/state)
+// share one definition and cannot drift apart.
+const StagingPrefix = ".sync-"
+
+// IsReservedDir reports whether name is one of Relay's internal, transient
+// directories that discovery and live/periodic reload must ignore ENTIRELY: a
+// staging directory (StagingPrefix) is not a user function, so it is neither a
+// valid function nor an invalid desired definition, and while it briefly exists
+// it must never produce a warning, a state write, or a degraded/unavailable
+// transition. It is deliberately narrow — the exact Relay-owned prefix, not
+// "any directory starting with '.'" — so a genuinely invalid user directory
+// (including a hidden one) keeps its existing invalid-name diagnostics.
+func IsReservedDir(name string) bool {
+	return strings.HasPrefix(name, StagingPrefix)
+}
 
 // Function is a loaded function: its name (from the directory name), directory
 // path (used later for image building), and parsed template.
@@ -125,7 +149,8 @@ func LoadSingle(root, name string) (Function, error) {
 }
 
 // Load returns the successfully loaded functions. Directories without a
-// template.yaml are silently skipped; invalid names, symlinked or non-directory
+// template.yaml are silently skipped; Relay-owned transient staging directories
+// (IsReservedDir) are ignored entirely; invalid names, symlinked or non-directory
 // entries, and invalid templates are logged and skipped without aborting the
 // load. Each entry is loaded through LoadSingle, so startup discovery and live
 // reload apply exactly the same path policy. Callers that must observe the
@@ -157,9 +182,11 @@ func (l *Loader) logIssues(issues []LoadIssue) {
 // functions, with the same logging and the same root-read error semantics — but
 // ALSO returns one LoadIssue per PRESENT entry that could not be loaded (an
 // invalid name/symlink/non-directory path, a missing template.yaml, or an
-// invalid/unreadable template). A directory that vanished between the directory
-// read and its load is not a desired definition and is deliberately omitted, so
-// a caller never mistakes a transient absence for an invalid desired state.
+// invalid/unreadable template). Relay-owned transient staging directories
+// (IsReservedDir) are ignored entirely and never reported. A directory that
+// VANISHED between the directory read and its load is not a desired definition
+// and is deliberately omitted, so a caller never mistakes a transient absence
+// for an invalid desired state.
 //
 // A root read error is returned as a fatal error (nil functions), exactly as
 // Load does: the loader cannot even enumerate the entries, so there is nothing
@@ -178,7 +205,8 @@ func (l *Loader) LoadWithDiagnostics() ([]Function, []LoadIssue, error) {
 // load is the shared loader body: it enumerates the root's direct child
 // directories, loads each through LoadSingle, and classifies the outcome. It
 // returns the loaded functions plus the present-but-invalid entries as issues;
-// vanished entries (fs.ErrNotExist) and entries without a template yet
+// Relay-owned transient staging directories (IsReservedDir) are skipped
+// entirely, vanished entries (fs.ErrNotExist) and entries without a template yet
 // (ErrNotReady) are neither functions nor issues. Callers own the logging and
 // the error semantics.
 func (l *Loader) load() ([]Function, []LoadIssue, error) {
@@ -196,6 +224,13 @@ func (l *Loader) load() ([]Function, []LoadIssue, error) {
 			continue
 		}
 		name := entry.Name()
+		if IsReservedDir(name) {
+			// A Relay-owned transient staging directory (git's ".sync-*") is
+			// never a function and never a desired definition: it is skipped
+			// entirely — no function, no issue, no warning — so a live sync
+			// cannot surface a spurious invalid/unavailable state.
+			continue
+		}
 		fn, err := LoadSingle(l.dir, name)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {

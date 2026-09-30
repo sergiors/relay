@@ -1,7 +1,12 @@
 // Package function is the pure decision layer for Relay functions.
 //
 // This package reads the /functions root and models what the runtime needs:
-//   - Discovery: each direct subdirectory is a function with a template.yaml
+//   - Discovery: each direct subdirectory is a function with a template.yaml.
+//     Relay-owned transient staging directories (IsReservedDir, git's ".sync-"
+//     created directly under the root during materialization) are ignored
+//     entirely: never a function, never an invalid desired definition, never
+//     logged — so a live sync cannot surface a spurious invalid/unavailable
+//     state.
 //   - Validation: templates are parsed and validated, including per-rule
 //     timeout resolution and handler form. Loader.LoadWithDiagnostics surfaces
 //     each PRESENT entry that cannot be loaded (invalid path, missing/invalid

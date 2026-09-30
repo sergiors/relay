@@ -1539,7 +1539,11 @@ func startupSeedFingerprints(
 // restorePersistedStats (the caller) so a pruned function's stats row is gone
 // before the fresh registry is seeded from it. Invalid functions stay out of the
 // loaded set and are never passed to discovery, matching, the scheduler, or
-// startup preparation — only their state view is updated.
+// startup preparation — only their state view is updated. Relay-owned transient
+// staging directories (function.IsReservedDir) are ignored entirely: a reserved
+// issue is never recorded as an invalid desired definition, and PruneRemoved
+// removes any stale reserved row a buggy prior discovery may have left, so a
+// live sync's ".sync-*" directory can never create, update, or retain state.
 //
 // It is split out of Run as a pure seam over the state handle so the
 // discovery/invalid persistence is unit-testable without Docker or Redis. A
@@ -1557,6 +1561,13 @@ func persistStartupDiscovery(
 		logger.Warn("State: rebuild from functions failed; continuing", "error", err)
 	}
 	for _, issue := range issues {
+		if function.IsReservedDir(issue.Name) {
+			// Defense in depth: the loader already filters Relay-owned staging
+			// directories, so a reserved issue should never reach here. If one
+			// does (a future caller), it must not create or update state for a
+			// directory that is not a function.
+			continue
+		}
 		st.RecordInvalidDesired(issue.Name, issue.Err)
 	}
 	st.PruneRemoved(dir)
