@@ -8,12 +8,14 @@ For event-driven workloads, Relay consumes events from Redis Streams, matches th
 
 Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
 
-**An app is the unit of source, configuration, and deployment.** Within an app, event-driven **functions** (its handlers), schedules, and optional persistent services share one declarative model. Functions remain a first-class Relay workload — schedules publish function work onto the same event pipeline, while services are long-lived containers that stay outside it. Start with a function. Add a service when you need one.
+**An app is the unit of source, configuration, and deployment.** Within an app, event-driven **functions**, schedules, and optional persistent services share one declarative model. Each function targets a handler, while schedules publish work into the same event pipeline and services run as long-lived containers outside it.
+
+Functions remain a first-class Relay workload. Start with a function. Add a service when you need one.
 
 Relay does not care where events originate:
 
 ```text
-Producer → Redis Stream → Relay → App Function (handler)
+Producer → Redis Stream → Relay → App → Function (handler)
 ```
 
 Functions, schedules, and persistent services are declared within an app and share the same deployment model while keeping their execution semantics independent.
@@ -58,7 +60,7 @@ runner
 isolated container
 ```
 
-A stream message may match multiple apps or handlers. Relay only acknowledges the message after every matched invocation reaches a terminal state.
+A stream message may match one or more handlers across one or more apps. Relay only acknowledges the message after every matched invocation reaches a terminal state.
 
 ### Schedules
 
@@ -374,15 +376,15 @@ See [docs/cli.md](docs/cli.md) for the detailed CLI reference.
 
 ## Documentation
 
-| Document                                       | Covers                                                                                     |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| [docs/configuration.md](docs/configuration.md) | Relay environment variables, defaults, and process-level configuration                     |
-| [docs/apps.md](docs/apps.md)         | App layout, templates, runtimes, environment, secrets, resources, and warm containers |
-| [docs/events.md](docs/events.md)               | Event matching, dispatch, retries, ACK semantics, invocation state, and DLQ                |
-| [docs/schedules.md](docs/schedules.md)         | Cron syntax, timezones, occurrence identity, publication deduplication, and recovery       |
-| [docs/services.md](docs/services.md)           | Persistent services, external images, routing, networks, replicas, and resources           |
-| [docs/operations.md](docs/operations.md)       | Lifecycle, state, recovery, metrics, tracing, logs, Git sync, and operational behavior     |
-| [docs/cli.md](docs/cli.md)                     | Commands, flags, and prerequisites                                                         |
+| Document                                       | Covers                                                                                 |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------- |
+| [docs/configuration.md](docs/configuration.md) | Relay environment variables, defaults, and process-level configuration                 |
+| [docs/apps.md](docs/apps.md)                   | App layout, templates, runtimes, environment, secrets, resources, and warm containers  |
+| [docs/events.md](docs/events.md)               | Event matching, dispatch, retries, ACK semantics, invocation state, and DLQ            |
+| [docs/schedules.md](docs/schedules.md)         | Cron syntax, timezones, occurrence identity, publication deduplication, and recovery   |
+| [docs/services.md](docs/services.md)           | Persistent services, external images, routing, networks, replicas, and resources       |
+| [docs/operations.md](docs/operations.md)       | Lifecycle, state, recovery, metrics, tracing, logs, Git sync, and operational behavior |
+| [docs/cli.md](docs/cli.md)                     | Commands, flags, and prerequisites                                                     |
 
 ## Development
 
