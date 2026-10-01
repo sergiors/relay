@@ -60,12 +60,7 @@ func appCommand(deps Dependencies) *cli.Command {
 				Name:        "ls",
 				Usage:       "List apps",
 				Description: "List all apps Relay has discovered, sorted by name.",
-				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.Args().Present() {
-						return cli.Exit("app ls: too many arguments", 2)
-					}
-					return appList(ctx, cmd.Writer, deps.StatePath)
-				},
+				Action:      appListAction(deps),
 			},
 			{
 				Name:      "inspect",
@@ -87,6 +82,41 @@ func appCommand(deps Dependencies) *cli.Command {
 			},
 			appInvokeCommand(deps),
 		},
+	}
+}
+
+// appsCommand builds the top-level `relay apps` short form of `relay app ls`.
+// It is a thin alias with NO subcommands: it shares appListAction with the
+// canonical `relay app ls`, so listing, sorting, and argument rejection are
+// identical. Every positional token — including `inspect` or `invoke`, which are
+// subcommands of the `relay app` group — is a usage error here rather than a
+// namespace dispatch, so the app grouping surface stays under `relay app`.
+// `relay app ls` remains the canonical form.
+func appsCommand(deps Dependencies) *cli.Command {
+	return &cli.Command{
+		Name:  "apps",
+		Usage: "List apps (short form of 'relay app ls')",
+		Description: "Short form of `relay app ls`: list all apps Relay has " +
+			"discovered, sorted by name, from the local state database. It takes no " +
+			"arguments; use `relay app inspect` or `relay app invoke` for the other " +
+			"app operations.",
+		Action: appListAction(deps),
+	}
+}
+
+// appListAction is the Action shared verbatim by the canonical `relay app ls`
+// and the top-level `relay apps` short form, so the two entry points can never
+// drift in listing, sorting, or argument handling. It rejects ANY positional
+// argument as a usage error — including a stray `inspect` or `invoke`, which
+// must not resolve as a namespace at the alias — and otherwise renders the table
+// from the state database at deps.StatePath. The error text names the canonical
+// command, because `app ls` is the form the alias mirrors.
+func appListAction(deps Dependencies) cli.ActionFunc {
+	return func(ctx context.Context, cmd *cli.Command) error {
+		if cmd.Args().Present() {
+			return cli.Exit("app ls: too many arguments", 2)
+		}
+		return appList(ctx, cmd.Writer, deps.StatePath)
 	}
 }
 

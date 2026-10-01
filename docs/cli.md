@@ -8,6 +8,7 @@ relay start
 relay health
 relay stats [reset]
 relay app <ls|inspect|invoke>
+relay apps                                 # short form of `relay app ls`
 relay dlq <ls|inspect|replay|rm>
 relay secret <ls|set|rm>
 relay git <keygen|set|sync|status|remove>
@@ -17,6 +18,13 @@ Running `relay` with no command prints the top-level help. A grouping command ru
 bare (e.g. `relay app`) prints its subcommand help; an unknown subcommand is
 a usage error naming the full command path.
 
+`relay apps` is a thin top-level alias for `relay app ls` and the only short
+form; `relay app ls` stays canonical. It is a leaf command with no namespace: it
+lists apps exactly as `relay app ls` does, and any positional argument
+(including `relay apps inspect` or `relay apps invoke`) is a usage error rather
+than a subcommand dispatch. Use `relay app inspect` / `relay app invoke` for
+those operations.
+
 ## Prerequisites per command
 
 | Command                     | Needs Redis | Needs Docker | Needs a running worker | Reads/writes                                 |
@@ -25,7 +33,7 @@ a usage error naming the full command path.
 | `health`                    | no          | no           | **yes**                | worker socket                                |
 | `stats`                     | no          | no           | no                     | state DB (read)                              |
 | `stats reset`               | no          | no           | optional (socket)      | state DB (write); worker socket when running |
-| `app ls` / `inspect`        | no          | no           | optional (inspect)     | state DB (read); socket for live pool gauges |
+| `app ls` / `inspect` / `apps` | no       | no           | optional (inspect)     | state DB (read); socket for live pool gauges |
 | `app invoke`                | no          | no           | **yes**                | worker socket                                |
 | `dlq ls` / `inspect` / `rm` | yes         | no           | no                     | Redis DLQ stream                             |
 | `dlq replay`                | yes         | no           | **yes**                | Redis DLQ + worker socket                    |
@@ -116,6 +124,7 @@ not reset.
 
 ```
 relay app ls
+relay apps        # equivalent short form
 ```
 
 ```
@@ -125,7 +134,9 @@ welcome-email-node    node24       ready     12s ago
 ```
 
 `UPDATED` is `prepared_at` (else `updated_at`) as a relative age; rows are sorted
-by name.
+by name. `relay apps` is a top-level alias for `relay app ls`; it accepts no
+arguments and owns no subcommands (`relay apps inspect` and `relay apps invoke`
+are usage errors — use the `relay app` forms below).
 
 ```
 relay app inspect user-events-python

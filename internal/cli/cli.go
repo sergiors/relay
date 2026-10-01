@@ -115,6 +115,7 @@ func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command 
 		Commands: []*cli.Command{
 			startCommand(logger, deps),
 			appCommand(deps),
+			appsCommand(deps),
 			dlqCommand(logger, deps),
 			secretCommand(),
 			gitCommand(),
