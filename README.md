@@ -1,8 +1,12 @@
 # Relay
 
-Relay is a self-hosted, event-driven runtime for running functions, schedules, and persistent services on infrastructure you already control.
+Relay is a self-hosted runtime for running event-driven functions, schedules, and persistent services on infrastructure you already control.
 
-It consumes events from Redis Streams, matches them against declarative rules, executes handlers in isolated Docker containers, retries failures, dead-letters exhausted invocations, and keeps long-running services converged — without a hosted control plane.
+It can execute short-lived handlers in response to events, publish scheduled work, and keep long-running applications such as APIs, workers, gateways, and consumers converged from the same declarative model.
+
+For event-driven workloads, Relay consumes events from Redis Streams, matches them against declarative rules, executes handlers in isolated Docker containers, retries failures, and dead-letters exhausted invocations.
+
+Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
 
 Relay does not care where events originate:
 
@@ -10,14 +14,14 @@ Relay does not care where events originate:
 Producer → Redis Stream → Relay → Function Handler
 ```
 
-Scheduled workloads and persistent services use the same runtime and container infrastructure, so event-driven functions, cron jobs, and long-running services can live under one deployment model.
+Functions, schedules, and persistent services share the same deployment model while keeping their execution semantics independent.
 
 ## What you get
 
 - **Event-driven execution** — Redis Streams, declarative matching, retries, reclaim, dead-lettering, and at-least-once delivery.
 - **Managed runtimes** — Python 3.14 and Node 24, including TypeScript support, with reusable warm containers and bounded concurrency.
 - **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries, and startup catch-up.
-- **Persistent services** — long-running services from managed-runtime entrypoints or external container images, with ports, replicas, Docker networks, resources, and optional Traefik routing.
+- **Persistent services** — run APIs, workers, gateways, consumers, and other long-running processes from managed-runtime entrypoints or external container images, with replicas, Docker networks, resource limits, environment configuration, secrets, and optional Traefik routing.
 - **Resource controls** — per-container memory, CPU, and PID limits.
 - **Configuration and secrets** — environment values and secret references shared across functions, schedules, and services.
 - **Observability** — persisted statistics, Prometheus metrics, structured logs, and OpenTelemetry tracing.
@@ -26,7 +30,17 @@ Scheduled workloads and persistent services use the same runtime and container i
 
 ## How it works
 
-For events, Relay follows this path:
+Relay manages three workload models:
+
+```text
+Events       → Function handlers
+Schedules    → Published occurrences → Function handlers
+Services     → Continuously reconciled containers
+```
+
+### Events
+
+For event-driven workloads, Relay follows this path:
 
 ```text
 Redis Stream
@@ -42,6 +56,8 @@ isolated container
 
 A stream message may match multiple functions or handlers. Relay only acknowledges the message after every matched invocation reaches a terminal state.
 
+### Schedules
+
 Schedules follow the same execution path after publication:
 
 ```text
@@ -54,13 +70,29 @@ Redis Stream
 normal Relay execution
 ```
 
-Persistent services are reconciled separately and kept aligned with their declared configuration.
+### Services
+
+Persistent services do not pass through the event execution pipeline.
+
+Instead, Relay continuously reconciles their declared configuration:
+
+```text
+service declaration
+       ↓
+service reconciler
+       ↓
+desired replicas / configuration
+       ↓
+long-running containers
+```
+
+Relay keeps those containers aligned with the declared service configuration, restarting or replacing them when necessary.
 
 Relay watches `/functions` for changes. When a function changes, Relay reconciles only the affected function and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image.
 
 ## Guarantees
 
-Relay is designed around explicit delivery and recovery semantics.
+Relay is designed around explicit delivery, recovery, and convergence semantics.
 
 - **Handler execution is at-least-once, not exactly-once.** A crash after a handler performs a side effect but before completion is recorded may cause the handler to run again. Handlers should be idempotent where side effects require it.
 - **Matched work is not acknowledged while unresolved.** Running invocations, retry backoff, and other non-terminal states keep the Redis message pending.
@@ -70,6 +102,7 @@ Relay is designed around explicit delivery and recovery semantics.
 - **Schedule publication is deduplicated cluster-wide.** Multiple workers may evaluate the same cron occurrence, but only one stream entry is admitted for that logical occurrence.
 - **Schedule deduplication does not imply exactly-once execution.** Once published, scheduled handlers follow the same at-least-once execution model as any other event.
 - **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
+- **Persistent services converge toward declared state.** Relay continuously reconciles service containers against their configured replicas and runtime configuration.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
 - **Resource limits are per container.** Increasing function concurrency or service replicas multiplies the possible aggregate resource usage.
 - **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.
@@ -163,7 +196,6 @@ The same template can also declare:
 - secret references
 - schedules
 - persistent services
-- Docker networks
 - resource limits
 - routing
 
@@ -171,20 +203,51 @@ See [docs/functions.md](docs/functions.md) for the full function model and [docs
 
 ## Persistent services
 
-A function may also declare long-running services.
+Relay can manage long-running workloads alongside event-driven functions and schedules.
 
-Using a managed runtime entrypoint:
+A service is continuously reconciled toward its declared state rather than invoked by an event. This makes services suitable for HTTP APIs, background workers, gateways, consumers, and other processes expected to remain running.
+
+Services can either reuse Relay's managed runtime or run an external container image directly.
+
+### Managed runtime services
+
+A managed service uses the same source tree and runtime image model as Relay-managed functions.
+
+For example:
 
 ```yaml
 runtime: python3.14
+
+env:
+  APP_ENV: production
+
+resources:
+  memory: 512MiB
+  cpus: 1
 
 services:
   - name: api
     entrypoint: app/main.py
     port: 8000
+    replicas: 2
 ```
 
-Or an external image:
+Relay prepares the runtime image and keeps the declared service replicas running.
+
+This is useful when the same application contains both event-driven handlers and long-running processes:
+
+```text
+application
+├── event handlers
+├── scheduled handlers
+└── persistent API / worker
+```
+
+They can share the runtime, source tree, environment, secrets, resources, and deployment model while still having different execution semantics.
+
+### External image services
+
+A service may also run an existing container image:
 
 ```yaml
 services:
@@ -197,16 +260,26 @@ These are intentionally different ownership models:
 
 ```text
 Managed runtime entrypoint
-  Relay prepares the runtime image and runs the service
+  Relay prepares the runtime image
+  Relay owns the managed image lifecycle
+  Relay runs and reconciles the service
 
 External image
   Relay pulls and runs the image as-is
+  Relay reconciles the service containers
   Relay does not build or own that image
 ```
 
-Services may also use function-level environment variables, secrets, Docker
-networks (the worker-global `NETWORKS` plus `TRAEFIK_NETWORK` for routed
-services), resources, replicas, and routing configuration.
+Services may use function-level environment variables, secrets, the worker-global `NETWORKS`, resources, replicas, and routing configuration.
+
+Routed services may additionally use `TRAEFIK_NETWORK`.
+
+In short:
+
+```text
+Functions are invoked.
+Services are converged.
+```
 
 See [docs/services.md](docs/services.md).
 
@@ -232,7 +305,9 @@ See [docs/schedules.md](docs/schedules.md).
 
 Relay distinguishes between image identity and container configuration.
 
-Managed runtime images are rebuilt only when their build inputs change.
+Managed runtime images may be shared by event-driven functions and managed-runtime services.
+
+They are rebuilt only when their build inputs change.
 
 Changes such as:
 
@@ -241,6 +316,8 @@ Changes such as:
 - PID limits
 - networks
 - runtime environment
+- service replicas
+- routing
 - other container-only configuration
 
 may require new containers without requiring a new image.
