@@ -34,7 +34,7 @@ var repoRoot = func() string {
 // app directories and returns the parsed template alongside its dir.
 func readRealTemplate(t *testing.T, relDir string) (string, *app.Template) {
 	t.Helper()
-	dir := filepath.Join(repoRoot, "examples", "functions", relDir)
+	dir := filepath.Join(repoRoot, "examples", "apps", relDir)
 	data, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read real template %s: %v", relDir, err)
