@@ -93,10 +93,12 @@ func expectedMetricTypes(r *Registry) map[string]dto.MetricType {
 }
 
 // TestMetricMetadataCompletenessAndTypes gathers every family after seeding and
-// asserts the registry exposes exactly the registered metrics, each with a
-// non-empty, sentence-case HELP and the type its registration implies. It pins
-// the _total-is-counter rule for every counter family and catches any collector
-// added without HELP.
+// asserts the registry exposes exactly the Relay-owned registered metrics, each
+// with a non-empty, sentence-case HELP and the type its registration implies. It
+// pins the _total-is-counter rule for every counter family and catches any
+// collector added without HELP. The standard Go runtime/process collectors share
+// the registry and are excluded here (their metadata is the client library's,
+// not Relay's).
 func TestMetricMetadataCompletenessAndTypes(t *testing.T) {
 	r := New()
 	seedAllMetrics(r)
@@ -110,6 +112,10 @@ func TestMetricMetadataCompletenessAndTypes(t *testing.T) {
 
 	for _, f := range families {
 		name := f.GetName()
+		if !r.ownsMetric(name) {
+			// Standard Go runtime/process family, not a Relay registration.
+			continue
+		}
 		seen[name] = true
 
 		wantType, ok := want[name]
@@ -161,11 +167,15 @@ func TestMetricMetadataTotalFamiliesAreCounters(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 	for _, f := range families {
-		if !strings.HasSuffix(f.GetName(), "_total") {
+		name := f.GetName()
+		if !r.ownsMetric(name) {
+			continue
+		}
+		if !strings.HasSuffix(name, "_total") {
 			continue
 		}
 		if got := f.GetType(); got != dto.MetricType_COUNTER {
-			t.Errorf("family %q ends in _total but has type %v, want COUNTER", f.GetName(), got)
+			t.Errorf("family %q ends in _total but has type %v, want COUNTER", name, got)
 		}
 	}
 }
@@ -186,6 +196,9 @@ func TestMetricMetadataDurationHistogramsAreSeconds(t *testing.T) {
 	}
 	for _, f := range families {
 		name := f.GetName()
+		if !r.ownsMetric(name) {
+			continue
+		}
 		if !strings.HasSuffix(name, "_seconds") {
 			continue
 		}
@@ -242,6 +255,51 @@ func TestMetricMetadataExpositionHasHelpAndType(t *testing.T) {
 		}
 		if !strings.Contains(body, "# TYPE "+name+" ") {
 			t.Errorf("exposition missing TYPE line for %q:\n%s", name, body)
+		}
+	}
+}
+
+// TestMetricMetadataStandardRuntimeAndProcessFamilies pins that the dedicated
+// registry also exposes the standard client_golang Go runtime and process
+// collectors, so a scrape carries the conventional go_* and process_* families
+// in addition to Relay's. Only PRESENCE is asserted (never exact runtime
+// values, which change between scrapes). These families are registered on the
+// same dedicated registry the /metrics handler serves — not the global default
+// registry — and are deliberately not part of Relay's own metadata audit or the
+// human-readable Snapshot.
+func TestMetricMetadataStandardRuntimeAndProcessFamilies(t *testing.T) {
+	r := New()
+
+	// Gather first (the collectors are eager: they emit on every gather).
+	families, err := r.reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	gathered := make(map[string]bool, len(families))
+	for _, f := range families {
+		gathered[f.GetName()] = true
+	}
+
+	want := []string{
+		"go_goroutines",
+		"go_memstats_heap_alloc_bytes",
+		"go_memstats_heap_objects",
+		"go_memstats_heap_sys_bytes",
+		"process_resident_memory_bytes",
+	}
+	for _, name := range want {
+		if !gathered[name] {
+			t.Errorf("registry missing standard family %q", name)
+		}
+	}
+
+	// The same families must be visible end to end on the served exposition.
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, name := range want {
+		if !strings.Contains(body, "# TYPE "+name+" ") {
+			t.Errorf("/metrics missing TYPE line for standard family %q:\n%s", name, body)
 		}
 	}
 }

@@ -27,6 +27,13 @@
 // non-empty sentence-case HELP in metricHelp (metrics.go), and the metadata
 // test gathers all of them to enforce that:
 //
+//   - Standard runtime/process: New also registers the client library's Go
+//     runtime collector (go_*, including the legacy go_memstats_* families) and
+//     process collector (process_*) on the same dedicated registry, so a scrape
+//     carries the conventional Go/process observability families alongside
+//     Relay's. These are NOT relay_-prefixed, are excluded from Relay's own
+//     metadata audit, and are excluded from the human-readable Snapshot (their
+//     live values would make the periodic log non-deterministic).
 //   - Counters: relay_events_received_total, relay_events_matched_total,
 //     relay_events_unmatched_total, relay_retries_total,
 //     relay_dlq_entries_total, relay_handler_success_total,

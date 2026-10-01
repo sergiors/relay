@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -454,6 +455,19 @@ type labeledGaugeVec struct {
 // registry registered with the fixed collectors callers use.
 func New() *Registry {
 	reg := prometheus.NewRegistry()
+
+	// Register the standard Go runtime and process collectors on this dedicated
+	// registry (never the global default), so a scrape exposes the same
+	// runtime/process families the Prometheus client library conventionally
+	// exports: go_*, process_*, and the runtime/metrics families. They are
+	// registered here, next to the Relay-owned collectors, because /metrics is
+	// served from this one registry — no second registry or global exists.
+	// Registration is process-lifetime and never removed: app lifecycle cleanup
+	// only deletes app-labelled series, never these.
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 
 	r := &Registry{
 		reg:           reg,
@@ -1513,10 +1527,42 @@ func (r *Registry) RuntimePoolCounters(name string) (warm, cold, discarded int64
 	return warm, cold, discarded
 }
 
-// Snapshot renders every registered metric as a logfmt-style line, one per
-// metric, sorted for deterministic output. Names are rendered via
-// metricDisplayName, i.e. WITHOUT the relay_ namespace prefix — this output is
-// purely for human logs (the MetricsLogger); the /metrics exposition keeps the
+// ownsMetric reports whether name is one of the Relay-owned collectors this
+// Registry registered in New, keyed by canonical metric name. It is the
+// membership test the human-readable Snapshot uses to stay scoped to Relay
+// metrics: the standard Go runtime and process collectors share the exposition
+// registry, but their constantly changing values must never make the periodic
+// log snapshot non-deterministic or drown the Relay families in log noise. It
+// is nil-safe.
+func (r *Registry) ownsMetric(name string) bool {
+	if r == nil {
+		return false
+	}
+	if _, ok := r.counters[name]; ok {
+		return true
+	}
+	if _, ok := r.gauges[name]; ok {
+		return true
+	}
+	if _, ok := r.counterVecs[name]; ok {
+		return true
+	}
+	if _, ok := r.histogramVecs[name]; ok {
+		return true
+	}
+	if _, ok := r.gaugeVecs[name]; ok {
+		return true
+	}
+	return false
+}
+
+// Snapshot renders every Relay-owned metric as a logfmt-style line, one per
+// metric, sorted for deterministic output. The standard Go runtime and process
+// collectors are part of the exposition registry but are deliberately NOT
+// rendered here: this output is the periodic human log (the MetricsLogger), and
+// live runtime values would make it non-deterministic and noisy. Names are
+// rendered via metricDisplayName, i.e. WITHOUT the relay_ namespace prefix —
+// this output is purely for human logs; the /metrics exposition keeps the
 // canonical prefixed names. The shapes are:
 //
 //	name count=N
@@ -1535,6 +1581,9 @@ func (r *Registry) Snapshot() string {
 	}
 	var lines []string
 	for _, f := range families {
+		if !r.ownsMetric(f.GetName()) {
+			continue
+		}
 		switch f.GetType() {
 		case dto.MetricType_COUNTER:
 			for _, m := range f.GetMetric() {

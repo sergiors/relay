@@ -66,6 +66,11 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	seen := map[string]bool{}
 	for _, f := range families {
 		name := f.GetName()
+		if !r.ownsMetric(name) {
+			// The standard Go runtime/process collectors also gather here; they
+			// are not Relay-namespaced and are deliberately excluded.
+			continue
+		}
 		if seen[name] {
 			t.Fatalf("duplicate family %q gathered", name)
 		}
