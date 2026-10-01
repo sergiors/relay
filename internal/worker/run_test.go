@@ -387,7 +387,6 @@ func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 	start := time.Now()
 	reg.run(logger)
 	elapsed := time.Since(start)
-	close(release)
 
 	if elapsed > 2*time.Second {
 		t.Fatalf("registry hung on a non-cooperative step: %v", elapsed)
@@ -398,12 +397,16 @@ func TestShutdownRegistryTimedOutStepContinues(t *testing.T) {
 		t.Fatal("blocking step never entered")
 	}
 	// The timeout cancelled the cleanup step's context, but the registry
-	// advanced without joining it.
+	// advanced without joining it. Return only guarantees cancellation, not that
+	// the step's goroutine has been scheduled to observe ctx.Done yet, so wait
+	// (bounded) for it to react before releasing it.
 	select {
 	case <-blockedCancelled:
-	default:
+	case <-time.After(2 * time.Second):
+		close(release)
 		t.Fatal("timed-out cleanup step's context was not cancelled")
 	}
+	close(release)
 	// The later step ran despite the timeout.
 	mu.Lock()
 	got := append([]string(nil), order...)
