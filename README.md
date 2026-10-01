@@ -1,10 +1,10 @@
 # Relay
 
-Relay is a self-hosted runtime for running event-driven apps — functions, schedules, and persistent services — on infrastructure you already control.
+Relay is an event-driven runtime for declarative apps — with serverless functions, schedules, and persistent services. Run it on infrastructure you control.
 
-It can execute short-lived functions in response to events, publish scheduled work that runs the same functions, and keep long-running applications such as APIs, workers, gateways, and consumers converged from the same declarative model.
+It executes short-lived functions in isolated runtimes, publishes scheduled work through the same event pipeline, and continuously reconciles long-running services from the same declarative model.
 
-For event-driven workloads, Relay consumes events from Redis Streams, matches them against declarative rules, executes the matched functions in isolated Docker containers, retries failures, and dead-letters exhausted invocations.
+For event-driven workloads, Relay consumes events from a broker, matches them against declarative rules, executes matched functions, retries failures, and dead-letters exhausted invocations.
 
 Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
 
