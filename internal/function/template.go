@@ -44,17 +44,22 @@ const DefaultServiceReplicas = 1
 // runs up to the cap is never reclaimed mid-flight.
 const MaxTimeout = 5 * time.Minute
 
-// operatorKeys are the only keys treated as operators when they are the only
-// keys present in a map; any other key is treated as a nested field.
-var operatorKeys = map[string]bool{
-	"equals": true,
-	"prefix": true,
-	"suffix": true,
-	"exists": true,
-	"gt":     true,
-	"gte":    true,
-	"lt":     true,
-	"lte":    true,
+// conditionOperators are the single-key operator maps allowed as an
+// alternative inside a field's condition list. Every operator takes a scalar
+// operand; a field's list is OR across its alternatives, so multiple prefixes
+// or thresholds are expressed as multiple single-operator alternatives rather
+// than as an operand list.
+var conditionOperators = map[string]struct{}{
+	"prefix": {}, "suffix": {}, "exists": {},
+	"gt": {}, "gte": {}, "lt": {}, "lte": {},
+}
+
+// removedConditionOperators are operator names Relay used to accept but no
+// longer does. They are still recognized at parse time so an old template
+// fails with a precise message instead of being silently reinterpreted as a
+// nested child field (or, for a list entry, silently dropped).
+var removedConditionOperators = map[string]struct{}{
+	"equals": {},
 }
 
 var supportedRuntimes = map[string]bool{
@@ -287,36 +292,67 @@ type EventRule struct {
 // Pattern maps top-level event fields to their conditions.
 type Pattern map[string]FieldCondition
 
-// FieldCondition is how one field is evaluated: value operators are
-// alternatives (OR), and child conditions AND with each other and the operators.
+// Literal is one bare (operator-free) alternative of a field's condition: the
+// event value must equal Value, with the matcher's type-preserving comparison
+// (numeric kinds compare numerically). Every field condition is a list, so a
+// literal is always an entry of that list.
+type Literal struct {
+	Value any
+}
+
+// FieldCondition is how one field is evaluated. Alternatives are the field's
+// ordered list of value conditions (OR); Children are nested field conditions
+// ANDed with each other and with the alternatives. Exactly the shapes the
+// parser produces: a field is either a non-empty list of alternatives, a map of
+// children, or both (a condition map never mixes alternatives and children, but
+// a hand-built condition may, and the matcher honors it).
 type FieldCondition struct {
-	Operators []ValueMatcher
-	Children  map[string]FieldCondition
+	Alternatives []Alternative
+	Children     map[string]FieldCondition
+}
+
+// Alternative is one value condition for a field. Exactly one of Literal or
+// Operator is meaningful: a Literal matches a value equal to Value, while an
+// Operator matches per the operator's semantics (prefix/suffix/exists/range).
+type Alternative struct {
+	Literal  *Literal
+	Operator ValueMatcher
+}
+
+// match evaluates the alternative against a decoded value and the field's
+// presence flag. A value matcher (operator or literal) never matches an absent
+// key; presence-aware operators (exists) resolve from the presence flag alone,
+// and a nested-map alternative resolves its children from the parent value.
+func (a Alternative) match(value any, present bool) bool {
+	if a.Literal != nil {
+		if !present {
+			return false
+		}
+		return valuesEqual(value, a.Literal.Value)
+	}
+	if a.Operator == nil {
+		return false
+	}
+	if pm, ok := a.Operator.(presenceMatcher); ok {
+		return pm.MatchPresent(present)
+	}
+	if cm, ok := a.Operator.(nestedMatcher); ok {
+		return cm.MatchValue(value, present)
+	}
+	if !present {
+		return false
+	}
+	return a.Operator.Match(value)
 }
 
 type ValueMatcher interface {
 	Match(value any) bool
 }
 
-// equalityMatcher matches values equal to any of the given values. Comparison
-// is type-preserving except that numeric kinds are compared numerically.
-type equalityMatcher struct {
-	values []any
-}
-
-func (m equalityMatcher) Match(value any) bool {
-	for _, want := range m.values {
-		if valuesEqual(value, want) {
-			return true
-		}
-	}
-	return false
-}
-
-// prefixMatcher matches string values that start with any of the given
-// prefixes. Non-string values never match.
+// prefixMatcher matches string values that start with the given prefix.
+// Non-string values never match.
 type prefixMatcher struct {
-	prefixes []string
+	prefix string
 }
 
 func (m prefixMatcher) Match(value any) bool {
@@ -324,18 +360,13 @@ func (m prefixMatcher) Match(value any) bool {
 	if !ok {
 		return false
 	}
-	for _, p := range m.prefixes {
-		if len(s) >= len(p) && s[:len(p)] == p {
-			return true
-		}
-	}
-	return false
+	return len(s) >= len(m.prefix) && s[:len(m.prefix)] == m.prefix
 }
 
-// suffixMatcher matches string values that end with any of the given suffixes.
+// suffixMatcher matches string values that end with the given suffix.
 // Non-string values never match.
 type suffixMatcher struct {
-	suffixes []string
+	suffix string
 }
 
 func (m suffixMatcher) Match(value any) bool {
@@ -343,12 +374,7 @@ func (m suffixMatcher) Match(value any) bool {
 	if !ok {
 		return false
 	}
-	for _, suf := range m.suffixes {
-		if len(s) >= len(suf) && s[len(s)-len(suf):] == suf {
-			return true
-		}
-	}
-	return false
+	return len(s) >= len(m.suffix) && s[len(s)-len(m.suffix):] == m.suffix
 }
 
 // existsMatcher matches key presence only. It ignores the value entirely:
@@ -1169,153 +1195,287 @@ func validateHandler(handler string) error {
 }
 
 // parseFieldCondition converts a decoded YAML node into a FieldCondition.
-//   - a plain scalar -> implicit equality
-//   - a plain list -> implicit equality (OR across the values)
-//   - a map with condition operator keys -> validated operators
-//   - a map with nested field keys -> child conditions (AND with siblings)
 //
-// Empty maps, unknown operator-like keys, and mixed operator/child maps are
-// rejected. A malformed operator must never silently become an empty condition:
-// FieldCondition.match treats no operators and no children as true, which would
-// widen a typo into a match-all predicate.
+// A field's condition is an ORDERED LIST of alternatives (OR). Each element is
+// one of:
+//   - a bare scalar           -> an equality literal (the only literal form)
+//   - a single-operator map   -> that operator: {prefix: "x"}, {gt: 10},
+//     {exists: true}, ...
+//   - a map of ordinary field keys -> a nested condition group (children AND)
 //
-// path is the dotted field path (e.g. "new_image.cnpj") used to give errors from
-// strict operator validation (exists) enough context to locate the offending
-// value. It must be non-empty for every field; nested fields append their name.
+// A bare map is also accepted as shorthand for a single-element nested group,
+// which preserves the established nested-object syntax
+// (`new_image: {status: [COMPLETED]}`). Because the old field-level operator
+// map (`status: {prefix: [x]}`) is REMOVED, a map may not name an operator: an
+// operator-like key at map level is rejected with a message showing the list
+// form, so an old template or an operator typo never silently becomes a nested
+// field. A null condition, an empty map, and an empty list are all rejected:
+// FieldCondition.match treats no alternatives and no children as true, so a
+// permissive parse would widen a mistake into a match-all predicate.
 //
-// now is the temporal clock for `now`-relative comparison operators, passed
+// path is the dotted field path (e.g. "new_image.cnpj") carried into errors so
+// the author can locate the offending value; nested fields append their name.
+//
+// now is the temporal clock for `now()`-relative comparison operators, passed
 // down unchanged so it is identical for the whole template.
 func parseFieldCondition(path string, v any, now func() time.Time) (FieldCondition, error) {
 	switch val := v.(type) {
 	case []any:
-		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: val}}}, nil
+		alts, err := parseAlternatives(path, val, now)
+		if err != nil {
+			return FieldCondition{}, err
+		}
+		return FieldCondition{Alternatives: alts}, nil
 	case map[string]any:
 		if len(val) == 0 {
-			return FieldCondition{}, fmt.Errorf("%s: condition map is empty; use an explicit operator such as exists", path)
+			return FieldCondition{}, fmt.Errorf("%s: condition map is empty; use a non-empty condition list", path)
 		}
-		if isOperatorMap(val) {
-			return buildOperators(val, path, now)
-		}
-		// Preserve the established nested-object syntax: a map with ordinary
-		// child fields (including fields literally named "exists" or "equals")
-		// is a nested condition, not an operator map. But reject an operator-like
-		// unknown key such as `prefx` rather than interpreting an operator typo as
-		// a child field and silently widening the rule.
-		for field := range val {
-			if looksLikeConditionOperator(field) {
-				return FieldCondition{}, fmt.Errorf("%s: unknown condition operator %q", path, field)
-			}
-		}
-		children := make(map[string]FieldCondition, len(val))
-		for field, child := range val {
-			childCond, err := parseFieldCondition(path+"."+field, child, now)
-			if err != nil {
-				return FieldCondition{}, err
-			}
-			children[field] = childCond
+		children, err := parseChildren(path, val, now)
+		if err != nil {
+			return FieldCondition{}, err
 		}
 		return FieldCondition{Children: children}, nil
+	case nil:
+		return FieldCondition{}, fmt.Errorf("%s: condition is null; a field condition must be a non-empty list or a map", path)
 	default:
-		// A bare scalar is treated as implicit equality with a single value.
-		return FieldCondition{Operators: []ValueMatcher{equalityMatcher{values: []any{val}}}}, nil
+		// Bare scalar shorthand is intentionally NOT supported: every field
+		// condition is a list. The error names the fix.
+		return FieldCondition{}, fmt.Errorf("%s: condition must be a non-empty list or a map; wrap the value in a list, e.g. [%v]", path, val)
 	}
 }
 
-// buildOperators converts a condition-operator map into a FieldCondition.
-// Unknown keys, mixed operator/nested-field maps, and malformed operators are
-// rejected: silently dropping one can leave an empty condition that matches
-// every event, widening a rule on typo.
-//
-// gt/gte/lt/lte are NEW operators with no legacy convention to preserve, so they
-// are validated strictly like exists. Each operand must be either a number (any
-// numeric kind — compared numerically) or a `now()`-relative expression string
-// (validated with parseNowOperand). Anything else — null, a bool, a map, a
-// plain non-now string such as "hello" or a literal RFC3339 timestamp — is
-// rejected rather than silently ignored. A literal timestamp string is NOT
-// treated as a date; only the exact `now()`/`now()±duration` syntax triggers
-// temporal comparison, so rejecting anything-but is the honest, fail-fast choice.
-func buildOperators(m map[string]any, path string, now func() time.Time) (FieldCondition, error) {
-	for key := range m {
-		if !isKnownConditionOperator(key) {
-			return FieldCondition{}, fmt.Errorf("%s: unknown condition operator %q", path, key)
-		}
+// parseAlternatives builds the ordered OR list for a field's condition list.
+func parseAlternatives(path string, list []any, now func() time.Time) ([]Alternative, error) {
+	if len(list) == 0 {
+		return nil, fmt.Errorf("%s: condition list is empty", path)
 	}
-	var matchers []ValueMatcher
-	if raw, ok := m["equals"]; ok {
-		vals, ok := raw.([]any)
-		if !ok || len(vals) == 0 {
-			return FieldCondition{}, fmt.Errorf("%s: equals must be a non-empty list", path)
+	alts := make([]Alternative, 0, len(list))
+	for _, entry := range list {
+		alt, err := parseAlternative(path, entry, now)
+		if err != nil {
+			return nil, err
 		}
-		matchers = append(matchers, equalityMatcher{values: vals})
+		alts = append(alts, alt)
 	}
-	if raw, ok := m["prefix"]; ok {
-		vals, ok := raw.([]any)
-		if !ok || len(vals) == 0 {
-			return FieldCondition{}, fmt.Errorf("%s: prefix must be a non-empty list of strings", path)
+	return alts, nil
+}
+
+// parseAlternative converts one list element into an Alternative. A single-key
+// map naming a known operator is that operator; a map containing an
+// operator-like key is rejected (an unknown operator, a removed operator, or an
+// operator map with several keys); any other map is a nested condition group.
+func parseAlternative(path string, entry any, now func() time.Time) (Alternative, error) {
+	if m, ok := entry.(map[string]any); ok {
+		if len(m) == 0 {
+			return Alternative{}, fmt.Errorf("%s: condition map is empty; use a non-empty nested condition or an operator", path)
 		}
-		prefixes := toStrings(vals)
-		if len(prefixes) != len(vals) {
-			return FieldCondition{}, fmt.Errorf("%s: prefix must contain only strings", path)
+		if len(m) == 1 {
+			for key, operand := range m {
+				if known, removed := conditionOperator(key); known {
+					op, err := parseOperatorAlternative(path, key, operand, now)
+					if err != nil {
+						return Alternative{}, err
+					}
+					return Alternative{Operator: op}, nil
+				} else if removed {
+					return Alternative{}, fmt.Errorf("%s: %q is no longer a condition operator; use a bare literal instead, e.g. [%q]", path, key, key)
+				}
+			}
 		}
-		matchers = append(matchers, prefixMatcher{prefixes: prefixes})
+		for key := range m {
+			if _, removed := conditionOperator(key); removed {
+				return Alternative{}, fmt.Errorf("%s: %q is no longer a condition operator; use a bare literal instead, e.g. [%q]", path, key, key)
+			}
+			if looksLikeConditionOperator(key) {
+				return Alternative{}, fmt.Errorf("%s: unknown condition operator %q", path, key)
+			}
+		}
+		children, err := parseChildren(path, m, now)
+		if err != nil {
+			return Alternative{}, err
+		}
+		return Alternative{Operator: childrenMatcher{children: children}}, nil
 	}
-	if raw, ok := m["suffix"]; ok {
-		vals, ok := raw.([]any)
-		if !ok || len(vals) == 0 {
-			return FieldCondition{}, fmt.Errorf("%s: suffix must be a non-empty list of strings", path)
+	return Alternative{Literal: &Literal{Value: entry}}, nil
+}
+
+// parseChildren parses a map of nested field conditions, rejecting any
+// operator-like key: operators belong inside a condition list, never a nested
+// condition map.
+func parseChildren(path string, m map[string]any, now func() time.Time) (map[string]FieldCondition, error) {
+	children := make(map[string]FieldCondition, len(m))
+	for field, child := range m {
+		if known, removed := conditionOperator(field); removed {
+			return nil, fmt.Errorf("%s: %q is no longer a condition operator; use a bare literal instead, e.g. [%q]", path, field, field)
+		} else if known {
+			return nil, fmt.Errorf("%s: %q is a condition operator and cannot be a nested field; put it in the field's condition list, e.g. [{%q: ...}]", path, field, field)
 		}
-		suffixes := toStrings(vals)
-		if len(suffixes) != len(vals) {
-			return FieldCondition{}, fmt.Errorf("%s: suffix must contain only strings", path)
+		if looksLikeConditionOperator(field) {
+			return nil, fmt.Errorf("%s: unknown condition operator %q", path, field)
 		}
-		matchers = append(matchers, suffixMatcher{suffixes: suffixes})
+		childCond, err := parseFieldCondition(path+"."+field, child, now)
+		if err != nil {
+			return nil, err
+		}
+		children[field] = childCond
 	}
-	if raw, ok := m["exists"]; ok {
-		want, ok := raw.(bool)
+	return children, nil
+}
+
+// parseOperatorAlternative validates and builds one operator alternative. Each
+// operator takes a single scalar operand; the OR across values is expressed as
+// multiple alternatives in the field's list, not as an operand list.
+func parseOperatorAlternative(path, key string, operand any, now func() time.Time) (ValueMatcher, error) {
+	switch key {
+	case "prefix", "suffix":
+		s, ok := operand.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: %s operand must be a string, got %v", path, key, operand)
+		}
+		if key == "prefix" {
+			return prefixMatcher{prefix: s}, nil
+		}
+		return suffixMatcher{suffix: s}, nil
+	case "exists":
+		want, ok := operand.(bool)
 		if !ok {
 			// yaml.v3 decodes YAML booleans into Go bool, so any non-bool here is
 			// a "true", 1, 1.5, null, list, or similar — none is a valid polarity.
-			return FieldCondition{}, fmt.Errorf("%s: exists must be a boolean, got %v", path, raw)
+			return nil, fmt.Errorf("%s: exists must be a boolean, got %v", path, operand)
 		}
-		matchers = append(matchers, existsMatcher{want: want})
+		return existsMatcher{want: want}, nil
+	default:
+		op, ok := comparisonOps[key]
+		if !ok {
+			// Unreachable: the caller only passes known operator keys.
+			return nil, fmt.Errorf("%s: unknown condition operator %q", path, key)
+		}
+		return buildComparison(key, op, operand, path, now)
 	}
-	for _, op := range []struct {
-		key string
-		op  comparisonOp
-	}{{key: "gt", op: opGt}, {key: "gte", op: opGte}, {key: "lt", op: opLt}, {key: "lte", op: opLte}} {
-		if raw, ok := m[op.key]; ok {
-			built, err := buildComparison(op.key, op.op, raw, path, now)
-			if err != nil {
-				return FieldCondition{}, err
+}
+
+// comparisonOps maps an ordering operator key to its comparisonOp.
+var comparisonOps = map[string]comparisonOp{
+	"gt": opGt, "gte": opGte, "lt": opLt, "lte": opLte,
+}
+
+// conditionOperator reports whether key names a single-key condition operator
+// (known) or a removed operator (removed). The two cases are distinguished so a
+// removed operator gets a precise message rather than an "unknown operator" one.
+func conditionOperator(key string) (known, removed bool) {
+	if _, ok := removedConditionOperators[key]; ok {
+		return false, true
+	}
+	_, ok := conditionOperators[key]
+	return ok, false
+}
+
+// buildComparison converts a gt/gte/lt/lte operand into one comparisonMatcher.
+// The operand must be a single value: a number (any numeric kind — compared
+// numerically) or a `now()`-relative expression string (validated with
+// parseNowOperand). Anything else — a list, null, a bool, a map, a plain
+// non-now string such as "hello", or a literal RFC3339 timestamp — is rejected
+// rather than silently ignored. A literal timestamp string is NOT treated as a
+// date; only the exact `now()`/`now()±duration` syntax triggers temporal
+// comparison. Multiple values are expressed as several alternatives in the
+// field's condition list, which match ORs.
+func buildComparison(key string, op comparisonOp, raw any, path string, now func() time.Time) (ValueMatcher, error) {
+	switch bound := raw.(type) {
+	case string:
+		// The ONLY strings allowed are valid `now()`/`now()±duration`
+		// expressions. Anything else — a literal timestamp, "hello", "abc", or
+		// the removed bare `now` syntax — is rejected rather than silently
+		// never-matching. Validation is pure syntax: it records only the
+		// relative offset and never consults a clock.
+		offset, temporal, err := parseNowOperand(bound)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s: %w", path, key, err)
+		}
+		if !temporal {
+			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %q`,
+				path, key, bound)
+		}
+		// The clock is stored so the cutoff is computed from it at match time;
+		// the relative duration's sign is already baked in, so now.Add(durNow)
+		// shifts the cutoff correctly (now()-5m -> cutoff 5 minutes in the past).
+		return comparisonMatcher{kind: nowComparison, op: op, durNow: offset, now: now}, nil
+	case nil:
+		return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got null`,
+			path, key)
+	default:
+		if !isNumeric(bound) {
+			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %v`,
+				path, key, bound)
+		}
+		f, _ := toFloat(bound)
+		return comparisonMatcher{kind: numericComparison, op: op, numBound: f}, nil
+	}
+}
+
+// nestedMatcher is implemented by an alternative that wraps a nested condition
+// group; it receives the parent's presence flag so children resolve exactly as
+// they do for a map-level child set.
+type nestedMatcher interface {
+	MatchValue(value any, present bool) bool
+}
+
+// childrenMatcher adapts a nested condition group to the Alternative/value
+// matcher interface, so a nested map can be one alternative of a field's
+// condition list. It resolves the child key from the parent object value; an
+// absent or non-map parent makes every child absent, exactly as FieldCondition
+// .match does for map-level children, so a nested `exists: false` still matches
+// when the parent map itself is missing.
+type childrenMatcher struct {
+	children map[string]FieldCondition
+}
+
+// Match fulfills ValueMatcher for the present-parent case.
+func (m childrenMatcher) Match(value any) bool { return m.MatchValue(value, true) }
+
+// MatchValue resolves the children against the parent value and presence flag.
+func (m childrenMatcher) MatchValue(value any, present bool) bool {
+	return matchChildren(m.children, value, present)
+}
+
+// matchChildren evaluates a child set against a parent value. present reports
+// whether the parent key existed; it only matters when the parent is a map (the
+// children are then looked up in it), otherwise every child is evaluated as
+// absent.
+func matchChildren(children map[string]FieldCondition, value any, present bool) bool {
+	var obj map[string]any
+	if present {
+		obj, _ = value.(map[string]any)
+	}
+	for field, child := range children {
+		var childValue any
+		childPresent := false
+		if obj != nil {
+			childValue, childPresent = obj[field]
+			if !childPresent {
+				childValue = nil
 			}
-			matchers = append(matchers, built...)
+		}
+		if !child.match(childValue, childPresent) {
+			return false
 		}
 	}
-	if len(matchers) == 0 {
-		return FieldCondition{}, fmt.Errorf("%s: condition has no valid operators", path)
-	}
-	return FieldCondition{Operators: matchers}, nil
+	return true
 }
 
-var conditionOperatorNames = map[string]struct{}{
-	"equals": {}, "prefix": {}, "suffix": {}, "exists": {},
-	"gt": {}, "gte": {}, "lt": {}, "lte": {},
-}
-
-func isKnownConditionOperator(key string) bool {
-	_, ok := conditionOperatorNames[key]
-	return ok
-}
-
-// looksLikeConditionOperator distinguishes a typo in an operator map from a
-// legitimate nested-field map. All supported operators and their common prefix
-// misspellings use lower-case operator-like identifiers; ordinary event field
-// names remain valid nested children.
+// looksLikeConditionOperator distinguishes a typo in an operator from a
+// legitimate nested-field name. All supported operators (and the removed
+// `equals`) and their common prefix misspellings use lower-case operator-like
+// identifiers; ordinary event field names remain valid nested children.
 func looksLikeConditionOperator(key string) bool {
-	if _, known := conditionOperatorNames[key]; known {
+	if known, removed := conditionOperator(key); known || removed {
 		return false
 	}
-	for op := range conditionOperatorNames {
+	for op := range conditionOperators {
+		if strings.HasPrefix(op, key) || strings.HasPrefix(key, op) || editDistanceAtMostOne(key, op) {
+			return true
+		}
+	}
+	for op := range removedConditionOperators {
 		if strings.HasPrefix(op, key) || strings.HasPrefix(key, op) || editDistanceAtMostOne(key, op) {
 			return true
 		}
@@ -1359,100 +1519,6 @@ func editDistanceAtMostOne(a, b string) bool {
 		edits++
 	}
 	return edits <= 1
-}
-
-// buildComparison converts a gt/gte/lt/lte operand into one comparisonMatcher per
-// operand (a list means OR across operands — the same field-level OR that
-// match() already applies to multiple matchers, so emitting several is the
-// natural fit). Validation is strict and names the field path on error.
-func buildComparison(key string, op comparisonOp, raw any, path string, now func() time.Time) ([]ValueMatcher, error) {
-	// A scalar is treated as a single-element operand list.
-	norms := make([]any, 0, 1)
-	switch v := raw.(type) {
-	case []any:
-		if len(v) == 0 {
-			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got an empty list`,
-				path, key)
-		}
-		norms = v
-	case nil:
-		return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got null`,
-			path, key)
-	default:
-		norms = append(norms, v)
-	}
-
-	for _, bound := range norms {
-		switch bound := bound.(type) {
-		case string:
-			// The ONLY strings allowed are valid `now()`/`now()±duration`
-			// expressions. Anything else — a literal timestamp, "hello", "abc",
-			// or the removed bare `now` syntax — is rejected rather than
-			// silently never-matching. Validation is pure syntax: it records
-			// only the relative offset and never consults a clock.
-			_, temporal, err := parseNowOperand(bound)
-			if err != nil {
-				return nil, fmt.Errorf("%s: %s: %w", path, key, err)
-			}
-			if !temporal {
-				return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %q`,
-					path, key, bound)
-			}
-		case nil:
-			return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got null`,
-				path, key)
-		default:
-			if !isNumeric(bound) {
-				return nil, fmt.Errorf(`%s: %s operand must be a number or a "now()" / "now()±duration" expression, got %v`,
-					path, key, bound)
-			}
-		}
-	}
-
-	matchers := make([]ValueMatcher, 0, len(norms))
-	for _, bound := range norms {
-		m := comparisonMatcher{op: op}
-		if s, ok := bound.(string); ok {
-			// Validated above; re-parsing cannot fail. The clock is stored so the
-			// cutoff is computed from it at match time; the relative duration's
-			// sign is already baked in, so now.Add(durNow) shifts the cutoff
-			// correctly (now()-5m -> the cutoff is 5 minutes in the past).
-			offset, _, _ := parseNowOperand(s)
-			m.kind = nowComparison
-			m.durNow = offset
-			m.now = now
-		} else {
-			m.kind = numericComparison
-			m.numBound, _ = toFloat(bound)
-		}
-		matchers = append(matchers, m)
-	}
-	return matchers, nil
-}
-
-// isOperatorMap reports whether the map has only operator keys. If so, it is a
-// set of operators rather than nested field conditions.
-func isOperatorMap(m map[string]any) bool {
-	if len(m) == 0 {
-		return false
-	}
-	for k := range m {
-		if !operatorKeys[k] {
-			return false
-		}
-	}
-	return true
-}
-
-// toStrings converts decoded YAML values to strings, skipping non-strings.
-func toStrings(vals []any) []string {
-	out := make([]string, 0, len(vals))
-	for _, v := range vals {
-		if s, ok := v.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 // parseNowOperand interprets a comparison operand string as either a plain

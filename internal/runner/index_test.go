@@ -73,13 +73,11 @@ events:
       status: [COMPLETED, FAILED]
   - handler: handler.prefix
     pattern:
-      id:
-        prefix: ["ENROLLMENT#"]
+      id: [{prefix: "ENROLLMENT#"}]
   - handler: handler.exists
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
   - handler: handler.and
     pattern:
       event_name: [MODIFY]
@@ -93,8 +91,7 @@ events:
       score: [92]
   - handler: handler.absent
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `
 
 // TestRegistryIndexGenerationEquivalence pins that a snapshot's per-function index
@@ -235,8 +232,7 @@ events:
       event_name: [MODIFY]
   - handler: beta.third
     pattern:
-      id:
-        prefix: ["NO-MATCH"]
+      id: [{prefix: "NO-MATCH"}]
 `, exec),
 		parsedFn(t, "alpha", indexedTmplA, exec),
 	}, testutil.DiscardLogger())

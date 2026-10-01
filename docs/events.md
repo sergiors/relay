@@ -44,26 +44,57 @@ events:
     retries: 2
 ```
 
-A pattern is a tree of field conditions:
+A pattern is a tree of field conditions. Each field's condition is an
+**ordered list of alternatives (OR)**. A list element is one of:
 
-- A plain list is implicit equality: `status: [COMPLETED, FAILED]`.
-- A bare scalar is implicit equality: `event_name: INSERT`.
-- A map whose keys are all operator keys holds operators.
-- Any other map is a nested condition over child fields.
+- a bare scalar literal — equality: `status: [COMPLETED, FAILED]` matches either
+  value;
+- a single-operator map — `id: [{prefix: "user_"}]`, `score: [{gt: 70}]`,
+  `deleted_at: [{exists: false}]`;
+- a nested map — a group of child fields, ANDed with each other:
+  `new_image: {status: [COMPLETED]}`.
+
+A bare map value is shorthand for a single-element list, so `new_image:
+{status: [COMPLETED]}` and `new_image: [{status: [COMPLETED]}]` are equivalent.
+A list element may itself be a nested map, which lets one field carry several
+alternative sub-objects:
+
+```yaml
+pattern:
+  result: [{ status: [OK] }, { status: [DEGRADED] }]
+```
+
+The following are rejected as parse errors, never silently widened:
+
+- a scalar as a whole field condition (`status: COMPLETED`): every condition is
+  a list — write `status: [COMPLETED]`;
+- an empty list, an empty map, or a null condition;
+- an operator used as a nested field name, and an unknown or misspelled
+  operator-like key (`{prefix: 12}`, `{prefx: "x"}`).
 
 ### Operators
 
-| Operator              | Semantics                                                                           |
-| --------------------- | ----------------------------------------------------------------------------------- |
-| `equals`              | Value equals any listed value (type-preserving; numeric kinds compare numerically). |
-| `prefix`              | String value starts with any listed prefix (non-strings never match).               |
-| `suffix`              | String value ends with any listed suffix (non-strings never match).                 |
-| `exists`              | Key presence only; takes a boolean, not a list.                                     |
-| `gt` `gte` `lt` `lte` | Numeric threshold, or `now()`-relative cutoff for RFC3339 strings.                  |
+| Operator              | Semantics                                                            |
+| --------------------- | -------------------------------------------------------------------- |
+| `prefix`              | String value starts with the given prefix (non-strings never match). |
+| `suffix`              | String value ends with the given suffix (non-strings never match).   |
+| `exists`              | Key presence only; takes a boolean, not a list.                      |
+| `gt` `gte` `lt` `lte` | Numeric threshold, or `now()`-relative cutoff for RFC3339 strings.   |
 
-`equals`, `prefix`, and `suffix` take non-empty lists; `exists` takes a strict
-boolean. An unknown or misspelled operator-like key is rejected rather than
-silently widening the rule.
+Each operator takes a **single scalar operand**. Multiple prefixes, suffixes, or
+thresholds for one field are separate alternatives:
+
+```yaml
+id:
+  - prefix: "user_"
+  - prefix: "org_"
+amount:
+  - lt: 10
+  - gte: 1000
+```
+
+There is no `equals` operator: a bare literal is equality. An unknown or
+misspelled operator-like key is rejected rather than silently widening the rule.
 
 ### Comparison operators
 
@@ -74,7 +105,7 @@ expression string:
 pattern:
   new_image:
     created_at:
-      gt: "now()-5m"
+      - gt: "now()-5m"
 ```
 
 - Only the exact `now()` / `now()±duration` syntax is temporal (`now()`,
@@ -86,20 +117,19 @@ pattern:
 - A literal timestamp such as `gt: "2026-09-12T10:00:00Z"` is **not** accepted;
   only `now()`-syntax is valid for string operands. The old bare `now`-style
   syntax is a validation error.
-- A list of operands is OR; multiple operators on the same field are also OR,
-  so `gte: "now()-1h"` together with `lt: "now()"` is not a range.
+- Multiple alternatives on the same field are OR, so `{gte: "now()-1h"}` together
+  with `{lt: "now()"}` is not a range.
 
 `exists` checks key presence only — `null`, `false`, `0`, `""`, `{}`, `[]` all
-count as present. It works recursively: `new_image: { exists: true }` checks the
-top-level key; `new_image: { name: { exists: true } }` checks `name` inside
+count as present. It works recursively: `new_image: [{exists: true}]` checks the
+top-level key; `new_image: {name: [{exists: true}]}` checks `name` inside
 `new_image`. A nested `exists: true` fails when a parent is missing; a nested
 `exists: false` matches when the nested key is absent, including when the parent
 map itself is missing.
 
 ### Combining conditions
 
-- Values within one operator's list, and multiple operators on one field, are
-  **OR**.
+- Alternatives within one field's list are **OR**.
 - Different fields (siblings) and nested children are **AND**.
 - A missing event field fails that field's value conditions (but `exists: false`
   can match absence).
@@ -109,8 +139,8 @@ map itself is missing.
   handler names are unique within a function, so each matching rule is a
   distinct handler invocation.
 
-Example: `status: [COMPLETED, FAILED]` matches either value; `id: { prefix:
-["user_"] }` matches `user_123` but not `123`.
+Example: `status: [COMPLETED, FAILED]` matches either value; an `id` field
+with `- prefix: "user_"` matches `user_123` but not `123`.
 
 ## Dispatch and concurrency
 

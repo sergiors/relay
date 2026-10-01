@@ -22,14 +22,14 @@ import (
 // over positive-exists anchors, and within a kind the lexicographically smallest
 // normalized field path wins.
 //
-// INDEXED OPERATORS: only equality and positive exists, because a FieldCondition's
-// operators are OR and only a lone operator is a necessary condition. A lone
-// positive exists is also necessary (the key must be present). Everything else —
-// prefix/suffix/range/temporal, a lone exists:false, an OR mix of operators, an
-// equality whose operands include a non-scalar/composite value — does not yield a
-// usable anchor at that path. Nested children are ANDed with their parent's
-// operators, so an eligible child anchor is still necessary even when the parent
-// carries an unindexable operator set.
+// INDEXED ALTERNATIVES: only a literal equality and a positive exists, because a
+// field's alternatives are OR and only a LONE alternative is a necessary
+// condition. A lone positive exists is also necessary (the key must be present).
+// Everything else — prefix/suffix/range/temporal, a lone exists:false, an OR mix
+// of alternatives, an equality whose literal is non-scalar/composite — does not
+// yield a usable anchor at that path. Nested children are ANDed with their
+// parent's alternatives, so an eligible child anchor is still necessary even
+// when the parent carries an unindexable alternative set.
 
 // anchorKind distinguishes the two necessary-condition shapes the index uses.
 type anchorKind uint8
@@ -57,8 +57,8 @@ type anchor struct {
 }
 
 // scalarKey returns a type-tagged, collision-free key for a scalar value and
-// whether the value is scalar (eligible for an equality anchor). It mirrors the
-// equality matcher's semantics exactly: every numeric kind is normalized through
+// whether the value is scalar (eligible for an equality anchor). It mirrors
+// valuesEqual's semantics exactly: every numeric kind is normalized through
 // float64 the way numericEqual does, so two values produce the same key whenever
 // the matcher considers them equal. Strings, bools, and nil carry distinct type
 // tags, so the string "1", the number 1, the bool true, the string "true", and
@@ -88,32 +88,6 @@ func scalarKey(v any) (string, bool) {
 		}
 		return "n:" + strconv.FormatFloat(f, 'x', -1, 64), true
 	}
-}
-
-// equalityAnchorKeys converts an equality matcher's operand list into the set of
-// scalar keys a matching value must carry. It reports false when any operand is
-// not a scalar (a map, list, or unsupported type), because such a rule may match
-// through reflect.DeepEqual on a structured value that a scalar key cannot
-// represent — the whole rule must fall back rather than risk a false negative. An
-// empty operand list is also unusable (it can never match).
-func equalityAnchorKeys(values []any) ([]string, bool) {
-	if len(values) == 0 {
-		return nil, false
-	}
-	keys := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, v := range values {
-		k, ok := scalarKey(v)
-		if !ok {
-			return nil, false
-		}
-		if _, dup := seen[k]; dup {
-			continue
-		}
-		seen[k] = struct{}{}
-		keys = append(keys, k)
-	}
-	return keys, true
 }
 
 // anchorLess orders anchors deterministically: equality before exists, then the
@@ -151,24 +125,78 @@ func ruleAnchor(pattern Pattern) (anchor, bool) {
 // collectAnchors visits cond at path and every descendant, offering each usable
 // anchor to better.
 func collectAnchors(cond FieldCondition, path string, better func(anchor)) {
-	// Operators on one field are OR; only a lone operator is a necessary
-	// condition. Children are ANDed and so are always necessary, regardless of
-	// how many operators the parent carries (or whether that set is indexable).
-	if len(cond.Operators) == 1 {
-		switch m := cond.Operators[0].(type) {
-		case equalityMatcher:
-			if keys, ok := equalityAnchorKeys(m.values); ok {
-				better(anchor{kind: anchorEquals, path: path, keys: keys})
-			}
-		case existsMatcher:
-			if m.want {
-				better(anchor{kind: anchorExists, path: path})
-			}
+	// A field's alternatives are OR. A LONE alternative is a necessary condition
+	// for the field; so is a set composed ENTIRELY of literal alternatives (the
+	// event value must then be one of those literals). Any other mix of
+	// alternatives yields no necessary scalar condition at this path.
+	if len(cond.Alternatives) == 1 {
+		collectAlternativeAnchor(cond.Alternatives[0], path, better)
+	} else if len(cond.Alternatives) > 1 {
+		if keys, ok := literalAlternativeKeys(cond.Alternatives); ok {
+			better(anchor{kind: anchorEquals, path: path, keys: keys})
 		}
 	}
+	// Map-level children are ANDed and therefore always necessary, regardless of
+	// how many alternatives the field carries (or whether that set is
+	// indexable).
 	for field, child := range cond.Children {
 		collectAnchors(child, joinPath(path, field), better)
 	}
+}
+
+// collectAlternativeAnchor offers the anchor (if any) of a single alternative.
+// A literal equality yields an equality anchor when its value is scalar; a lone
+// positive exists yields a presence anchor; a lone nested group recurses (its
+// children are ANDed and so necessary). Every other operator has no necessary
+// scalar condition and contributes nothing.
+func collectAlternativeAnchor(alt Alternative, path string, better func(anchor)) {
+	if alt.Literal != nil {
+		if key, ok := scalarKey(alt.Literal.Value); ok {
+			better(anchor{kind: anchorEquals, path: path, keys: []string{key}})
+		}
+		return
+	}
+	switch m := alt.Operator.(type) {
+	case existsMatcher:
+		if m.want {
+			better(anchor{kind: anchorExists, path: path})
+		}
+	case childrenMatcher:
+		// The lone alternative is a nested group: its children are ANDed and so
+		// are necessary for the alternative — and therefore for the field — to
+		// hold.
+		for field, child := range m.children {
+			collectAnchors(child, joinPath(path, field), better)
+		}
+	}
+}
+
+// literalAlternativeKeys returns the typed scalar keys of an all-literal
+// alternative set. It reports false if any alternative is an operator or carries
+// a non-scalar literal, because then the field does not require the value to be
+// one of a scalar set and the whole rule must fall back rather than risk a
+// false negative.
+func literalAlternativeKeys(alts []Alternative) ([]string, bool) {
+	if len(alts) == 0 {
+		return nil, false
+	}
+	keys := make([]string, 0, len(alts))
+	seen := make(map[string]struct{}, len(alts))
+	for _, alt := range alts {
+		if alt.Literal == nil {
+			return nil, false
+		}
+		k, ok := scalarKey(alt.Literal.Value)
+		if !ok {
+			return nil, false
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		keys = append(keys, k)
+	}
+	return keys, true
 }
 
 // joinPath appends field to a normalized path.

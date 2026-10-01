@@ -49,30 +49,17 @@ type presenceMatcher interface {
 }
 
 // match evaluates a FieldCondition against a decoded value and its presence
-// flag. Operators are alternatives (OR); children are ANDed with each other
-// and with the operators. A parent that is absent or not a map still evaluates
-// its children against (nil, absent) so that presence-oriented child conditions
-// (exists: false) can succeed on a missing nested field.
+// flag. Alternatives are OR; children are ANDed with each other and with the
+// alternatives. Children are only looked up in the parent map when the parent
+// is present and actually a map; otherwise every child is evaluated against an
+// absent key, so an `exists: false` child can still match when its parent map
+// is missing.
 func (c FieldCondition) match(value any, present bool) bool {
-	// Operators on the same field are alternatives (OR).
-	if len(c.Operators) > 0 {
+	// Alternatives on the same field are OR.
+	if len(c.Alternatives) > 0 {
 		matched := false
-		for _, op := range c.Operators {
-			if pm, ok := op.(presenceMatcher); ok {
-				// Presence-aware operators (exists) resolve from the
-				// key-presence flag alone.
-				if pm.MatchPresent(present) {
-					matched = true
-					break
-				}
-				continue
-			}
-			// A plain value operator never matches an absent key. This preserves
-			// the historical behavior where a missing field failed the pattern.
-			if !present {
-				continue
-			}
-			if op.Match(value) {
+		for _, alt := range c.Alternatives {
+			if alt.match(value, present) {
 				matched = true
 				break
 			}
@@ -82,27 +69,10 @@ func (c FieldCondition) match(value any, present bool) bool {
 		}
 	}
 
-	// Nested children are ANDed. They are only looked up in the parent map when
-	// the parent is present and actually a map; otherwise every child is
-	// evaluated against an absent key, so an `exists: false` child can still
-	// match when its parent map is missing.
+	// Nested children are ANDed.
 	if len(c.Children) > 0 {
-		var obj map[string]any
-		if present {
-			obj, _ = value.(map[string]any)
-		}
-		for field, child := range c.Children {
-			var childValue any
-			childPresent := false
-			if obj != nil {
-				childValue, childPresent = obj[field]
-				if !childPresent {
-					childValue = nil
-				}
-			}
-			if !child.match(childValue, childPresent) {
-				return false
-			}
+		if !matchChildren(c.Children, value, present) {
+			return false
 		}
 	}
 

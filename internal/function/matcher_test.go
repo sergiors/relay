@@ -21,7 +21,9 @@ func matches(t *testing.T, tmpl *Template, event map[string]any) bool {
 	return len(tmpl.MatchingEventRules(event)) > 0
 }
 
-func TestImplicitEquality(t *testing.T) {
+// TestLiteralListEquality pins the primary literal form: a field's condition is
+// an ordered list of alternatives, here two bare literals.
+func TestLiteralListEquality(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -32,21 +34,7 @@ events:
 	if !matches(t, tmpl, map[string]any{"status": "COMPLETED"}) {
 		t.Error("expected match")
 	}
-	if matches(t, tmpl, map[string]any{"status": "FAILED"}) {
-		t.Error("expected no match")
-	}
-}
-
-func TestExplicitEquals(t *testing.T) {
-	tmpl := mustParse(t, `
-runtime: python3.14
-events:
-  - handler: handler.main
-    pattern:
-      status:
-        equals: [COMPLETED]
-`)
-	if !matches(t, tmpl, map[string]any{"status": "COMPLETED"}) {
+	if !matches(t, tmpl, map[string]any{"status": "IN_PROGRESS"}) {
 		t.Error("expected match")
 	}
 	if matches(t, tmpl, map[string]any{"status": "FAILED"}) {
@@ -79,8 +67,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      id:
-        prefix: ["ENROLLMENT#"]
+      id: [{prefix: "ENROLLMENT#"}]
 `)
 	if !matches(t, tmpl, map[string]any{"id": "ENROLLMENT#123"}) {
 		t.Error("expected match")
@@ -91,13 +78,14 @@ events:
 }
 
 func TestMultiplePrefixes(t *testing.T) {
+	// Multiple prefixes are expressed as multiple single-operator alternatives;
+	// the list is OR.
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      id:
-        prefix: ["ENROLLMENT#", "ENR#"]
+      id: [{prefix: "ENROLLMENT#"}, {prefix: "ENR#"}]
 `)
 	if !matches(t, tmpl, map[string]any{"id": "ENROLLMENT#123"}) {
 		t.Error("expected match for ENROLLMENT#")
@@ -116,8 +104,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      email:
-        suffix: ["@example.com"]
+      email: [{suffix: "@example.com"}]
 `)
 	if !matches(t, tmpl, map[string]any{"email": "user@example.com"}) {
 		t.Error("expected match")
@@ -133,8 +120,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      email:
-        suffix: ["@example.com", "@test.org"]
+      email: [{suffix: "@example.com"}, {suffix: "@test.org"}]
 `)
 	if !matches(t, tmpl, map[string]any{"email": "a@example.com"}) {
 		t.Error("expected match for @example.com")
@@ -147,18 +133,18 @@ events:
 	}
 }
 
-func TestEqualsAndPrefixSameField(t *testing.T) {
+// TestLiteralAndOperatorAlternatives pins that a field's list may mix bare
+// literals and operator alternatives; they are OR.
+func TestLiteralAndOperatorAlternatives(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      id:
-        equals: ["SPECIAL"]
-        prefix: ["ENROLLMENT#"]
+      id: [SPECIAL, {prefix: "ENROLLMENT#"}]
 `)
 	if !matches(t, tmpl, map[string]any{"id": "SPECIAL"}) {
-		t.Error("expected match via equals")
+		t.Error("expected match via literal")
 	}
 	if !matches(t, tmpl, map[string]any{"id": "ENROLLMENT#123"}) {
 		t.Error("expected match via prefix")
@@ -169,6 +155,7 @@ events:
 }
 
 func TestNestedObjects(t *testing.T) {
+	// A bare map value is shorthand for a single nested condition group.
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
@@ -181,6 +168,29 @@ events:
 		t.Error("expected match")
 	}
 	if matches(t, tmpl, map[string]any{"new_image": map[string]any{"status": "FAILED"}}) {
+		t.Error("expected no match")
+	}
+}
+
+// TestNestedGroupAsAlternative pins a nested group as one alternative of a
+// field's list, ORed with a sibling literal.
+func TestNestedGroupAsAlternative(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      new_image:
+        - status: [COMPLETED]
+        - status: [FAILED]
+`)
+	if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"status": "COMPLETED"}}) {
+		t.Error("expected match via first nested group")
+	}
+	if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"status": "FAILED"}}) {
+		t.Error("expected match via second nested group")
+	}
+	if matches(t, tmpl, map[string]any{"new_image": map[string]any{"status": "PENDING"}}) {
 		t.Error("expected no match")
 	}
 }
@@ -328,8 +338,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      id:
-        prefix: ["ENROLLMENT#"]
+      id: [{prefix: "ENROLLMENT#"}]
 `)
 	if matches(t, tmpl, map[string]any{"id": 123}) {
 		t.Error("expected no match for non-string prefix")
@@ -345,33 +354,42 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      email:
-        suffix: ["@example.com"]
+      email: [{suffix: "@example.com"}]
 `)
 	if matches(t, tmpl, map[string]any{"email": 123}) {
 		t.Error("expected no match for non-string suffix")
 	}
 }
 
-func TestNestedFieldNamedEquals(t *testing.T) {
-	// A nested object that happens to have a field named "equals" alongside
-	// other fields must be treated as nested conditions, not operators.
-	tmpl := mustParse(t, `
+// TestRemovedEqualsRejected pins that `equals` is no longer an operator: using
+// it anywhere (as the whole field condition or as a list alternative) is a
+// parse error with a precise message pointing at the bare-literal replacement.
+func TestRemovedEqualsRejected(t *testing.T) {
+	templates := []string{
+		`
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        equals: [x]
-        status: [COMPLETED]
-`)
-	// "equals" here is a nested field, so the event must have new_image.equals == "x"
-	// AND new_image.status == "COMPLETED".
-	if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"equals": "x", "status": "COMPLETED"}}) {
-		t.Error("expected match for nested equals field")
+      status:
+        equals: [COMPLETED]
+`,
+		`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [{equals: [COMPLETED]}]
+`,
 	}
-	if matches(t, tmpl, map[string]any{"new_image": map[string]any{"equals": "y", "status": "COMPLETED"}}) {
-		t.Error("expected no match when nested equals differs")
+	for i, yaml := range templates {
+		_, err := ParseTemplate([]byte(yaml))
+		if err == nil {
+			t.Fatalf("template %d: expected equals to be rejected", i)
+		}
+		if !strings.Contains(err.Error(), "equals") {
+			t.Errorf("template %d: error %q should mention equals", i, err)
+		}
 	}
 }
 
@@ -402,9 +420,9 @@ events:
       new_image:
         status: [COMPLETED, FAILED]
         id:
-          prefix: ["ENROLLMENT#"]
+          - prefix: "ENROLLMENT#"
         email:
-          suffix: ["@example.com"]
+          - suffix: "@example.com"
 `)
 	if !matches(t, tmpl, event) {
 		t.Error("expected example event to match enrollment template")
@@ -417,8 +435,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        exists: true
+      field: [{exists: true}]
 `)
 	cases := []struct {
 		name  string
@@ -451,8 +468,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `)
 	cases := []struct {
 		name  string
@@ -483,8 +499,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        exists: true
+      field: [{exists: true}]
 `)
 	if matches(t, trueTmpl, map[string]any{}) {
 		t.Error("exists: true should not match a missing field")
@@ -495,8 +510,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `)
 	if !matches(t, falseTmpl, map[string]any{}) {
 		t.Error("exists: false should match a missing field")
@@ -510,8 +524,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: true
+      new_image: [{exists: true}]
 `)
 		if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"a": 1}}) {
 			t.Error("expected match when new_image present")
@@ -526,8 +539,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: true
+      new_image: [{exists: true}]
 `)
 		if matches(t, tmpl, map[string]any{}) {
 			t.Error("expected no match when new_image absent")
@@ -539,8 +551,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: false
+      new_image: [{exists: false}]
 `)
 		if !matches(t, tmpl, map[string]any{}) {
 			t.Error("expected match when new_image absent")
@@ -552,8 +563,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: false
+      new_image: [{exists: false}]
 `)
 		if matches(t, tmpl, map[string]any{"new_image": map[string]any{}}) {
 			t.Error("expected no match when new_image present")
@@ -569,8 +579,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `)
 		// A JSON null key counts as present.
 		if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"cnpj": nil}}) {
@@ -584,8 +593,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `)
 		// cnpj is absent; another key does not stand in for it.
 		if matches(t, tmpl, map[string]any{"new_image": map[string]any{"name": "ACME"}}) {
@@ -599,8 +607,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `)
 		if matches(t, tmpl, map[string]any{}) {
 			t.Error("expected no match when new_image (the parent) is absent")
@@ -613,8 +620,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: false
+        cnpj: [{exists: false}]
 `)
 		// cnpj is absent inside new_image -> exists:false matches.
 		if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"name": "ACME"}}) {
@@ -628,8 +634,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: false
+        cnpj: [{exists: false}]
 `)
 		// new_image absent -> cnpj is necessarily absent too -> exists:false matches.
 		if !matches(t, tmpl, map[string]any{}) {
@@ -643,8 +648,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: false
+        cnpj: [{exists: false}]
 `)
 		if matches(t, tmpl, map[string]any{"new_image": map[string]any{"cnpj": 123}}) {
 			t.Error("expected no match when cnpj present")
@@ -660,8 +664,7 @@ events:
     pattern:
       a:
         b:
-          c:
-            exists: true
+          c: [{exists: true}]
 `)
 	if !matches(t, tmpl, map[string]any{"a": map[string]any{"b": map[string]any{"c": "x"}}}) {
 		t.Error("expected match for deeply nested present key")
@@ -680,8 +683,7 @@ events:
     pattern:
       a:
         b:
-          c:
-            exists: false
+          c: [{exists: false}]
 `)
 	if !matches(t, falseTmpl, map[string]any{"a": map[string]any{"b": map[string]any{"name": "x"}}}) {
 		t.Error("expected match for deeply nested absent key (exists:false)")
@@ -694,11 +696,10 @@ events:
 	}
 }
 
-// TestExistsWithValueOperators pins the OR-combination semantics. Operators on
-// the same field are alternatives, so exists:true makes the condition pass for
-// any present key regardless of value; exists:false makes it pass only when the
-// key is absent OR another operator matches a present key's value. This mirrors
-// the existing equals+prefix combination behavior and is not special-cased.
+// TestExistsWithValueOperators pins the OR-combination semantics. Alternatives
+// on the same field are OR, so exists:true makes the condition pass for any
+// present key regardless of value; exists:false makes it pass only when the key
+// is absent OR another alternative matches a present key's value.
 func TestExistsWithValueOperators(t *testing.T) {
 	t.Run("exists true OR prefix", func(t *testing.T) {
 		tmpl := mustParse(t, `
@@ -706,9 +707,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      cnpj:
-        exists: true
-        prefix: ["12"]
+      cnpj: [{exists: true}, {prefix: "12"}]
 `)
 		if !matches(t, tmpl, map[string]any{"cnpj": "12abc"}) {
 			t.Error("expected match: key present with matching prefix")
@@ -727,9 +726,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      cnpj:
-        exists: false
-        prefix: ["12"]
+      cnpj: [{exists: false}, {prefix: "12"}]
 `)
 		// Absent key: exists:false passes.
 		if !matches(t, tmpl, map[string]any{}) {
@@ -756,8 +753,7 @@ events:
     pattern:
       event_name: [MODIFY]
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `)
 	if !matches(t, tmpl, map[string]any{"event_name": "MODIFY", "new_image": map[string]any{"cnpj": nil}}) {
 		t.Error("expected match when both fields satisfy their conditions")
@@ -772,26 +768,23 @@ events:
 	}
 }
 
-// TestNestedFieldNamedExists mirrors TestNestedFieldNamedEquals: a nested map
-// containing an "exists" key alongside other (non-operator) keys is nested field
-// conditions, not an operator. Only an operator-only map ({exists: ...}) is an
-// operator map. So an event field literally named "exists" participates in
-// normal equality matching.
-func TestNestedFieldNamedExists(t *testing.T) {
-	tmpl := mustParse(t, `
+// TestOperatorNamesReservedAsNestedFields pins that operator names can no longer
+// be used as nested field names: an operator inside a nested condition map is
+// rejected, because operators belong inside a field's condition list.
+func TestOperatorNamesReservedAsNestedFields(t *testing.T) {
+	for _, field := range []string{"exists", "prefix", "suffix", "gt", "equals"} {
+		yaml := `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
       new_image:
-        exists: [x]
+        ` + field + `: x
         status: [COMPLETED]
-`)
-	if !matches(t, tmpl, map[string]any{"new_image": map[string]any{"exists": "x", "status": "COMPLETED"}}) {
-		t.Error("expected match for nested field literally named exists")
-	}
-	if matches(t, tmpl, map[string]any{"new_image": map[string]any{"exists": "y", "status": "COMPLETED"}}) {
-		t.Error("expected no match when nested exists field differs")
+`
+		if _, err := ParseTemplate([]byte(yaml)); err == nil {
+			t.Errorf("nested field named %q must be rejected", field)
+		}
 	}
 }
 
@@ -805,8 +798,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `)
 	falseTmpl := mustParse(t, `
 runtime: python3.14
@@ -814,8 +806,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        cnpj:
-          exists: false
+        cnpj: [{exists: false}]
 `)
 
 	var withNull map[string]any
@@ -839,22 +830,22 @@ func TestExistsInvalidValues(t *testing.T) {
 		yaml   string
 		expect string // substring required in the error message
 	}{
-		{"string true", "exists: \"true\"", "boolean"},
-		{"int", "exists: 1", "boolean"},
-		{"float", "exists: 1.5", "boolean"},
-		{"null", "exists: null", "boolean"},
-		{"list", "exists: [true]", "boolean"},
+		{"string true", "{exists: \"true\"}", "boolean"},
+		{"int", "{exists: 1}", "boolean"},
+		{"float", "{exists: 1.5}", "boolean"},
+		{"null", "{exists: null}", "boolean"},
+		{"list", "{exists: [true]}", "boolean"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// The exists value must be indented under the cnpj key to be its value.
+			// The exists alternative must be an entry of the cnpj field's list.
 			_, err := ParseTemplate([]byte(`
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      cnpj:
-        ` + tc.yaml + "\n"))
+      cnpj: [` + tc.yaml + `]
+`))
 			if err == nil {
 				t.Fatalf("expected parse error for %s exists, got nil", tc.name)
 			}
@@ -881,31 +872,26 @@ func TestExistsValidParses(t *testing.T) {
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: true
+      new_image: [{exists: true}]
+`,
+		`runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      new_image: [{exists: false}]
 `,
 		`runtime: python3.14
 events:
   - handler: handler.main
     pattern:
       new_image:
-        exists: false
+        cnpj: [{exists: true}]
 `,
 		`runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        cnpj:
-          exists: true
-`,
-		`runtime: python3.14
-events:
-  - handler: handler.main
-    pattern:
-      cnpj:
-        exists: false
-        prefix: ["12"]
+      cnpj: [{exists: false}, {prefix: "12"}]
 `,
 	}
 	for i, yaml := range templates {
@@ -915,19 +901,26 @@ events:
 	}
 }
 
-func TestMalformedOperatorMapsRejected(t *testing.T) {
+// TestMalformedConditionsRejected pins the invalid shapes of the list grammar:
+// operator maps as whole field values, operand lists, empty conditions, null,
+// scalar shorthand, and unknown operator-like keys.
+func TestMalformedConditionsRejected(t *testing.T) {
 	cases := []struct {
 		name      string
 		condition string
 		wantError string
-		wantPath  string
 	}{
-		{"unknown only", "equalz: [\"12\"]", "unknown condition operator", "cnpj"},
-		{"empty map", "{}", "condition map is empty", "cnpj"},
-		{"prefix typo", "prefx: [\"12\"]", "unknown condition operator", "cnpj"},
-		{"mixed valid and unknown", "prefix: [\"12\"]\n        prefx: [\"34\"]", "unknown condition operator", "cnpj"},
-		{"malformed prefix value", "prefix: \"12\"", "prefix must be a non-empty list", "cnpj"},
-		{"empty equality list", "equals: []", "equals must be a non-empty list", "cnpj"},
+		{"operator map as field value", `{prefix: "12"}`, "condition operator"},
+		{"operator operand list", `[{prefix: ["12"]}]`, "must be a string"},
+		{"empty map", `{}`, "condition map is empty"},
+		{"empty map as list element", `[{}]`, "condition map is empty"},
+		{"empty list", `[]`, "condition list is empty"},
+		{"null", `null`, "condition is null"},
+		{"scalar shorthand", `"12"`, "condition must be a non-empty list"},
+		{"unknown only", `[{equalz: "12"}]`, "unknown condition operator"},
+		{"prefix typo", `[{prefx: "12"}]`, "unknown condition operator"},
+		{"unknown in nested map", "{prefx: \"12\"}", "unknown condition operator"},
+		{"mixed operator and child in list element", `[{prefix: "12", status: [OK]}]`, "condition operator"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -936,34 +929,36 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      cnpj:
-        ` + tc.condition + "\n"))
+      cnpj: ` + tc.condition + "\n"))
 			if err == nil {
 				t.Fatalf("expected malformed condition to fail parsing")
 			}
-			if !strings.Contains(err.Error(), tc.wantError) || !strings.Contains(err.Error(), tc.wantPath) {
-				t.Fatalf("error = %q, want %q and field path %q", err, tc.wantError, tc.wantPath)
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %q, want substring %q", err, tc.wantError)
+			}
+			if !strings.Contains(err.Error(), "cnpj") {
+				t.Errorf("error %q should mention the field path cnpj", err)
 			}
 		})
 	}
 }
 
-func TestValidConditionOperatorMapFormsStillParseAndMatch(t *testing.T) {
+func TestValidConditionFormsParseAndMatch(t *testing.T) {
 	tests := []struct {
 		name      string
 		condition string
 		event     map[string]any
 	}{
-		{"equals", "equals: [\"x\"]", map[string]any{"field": "x"}},
-		{"prefix", "prefix: [\"x\"]", map[string]any{"field": "xyz"}},
-		{"suffix", "suffix: [\"z\"]", map[string]any{"field": "xyz"}},
-		{"exists true", "exists: true", map[string]any{"field": nil}},
-		{"exists false", "exists: false", map[string]any{}},
-		{"gt", "gt: 1", map[string]any{"field": 2}},
-		{"gte", "gte: 2", map[string]any{"field": 2}},
-		{"lt", "lt: 3", map[string]any{"field": 2}},
-		{"lte", "lte: 2", map[string]any{"field": 2}},
-		{"temporal", "gt: \"now()-5m\"", map[string]any{"field": time.Now().UTC().Format(time.RFC3339)}},
+		{"literal", `["x"]`, map[string]any{"field": "x"}},
+		{"prefix", `[{prefix: "x"}]`, map[string]any{"field": "xyz"}},
+		{"suffix", `[{suffix: "z"}]`, map[string]any{"field": "xyz"}},
+		{"exists true", `[{exists: true}]`, map[string]any{"field": nil}},
+		{"exists false", `[{exists: false}]`, map[string]any{}},
+		{"gt", `[{gt: 1}]`, map[string]any{"field": 2}},
+		{"gte", `[{gte: 2}]`, map[string]any{"field": 2}},
+		{"lt", `[{lt: 3}]`, map[string]any{"field": 2}},
+		{"lte", `[{lte: 2}]`, map[string]any{"field": 2}},
+		{"temporal", `[{gt: "now()-5m"}]`, map[string]any{"field": time.Now().UTC().Format(time.RFC3339)}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -972,8 +967,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        ` + tc.condition + "\n"))
+      field: ` + tc.condition + "\n"))
 			if err != nil {
 				t.Fatalf("valid condition rejected: %v", err)
 			}
@@ -984,22 +978,16 @@ events:
 	}
 }
 
-func TestMalformedOperatorRuleNeverMatches(t *testing.T) {
-	for _, condition := range []string{"prefx: [\"x\"]", "{}"} {
+func TestMalformedConditionNeverMatches(t *testing.T) {
+	for _, condition := range []string{`[{prefx: "x"}]`, `{}`, `[]`, `null`} {
 		_, err := ParseTemplate([]byte(`
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        ` + condition + "\n"))
+      field: ` + condition + "\n"))
 		if err == nil {
 			t.Fatalf("condition %q unexpectedly parsed", condition)
-		}
-		// The parser must reject the malformed condition before a Template can be
-		// constructed; otherwise a zero FieldCondition would match broadly.
-		if (FieldCondition{}).match(nil, false) != true {
-			t.Fatal("test precondition changed: empty FieldCondition no longer matches broadly")
 		}
 	}
 }

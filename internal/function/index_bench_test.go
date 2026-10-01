@@ -22,9 +22,9 @@ func benchTemplate(b *testing.B, n int) *Template {
 		sb.WriteString("\n    pattern:\n")
 		switch i % 10 {
 		case 7, 8: // exists, on a distinct field per rule
-			fmt.Fprintf(&sb, "      present_%d:\n        exists: true\n", i)
+			fmt.Fprintf(&sb, "      present_%d: [{exists: true}]\n", i)
 		case 9: // prefix fallback
-			fmt.Fprintf(&sb, "      id_%d:\n        prefix: [\"pfx-%d\"]\n", i, i)
+			fmt.Fprintf(&sb, "      id_%d: [{prefix: \"pfx-%d\"}]\n", i, i)
 		default: // equality on a shared field with a unique value
 			fmt.Fprintf(&sb, "      status: [v%d]\n", i)
 		}

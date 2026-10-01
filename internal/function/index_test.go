@@ -125,7 +125,7 @@ events:
   - handler: handler.main
     pattern: {}
 `,
-		// Implicit and explicit equality.
+		// Implicit and explicit equality (now always a literal list).
 		`runtime: python3.14
 events:
   - handler: handler.a
@@ -133,42 +133,33 @@ events:
       status: [COMPLETED, IN_PROGRESS]
   - handler: handler.b
     pattern:
-      status:
-        equals: [FAILED]
+      status: [FAILED]
 `,
 		// Prefix/suffix/range fallback rules.
 		`runtime: python3.14
 events:
   - handler: handler.prefix
     pattern:
-      id:
-        prefix: ["ENROLLMENT#"]
+      id: [{prefix: "ENROLLMENT#"}]
   - handler: handler.suffix
     pattern:
-      email:
-        suffix: ["@example.com"]
+      email: [{suffix: "@example.com"}]
   - handler: handler.range
     pattern:
-      score:
-        gt: 70
-        lte: 100
+      score: [{gt: 70}, {lte: 100}]
 `,
 		// OR mix and exists polarities.
 		`runtime: python3.14
 events:
   - handler: handler.mix
     pattern:
-      cnpj:
-        exists: false
-        prefix: ["12"]
+      cnpj: [{exists: false}, {prefix: "12"}]
   - handler: handler.present
     pattern:
-      field:
-        exists: true
+      field: [{exists: true}]
   - handler: handler.absent
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `,
 		// Nested equality, nested exists, deep nesting.
 		`runtime: python3.14
@@ -177,21 +168,17 @@ events:
     pattern:
       new_image:
         status: [COMPLETED]
-        id:
-          prefix: ["ENROLLMENT#"]
-        email:
-          suffix: ["@example.com"]
+        id: [{prefix: "ENROLLMENT#"}]
+        email: [{suffix: "@example.com"}]
   - handler: handler.nestedexists
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
   - handler: handler.deep
     pattern:
       a:
         b:
-          c:
-            exists: true
+          c: [{exists: true}]
 `,
 		// Multiple top-level AND fields.
 		`runtime: python3.14
@@ -241,12 +228,10 @@ runtime: python3.14
 events:
   - handler: handler.fresh
     pattern:
-      created_at:
-        gt: "now()-5m"
+      created_at: [{gt: "now()-5m"}]
   - handler: handler.stale
     pattern:
-      created_at:
-        lt: "now()-1h"
+      created_at: [{lt: "now()-1h"}]
 `, func() time.Time { return now })
 
 	ix := NewRuleIndex(tmpl.Events)
@@ -285,8 +270,7 @@ events:
     pattern:
       z:
         status: [ok]
-      top:
-        exists: true
+      top: [{exists: true}]
 `)
 				return tmpl.Events[0].Pattern
 			},
@@ -317,8 +301,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `)
 				return tmpl.Events[0].Pattern
 			},
@@ -332,40 +315,50 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      cnpj:
-        exists: false
-        prefix: ["12"]
+      cnpj: [{exists: false}, {prefix: "12"}]
 `)
 				return tmpl.Events[0].Pattern
 			},
 			ok: false,
 		},
 		{
-			name: "equals plus prefix mix falls back",
+			name: "literal plus prefix mix falls back",
 			build: func() Pattern {
 				tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      id:
-        equals: ["SPECIAL"]
-        prefix: ["ENROLLMENT#"]
+      id: [SPECIAL, {prefix: "ENROLLMENT#"}]
 `)
 				return tmpl.Events[0].Pattern
 			},
 			ok: false,
 		},
 		{
-			name: "non-scalar equality operand falls back",
+			name: "all-literal set is a multi-key equality anchor",
 			build: func() Pattern {
 				tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      field:
-        equals: [[1, 2]]
+      status: [COMPLETED, FAILED]
+`)
+				return tmpl.Events[0].Pattern
+			},
+			want: anchor{kind: anchorEquals, path: "status", keys: []string{`s:"COMPLETED"`, `s:"FAILED"`}},
+			ok:   true,
+		},
+		{
+			name: "non-scalar literal operand falls back",
+			build: func() Pattern {
+				tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      field: [[1, 2]]
 `)
 				return tmpl.Events[0].Pattern
 			},
@@ -379,8 +372,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      new_image:
-        exists: true
+      new_image: [{exists: true}]
 `)
 				return tmpl.Events[0].Pattern
 			},
@@ -401,24 +393,61 @@ events:
 			ok: false,
 		},
 		{
-			name: "child anchor survives an unindexable parent operator set",
+			name: "child anchor survives an unindexable parent alternative set",
 			build: func() Pattern {
-				// A parsed template never emits operators AND children on one
-				// condition (the YAML is either an operator map or a child map), so
-				// this hand-built shape is the only way to exercise the AND
-				// property directly: the parent's lone prefix operator is not an
-				// anchor, but the ANDed child equality still is.
+				// A parsed template never emits alternatives AND children on one
+				// condition (the YAML is either a list or a child map), so this
+				// hand-built shape is the only way to exercise the AND property
+				// directly: the parent's lone prefix alternative is not an anchor,
+				// but the ANDed child equality still is.
 				return Pattern{
 					"new_image": FieldCondition{
-						Operators: []ValueMatcher{prefixMatcher{prefixes: []string{"x"}}},
+						Alternatives: []Alternative{{Operator: prefixMatcher{prefix: "x"}}},
 						Children: map[string]FieldCondition{
-							"status": {Operators: []ValueMatcher{equalityMatcher{values: []any{"COMPLETED"}}}},
+							"status": {Alternatives: []Alternative{{Literal: &Literal{Value: "COMPLETED"}}}},
 						},
 					},
 				}
 			},
 			want: anchor{kind: anchorEquals, path: "new_image" + pathSeparator + "status", keys: []string{`s:"COMPLETED"`}},
 			ok:   true,
+		},
+		{
+			name: "lone nested group recurses into its children",
+			build: func() Pattern {
+				// A field whose lone alternative is a nested group: the group's
+				// children are ANDed and so necessary, and the child equality is
+				// an anchor.
+				return Pattern{
+					"new_image": FieldCondition{
+						Alternatives: []Alternative{{Operator: childrenMatcher{children: map[string]FieldCondition{
+							"status": {Alternatives: []Alternative{{Literal: &Literal{Value: "COMPLETED"}}}},
+						}}}},
+					},
+				}
+			},
+			want: anchor{kind: anchorEquals, path: "new_image" + pathSeparator + "status", keys: []string{`s:"COMPLETED"`}},
+			ok:   true,
+		},
+		{
+			name: "two nested-group alternatives fall back",
+			build: func() Pattern {
+				// Each group is an OR alternative, so neither group's children are
+				// necessary — no anchor.
+				return Pattern{
+					"new_image": FieldCondition{
+						Alternatives: []Alternative{
+							{Operator: childrenMatcher{children: map[string]FieldCondition{
+								"status": {Alternatives: []Alternative{{Literal: &Literal{Value: "COMPLETED"}}}},
+							}}},
+							{Operator: childrenMatcher{children: map[string]FieldCondition{
+								"status": {Alternatives: []Alternative{{Literal: &Literal{Value: "FAILED"}}}},
+							}}},
+						},
+					},
+				}
+			},
+			ok: false,
 		},
 	}
 	for _, tc := range cases {
@@ -487,22 +516,22 @@ func mustKey(t *testing.T, v any) string {
 	return k
 }
 
-// TestEqualityAnchorKeysRejectsNonScalar pins that any non-scalar operand forces
-// the whole rule to fall back (the matcher may still match it structurally, so a
-// scalar key must never narrow it).
-func TestEqualityAnchorKeysRejectsNonScalar(t *testing.T) {
+// TestLiteralAlternativeKeysRejectsNonLiteral pins that any operator or
+// non-scalar literal in the alternative set forces the whole rule to fall back
+// (the matcher may still match it, so a scalar key must never narrow it).
+func TestLiteralAlternativeKeysRejectsNonLiteral(t *testing.T) {
 	t.Parallel()
-	if _, ok := equalityAnchorKeys([]any{map[string]any{"a": 1}}); ok {
-		t.Fatal("map operand must force fallback")
+	if _, ok := literalAlternativeKeys([]Alternative{{Operator: prefixMatcher{prefix: "x"}}}); ok {
+		t.Fatal("operator alternative must force fallback")
 	}
-	if _, ok := equalityAnchorKeys([]any{[]any{1}}); ok {
-		t.Fatal("list operand must force fallback")
+	if _, ok := literalAlternativeKeys([]Alternative{{Literal: &Literal{Value: []any{1}}}}); ok {
+		t.Fatal("non-scalar literal must force fallback")
 	}
-	if _, ok := equalityAnchorKeys([]any{"x", nil}); !ok {
-		t.Fatal("string+nil operands are all scalar")
+	if _, ok := literalAlternativeKeys([]Alternative{{Literal: &Literal{Value: "x"}}, {Literal: &Literal{Value: nil}}}); !ok {
+		t.Fatal("string+nil literals are all scalar")
 	}
-	if _, ok := equalityAnchorKeys(nil); ok {
-		t.Fatal("empty operand list must force fallback")
+	if _, ok := literalAlternativeKeys(nil); ok {
+		t.Fatal("empty alternative set must force fallback")
 	}
 }
 
@@ -563,8 +592,7 @@ events:
       a: [y]
   - handler: handler.third
     pattern:
-      c:
-        prefix: ["z"]
+      c: [{prefix: "z"}]
   - handler: handler.fourth
     pattern: {}
 `)
@@ -601,13 +629,11 @@ events:
         status: [COMPLETED]
   - handler: handler.prefix
     pattern:
-      id:
-        prefix: ["ENR"]
+      id: [{prefix: "ENR"}]
   - handler: handler.exists
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `),
 		mustParse(t, `
 runtime: python3.14
@@ -628,8 +654,7 @@ events:
           c: [x]
   - handler: handler.neg
     pattern:
-      field:
-        exists: false
+      field: [{exists: false}]
 `),
 	}
 
@@ -679,8 +704,7 @@ events:
     pattern:
       status: [COMPLETED]
       table_name: [enrollments]
-      id:
-        prefix: ["ENR"]
+      id: [{prefix: "ENR"}]
   - handler: handler.always
     pattern: {}
 `)
@@ -754,15 +778,13 @@ events:
   - handler: handler.a
     pattern:
       new_image:
-        cnpj:
-          exists: true
+        cnpj: [{exists: true}]
 `, `{"new_image":{"cnpj":null}}`},
 		{`runtime: python3.14
 events:
   - handler: handler.a
     pattern:
-      id:
-        prefix: ["ENR"]
+      id: [{prefix: "ENR"}]
 `, `{"id":"ENR#1"}`},
 		{`runtime: python3.14
 events:
@@ -774,8 +796,7 @@ events:
   - handler: handler.a
     pattern:
       status: [COMPLETED]
-      score:
-        gt: 10
+      score: [{gt: 10}]
 `, `{"status":"COMPLETED","score":42}`},
 		{`runtime: python3.14
 events:

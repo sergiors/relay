@@ -63,9 +63,12 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   `entrypoint` or `image`, optional `port`/`replicas`/`host`/`path` (path
   requires host). Event identity is the handler; service/schedule identity is the
   name.
+- A pattern field is an ordered OR list of alternatives: a bare literal
+  (equality), a single-key operator map (`prefix`, `suffix`, `exists`,
+  `gt`/`gte`/`lt`/`lte`), or a nested map (ANDed children). Operators take a
+  single scalar operand; there is no `equals` and no scalar field shorthand.
 - `concurrency`, `resources` (memory/CPU/PIDs), `env`, `secrets` (references
-  only; a name may not be in both; `RELAY_HANDLER` reserved); operators
-  `equals`, `prefix`, `suffix`, `exists`, `gt`/`gte`/`lt`/`lte`. Names
+  only; a name may not be in both; `RELAY_HANDLER` reserved). Names
   `[a-z0-9][a-z0-9._-]*`, <=63 chars, no trailing `.`.
 
 ## Runtime identity and generation

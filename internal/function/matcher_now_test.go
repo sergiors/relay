@@ -140,8 +140,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      score:
-        gt: 70
+      score: [{gt: 70}]
 `)
 	if !matches(t, tmpl, map[string]any{"score": float64(92)}) {
 		t.Error("expected match for 92 > 70")
@@ -169,8 +168,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      price:
-        lte: 100.5
+      price: [{lte: 100.5}]
 `)
 	if !matches(t, tmpl, map[string]any{"price": float64(100.5)}) {
 		t.Error("expected match: equality satisfies lte")
@@ -183,14 +181,16 @@ events:
 	}
 }
 
-func TestNumericOperandListsOR(t *testing.T) {
+// TestNumericComparisonAlternativesOR pins that several thresholds for one
+// operator are expressed as several alternatives in the field's list, and that
+// the list is OR.
+func TestNumericComparisonAlternativesOR(t *testing.T) {
 	tmpl := mustParse(t, `
 runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      score:
-        gte: [60, 80]
+      score: [{gte: 60}, {gte: 80}]
 `)
 	if !matches(t, tmpl, map[string]any{"score": 65}) {
 		t.Error("expected match: 65 >= 60")
@@ -210,8 +210,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      created_at:
-        gt: "now()-5m"
+      created_at: [{gt: "now()-5m"}]
 `, func() time.Time { return fixedNow })
 	// Cutoff = fixedNow - 5m = 09:55:00Z. An event after that matches.
 	if !matches(t, tmpl, map[string]any{"created_at": timestamp(t, "2026-09-12T10:00:00Z")}) {
@@ -227,14 +226,13 @@ events:
 	}
 }
 
-// templateYAML wraps an operator line into a minimal parseable template.
-func templateYAML(operatorLine string) string {
+// templateYAML wraps a whole field condition into a minimal parseable template.
+func templateYAML(condition string) string {
 	return `runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      created_at:
-        ` + operatorLine + "\n"
+      created_at: ` + condition + "\n"
 }
 
 func TestTemporalGteLteExactCutoff(t *testing.T) {
@@ -244,7 +242,7 @@ func TestTemporalGteLteExactCutoff(t *testing.T) {
 	after := "2026-09-12T10:00:00Z"
 	clock := func() time.Time { return fixedNow }
 
-	gte := mustParseWithClock(t, templateYAML("gte: \"now()-5m\""), clock)
+	gte := mustParseWithClock(t, templateYAML(`[{gte: "now()-5m"}]`), clock)
 	if !matches(t, gte, map[string]any{"created_at": cutoff}) {
 		t.Error("expected gte to match at exact cutoff")
 	}
@@ -255,7 +253,7 @@ func TestTemporalGteLteExactCutoff(t *testing.T) {
 		t.Error("expected gte no match before cutoff")
 	}
 
-	lt := mustParseWithClock(t, templateYAML("lt: \"now()-5m\""), clock)
+	lt := mustParseWithClock(t, templateYAML(`[{lt: "now()-5m"}]`), clock)
 	if matches(t, lt, map[string]any{"created_at": cutoff}) {
 		t.Error("expected lt no match at exact cutoff")
 	}
@@ -263,7 +261,7 @@ func TestTemporalGteLteExactCutoff(t *testing.T) {
 		t.Error("expected lt match before cutoff")
 	}
 
-	lte := mustParseWithClock(t, templateYAML("lte: \"now()-5m\""), clock)
+	lte := mustParseWithClock(t, templateYAML(`[{lte: "now()-5m"}]`), clock)
 	if !matches(t, lte, map[string]any{"created_at": cutoff}) {
 		t.Error("expected lte to match at exact cutoff")
 	}
@@ -282,8 +280,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      created_at:
-        gt: "now()-20m"
+      created_at: [{gt: "now()-20m"}]
 `, func() time.Time { return fixedNow })
 	// now()-20m = 09:40:00Z. All of these are the SAME instant (10:00:00Z) written
 	// with Z and positive/negative offsets, so all should match gt.
@@ -310,7 +307,7 @@ events:
 
 func TestTemporalBadEventValues(t *testing.T) {
 	t.Parallel()
-	tmpl := mustParseWithClock(t, templateYAML("gt: \"now()-5m\""), func() time.Time { return fixedNow })
+	tmpl := mustParseWithClock(t, templateYAML(`[{gt: "now()-5m"}]`), func() time.Time { return fixedNow })
 	// Missing field.
 	if matches(t, tmpl, map[string]any{}) {
 		t.Error("expected no match for missing field")
@@ -342,8 +339,7 @@ events:
     pattern:
       metadata:
         timestamps:
-          updated_at:
-            gt: "now()-1h"
+          updated_at: [{gt: "now()-1h"}]
 `, func() time.Time { return fixedNow })
 	if !matches(t, tmpl, map[string]any{
 		"metadata": map[string]any{"timestamps": map[string]any{"updated_at": "2026-09-12T10:00:00Z"}},
@@ -364,12 +360,10 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      created_at:
-        gt: "now()-5m"
-        exists: true
+      created_at: [{gt: "now()-5m"}, {exists: true}]
 `, func() time.Time { return fixedNow })
-	// Both operators on the same field are OR. exists:true passes for any
-	// present key, so a present but stale created_at still matches.
+	// Alternatives on the same field are OR. exists:true passes for any present
+	// key, so a present but stale created_at still matches.
 	if !matches(t, tmpl, map[string]any{"created_at": "2020-01-01T00:00:00Z"}) {
 		t.Error("expected match via exists:true OR even when gt fails")
 	}
@@ -387,7 +381,7 @@ func TestTemporalNowEvaluatedAtMatchTime(t *testing.T) {
 	// time.
 	cutoff1 := time.Date(2026, 9, 12, 9, 59, 0, 0, time.UTC) // base now = 10:04:00Z
 	now := cutoff1.Add(5 * time.Minute)
-	tmpl := mustParseWithClock(t, templateYAML("gt: \"now()-5m\""), func() time.Time { return now })
+	tmpl := mustParseWithClock(t, templateYAML(`[{gt: "now()-5m"}]`), func() time.Time { return now })
 	event := map[string]any{"created_at": "2026-09-12T10:00:00Z"}
 
 	// At now=10:04:00Z, cutoff=09:59:00Z -> event 10:00 matches.
@@ -407,7 +401,7 @@ func TestTemporalLocalTimezoneIndependent(t *testing.T) {
 	// The cutoff arithmetic operates on UTC instants only. fixedNow has no local
 	// timezone dependence, and expected values are computed with time.Date in
 	// UTC, so this test passes regardless of the host TZ.
-	tmpl := mustParseWithClock(t, templateYAML("gte: \"now()-5m\""), func() time.Time { return fixedNow })
+	tmpl := mustParseWithClock(t, templateYAML(`[{gte: "now()-5m"}]`), func() time.Time { return fixedNow })
 	// now()-5m in UTC is 09:59:00Z. Construct the expected cutoff explicitly in UTC.
 	expectedCutoff := fixedNow.Add(-5 * time.Minute)
 	if !matches(t, tmpl, map[string]any{"created_at": expectedCutoff.Format(time.RFC3339)}) {
@@ -419,29 +413,29 @@ func TestTemporalLocalTimezoneIndependent(t *testing.T) {
 // operands: malformed values are rejected at ParseTemplate, naming the field.
 func TestComparisonParseValidation(t *testing.T) {
 	bad := []struct {
-		name  string
-		line  string
-		field string // expected in the error (field path)
-		sub   string // expected substring in the error
+		name      string
+		condition string
+		field     string // expected in the error (field path)
+		sub       string // expected substring in the error
 	}{
-		{"gt malformed now()", `gt: "now()-"`, "created_at", "now()"},
-		{"gt now()+foo", `gt: "now()+foo"`, "created_at", "now()"},
-		{"gt now() with space", `gt: "now() - 5m"`, "created_at", "now()"},
-		{"gt bare old now", `gt: "now"`, "created_at", "must be a number"},
-		{"gt old now-5m", `gt: "now-5m"`, "created_at", "must be a number"},
-		{"gt old now+1h", `gt: "now+1h"`, "created_at", "must be a number"},
-		{"gt uppercase NOW()", `gt: "NOW()"`, "created_at", "must be a number"},
-		{"gt plain string", `gt: "hello"`, "created_at", "must be a number"},
-		{"gt looks like date", `gt: "2026-09-12T10:00:00Z"`, "created_at", "must be a number"},
-		{"gt abc", `gt: "abc"`, "created_at", "must be a number"},
-		{"gt null", `gt: null`, "created_at", "got null"},
-		{"gt null in list", `gt: [null]`, "created_at", "got null"},
-		{"lt bool", `lt: true`, "created_at", "must be a number"},
-		{"gt empty list", `gt: []`, "created_at", "empty list"},
+		{"gt malformed now()", `[{gt: "now()-"}]`, "created_at", "now()"},
+		{"gt now()+foo", `[{gt: "now()+foo"}]`, "created_at", "now()"},
+		{"gt now() with space", `[{gt: "now() - 5m"}]`, "created_at", "now()"},
+		{"gt bare old now", `[{gt: "now"}]`, "created_at", "must be a number"},
+		{"gt old now-5m", `[{gt: "now-5m"}]`, "created_at", "must be a number"},
+		{"gt old now+1h", `[{gt: "now+1h"}]`, "created_at", "must be a number"},
+		{"gt uppercase NOW()", `[{gt: "NOW()"}]`, "created_at", "must be a number"},
+		{"gt plain string", `[{gt: "hello"}]`, "created_at", "must be a number"},
+		{"gt looks like date", `[{gt: "2026-09-12T10:00:00Z"}]`, "created_at", "must be a number"},
+		{"gt abc", `[{gt: "abc"}]`, "created_at", "must be a number"},
+		{"gt null", `[{gt: null}]`, "created_at", "got null"},
+		{"gt null in list", `[{gt: [null]}]`, "created_at", "must be a number"},
+		{"lt bool", `[{lt: true}]`, "created_at", "must be a number"},
+		{"gt empty list", `[{gt: []}]`, "created_at", "must be a number"},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseTemplate([]byte(templateYAML(tc.line)))
+			_, err := ParseTemplate([]byte(templateYAML(tc.condition)))
 			if err == nil {
 				t.Fatalf("expected parse error for %s", tc.name)
 			}
@@ -454,17 +448,17 @@ func TestComparisonParseValidation(t *testing.T) {
 	}
 }
 
-// TestComparisonValidParses pins that valid numeric and now operands (scalar
-// and list, mixed kinds, zero duration) all parse without error.
+// TestComparisonValidParses pins that valid numeric and now operands (single and
+// multiple alternatives, mixed kinds, zero duration) all parse without error.
 func TestComparisonValidParses(t *testing.T) {
 	templates := []string{
-		templateYAML(`gt: 70`),
-		templateYAML(`lte: 100.5`),
-		templateYAML(`gte: "now()-1h"`),
-		templateYAML(`lt: ["now()-5m", 100]`),
-		templateYAML(`gt: "now()"`),
-		templateYAML(`gt: "now()+0s"`),
-		templateYAML(`gte: [60, "now()-2h45m30s"]`),
+		templateYAML(`[{gt: 70}]`),
+		templateYAML(`[{lte: 100.5}]`),
+		templateYAML(`[{gte: "now()-1h"}]`),
+		templateYAML(`[{lt: "now()-5m"}, {lt: 100}]`),
+		templateYAML(`[{gt: "now()"}]`),
+		templateYAML(`[{gt: "now()+0s"}]`),
+		templateYAML(`[{gte: 60}, {gte: "now()-2h45m30s"}]`),
 	}
 	for i, yaml := range templates {
 		if _, err := ParseTemplate([]byte(yaml)); err != nil {
@@ -485,7 +479,7 @@ func TestTemporalNowZeroOffset(t *testing.T) {
 	after := now.Add(time.Minute).Format(time.RFC3339)
 
 	// gt now(): event strictly after now() matches; at/equal or before does not.
-	gt := mustParseWithClock(t, templateYAML("gt: \"now()\""), func() time.Time { return now })
+	gt := mustParseWithClock(t, templateYAML(`[{gt: "now()"}]`), func() time.Time { return now })
 	if !matches(t, gt, map[string]any{"created_at": after}) {
 		t.Error("expected gt now() to match event after now()")
 	}
@@ -497,7 +491,7 @@ func TestTemporalNowZeroOffset(t *testing.T) {
 	}
 
 	// gte now(): event == now() satisfies gte (equality passes).
-	gte := mustParseWithClock(t, templateYAML("gte: \"now()\""), func() time.Time { return now })
+	gte := mustParseWithClock(t, templateYAML(`[{gte: "now()"}]`), func() time.Time { return now })
 	if !matches(t, gte, map[string]any{"created_at": atNow}) {
 		t.Error("expected gte now() to match event equal to now()")
 	}
@@ -506,7 +500,7 @@ func TestTemporalNowZeroOffset(t *testing.T) {
 	}
 
 	// lt now(): event == now() does not satisfy strict lt; before does.
-	lt := mustParseWithClock(t, templateYAML("lt: \"now()\""), func() time.Time { return now })
+	lt := mustParseWithClock(t, templateYAML(`[{lt: "now()"}]`), func() time.Time { return now })
 	if matches(t, lt, map[string]any{"created_at": atNow}) {
 		t.Error("expected lt now() NOT to match event equal to now()")
 	}
@@ -515,7 +509,7 @@ func TestTemporalNowZeroOffset(t *testing.T) {
 	}
 
 	// lte now(): event == now() satisfies lte.
-	lte := mustParseWithClock(t, templateYAML("lte: \"now()\""), func() time.Time { return now })
+	lte := mustParseWithClock(t, templateYAML(`[{lte: "now()"}]`), func() time.Time { return now })
 	if !matches(t, lte, map[string]any{"created_at": atNow}) {
 		t.Error("expected lte now() to match event equal to now()")
 	}
@@ -524,9 +518,9 @@ func TestTemporalNowZeroOffset(t *testing.T) {
 	}
 }
 
-// TestGteLtORSemantics documents and pins the OR behavior of two comparison
-// operators on the same field.
-func TestGteLtORSemantics(t *testing.T) {
+// TestGteLtAlternativesORSemantics documents and pins the OR behavior of two
+// comparison operators on the same field.
+func TestGteLtAlternativesORSemantics(t *testing.T) {
 	t.Parallel()
 	// gte now()-1h -> passes for instants >= 09:00:00Z.
 	// lt now()-2h -> passes for instants < 08:00:00Z.
@@ -534,7 +528,7 @@ func TestGteLtORSemantics(t *testing.T) {
 	// is NOT a range constraint (that would be AND); it is two independent
 	// alternatives.
 	tmpl := mustParseWithClock(t,
-		templateYAML("gte: \"now()-1h\"\n        lt: \"now()-2h\""),
+		templateYAML(`[{gte: "now()-1h"}, {lt: "now()-2h"}]`),
 		func() time.Time { return fixedNow })
 	// 09:30 satisfies gte -> match.
 	if !matches(t, tmpl, map[string]any{"created_at": "2026-09-12T09:30:00Z"}) {
@@ -560,8 +554,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      score:
-        gte: 70
+      score: [{gte: 70}]
 `)
 	// Equality satisfies gte, for both int and float64 event kinds.
 	if !matches(t, gte, map[string]any{"score": 70}) {
@@ -587,8 +580,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      price:
-        lt: 100.5
+      price: [{lt: 100.5}]
 `)
 	if matches(t, lt, map[string]any{"price": 100.5}) {
 		t.Error("expected no lt match on strict equality")
@@ -610,8 +602,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      count:
-        lte: 10
+      count: [{lte: 10}]
 `)
 	if !matches(t, lte, map[string]any{"count": 10}) {
 		t.Error("expected lte match on equality")
@@ -658,7 +649,7 @@ func TestTemporalCutoffMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tmpl := mustParseWithClock(t, templateYAML(tc.op+": \"now()-5m\""), clock)
+			tmpl := mustParseWithClock(t, templateYAML(`[{`+tc.op+`: "now()-5m"}]`), clock)
 			got := matches(t, tmpl, map[string]any{"created_at": tc.instant})
 			if got != tc.want {
 				t.Errorf("%s now()-5m vs instant %s = %v, want %v", tc.op, tc.instant, got, tc.want)
@@ -672,7 +663,7 @@ func TestTemporalCutoffMatrix(t *testing.T) {
 func TestTemporalPositiveOffset(t *testing.T) {
 	t.Parallel()
 
-	ltTmpl := mustParseWithClock(t, templateYAML("lt: \"now()+1h\""), func() time.Time { return fixedNow })
+	ltTmpl := mustParseWithClock(t, templateYAML(`[{lt: "now()+1h"}]`), func() time.Time { return fixedNow })
 	if !matches(t, ltTmpl, map[string]any{"created_at": "2026-09-12T10:59:00Z"}) {
 		t.Error("expected lt match before positive cutoff")
 	}
@@ -683,7 +674,7 @@ func TestTemporalPositiveOffset(t *testing.T) {
 		t.Error("expected no lt match after positive cutoff")
 	}
 
-	lteTmpl := mustParseWithClock(t, templateYAML("lte: \"now()+1h\""), func() time.Time { return fixedNow })
+	lteTmpl := mustParseWithClock(t, templateYAML(`[{lte: "now()+1h"}]`), func() time.Time { return fixedNow })
 	if !matches(t, lteTmpl, map[string]any{"created_at": "2026-09-12T11:00:00Z"}) {
 		t.Error("expected lte match at positive cutoff")
 	}
@@ -691,7 +682,7 @@ func TestTemporalPositiveOffset(t *testing.T) {
 		t.Error("expected no lte match after positive cutoff")
 	}
 
-	gtTmpl := mustParseWithClock(t, templateYAML("gt: \"now()+1h\""), func() time.Time { return fixedNow })
+	gtTmpl := mustParseWithClock(t, templateYAML(`[{gt: "now()+1h"}]`), func() time.Time { return fixedNow })
 	if !matches(t, gtTmpl, map[string]any{"created_at": "2026-09-12T12:00:00Z"}) {
 		t.Error("expected gt match after positive cutoff")
 	}
@@ -700,17 +691,17 @@ func TestTemporalPositiveOffset(t *testing.T) {
 	}
 }
 
-// TestTemporalOperandListOR covers OR semantics across operand lists that mix
-// temporal cutoffs as well as temporal + numeric kinds, plus the equivalence
-// between a single-element list and a scalar.
-func TestTemporalOperandListOR(t *testing.T) {
+// TestTemporalAlternativesOR covers OR semantics across condition alternatives
+// that mix temporal cutoffs as well as temporal + numeric kinds, plus the
+// equivalence between a single-element list and a list with one alternative.
+func TestTemporalAlternativesOR(t *testing.T) {
 	t.Parallel()
 	clock := func() time.Time { return fixedNow }
 
-	// gte ["now()-1h", "now()-5m"]: OR. now()-1h cutoff 09:00, now()-5m cutoff 09:55.
-	tmpl := mustParseWithClock(t, templateYAML("gte: [\"now()-1h\", \"now()-5m\"]"), clock)
+	// [{gte: "now()-1h"}, {gte: "now()-5m"}]: OR. now()-1h cutoff 09:00, now()-5m cutoff 09:55.
+	tmpl := mustParseWithClock(t, templateYAML(`[{gte: "now()-1h"}, {gte: "now()-5m"}]`), clock)
 	if !matches(t, tmpl, map[string]any{"created_at": "2026-09-12T09:30:00Z"}) {
-		t.Error("expected match: 09:30 >= 09:00 via first operand")
+		t.Error("expected match: 09:30 >= 09:00 via first alternative")
 	}
 	if matches(t, tmpl, map[string]any{"created_at": "2026-09-12T08:00:00Z"}) {
 		t.Error("expected no match: 08:00 below both cutoffs")
@@ -719,8 +710,8 @@ func TestTemporalOperandListOR(t *testing.T) {
 		t.Error("expected match: 09:55 at the now()-5m cutoff satisfies both")
 	}
 
-	// Mixed temporal + numeric list is OR across kinds: lt ["now()", 100].
-	mixed := mustParseWithClock(t, templateYAML("lt: [\"now()\", 100]"), clock)
+	// Mixed temporal + numeric alternatives are OR across kinds: [{lt: "now()"}, {lt: 100}].
+	mixed := mustParseWithClock(t, templateYAML(`[{lt: "now()"}, {lt: 100}]`), clock)
 	if !matches(t, mixed, map[string]any{"created_at": "2026-09-12T09:00:00Z"}) {
 		t.Error("expected match via temporal arm (09:00 < now())")
 	}
@@ -731,13 +722,13 @@ func TestTemporalOperandListOR(t *testing.T) {
 		t.Error("expected no match: 11:00 not < now() and not numeric")
 	}
 
-	// A single-element list behaves exactly like a scalar.
-	single := mustParseWithClock(t, templateYAML("gt: [\"now()-5m\"]"), clock)
+	// A list with a single alternative behaves exactly like one operator.
+	single := mustParseWithClock(t, templateYAML(`[{gt: "now()-5m"}]`), clock)
 	if !matches(t, single, map[string]any{"created_at": "2026-09-12T10:00:00Z"}) {
-		t.Error("expected single-element list to behave like scalar gt")
+		t.Error("expected single-alternative list to behave like a lone operator")
 	}
 	if matches(t, single, map[string]any{"created_at": "2026-09-12T09:50:00Z"}) {
-		t.Error("expected single-element list no match before cutoff")
+		t.Error("expected single-alternative list no match before cutoff")
 	}
 }
 
@@ -747,7 +738,7 @@ func TestTemporalOperandListOR(t *testing.T) {
 // fractional-seconds RFC3339.
 func TestTemporalJSONDecoded(t *testing.T) {
 	t.Parallel()
-	tmpl := mustParseWithClock(t, templateYAML("gt: \"now()-5m\""), func() time.Time { return fixedNow })
+	tmpl := mustParseWithClock(t, templateYAML(`[{gt: "now()-5m"}]`), func() time.Time { return fixedNow })
 
 	var event map[string]any
 	if err := json.Unmarshal([]byte(`{"created_at": "2026-09-12T10:00:00Z"}`), &event); err != nil {
@@ -774,10 +765,8 @@ func TestTemporalJSONDecoded(t *testing.T) {
 	}
 }
 
-// TestTemporalDeepNesting covers three-level nesting, sibling AND between a
-// temporal field and an equality field, and that a nested field literally named
-// "gt" alongside siblings stays a NESTED CONDITION (type-preserving equality),
-// not an operator.
+// TestTemporalDeepNesting covers three-level nesting and sibling AND between a
+// temporal field and an equality field.
 func TestTemporalDeepNesting(t *testing.T) {
 	t.Parallel()
 	clock := func() time.Time { return fixedNow }
@@ -789,8 +778,7 @@ events:
     pattern:
       a:
         b:
-          c:
-            gt: "now()-1h"
+          c: [{gt: "now()-1h"}]
 `, clock)
 	if !matches(t, deep, map[string]any{"a": map[string]any{"b": map[string]any{"c": "2026-09-12T10:00:00Z"}}}) {
 		t.Error("expected deep nested match")
@@ -805,8 +793,7 @@ runtime: python3.14
 events:
   - handler: handler.main
     pattern:
-      created_at:
-        gt: "now()-5m"
+      created_at: [{gt: "now()-5m"}]
       status: [COMPLETED]
 `, clock)
 	if !matches(t, and, map[string]any{"created_at": "2026-09-12T10:00:00Z", "status": "COMPLETED"}) {
@@ -818,25 +805,6 @@ events:
 	if matches(t, and, map[string]any{"created_at": "2026-09-12T10:00:00Z", "status": "FAILED"}) {
 		t.Error("expected no match when status sibling fails")
 	}
-
-	// A nested map with a "gt" key alongside non-operator siblings is nested
-	// field conditions (mirror of TestNestedFieldNamedEquals): the event needs
-	// data.gt == 5 (numeric) AND data.status == "OK".
-	nested := mustParseWithClock(t, `
-runtime: python3.14
-events:
-  - handler: handler.main
-    pattern:
-      data:
-        gt: 5
-        status: [OK]
-`, clock)
-	if !matches(t, nested, map[string]any{"data": map[string]any{"gt": 5, "status": "OK"}}) {
-		t.Error("expected match for nested field named gt with numeric equality")
-	}
-	if matches(t, nested, map[string]any{"data": map[string]any{"gt": "5", "status": "OK"}}) {
-		t.Error("expected no match: type-preserving equality rejects string \"5\" against numeric 5")
-	}
 }
 
 // TestParseTemplateNilClockDefaults verifies parseTemplateWithClock(data, nil)
@@ -845,7 +813,7 @@ events:
 // assertions wall-clock stable.
 func TestParseTemplateNilClockDefaults(t *testing.T) {
 	t.Parallel()
-	tmpl, err := parseTemplateWithClock([]byte(templateYAML("gt: \"now()\"")), nil)
+	tmpl, err := parseTemplateWithClock([]byte(templateYAML(`[{gt: "now()"}]`)), nil)
 	if err != nil {
 		t.Fatalf("parse with nil clock: %v", err)
 	}
@@ -863,21 +831,21 @@ func TestParseTemplateNilClockDefaults(t *testing.T) {
 // numeric-looking-string rejection.
 func TestComparisonParseValidationContext(t *testing.T) {
 	bad := []struct {
-		name  string
-		line  string
-		field string
-		sub   string
+		name      string
+		condition string
+		field     string
+		sub       string
 	}{
-		{"gte malformed now()", `gte: "now()-"`, "created_at", "gte"},
-		{"lte now()+foo", `lte: "now()+foo"`, "created_at", "lte"},
-		{"lt now() with interior space", `lt: "now() - 5m"`, "created_at", "lt"},
-		{"map operand", `gt: {a: 1}`, "created_at", "must be a number"},
-		{"list-of-list operand", `gt: [[1]]`, "created_at", "must be a number"},
-		{"numeric-looking string", `gt: "70"`, "created_at", "must be a number"},
+		{"gte malformed now()", `[{gte: "now()-"}]`, "created_at", "gte"},
+		{"lte now()+foo", `[{lte: "now()+foo"}]`, "created_at", "lte"},
+		{"lt now() with interior space", `[{lt: "now() - 5m"}]`, "created_at", "lt"},
+		{"map operand", `[{gt: {a: 1}}]`, "created_at", "must be a number"},
+		{"list operand", `[{gt: [1]}]`, "created_at", "must be a number"},
+		{"numeric-looking string", `[{gt: "70"}]`, "created_at", "must be a number"},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseTemplate([]byte(templateYAML(tc.line)))
+			_, err := ParseTemplate([]byte(templateYAML(tc.condition)))
 			if err == nil {
 				t.Fatalf("expected parse error for %s", tc.name)
 			}
@@ -896,8 +864,7 @@ events:
   - handler: handler.main
     pattern:
       new_image:
-        created_at:
-          gt: "now()-"
+        created_at: [{gt: "now()-"}]
 `))
 	if err == nil {
 		t.Fatal("expected parse error for nested malformed now()")
@@ -910,7 +877,7 @@ events:
 
 	// A float operand parses fine (yaml gives float64); docs the strict rule
 	// that numbers must be YAML numbers, never numeric-looking strings.
-	if _, err := ParseTemplate([]byte(templateYAML("gt: 1.5"))); err != nil {
+	if _, err := ParseTemplate([]byte(templateYAML(`[{gt: 1.5}]`))); err != nil {
 		t.Errorf("gt: 1.5 should parse: %v", err)
 	}
 }
@@ -925,12 +892,10 @@ runtime: python3.14
 events:
   - handler: handler.aging
     pattern:
-      created_at:
-        gt: "now()-5m"
+      created_at: [{gt: "now()-5m"}]
   - handler: handler.score
     pattern:
-      score:
-        gte: 90
+      score: [{gte: 90}]
 `, func() time.Time { return fixedNow })
 
 	// Only rule A (created_at fresh, score low).
