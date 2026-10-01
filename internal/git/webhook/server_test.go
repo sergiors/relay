@@ -346,11 +346,11 @@ func subsystemConfig(t *testing.T) Config {
 		t.Fatalf("set source: %v", err)
 	}
 	return Config{
-		Secrets:      prov,
-		ConfigPath:   cfgPath,
-		CheckoutDir:  filepath.Join(gitDir, "checkout"),
-		FunctionsDir: filepath.Join(t.TempDir(), "functions"),
-		SSHDir:       filepath.Join(gitDir, "ssh"),
+		Secrets:     prov,
+		ConfigPath:  cfgPath,
+		CheckoutDir: filepath.Join(gitDir, "checkout"),
+		AppsDir:     filepath.Join(t.TempDir(), "functions"),
+		SSHDir:      filepath.Join(gitDir, "ssh"),
 	}
 }
 
@@ -366,11 +366,11 @@ func subsystemConfigNoSecret(t *testing.T) Config {
 		t.Fatalf("set source: %v", err)
 	}
 	return Config{
-		Secrets:      mustProvider(t),
-		ConfigPath:   cfgPath,
-		CheckoutDir:  filepath.Join(gitDir, "checkout"),
-		FunctionsDir: filepath.Join(t.TempDir(), "functions"),
-		SSHDir:       filepath.Join(gitDir, "ssh"),
+		Secrets:     mustProvider(t),
+		ConfigPath:  cfgPath,
+		CheckoutDir: filepath.Join(gitDir, "checkout"),
+		AppsDir:     filepath.Join(t.TempDir(), "functions"),
+		SSHDir:      filepath.Join(gitDir, "ssh"),
 	}
 }
 

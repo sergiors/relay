@@ -8,26 +8,26 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
-// TestFunctionBuildObserverFiresOnlyOnActualBuild pins the focused seam the
+// TestAppBuildObserverFiresOnlyOnActualBuild pins the focused seam the
 // worker and reconciler use to publish the persisted building status at the
 // ACTUAL managed-runtime image build boundary:
 //
 //   - a real build (the image is absent, so Prepare issues ImageBuild) fires the
 //     observer exactly once;
-//   - a template that needs no runtime has no function image to build, so the
+//   - a template that needs no runtime has no app image to build, so the
 //     observer never fires (no spurious building);
 //   - an observer installed on the context is only invoked by Prepare, never by
 //     an unrelated call.
-func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
+func TestAppBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 	t.Run("real build fires the observer once", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
-		fn := function.Function{Name: "build-fires", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+		fn := app.App{Name: "build-fires", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
@@ -36,7 +36,7 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		m := newLifecycleManager(t, cli, context.Background())
 
 		var fired atomic.Int32
-		ctx := WithFunctionBuildObserver(context.Background(), func() { fired.Add(1) })
+		ctx := WithAppBuildObserver(context.Background(), func() { fired.Add(1) })
 		if _, err := m.Prepare(ctx, fn); err == nil {
 			t.Fatal("expected the scripted build failure to surface")
 		}
@@ -50,10 +50,10 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:alpine\n"), 0o644); err != nil {
 			t.Fatalf("write template: %v", err)
 		}
-		fn := function.Function{
+		fn := app.App{
 			Name:     "no-runtime",
 			Dir:      dir,
-			Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
+			Template: &app.Template{Services: []app.Service{{Image: "nginx:alpine"}}},
 		}
 		if fn.Template.NeedsRuntime() {
 			t.Fatal("fixture precondition: template must not need a runtime")
@@ -63,7 +63,7 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		m := newLifecycleManager(t, cli, context.Background())
 
 		var fired atomic.Int32
-		ctx := WithFunctionBuildObserver(context.Background(), func() { fired.Add(1) })
+		ctx := WithAppBuildObserver(context.Background(), func() { fired.Add(1) })
 		if _, err := m.Prepare(ctx, fn); err != nil {
 			t.Fatalf("no-runtime prepare: %v", err)
 		}
@@ -77,7 +77,7 @@ func TestFunctionBuildObserverFiresOnlyOnActualBuild(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
-		fn := function.Function{Name: "nil-observer", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+		fn := app.App{Name: "nil-observer", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},

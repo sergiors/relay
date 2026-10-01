@@ -5,13 +5,13 @@ history. Update it only when an architectural boundary or an invariant changes;
 ordinary changes (a handler, a default, a test) do not warrant an update. Prefer
 the code, `README.md`, and `internal/*/doc.go` when this file disagrees.
 
-Relay is an event-driven function runner: Go 1.27, module `relay`, one binary
+Relay is an event-driven app runner: Go 1.27, module `relay`, one binary
 built from `./cmd`, GPL-3.0.
 
 ## Purpose and data flow
 
 Relay consumes events from a Redis Stream with a consumer group, matches each
-event against declarative patterns in each function's `template.yaml`, executes
+event against declarative patterns in each app's `template.yaml`, executes
 matching handlers in isolated Docker containers, and acknowledges a message only
 after every matching invocation is terminal (succeeded, or exhausted to the DLQ).
 `relay start` runs the long-running runtime in the foreground; other subcommands
@@ -27,9 +27,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - `cli` command tree (urfave/cli/v3), parsing/help only, errors returned;
   `config` resolves env into one `Config`; `worker` the runtime lifecycle
   (external-dependency preflight, then resources) and Unix control socket.
-- `function` pure decision layer (discovery, validation, matching,
-  fingerprinting) with `source` the shared `.gitignore` policy; `runtime` Docker
-  client, image build/GC, warm pool, engines (`runtime/python`, `runtime/node`).
+- `app` pure decision layer (discovery, validation, declarative model,
+  fingerprinting) with `source` the shared `.gitignore` policy; `event`
+  event-pattern matching and the candidate index (consumes `app` types,
+  never the reverse); `runtime` Docker client, image build/GC, warm pool,
+  engines (`runtime/python`, `runtime/node`).
 - `runner` match -> attempt/retry/exhaustion -> outcome aggregate; `stream`
   consumption, recovery, per-invocation state, DLQ.
 - `schedule` identity/publish; `cron` timing/catch-up; `reconciler` live reload
@@ -38,12 +40,12 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Ownership and invariants
 
-- `/functions` is the source of truth; the SQLite state DB is a view that never
+- `/apps` is the source of truth; the SQLite state DB is a view that never
   drives matching, building, or reconciliation.
-- Relay touches only its own namespaces (`relay-fn-*` / `relay-dep-*` images,
+- Relay touches only its own namespaces (`relay-app-*` / `relay-dep-*` images,
   `relay.`-labelled containers and keys); ownership is the strict `relay.type`
   label, never a name, with no global pruning.
-- Matching includes currently-unavailable functions: the event is still
+- Matching includes currently-unavailable apps: the event is still
   `matched`, its invocation stays pending, and it is never DLQ'd for
   unavailability alone. Effective concurrency is
   `min(template concurrency, MAX_CONCURRENCY)`, bounding the runner semaphore and
@@ -73,7 +75,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Runtime identity and generation
 
-- One image per function, versioned by source fingerprint (selected source plus
+- One image per app, versioned by source fingerprint (selected source plus
   applicable `.gitignore` files; `template.yaml` verbatim; `resources` excluded).
   A rebuild is a new immutable image; the old version keeps serving until the new
   one is prepared and swapped in; resource-only edits instead reuse the image and
@@ -91,7 +93,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 - Consumer group created with `MKSTREAM` at position `0`; consumer name is the
   hostname. Per-invocation state is a Redis hash keyed by message and
-  `<function>/<handler>`, with forms complete, running-until-deadline,
+  `<app>/<handler>`, with forms complete, running-until-deadline,
   next-attempt-until-deadline, exhausted, and exhausted-and-DLQ-persisted. While
   the message is recoverable (pending in the PEL) the hash is persistent with no
   TTL; only after it leaves the PEL (a successful XACK, or a cleared
@@ -119,11 +121,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 - Every worker evaluates schedules locally, but publication is deduplicated
   atomically, so exactly one stream entry exists per logical occurrence.
-- Occurrence identity derives from function, schedule NAME, and the absolute
+- Occurrence identity derives from app, schedule NAME, and the absolute
   scheduled instant normalized to UTC; timezone affects when a schedule fires,
   never the identity, so DST cannot split or merge occurrences. The handler is not
   part of the identity. Dedup keys expire by TTL.
-- Schedule names are mandatory and unique per function; multiple schedules may
+- Schedule names are mandatory and unique per app; multiple schedules may
   share a handler. Cron jobs, occurrence identity, and runner config resolution
   are all keyed by the stable name, so editing a schedule under the same name
   replaces only that job and removing one name never obsoletes another sharing its
@@ -145,7 +147,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   the invocation, which completes its retry/DLQ lifecycle under the admitted
   contract. The handler is not part of occurrence identity; the descriptor is
   provenance only and DLQ attribution stays handler-based.
-- Removing a function (or a schedule NAME that was never admitted) makes its
+- Removing an app (or a schedule NAME that was never admitted) makes its
   pending occurrences obsolete (acked, never retried or dead-lettered).
 
 ## Services and routing boundaries
@@ -153,7 +155,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Both service source kinds share one reconciler and lifecycle; the desired
   source is resolved before any container action, so an unresolvable source
   preserves the existing healthy containers.
-- Service names are mandatory and unique per function; the name is the identity
+- Service names are mandatory and unique per app; the name is the identity
   (relay.service) that keys container grouping, routing ids, and the persisted
   snapshot. The SourceRef (relay.identity) is used only for image/entry
   resolution and desired-implementation comparison; two names may share one
@@ -182,7 +184,7 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Lifecycle and command hierarchy
 
-- Startup runs an explicit external-dependency preflight BEFORE function
+- Startup runs an explicit external-dependency preflight BEFORE app
   loading/fingerprinting, `state.Open`, the runtime socket/services, sweeps and
   preparation, listener starts, background loops, the scheduler, and the
   reconciler. The fixed order is Redis stream/group readiness → Docker
@@ -202,16 +204,16 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   process exit.
 - A worker-owned readiness flag (`internal/worker/readiness.go`) starts false,
   is set true only at the ready-to-consume boundary (after the preflight,
-  function load/prepare, and socket/listener/loop and consumer/schedule/
+  app load/prepare, and socket/listener/loop and consumer/schedule/
   reconciler/scheduler wiring, immediately before `Consume`), and is cleared as
   the first instruction of the shutdown defer, before lifecycle cancellation.
   It is bound to the worker lifecycle context, so a lifecycle cancellation that
   precedes that clear also reports not-ready. `relay health` queries it over the
   existing control socket; a false flag is not-ready, and in steady state the
   query reflects live Redis consumer health plus a bounded Docker ping and
-  `NETWORKS` verification. Per-function status, SQLite, tracing, and
+  `NETWORKS` verification. Per-app status, SQLite, tracing, and
   asynchronous service/housekeeping convergence do not gate readiness.
-- Tree: `start`; `health`; `stats` (`reset`); `function` (`ls`,
+- Tree: `start`; `health`; `stats` (`reset`); `app` (`ls`,
   `inspect`, `invoke`); `dlq` (`ls`, `inspect`, `replay`, `rm`); `secret` (`ls`,
   `set`, `rm`); `git` (`keygen`, `set`, `sync`, `status`, `remove`). Grouping
   commands show help when bare and return a usage error on an unknown
@@ -219,10 +221,10 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - `health` is worker health over the socket: it asks the RUNNING worker whether
   it is ready with its live dependencies healthy, and needs no Redis/Docker
   configuration or clients in the CLI process (with no running worker it fails).
-  `stats`/`function ls|inspect` read SQLite only; `health`, `invoke`,
+  `stats`/`app ls|inspect` read SQLite only; `health`, `invoke`,
   `dlq replay`, and a running `stats reset` use the worker socket; `dlq` is the
   one command needing Redis. Persistent state is under `/var/lib/relay`,
-  ephemeral lock/socket state under `/run/relay`; `/functions` is written only by
+  ephemeral lock/socket state under `/run/relay`; `/apps` is written only by
   `git sync`.
 
 ## Conventions
@@ -256,7 +258,7 @@ integration suite with Redis and Node.
 - Never weaken claim atomicity: CAS attempt+token, keep terminal markers
   monotonic, never downgrade a completed or exhausted marker.
 - Never silently drop a pending/PEL reference; a missing payload is an anomaly.
-- Never change schedule occurrence identity (function + schedule name + absolute
+- Never change schedule occurrence identity (app + schedule name + absolute
   instant) or add sub-minute granularity.
 - Never identify a service or schedule by anything but its mandatory name (never
   a source descriptor, handler, or index); never make a name optional.

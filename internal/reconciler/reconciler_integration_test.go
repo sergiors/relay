@@ -25,7 +25,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/source"
@@ -40,14 +40,14 @@ type dockerManagerAdapter struct{ m *runtime.Manager }
 
 func (a dockerManagerAdapter) Prepare(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 ) (*runtime.Prepared, error) {
 	return a.m.Prepare(ctx, fn)
 }
 
 func (a dockerManagerAdapter) PrepareWithFingerprintAndSelection(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	fingerprint string,
 	selection *source.Selection,
 ) (*runtime.Prepared, error) {
@@ -63,13 +63,13 @@ func (a dockerManagerAdapter) Execute(
 	return a.m.Execute(ctx, prepared, handler, eventJSON, extraEnv)
 }
 
-// SetFunctionResources implements the optional resourceSetter seam so the
+// SetAppResources implements the optional resourceSetter seam so the
 // adapter exercises the same resource-only hot-change path production uses.
-func (a dockerManagerAdapter) SetFunctionResources(name string, limits function.ResourceLimits) {
-	a.m.SetFunctionResources(name, limits)
+func (a dockerManagerAdapter) SetAppResources(name string, limits app.ResourceLimits) {
+	a.m.SetAppResources(name, limits)
 }
 
-// writeFn writes a node function directory: template + handler.
+// writeFn writes a node app directory: template + handler.
 func writeNodeFn(t *testing.T, root, name, output string) {
 	t.Helper()
 	dir := filepath.Join(root, name)
@@ -91,7 +91,7 @@ func runHandlerWith(
 	t *testing.T,
 	m *runtime.Manager,
 	out *testutil.SyncBuffer,
-	fn function.Function,
+	fn app.App,
 	hndlr,
 	eventJSON string,
 ) {
@@ -116,18 +116,18 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		t.Fatalf("mkdir root: %v", err)
 	}
 
-	// Derive a unique function name from the test name and a nanosecond stamp so
+	// Derive a unique app name from the test name and a nanosecond stamp so
 	// concurrent runs against one daemon cannot collide on the image repo or the
-	// function directory, and scope cleanup to that prefix; testutil.UniqueName
-	// keeps it within function.ValidName's 63-char cap even for a long test name.
+	// app directory, and scope cleanup to that prefix; testutil.UniqueName
+	// keeps it within app.ValidName's 63-char cap even for a long test name.
 	name := testutil.UniqueName(t, "recon")
 
 	var buf bytes.Buffer
 	// Relay-operational logger. Container stdout/stderr is NO LONGER routed
 	// through the logger (it is forwarded as a raw transport to the
-	// function-output sink; see runtime/output.go), so the assertions below that
+	// app-output sink; see runtime/output.go), so the assertions below that
 	// match handler output read from the sink buffer installed via
-	// SetFunctionOutput, not from this operational log buffer.
+	// SetAppOutput, not from this operational log buffer.
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	m, err := runtime.NewManager(logger, nil, "test-host")
 	if err != nil {
@@ -135,15 +135,15 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	}
 	defer m.Close()
 
-	// Function-output sink: handler stdout is transport-forwarded here (not to
+	// App-output sink: handler stdout is transport-forwarded here (not to
 	// the logger), so handler-output assertions read from this buffer. It is
-	// written by SetFunctionOutput goroutines, so a mutex-guarded buffer is used
+	// written by SetAppOutput goroutines, so a mutex-guarded buffer is used
 	// under -race.
 	outBuf := &testutil.SyncBuffer{}
-	outPrev := runtime.SetFunctionOutput(outBuf)
-	defer runtime.SetFunctionOutput(outPrev)
+	outPrev := runtime.SetAppOutput(outBuf)
+	defer runtime.SetAppOutput(outPrev)
 
-	// Track the relay-fn-<name>:* images this test builds (v1/v2/v3 via
+	// Track the relay-app-<name>:* images this test builds (v1/v2/v3 via
 	// fingerprint-tagged refs) so t.Cleanup removes them; the reconciler's
 	// rebuilds leave superseded versions behind. Removal is scoped strictly to
 	// the derived name, never unrelated images.
@@ -162,7 +162,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-"+name+":") {
+				if strings.HasPrefix(tag, "relay-app-"+name+":") {
 					if _, err := cleanupCli.ImageRemove(cleanupCtx, tag, client.ImageRemoveOptions{Force: true}); err != nil {
 						t.Logf("cleanup: remove %s: %v", tag, err)
 					}
@@ -174,7 +174,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 
 	adapter := dockerManagerAdapter{m}
 
-	// a) Discover a brand-new function via reconcile.
+	// a) Discover a brand-new app via reconcile.
 	writeNodeFn(t, root, name, "hello-v1")
 	reg := &runner.Registry{}
 	reg.Set(nil)
@@ -188,13 +188,13 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 		adapter,
 		logger,
 	)
-	r.reconcileFunction(name)
+	r.reconcileApp(name)
 
 	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
 		t.Fatal("function should be discovered and prepared")
 	}
 	// Execute the freshly built image for v1.
-	fn := function.Function{Name: name, Dir: filepath.Join(root, name), Template: mustParse(templateWithInsert())}
+	fn := app.App{Name: name, Dir: filepath.Join(root, name), Template: mustParse(templateWithInsert())}
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v1")) {
 		t.Fatalf("expected v1 output, got: %s", outBuf.String())
@@ -203,7 +203,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	// b) Change source; unchanged template. Fingerprint changes -> rebuild.
 	outBuf.Reset()
 	writeNodeFn(t, root, name, "hello-v2")
-	r.reconcileFunction(name)
+	r.reconcileApp(name)
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v2")) {
 		t.Fatalf("expected v2 output after reload, got: %s", outBuf.String())
@@ -218,7 +218,7 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	if err := os.WriteFile(tmplPath, []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
-	r.reconcileFunction(name)
+	r.reconcileApp(name)
 	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
 		t.Fatal("broken template must not drop the active version")
 	}
@@ -231,17 +231,17 @@ func TestReconcilerReloadIntegration(t *testing.T) {
 	// d) Fix template -> rebuild succeeds.
 	outBuf.Reset()
 	writeNodeFn(t, root, name, "hello-v3")
-	r.reconcileFunction(name)
+	r.reconcileApp(name)
 	runHandlerWith(t, m, outBuf, fn, "index.hi", `{"event_name":"INSERT"}`)
 	if !bytes.Contains(outBuf.Bytes(), []byte("hello-v3")) {
 		t.Fatalf("expected v3 output after fix, got: %s", outBuf.String())
 	}
 
-	// e) Remove dir -> function dropped.
+	// e) Remove dir -> app dropped.
 	if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
 		t.Fatalf("remove function dir: %v", err)
 	}
-	r.reconcileFunction(name)
+	r.reconcileApp(name)
 	if reg.GetByName(name) != nil {
 		t.Fatal("function should be removed from the registry when its dir vanishes")
 	}

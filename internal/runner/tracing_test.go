@@ -14,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/tracing"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -99,27 +99,28 @@ func attrString(span tracetest.SpanStub, key string) string {
 	return ""
 }
 
-// TestHandleEmitsFunctionInvokeSpan proves the shared invocation path emits one
+// TestHandleEmitsAppInvokeSpan proves the shared invocation path emits one
 // function.invoke span per executed handler, carrying the low-cardinality
-// function/handler/runtime attributes and a success result.
-func TestHandleEmitsFunctionInvokeSpan(t *testing.T) {
+// relay.app.name / relay.handler.name / relay.app.runtime attributes and a
+// success result.
+func TestHandleEmitsAppInvokeSpan(t *testing.T) {
 	exp := withSpanRecorder(t)
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 
 	if err := r.Handle(context.Background(), "m-1", map[string]any{"event_name": "X"}); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 
 	span := spanByName(t, exp, "function.invoke")
-	if got := attrString(span, "function.name"); got != "demo" {
-		t.Errorf("function.name = %q, want demo", got)
+	if got := attrString(span, "relay.app.name"); got != "demo" {
+		t.Errorf("relay.app.name = %q, want demo", got)
 	}
-	if got := attrString(span, "function.handler"); got != "index.run" {
-		t.Errorf("function.handler = %q, want index.run", got)
+	if got := attrString(span, "relay.handler.name"); got != "index.run" {
+		t.Errorf("relay.handler.name = %q, want index.run", got)
 	}
-	if got := attrString(span, "function.runtime"); got != "node24" {
-		t.Errorf("function.runtime = %q, want node24", got)
+	if got := attrString(span, "relay.app.runtime"); got != "node24" {
+		t.Errorf("relay.app.runtime = %q, want node24", got)
 	}
 	if got := attrString(span, "function.result"); got != "success" {
 		t.Errorf("function.result = %q, want success", got)
@@ -135,7 +136,7 @@ func TestHandleEmitsFunctionInvokeSpan(t *testing.T) {
 func TestHandleFailureSpanRecordsError(t *testing.T) {
 	exp := withSpanRecorder(t)
 	exec := &countingExecutor{fail: true}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 
 	err := r.Handle(context.Background(), "m-1", map[string]any{"event_name": "X"})
 	if err == nil {
@@ -160,7 +161,7 @@ func TestHandleFailureSpanRecordsError(t *testing.T) {
 func TestRunInvocationSpanPropagatesToExecutor(t *testing.T) {
 	exp := withSpanRecorder(t)
 	exec := &spanAwareExecutor{}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 
 	if err := r.Handle(context.Background(), "m-1", map[string]any{"event_name": "X"}); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -238,7 +239,7 @@ func invokeSpans(t *testing.T, rec *spanRecorder) []tracetest.SpanStub {
 func TestHandleRetrySpanIsDistinctAndLinksToPreviousAttempt(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &retryFlipExecutor{}
-	r := New([]*PreparedFunction{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -296,7 +297,7 @@ func TestHandleRetrySpanIsDistinctAndLinksToPreviousAttempt(t *testing.T) {
 func TestHandleRetryLinksToPersistedLineageAfterRestart(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 
 	// A known reference as another worker would have persisted it.
 	traceID, _ := oteltrace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
@@ -328,7 +329,7 @@ func TestHandleRetryLinksToPersistedLineageAfterRestart(t *testing.T) {
 func TestHandleMalformedPersistedLineageIgnoresIt(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 	prog.RecordTrace("demo/index.run", "not-a-traceparent")
 
@@ -346,14 +347,14 @@ func TestHandleMalformedPersistedLineageIgnoresIt(t *testing.T) {
 }
 
 // TestHandleFanOutRetryLinksOnlyOwnLineage proves the fan-out invariant: two
-// functions matching the same event run as SIBLING function.invoke spans under
+// apps matching the same event run as SIBLING function.invoke spans under
 // the same delivery context (neither is the other's parent), and a retried one
 // links only to its own previous attempt's lineage — never to its sibling's.
 func TestHandleFanOutRetryLinksOnlyOwnLineage(t *testing.T) {
 	rec := withSpanRecorder(t)
 	a := &retryFlipExecutor{} // fails once, then succeeds
 	b := &countingExecutor{}  // always succeeds
-	r := New([]*PreparedFunction{
+	r := New([]*PreparedApp{
 		fnWithRetries(t, "alpha", 1, a),
 		fnWithRetries(t, "beta", 1, b),
 	}, testutil.DiscardLogger())
@@ -385,7 +386,7 @@ func TestHandleFanOutRetryLinksOnlyOwnLineage(t *testing.T) {
 			continue
 		}
 		stub := s
-		switch attrString(s, "function.name") {
+		switch attrString(s, "relay.app.name") {
 		case "beta":
 			if betaFirst == nil {
 				betaFirst = &stub
@@ -424,7 +425,7 @@ func TestHandleTracingDisabledPersistsNoLineage(t *testing.T) {
 	otel.SetTracerProvider(oteltrace.NewNoopTracerProvider())
 
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", exec)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -439,28 +440,28 @@ func TestHandleTracingDisabledPersistsNoLineage(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionEmitsManualRootOperation proves a manual invocation creates
-// a worker-side function.manual_invoke ROOT operation span (new root) with each
+// TestInvokeAppEmitsManualRootOperation proves a manual invocation creates
+// a worker-side app.manual_invoke ROOT operation span (new root) with each
 // matching function.invoke as its child, without any caller-supplied context.
-func TestInvokeFunctionEmitsManualRootOperation(t *testing.T) {
+func TestInvokeAppEmitsManualRootOperation(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: events.created.handler
     pattern:
       event_name: [INSERT]
 `, exec)}, testutil.DiscardLogger())
 
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
+		t.Fatalf("InvokeApp: %v", err)
 	}
-	root := spanByName(t, rec, "function.manual_invoke")
+	root := spanByName(t, rec, "app.manual_invoke")
 	if root.Parent.IsValid() {
 		t.Fatalf("manual_invoke parent = %s, want a new root", root.Parent.SpanID())
 	}
-	if got := attrString(root, "function.name"); got != "fn" {
-		t.Errorf("manual_invoke function.name = %q, want fn", got)
+	if got := attrString(root, "relay.app.name"); got != "fn" {
+		t.Errorf("manual_invoke relay.app.name = %q, want fn", got)
 	}
 	if got := attrString(root, "function.result"); got != "success" {
 		t.Errorf("manual_invoke result = %q, want success", got)
@@ -482,7 +483,7 @@ events:
 func TestReplayDLQEmitsNewRootOperationWithLink(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &spanAwareExecutor{}
-	r := New([]*PreparedFunction{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
 	traceID, _ := oteltrace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
 	spanID, _ := oteltrace.SpanIDFromHex("00f067aa0ba902b7")
@@ -531,7 +532,7 @@ func TestReplayDLQEmitsNewRootOperationWithLink(t *testing.T) {
 func TestReplayDLQWithoutLineageIsRootWithoutLink(t *testing.T) {
 	for _, lineage := range []string{"", "not-a-traceparent"} {
 		rec := withSpanRecorder(t)
-		r := New([]*PreparedFunction{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
+		r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
 		if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), lineage); err != nil {
 			t.Fatalf("ReplayDLQ(lineage=%q): %v", lineage, err)
 		}
@@ -549,7 +550,7 @@ func TestReplayDLQWithoutLineageIsRootWithoutLink(t *testing.T) {
 // error on the dlq.replay operation span, preserving the error contract.
 func TestReplayDLQFailingOperationRecordsError(t *testing.T) {
 	rec := withSpanRecorder(t)
-	r := New([]*PreparedFunction{replayFn(t, "fn", &countingExecutor{fail: true})}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{fail: true})}, testutil.DiscardLogger())
 	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err == nil {
 		t.Fatal("expected a failed replay")
 	}
@@ -563,11 +564,11 @@ func TestReplayDLQFailingOperationRecordsError(t *testing.T) {
 }
 
 // TestRunnerTracingHelpersStayLowCardinality is a guard that the shared
-// invocation span still carries the configuration attributes (function/handler/
+// invocation span still carries the configuration attributes (app/handler/
 // runtime) and nothing payload-derived.
 func TestRunnerTracingHelpersStayLowCardinality(t *testing.T) {
 	rec := withSpanRecorder(t)
-	r := New([]*PreparedFunction{alwaysMatchFn(t, "demo", &countingExecutor{})}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{alwaysMatchFn(t, "demo", &countingExecutor{})}, testutil.DiscardLogger())
 	if err := r.Handle(context.Background(), "m-1", map[string]any{"event_name": "X", "secret": "s3cr3t"}); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
@@ -587,7 +588,7 @@ func TestRunnerTracingHelpersStayLowCardinality(t *testing.T) {
 func TestInvokeHandlerScheduleRetryLinksItsOwnLineage(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &retryFlipExecutor{}
-	r := New([]*PreparedFunction{schedFnRetries(t, "fn", exec, time.Second, 1)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{schedFnRetries(t, "fn", exec, time.Second, 1)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -638,7 +639,7 @@ func TestInvokeHandlerScheduleRetryLinksItsOwnLineage(t *testing.T) {
 func TestHandleRetriesShareUpstreamTraceAndLink(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &retryFlipExecutor{}
-	r := New([]*PreparedFunction{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 
 	// One stable upstream delivery span stands in for the stream.message span
@@ -695,7 +696,7 @@ func intAttr(span tracetest.SpanStub, key string) (int64, bool) {
 func TestHandleRetrySpanCarriesHandlerAttempt(t *testing.T) {
 	rec := withSpanRecorder(t)
 	exec := &retryFlipExecutor{}
-	r := New([]*PreparedFunction{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{fnWithRetries(t, "demo", 1, exec)}, testutil.DiscardLogger())
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -719,20 +720,20 @@ func TestHandleRetrySpanCarriesHandlerAttempt(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionManualSpanOmitsUnknownAttempt proves a manual invocation
+// TestInvokeAppManualSpanOmitsUnknownAttempt proves a manual invocation
 // (state-free, so no handler attempt is known) still emits the operation span and
 // function.invoke without a fabricated function.attempt attribute.
-func TestInvokeFunctionManualSpanOmitsUnknownAttempt(t *testing.T) {
+func TestInvokeAppManualSpanOmitsUnknownAttempt(t *testing.T) {
 	rec := withSpanRecorder(t)
-	r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: events.created.handler
     pattern:
       event_name: [INSERT]
 `, &countingExecutor{})}, testutil.DiscardLogger())
 
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	child := spanByName(t, rec, "function.invoke")
 	if _, ok := intAttr(child, "function.attempt"); ok {
@@ -740,35 +741,35 @@ events:
 	}
 }
 
-// TestInvokeFunctionInvalidStillTraced proves the operation span covers
-// validation failures: an unknown function, an unavailable function, and a
-// no-match invocation each emit function.manual_invoke (with the error recorded
+// TestInvokeAppInvalidStillTraced proves the operation span covers
+// validation failures: an unknown app, an unavailable app, and a
+// no-match invocation each emit app.manual_invoke (with the error recorded
 // where one occurs) without changing the existing return values.
-func TestInvokeFunctionInvalidStillTraced(t *testing.T) {
+func TestInvokeAppInvalidStillTraced(t *testing.T) {
 	t.Run("unknown function", func(t *testing.T) {
 		rec := withSpanRecorder(t)
 		r := New(nil, testutil.DiscardLogger())
-		count, err := r.InvokeFunction(context.Background(), "ghost", map[string]any{"x": 1})
-		if count != 0 || !errors.Is(err, ErrFunctionNotFound) {
-			t.Fatalf("InvokeFunction = (%d, %v), want (0, ErrFunctionNotFound)", count, err)
+		count, err := r.InvokeApp(context.Background(), "ghost", map[string]any{"x": 1})
+		if count != 0 || !errors.Is(err, ErrAppNotFound) {
+			t.Fatalf("InvokeApp = (%d, %v), want (0, ErrAppNotFound)", count, err)
 		}
-		op := spanByName(t, rec, "function.manual_invoke")
+		op := spanByName(t, rec, "app.manual_invoke")
 		if op.Status.Code != codes.Error {
 			t.Errorf("manual_invoke status = %v, want codes.Error", op.Status.Code)
 		}
-		if got := attrString(op, "function.name"); got != "ghost" {
-			t.Errorf("manual_invoke function.name = %q, want ghost", got)
+		if got := attrString(op, "relay.app.name"); got != "ghost" {
+			t.Errorf("manual_invoke relay.app.name = %q, want ghost", got)
 		}
 	})
 
 	t.Run("unavailable function", func(t *testing.T) {
 		rec := withSpanRecorder(t)
-		r := New([]*PreparedFunction{NewUnavailable(function.Function{Name: "broken"})}, testutil.DiscardLogger())
-		count, err := r.InvokeFunction(context.Background(), "broken", map[string]any{"x": 1})
-		if count != 0 || !errors.Is(err, ErrFunctionUnavailable) {
-			t.Fatalf("InvokeFunction = (%d, %v), want (0, ErrFunctionUnavailable)", count, err)
+		r := New([]*PreparedApp{NewUnavailable(app.App{Name: "broken"})}, testutil.DiscardLogger())
+		count, err := r.InvokeApp(context.Background(), "broken", map[string]any{"x": 1})
+		if count != 0 || !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("InvokeApp = (%d, %v), want (0, ErrAppUnavailable)", count, err)
 		}
-		op := spanByName(t, rec, "function.manual_invoke")
+		op := spanByName(t, rec, "app.manual_invoke")
 		if op.Status.Code != codes.Error {
 			t.Errorf("manual_invoke status = %v, want codes.Error", op.Status.Code)
 		}
@@ -776,18 +777,18 @@ func TestInvokeFunctionInvalidStillTraced(t *testing.T) {
 
 	t.Run("no matching rule", func(t *testing.T) {
 		rec := withSpanRecorder(t)
-		r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+		r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: events.created.handler
     pattern:
       event_name: [INSERT]
 `, &countingExecutor{})}, testutil.DiscardLogger())
-		count, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "DELETE"})
+		count, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "DELETE"})
 		if count != 0 || err != nil {
-			t.Fatalf("InvokeFunction = (%d, %v), want (0, nil)", count, err)
+			t.Fatalf("InvokeApp = (%d, %v), want (0, nil)", count, err)
 		}
 		// The no-match no-op is a successful operation and is still traced.
-		op := spanByName(t, rec, "function.manual_invoke")
+		op := spanByName(t, rec, "app.manual_invoke")
 		if op.Status.Code == codes.Error {
 			t.Errorf("no-match manual_invoke status = %v, want non-error", op.Status.Code)
 		}
@@ -795,7 +796,7 @@ events:
 }
 
 // TestReplayDLQInvalidStillTraced proves the replay operation span covers
-// validation failures: a removed function and a removed handler each emit
+// validation failures: a removed app and a removed handler each emit
 // dlq.replay (with the error recorded) without changing the return sentinels,
 // and no function.invoke child runs.
 func TestReplayDLQInvalidStillTraced(t *testing.T) {
@@ -803,8 +804,8 @@ func TestReplayDLQInvalidStillTraced(t *testing.T) {
 		rec := withSpanRecorder(t)
 		r := New(nil, testutil.DiscardLogger())
 		err := r.ReplayDLQ(context.Background(), "ghost", "h", []byte(`{}`), "")
-		if !errors.Is(err, ErrFunctionNotFound) {
-			t.Fatalf("err = %v, want ErrFunctionNotFound", err)
+		if !errors.Is(err, ErrAppNotFound) {
+			t.Fatalf("err = %v, want ErrAppNotFound", err)
 		}
 		op := spanByName(t, rec, "dlq.replay")
 		if op.Status.Code != codes.Error {
@@ -814,7 +815,7 @@ func TestReplayDLQInvalidStillTraced(t *testing.T) {
 
 	t.Run("removed handler", func(t *testing.T) {
 		rec := withSpanRecorder(t)
-		r := New([]*PreparedFunction{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
+		r := New([]*PreparedApp{replayFn(t, "fn", &countingExecutor{})}, testutil.DiscardLogger())
 		err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "")
 		if !errors.Is(err, ErrHandlerNotFound) {
 			t.Fatalf("err = %v, want ErrHandlerNotFound", err)

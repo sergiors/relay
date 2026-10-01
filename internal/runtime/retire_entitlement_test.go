@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -24,7 +24,7 @@ func newEntitlementManager(t *testing.T, start func(m *Manager, img resolvedImag
 	m.resolveImageIdentityFn = func(_ context.Context, ref, fp string) (resolvedImage, error) {
 		return resolvedImage{ref: ref, id: "sha256:" + ref, fingerprint: fp}, nil
 	}
-	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		return start(m, img)
 	}
 	t.Cleanup(func() { _ = m.Close() })
@@ -49,7 +49,7 @@ func newEntitlementManager(t *testing.T, start func(m *Manager, img resolvedImag
 // coordinator's retire-entered hook, the stubbed create boundary); the
 // time.After cases are deadlock bounds only.
 func TestExecuteCarriedEntitlementHoldsOwnReferenceAcrossRetirement(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	dels := 0
 	cli := newScriptedDockerClient(t,
@@ -148,8 +148,8 @@ func TestExecuteCarriedEntitlementHoldsOwnReferenceAcrossRetirement(t *testing.T
 // rather than silently riding a token that protects another image. The carried
 // lease is left untouched (its holder owns it).
 func TestExecuteCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
-	const image = "relay-fn-a:v1"
-	const other = "relay-fn-b:v1"
+	const image = "relay-app-a:v1"
+	const other = "relay-app-b:v1"
 
 	var ownDuringCreate, carriedDuringCreate int
 	m := newEntitlementManager(t, func(mgr *Manager, _ resolvedImage) (reusableContainer, error) {
@@ -186,7 +186,7 @@ func TestExecuteCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
 // released no longer entitles anything: Execute acquires its own independent
 // reference instead of trusting a spent token.
 func TestExecuteReleasedCarriedLeaseAcquiresOwn(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	var ownDuringCreate int
 	m := newEntitlementManager(t, func(mgr *Manager, _ resolvedImage) (reusableContainer, error) {
@@ -217,7 +217,7 @@ func TestExecuteReleasedCarriedLeaseAcquiresOwn(t *testing.T) {
 // execution against a RETIRING image is rejected with the retryable
 // ErrImageRetiring — it may not slip past the gate on a spent token.
 func TestExecuteReleasedCarriedLeaseCannotBypassRetirement(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	created := 0
 	m := newEntitlementManager(t, func(*Manager, resolvedImage) (reusableContainer, error) {
@@ -252,7 +252,7 @@ func TestExecuteReleasedCarriedLeaseCannotBypassRetirement(t *testing.T) {
 // entitlement WHILE the invocation is running cannot pull the image out from
 // under it (the execution still holds its own reference).
 func TestExecuteCarriedLeaseReleasedMidExecutionKeepsOwnReference(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	createEntered := make(chan struct{})
 	createRelease := make(chan struct{})
@@ -306,7 +306,7 @@ func TestExecuteCarriedLeaseReleasedMidExecutionKeepsOwnReference(t *testing.T) 
 // replacement under that admitted authority while the image is retiring, and the
 // service takes its OWN child share for the whole create+start window.
 func TestStartServiceCarriedEntitlementSharesUnderRetirement(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	var heldDuringCreate int
 	var m0 *Manager
@@ -331,7 +331,7 @@ func TestStartServiceCarriedEntitlementSharesUnderRetirement(t *testing.T) {
 
 	ctx := WithImageLease(context.Background(), carried)
 	if _, err := m0.StartService(ctx, ServiceSpec{
-		Function: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
+		App: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
 	}, 0); err != nil {
 		t.Fatalf("StartService under retirement with an admitted lease failed: %v", err)
 	}
@@ -351,8 +351,8 @@ func TestStartServiceCarriedEntitlementSharesUnderRetirement(t *testing.T) {
 // and started a container on a retiring image; now it acquires a fresh lease,
 // which the gate rejects.
 func TestStartServiceCarriedLeaseForOtherImageDoesNotBypassRetirement(t *testing.T) {
-	const image = "relay-fn-a:v1"
-	const other = "relay-fn-b:v1"
+	const image = "relay-app-a:v1"
+	const other = "relay-app-b:v1"
 
 	creates := 0
 	cli := newScriptedDockerClient(t,
@@ -374,7 +374,7 @@ func TestStartServiceCarriedLeaseForOtherImageDoesNotBypassRetirement(t *testing
 	m.leaseCoord().beginRetire(image)
 
 	_, err = m.StartService(WithImageLease(context.Background(), carried), ServiceSpec{
-		Function: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
+		App: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
 	}, 0)
 	if !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("StartService with a mismatched carried lease on a retiring image = %v, want wrapped ErrImageRetiring", err)
@@ -388,8 +388,8 @@ func TestStartServiceCarriedLeaseForOtherImageDoesNotBypassRetirement(t *testing
 // of the test above: with the service's image live, a mismatched carried lease is
 // ignored and the service acquires its own reference for the image it starts.
 func TestStartServiceCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
-	const image = "relay-fn-a:v1"
-	const other = "relay-fn-b:v1"
+	const image = "relay-app-a:v1"
+	const other = "relay-app-b:v1"
 
 	var heldDuringCreate, otherDuringCreate int
 	var m0 *Manager
@@ -412,7 +412,7 @@ func TestStartServiceCarriedLeaseForOtherImageAcquiresOwn(t *testing.T) {
 	defer carried.Release()
 
 	if _, err := m0.StartService(WithImageLease(context.Background(), carried), ServiceSpec{
-		Function: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
+		App: "fn", Name: "svc", SourceRef: "service.js", Port: 80, Image: image, Env: []string{"PORT=80"},
 	}, 0); err != nil {
 		t.Fatalf("StartService with a mismatched carried lease: %v", err)
 	}

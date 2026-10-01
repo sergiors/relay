@@ -128,7 +128,7 @@ func imageListJSON(tags ...string) string {
 
 // scriptedImage is one image in a scripted /images/json response, with an
 // optional full label set so tests can exercise the strict managed-image
-// classification (relay.type=function + a matching relay.function).
+// classification (relay.type=app + a matching relay.app).
 type scriptedImage struct {
 	tags   []string
 	labels map[string]string

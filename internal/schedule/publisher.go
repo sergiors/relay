@@ -30,7 +30,7 @@ const occurrenceTTL = 7 * 24 * time.Hour
 // The ID already carries the "schedule:" family prefix, so the namespace is
 // just "relay:" and the family word is not repeated. Like invocation keys, no
 // percent-encoding is needed: the ID is composed of validated identifiers
-// (function names are validated at load, schedule names follow the same rule,
+// (app names are validated at load, schedule names follow the same rule,
 // scheduled_at is RFC3339) and is deterministic, so the same logical occurrence
 // maps to the same key on every worker.
 func dedupKey(o Occurrence) string {
@@ -133,7 +133,7 @@ func NewPublisher(
 func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence) (published bool, err error) {
 	ctx, span := tracing.Start(ctx, "schedule.publish.attempt",
 		trace.WithAttributes(
-			attribute.String("relay.function", o.Function),
+			attribute.String("relay.app", o.App),
 			attribute.String("relay.schedule", o.Schedule),
 			attribute.String("relay.handler", o.Handler),
 		),
@@ -151,7 +151,7 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 	if err != nil {
 		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed",
-			"function", o.Function,
+			"app", o.App,
 			"schedule", o.Schedule,
 			"handler", o.Handler,
 			"occurrence_id", id,
@@ -168,7 +168,7 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 	if err != nil {
 		p.metrics.Inc(metrics.MetricSchedulePublishFailures)
 		p.log.Warn("Schedule: publish failed",
-			"function", o.Function,
+			"app", o.App,
 			"schedule", o.Schedule,
 			"handler", o.Handler,
 			"occurrence_id", id,
@@ -180,7 +180,7 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 	case 1:
 		p.metrics.Inc(metrics.MetricScheduleOccurrencesPublished)
 		p.log.Debug("Schedule: occurrence published",
-			"function", o.Function,
+			"app", o.App,
 			"schedule", o.Schedule,
 			"handler", o.Handler,
 			"scheduled_at", o.ScheduledAt.UTC().Format(time.RFC3339),
@@ -190,7 +190,7 @@ func (p *SchedulePublisher) PublishOccurrence(ctx context.Context, o Occurrence)
 	default:
 		p.metrics.Inc(metrics.MetricScheduleOccurrencesDuplicate)
 		p.log.Debug("Schedule: occurrence already published",
-			"function", o.Function,
+			"app", o.App,
 			"schedule", o.Schedule,
 			"handler", o.Handler,
 			"occurrence_id", id,

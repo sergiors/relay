@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 )
 
@@ -75,7 +75,7 @@ type blockingBuilder struct {
 }
 
 func (b *blockingBuilder) Prepare(
-	_ context.Context, fn function.Function,
+	_ context.Context, fn app.App,
 ) (*runtime.Prepared, error) {
 	if b.enteredOnce.CompareAndSwap(false, true) {
 		close(b.entered)

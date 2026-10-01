@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -15,7 +15,7 @@ import (
 )
 
 // TestHandleSkipsCompletedInvocationsOnRedelivery is the core redelivery
-// scenario: a message matching two functions is delivered, one invocation
+// scenario: a message matching two apps is delivered, one invocation
 // succeeds and one fails; on redelivery the succeeded one is skipped (its
 // executor is not called again) while the failed one is retried; once it
 // succeeds, a third delivery skips both and Handle returns nil (so the stream
@@ -23,7 +23,7 @@ import (
 func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 	alpha := &countingExecutor{}
 	beta := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
 	}, testutil.DiscardLogger(), nil)
@@ -81,7 +81,7 @@ func TestHandleSkipsCompletedInvocationsOnRedelivery(t *testing.T) {
 func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
 	a := &countingExecutor{fail: true} // sorts first, fails delivery 1
 	b := &countingExecutor{}           // sorts second, succeeds always
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", a), // sorts before "beta"
 		alwaysMatchFn(t, "beta", b),
 	}, testutil.DiscardLogger(), nil)
@@ -138,7 +138,7 @@ func TestHandleMultiHandlerFirstFailsSecondSucceeds(t *testing.T) {
 // TestHandleSkippedInvocationsDoNotCountMetrics verifies that a skipped
 // invocation (already completed on a previous delivery) is not counted as an
 // execution: handler_success_total and function_handler_success_total only
-// count real executions, while function_events_matched_total counts the function
+// count real executions, while app_events_matched_total counts the app
 // as engaged once for the logical event (attribution, not execution), and the
 // event classification counters are claimed once and not re-counted on the
 // redelivery.
@@ -146,7 +146,7 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 	m := metrics.New()
 	alpha := &countingExecutor{}
 	beta := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
 	}, testutil.DiscardLogger(), m)
@@ -184,15 +184,15 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
 
-	fs := m.FunctionStatsSnapshot()
-	byName := map[string]metrics.FunctionStat{}
+	fs := m.AppStatsSnapshot()
+	byName := map[string]metrics.AppStat{}
 	for _, f := range fs {
-		byName[f.Function] = f
+		byName[f.App] = f
 	}
 	if byName["alpha"].HandlerSuccessTotal != 1 {
 		t.Errorf("alpha success = %d, want 1 (not 2; the skip is not an execution)", byName["alpha"].HandlerSuccessTotal)
 	}
-	// Each function is engaged once for the logical event, not once per delivery.
+	// Each app is engaged once for the logical event, not once per delivery.
 	if byName["alpha"].EventsMatchedTotal != 1 {
 		t.Errorf("alpha events = %d, want 1 (counted once per logical event)", byName["alpha"].EventsMatchedTotal)
 	}
@@ -205,7 +205,7 @@ func TestHandleSkippedInvocationsDoNotCountMetrics(t *testing.T) {
 // never marked, and a later success marks it.
 func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -237,7 +237,7 @@ func TestHandleMarksStateOnlyAfterSuccess(t *testing.T) {
 func TestHandleWithoutStateStillExecutesOnEveryDelivery(t *testing.T) {
 	a := &countingExecutor{}
 	b := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
 	}, testutil.DiscardLogger(), nil)
@@ -252,17 +252,17 @@ func TestHandleWithoutStateStillExecutesOnEveryDelivery(t *testing.T) {
 	}
 }
 
-// TestHandleMultipleFunctionsIndependentState verifies that each function's
+// TestHandleMultipleAppsIndependentState verifies that each app's
 // invocation state is tracked independently across redeliveries. Now that
-// Handle aggregates outcomes instead of failing fast, ALL matching functions
+// Handle aggregates outcomes instead of failing fast, ALL matching apps
 // are attempted on every eligible delivery regardless of the others' outcomes:
 // a failure in one handler no longer prevents the later, sorted ones from
 // running.
-func TestHandleMultipleFunctionsIndependentState(t *testing.T) {
+func TestHandleMultipleAppsIndependentState(t *testing.T) {
 	a := &countingExecutor{}           // A: always succeeds
 	c := &countingExecutor{fail: true} // C: fails delivery 1, succeeds delivery 2
 	z := &countingExecutor{fail: true} // Z: always fails
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "A", a),
 		alwaysMatchFn(t, "C", c),
 		alwaysMatchFn(t, "Z", z),
@@ -356,7 +356,7 @@ func TestRetryBackoffSchedule(t *testing.T) {
 // sole invocation is terminal).
 func TestHandleRetriesZeroExhaustsAfterOneAttempt(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -380,7 +380,7 @@ func TestHandleRetriesZeroExhaustsAfterOneAttempt(t *testing.T) {
 // schedule 1m/2m/5m/10m applied after attempts 1..4.
 func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", app.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -428,7 +428,7 @@ func TestHandleDefaultRetriesFiveAttempts(t *testing.T) {
 func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
 	alpha := &countingExecutor{fail: true} // exhausts
 	beta := &countingExecutor{}            // succeeds
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
 	}, testutil.DiscardLogger(), nil)
@@ -459,7 +459,7 @@ func TestHandleExhaustedAndOtherCompletesRoutesToDLQ(t *testing.T) {
 func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
 	alpha := &countingExecutor{fail: true} // exhausts
 	beta := &countingExecutor{}            // protected (never executed)
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
 	}, testutil.DiscardLogger(), nil)
@@ -496,7 +496,7 @@ func TestHandleExhaustedOtherProtectedKeepsPending(t *testing.T) {
 func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
 	alpha := &countingExecutor{} // executes and succeeds this delivery
 	beta := &countingExecutor{}  // protected, never executes
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", alpha),
 		alwaysMatchFn(t, "beta", beta),
 	}, testutil.DiscardLogger(), nil)
@@ -535,7 +535,7 @@ func TestHandleSuccessWithProtectedSkipNotEligible(t *testing.T) {
 // the message pending.
 func TestHandleNotEligibleWhenProtected(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -557,7 +557,7 @@ func TestHandleNotEligibleWhenProtected(t *testing.T) {
 func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 1, exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", 1, exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -565,7 +565,7 @@ func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected attempt 1 to fail")
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].RetriesTotal != 1 {
 		t.Fatalf("retries after attempt 1 = %+v, want 1", fs)
 	}
@@ -575,7 +575,7 @@ func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("attempt 2 error = %v, want ErrInvocationExhausted", err)
 	}
-	fs = m.FunctionStatsSnapshot()
+	fs = m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].RetriesTotal != 1 {
 		t.Fatalf("retries after exhaustion = %+v, want still 1", fs)
 	}
@@ -584,21 +584,21 @@ func TestHandleRetriesTotalOnlyOnRetryable(t *testing.T) {
 	}
 }
 
-// --- Lifecycle regressions #4-#8: removed functions/rules on the event path ---
+// --- Lifecycle regressions #4-#8: removed apps/rules on the event path ---
 //
 // These pin the invariant that Handle re-matches against the CURRENT registry
-// snapshot every delivery, so a removed function or removed rule drops out of
+// snapshot every delivery, so a removed app or removed rule drops out of
 // `matched` on the next delivery: it stops gating the ACK, its stale
 // invocation-state field is never consulted, and it is never DLQ'd.
 
-// regression #4: a function whose rule matches H is registered; its invocation
+// regression #4: an app whose rule matches H is registered; its invocation
 // is pre-marked as waiting out a retry backoff (which WOULD block a redelivery
-// if it still gated). The function is then REMOVED from the registry. A
+// if it still gated). The app is then REMOVED from the registry. A
 // redelivery matches nothing, so Handle returns nil (the stream would ACK) and
 // the removed invocation's backoff no longer blocks.
-func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
+func TestHandleRemovedAppDoesNotGateAck(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -606,7 +606,7 @@ func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
 	prog.nextAt["alpha/index.run"] = now.Add(time.Hour)
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// Remove the function from the registry before redelivery.
+	// Remove the app from the registry before redelivery.
 	r.Registry().Replace("alpha", nil)
 
 	// Nothing matches → nil (ACK). The removed invocation must not block.
@@ -622,13 +622,13 @@ func TestHandleRemovedFunctionDoesNotGateAck(t *testing.T) {
 	}
 }
 
-// regression #5: the function stays registered but its handler is removed from
+// regression #5: the app stays registered but its handler is removed from
 // the template event rules, so MatchingEventRules no longer matches H. Redelivery
 // matches nothing → nil (ACK); the stale invocation-state field is not
 // consulted.
 func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -637,11 +637,11 @@ func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 
 	// Swap to a template with NO matching rules (empty rule set).
 	swapped := NewPrepared(
-		function.Function{
+		app.App{
 			Name: "alpha",
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Events:  []function.EventRule{},
+				Events:  []app.EventRule{},
 			},
 		},
 		&runtime.Prepared{Name: "alpha", Image: "x"},
@@ -660,13 +660,13 @@ func TestHandleRemovedRuleDoesNotGateAck(t *testing.T) {
 	}
 }
 
-// regression #6: two functions A (removed) and B (valid, its invocation
+// regression #6: two apps A (removed) and B (valid, its invocation
 // pre-marked complete). A redelivery matches only B, which is complete → Handle
 // returns nil (ACK). A's removal does not re-gate anything.
 func TestHandleRemovedAndCompleteMatchesAck(t *testing.T) {
 	a := &countingExecutor{}
 	b := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
 	}, testutil.DiscardLogger(), nil)
@@ -675,7 +675,7 @@ func TestHandleRemovedAndCompleteMatchesAck(t *testing.T) {
 	prog.done["beta/index.run"] = true
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// Remove function alpha before redelivery.
+	// Remove app alpha before redelivery.
 	r.Registry().Replace("alpha", nil)
 
 	// Only B matches, and B is complete → nil (ACK).
@@ -695,7 +695,7 @@ func TestHandleRemovedAndCompleteMatchesAck(t *testing.T) {
 func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
 	a := &countingExecutor{}
 	b := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "alpha", a),
 		alwaysMatchFn(t, "beta", b),
 	}, testutil.DiscardLogger(), nil)
@@ -706,7 +706,7 @@ func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
 	prog.nextAt["beta/index.run"] = now.Add(time.Hour)
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	// Remove function alpha before redelivery.
+	// Remove app alpha before redelivery.
 	r.Registry().Replace("alpha", nil)
 
 	// Only B matches and B is protected → not eligible, message stays pending.
@@ -723,13 +723,13 @@ func TestHandleRemovedDoesNotForceAckWhenOtherProtected(t *testing.T) {
 }
 
 // regression #8: no DLQ accounting for a removed invocation. On a removed
-// function/rule redelivery, MarkExhausted is never called for the removed
+// app/rule redelivery, MarkExhausted is never called for the removed
 // invocation and function_dlq_total is not bumped. Combined with #4/#5/#6's
 // assertions on prog.exhausted, this pins there is no DLQ path for removals.
-func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
+func TestHandleRemovedAppNoDLQAccounting(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -744,7 +744,7 @@ func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
 	if len(prog.exhausted) != 0 {
 		t.Fatalf("exhausted = %v, want none (removed invocation must not be MarkExhausted → no DLQ)", prog.exhausted)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 0 {
 		t.Fatalf("function stats = %+v, want none (no DLQ/metrics for a removed function)", fs)
 	}
@@ -759,7 +759,7 @@ func TestHandleRemovedFunctionNoDLQAccounting(t *testing.T) {
 // re-routes to the DLQ and carries the persisted handler attempt count.
 func TestHandleExhaustedTerminalRedeliveryReRoutes(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	// Simulate the state left behind after a prior delivery marked the
 	// invocation exhausted (retries:0 → attempt 1) but the message stayed in the
@@ -779,7 +779,7 @@ func TestHandleExhaustedTerminalRedeliveryReRoutes(t *testing.T) {
 		t.Fatalf("Invocations = %+v, want exactly one exhausted invocation", exhausted.Invocations)
 	}
 	got := exhausted.Invocations[0]
-	if got.Function != "beta" || got.Handler != "index.run" || got.Attempts != 1 {
+	if got.App != "beta" || got.Handler != "index.run" || got.Attempts != 1 {
 		t.Fatalf("exhausted invocation = %+v, want beta/index.run attempt 1 (persisted exhausted attempt)", got)
 	}
 	if exec.count() != 0 {
@@ -794,7 +794,7 @@ func TestHandleExhaustedTerminalRedeliveryReRoutes(t *testing.T) {
 func TestHandleExhaustedAndCompleteRedeliveryReRoutes(t *testing.T) {
 	alpha := &countingExecutor{} // already complete from a prior delivery
 	beta := &countingExecutor{}  // already exhausted from a prior delivery
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 0, beta),
 	}, testutil.DiscardLogger(), nil)
@@ -820,7 +820,7 @@ func TestHandleExhaustedAndCompleteRedeliveryReRoutes(t *testing.T) {
 func TestHandleExhaustedRedeliveryWithProtectedSiblingStaysPending(t *testing.T) {
 	beta := &countingExecutor{} // already exhausted from a prior delivery
 	gamma := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "beta", 0, beta),
 		fnWithRetries(t, "gamma", 0, gamma),
 	}, testutil.DiscardLogger(), nil)
@@ -852,7 +852,7 @@ func TestHandleExhaustedRedeliveryWithProtectedSiblingStaysPending(t *testing.T)
 // carried the message.
 func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", app.DefaultRetries, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -872,7 +872,7 @@ func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
 	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 5 {
 		t.Fatalf("Invocations = %+v, want one with attempts 5 (1+retries)", exhausted.Invocations)
 	}
-	if exhausted.Invocations[0].Function != "user-events" || exhausted.Invocations[0].Handler != "index.run" {
+	if exhausted.Invocations[0].App != "user-events" || exhausted.Invocations[0].Handler != "index.run" {
 		t.Fatalf("exhausted invocation = %+v, want user-events/index.run", exhausted.Invocations[0])
 	}
 	if !errors.Is(err, stream.ErrInvocationExhausted) {
@@ -886,15 +886,15 @@ func TestHandleExhaustionCarriesHandlerAttempts(t *testing.T) {
 }
 
 // TestHandleMultipleExhaustionsCarryPerInvocationMetadata pins the aggregate
-// exhaustion metadata: when a message matches several functions/handlers that
+// exhaustion metadata: when a message matches several apps/handlers that
 // ALL exhaust in the same delivery, the terminal error carries every exhausted
-// invocation with its exact function, handler, and attempt count. The stream
+// invocation with its exact app, handler, and attempt count. The stream
 // layer turns this into one correctly-attributed DLQ entry per invocation.
 func TestHandleMultipleExhaustionsCarryPerInvocationMetadata(t *testing.T) {
 	alpha := &countingExecutor{fail: true}
 	beta := &countingExecutor{fail: true}
 	gamma := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, alpha),
 		fnWithRetries(t, "beta", 2, beta),
 		fnWithRetries(t, "gamma", 0, gamma),
@@ -931,7 +931,7 @@ func TestHandleMultipleExhaustionsCarryPerInvocationMetadata(t *testing.T) {
 	}
 	got := map[string]int{}
 	for _, iv := range exhausted.Invocations {
-		got[iv.Function+"/"+iv.Handler] = iv.Attempts
+		got[iv.App+"/"+iv.Handler] = iv.Attempts
 	}
 	if len(got) != len(want) {
 		t.Fatalf("exhausted invocations = %+v, want %+v", got, want)
@@ -954,9 +954,9 @@ func TestHandleMultipleExhaustionsCarryPerInvocationMetadata(t *testing.T) {
 // remains for aggregates that still carry duplicates.
 func TestDedupeExhaustedCollapsesSameInvocation(t *testing.T) {
 	in := []stream.ExhaustedInvocation{
-		{Function: "fn", Handler: "notify", Attempts: 3},
-		{Function: "fn", Handler: "notify", Attempts: 3},
-		{Function: "fn", Handler: "other", Attempts: 1},
+		{App: "fn", Handler: "notify", Attempts: 3},
+		{App: "fn", Handler: "notify", Attempts: 3},
+		{App: "fn", Handler: "other", Attempts: 1},
 	}
 	out := dedupeExhausted(in)
 	if len(out) != 2 {
@@ -971,7 +971,7 @@ func TestDedupeExhaustedCollapsesSameInvocation(t *testing.T) {
 // single failed attempt exhausts and the typed error reports handler attempt 1.
 func TestHandleRetriesZeroExhaustionCarriesAttemptOne(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", 0, exec)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 

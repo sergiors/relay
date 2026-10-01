@@ -34,26 +34,26 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.Inc(MetricSchedulePublishExhausted)
 	r.Inc(MetricScheduleCatchUp)
 	r.Inc(MetricMissingPayload)
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
-	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionRetries, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionDLQ, []Label{{"function", "a"}})
-	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
-	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", "a"}}, time.Millisecond)
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
+	r.IncLabels(MetricAppBuildFailures, []Label{{"app", "a"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "a"}})
+	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"app", "a"}})
+	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"app", "a"}})
+	r.IncLabels(MetricFunctionRetries, []Label{{"app", "a"}})
+	r.IncLabels(MetricFunctionDLQ, []Label{{"app", "a"}})
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "a"}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricAppBuild, []Label{{"app", "a"}}, time.Millisecond)
 	// Warm-container pool vecs.
-	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", "a"}, {"state", RuntimeStateIdle}}, 1)
-	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", "a"}}, 1)
-	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeCold}})
-	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}})
-	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", "a"}}, time.Millisecond)
-	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", "a"}})
-	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", "a"}, {"status", "ready"}}, 1)
+	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"app", "a"}, {"state", RuntimeStateIdle}}, 1)
+	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"app", "a"}}, 1)
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"app", "a"}, {"outcome", RuntimeOutcomeCold}})
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"app", "a"}, {"reason", "shutdown"}})
+	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"app", "a"}}, time.Millisecond)
+	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"app", "a"}})
+	r.SetGaugeLabels(MetricAppStatus, []Label{{"app", "a"}, {"status", "ready"}}, 1)
 	r.IncLabels(MetricRedisReadErrors, []Label{{"operation", RedisOpReadGroup}})
-	r.IncLabels(MetricServiceReconciles, []Label{{"function", "a"}, {"outcome", ServiceOutcomeChanged}})
-	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", "a"}}, time.Millisecond)
+	r.IncLabels(MetricServiceReconciles, []Label{{"app", "a"}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"app", "a"}}, time.Millisecond)
 	r.SetGauge(MetricPendingEntries, 1)
 	r.SetGauge(MetricPendingOldestAge, 1)
 	r.SetGauge(MetricBufferedEvents, 1)
@@ -118,15 +118,15 @@ func TestCounterAddsAccumulateAcrossIncAndAdd(t *testing.T) {
 
 func TestLabeledCounterIsolation(t *testing.T) {
 	r := New()
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
 	// Reversed label order must resolve to the same metric.
-	r.IncLabels(MetricHandlerInvocations, []Label{{"handler", "x"}, {"outcome", "success"}, {"function", "a"}})
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "b"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"handler", "x"}, {"outcome", "success"}, {"app", "a"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "b"}, {"handler", "x"}})
 	got := r.Snapshot()
-	if !strings.Contains(got, "handler_invocations_total{function=a,handler=x,outcome=success} count=2") {
+	if !strings.Contains(got, "handler_invocations_total{app=a,handler=x,outcome=success} count=2") {
 		t.Fatalf("snapshot missing first series:\n%s", got)
 	}
-	if !strings.Contains(got, "handler_invocations_total{function=b,handler=x,outcome=success} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=b,handler=x,outcome=success} count=1") {
 		t.Fatalf("snapshot missing second series:\n%s", got)
 	}
 	if strings.Contains(got, "outcome=failure") {
@@ -137,15 +137,15 @@ func TestLabeledCounterIsolation(t *testing.T) {
 func TestDurationCountSum(t *testing.T) {
 	r := New()
 	obs := func(d time.Duration) {
-		r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, d)
+		r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "a"}, {"handler", "x"}}, d)
 	}
 	obs(1 * time.Second)
 	obs(3 * time.Second)
 	obs(2 * time.Second)
 	got := r.Snapshot()
-	if !strings.Contains(got, "handler_duration_seconds{function=a,handler=x} count=3 sum=6.000") {
+	if !strings.Contains(got, "handler_duration_seconds{app=a,handler=x} count=3 sum=6.000") {
 		t.Fatalf("snapshot = %q, want it to contain %q", got,
-			"handler_duration_seconds{function=a,handler=x} count=3 sum=6.000")
+			"handler_duration_seconds{app=a,handler=x} count=3 sum=6.000")
 	}
 }
 
@@ -164,7 +164,7 @@ func TestCounterGetter(t *testing.T) {
 	if got := r.Counter("missing"); got != 0 {
 		t.Fatalf("Counter(missing) = %d, want 0", got)
 	}
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
 	if got := r.Counter(MetricHandlerInvocations); got != 0 {
 		t.Fatalf("Counter(handler_invocations_total) = %d, want 0 (labeled only)", got)
 	}
@@ -211,9 +211,9 @@ func TestSnapshotDeterminism(t *testing.T) {
 	r := New()
 	r.Inc(MetricDLQEntries)
 	r.Inc(MetricEventsMatched)
-	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", "a"}}, time.Second)
+	r.ObserveDurationLabels(MetricAppBuild, []Label{{"app", "a"}}, time.Second)
 	r.SetGauge(MetricPendingEntries, 1)
-	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
+	r.IncLabels(MetricAppBuildFailures, []Label{{"app", "a"}})
 	first := r.Snapshot()
 	for i := 0; i < 100; i++ {
 		if got := r.Snapshot(); got != first {
@@ -237,23 +237,23 @@ func TestNilReceiverNoop(t *testing.T) {
 	}
 }
 
-func TestFunctionStatsSnapshot(t *testing.T) {
+func TestAppStatsSnapshot(t *testing.T) {
 	r := New()
-	// Two functions with distinct per-function counters.
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "b"}})
-	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "a"}})
-	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", "b"}})
-	r.IncLabels(MetricFunctionRetries, []Label{{"function", "b"}})
-	r.IncLabels(MetricFunctionDLQ, []Label{{"function", "b"}})
+	// Two apps with distinct per-app counters.
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "a"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "a"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "b"}})
+	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"app", "a"}})
+	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"app", "b"}})
+	r.IncLabels(MetricFunctionRetries, []Label{{"app", "b"}})
+	r.IncLabels(MetricFunctionDLQ, []Label{{"app", "b"}})
 
-	got := r.FunctionStatsSnapshot()
+	got := r.AppStatsSnapshot()
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2: %+v", len(got), got)
 	}
-	// Sorted by function name.
-	if got[0].Function != "a" || got[1].Function != "b" {
+	// Sorted by app name.
+	if got[0].App != "a" || got[1].App != "b" {
 		t.Fatalf("unexpected order: %+v", got)
 	}
 	if got[0].EventsMatchedTotal != 2 || got[0].HandlerSuccessTotal != 1 || got[0].HandlerFailureTotal != 0 {
@@ -264,19 +264,19 @@ func TestFunctionStatsSnapshot(t *testing.T) {
 	}
 }
 
-// TestFunctionStatsSnapshotIncludesPoolCounters verifies the per-function
+// TestAppStatsSnapshotIncludesPoolCounters verifies the per-app
 // snapshot reads the cumulative warm-container pool counters: warm/cold acquires
 // by outcome and discards summed across every reason. It also pins that a
-// function with ONLY pool activity still surfaces (the pool series is a
-// function-scoped series the snapshot groups).
-func TestFunctionStatsSnapshotIncludesPoolCounters(t *testing.T) {
+// app with ONLY pool activity still surfaces (the pool series is a
+// app-scoped series the snapshot groups).
+func TestAppStatsSnapshotIncludesPoolCounters(t *testing.T) {
 	r := New()
-	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeWarm}}, 7)
-	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeCold}}, 3)
-	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "timeout"}}, 2)
-	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}}, 1)
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"app", "a"}, {"outcome", RuntimeOutcomeWarm}}, 7)
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"app", "a"}, {"outcome", RuntimeOutcomeCold}}, 3)
+	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"app", "a"}, {"reason", "timeout"}}, 2)
+	r.AddLabels(MetricRuntimeContainerDiscards, []Label{{"app", "a"}, {"reason", "shutdown"}}, 1)
 
-	got := byFn(r.FunctionStatsSnapshot(), "a")
+	got := byFn(r.AppStatsSnapshot(), "a")
 	if got.WarmAcquiresTotal != 7 || got.ColdStartsTotal != 3 {
 		t.Fatalf("acquires = %+v, want warm 7 cold 3", got)
 	}
@@ -284,31 +284,31 @@ func TestFunctionStatsSnapshotIncludesPoolCounters(t *testing.T) {
 		t.Fatalf("discarded = %d, want 3 (all reasons summed)", got.DiscardedTotal)
 	}
 
-	// A pool-only function (no operational counter series) still surfaces.
-	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"function", "poolonly"}, {"outcome", RuntimeOutcomeCold}}, 1)
-	got = byFn(r.FunctionStatsSnapshot(), "poolonly")
-	if got.Function != "poolonly" || got.ColdStartsTotal != 1 || got.EventsMatchedTotal != 0 {
+	// A pool-only app (no operational counter series) still surfaces.
+	r.AddLabels(MetricRuntimeContainerAcquires, []Label{{"app", "poolonly"}, {"outcome", RuntimeOutcomeCold}}, 1)
+	got = byFn(r.AppStatsSnapshot(), "poolonly")
+	if got.App != "poolonly" || got.ColdStartsTotal != 1 || got.EventsMatchedTotal != 0 {
 		t.Fatalf("pool-only function = %+v, want cold 1", got)
 	}
 }
 
-// TestSeedFunctionStatPoolCounters verifies SeedFunctionStat restores the
+// TestSeedAppStatPoolCounters verifies SeedAppStat restores the
 // cumulative pool counters: acquires into their fixed outcome series and the
 // aggregate discard total into the INTERNAL restored baseline rather than a
 // synthetic Prometheus reason series — so the aggregate the snapshot later reads
 // stays monotonic while the exposed per-reason series remain strictly causal.
 // Zero values seed nothing.
-func TestSeedFunctionStatPoolCounters(t *testing.T) {
+func TestSeedAppStatPoolCounters(t *testing.T) {
 	r := New()
-	r.SeedFunctionStat(FunctionStat{
-		Function:          "alpha",
+	r.SeedAppStat(AppStat{
+		App:               "alpha",
 		WarmAcquiresTotal: 5,
 		ColdStartsTotal:   2,
 		DiscardedTotal:    4,
 	})
-	r.SeedFunctionStat(FunctionStat{Function: "beta"}) // zero pool counters
+	r.SeedAppStat(AppStat{App: "beta"}) // zero pool counters
 
-	got := byFn(r.FunctionStatsSnapshot(), "alpha")
+	got := byFn(r.AppStatsSnapshot(), "alpha")
 	if got.WarmAcquiresTotal != 5 || got.ColdStartsTotal != 2 || got.DiscardedTotal != 4 {
 		t.Fatalf("seeded pool counters = %+v, want warm 5 cold 2 discarded 4", got)
 	}
@@ -323,17 +323,17 @@ func TestSeedFunctionStatPoolCounters(t *testing.T) {
 		t.Fatalf("RuntimePoolCounters(alpha) discarded = %d, want 4", d)
 	}
 	// A zero-valued pool seed writes no pool counters (the pre-existing
-	// operational counter series are still created by SeedFunctionStat).
-	if b := byFn(r.FunctionStatsSnapshot(), "beta"); b.WarmAcquiresTotal != 0 ||
+	// operational counter series are still created by SeedAppStat).
+	if b := byFn(r.AppStatsSnapshot(), "beta"); b.WarmAcquiresTotal != 0 ||
 		b.ColdStartsTotal != 0 || b.DiscardedTotal != 0 {
 		t.Fatalf("zero-valued pool seed must not create pool counters: %+v", b)
 	}
 
-	// A function whose ONLY restored pool counter is a discard total still
+	// An app whose ONLY restored pool counter is a discard total still
 	// surfaces in the snapshot (it had a synthetic series before the baseline
 	// change), and no Prometheus discard series is created for it.
-	r.SeedFunctionStat(FunctionStat{Function: "gamma", DiscardedTotal: 3})
-	if g := byFn(r.FunctionStatsSnapshot(), "gamma"); g.Function != "gamma" || g.DiscardedTotal != 3 {
+	r.SeedAppStat(AppStat{App: "gamma", DiscardedTotal: 3})
+	if g := byFn(r.AppStatsSnapshot(), "gamma"); g.App != "gamma" || g.DiscardedTotal != 3 {
 		t.Fatalf("discard-only restored function must surface: %+v", g)
 	}
 	if seriesPresent(t, r.Snapshot(), MetricRuntimeContainerDiscards, "gamma") {
@@ -343,12 +343,12 @@ func TestSeedFunctionStatPoolCounters(t *testing.T) {
 	// A live discard after the seed keeps accumulating on top of the restored
 	// total rather than replacing it, and the live series is causal (its real
 	// reason), not the restored aggregate.
-	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "alpha"}, {"reason", "idle_timeout"}})
-	if d := byFn(r.FunctionStatsSnapshot(), "alpha").DiscardedTotal; d != 5 {
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"app", "alpha"}, {"reason", "idle_timeout"}})
+	if d := byFn(r.AppStatsSnapshot(), "alpha").DiscardedTotal; d != 5 {
 		t.Fatalf("discarded after live increment = %d, want 5", d)
 	}
 	s := r.Snapshot()
-	if !strings.Contains(s, "runtime_container_discards_total{function=alpha,reason=idle_timeout} count=1") {
+	if !strings.Contains(s, "runtime_container_discards_total{app=alpha,reason=idle_timeout} count=1") {
 		t.Fatalf("live discard must be causal:\n%s", s)
 	}
 	if strings.Contains(s, "reason=restored") {
@@ -361,29 +361,29 @@ func TestSeedFunctionStatPoolCounters(t *testing.T) {
 }
 
 // TestRestoredDiscardsClearedOnRemoval pins that the internal restored discard
-// baseline is cleared by every function retirement path — RemoveFunction,
-// SweepFunctionMetrics, and DeleteRuntimePool — so a removed function's restored
+// baseline is cleared by every app retirement path — RemoveApp,
+// SweepAppMetrics, and DeleteRuntimePool — so a removed app's restored
 // aggregate never lingers in a future snapshot or inspect read.
 func TestRestoredDiscardsClearedOnRemoval(t *testing.T) {
-	t.Run("RemoveFunction", func(t *testing.T) {
+	t.Run("RemoveApp", func(t *testing.T) {
 		r := New()
-		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
+		r.SeedAppStat(AppStat{App: "alpha", DiscardedTotal: 4})
 		if _, _, d := r.RuntimePoolCounters("alpha"); d != 4 {
 			t.Fatalf("baseline not seeded: %d", d)
 		}
-		r.RemoveFunction("alpha")
+		r.RemoveApp("alpha")
 		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
-			t.Fatalf("RemoveFunction must clear the restored baseline: %d", d)
+			t.Fatalf("RemoveApp must clear the restored baseline: %d", d)
 		}
-		if len(r.FunctionStatsSnapshot()) != 0 {
-			t.Fatalf("snapshot must be empty after removal: %+v", r.FunctionStatsSnapshot())
+		if len(r.AppStatsSnapshot()) != 0 {
+			t.Fatalf("snapshot must be empty after removal: %+v", r.AppStatsSnapshot())
 		}
 	})
 
-	t.Run("SweepFunctionMetrics", func(t *testing.T) {
+	t.Run("SweepAppMetrics", func(t *testing.T) {
 		r := New()
-		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
-		r.SweepFunctionMetrics(map[string]bool{"other": true})
+		r.SeedAppStat(AppStat{App: "alpha", DiscardedTotal: 4})
+		r.SweepAppMetrics(map[string]bool{"other": true})
 		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
 			t.Fatalf("sweep must clear the restored baseline: %d", d)
 		}
@@ -391,7 +391,7 @@ func TestRestoredDiscardsClearedOnRemoval(t *testing.T) {
 
 	t.Run("DeleteRuntimePool", func(t *testing.T) {
 		r := New()
-		r.SeedFunctionStat(FunctionStat{Function: "alpha", DiscardedTotal: 4})
+		r.SeedAppStat(AppStat{App: "alpha", DiscardedTotal: 4})
 		r.DeleteRuntimePool("alpha")
 		if _, _, d := r.RuntimePoolCounters("alpha"); d != 0 {
 			t.Fatalf("DeleteRuntimePool must clear the restored baseline: %d", d)
@@ -404,17 +404,17 @@ func TestRestoredDiscardsClearedOnRemoval(t *testing.T) {
 			t.Fatalf("nil registry discarded = %d, want 0", d)
 		}
 		nilR.DeleteRuntimePool("alpha")
-		nilR.RemoveFunction("alpha")
+		nilR.RemoveApp("alpha")
 	})
 }
 
-func TestFunctionStatsSnapshotEmptyAndNil(t *testing.T) {
+func TestAppStatsSnapshotEmptyAndNil(t *testing.T) {
 	r := New()
-	if got := r.FunctionStatsSnapshot(); got != nil {
+	if got := r.AppStatsSnapshot(); got != nil {
 		t.Fatalf("empty snapshot = %+v, want nil", got)
 	}
 	var nilR *Registry
-	if got := nilR.FunctionStatsSnapshot(); got != nil {
+	if got := nilR.AppStatsSnapshot(); got != nil {
 		t.Fatalf("nil snapshot = %+v, want nil", got)
 	}
 }
@@ -437,27 +437,27 @@ func TestHandlerNilRegistryServesEmpty(t *testing.T) {
 	}
 }
 
-// TestSetFunctionTimestampSnapshot verifies SetFunctionTimestamp stores the
-// latest per-kind values and FunctionStatsSnapshot surfaces them, including the
+// TestSetAppTimestampSnapshot verifies SetAppTimestamp stores the
+// latest per-kind values and AppStatsSnapshot surfaces them, including the
 // counter-without-timestamp (all-zero timestamps) and timestamp-without-counter
 // shapes.
-func TestSetFunctionTimestampSnapshot(t *testing.T) {
+func TestSetAppTimestampSnapshot(t *testing.T) {
 	r := New()
 	// "a": counters + all four timestamps.
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "a"}})
 	ts := int64(1700000000)
-	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
-	r.SetFunctionTimestamp("a", FunctionTimestampSuccess, ts+1)
-	r.SetFunctionTimestamp("a", FunctionTimestampFailure, ts+2)
-	r.SetFunctionTimestamp("a", FunctionTimestampDLQ, ts+3)
+	r.SetAppTimestamp("a", AppTimestampExecution, ts)
+	r.SetAppTimestamp("a", AppTimestampSuccess, ts+1)
+	r.SetAppTimestamp("a", AppTimestampFailure, ts+2)
+	r.SetAppTimestamp("a", AppTimestampDLQ, ts+3)
 
 	// SetTimestamp entries survive repeated overwrites (latest wins).
-	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts+10)
+	r.SetAppTimestamp("a", AppTimestampExecution, ts+10)
 
-	got := r.FunctionStatsSnapshot()
-	byName := map[string]FunctionStat{}
+	got := r.AppStatsSnapshot()
+	byName := map[string]AppStat{}
 	for _, f := range got {
-		byName[f.Function] = f
+		byName[f.App] = f
 	}
 	a, ok := byName["a"]
 	if !ok {
@@ -467,9 +467,9 @@ func TestSetFunctionTimestampSnapshot(t *testing.T) {
 		t.Fatalf("a timestamps = %+v", a)
 	}
 
-	// A function with counters but NO timestamp entry reads zeros (counters-only shape).
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "c"}})
-	got = r.FunctionStatsSnapshot()
+	// An app with counters but NO timestamp entry reads zeros (counters-only shape).
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "c"}})
+	got = r.AppStatsSnapshot()
 	c := byFn(got, "c")
 	if c.EventsMatchedTotal != 1 || c.LastExecution != 0 || c.LastSuccess != 0 || c.LastFailure != 0 || c.LastDLQ != 0 {
 		t.Fatalf("c (counters-only) = %+v", c)
@@ -477,35 +477,35 @@ func TestSetFunctionTimestampSnapshot(t *testing.T) {
 
 	// Nil-safe: a nil receiver is a no-op.
 	var nilR *Registry
-	nilR.SetFunctionTimestamp("x", FunctionTimestampExecution, ts)
+	nilR.SetAppTimestamp("x", AppTimestampExecution, ts)
 	// An unknown kind is ignored.
-	r.SetFunctionTimestamp("a", FunctionTimestampKind(99), ts+20)
-	if a := byFn(r.FunctionStatsSnapshot(), "a"); a.LastExecution != ts+10 {
+	r.SetAppTimestamp("a", AppTimestampKind(99), ts+20)
+	if a := byFn(r.AppStatsSnapshot(), "a"); a.LastExecution != ts+10 {
 		t.Fatalf("unknown kind must not write: %+v", a)
 	}
 }
 
-// byFn finds the FunctionStat for name in a snapshot, or a zero value.
-func byFn(fs []FunctionStat, name string) FunctionStat {
+// byFn finds the AppStat for name in a snapshot, or a zero value.
+func byFn(fs []AppStat, name string) AppStat {
 	for _, f := range fs {
-		if f.Function == name {
+		if f.App == name {
 			return f
 		}
 	}
-	return FunctionStat{}
+	return AppStat{}
 }
 
-// TestSeedFunctionStatTimestamps verifies SeedFunctionStat restores persisted
+// TestSeedAppStatTimestamps verifies SeedAppStat restores persisted
 // timestamps into the snapshot and SKIPS zeros (a persisted zero never
 // materializes as an entry that could later look newer than nothing).
-func TestSeedFunctionStatTimestamps(t *testing.T) {
+func TestSeedAppStatTimestamps(t *testing.T) {
 	r := New()
 	ts := int64(1700000000)
-	r.SeedFunctionStat(FunctionStat{Function: "alpha", EventsMatchedTotal: 1, LastExecution: ts, LastSuccess: ts + 1})
+	r.SeedAppStat(AppStat{App: "alpha", EventsMatchedTotal: 1, LastExecution: ts, LastSuccess: ts + 1})
 	// beta has counters but only zero timestamps: nothing is stored.
-	r.SeedFunctionStat(FunctionStat{Function: "beta", EventsMatchedTotal: 1})
+	r.SeedAppStat(AppStat{App: "beta", EventsMatchedTotal: 1})
 
-	got := r.FunctionStatsSnapshot()
+	got := r.AppStatsSnapshot()
 	a := byFn(got, "alpha")
 	if a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != 0 || a.LastDLQ != 0 {
 		t.Fatalf("alpha = %+v", a)
@@ -515,26 +515,26 @@ func TestSeedFunctionStatTimestamps(t *testing.T) {
 	}
 
 	// A partial overwrite preserves the kinds that were not seeded.
-	r.SeedFunctionStat(FunctionStat{Function: "alpha", EventsMatchedTotal: 2, LastFailure: ts + 5})
-	a = byFn(r.FunctionStatsSnapshot(), "alpha")
+	r.SeedAppStat(AppStat{App: "alpha", EventsMatchedTotal: 2, LastFailure: ts + 5})
+	a = byFn(r.AppStatsSnapshot(), "alpha")
 	if a.EventsMatchedTotal != 3 || a.LastExecution != ts || a.LastSuccess != ts+1 || a.LastFailure != ts+5 {
 		t.Fatalf("alpha after partial seed = %+v", a)
 	}
 }
 
-// TestRemoveFunctionClearsTimestamps verifies RemoveFunction deletes the
+// TestRemoveAppClearsTimestamps verifies RemoveApp deletes the
 // Relay-side timestamp entry alongside the Prometheus series.
-func TestRemoveFunctionClearsTimestamps(t *testing.T) {
+func TestRemoveAppClearsTimestamps(t *testing.T) {
 	r := New()
 	ts := int64(1700000000)
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "a"}})
-	r.SetFunctionTimestamp("a", FunctionTimestampExecution, ts)
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "b"}})
-	r.SetFunctionTimestamp("b", FunctionTimestampExecution, ts)
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "a"}})
+	r.SetAppTimestamp("a", AppTimestampExecution, ts)
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "b"}})
+	r.SetAppTimestamp("b", AppTimestampExecution, ts)
 
-	r.RemoveFunction("a")
-	got := r.FunctionStatsSnapshot()
-	if byFn(got, "a").Function != "" {
+	r.RemoveApp("a")
+	got := r.AppStatsSnapshot()
+	if byFn(got, "a").App != "" {
 		t.Fatalf("a (series+timestamps) must be fully removed: %+v", got)
 	}
 	if byFn(got, "b").LastExecution != ts {
@@ -544,17 +544,17 @@ func TestRemoveFunctionClearsTimestamps(t *testing.T) {
 	// Sweep does the same with the live set: with live={"a"} (no series at all
 	// after the removal, so a is absent from the snapshot entirely) b's
 	// timestamps and series are swept; with live={"b"} b survives fully.
-	r.SweepFunctionMetrics(map[string]bool{"b": true})
-	if a := byFn(r.FunctionStatsSnapshot(), "b"); a.LastExecution != ts {
-		t.Fatalf("sweep must keep live b's timestamps:\n%+v", r.FunctionStatsSnapshot())
+	r.SweepAppMetrics(map[string]bool{"b": true})
+	if a := byFn(r.AppStatsSnapshot(), "b"); a.LastExecution != ts {
+		t.Fatalf("sweep must keep live b's timestamps:\n%+v", r.AppStatsSnapshot())
 	}
-	r.SweepFunctionMetrics(map[string]bool{"a": true})
-	if fs := r.FunctionStatsSnapshot(); len(fs) != 0 {
+	r.SweepAppMetrics(map[string]bool{"a": true})
+	if fs := r.AppStatsSnapshot(); len(fs) != 0 {
 		t.Fatalf("sweep must clear non-live b's timestamps too:\n%+v", fs)
 	}
 
 	// Nil-safety: none of these cleanup paths panic on a nil receiver.
 	var nilR *Registry
-	nilR.RemoveFunction("a")
-	nilR.SweepFunctionMetrics(map[string]bool{})
+	nilR.RemoveApp("a")
+	nilR.SweepAppMetrics(map[string]bool{})
 }

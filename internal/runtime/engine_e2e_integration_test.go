@@ -1,7 +1,7 @@
 //go:build integration
 
-// Engine end-to-end smoke tests: real Python/Node function builds executed
-// against a real Docker daemon, including the bundled example functions.
+// Engine end-to-end smoke tests: real Python/Node app builds executed
+// against a real Docker daemon, including the bundled example apps.
 package runtime
 
 import (
@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
 // repoRoot is the repository root, derived from THIS source file's location
 // (internal/runtime/x.go -> repo root) rather than the test working directory,
-// so the real example function directories under examples/functions/ resolve
+// so the real example app directories under examples/apps/ resolve
 // regardless of where `go test` is invoked from.
 var repoRoot = func() string {
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -31,15 +31,15 @@ var repoRoot = func() string {
 }()
 
 // readRealTemplate loads the template.yaml from one of the real example
-// function directories and returns the parsed template alongside its dir.
-func readRealTemplate(t *testing.T, relDir string) (string, *function.Template) {
+// app directories and returns the parsed template alongside its dir.
+func readRealTemplate(t *testing.T, relDir string) (string, *app.Template) {
 	t.Helper()
 	dir := filepath.Join(repoRoot, "examples", "functions", relDir)
 	data, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read real template %s: %v", relDir, err)
 	}
-	tmpl, err := function.ParseTemplate(data)
+	tmpl, err := app.ParseTemplate(data)
 	if err != nil {
 		t.Fatalf("parse real template %s: %v", relDir, err)
 	}
@@ -77,7 +77,7 @@ def completed(event):
     print("completed %s" % event.get("event_id"))
 `)
 
-	fn := function.Function{Name: "py-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "py-e2e", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
 
 	prepared, err := m.Prepare(ctx, fn)
@@ -115,7 +115,7 @@ async def completed(event):
     print("async completed %s" % event.get("event_id"))
 `)
 
-	fn := function.Function{Name: "py-async-e2e", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "py-async-e2e", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	m, _ := newManager(t)
 
 	prepared, err := m.Prepare(ctx, fn)
@@ -147,10 +147,10 @@ export async function created(event) {
 `)
 	// No package.json: the image must inject an ESM package.json.
 
-	fn := function.Function{
+	fn := app.App{
 		Name: "node-e2e",
 		Dir:  dir,
-		Template: &function.Template{
+		Template: &app.Template{
 			Runtime: "node24",
 		},
 	}
@@ -171,16 +171,16 @@ export async function created(event) {
 }
 
 // TestRealUserEventsPythonEndToEnd drives the real
-// examples/functions/user-events-python example: three rules whose handlers
+// examples/apps/user-events-python example: three rules whose handlers
 // live in the events/ namespace package
 // (events.created / events.updated / events.deleted).
 func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 	testutil.RequireDocker(t)
 
 	dir, tmpl := readRealTemplate(t, "user-events-python")
-	fn := function.Function{Name: "user-events-python", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "user-events-python", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -218,7 +218,7 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	logs := awaitFunctionOutput(t, ctx, out,
+	logs := awaitAppOutput(t, ctx, out,
 		"User created: user_123",
 		"User updated: user_123",
 		"User deleted: user_123",
@@ -227,7 +227,7 @@ func TestIntegrationRealUserEventsPythonEndToEnd(t *testing.T) {
 }
 
 // TestRealWelcomeEmailNodeEndToEnd drives the real
-// examples/functions/welcome-email-node example: a single rule whose handler
+// examples/apps/welcome-email-node example: a single rule whose handler
 // resolves as handler.handler -> module
 // "handler" -> /app/handler.js. No package.json is present, exercising the
 // injected ESM package.json path.
@@ -235,9 +235,9 @@ func TestIntegrationRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 	testutil.RequireDocker(t)
 
 	dir, tmpl := readRealTemplate(t, "welcome-email-node")
-	fn := function.Function{Name: "welcome-email-node", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "welcome-email-node", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -251,7 +251,7 @@ func TestIntegrationRealWelcomeEmailNodeEndToEnd(t *testing.T) {
 		t.Fatalf("execute handler.handler: %v", err)
 	}
 
-	logs := awaitFunctionOutput(t, ctx, out, "Sending welcome email to john@example.com")
+	logs := awaitAppOutput(t, ctx, out, "Sending welcome email to john@example.com")
 	t.Logf("captured handler output:\n%s", logs)
 }
 
@@ -276,9 +276,9 @@ export function run(event) {
 }
 `)
 
-	fn := function.Function{Name: "node-broken-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "node-broken-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -296,7 +296,7 @@ export function run(event) {
 	if strings.Contains(err.Error(), "not found") {
 		t.Errorf("broken dependency must NOT be reported as module not found, got: %v", err)
 	}
-	logs := awaitFunctionOutput(t, ctx, out, "missing-package")
+	logs := awaitAppOutput(t, ctx, out, "missing-package")
 	t.Logf("execute error: %v", err)
 	t.Logf("container logs: %s", logs)
 }
@@ -304,10 +304,10 @@ export function run(event) {
 // tsTemplate builds a hand-constructed node24 template carrying the given event
 // handlers, since Prepare derives the handler modules from the template (an
 // empty template would mean no TypeScript compilation).
-func tsTemplate(handlers ...string) *function.Template {
-	tmpl := &function.Template{Runtime: "node24"}
+func tsTemplate(handlers ...string) *app.Template {
+	tmpl := &app.Template{Runtime: "node24"}
 	for _, h := range handlers {
-		tmpl.Events = append(tmpl.Events, function.EventRule{Handler: h})
+		tmpl.Events = append(tmpl.Events, app.EventRule{Handler: h})
 	}
 	return tmpl
 }
@@ -339,9 +339,9 @@ export function message(event: { event_id: string }): string {
 `)
 	// No package.json and no tsconfig.json: the ESM package.json is injected.
 
-	fn := function.Function{Name: "node-ts-e2e", Dir: dir, Template: tsTemplate("index.handler")}
+	fn := app.App{Name: "node-ts-e2e", Dir: dir, Template: tsTemplate("index.handler")}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -353,8 +353,8 @@ export function message(event: { event_id: string }): string {
 	if err := m.Execute(ctx, prepared, "index.handler", []byte(`{"event_id":"1757-0","event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	// The transpiled handler's stdout reaches the function-output sink.
-	awaitFunctionOutput(t, ctx, out, "ts created 1757-0")
+	// The transpiled handler's stdout reaches the app-output sink.
+	awaitAppOutput(t, ctx, out, "ts created 1757-0")
 }
 
 // TestIntegrationNodeTSDepsEndToEnd proves packages left external by the bundler
@@ -384,9 +384,9 @@ export function handler(event: { event_id: string }): void {
 }
 `)
 
-	fn := function.Function{Name: "node-ts-deps-e2e", Dir: dir, Template: tsTemplate("index.handler")}
+	fn := app.App{Name: "node-ts-deps-e2e", Dir: dir, Template: tsTemplate("index.handler")}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -403,20 +403,20 @@ export function handler(event: { event_id: string }): void {
 	}
 	// picocolors.red wraps the text in ANSI escapes; match the inner text. The
 	// import resolves at runtime from the dependency layer's node_modules.
-	awaitFunctionOutput(t, ctx, out, "dep 1757-0")
+	awaitAppOutput(t, ctx, out, "dep 1757-0")
 }
 
 // TestIntegrationNodeTSExampleEndToEnd drives the real
-// examples/functions/order-confirmation-typescript example: a TypeScript handler
+// examples/apps/order-confirmation-typescript example: a TypeScript handler
 // at src/handler.ts importing two local .ts modules (a type module and a message
 // module), with a committed tsconfig.json and package-lock.json.
 func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 	testutil.RequireDocker(t)
 
 	dir, tmpl := readRealTemplate(t, "order-confirmation-typescript")
-	fn := function.Function{Name: "order-confirmation-typescript", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "order-confirmation-typescript", Dir: dir, Template: tmpl}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -436,7 +436,7 @@ func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 		t.Fatalf("execute src.handler.handler: %v", err)
 	}
 
-	logs := awaitFunctionOutput(t, ctx, out,
+	logs := awaitAppOutput(t, ctx, out,
 		"confirmation sent to jane@example.com",
 		"ord_42",
 		"$99.50",
@@ -475,13 +475,13 @@ export function handler(event: { event_id: string }): void {
 }
 `)
 
-	fn := function.Function{
+	fn := app.App{
 		Name:     "node-ts-multi-e2e",
 		Dir:      dir,
 		Template: tsTemplate("events.created.handler", "events.deleted.handler"),
 	}
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -497,7 +497,7 @@ export function handler(event: { event_id: string }): void {
 		t.Fatalf("execute events.deleted.handler: %v", err)
 	}
 
-	awaitFunctionOutput(t, ctx, out, "created ts 1", "deleted ts 2")
+	awaitAppOutput(t, ctx, out, "created ts 1", "deleted ts 2")
 }
 
 // TestIntegrationNodeTSAmbiguousFailsPrepare pins the build-time ambiguity error:
@@ -517,7 +517,7 @@ events:
 	writeFile(t, dir, "x.js", "export function handler(e) {}\n")
 	writeFile(t, dir, "x.ts", "export function handler(e: unknown): void {}\n")
 
-	fn := function.Function{Name: "node-ts-ambiguous-e2e", Dir: dir, Template: tsTemplate("x.handler")}
+	fn := app.App{Name: "node-ts-ambiguous-e2e", Dir: dir, Template: tsTemplate("x.handler")}
 	m, _ := newManager(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -547,7 +547,7 @@ events:
       event_name: [INSERT]
 `)
 
-	fn := function.Function{Name: "node-ts-missing-e2e", Dir: dir, Template: tsTemplate("events.created.handler")}
+	fn := app.App{Name: "node-ts-missing-e2e", Dir: dir, Template: tsTemplate("events.created.handler")}
 	m, _ := newManager(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

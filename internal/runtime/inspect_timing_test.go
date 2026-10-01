@@ -12,7 +12,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/plan"
 )
 
@@ -45,8 +45,8 @@ func TestPrepareLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 			t.Fatalf("write source: %v", err)
 		}
-		fn := function.Function{Name: "reuse-timing", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-		fp, err := function.FingerprintFunction(dir, fn.Template)
+		fn := app.App{Name: "reuse-timing", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+		fp, err := app.FingerprintApp(dir, fn.Template)
 		if err != nil {
 			t.Fatalf("fingerprint: %v", err)
 		}
@@ -75,7 +75,7 @@ func TestPrepareLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "util.js"), []byte("export const u = 1;\n"), 0o644); err != nil {
 			t.Fatalf("write util: %v", err)
 		}
-		fn := function.Function{Name: "miss-timing", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+		fn := app.App{Name: "miss-timing", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 		cli := newScriptedDockerClient(t,
 			dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
@@ -112,7 +112,7 @@ func TestEnsureDependencyImageLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		)
 		m, logs := newLogCapturingManager(t, cli)
 
-		fn := function.Function{Name: "dep-reuse-timing", Dir: t.TempDir(), Template: &function.Template{Runtime: "python3.14"}}
+		fn := app.App{Name: "dep-reuse-timing", Dir: t.TempDir(), Template: &app.Template{Runtime: "python3.14"}}
 		snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
 
 		if _, err := m.ensureDependencyImage(context.Background(), fn, spec, deps, snap, sentinel, depRef); err != nil {
@@ -129,7 +129,7 @@ func TestEnsureDependencyImageLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		)
 		m, logs := newLogCapturingManager(t, cli)
 
-		fn := function.Function{Name: "dep-miss-timing", Dir: t.TempDir(), Template: &function.Template{Runtime: "python3.14"}}
+		fn := app.App{Name: "dep-miss-timing", Dir: t.TempDir(), Template: &app.Template{Runtime: "python3.14"}}
 		snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
 
 		if _, err := m.ensureDependencyImage(context.Background(), fn, spec, deps, snap, sentinel, depRef); err != nil {

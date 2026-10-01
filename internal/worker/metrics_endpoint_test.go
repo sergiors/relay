@@ -15,11 +15,11 @@ import (
 	"relay/internal/observability/metrics"
 )
 
-// TestMetricsEndpointScrapeExposesFunctionSeries boots a metrics server on a
+// TestMetricsEndpointScrapeExposesAppSeries boots a metrics server on a
 // free port fed from an in-memory registry, then scrapes /metrics and asserts
-// the Prometheus text exposition carries the function-scoped and warm-pool
+// the Prometheus text exposition carries the app-scoped and warm-pool
 // series end to end. It needs no Redis or Docker: the registry is in-memory.
-func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
+func TestMetricsEndpointScrapeExposesAppSeries(t *testing.T) {
 	// Free port for the metrics server.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -30,24 +30,24 @@ func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
 
 	metricsInstance := metrics.New()
 	metricsInstance.Inc(metrics.MetricEventsMatched)
-	metricsInstance.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
+	metricsInstance.IncLabels(metrics.MetricHandlerInvocations, []metrics.Label{{Name: "outcome", Value: "success"}, {Name: "app", Value: "demo"}, {Name: "handler", Value: "index.hi"}})
 	metricsInstance.ObserveDurationLabels(metrics.MetricHandlerDuration,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "handler", Value: "index.hi"}}, 250*time.Millisecond)
 	metricsInstance.SetGauge(metrics.MetricPendingEntries, 3)
 	// Warm-container pool observability series.
-	metricsInstance.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "function", Value: "demo"}}, 2)
+	metricsInstance.SetGaugeLabels(metrics.MetricRuntimePoolCapacity, []metrics.Label{{Name: "app", Value: "demo"}}, 2)
 	metricsInstance.SetGaugeLabels(metrics.MetricRuntimeContainers,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 1)
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateIdle}}, 1)
 	metricsInstance.SetGaugeLabels(metrics.MetricRuntimeContainers,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateBusy}}, 1)
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "state", Value: metrics.RuntimeStateBusy}}, 1)
 	metricsInstance.IncLabels(metrics.MetricRuntimeContainerAcquires,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}})
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeCold}})
 	metricsInstance.IncLabels(metrics.MetricRuntimeContainerAcquires,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "outcome", Value: metrics.RuntimeOutcomeWarm}})
 	metricsInstance.IncLabels(metrics.MetricRuntimeContainerDiscards,
-		[]metrics.Label{{Name: "function", Value: "demo"}, {Name: "reason", Value: "timeout"}})
+		[]metrics.Label{{Name: "app", Value: "demo"}, {Name: "reason", Value: "timeout"}})
 	metricsInstance.ObserveDurationLabels(metrics.MetricRuntimeContainerAcquireDuration,
-		[]metrics.Label{{Name: "function", Value: "demo"}}, 100*time.Millisecond)
+		[]metrics.Label{{Name: "app", Value: "demo"}}, 100*time.Millisecond)
 
 	metricsServer := metrics.NewServer(fmt.Sprintf("127.0.0.1:%d", port), metricsInstance.Handler(), slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	if err := metricsServer.Start(); err != nil {
@@ -76,18 +76,18 @@ func TestMetricsEndpointScrapeExposesFunctionSeries(t *testing.T) {
 	}
 	for _, want := range []string{
 		"relay_events_matched_total 1",
-		`handler_invocations_total{function="demo",handler="index.hi",outcome="success"} 1`,
-		`handler_duration_seconds_count{function="demo",handler="index.hi"} 1`,
+		`handler_invocations_total{app="demo",handler="index.hi",outcome="success"} 1`,
+		`handler_duration_seconds_count{app="demo",handler="index.hi"} 1`,
 		"relay_pending_entries 3",
 		"# TYPE",
 		// Warm-container pool observability.
-		`relay_runtime_pool_capacity{function="demo"} 2`,
-		`relay_runtime_containers{function="demo",state="idle"} 1`,
-		`relay_runtime_containers{function="demo",state="busy"} 1`,
-		`relay_runtime_container_acquires_total{function="demo",outcome="cold"} 1`,
-		`relay_runtime_container_acquires_total{function="demo",outcome="warm"} 1`,
-		`relay_runtime_container_discards_total{function="demo",reason="timeout"} 1`,
-		`relay_runtime_container_acquire_duration_seconds_count{function="demo"} 1`,
+		`relay_runtime_pool_capacity{app="demo"} 2`,
+		`relay_runtime_containers{app="demo",state="idle"} 1`,
+		`relay_runtime_containers{app="demo",state="busy"} 1`,
+		`relay_runtime_container_acquires_total{app="demo",outcome="cold"} 1`,
+		`relay_runtime_container_acquires_total{app="demo",outcome="warm"} 1`,
+		`relay_runtime_container_discards_total{app="demo",reason="timeout"} 1`,
+		`relay_runtime_container_acquire_duration_seconds_count{app="demo"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/metrics missing %q:\n%s", want, body)

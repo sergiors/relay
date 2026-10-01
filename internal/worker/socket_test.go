@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/processlock"
 	"relay/internal/runner"
 	"relay/internal/runtime"
@@ -208,7 +208,7 @@ func TestRuntimeSocketReplacesStaleUnixSocket(t *testing.T) {
 	}
 
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{
-		"fn": {Function: "fn", Capacity: 2},
+		"fn": {App: "fn", Capacity: 2},
 	})
 	st, err := QueryRuntimeState(path, "fn")
 	if err != nil {
@@ -247,12 +247,12 @@ func TestRuntimeSocketRefusesActiveSocket(t *testing.T) {
 
 // TestRuntimeSocketLiveStateIncludingZeros covers the live query: an existing
 // pool with all-zero gauges is a KNOWN state (no error), distinct from an
-// unknown function.
+// unknown app.
 func TestRuntimeSocketLiveStateIncludingZeros(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, map[string]runtime.PoolSnapshot{
-		"empty": {Function: "empty", Capacity: 0, Containers: 0, Busy: 0, Idle: 0, Starting: 0},
-		"busy":  {Function: "busy", Capacity: 4, Containers: 3, Busy: 2, Idle: 1, Starting: 1},
+		"empty": {App: "empty", Capacity: 0, Containers: 0, Busy: 0, Idle: 0, Starting: 0},
+		"busy":  {App: "busy", Capacity: 4, Containers: 3, Busy: 2, Idle: 1, Starting: 1},
 	})
 
 	empty, err := QueryRuntimeState(path, "empty")
@@ -272,15 +272,15 @@ func TestRuntimeSocketLiveStateIncludingZeros(t *testing.T) {
 	}
 }
 
-// TestRuntimeSocketUnknownFunction covers the clean unknown-function answer:
-// QueryRuntimeState wraps ErrUnknownFunction and does not return a state.
-func TestRuntimeSocketUnknownFunction(t *testing.T) {
+// TestRuntimeSocketUnknownApp covers the clean unknown-app answer:
+// QueryRuntimeState wraps ErrUnknownApp and does not return a state.
+func TestRuntimeSocketUnknownApp(t *testing.T) {
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
 	_, err := QueryRuntimeState(path, "ghost")
-	if !errors.Is(err, ErrUnknownFunction) {
-		t.Fatalf("error = %v, want ErrUnknownFunction", err)
+	if !errors.Is(err, ErrUnknownApp) {
+		t.Fatalf("error = %v, want ErrUnknownApp", err)
 	}
 	if errors.Is(err, ErrRuntimeStateUnavailable) {
 		t.Fatalf("unknown function must not be reported as unavailable: %v", err)
@@ -289,17 +289,17 @@ func TestRuntimeSocketUnknownFunction(t *testing.T) {
 
 // TestRuntimeSocketMalformedRequest covers the malformed frame path directly at
 // the wire level: a non-JSON line, an absent command, an empty command, and an
-// empty function name are all rejected as malformed_request.
+// empty app name are all rejected as malformed_request.
 func TestRuntimeSocketMalformedRequest(t *testing.T) {
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
 	for _, line := range []string{
 		"not-json\n",
 		"{}\n",
-		`{"function":"fn"}` + "\n",
-		`{"command":"","function":"fn"}` + "\n",
-		`{"command":"runtime_state","function":""}` + "\n",
+		`{"app":"fn"}` + "\n",
+		`{"command":"","app":"fn"}` + "\n",
+		`{"command":"runtime_state","app":""}` + "\n",
 	} {
 		resp := rawQuery(t, path, line)
 		if resp.Error != errCodeMalformedRequest {
@@ -317,7 +317,7 @@ func TestRuntimeSocketMalformedRequest(t *testing.T) {
 // closed (the client's read sees EOF).
 func TestRuntimeSocketSilentClientHitsDeadline(t *testing.T) {
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
 	conn, err := net.Dial("unix", path)
 	if err != nil {
@@ -341,7 +341,7 @@ func TestRuntimeSocketSilentClientHitsDeadline(t *testing.T) {
 // a malformed_request error.
 func TestRuntimeSocketOversizeRequestRejected(t *testing.T) {
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
 	conn, err := net.Dial("unix", path)
 	if err != nil {
@@ -391,7 +391,7 @@ func rawQuery(t *testing.T, path, line string) socketResponse {
 // file, so a later query is unavailable and a fresh start can rebind cleanly.
 func TestRuntimeSocketGracefulRemoval(t *testing.T) {
 	path := testSocketPath(t)
-	s := startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	s := startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestRuntimeSocketGracefulRemoval(t *testing.T) {
 	}
 
 	// A fresh socket can bind the same path.
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 }
 
 // TestRuntimeSocketCloseWithAbsentFile covers absent-path cleanup: Close on a
@@ -456,7 +456,7 @@ func TestRuntimeSocketActiveOwnershipGuard(t *testing.T) {
 	defer held.Close()
 
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn", Capacity: 1}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn", Capacity: 1}})
 
 	// Worker B's startup order is lock-then-socket; the lock rejects it, so
 	// NewSocketServer (and its stale removal) is unreachable.
@@ -494,7 +494,7 @@ func (f *fakeStatsResetter) count() int {
 func TestRuntimeSocketResetStatsCommand(t *testing.T) {
 	path := testSocketPath(t)
 	resetter := &fakeStatsResetter{}
-	startTestSocketWithResetter(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}}, resetter)
+	startTestSocketWithResetter(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}}, resetter)
 
 	if err := ResetRuntimeStats(path); err != nil {
 		t.Fatalf("ResetRuntimeStats: %v", err)
@@ -523,7 +523,7 @@ func TestRuntimeSocketResetStatsCommand(t *testing.T) {
 // rather than looking like a successful reset.
 func TestRuntimeSocketResetStatsUnavailable(t *testing.T) {
 	path := testSocketPath(t)
-	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {Function: "fn"}})
+	startTestSocket(t, path, map[string]runtime.PoolSnapshot{"fn": {App: "fn"}})
 
 	err := ResetRuntimeStats(path)
 	if !errors.Is(err, ErrRuntimeStatsUnavailable) {
@@ -631,7 +631,7 @@ func TestResetRuntimeStatsTimeoutIsAmbiguous(t *testing.T) {
 }
 
 // fakeInvoker records manual-invocation calls for socket tests, so the
-// invoke_function command can be exercised without Docker or a live runner.
+// invoke_app command can be exercised without Docker or a live runner.
 type fakeInvoker struct {
 	mu      sync.Mutex
 	calls   int
@@ -639,15 +639,15 @@ type fakeInvoker struct {
 	event   map[string]any
 	invoked int
 	err     error
-	// entered, when non-nil, is signalled once at the start of InvokeFunction;
-	// release, when non-nil, makes InvokeFunction block until it closes or ctx
+	// entered, when non-nil, is signalled once at the start of InvokeApp;
+	// release, when non-nil, makes InvokeApp block until it closes or ctx
 	// is done. They let tests observe shutdown cancelling an in-flight call.
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
 }
 
-func (f *fakeInvoker) InvokeFunction(ctx context.Context, name string, event map[string]any) (int, error) {
+func (f *fakeInvoker) InvokeApp(ctx context.Context, name string, event map[string]any) (int, error) {
 	f.mu.Lock()
 	f.calls++
 	f.name = name
@@ -674,8 +674,8 @@ func (f *fakeInvoker) snapshot() (calls int, name string, event map[string]any) 
 }
 
 // startTestSocketWithInvoker starts a SocketServer backed by pools at path with
-// the given manual invoker, so the invoke_function command can be exercised.
-func startTestSocketWithInvoker(t *testing.T, path string, pools map[string]runtime.PoolSnapshot, invoker FunctionInvoker) *SocketServer {
+// the given manual invoker, so the invoke_app command can be exercised.
+func startTestSocketWithInvoker(t *testing.T, path string, pools map[string]runtime.PoolSnapshot, invoker AppInvoker) *SocketServer {
 	t.Helper()
 	s, err := NewSocketServer(
 		path,
@@ -691,17 +691,17 @@ func startTestSocketWithInvoker(t *testing.T, path string, pools map[string]runt
 	return s
 }
 
-// TestRuntimeSocketInvokeFunctionDelegates verifies the invoke_function command
-// forwards the function name and decoded event object to the wired invoker and
+// TestRuntimeSocketInvokeAppDelegates verifies the invoke_app command
+// forwards the app name and decoded event object to the wired invoker and
 // answers with the handler count.
-func TestRuntimeSocketInvokeFunctionDelegates(t *testing.T) {
+func TestRuntimeSocketInvokeAppDelegates(t *testing.T) {
 	path := testSocketPath(t)
 	inv := &fakeInvoker{invoked: 2}
 	startTestSocketWithInvoker(t, path, nil, inv)
 
-	invoked, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{"event_name":"INSERT","n":7}`))
+	invoked, err := InvokeApp(context.Background(), path, "fn", json.RawMessage(`{"event_name":"INSERT","n":7}`))
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 2 {
 		t.Fatalf("invoked = %d, want 2", invoked)
@@ -718,15 +718,15 @@ func TestRuntimeSocketInvokeFunctionDelegates(t *testing.T) {
 	}
 }
 
-// TestRuntimeSocketInvokeFunctionFailed verifies a runner error is reported as
+// TestRuntimeSocketInvokeAppFailed verifies a runner error is reported as
 // ErrInvokeFailed carrying the worker's message, and that the invoker was still
 // called exactly once.
-func TestRuntimeSocketInvokeFunctionFailed(t *testing.T) {
+func TestRuntimeSocketInvokeAppFailed(t *testing.T) {
 	path := testSocketPath(t)
 	inv := &fakeInvoker{err: fmt.Errorf("function %q handler %q: boom", "fn", "index.run")}
 	startTestSocketWithInvoker(t, path, nil, inv)
 
-	_, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`))
+	_, err := InvokeApp(context.Background(), path, "fn", json.RawMessage(`{}`))
 	if !errors.Is(err, ErrInvokeFailed) {
 		t.Fatalf("error = %v, want ErrInvokeFailed", err)
 	}
@@ -738,15 +738,15 @@ func TestRuntimeSocketInvokeFunctionFailed(t *testing.T) {
 	}
 }
 
-// TestRuntimeSocketInvokeFunctionUnknownFunction verifies the runner's
-// not-found sentinel is classified as unknown_function, so the CLI reports the
+// TestRuntimeSocketInvokeAppUnknownApp verifies the runner's
+// not-found sentinel is classified as unknown_app, so the CLI reports the
 // right cause (not a generic failure).
-func TestRuntimeSocketInvokeFunctionUnknownFunction(t *testing.T) {
+func TestRuntimeSocketInvokeAppUnknownApp(t *testing.T) {
 	path := testSocketPath(t)
-	inv := &fakeInvoker{err: fmt.Errorf("%w: %q", runner.ErrFunctionNotFound, "ghost")}
+	inv := &fakeInvoker{err: fmt.Errorf("%w: %q", runner.ErrAppNotFound, "ghost")}
 	startTestSocketWithInvoker(t, path, nil, inv)
 
-	_, err := InvokeFunction(context.Background(), path, "ghost", json.RawMessage(`{}`))
+	_, err := InvokeApp(context.Background(), path, "ghost", json.RawMessage(`{}`))
 	if !errors.Is(err, ErrInvokeFailed) {
 		t.Fatalf("error = %v, want ErrInvokeFailed", err)
 	}
@@ -755,35 +755,35 @@ func TestRuntimeSocketInvokeFunctionUnknownFunction(t *testing.T) {
 	}
 }
 
-// TestRuntimeSocketInvokeFunctionNoInvoker verifies a socket with no wired
+// TestRuntimeSocketInvokeAppNoInvoker verifies a socket with no wired
 // invoker answers invoke_unavailable (there is no offline fallback), rather than
 // appearing to have run zero handlers.
-func TestRuntimeSocketInvokeFunctionNoInvoker(t *testing.T) {
+func TestRuntimeSocketInvokeAppNoInvoker(t *testing.T) {
 	path := testSocketPath(t)
 	startTestSocket(t, path, nil)
 
-	_, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`))
+	_, err := InvokeApp(context.Background(), path, "fn", json.RawMessage(`{}`))
 	if !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
 }
 
-// TestRuntimeSocketInvokeFunctionMalformed verifies the wire validation: an
-// empty function, a missing event, invalid JSON, a non-object event (array),
+// TestRuntimeSocketInvokeAppMalformed verifies the wire validation: an
+// empty app, a missing event, invalid JSON, a non-object event (array),
 // and a null event are all rejected as malformed without invoking the runner.
-func TestRuntimeSocketInvokeFunctionMalformed(t *testing.T) {
+func TestRuntimeSocketInvokeAppMalformed(t *testing.T) {
 	path := testSocketPath(t)
 	inv := &fakeInvoker{}
 	startTestSocketWithInvoker(t, path, nil, inv)
 
 	for _, line := range []string{
 		`{"command":"invoke_function"}` + "\n",
-		`{"command":"invoke_function","function":""}` + "\n",
-		`{"command":"invoke_function","function":"fn"}` + "\n",
-		`{"command":"invoke_function","function":"fn","event":"not-json"}` + "\n",
-		`{"command":"invoke_function","function":"fn","event":[1,2]}` + "\n",
-		`{"command":"invoke_function","function":"fn","event":null}` + "\n",
-		`{"command":"invoke_function","function":"fn","event":"scalar"}` + "\n",
+		`{"command":"invoke_function","app":""}` + "\n",
+		`{"command":"invoke_function","app":"fn"}` + "\n",
+		`{"command":"invoke_function","app":"fn","event":"not-json"}` + "\n",
+		`{"command":"invoke_function","app":"fn","event":[1,2]}` + "\n",
+		`{"command":"invoke_function","app":"fn","event":null}` + "\n",
+		`{"command":"invoke_function","app":"fn","event":"scalar"}` + "\n",
 	} {
 		resp := rawQuery(t, path, line)
 		if resp.Error != errCodeMalformedRequest {
@@ -798,11 +798,11 @@ func TestRuntimeSocketInvokeFunctionMalformed(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionNoSocket verifies the standalone no-worker case reports
+// TestInvokeAppNoSocket verifies the standalone no-worker case reports
 // ErrInvokeUnavailable (there is no offline fallback for a manual invocation).
-func TestInvokeFunctionNoSocket(t *testing.T) {
+func TestInvokeAppNoSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.sock")
-	if _, err := InvokeFunction(context.Background(), path, "fn", json.RawMessage(`{}`)); !errors.Is(err, ErrInvokeUnavailable) {
+	if _, err := InvokeApp(context.Background(), path, "fn", json.RawMessage(`{}`)); !errors.Is(err, ErrInvokeUnavailable) {
 		t.Fatalf("error = %v, want ErrInvokeUnavailable", err)
 	}
 }
@@ -811,7 +811,7 @@ func TestInvokeFunctionNoSocket(t *testing.T) {
 // runner the worker installs via SetInvoker must satisfy the socket's local
 // seam, so the two cannot drift apart. It is a compile-time assertion (the
 // assignment would not type-check otherwise).
-var _ FunctionInvoker = (*runner.Runner)(nil)
+var _ AppInvoker = (*runner.Runner)(nil)
 
 // HandlerReplayerContract pins the production wiring contract for DLQ replay:
 // the concrete live runner the worker installs via SetReplayer must satisfy the
@@ -866,7 +866,7 @@ func startTestSocketWithReplayer(t *testing.T, path string, replayer HandlerRepl
 }
 
 // TestRuntimeSocketReplayDLQDelegates verifies the replay_dlq command forwards
-// the exact function, handler, event bytes, AND trace metadata (as a control-path
+// the exact app, handler, event bytes, AND trace metadata (as a control-path
 // sibling of the event) to the wired replayer and answers with replayed=true.
 func TestRuntimeSocketReplayDLQDelegates(t *testing.T) {
 	path := testSocketPath(t)
@@ -897,8 +897,8 @@ func TestRuntimeSocketReplayDLQErrorCodes(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"unknown function", fmt.Errorf("%w: %q", runner.ErrFunctionNotFound, "ghost")},
-		{"unavailable function", fmt.Errorf("%w: %q", runner.ErrFunctionUnavailable, "broken")},
+		{"unknown function", fmt.Errorf("%w: %q", runner.ErrAppNotFound, "ghost")},
+		{"unavailable function", fmt.Errorf("%w: %q", runner.ErrAppUnavailable, "broken")},
 		{"removed handler", fmt.Errorf("%w: function %q handler %q", runner.ErrHandlerNotFound, "fn", "old.handler")},
 		{"handler failure", fmt.Errorf("function %q handler %q: boom", "fn", "index.run")},
 	} {
@@ -1019,7 +1019,7 @@ func TestCheckReadyNoSocket(t *testing.T) {
 }
 
 // TestRuntimeSocketReplayDLQMalformed verifies the wire validation: empty
-// function/handler and an absent payload are rejected without invoking the
+// app/handler and an absent payload are rejected without invoking the
 // replayer.
 func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 	path := testSocketPath(t)
@@ -1028,10 +1028,10 @@ func TestRuntimeSocketReplayDLQMalformed(t *testing.T) {
 
 	for _, line := range []string{
 		`{"command":"replay_dlq"}` + "\n",
-		`{"command":"replay_dlq","function":"fn"}` + "\n",
-		`{"command":"replay_dlq","function":"fn","handler":"index.run"}` + "\n",
-		`{"command":"replay_dlq","function":"","handler":"index.run","event":"{}"}` + "\n",
-		`{"command":"replay_dlq","function":"fn","handler":"","event":"{}"}` + "\n",
+		`{"command":"replay_dlq","app":"fn"}` + "\n",
+		`{"command":"replay_dlq","app":"fn","handler":"index.run"}` + "\n",
+		`{"command":"replay_dlq","app":"","handler":"index.run","event":"{}"}` + "\n",
+		`{"command":"replay_dlq","app":"fn","handler":"","event":"{}"}` + "\n",
 	} {
 		resp := rawQuery(t, path, line)
 		if resp.Error != errCodeMalformedRequest {
@@ -1075,14 +1075,14 @@ func (e *testExecutor) got() []string {
 	return append([]string(nil), e.handlers...)
 }
 
-// TestRuntimeSocketInvokeFunctionFullStack wires the REAL runner through the
+// TestRuntimeSocketInvokeAppFullStack wires the REAL runner through the
 // socket and drives it over the wire with a parsed template: the matching rules
 // execute (and the non-matching one does not), proving the whole CLI-less stack
 // — socket codec, dispatch, and runner matching/execution.
-func TestRuntimeSocketInvokeFunctionFullStack(t *testing.T) {
+func TestRuntimeSocketInvokeAppFullStack(t *testing.T) {
 	path := testSocketPath(t)
 	exec := &testExecutor{}
-	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
 events:
   - handler: events.created.handler
     pattern:
@@ -1095,16 +1095,16 @@ events:
 		t.Fatalf("parse template: %v", err)
 	}
 	prepared := runner.NewPrepared(
-		function.Function{Name: "user-events", Template: tmpl},
+		app.App{Name: "user-events", Template: tmpl},
 		&runtime.Prepared{Name: "user-events", Image: "x"},
 		exec,
 	)
-	run := runner.New([]*runner.PreparedFunction{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	run := runner.New([]*runner.PreparedApp{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	startTestSocketWithInvoker(t, path, nil, run)
 
-	invoked, err := InvokeFunction(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"INSERT"}`))
+	invoked, err := InvokeApp(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"INSERT"}`))
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 1 {
 		t.Fatalf("invoked = %d, want 1", invoked)
@@ -1115,9 +1115,9 @@ events:
 	}
 
 	// A non-matching event runs nothing and answers zero (success).
-	invoked, err = InvokeFunction(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"MODIFY"}`))
+	invoked, err = InvokeApp(context.Background(), path, "user-events", json.RawMessage(`{"event_name":"MODIFY"}`))
 	if err != nil {
-		t.Fatalf("non-matching InvokeFunction: %v", err)
+		t.Fatalf("non-matching InvokeApp: %v", err)
 	}
 	if invoked != 0 {
 		t.Fatalf("non-matching invoked = %d, want 0", invoked)
@@ -1144,7 +1144,7 @@ func TestRuntimeSocketCloseCancelsInflightInvoke(t *testing.T) {
 	}
 	s.SetInvoker(inv)
 
-	// Dial directly (not through InvokeFunction) so the client deadline does not
+	// Dial directly (not through InvokeApp) so the client deadline does not
 	// interfere; the invocation blocks in the invoker until Close cancels it.
 	conn, err := net.Dial("unix", path)
 	if err != nil {
@@ -1152,7 +1152,7 @@ func TestRuntimeSocketCloseCancelsInflightInvoke(t *testing.T) {
 	}
 	defer conn.Close()
 	if err := json.NewEncoder(conn).Encode(socketRequest{
-		Command: cmdInvokeFunction, Function: "fn", Event: json.RawMessage(`{}`),
+		Command: cmdInvokeApp, App: "fn", Event: json.RawMessage(`{}`),
 	}); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -1175,10 +1175,10 @@ func TestRuntimeSocketCloseCancelsInflightInvoke(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionClientCancelAborts verifies a cancelled client context
+// TestInvokeAppClientCancelAborts verifies a cancelled client context
 // (Ctrl-C) aborts an in-flight manual invocation promptly rather than waiting out
 // the invocation deadline: the client closes its connection and the call returns.
-func TestInvokeFunctionClientCancelAborts(t *testing.T) {
+func TestInvokeAppClientCancelAborts(t *testing.T) {
 	path := testSocketPath(t)
 	inv := &fakeInvoker{entered: make(chan struct{}), release: make(chan struct{})}
 	s, err := NewSocketServer(
@@ -1196,7 +1196,7 @@ func TestInvokeFunctionClientCancelAborts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := InvokeFunction(ctx, path, "fn", json.RawMessage(`{}`))
+		_, err := InvokeApp(ctx, path, "fn", json.RawMessage(`{}`))
 		done <- err
 	}()
 
@@ -1212,6 +1212,6 @@ func TestInvokeFunctionClientCancelAborts(t *testing.T) {
 			t.Fatalf("error = %v, want ErrInvokeUnavailable after cancel", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("InvokeFunction did not abort promptly on client cancel")
+		t.Fatal("InvokeApp did not abort promptly on client cancel")
 	}
 }

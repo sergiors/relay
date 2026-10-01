@@ -38,8 +38,8 @@ func TestSelectMissingSourceDir(t *testing.T) {
 
 // TestMaterializeMissingSourceRace pins the TOCTOU guard: if the source dir
 // vanishes between Selection construction and the materialize read, materialize
-// returns the clear missing-source error and leaves /functions untouched (even a
-// pre-existing dir is NOT removed, so a failed sync cannot erase valid functions).
+// returns the clear missing-source error and leaves /apps untouched (even a
+// pre-existing dir is NOT removed, so a failed sync cannot erase valid apps).
 func TestMaterializeMissingSourceRace(t *testing.T) {
 	funcs := t.TempDir()
 	src := filepath.Join(t.TempDir(), "src")
@@ -83,24 +83,24 @@ func TestMaterializeEmptySourceClearsStale(t *testing.T) {
 	}
 }
 
-func TestMaterializeDiscoveryIgnoresNonFunctions(t *testing.T) {
+func TestMaterializeDiscoveryIgnoresNonApps(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "valid", "template.yaml"), "runtime: node\n")
 	writeFile(t, filepath.Join(src, "notadir.txt"), "x\n")
 	writeFile(t, filepath.Join(src, "nofn", "readme.md"), "not a function\n")
-	names, err := discoverFunctions(mustSelect(t, src, src))
+	names, err := discoverApps(mustSelect(t, src, src))
 	if err != nil {
-		t.Fatalf("discoverFunctions: %v", err)
+		t.Fatalf("discoverApps: %v", err)
 	}
 	if len(names) != 1 || names[0] != "valid" {
-		t.Fatalf("discoverFunctions = %v, want [valid]", names)
+		t.Fatalf("discoverApps = %v, want [valid]", names)
 	}
 }
 
 // TestMaterializeDoesNotRemoveStagingDir pins that the deterministic-removal
 // pass leaves a Relay-owned staging directory in the target alone: it is not a
-// materialized function, so it is neither reported as removed nor deleted (the
-// creator owns its lifecycle), while a genuine stale function dir is still
+// materialized app, so it is neither reported as removed nor deleted (the
+// creator owns its lifecycle), while a genuine stale app dir is still
 // removed.
 func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 	src := t.TempDir()
@@ -110,7 +110,7 @@ func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 	// A transient staging directory in the target (as git leaves it mid-copy).
 	stage := filepath.Join(funcs, ".sync-live")
 	writeFile(t, filepath.Join(stage, "template.yaml"), "runtime: node24\n")
-	// A genuinely stale function directory.
+	// A genuinely stale app directory.
 	writeFile(t, filepath.Join(funcs, "stale", "template.yaml"), "runtime: node24\n")
 
 	mat, rem, err := materialize(mustSelect(t, src, src), funcs)
@@ -132,11 +132,11 @@ func TestMaterializeDoesNotRemoveStagingDir(t *testing.T) {
 }
 
 // TestMaterializeHonorsIgnoreRules proves the shared policy drives
-// materialization: a function directory excluded by the source root's
+// materialization: an app directory excluded by the source root's
 // .gitignore is not copied, while an included sibling is; and a .gitignore
-// inside the function travels with it so the build context and fingerprint can
-// keep applying the same rules against /functions. Ignored files inside the
-// function are not copied either.
+// inside the app travels with it so the build context and fingerprint can
+// keep applying the same rules against /apps. Ignored files inside the
+// app are not copied either.
 func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, ".gitignore"), "ignored/\n")
@@ -166,7 +166,7 @@ func TestMaterializeHonorsIgnoreRules(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(funcs, "keep", "handler.js")); err != nil {
 		t.Fatalf("included source missing: %v", err)
 	}
-	// The function's own policy travels with it and its rules exclude the
+	// The app's own policy travels with it and its rules exclude the
 	// ignored file from the copy.
 	if _, err := os.Stat(filepath.Join(funcs, "keep", ".gitignore")); err != nil {
 		t.Fatalf("applicable .gitignore not materialized with the function: %v", err)
@@ -201,7 +201,7 @@ func TestMaterializeAnchorsRootIgnoreRules(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(funcs, "funa", "handler.js")); err != nil {
 		t.Fatalf("included source missing: %v", err)
 	}
-	// The root policy is carried into the function so a later fingerprint and
+	// The root policy is carried into the app so a later fingerprint and
 	// build context retain the same applicable policy after sync.
 	if _, err := os.Stat(filepath.Join(funcs, "funa", ".gitignore")); err != nil {
 		t.Fatalf("ancestor .gitignore was not preserved: %v", err)

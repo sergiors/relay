@@ -61,7 +61,7 @@ func Status(cfgPath, sshDir, checkoutDir string) (StatusConfig, error) {
 }
 
 // PrintStatus renders a StatusConfig to w with tab-aligned labels (the same
-// presentation style as `relay function inspect`). It prints no key material
+// presentation style as `relay app inspect`). It prints no key material
 // and no repository credentials, only the summary fields.
 func PrintStatus(w io.Writer, s StatusConfig) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)

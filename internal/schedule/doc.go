@@ -12,7 +12,7 @@
 // occurrence follows Relay's normal at-least-once delivery, retry, invocation
 // state, and DLQ semantics.
 //
-// An Occurrence identifies one logical firing by function, SCHEDULE NAME, and
+// An Occurrence identifies one logical firing by app, SCHEDULE NAME, and
 // scheduled instant; the handler is carried but is not part of the identity.
 // ScheduledAt is normalized to UTC before its deterministic ID is derived, so
 // workers evaluating the same logical tick produce the same identity regardless
@@ -30,7 +30,7 @@
 // during startup catch-up; both paths reuse the same occurrence identity, so an
 // occurrence already published by another worker remains a harmless duplicate.
 //
-// Updating a function's schedules affects future occurrences only. Existing
+// Updating an app's schedules affects future occurrences only. Existing
 // dedup keys and already-published stream entries are left intact and expire
 // through their normal retention policies.
 package schedule

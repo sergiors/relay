@@ -303,7 +303,7 @@ func TestManagerCloseContextBoundedDuringMaintenanceEviction(t *testing.T) {
 	m.containers.idleTimeout = time.Minute
 	m.containers.now = clk.Now
 
-	// Several idle containers across distinct functions. The eviction pass walks
+	// Several idle containers across distinct apps. The eviction pass walks
 	// pools serially, so only the first teardown blocks; the rest block only
 	// until the shared lifecycle is cancelled. entered closes on the first
 	// teardown regardless of map order, making the "eviction is in flight"

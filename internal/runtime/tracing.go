@@ -10,13 +10,13 @@ import (
 	"relay/internal/observability/tracing"
 )
 
-// startRuntimeSpan begins a runtime-layer span. The attributes are the function
+// startRuntimeSpan begins a runtime-layer span. The attributes are the app
 // name and the image reference (both bounded, configuration-level identities),
 // never the handler payload.
 func startRuntimeSpan(ctx context.Context, name, fnName, image string) (context.Context, trace.Span) {
 	return tracing.Start(ctx, name,
 		trace.WithAttributes(
-			attribute.String("relay.function", fnName),
+			attribute.String("relay.app", fnName),
 			attribute.String("relay.image", image),
 		),
 	)

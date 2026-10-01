@@ -471,7 +471,7 @@ func TestSetupWithExporterRecordsSpansAndParent(t *testing.T) {
 
 	// Root span, then a child span started from the root's context.
 	rootCtx, root := Start(context.Background(), "relay.startup")
-	childCtx, child := Start(rootCtx, "functions.load")
+	childCtx, child := Start(rootCtx, "apps.load")
 	if got, want := trace.SpanContextFromContext(childCtx).TraceID(), root.SpanContext().TraceID(); got != want {
 		t.Fatalf("child trace id = %s, want parent %s", got, want)
 	}
@@ -500,9 +500,9 @@ func TestSetupWithExporterRecordsSpansAndParent(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing relay.startup span in %+v", spans)
 	}
-	childStub, ok := byName["functions.load"]
+	childStub, ok := byName["apps.load"]
 	if !ok {
-		t.Fatalf("missing functions.load span in %+v", spans)
+		t.Fatalf("missing apps.load span in %+v", spans)
 	}
 	if childStub.Parent.SpanID() != rootStub.SpanContext.SpanID() {
 		t.Errorf("child parent span id = %s, want %s", childStub.Parent.SpanID(), rootStub.SpanContext.SpanID())

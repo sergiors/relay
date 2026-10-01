@@ -40,7 +40,7 @@ type Config struct {
 	// used by cmd/main.go to build the process logger after config.Load.
 	LogLevel slog.Level
 	// MaxConcurrency is the MAX_CONCURRENCY value (default 8): the total number
-	// of function invocations executing concurrently in this single Relay
+	// of app invocations executing concurrently in this single Relay
 	// worker. Values below the default fall back in the runner (see
 	// runner.SetMaxConcurrency); it is always positive after Load.
 	MaxConcurrency int
@@ -59,7 +59,7 @@ type Config struct {
 	// Relay verifies they exist at startup and never creates them.
 	Networks []string
 	// TraefikNetwork is the optional TRAEFIK_NETWORK value: the Docker network
-	// Traefik is attached to. It is required only when a function's template
+	// Traefik is attached to. It is required only when an app's template
 	// service declares a `host` (routed service); Relay never creates the
 	// network itself and verifies it exists on every routed reconcile. Empty
 	// means routing is not configured (unrouted services are unaffected).

@@ -300,7 +300,7 @@ func TestPathMiddlewareIDCollisionResistant(t *testing.T) {
 }
 
 // TestServiceProviderIDTruncatesOverlong pins the truncation branch: a long
-// function name plus a long identity produces an id capped at exactly the max
+// app name plus a long identity produces an id capped at exactly the max
 // length, with the hash suffix still present and the charset safe.
 func TestServiceProviderIDTruncatesOverlong(t *testing.T) {
 	longName := strings.Repeat("verylongfunction", 5) // 80 chars
@@ -320,7 +320,7 @@ func TestServiceProviderIDTruncatesOverlong(t *testing.T) {
 	}
 }
 
-// Odd characters in the function name or identity still produce a safe,
+// Odd characters in the app name or identity still produce a safe,
 // deterministic id whose hash suffix reflects the full inputs.
 func TestServiceProviderIDSanitizes(t *testing.T) {
 	for _, tc := range []struct {
@@ -364,7 +364,7 @@ func TestIsTraefikLabel(t *testing.T) {
 		{"traefik.http.routers.x.rule", true},
 		{"traefik", false},
 		{"traefikk.enable", false},
-		{"relay.function", false},
+		{"relay.app", false},
 		{"", false},
 	} {
 		if got := IsTraefikLabel(tc.key); got != tc.want {

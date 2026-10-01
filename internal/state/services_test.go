@@ -22,7 +22,7 @@ services:
 `
 
 // TestServiceRoundTrip seeds a template with services through
-// RecordReconcileSuccess and asserts GetFunction returns the resolved rows
+// RecordReconcileSuccess and asserts GetApp returns the resolved rows
 // (entrypoint file, canonical path, effective port, desired replicas; defaults
 // applied).
 func TestServiceRoundTrip(t *testing.T) {
@@ -30,7 +30,7 @@ func TestServiceRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, servicesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -70,7 +70,7 @@ services:
 `)
 	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -90,7 +90,7 @@ func TestServiceRemovalClearsRows(t *testing.T) {
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
 	st.RecordRemoved("demo")
-	if _, ok := st.GetFunction("demo"); ok {
+	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
 }
@@ -101,7 +101,7 @@ func TestServiceEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no services key
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -131,7 +131,7 @@ func TestServiceSourceKindsRoundTrip(t *testing.T) {
 	tmpl := mustTemplate(t, sourceServicesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}

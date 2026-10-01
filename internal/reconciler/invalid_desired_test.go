@@ -6,14 +6,14 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/source"
 	"relay/internal/state"
 )
 
 // TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry pins the live
-// invalid-desired seam end to end: a function whose template becomes invalid is
+// invalid-desired seam end to end: an app whose template becomes invalid is
 // recorded as a failed desired state (degraded with its retained active
 // generation) while the runtime registry keeps serving the previous version
 // untouched and no rebuild is attempted. Removal is reserved for a genuinely
@@ -24,13 +24,13 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Seed a usable active generation (the registry already serves img-guarded;
 	// the skip path deliberately records no outcome, so record it explicitly as
 	// startup/reconcile would after a real success).
-	st.RecordReconcileSuccess("guarded", "img-guarded", "fp-guarded", time.Now(), fn.Function())
-	before, ok := st.GetFunction("guarded")
+	st.RecordReconcileSuccess("guarded", "img-guarded", "fp-guarded", time.Now(), fn.App())
+	before, ok := st.GetApp("guarded")
 	if !ok || before.Status != state.StatusReady {
 		t.Fatalf("precondition: %+v ok=%v, want ready", before, ok)
 	}
@@ -39,9 +39,9 @@ func TestReconcileInvalidDesiredWritesFailureAndKeepsRegistry(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
-	r.reconcileFunction("guarded")
+	r.reconcileApp("guarded")
 
-	after, ok := st.GetFunction("guarded")
+	after, ok := st.GetApp("guarded")
 	if !ok {
 		t.Fatal("guarded row must survive an invalid desired definition")
 	}
@@ -79,18 +79,18 @@ func TestReconcileMissingTemplateRecordsInvalidButRetains(t *testing.T) {
 
 	fn := initialFn("midcopy", dir)
 	b := &fakeBuilder{}
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("midcopy", "img-midcopy", "fp-midcopy", time.Now(), fn.Function())
+	st.RecordReconcileSuccess("midcopy", "img-midcopy", "fp-midcopy", time.Now(), fn.App())
 	if err := os.Remove(filepath.Join(dir, "template.yaml")); err != nil {
 		t.Fatalf("remove template: %v", err)
 	}
-	r.reconcileFunction("midcopy")
+	r.reconcileApp("midcopy")
 
 	if pf := reg.GetByName("midcopy"); pf == nil || pf.Prepared() == nil {
 		t.Fatal("a missing template (mid-copy) must retain the loaded function")
 	}
-	after, ok := st.GetFunction("midcopy")
+	after, ok := st.GetApp("midcopy")
 	if !ok {
 		t.Fatal("midcopy row must survive")
 	}
@@ -106,7 +106,7 @@ func TestReconcileMissingTemplateRecordsInvalidButRetains(t *testing.T) {
 // fingerprint-failure branch: when the injected identity resolver errors for a
 // still-present desired definition, the reconciler records the invalid/failed
 // view through state (retaining the active generation) without modifying the
-// live registry or its fingerprint, and without treating the function as
+// live registry or its fingerprint, and without treating the app as
 // removed.
 func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T) {
 	root := t.TempDir()
@@ -114,17 +114,17 @@ func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T)
 
 	fn := initialFn("unreadable", dir)
 	b := &fakeBuilder{}
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, func(cfg *Config, _ *state.State) {
-		cfg.Fingerprint = func(string, *function.Template) (*source.Selection, string, error) {
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, func(cfg *Config, _ *state.State) {
+		cfg.Fingerprint = func(string, *app.Template) (*source.Selection, string, error) {
 			return nil, "", errBoom
 		}
 	})
 
 	// Seed an active generation so the retained view is observable.
-	st.RecordReconcileSuccess("unreadable", "img-active", "fp-active", time.Now(), fn.Function())
-	before, _ := st.GetFunction("unreadable")
+	st.RecordReconcileSuccess("unreadable", "img-active", "fp-active", time.Now(), fn.App())
+	before, _ := st.GetApp("unreadable")
 
-	r.reconcileFunction("unreadable")
+	r.reconcileApp("unreadable")
 
 	if pf := reg.GetByName("unreadable"); pf == nil || pf.Prepared() == nil {
 		t.Fatal("a fingerprint failure must not drop the loaded function")
@@ -132,7 +132,7 @@ func TestReconcileFingerprintFailureRecordsInvalidAndKeepsRegistry(t *testing.T)
 	if b.prepares() != 0 {
 		t.Fatalf("prepares = %d, want 0 (a fingerprint failure never builds)", b.prepares())
 	}
-	after, ok := st.GetFunction("unreadable")
+	after, ok := st.GetApp("unreadable")
 	if !ok {
 		t.Fatal("row must survive a fingerprint failure")
 	}
@@ -157,17 +157,17 @@ func TestReconcileGenuinelyMissingDirStillPrunes(t *testing.T) {
 
 	fn := initialFn("vanished", dir)
 	b := &fakeBuilder{}
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("removeall: %v", err)
 	}
-	r.reconcileFunction("vanished")
+	r.reconcileApp("vanished")
 
 	if reg.GetByName("vanished") != nil {
 		t.Fatal("a vanished directory must be removed from the registry")
 	}
-	if _, ok := st.GetFunction("vanished"); ok {
+	if _, ok := st.GetApp("vanished"); ok {
 		t.Fatal("a vanished directory must have its state row pruned, not marked invalid")
 	}
 }
@@ -184,9 +184,9 @@ func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
 
 	fn := initialFn("restored", dir)
 	b := &fakeBuilder{}
-	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("restored", "img-v1", "fp-v1", time.Now(), fn.Function())
+	st.RecordReconcileSuccess("restored", "img-v1", "fp-v1", time.Now(), fn.App())
 	original, err := os.ReadFile(filepath.Join(dir, "template.yaml"))
 	if err != nil {
 		t.Fatalf("read template: %v", err)
@@ -196,17 +196,17 @@ func TestReconcileInvalidThenRestoredIdenticalContentRecovers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
-	r.reconcileFunction("restored")
-	if got, _ := st.GetFunction("restored"); got.Status != state.StatusDegraded {
+	r.reconcileApp("restored")
+	if got, _ := st.GetApp("restored"); got.Status != state.StatusDegraded {
 		t.Fatalf("precondition: status = %q, want degraded", got.Status)
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), original, 0o644); err != nil {
 		t.Fatalf("restore template: %v", err)
 	}
-	r.reconcileFunction("restored")
+	r.reconcileApp("restored")
 
-	got, ok := st.GetFunction("restored")
+	got, ok := st.GetApp("restored")
 	if !ok {
 		t.Fatal("expected row after recovery")
 	}
@@ -228,14 +228,14 @@ func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
 
 	fn := initialFn("recovers", dir)
 	b := &fakeBuilder{}
-	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, _, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	st.RecordReconcileSuccess("recovers", "img-v1", "fp-v1", time.Now(), fn.Function())
+	st.RecordReconcileSuccess("recovers", "img-v1", "fp-v1", time.Now(), fn.App())
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
-	r.reconcileFunction("recovers") // invalid -> degraded
-	if got, _ := st.GetFunction("recovers"); got.Status != state.StatusDegraded {
+	r.reconcileApp("recovers") // invalid -> degraded
+	if got, _ := st.GetApp("recovers"); got.Status != state.StatusDegraded {
 		t.Fatalf("precondition: status = %q, want degraded (active generation retained)", got.Status)
 	}
 
@@ -244,9 +244,9 @@ func TestReconcileValidReplacementOverwritesInvalidGeneration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction("recovers")
+	r.reconcileApp("recovers")
 
-	got, ok := st.GetFunction("recovers")
+	got, ok := st.GetApp("recovers")
 	if !ok {
 		t.Fatal("expected row after recovery")
 	}

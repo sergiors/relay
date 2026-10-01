@@ -13,7 +13,7 @@ import (
 func TestAcquireServiceLeaseOwnershipScope(t *testing.T) {
 	mgr := &runtime.Manager{}
 
-	if got := acquireServiceLease(nil, "fn", "relay-fn-fn:abc"); got != nil {
+	if got := acquireServiceLease(nil, "fn", "relay-app-fn:abc"); got != nil {
 		t.Fatal("a nil manager must not lease an image")
 	}
 
@@ -24,15 +24,15 @@ func TestAcquireServiceLeaseOwnershipScope(t *testing.T) {
 		t.Fatalf("external image lease count = %d, want 0", got)
 	}
 
-	lease := acquireServiceLease(mgr, "fn", "relay-fn-fn:abcdef0123456789")
+	lease := acquireServiceLease(mgr, "fn", "relay-app-fn:abcdef0123456789")
 	if lease == nil {
 		t.Fatal("a Relay-owned image must be leased before enqueue")
 	}
-	if got := mgr.LeaseCount("relay-fn-fn:abcdef0123456789"); got != 1 {
+	if got := mgr.LeaseCount("relay-app-fn:abcdef0123456789"); got != 1 {
 		t.Fatalf("service lease count = %d, want 1", got)
 	}
 	lease.Release()
-	if got := mgr.LeaseCount("relay-fn-fn:abcdef0123456789"); got != 0 {
+	if got := mgr.LeaseCount("relay-app-fn:abcdef0123456789"); got != 0 {
 		t.Fatalf("service lease count after release = %d, want 0", got)
 	}
 }

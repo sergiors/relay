@@ -1,8 +1,8 @@
 //go:build integration
 
 // This file exercises the REUSED execution container lifecycle end to end
-// against a real Docker daemon: container reuse per function, discard paths
-// (timeout, process exit, image change, shutdown), per-function isolation,
+// against a real Docker daemon: container reuse per app, discard paths
+// (timeout, process exit, image change, shutdown), per-app isolation,
 // container labels/hardening/failed-start removal, and concurrency
 // serialization. It complements the image/build/sweep integration files.
 package runtime
@@ -22,7 +22,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
@@ -60,10 +60,10 @@ func newMetricsManager(t *testing.T) (*Manager, *metrics.Registry) {
 }
 
 // reusedContainerID polls (bridging start latency) for the running container
-// carrying the function's label and returns its id.
+// carrying the app's label and returns its id.
 func reusedContainerID(t *testing.T, ctx context.Context, m *Manager, fnName string) string {
 	t.Helper()
-	return waitForContainerByLabel(ctx, m.cli, labelFunction, fnName)
+	return waitForContainerByLabel(ctx, m.cli, labelApp, fnName)
 }
 
 // TestIntegrationProcessExitDiscardsContainer verifies the process_exit
@@ -73,7 +73,7 @@ func reusedContainerID(t *testing.T, ctx context.Context, m *Manager, fnName str
 func TestIntegrationProcessExitDiscardsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -98,7 +98,7 @@ export function run(event) {
   console.log("resurrected");
 }
 `)
-	fn := function.Function{Name: "proc-exit-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "proc-exit-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -110,7 +110,7 @@ export function run(event) {
 	done := make(chan error, 1)
 	go func() {
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: "proc-exit-e2e", Handler: "index.die", Image: prepared.Image})
+			RunMeta{Hostname: "test-host", App: "proc-exit-e2e", Handler: "index.die", Image: prepared.Image})
 		done <- m.Execute(execCtx, prepared, "index.die", []byte(`{"event_name":"INSERT"}`), nil)
 	}()
 	id1 = reusedContainerID(t, ctx, m, "proc-exit-e2e")
@@ -120,13 +120,13 @@ export function run(event) {
 	if id1 == "" {
 		t.Fatalf("expected the first container to have been running")
 	}
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "proc-exit-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "proc-exit-e2e") {
 		t.Error("process-exit container should have been discarded (removed by AutoRemove)")
 	}
 
 	// Next invocation: fresh container.
 	secondCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "proc-exit-e2e", Handler: "index.run", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "proc-exit-e2e", Handler: "index.run", Image: prepared.Image})
 	if err := m.Execute(secondCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after process exit: %v", err)
 	}
@@ -140,17 +140,17 @@ export function run(event) {
 }
 
 // TestIntegrationImageChangeDiscardsContainer verifies the image_changed
-// discard: a function's image version changes (source modified -> new
+// discard: an app's image version changes (source modified -> new
 // fingerprint), the next Execute discards the old container (even healthy)
 // and runs the NEW image; the old container is removed.
 func TestIntegrationImageChangeDiscardsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-fn-img-change:"))
+	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-app-img-change:"))
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
 runtime: node24
@@ -160,7 +160,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('v1'); }\n")
-	fn := function.Function{Name: "img-change", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "img-change", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -168,7 +168,7 @@ events:
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "img-change", Image: p1.Image})
+		RunMeta{Hostname: "test-host", App: "img-change", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute v1: %v", err)
 	}
@@ -199,9 +199,9 @@ events:
 	}
 }
 
-// TestIntegrationTwoFunctionsDistinctContainers verifies no cross-function
-// reuse: two functions, two distinct running container ids.
-func TestIntegrationTwoFunctionsDistinctContainers(t *testing.T) {
+// TestIntegrationTwoAppsDistinctContainers verifies no cross-app
+// reuse: two apps, two distinct running container ids.
+func TestIntegrationTwoAppsDistinctContainers(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -218,13 +218,13 @@ events:
       event_name: [INSERT]
 `)
 		writeFile(t, dir, "index.js", "export function run(e){ console.log('"+name+"'); }\n")
-		fn := function.Function{Name: name, Dir: dir, Template: &function.Template{Runtime: "node24"}}
+		fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 		prepared, err := m.Prepare(ctx, fn)
 		if err != nil {
 			t.Fatalf("prepare %s: %v", name, err)
 		}
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: name, Image: prepared.Image})
+			RunMeta{Hostname: "test-host", App: name, Image: prepared.Image})
 		if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 			t.Fatalf("execute %s: %v", name, err)
 		}
@@ -235,8 +235,8 @@ events:
 	}
 }
 
-// pollingSink is a concurrency-safe function-output sink that lets a test
-// observe handler progress WHILE invocations are in flight. newFunctionOutputSink's
+// pollingSink is a concurrency-safe app-output sink that lets a test
+// observe handler progress WHILE invocations are in flight. newAppOutputSink's
 // bytes.Buffer cannot be read concurrently with the container output reader
 // goroutines (and would race under -race), so this sink guards every write and
 // read with a mutex.
@@ -270,8 +270,8 @@ func waitForSinkContains(ctx context.Context, sink *pollingSink, sub string) boo
 }
 
 // TestIntegrationConcurrentInvocationsDistinctContainers verifies the warm pool
-// at the function's resolved concurrency (2): two concurrent Execute calls for
-// the SAME function lease DISTINCT containers and run concurrently, and a THIRD
+// at the app's resolved concurrency (2): two concurrent Execute calls for
+// the SAME app lease DISTINCT containers and run concurrently, and a THIRD
 // concurrent call CANNOT start until one of the first two releases — it is
 // bounded by the pool instead of starting a third container — then runs on the
 // released (reused) container. The scenario is made deterministic with handler
@@ -282,8 +282,8 @@ func TestIntegrationConcurrentInvocationsDistinctContainers(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	sink := &pollingSink{}
-	prev := SetFunctionOutput(sink)
-	t.Cleanup(func() { SetFunctionOutput(prev) })
+	prev := SetAppOutput(sink)
+	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -315,8 +315,8 @@ export async function c(event) {
   console.log("START c");
 }
 `)
-	fn := function.Function{Name: "concurrent-e2e", Dir: dir,
-		Template: &function.Template{Runtime: "node24", Concurrency: 2}}
+	fn := app.App{Name: "concurrent-e2e", Dir: dir,
+		Template: &app.Template{Runtime: "node24", Concurrency: 2}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -327,7 +327,7 @@ export async function c(event) {
 
 	exec := func(handler, event string) error {
 		execCtx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: "concurrent-e2e", Handler: handler, Image: prepared.Image})
+			RunMeta{Hostname: "test-host", App: "concurrent-e2e", Handler: handler, Image: prepared.Image})
 		return m.Execute(execCtx, prepared, handler, []byte(event), nil)
 	}
 
@@ -341,9 +341,9 @@ export async function c(event) {
 	if !waitForSinkContains(ctx, sink, "START a") || !waitForSinkContains(ctx, sink, "START b") {
 		t.Fatalf("expected both handlers to start concurrently; sink:\n%s", sink.String())
 	}
-	if !waitForContainersCount(ctx, m.cli, labelFunction, "concurrent-e2e", 2) {
+	if !waitForContainersCount(ctx, m.cli, labelApp, "concurrent-e2e", 2) {
 		t.Fatalf("expected 2 pooled containers while A and B run, got %d:\n%s",
-			countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"), sink.String())
+			countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"), sink.String())
 	}
 
 	// C is the third concurrent invocation. Both slots are leased and blocked,
@@ -354,13 +354,13 @@ export async function c(event) {
 	// Barrier: while A and B are still blocked (observed started above and
 	// sleeping 6s), C must not have started and the pool must not exceed its
 	// bound. A third container here would mean the pool is not bounded by the
-	// function's concurrency. pollUntil re-runs the check on the shared cadence
+	// app's concurrency. pollUntil re-runs the check on the shared cadence
 	// for the barrier window.
 	pollUntil(ctx, 900*time.Millisecond, func() bool {
 		if sink.contains("START c") {
 			t.Fatalf("C started before A or B released:\n%s", sink.String())
 		}
-		if got := countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"); got != 2 {
+		if got := countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"); got != 2 {
 			t.Fatalf("pool exceeded its concurrency bound while C waited: %d containers", got)
 		}
 		return false
@@ -377,7 +377,7 @@ export async function c(event) {
 	}
 	// Exactly the two pooled containers remain: C reused a released one rather
 	// than starting a third.
-	if got := countContainersByLabel(ctx, m.cli, labelFunction, "concurrent-e2e"); got != 2 {
+	if got := countContainersByLabel(ctx, m.cli, labelApp, "concurrent-e2e"); got != 2 {
 		t.Errorf("pooled containers after execution = %d, want 2", got)
 	}
 	if strings.Contains(sink.String(), relayProtocolSentinel) {
@@ -386,7 +386,7 @@ export async function c(event) {
 }
 
 // TestIntegrationPoolBoundedByConcurrency verifies the pool max is the
-// function's resolved concurrency: with concurrency 1, three concurrent
+// app's resolved concurrency: with concurrency 1, three concurrent
 // Execute calls serialize over a single container (never a second one), and all
 // succeed.
 func TestIntegrationPoolBoundedByConcurrency(t *testing.T) {
@@ -409,7 +409,7 @@ export async function run(event) {
   await new Promise(r => setTimeout(r, 150));
 }
 `)
-	fn := function.Function{Name: "bounded-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 1}}
+	fn := app.App{Name: "bounded-e2e", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 1}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -425,7 +425,7 @@ export async function run(event) {
 		go func() {
 			defer wg.Done()
 			execCtx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", Function: "bounded-e2e", Image: prepared.Image})
+				RunMeta{Hostname: "test-host", App: "bounded-e2e", Image: prepared.Image})
 			errCh <- m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 		}()
 	}
@@ -437,7 +437,7 @@ export async function run(event) {
 	}
 	// Never more than the concurrency bound of containers, and exactly one
 	// pooled after all three serialized over it.
-	if got := countContainersByLabel(ctx, m.cli, labelFunction, "bounded-e2e"); got != 1 {
+	if got := countContainersByLabel(ctx, m.cli, labelApp, "bounded-e2e"); got != 1 {
 		t.Errorf("pooled containers = %d, want exactly 1 (concurrency bound)", got)
 	}
 }
@@ -459,13 +459,13 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := function.Function{Name: "invalidate-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "invalidate-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "invalidate-e2e", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "invalidate-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -475,14 +475,14 @@ events:
 	}
 
 	// Invalidating a DIFFERENT image must not touch ours.
-	m.InvalidateImage("relay-fn-some-other-fn:abc")
+	m.InvalidateImage("relay-app-some-other-fn:abc")
 	if id := reusedContainerID(t, ctx, m, "invalidate-e2e"); id != id1 {
 		t.Errorf("container for another image must survive: id1=%s now=%s", id1, id)
 	}
 
 	// Invalidating OUR image discards the (healthy!) container promptly.
 	m.InvalidateImage(prepared.Image)
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "invalidate-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "invalidate-e2e") {
 		t.Error("container should have been discarded on InvalidateImage")
 	}
 
@@ -503,7 +503,7 @@ events:
 func TestIntegrationIdleEviction(t *testing.T) {
 	testutil.RequireDocker(t)
 	m := newManagerWithIdleTimeout(t, time.Second)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -516,14 +516,14 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := function.Function{Name: "idle-evict-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "idle-evict-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "idle-evict-e2e", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "idle-evict-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -534,7 +534,7 @@ events:
 
 	// The container must be evicted within a bounded multiple of the 1s window
 	// (tick = 500ms, so ~1.5s worst case; allow generous Docker latency).
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "idle-evict-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "idle-evict-e2e") {
 		t.Fatal("idle container was not evicted after the configured timeout")
 	}
 
@@ -560,12 +560,12 @@ func TestIntegrationBusyImageChangeDrains(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	sink := &pollingSink{}
-	prev := SetFunctionOutput(sink)
-	t.Cleanup(func() { SetFunctionOutput(prev) })
+	prev := SetAppOutput(sink)
+	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-fn-busy-change:"))
+	t.Cleanup(cleanupImagePrefixes(m.cli, "relay-app-busy-change:"))
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
 runtime: node24
@@ -584,14 +584,14 @@ export async function run(event) {
   console.log("END v1");
 }
 `)
-	fn := function.Function{Name: "busy-change", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 2}}
+	fn := app.App{Name: "busy-change", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 2}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare v1: %v", err)
 	}
 
 	v1Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "busy-change", Handler: "index.run", Image: p1.Image})
+		RunMeta{Hostname: "test-host", App: "busy-change", Handler: "index.run", Image: p1.Image})
 	v1Done := make(chan error, 1)
 	go func() {
 		v1Done <- m.Execute(v1Ctx, p1, "index.run", []byte(`{"event_name":"INSERT","blockMs":4000}`), nil)
@@ -614,7 +614,7 @@ export async function run(event) {
 	// container (the draining generation stays within capacity). The old v1
 	// container must not be discarded mid-invocation.
 	v2Ctx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "busy-change", Handler: "index.run", Image: p2.Image})
+		RunMeta{Hostname: "test-host", App: "busy-change", Handler: "index.run", Image: p2.Image})
 	if err := m.Execute(v2Ctx, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute v2 while v1 busy: %v", err)
 	}
@@ -630,18 +630,18 @@ export async function run(event) {
 		t.Errorf("expected v1 to complete; sink:\n%s", sink.String())
 	}
 	// Exactly the v2 container remains: the v1 container is gone.
-	if !waitForContainersCount(ctx, m.cli, labelFunction, "busy-change", 1) {
+	if !waitForContainersCount(ctx, m.cli, labelApp, "busy-change", 1) {
 		t.Errorf("expected exactly one pooled container after drain, got %d:\n%s",
-			countContainersByLabel(ctx, m.cli, labelFunction, "busy-change"), sink.String())
+			countContainersByLabel(ctx, m.cli, labelApp, "busy-change"), sink.String())
 	}
 }
 
-// TestIntegrationRemoveFunctionDiscardsContainers verifies the function-removal
-// lifecycle end to end: m.RemoveFunction discards its idle warm container, a
-// new Execute for the removed function fails with errPoolClosed (and the
+// TestIntegrationRemoveAppDiscardsContainers verifies the app-removal
+// lifecycle end to end: m.RemoveApp discards its idle warm container, a
+// new Execute for the removed app fails with errPoolClosed (and the
 // invocation is left pending, not run on stale state), and re-preparing the
-// function warms it again.
-func TestIntegrationRemoveFunctionDiscardsContainers(t *testing.T) {
+// app warms it again.
+func TestIntegrationRemoveAppDiscardsContainers(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -656,13 +656,13 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function run(e){ console.log('ok'); }\n")
-	fn := function.Function{Name: "remove-fn-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "remove-fn-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "remove-fn-e2e", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "remove-fn-e2e", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -670,18 +670,18 @@ events:
 		t.Fatal("expected a warm container")
 	}
 
-	m.RemoveFunction("remove-fn-e2e")
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "remove-fn-e2e") {
-		t.Fatal("idle container should have been discarded on RemoveFunction")
+	m.RemoveApp("remove-fn-e2e")
+	if !waitForContainerGone(ctx, m.cli, labelApp, "remove-fn-e2e") {
+		t.Fatal("idle container should have been discarded on RemoveApp")
 	}
 
-	// A new execute for the removed function must fail without running a
+	// A new execute for the removed app must fail without running a
 	// throwaway container (the invocation stays pending for replay).
 	err = m.Execute(execCtx, prepared, "index.run", []byte(`{"event_name":"INSERT"}`), nil)
 	if !errors.Is(err, errPoolClosed) {
-		t.Fatalf("execute after RemoveFunction = %v, want errPoolClosed", err)
+		t.Fatalf("execute after RemoveApp = %v, want errPoolClosed", err)
 	}
-	if countContainersByLabel(ctx, m.cli, labelFunction, "remove-fn-e2e") != 0 {
+	if countContainersByLabel(ctx, m.cli, labelApp, "remove-fn-e2e") != 0 {
 		t.Fatal("a removed function must not start new warm containers")
 	}
 
@@ -722,7 +722,7 @@ export async function slow(event) {
   await new Promise(r => setTimeout(r, 10000));
 }
 `)
-	fn := function.Function{Name: "pool-metrics-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "pool-metrics-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -730,7 +730,7 @@ export async function slow(event) {
 
 	exec := func(handler string, timeout time.Duration) error {
 		ectx := context.WithValue(context.Background(), runMetaKey{},
-			RunMeta{Hostname: "test-host", Function: "pool-metrics-e2e", Handler: handler, Image: prepared.Image})
+			RunMeta{Hostname: "test-host", App: "pool-metrics-e2e", Handler: handler, Image: prepared.Image})
 		if timeout > 0 {
 			var cancelFn context.CancelFunc
 			ectx, cancelFn = context.WithTimeout(ectx, timeout)
@@ -755,10 +755,10 @@ export async function slow(event) {
 		t.Fatalf("warm acquires = %d, want 1", got)
 	}
 
-	// Capacity gauge is the function's resolved concurrency.
+	// Capacity gauge is the app's resolved concurrency.
 	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
-		[]metrics.Label{{Name: "function", Value: "pool-metrics-e2e"}}); got != float64(function.DefaultConcurrency) {
-		t.Fatalf("capacity gauge = %v, want %d", got, function.DefaultConcurrency)
+		[]metrics.Label{{Name: "app", Value: "pool-metrics-e2e"}}); got != float64(app.DefaultConcurrency) {
+		t.Fatalf("capacity gauge = %v, want %d", got, app.DefaultConcurrency)
 	}
 
 	// Timeout discards the container with the timeout reason.
@@ -766,10 +766,10 @@ export async function slow(event) {
 		t.Fatal("expected the slow handler to time out")
 	}
 	if got := reg.CounterLabels(metrics.MetricRuntimeContainerDiscards,
-		[]metrics.Label{{Name: "function", Value: "pool-metrics-e2e"}, {Name: "reason", Value: "timeout"}}); got != 1 {
+		[]metrics.Label{{Name: "app", Value: "pool-metrics-e2e"}, {Name: "reason", Value: "timeout"}}); got != 1 {
 		t.Fatalf("timeout discards = %d, want 1", got)
 	}
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "pool-metrics-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "pool-metrics-e2e") {
 		t.Error("timed-out container should have been discarded")
 	}
 
@@ -782,7 +782,7 @@ export async function slow(event) {
 		"relay_runtime_container_discards_total",
 		"relay_runtime_container_acquire_duration_seconds_count",
 		"relay_runtime_pool_capacity",
-		`relay_runtime_containers{function="pool-metrics-e2e",state="idle"}`,
+		`relay_runtime_containers{app="pool-metrics-e2e",state="idle"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/metrics missing %q:\n%s", want, body)
@@ -791,9 +791,9 @@ export async function slow(event) {
 }
 
 // TestIntegrationPoolMetricsConcurrent drives concurrent invocations of the
-// same function end to end and asserts the pool observes only cold starts (all
+// same app end to end and asserts the pool observes only cold starts (all
 // pool slots start fresh), the starting gauge rolls back to zero, and the busy
-// gauge equals the function's concurrency.
+// gauge equals the app's concurrency.
 func TestIntegrationPoolMetricsConcurrent(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, reg := newMetricsManager(t)
@@ -817,8 +817,8 @@ export async function sleep(event) {
   console.log("done");
 }
 `)
-	fn := function.Function{Name: "pool-metrics-conc", Dir: dir,
-		Template: &function.Template{Runtime: "node24", Concurrency: 2}}
+	fn := app.App{Name: "pool-metrics-conc", Dir: dir,
+		Template: &app.Template{Runtime: "node24", Concurrency: 2}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -835,13 +835,13 @@ export async function sleep(event) {
 		go func() {
 			defer wg.Done()
 			ectx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", Function: "pool-metrics-conc", Handler: "index.sleep", Image: prepared.Image})
+				RunMeta{Hostname: "test-host", App: "pool-metrics-conc", Handler: "index.sleep", Image: prepared.Image})
 			errCh <- m.Execute(ectx, prepared, "index.sleep", []byte(`{"event_name":"INSERT"}`), nil)
 		}()
 	}
 	// Wait until both containers are leased (busy == 2).
 	busyLabels := []metrics.Label{
-		{Name: "function", Value: "pool-metrics-conc"},
+		{Name: "app", Value: "pool-metrics-conc"},
 		{Name: "state", Value: metrics.RuntimeStateBusy},
 	}
 	if !pollUntil(ctx, 30*time.Second, func() bool {
@@ -864,14 +864,14 @@ export async function sleep(event) {
 	}
 	for _, state := range []string{metrics.RuntimeStateStarting} {
 		if got := reg.GaugeLabels(metrics.MetricRuntimeContainers,
-			[]metrics.Label{{Name: "function", Value: "pool-metrics-conc"}, {Name: "state", Value: state}}); got != 0 {
+			[]metrics.Label{{Name: "app", Value: "pool-metrics-conc"}, {Name: "state", Value: state}}); got != 0 {
 			t.Fatalf("%s gauge after run = %v, want 0", state, got)
 		}
 	}
 }
 
 // TestIntegrationPrepareResizesLivePool drives the full Prepare -> pool-resize
-// path end to end against Docker: a function prepared at concurrency 1 warms a
+// path end to end against Docker: an app prepared at concurrency 1 warms a
 // pool bounded by 1, then a hot-swapped template raising concurrency propagates
 // the new bound to the ALREADY-CREATED pool through Manager.Prepare (no restart
 // and no new Manager). The capacity gauge, live snapshot, and acquisition bound
@@ -892,8 +892,8 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	fn := function.Function{Name: "prepare-resize-e2e", Dir: dir,
-		Template: &function.Template{Runtime: "node24", Concurrency: 1}}
+	fn := app.App{Name: "prepare-resize-e2e", Dir: dir,
+		Template: &app.Template{Runtime: "node24", Concurrency: 1}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 1: %v", err)
@@ -903,7 +903,7 @@ events:
 	}
 	// Warm the pool at 1.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "prepare-resize-e2e", Image: p1.Image})
+		RunMeta{Hostname: "test-host", App: "prepare-resize-e2e", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute at concurrency 1: %v", err)
 	}
@@ -911,7 +911,7 @@ events:
 		t.Fatalf("snapshot after concurrency 1 = %+v, ok=%v; want capacity 1", s, ok)
 	}
 
-	// Hot-swap template.yaml to concurrency 3 (changing the function content, so
+	// Hot-swap template.yaml to concurrency 3 (changing the app content, so
 	// the reconciler rebuilds) and re-Prepare.
 	writeFile(t, dir, "template.yaml", `
 runtime: node24
@@ -921,7 +921,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	fn.Template = &function.Template{Runtime: "node24", Concurrency: 3}
+	fn.Template = &app.Template{Runtime: "node24", Concurrency: 3}
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 3: %v", err)
@@ -932,7 +932,7 @@ events:
 
 	// The already-created pool's bound follows the successful Prepare.
 	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
-		[]metrics.Label{{Name: "function", Value: "prepare-resize-e2e"}}); got != 3 {
+		[]metrics.Label{{Name: "app", Value: "prepare-resize-e2e"}}); got != 3 {
 		t.Fatalf("capacity gauge after re-prepare = %v, want 3", got)
 	}
 	s, ok := m.PoolSnapshot("prepare-resize-e2e")
@@ -942,18 +942,18 @@ events:
 
 	// Admission opened: the new image's containers now fit up to 3 concurrently.
 	execCtx2 := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "prepare-resize-e2e", Image: p2.Image})
+		RunMeta{Hostname: "test-host", App: "prepare-resize-e2e", Image: p2.Image})
 	if err := m.Execute(execCtx2, p2, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after re-prepare: %v", err)
 	}
 }
 
 // TestIntegrationPrepareClipsConcurrencyToGlobal drives the MAX_CONCURRENCY clip
-// end to end against Docker: a function whose template asks for concurrency 15
+// end to end against Docker: an app whose template asks for concurrency 15
 // under the default worker-global cap of 8 is prepared with an EFFECTIVE bound
 // of 8, and its warm pool's capacity gauge and live snapshot report 8 (not 15).
 // A later hot-swap to concurrency 4 re-clips to 4. This proves the effective
-// min(function concurrency, MAX_CONCURRENCY) — not the raw template value —
+// min(app concurrency, MAX_CONCURRENCY) — not the raw template value —
 // drives runtime pool capacity.
 func TestIntegrationPrepareClipsConcurrencyToGlobal(t *testing.T) {
 	testutil.RequireDocker(t)
@@ -973,7 +973,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	fn := function.Function{Name: "clip-e2e", Dir: dir, Template: &function.Template{Runtime: "node24", Concurrency: 15}}
+	fn := app.App{Name: "clip-e2e", Dir: dir, Template: &app.Template{Runtime: "node24", Concurrency: 15}}
 	p1, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 15: %v", err)
@@ -983,12 +983,12 @@ events:
 	}
 	// Warm the pool and verify the clipped bound, not 15.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "clip-e2e", Image: p1.Image})
+		RunMeta{Hostname: "test-host", App: "clip-e2e", Image: p1.Image})
 	if err := m.Execute(execCtx, p1, "index.run", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute at clipped concurrency 8: %v", err)
 	}
 	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
-		[]metrics.Label{{Name: "function", Value: "clip-e2e"}}); got != 8 {
+		[]metrics.Label{{Name: "app", Value: "clip-e2e"}}); got != 8 {
 		t.Fatalf("capacity gauge = %v, want 8 (clipped)", got)
 	}
 	if s, ok := m.PoolSnapshot("clip-e2e"); !ok || s.Capacity != 8 {
@@ -1004,7 +1004,7 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	fn.Template = &function.Template{Runtime: "node24", Concurrency: 4}
+	fn.Template = &app.Template{Runtime: "node24", Concurrency: 4}
 	p2, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare concurrency 4: %v", err)
@@ -1013,7 +1013,7 @@ events:
 		t.Fatalf("re-prepared concurrency = %d, want 4 (below cap, untouched)", p2.Concurrency)
 	}
 	if got := reg.GaugeLabels(metrics.MetricRuntimePoolCapacity,
-		[]metrics.Label{{Name: "function", Value: "clip-e2e"}}); got != 4 {
+		[]metrics.Label{{Name: "app", Value: "clip-e2e"}}); got != 4 {
 		t.Fatalf("capacity gauge after re-prepare = %v, want 4", got)
 	}
 	if s, ok := m.PoolSnapshot("clip-e2e"); !ok || s.Capacity != 4 {
@@ -1029,7 +1029,7 @@ events:
 func TestIntegrationSuccessfulRunKeepsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1046,22 +1046,22 @@ export function ok(event) {
   console.log("ok " + event.event_id);
 }
 `)
-	fn := function.Function{Name: "no-remove-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "no-remove-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "no-remove-e2e", Handler: "index.ok", Image: prepared.Image})
 	event1 := []byte(`{"event_id":"evt_1","event_name":"INSERT"}`)
 	if err := m.Execute(execCtx, prepared, "index.ok", event1, nil); err != nil {
 		t.Fatalf("execute 1: %v", err)
 	}
 
-	// The reuse container is still running (Polled by its function label; the
+	// The reuse container is still running (Polled by its app label; the
 	// per-invocation labels are empty at creation time by design).
-	id1 := waitForContainerByLabel(ctx, m.cli, labelFunction, "no-remove-e2e")
+	id1 := waitForContainerByLabel(ctx, m.cli, labelApp, "no-remove-e2e")
 	if id1 == "" {
 		t.Fatal("reused execution container not found while healthy")
 	}
@@ -1079,7 +1079,7 @@ export function ok(event) {
 	if err := m.Execute(execCtx, prepared, "index.ok", event2, nil); err != nil {
 		t.Fatalf("execute 2: %v", err)
 	}
-	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "no-remove-e2e")
+	id2 := waitForContainerByLabel(ctx, m.cli, labelApp, "no-remove-e2e")
 	if id2 != id1 {
 		t.Errorf("second invocation must REUSE the same container: id1=%s id2=%s", id1, id2)
 	}
@@ -1091,7 +1091,7 @@ export function ok(event) {
 	if err := m.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "no-remove-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "no-remove-e2e") {
 		t.Error("container should have been removed on Manager.Close (shutdown)")
 	}
 }
@@ -1115,7 +1115,7 @@ func TestIntegrationFailedStartRemovesContainer(t *testing.T) {
 		Config: &container.Config{
 			Image: "node:24-alpine",
 			Labels: runLabels(RunMeta{
-				Hostname: "test-host", Function: "fail-start-e2e",
+				Hostname: "test-host", App: "fail-start-e2e",
 				Handler: "index.run", Image: "node:24-alpine",
 			}),
 		},
@@ -1172,7 +1172,7 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 
 // TestIntegrationContainerCreationLabels drives a real execution while
 // verifying the creation-time label set on the reused container: the IDENTITY
-// labels (relay.type, relay.function, relay.hostname, relay.image) are stamped
+// labels (relay.type, relay.app, relay.hostname, relay.image) are stamped
 // from the creating invocation's RunMeta, while the per-invocation labels
 // (relay.handler, relay.message_id, relay.event_id, relay.event_name) are
 // EMPTY — labels are immutable per container and this container outlives
@@ -1182,7 +1182,7 @@ func TestIntegrationRemoveContainerTwiceBenign(t *testing.T) {
 func TestIntegrationContainerCreationLabels(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1200,7 +1200,7 @@ export async function slow(event) {
   console.log("completed " + event.event_id);
 }
 `)
-	fn := function.Function{Name: "labels-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "labels-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1209,7 +1209,7 @@ export async function slow(event) {
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
 		RunMeta{
 			Type:      ContainerTypeEvent,
-			Function:  "labels-e2e",
+			App:       "labels-e2e",
 			Handler:   "index.slow",
 			MessageID: "1791234567890-0",
 			EventID:   "evt_777",
@@ -1223,14 +1223,14 @@ export async function slow(event) {
 	}()
 
 	// Poll while the handler runs (sleeps 1.5s) for the container carrying our
-	// function label, then assert the full label set while it runs.
+	// app label, then assert the full label set while it runs.
 	id := ""
 	pollUntil(ctx, 15*time.Second, func() bool {
-		id = findContainerByLabel(ctx, m.cli, labelFunction, "labels-e2e")
+		id = findContainerByLabel(ctx, m.cli, labelApp, "labels-e2e")
 		return id != ""
 	})
 	if id == "" {
-		t.Fatal("container with relay.function=labels-e2e not found during execution")
+		t.Fatal("container with relay.app=labels-e2e not found during execution")
 	}
 	// Inspect what we saw to assert all labels.
 	list, err := m.cli.ContainerList(ctx, client.ContainerListOptions{All: true})
@@ -1248,7 +1248,7 @@ export async function slow(event) {
 	}
 	for k, want := range map[string]string{
 		labelType:      ContainerTypeEvent,
-		labelFunction:  "labels-e2e",
+		labelApp:       "labels-e2e",
 		labelHandler:   "",
 		labelMessageID: "",
 		labelEventID:   "",
@@ -1281,7 +1281,7 @@ export async function slow(event) {
 	if err := m.Execute(execCtx, prepared, "index.slow", event778, nil); err != nil {
 		t.Fatalf("execute 2: %v", err)
 	}
-	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "labels-e2e")
+	id2 := waitForContainerByLabel(ctx, m.cli, labelApp, "labels-e2e")
 	if id2 != id {
 		t.Errorf("second invocation must reuse the container: id1=%s id2=%s", id, id2)
 	}
@@ -1294,7 +1294,7 @@ export async function slow(event) {
 func TestIntegrationHandlerErrorKeepsContainer(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -1315,14 +1315,14 @@ export function ok(event) {
   console.log("recovered " + event.n);
 }
 `)
-	fn := function.Function{Name: "fail-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "fail-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
 
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "fail-e2e", Handler: "index.fail", Image: prepared.Image})
 	err = m.Execute(execCtx, prepared, "index.fail", []byte(`{"event_name":"INSERT"}`), nil)
 	if err == nil {
 		t.Fatal("expected execute to fail for the erroring handler")
@@ -1330,32 +1330,32 @@ export function ok(event) {
 	if !strings.Contains(err.Error(), `handler "index.fail" failed`) {
 		t.Errorf("expected handler-failure error, got: %v", err)
 	}
-	// stderr (console.error) is forwarded to the function-output sink on a line
+	// stderr (console.error) is forwarded to the app-output sink on a line
 	// carrying the handler context; the exact prefix format is unit-tested, so
 	// this asserts the transport contract only.
 	if !lineHasAll(out.String(), "boom", "stderr") {
 		t.Errorf("expected stderr 'boom' forwarded on a stderr line, got: %q", out.String())
 	}
 	// The container is healthy and RETAINED after a handler error.
-	id1 := waitForContainerByLabel(ctx, m.cli, labelFunction, "fail-e2e")
+	id1 := waitForContainerByLabel(ctx, m.cli, labelApp, "fail-e2e")
 	if id1 == "" {
 		t.Fatal("container should be retained after a handler error")
 	}
 
 	// The next invocation succeeds on the SAME container.
 	okCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "fail-e2e", Handler: "index.ok", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "fail-e2e", Handler: "index.ok", Image: prepared.Image})
 	if err := m.Execute(okCtx, prepared, "index.ok", []byte(`{"n":1}`), nil); err != nil {
 		t.Fatalf("execute after failure: %v", err)
 	}
-	id2 := waitForContainerByLabel(ctx, m.cli, labelFunction, "fail-e2e")
+	id2 := waitForContainerByLabel(ctx, m.cli, labelApp, "fail-e2e")
 	if id2 != id1 {
 		t.Errorf("post-error invocation must reuse the same container: id1=%s id2=%s", id1, id2)
 	}
 	if !strings.Contains(out.String(), "recovered 1") {
 		t.Errorf("expected 'recovered 1', got: %s", out.String())
 	}
-	// Protocol frames must never leak to the function-output sink.
+	// Protocol frames must never leak to the app-output sink.
 	if strings.Contains(out.String(), relayProtocolSentinel) {
 		t.Errorf("protocol frames leaked into the function output sink:\n%s", out.String())
 	}
@@ -1390,7 +1390,7 @@ export function quick(event) {
   console.log("quick done");
 }
 `)
-	fn := function.Function{Name: "timeout-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "timeout-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -1398,7 +1398,7 @@ export function quick(event) {
 
 	// Timeout the invocation after 1s: the handler sleeps 10s, so the ctx
 	// timeout path must kill and discard the container.
-	timeoutMeta := RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}
+	timeoutMeta := RunMeta{Hostname: "test-host", App: "timeout-e2e", Handler: "index.sleeper", Image: prepared.Image}
 	invokeCtx, invokeCancel := context.WithTimeout(
 		context.WithValue(context.Background(), runMetaKey{}, timeoutMeta), 1*time.Second)
 	defer invokeCancel()
@@ -1409,28 +1409,28 @@ export function quick(event) {
 	if !strings.Contains(err.Error(), "docker run:") {
 		t.Errorf("expected the wrapped ctx error wording, got: %v", err)
 	}
-	if !waitForContainerGone(ctx, m.cli, labelFunction, "timeout-e2e") {
+	if !waitForContainerGone(ctx, m.cli, labelApp, "timeout-e2e") {
 		t.Error("timed-out container should have been killed and removed (discarded)")
 	}
 
 	// The next invocation uses a FRESH container (the cache dropped the dead
 	// one) and succeeds.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "timeout-e2e", Handler: "index.quick", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "timeout-e2e", Handler: "index.quick", Image: prepared.Image})
 	if err := m.Execute(execCtx, prepared, "index.quick", []byte(`{"event_name":"INSERT"}`), nil); err != nil {
 		t.Fatalf("execute after timeout: %v", err)
 	}
-	if id := waitForContainerByLabel(ctx, m.cli, labelFunction, "timeout-e2e"); id == "" {
+	if id := waitForContainerByLabel(ctx, m.cli, labelApp, "timeout-e2e"); id == "" {
 		t.Error("expected a fresh container to be running after the timeout discard")
 	}
 }
 
 // TestIntegrationContainerHardening drives a real execution of both a Python
-// and a Node function whose handlers assert the hardening from inside the
+// and a Node app whose handlers assert the hardening from inside the
 // container (non-root uid, read-only rootfs, writable /tmp, dropped caps), and
 // mid-flight inspects the running container to assert the resource limits and
 // host-config hardening are actually applied by the daemon. It also asserts
-// networking is not disabled (outbound access is a legitimate function need).
+// networking is not disabled (outbound access is a legitimate app need).
 func TestIntegrationContainerHardening(t *testing.T) {
 	testutil.RequireDocker(t)
 
@@ -1543,7 +1543,7 @@ export function check(event) {
 }
 `)
 
-	// Run both functions. Each Prepare builds a fresh image; the in-handler
+	// Run both apps. Each Prepare builds a fresh image; the in-handler
 	// assertions run inside the hardened container and Execute returns nil only
 	// if every assertion passed.
 	for _, tc := range []struct {
@@ -1557,9 +1557,9 @@ export function check(event) {
 		{"node", ndDir, "node24", "index.check", []byte(`{"event_name":"INSERT"}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fn := function.Function{Name: "harden-" + tc.name, Dir: tc.dir, Template: &function.Template{Runtime: tc.runtime}}
+			fn := app.App{Name: "harden-" + tc.name, Dir: tc.dir, Template: &app.Template{Runtime: tc.runtime}}
 			m, _ := newManager(t)
-			out := newFunctionOutputSink(t)
+			out := newAppOutputSink(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
@@ -1579,7 +1579,7 @@ export function check(event) {
 			// Run the handler in a goroutine so we can inspect the container
 			// mid-flight while it runs.
 			execCtx := context.WithValue(context.Background(), runMetaKey{},
-				RunMeta{Hostname: "test-host", Function: "harden-" + tc.name, Image: prepared.Image})
+				RunMeta{Hostname: "test-host", App: "harden-" + tc.name, Image: prepared.Image})
 			done := make(chan error, 1)
 			go func() {
 				done <- m.Execute(execCtx, prepared, tc.handler, tc.event, nil)
@@ -1587,14 +1587,14 @@ export function check(event) {
 
 			// Poll for the running container (the reused container stays
 			// running between invocations; it is polled by the creation-time
-			// function label), then inspect it to assert the host-config
+			// app label), then inspect it to assert the host-config
 			// hardening is actually applied by the daemon. The container is
 			// labeled at create, so polling for the label also bridges the
 			// create->start gap deterministically; HostConfig is applied at
 			// create and is inspectable without a fixed settle delay.
 			id := ""
 			pollUntil(ctx, 15*time.Second, func() bool {
-				id = findContainerByLabel(ctx, m.cli, labelFunction, "harden-"+tc.name)
+				id = findContainerByLabel(ctx, m.cli, labelApp, "harden-"+tc.name)
 				return id != ""
 			})
 			if id == "" {

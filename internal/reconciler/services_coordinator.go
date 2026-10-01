@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 )
 
@@ -13,12 +13,12 @@ const serviceReconcileWorkers = 2
 type serviceRequest struct {
 	remove      bool
 	name        string
-	tmpl        *function.Template
+	tmpl        *app.Template
 	image       string
 	preparedEnv []string
 	// lease is the managed image lease the producer acquired BEFORE enqueue and
 	// owns across this request's whole life. It is held through pending
-	// retention, worker execution, and StartService completion, so the function
+	// retention, worker execution, and StartService completion, so the app
 	// image a service pass is converging to (or from) cannot be removed out from
 	// under it. A coalesced (superseded) pending request releases its lease; a
 	// request the worker never picks up (lifecycle cancellation) also releases
@@ -37,7 +37,7 @@ type serviceRequest struct {
 	onComplete       func(error)
 }
 
-// serviceFunctionState is one function's desired-state slot. At most one pass
+// serviceAppState is one app's desired-state slot. At most one pass
 // runs at a time; a newer desired state replaces a not-yet-started pending
 // request (coalescing to the latest). running is true from when a pass is
 // scheduled until it (and any chained replacement) finishes, and it is what
@@ -46,13 +46,13 @@ type serviceRequest struct {
 // worker has picked up is no longer referenced here, so lifecycle cancellation
 // can never release an executing request's done early — that worker closes it
 // once its bounded operation returns.
-type serviceFunctionState struct {
+type serviceAppState struct {
 	pending *serviceRequest
 	running bool
 }
 
 // ServiceCoordinator asynchronously converges persistent services. It permits
-// work for different functions to run concurrently, while each function has at
+// work for different apps to run concurrently, while each app has at
 // most one active pass and only its latest pending desired state is retained.
 // The fixed worker count deliberately keeps Docker pressure bounded.
 //
@@ -66,7 +66,7 @@ type serviceFunctionState struct {
 // resuming with the latest coalesced desired states.
 //
 // Desired states are snapshotted at enqueue time (see cloneServiceTemplate), so
-// a live reconciler replacing a function's template cannot mutate a queued or
+// a live reconciler replacing an app's template cannot mutate a queued or
 // in-flight request underneath a worker.
 type ServiceCoordinator struct {
 	services *ServiceReconciler
@@ -75,7 +75,7 @@ type ServiceCoordinator struct {
 	jobs     chan string
 
 	mu          sync.Mutex
-	states      map[string]*serviceFunctionState
+	states      map[string]*serviceAppState
 	idle        *sync.Cond
 	paused      bool
 	stopped     bool
@@ -91,7 +91,7 @@ func NewServiceCoordinator(services *ServiceReconciler) *ServiceCoordinator {
 	return &ServiceCoordinator{
 		services:   services,
 		jobs:       make(chan string),
-		states:     make(map[string]*serviceFunctionState),
+		states:     make(map[string]*serviceAppState),
 		desiredIDs: make(map[string]uint64),
 	}
 }
@@ -117,11 +117,11 @@ func (c *ServiceCoordinator) Start(lifecycle context.Context) {
 // An in-flight pass is never interrupted; its replacement runs immediately
 // afterward using the latest request. The template and prepared env are
 // snapshotted (see cloneServiceTemplate) so the live reconciler swapping the
-// function's template cannot mutate a queued or in-flight request under a
+// app's template cannot mutate a queued or in-flight request under a
 // worker.
 func (c *ServiceCoordinator) Enqueue(
 	name string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 	preparedEnv []string,
 ) {
@@ -138,7 +138,7 @@ func (c *ServiceCoordinator) Enqueue(
 // never complete a newer generation's status transition. onReconcileStart fires
 // once the source is resolved and container convergence is about to begin.
 func (c *ServiceCoordinator) EnqueueWithStatus(
-	name string, tmpl *function.Template, image string, preparedEnv []string,
+	name string, tmpl *app.Template, image string, preparedEnv []string,
 	onReconcileStart func(), onComplete func(error),
 ) {
 	c.enqueue(&serviceRequest{name: name, meaningful: true, tmpl: cloneServiceTemplate(tmpl), image: image,
@@ -150,11 +150,11 @@ func (c *ServiceCoordinator) EnqueueWithStatus(
 // held across pending retention, worker execution, and StartService completion,
 // so the image cannot be removed while this service pass may still need it. A
 // superseded pending request releases its lease; the worker releases the running
-// one after the operation. lease may be nil (a no-runtime function or a test
+// one after the operation. lease may be nil (a no-runtime app or a test
 // caller), making this identical to Enqueue.
 func (c *ServiceCoordinator) EnqueueLeased(
 	name string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 	preparedEnv []string,
 	lease *runtime.ImageLease,
@@ -171,7 +171,7 @@ func (c *ServiceCoordinator) EnqueueLeased(
 // EnqueueWithStatusLeased is EnqueueWithStatus with an admitted image lease
 // (see EnqueueLeased).
 func (c *ServiceCoordinator) EnqueueWithStatusLeased(
-	name string, tmpl *function.Template, image string, preparedEnv []string,
+	name string, tmpl *app.Template, image string, preparedEnv []string,
 	lease *runtime.ImageLease,
 	onReconcileStart func(), onComplete func(error),
 ) {
@@ -183,7 +183,7 @@ func (c *ServiceCoordinator) EnqueueWithStatusLeased(
 // EnqueueStatusObservationLeased is EnqueueStatusObservation with an admitted
 // image lease (see EnqueueLeased).
 func (c *ServiceCoordinator) EnqueueStatusObservationLeased(
-	name string, tmpl *function.Template, image string, preparedEnv []string,
+	name string, tmpl *app.Template, image string, preparedEnv []string,
 	lease *runtime.ImageLease,
 	onReconcileStart func(), onComplete func(error),
 ) {
@@ -198,7 +198,7 @@ func (c *ServiceCoordinator) EnqueueStatusObservationLeased(
 // because a periodic tick happened while it was in flight. A newer meaningful
 // request still supersedes both the observation and any older operation.
 func (c *ServiceCoordinator) EnqueueStatusObservation(
-	name string, tmpl *function.Template, image string, preparedEnv []string,
+	name string, tmpl *app.Template, image string, preparedEnv []string,
 	onReconcileStart func(), onComplete func(error),
 ) {
 	c.enqueue(&serviceRequest{name: name, tmpl: cloneServiceTemplate(tmpl), image: image,
@@ -208,7 +208,7 @@ func (c *ServiceCoordinator) EnqueueStatusObservation(
 // EnqueueRemove publishes a removal and returns immediately. It is the
 // nonblocking counterpart of RemoveAndWait for callers that must not wait on
 // Docker work (startup's unavailable/no-services cleanup). Like any desired
-// state it serializes behind the function's active pass and is itself replaced
+// state it serializes behind the app's active pass and is itself replaced
 // by a newer enqueue.
 func (c *ServiceCoordinator) EnqueueRemove(name string) {
 	c.enqueue(&serviceRequest{name: name, remove: true})
@@ -216,14 +216,14 @@ func (c *ServiceCoordinator) EnqueueRemove(name string) {
 
 // RemoveAndWait serializes removal behind any active pass for name and waits
 // DETERMINISTICALLY until the request concludes. It is the reconciler's removal
-// hook, called before the function's images are retired: returning while the
+// hook, called before the app's images are retired: returning while the
 // container stop was still running (e.g. because a caller timeout expired) would
 // let image retirement race the very removal it depends on, so there is no
 // early-return timeout path. The wait ends when the worker closes the request's
 // done after the removal returns; at shutdown the lifecycle cancels the bounded
 // removal context, so the wait is still bounded. A removal superseded by a newer
 // enqueue before it starts concludes without running — not reachable from the
-// removal hook, which runs after the function is gone and no further desired
+// removal hook, which runs after the app is gone and no further desired
 // state is published for it.
 //
 // The removal operation is bounded by a fresh coordinator-derived context
@@ -251,7 +251,7 @@ func (c *ServiceCoordinator) Wait(ctx context.Context) error {
 	return c.waitIdleLocked(ctx)
 }
 
-// waitIdleLocked parks on the idle condition until no function has running or
+// waitIdleLocked parks on the idle condition until no app has running or
 // pending work (busyLocked), returning ctx.Err() on cancellation. The caller
 // must hold c.mu; it is still held on return. The context.AfterFunc watcher is
 // what makes a Wait/RunExclusive parked with no worker progress wake promptly
@@ -280,7 +280,7 @@ func (c *ServiceCoordinator) waitIdleLocked(ctx context.Context) error {
 // sweep, image sweep, dependency GC) can never overlap an Apply, a Remove, or a
 // worker picking up a freshly enqueued request. Requests published while fn runs
 // are neither dropped nor run concurrently: they coalesce as pending desired
-// states exactly as under normal operation, and the latest state per function is
+// states exactly as under normal operation, and the latest state per app is
 // scheduled when fn returns.
 //
 // fn runs with ctx and is expected to be the bounded, lifecycle-aware cleanup
@@ -347,7 +347,7 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	}
 	state := c.states[req.name]
 	if state == nil {
-		state = &serviceFunctionState{}
+		state = &serviceAppState{}
 		c.states[req.name] = state
 	}
 	c.nextID++
@@ -373,7 +373,7 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	// While RunExclusive holds the housekeeping pause, scheduling is deferred:
 	// the request is retained (coalescing to the latest) but no worker pass is
 	// started, so it cannot overlap the exclusive cleanup. resume schedules the
-	// latest pending state per function once the pause lifts.
+	// latest pending state per app once the pause lifts.
 	schedule := !c.paused && !state.running
 	if schedule {
 		state.running = true
@@ -381,14 +381,14 @@ func (c *ServiceCoordinator) enqueue(req *serviceRequest) chan struct{} {
 	c.mu.Unlock()
 	if schedule {
 		// The state was marked running while holding the mutex; signal outside it
-		// so the function reconciler never blocks behind a busy Docker worker.
+		// so the app reconciler never blocks behind a busy Docker worker.
 		go c.signal(req.name)
 	}
 	return req.done
 }
 
 // resume lifts the RunExclusive pause and schedules the latest pending desired
-// state for every function that acquired one during the pause. It is only ever
+// state for every app that acquired one during the pause. It is only ever
 // called by RunExclusive, which is the sole writer of paused, so there is no
 // concurrent pause to lose. The signals are launched outside the mutex, matching
 // enqueue, so a worker is never asked to wait on a busy reconciler.
@@ -439,7 +439,7 @@ func (c *ServiceCoordinator) run(name string) {
 	// state, so lifecycle cancellation can never release its waiter early. The
 	// worker closes it below, after the (bounded) operation returns. Its admitted
 	// image lease (when present) is held for the whole operation and released
-	// after it, so the function image cannot be removed while the service pass
+	// after it, so the app image cannot be removed while the service pass
 	// still needs it.
 	if req.remove {
 		// Removal is a single quick Docker operation, so it runs on its own
@@ -470,7 +470,7 @@ func (c *ServiceCoordinator) run(name string) {
 			applyCtx = runtime.WithImageLease(applyCtx, req.lease)
 		}
 		// Supersession authority: while this pass runs, a newer desired state for
-		// this function (a live reload, or a periodic self-heal that inherited a
+		// this app (a live reload, or a periodic self-heal that inherited a
 		// newer token) makes it stale. Reconcile consults this at its commit
 		// boundaries, so a superseded pass never stops the old generation it was
 		// about to replace; it cleans only its own provisional replacements and
@@ -495,7 +495,7 @@ func (c *ServiceCoordinator) run(name string) {
 
 	c.mu.Lock()
 	if state.pending != nil {
-		// Keep the function marked running, but signal outside the mutex. This
+		// Keep the app marked running, but signal outside the mutex. This
 		// avoids blocking a worker that needs the mutex to finish another job.
 		// This tail never runs during a housekeeping pause: RunExclusive acquires
 		// the pause only once the coordinator is idle (no running or pending
@@ -530,20 +530,20 @@ func (c *ServiceCoordinator) removalContext() (context.Context, context.CancelFu
 
 // cloneServiceTemplate snapshots the template fields the service reconcile path
 // reads — Runtime, Env, Secrets, and Services — so a live reconciler
-// replacing a function's *Template while a request is queued or in flight cannot
+// replacing an app's *Template while a request is queued or in flight cannot
 // mutate the copy a worker is converging. Template is otherwise treated as
 // immutable, but the live registry shares the pointer with the reconciler, so a
 // copied slice/map is the race-free envelope. Services are value structs, so a
 // copied slice fully detaches them; Env/Secrets get fresh maps. A nil template
 // clones to nil.
-func cloneServiceTemplate(tmpl *function.Template) *function.Template {
+func cloneServiceTemplate(tmpl *app.Template) *app.Template {
 	if tmpl == nil {
 		return nil
 	}
 	clone := *tmpl
 	clone.Env = cloneStringMap(tmpl.Env)
 	clone.Secrets = cloneSecretMap(tmpl.Secrets)
-	clone.Services = append([]function.Service(nil), tmpl.Services...)
+	clone.Services = append([]app.Service(nil), tmpl.Services...)
 	return &clone
 }
 
@@ -558,11 +558,11 @@ func cloneStringMap(src map[string]string) map[string]string {
 	return dst
 }
 
-func cloneSecretMap(src map[string]function.SecretRef) map[string]function.SecretRef {
+func cloneSecretMap(src map[string]app.SecretRef) map[string]app.SecretRef {
 	if src == nil {
 		return nil
 	}
-	dst := make(map[string]function.SecretRef, len(src))
+	dst := make(map[string]app.SecretRef, len(src))
 	for k, v := range src {
 		dst[k] = v
 	}

@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 )
 
-// reusableContainer is the seam the per-function container pool programs: the
+// reusableContainer is the seam the per-app container pool programs: the
 // production implementation is *executionContainer; tests inject fake
 // containers to exercise the pool's get-or-create, leasing, capacity,
 // invalidation, eviction, and removal logic without a Docker daemon.
@@ -60,7 +60,7 @@ const (
 	reasonImageChanged      = "image_changed"
 	reasonResourcesChanged  = "resources_changed"
 	reasonShutdown          = "shutdown"
-	reasonFunctionRemove    = "function_removed"
+	reasonAppRemove         = "app_removed"
 	reasonIdleTimeout       = "idle_timeout"
 	reasonConcurrencyShrink = "concurrency_shrink"
 	reasonTimeout           = "timeout"
@@ -69,36 +69,36 @@ const (
 )
 
 // errPoolClosed is returned when an acquire is attempted on a cache/pool that
-// has been closed (graceful shutdown) or whose function has been removed. It is
+// has been closed (graceful shutdown) or whose app has been removed. It is
 // not a container failure: the stream layer leaves the invocation pending and a
 // live worker replays it.
 var errPoolClosed = errors.New("runtime: container pool closed")
 
-// containerCache owns a bounded warm pool of execution containers per FUNCTION
-// NAME (a function never touches another function's containers). Each pool
-// holds at most the function's resolved concurrency containers; an invocation
+// containerCache owns a bounded warm pool of execution containers per APP
+// NAME (an app never touches another app's containers). Each pool
+// holds at most the app's resolved concurrency containers; an invocation
 // LEASES one container for the duration of its Invoke and returns it on
-// release. Distinct invocations of the same function therefore run
+// release. Distinct invocations of the same app therefore run
 // concurrently on distinct containers (each container still serializes its own
 // protocol I/O), which is what makes the reused request/response frames
 // well-defined on a shared stdin/stdout pair.
 //
-// The pool's bound is the function's concurrency, the SAME value the runner's
-// per-function semaphore is sized to. It is deliberately NOT a second
-// invocation-concurrency limiter: in the runner path the per-function semaphore
+// The pool's bound is the app's concurrency, the SAME value the runner's
+// per-app semaphore is sized to. It is deliberately NOT a second
+// invocation-concurrency limiter: in the runner path the per-app semaphore
 // already admits at most `concurrency` concurrent Execute calls, so the pool
 // always has capacity and never blocks; direct Execute callers (integration
 // tests) that bypass the runner are bounded by the pool itself.
 //
-// Locking: a manager-wide mu guards the map itself; each function pool carries
+// Locking: a manager-wide mu guards the map itself; each app pool carries
 // its own mutex. The manager-wide mu is never held during create/Invoke, and a
 // pool mutex is never held across start() or Invoke. When a cache-level mutex
 // must be combined with a pool mutex the order is always cache.mu -> pool.mu;
 // no path takes pool.mu and then cache.mu.
 type containerCache struct {
-	// mu guards pools, retiredImages, removedFunctions, and closed.
+	// mu guards pools, retiredImages, removedApps, and closed.
 	mu    sync.Mutex
-	pools map[string]*functionPool
+	pools map[string]*appPool
 	// retiredImages is the cache-level retirement set. invalidateImage records
 	// an image here in the SAME critical section that snapshots the pools, and
 	// poolFor seeds every newly created pool from it. This closes the race where
@@ -109,33 +109,33 @@ type containerCache struct {
 	// (it is created after the retirement was recorded).
 	//
 	// Like the per-pool set, retirements persist for the process UNLESS a
-	// function is successfully re-activated for the same image reference
-	// (activateFunction clears the reference and every content identity sharing
+	// app is successfully re-activated for the same image reference
+	// (activateApp clears the reference and every content identity sharing
 	// it), and are bounded by the number of distinct image versions retired in a
 	// worker's lifetime. Guarded by mu.
 	retiredImages map[string]bool
-	// removedFunctions holds function names whose removal has been requested and
+	// removedApps holds app names whose removal has been requested and
 	// whose pool may still be draining (busy containers completing) or may
 	// already have been deleted once empty. While set, poolFor refuses to create
 	// a new pool for the name, so a stale acquire cannot recreate warm state for
-	// a removed function. Manager.Prepare clears the mark (activateFunction) only
-	// after a successful prepare, so a removed-then-recreated function warms
+	// a removed app. Manager.Prepare clears the mark (activateApp) only
+	// after a successful prepare, so a removed-then-recreated app warms
 	// again. Guarded by mu.
-	removedFunctions map[string]bool
-	// capacity records the last effective per-function concurrency published by
-	// a successful Prepare (see setFunctionConcurrency). poolFor uses it when it
+	removedApps map[string]bool
+	// capacity records the last effective per-app concurrency published by
+	// a successful Prepare (see setAppConcurrency). poolFor uses it when it
 	// CREATES a pool, so a stale in-flight acquire that races a reconcile cannot
 	// seed a fresh pool with an out-of-date Prepared.Concurrency — the pool is
 	// always created at the current effective bound. It is deleted with the
-	// function on removal. Guarded by mu.
+	// app on removal. Guarded by mu.
 	capacity map[string]int
-	// resources records the last effective per-function resource limits published
+	// resources records the last effective per-app resource limits published
 	// by a successful Prepare or a resource-only reconcile
-	// (see setFunctionResources). poolFor seeds a newly created pool from it, and
+	// (see setAppResources). poolFor seeds a newly created pool from it, and
 	// Execute reads it so a resource-only hot change takes effect on the next
 	// container create without a Prepared rebuild. It is deleted with the
-	// function on removal. Guarded by mu.
-	resources map[string]function.ResourceLimits
+	// app on removal. Guarded by mu.
+	resources map[string]app.ResourceLimits
 	closed    bool
 
 	// idleTimeout is how long a healthy idle pooled container may stay before
@@ -152,10 +152,10 @@ type containerCache struct {
 	metrics *metrics.Registry
 }
 
-// generation is one container VERSION's set inside a function pool. A version is
+// generation is one container VERSION's set inside an app pool. A version is
 // the triple (image CONTENT identity, resource config fingerprint): the image
 // content determines the code, and the config fingerprint (`relay.resources`, see
-// function.ResourceLimits.Fingerprint) determines the per-container resource
+// app.ResourceLimits.Fingerprint) determines the per-container resource
 // limits. The image half is the IMMUTABLE content identity resolved before the
 // lease (see resolvedImage.identity) — the reference plus the Docker image ID and
 // the Relay fingerprint metadata — so the same tag whose content changed is a NEW
@@ -176,7 +176,7 @@ type containerCache struct {
 // Retirement is scoped to the mutable REFERENCE, which identityRef recovers from
 // the identity key (the key always begins with "<ref>\x00"), so
 // InvalidateImage/RemoveImage and Prepare's re-activation keep working on the
-// function's own tag regardless of which content identity is currently warm.
+// app's own tag regardless of which content identity is currently warm.
 type generation struct {
 	// image is the immutable content identity (see resolvedImage.identity) that
 	// keys generation matching.
@@ -246,13 +246,13 @@ func clearImageRetirement(set map[string]bool, ref string) {
 	}
 }
 
-// functionPool is one function's bounded warm container pool.
+// appPool is one app's bounded warm container pool.
 //
 // Capacity accounting: usedLocked() (active idle+busy, draining busy, and
 // creating reservations) must stay <= max. creating is the number of capacity
 // reservations in flight (a lazy start that has not yet registered its
 // container); it is rolled back if start fails.
-type functionPool struct {
+type appPool struct {
 	// name and cache back the pool's ability to delete itself from the cache
 	// once a removal has drained it empty.
 	name  string
@@ -294,20 +294,20 @@ type functionPool struct {
 	// is served on a throwaway and a dead tag never warms.
 	//
 	// Retirements are permanent for the pool's lifetime UNLESS the image is
-	// re-activated: activateFunction clears both the bare reference and every
+	// re-activated: activateApp clears both the bare reference and every
 	// identity key sharing its reference, so a reverted content address warms
-	// again. The set is bounded by the number of distinct function versions
-	// retired in a worker's lifetime (and is discarded with the pool on function
+	// again. The set is bounded by the number of distinct app versions
+	// retired in a worker's lifetime (and is discarded with the pool on app
 	// removal). Guarded by mu.
 	retiredImages map[string]bool
 
 	// retiredConfigs holds resource-config fingerprints whose containers must
 	// never be pooled again because a newer effective resource config superseded
-	// them (setFunctionResources). It parallels retiredImages for the config
+	// them (setAppResources). It parallels retiredImages for the config
 	// half of the version identity: a stale request carrying an old config
 	// fingerprint (same image) must be served on a throwaway transient rather
 	// than re-pooling the old limits, and must not supersede the new active
-	// generation. Re-publishing a config (setFunctionResources, after a revert to
+	// generation. Re-publishing a config (setAppResources, after a revert to
 	// a previously-retired fingerprint) clears the entry via replaceConfig so it
 	// warms again. Guarded by mu.
 	retiredConfigs map[string]bool
@@ -332,9 +332,9 @@ type functionPool struct {
 	notify chan struct{}
 }
 
-// pooledContainer is one reusable container in a function pool, with its image
+// pooledContainer is one reusable container in an app pool, with its image
 // version, resource-config fingerprint, owning generation, and retirement state.
-// retired/retireReason/idleSince are guarded by the owning functionPool.mu;
+// retired/retireReason/idleSince are guarded by the owning appPool.mu;
 // membership in a generation's idle/busy set (or the pool's transient set) is
 // the lease state. gen is nil for transient containers.
 type pooledContainer struct {
@@ -369,19 +369,19 @@ func (pc *pooledContainer) matchesVersion(image, config string) bool {
 
 func newContainerCache() *containerCache {
 	return &containerCache{
-		pools:            map[string]*functionPool{},
-		retiredImages:    map[string]bool{},
-		removedFunctions: map[string]bool{},
-		capacity:         map[string]int{},
-		resources:        map[string]function.ResourceLimits{},
+		pools:         map[string]*appPool{},
+		retiredImages: map[string]bool{},
+		removedApps:   map[string]bool{},
+		capacity:      map[string]int{},
+		resources:     map[string]app.ResourceLimits{},
 	}
 }
 
-func newFunctionPool(name string, max int, cache *containerCache) *functionPool {
+func newAppPool(name string, max int, cache *containerCache) *appPool {
 	if max < 1 {
 		max = 1
 	}
-	return &functionPool{
+	return &appPool{
 		name:           name,
 		cache:          cache,
 		max:            max,
@@ -395,7 +395,7 @@ func newFunctionPool(name string, max int, cache *containerCache) *functionPool 
 // clock returns the cache's current time from the injected seam, or the wall
 // clock when unset. It is called with the owning pool's lock held, so the seam
 // must be set before the cache is used (tests do).
-func (p *functionPool) clock() time.Time {
+func (p *appPool) clock() time.Time {
 	if p.cache != nil && p.cache.now != nil {
 		return p.cache.now()
 	}
@@ -406,34 +406,34 @@ func (p *functionPool) clock() time.Time {
 // be Close-able). It must be called with cc.mu held.
 func (cc *containerCache) lazyInit() {
 	if cc.pools == nil {
-		cc.pools = map[string]*functionPool{}
+		cc.pools = map[string]*appPool{}
 	}
 	if cc.retiredImages == nil {
 		cc.retiredImages = map[string]bool{}
 	}
-	if cc.removedFunctions == nil {
-		cc.removedFunctions = map[string]bool{}
+	if cc.removedApps == nil {
+		cc.removedApps = map[string]bool{}
 	}
 	if cc.capacity == nil {
 		cc.capacity = map[string]int{}
 	}
 	if cc.resources == nil {
-		cc.resources = map[string]function.ResourceLimits{}
+		cc.resources = map[string]app.ResourceLimits{}
 	}
 }
 
 // poolFor returns (creating) the pool for fnName. max is used only when the pool
 // is CREATED: an existing pool's bound is authoritative and is updated in place
-// by setFunctionConcurrency when Prepare reconciles the function's resolved
+// by setAppConcurrency when Prepare reconciles the app's resolved
 // concurrency, never by a later acquire (a stale Prepared must not resize a live
 // pool backwards).
 //
 // A pool requested after the cache is closed is returned closed so acquire
-// fails immediately. A function whose removal has been requested (and whose
+// fails immediately. An app whose removal has been requested (and whose
 // pool may already have been deleted) gets a detached, closed pool so a stale
 // acquire can neither recreate warm state nor block: poolFor never inserts a
-// pool for a removed function until activateFunction clears the mark.
-func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
+// pool for a removed app until activateApp clears the mark.
+func (cc *containerCache) poolFor(fnName string, max int) *appPool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.lazyInit()
@@ -448,14 +448,14 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	if effective, ok := cc.capacity[fnName]; ok {
 		max = effective
 	}
-	if cc.removedFunctions[fnName] {
-		p := newFunctionPool(fnName, max, cc)
+	if cc.removedApps[fnName] {
+		p := newAppPool(fnName, max, cc)
 		p.removing = true
 		p.closed = true
 		close(p.notify)
 		return p
 	}
-	p := newFunctionPool(fnName, max, cc)
+	p := newAppPool(fnName, max, cc)
 	// Seed the new pool from the cache-level retirement set under the same mu
 	// that snapshots it below, so an invalidation that already happened (and
 	// therefore may have missed this pool) is still honored: a stale acquire
@@ -469,13 +469,13 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 	}
 	cc.pools[fnName] = p
 	// Publish the pool's bound at registration, before it is shared through the
-	// map. Its bound is later updated in place by setFunctionConcurrency when
+	// map. Its bound is later updated in place by setAppConcurrency when
 	// Prepare reconciles a changed concurrency.
 	p.publishPoolCapacity()
 	return p
 }
 
-// setFunctionResources updates fnName's effective per-container resource limits
+// setAppResources updates fnName's effective per-container resource limits
 // and retires any warm containers created under the previous limits, so a
 // resource-only template change takes effect on the next container create
 // WITHOUT a rebuild. It is how the reconciler's skip path (a resource-only
@@ -487,7 +487,7 @@ func (cc *containerCache) poolFor(fnName string, max int) *functionPool {
 // active generation is superseded: idle old-config containers are discarded now,
 // busy ones drain on release, and the next acquire opens a new generation. A
 // no-op (equal limits) touches nothing, so an unchanged template never churns.
-func (cc *containerCache) setFunctionResources(fnName string, limits function.ResourceLimits) {
+func (cc *containerCache) setAppResources(fnName string, limits app.ResourceLimits) {
 	limits = limits.OrDefault()
 	cc.mu.Lock()
 	cc.lazyInit()
@@ -513,7 +513,7 @@ func (cc *containerCache) setFunctionResources(fnName string, limits function.Re
 // containers immediately, and moves its busy ones to a draining generation. It
 // returns the idle containers to discard outside the lock, and must not be called
 // with p.mu held.
-func (p *functionPool) replaceConfig(newConfig string) []*pooledContainer {
+func (p *appPool) replaceConfig(newConfig string) []*pooledContainer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.retiredConfigs, newConfig)
@@ -551,37 +551,37 @@ func (p *functionPool) replaceConfig(newConfig string) []*pooledContainer {
 	return discard
 }
 
-// functionResources returns fnName's current effective per-container resource
+// appResources returns fnName's current effective per-container resource
 // limits as recorded by the last successful Prepare or resource reconcile,
-// defaulting to the package defaults for a function that never published any
+// defaulting to the package defaults for an app that never published any
 // (a direct/integration caller). It is the single read path for both the cache's
 // generation identity and the Manager's container create, so the limits a
 // container is created with and the generation it is pooled under always agree.
-func (cc *containerCache) functionResources(fnName string) function.ResourceLimits {
+func (cc *containerCache) appResources(fnName string) app.ResourceLimits {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.lazyInit()
 	if limits, ok := cc.resources[fnName]; ok {
 		return limits.OrDefault()
 	}
-	return function.DefaultResourceLimits()
+	return app.DefaultResourceLimits()
 }
 
-// functionConfig is shorthand for the resource fingerprint of fnName's current
+// appConfig is shorthand for the resource fingerprint of fnName's current
 // effective limits: the config half of the cache's generation identity.
-func (cc *containerCache) functionConfig(fnName string) string {
-	return cc.functionResources(fnName).Fingerprint()
+func (cc *containerCache) appConfig(fnName string) string {
+	return cc.appResources(fnName).Fingerprint()
 }
 
-// setFunctionConcurrency updates fnName's live warm pool bound to max. It is how
-// a successful function Prepare propagates a reconciled `concurrency` to an
+// setAppConcurrency updates fnName's live warm pool bound to max. It is how
+// a successful app Prepare propagates a reconciled `concurrency` to an
 // ALREADY-CREATED pool without a restart: the pool bound is not first-wins. A
 // pool that does not exist yet needs no update (the next acquire creates it with
 // the current max, supplied from the current Prepared); a removed or closed pool
 // is left alone. The new bound publishes the capacity gauge and wakes blocked
 // acquires, and on a DECREASE it immediately retires only EXCESS IDLE containers
 // (see setMax and release for the shrink invariant).
-func (cc *containerCache) setFunctionConcurrency(fnName string, max int) {
+func (cc *containerCache) setAppConcurrency(fnName string, max int) {
 	if max < 1 {
 		max = 1
 	}
@@ -608,7 +608,7 @@ func (cc *containerCache) setFunctionConcurrency(fnName string, max int) {
 // equal bound or a closed/removing pool. It is the single pool-level bound
 // operation, so acquisition, PoolSnapshot/socket/CLI, and the capacity gauge all
 // read the same p.max. It must not be called with p.mu held.
-func (p *functionPool) setMax(max int) []*pooledContainer {
+func (p *appPool) setMax(max int) []*pooledContainer {
 	p.mu.Lock()
 	if p.closed || p.removing || max == p.max {
 		p.mu.Unlock()
@@ -634,7 +634,7 @@ func (p *functionPool) setMax(max int) []*pooledContainer {
 // draining generations, marking each retired with the shrink reason, so a
 // decreased bound sheds only idle capacity. It must be called with p.mu held; a
 // non-positive n removes nothing.
-func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
+func (p *appPool) takeExcessIdleLocked(n int) []*pooledContainer {
 	if n <= 0 {
 		return nil
 	}
@@ -674,8 +674,8 @@ func (p *functionPool) takeExcessIdleLocked(n int) []*pooledContainer {
 //
 // This compatibility form takes only the image and derives the resource-config
 // half of the version identity from the cache's last published effective limits
-// (functionConfig), so a direct caller that never went through
-// setFunctionResources still pools under a consistent config. The Manager's
+// (appConfig), so a direct caller that never went through
+// setAppResources still pools under a consistent config. The Manager's
 // production path uses executeVersion, which passes the config it resolved for
 // the create so the HostConfig and the generation identity cannot disagree.
 func (cc *containerCache) execute(
@@ -687,7 +687,7 @@ func (cc *containerCache) execute(
 	eventJSON []byte,
 	env map[string]string,
 ) (retErr error) {
-	return cc.executeVersion(ctx, fnName, image, cc.functionConfig(fnName), max, start, handler, eventJSON, env)
+	return cc.executeVersion(ctx, fnName, image, cc.appConfig(fnName), max, start, handler, eventJSON, env)
 }
 
 // executeVersion is execute with an explicit resource-config fingerprint: the
@@ -740,7 +740,7 @@ func (cc *containerCache) acquire(
 	max int,
 	start func() (reusableContainer, error),
 ) (*containerLease, error) {
-	return cc.acquireVersion(ctx, fnName, image, cc.functionConfig(fnName), max, start)
+	return cc.acquireVersion(ctx, fnName, image, cc.appConfig(fnName), max, start)
 }
 
 // acquireVersion leases one container for fnName's (image, config) version. It:
@@ -751,7 +751,7 @@ func (cc *containerCache) acquire(
 //     at-least-once on a throwaway (transient) container that is never pooled
 //     and is discarded on release ("no new acquires old version"), without
 //     reaping, rewinding, or waiting on the current (newer) version. The
-//     runner's per-function semaphore keeps the number of such in-flight stale
+//     runner's per-app semaphore keeps the number of such in-flight stale
 //     requests bounded in production;
 //   - on a request for a NEW version (a different image or resource config),
 //     supersedes the active generation: idle containers of the old version are
@@ -781,7 +781,7 @@ func (cc *containerCache) acquireVersion(
 	// so a concurrent removal cannot delete the series underneath a late write.
 	acquiredAt := time.Now()
 	waitRecorded := false
-	recordWait := func(p *functionPool) {
+	recordWait := func(p *appPool) {
 		if !waitRecorded {
 			waitRecorded = true
 			p.recordWaitLocked()
@@ -792,8 +792,8 @@ func (cc *containerCache) acquireVersion(
 	// pool would be permanently at capacity. reserved/transientReserved track
 	// which reservation is currently held so the unwind path can roll it back
 	// (and delete a pool whose removal landed while the start was in flight).
-	var reserved *functionPool
-	var transientReserved *functionPool
+	var reserved *appPool
+	var transientReserved *appPool
 	defer func() {
 		if r := recover(); r != nil {
 			if reserved != nil {
@@ -1060,7 +1060,7 @@ func versionReason(oldImage, newImage string) string {
 // retired in this pool: either the image (by exact content identity or by its
 // whole reference) was invalidated/superseded, or the resource config was
 // superseded. It must be called with p.mu held.
-func (p *functionPool) versionRetired(image, config string) bool {
+func (p *appPool) versionRetired(image, config string) bool {
 	return imageRetired(p.retiredImages, image) || p.retiredConfigs[config]
 }
 
@@ -1068,7 +1068,7 @@ func (p *functionPool) versionRetired(image, config string) bool {
 // request: an image retirement reports reasonImageChanged, otherwise the config
 // was superseded and it reports reasonResourcesChanged. It must be called with
 // p.mu held, after versionRetired has confirmed the version is retired.
-func (p *functionPool) retiredReasonLocked(image, config string) string {
+func (p *appPool) retiredReasonLocked(image, config string) string {
 	if imageRetired(p.retiredImages, image) {
 		return reasonImageChanged
 	}
@@ -1083,7 +1083,7 @@ func (p *functionPool) retiredReasonLocked(image, config string) string {
 // generation's busy containers (they are real containers still completing, so
 // they count), and in-flight start reservations. Transients are deliberately
 // excluded. It must be called with p.mu held.
-func (p *functionPool) usedLocked() int {
+func (p *appPool) usedLocked() int {
 	n := p.creating
 	if p.active != nil {
 		n += len(p.active.idle) + len(p.active.busy)
@@ -1104,7 +1104,7 @@ func (p *functionPool) usedLocked() int {
 // returning, so the caller must not touch p afterwards. maybeDeletePool is
 // called without p.mu (it takes cache.mu -> pool.mu, and this path must not
 // invert that order).
-func (p *functionPool) rollbackStartLocked(transient bool) {
+func (p *appPool) rollbackStartLocked(transient bool) {
 	if transient {
 		p.transientCreating--
 	} else {
@@ -1120,7 +1120,7 @@ func (p *functionPool) rollbackStartLocked(transient bool) {
 }
 
 // invalidateImage retires every pooled container running image across every
-// function: idle ones are discarded immediately, busy ones are marked retired
+// app: idle ones are discarded immediately, busy ones are marked retired
 // and discarded when their invocation releases. It never blocks on an in-flight
 // invocation (the pool mutex is not held across Invoke) and, once run, no later
 // acquire can be handed a pre-invalidation container for that image. It must
@@ -1135,7 +1135,7 @@ func (cc *containerCache) invalidateImage(image string) {
 	// pool is covered by the snapshot (existed already) or the seed (created
 	// later) — there is no interleaving that misses both.
 	cc.retiredImages[image] = true
-	pools := make([]*functionPool, 0, len(cc.pools))
+	pools := make([]*appPool, 0, len(cc.pools))
 	for _, p := range cc.pools {
 		pools = append(pools, p)
 	}
@@ -1149,7 +1149,7 @@ func (cc *containerCache) invalidateImage(image string) {
 // containers (active or draining) are removed and discarded immediately; busy
 // matching containers are marked retired so release discards them. Waiters are
 // notified because discarding idle containers frees capacity.
-func (p *functionPool) invalidateImage(image string) {
+func (p *appPool) invalidateImage(image string) {
 	p.mu.Lock()
 	// Remember the retirement by REFERENCE so any start already in flight (or
 	// any later stale acquire resolving this tag to any content) produces a
@@ -1191,31 +1191,31 @@ func (p *functionPool) invalidateImage(image string) {
 	}
 }
 
-// removeFunction requests the removal of fnName's warm container state. The
+// removeApp requests the removal of fnName's warm container state. The
 // request is linearized under the cache lock: it sets the removed mark and, in
 // the SAME critical section (cache.mu -> pool.mu), marks the pool removing, so
-// a concurrent activateFunction can never be undone by this removal's later
+// a concurrent activateApp can never be undone by this removal's later
 // teardown (activation observes removing and detaches the pool), and no
 // concurrent acquire can create warm state after this point (poolFor refuses
 // while the mark is set). Idle containers are then discarded outside the locks,
 // busy ones were retired so their release discards them, and once the pool is
 // empty its state is deleted from the cache.
 //
-// The function's runtime-pool metric series are deleted in the SAME critical
+// The app's runtime-pool metric series are deleted in the SAME critical
 // section that installs the removal tombstone (p.removing), under BOTH cc.mu and
 // p.mu. This is what makes metric cleanup atomic with the lifecycle transition:
 // every pool metric writer checks the tombstone under p.mu, so a writer runs
 // entirely before the delete (its series are then deleted) or entirely after
 // (it observes the tombstone and writes nothing) — it can never recreate a
 // series after the delete. Holding cc.mu additionally excludes a concurrent
-// reactivation: activateFunction needs cc.mu, so it cannot clear the removal
+// reactivation: activateApp needs cc.mu, so it cannot clear the removal
 // mark and let a fresh pool publish between the tombstone and the delete (which
 // would delete the reactivated pool's brand-new series). A genuinely reactivated
-// function gets a fresh pool after this critical section and publishes normally.
-func (cc *containerCache) removeFunction(fnName string) {
+// app gets a fresh pool after this critical section and publishes normally.
+func (cc *containerCache) removeApp(fnName string) {
 	cc.mu.Lock()
 	cc.lazyInit()
-	cc.removedFunctions[fnName] = true
+	cc.removedApps[fnName] = true
 	delete(cc.capacity, fnName)
 	p := cc.pools[fnName]
 	var discard []*pooledContainer
@@ -1241,7 +1241,7 @@ func (cc *containerCache) removeFunction(fnName string) {
 }
 
 // deleteRuntimePoolMetrics deletes fnName's runtime-pool series when a registry
-// is attached. It is called from removeFunction's critical section (cc.mu held,
+// is attached. It is called from removeApp's critical section (cc.mu held,
 // and p.mu held when a pool exists) so the delete is atomic with the removal
 // tombstone; it must not be hoisted outside that section.
 func (cc *containerCache) deleteRuntimePoolMetrics(fnName string) {
@@ -1250,44 +1250,44 @@ func (cc *containerCache) deleteRuntimePoolMetrics(fnName string) {
 	}
 }
 
-// activateFunction clears a previous removal mark for fnName so a
-// removed-then-recreated function warms again, and un-retires exactly the
-// function's own image so a same-image recreation is not permanently treated as
+// activateApp clears a previous removal mark for fnName so a
+// removed-then-recreated app warms again, and un-retires exactly the
+// app's own image so a same-image recreation is not permanently treated as
 // retired. Clearing the mark, un-retiring the image, and detaching a
 // removal-draining pool all happen in one critical section, so:
-//   - a concurrent acquire after this point sees the function active;
+//   - a concurrent acquire after this point sees the app active;
 //   - a removal that already began cannot leave a stale removing pool in the
 //     map to permanently serve errPoolClosed (the pool is detached; the next
 //     acquire builds a fresh one with the current capacity);
 //   - only fnName's own image is touched. A foreign image reference is never
-//     cleared, so a stale request for another function's image cannot be
+//     cleared, so a stale request for another app's image cannot be
 //     un-retired.
 //
-// image is the image Prepare resolved for this function ("" means "no image to
+// image is the image Prepare resolved for this app ("" means "no image to
 // un-retire", e.g. a caller that only wants the removal mark cleared).
-func (cc *containerCache) activateFunction(fnName, image string) {
+func (cc *containerCache) activateApp(fnName, image string) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.lazyInit()
-	delete(cc.removedFunctions, fnName)
+	delete(cc.removedApps, fnName)
 	if image == "" {
 		// No image to un-retire: only the removal mark is cleared.
-	} else if name, ok := functionNameFromImage(image); ok && name == fnName {
+	} else if name, ok := appNameFromImage(image); ok && name == fnName {
 		// The image is fnName's own: its same-image recreation must warm.
-		// Retirements of OTHER versions of this function stay in place so a
+		// Retirements of OTHER versions of this app stay in place so a
 		// stale old-version request can never supersede the active version.
 		// Every content identity sharing this reference is cleared too, so a
 		// reverted content address warms again.
 		clearImageRetirement(cc.retiredImages, image)
 	} else {
 		// A foreign or unparseable reference is never un-retired, so a caller
-		// cannot clear another function's (or an arbitrary) retirement.
+		// cannot clear another app's (or an arbitrary) retirement.
 		image = ""
 	}
 	if p, ok := cc.pools[fnName]; ok {
 		if p.activate(image) {
 			// Detach the draining pool: a later acquire must build a fresh pool
-			// (with the function's current capacity) rather than be served the
+			// (with the app's current capacity) rather than be served the
 			// removed one. Its own maybeDeletePool becomes a no-op because the
 			// map no longer points at it.
 			delete(cc.pools, fnName)
@@ -1299,7 +1299,7 @@ func (cc *containerCache) activateFunction(fnName, image string) {
 // reports whether the pool must be detached because a removal is (or was)
 // draining it. It takes the pool lock, so the caller must not hold it; the
 // caller holds cc.mu (the allowed cache -> pool order).
-func (p *functionPool) activate(image string) (detach bool) {
+func (p *appPool) activate(image string) (detach bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.removing {
@@ -1316,9 +1316,9 @@ func (p *functionPool) activate(image string) (detach bool) {
 // active and draining busy containers are marked retired (discarded on release)
 // and transient throwaways are marked retired. It is idempotent and returns the
 // discards to perform outside the pool lock. It must be called with p.mu held
-// (and, for the removeFunction path, with cc.mu held so the mark is linearized
+// (and, for the removeApp path, with cc.mu held so the mark is linearized
 // against activation).
-func (p *functionPool) beginRemoveLocked() []*pooledContainer {
+func (p *appPool) beginRemoveLocked() []*pooledContainer {
 	if p.removing {
 		return nil
 	}
@@ -1333,7 +1333,7 @@ func (p *functionPool) beginRemoveLocked() []*pooledContainer {
 			for pc := range g.busy {
 				if !pc.retired {
 					pc.retired = true
-					pc.retireReason = reasonFunctionRemove
+					pc.retireReason = reasonAppRemove
 				}
 			}
 		}
@@ -1345,13 +1345,13 @@ func (p *functionPool) beginRemoveLocked() []*pooledContainer {
 	for pc := range p.transient {
 		if !pc.retired {
 			pc.retired = true
-			pc.retireReason = reasonFunctionRemove
+			pc.retireReason = reasonAppRemove
 		}
 	}
 	p.pruneDrainingLocked()
 	// No gauge publish here: p.removing is now set, so the pool is a metric
 	// tombstone (publishPoolGaugesLocked is a no-op). The caller
-	// (containerCache.removeFunction) deletes the function's runtime-pool series
+	// (containerCache.removeApp) deletes the app's runtime-pool series
 	// in this same critical section, which is the removal-visible transition.
 	return discard
 }
@@ -1359,18 +1359,18 @@ func (p *functionPool) beginRemoveLocked() []*pooledContainer {
 // teardownDiscards discards the containers beginRemoveLocked removed from the
 // pool's ownership. It runs outside the pool lock; dead containers are still
 // recorded (their own path already tore them down) but not discarded again.
-func (p *functionPool) teardownDiscards(discard []*pooledContainer) {
+func (p *appPool) teardownDiscards(discard []*pooledContainer) {
 	for _, pc := range discard {
-		p.discardContainer(pc, reasonFunctionRemove)
+		p.discardContainer(pc, reasonAppRemove)
 	}
 }
 
 // maybeDeletePool deletes p from the cache map when it has been removed and is
-// now empty, so a removed function's state does not linger and a later
+// now empty, so a removed app's state does not linger and a later
 // reactivation starts from a clean pool. It is a no-op for a pool that is not
 // removing, has work in flight, or has already been replaced in the map. Lock
 // order is cache.mu -> pool.mu (the pool lock must not be held by the caller).
-func (cc *containerCache) maybeDeletePool(fnName string, p *functionPool) {
+func (cc *containerCache) maybeDeletePool(fnName string, p *appPool) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.lazyInit()
@@ -1387,7 +1387,7 @@ func (cc *containerCache) maybeDeletePool(fnName string, p *functionPool) {
 
 // pruneDrainingLocked drops draining generations that hold nothing. It must be
 // called with p.mu held.
-func (p *functionPool) pruneDrainingLocked() {
+func (p *appPool) pruneDrainingLocked() {
 	if len(p.draining) == 0 {
 		return
 	}
@@ -1403,7 +1403,7 @@ func (p *functionPool) pruneDrainingLocked() {
 
 // isEmptyLocked reports whether the pool holds no containers and no in-flight
 // starts. It must be called with p.mu held.
-func (p *functionPool) isEmptyLocked() bool {
+func (p *appPool) isEmptyLocked() bool {
 	if p.creating > 0 || p.transientCreating > 0 || len(p.transient) > 0 {
 		return false
 	}
@@ -1446,7 +1446,7 @@ func (cc *containerCache) evictIdleContext(ctx context.Context) {
 		now = cc.now()
 	}
 	cc.mu.Lock()
-	pools := make([]*functionPool, 0, len(cc.pools))
+	pools := make([]*appPool, 0, len(cc.pools))
 	for _, p := range cc.pools {
 		pools = append(pools, p)
 	}
@@ -1463,7 +1463,7 @@ func (cc *containerCache) evictIdleContext(ctx context.Context) {
 // the pool's authoritative counts are republished whenever anything is dropped.
 // Teardown runs on ctx so a shutdown-cancelled maintenance pass returns
 // promptly.
-func (p *functionPool) evictIdle(ctx context.Context, now time.Time, timeout time.Duration) {
+func (p *appPool) evictIdle(ctx context.Context, now time.Time, timeout time.Duration) {
 	p.mu.Lock()
 	if p.closed || p.removing {
 		// A closed pool has already zeroed its gauges; a removing pool is a
@@ -1539,7 +1539,7 @@ func (cc *containerCache) closeContext(ctx context.Context) {
 	cc.mu.Lock()
 	cc.closed = true
 	cc.lazyInit()
-	pools := make([]*functionPool, 0, len(cc.pools))
+	pools := make([]*appPool, 0, len(cc.pools))
 	for _, p := range cc.pools {
 		pools = append(pools, p)
 	}
@@ -1555,9 +1555,9 @@ func (cc *containerCache) closeContext(ctx context.Context) {
 }
 
 // pooledDiscard pairs a container with its owning pool, so the bounded parallel
-// teardown can still record each discard metric against the right function.
+// teardown can still record each discard metric against the right app.
 type pooledDiscard struct {
-	pool *functionPool
+	pool *appPool
 	pc   *pooledContainer
 }
 
@@ -1577,7 +1577,7 @@ const containerShutdownConcurrency = 8
 // returns promptly AND no worker outlives it — which is what lets Manager close
 // the Docker client only after every teardown has concluded. A caller that truly
 // cannot wait relies on the shutdown registry's outer per-step timeout (the step
-// runs in its own goroutine), not on this function abandoning its workers.
+// runs in its own goroutine), not on this app abandoning its workers.
 func discardAllContext(ctx context.Context, items []pooledDiscard, reason string) {
 	if len(items) == 0 {
 		return
@@ -1618,7 +1618,7 @@ func discardAllContext(ctx context.Context, items []pooledDiscard, reason string
 // idempotent: a second call returns nil. The caller owns the teardown, so
 // closeContext can run it in a bounded parallel worker pool while the serial
 // close convenience form tears down in place.
-func (p *functionPool) beginClose() []*pooledContainer {
+func (p *appPool) beginClose() []*pooledContainer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -1658,19 +1658,19 @@ func (p *functionPool) beginClose() []*pooledContainer {
 // "shutdown", serially with detached per-container bounds. It is the convenience
 // form used by tests and callers without a shutdown bound; production shutdown
 // uses closeContext.
-func (p *functionPool) close() {
+func (p *appPool) close() {
 	for _, pc := range p.beginClose() {
 		p.discardContainer(pc, reasonShutdown)
 	}
 }
 
 // poolDiscardReason picks the teardown reason for an unregistered container
-// whose pool was removed mid-start: a removed function is reported as
-// function_removed, otherwise the pool is shutting down. It is a pure helper
+// whose pool was removed mid-start: a removed app is reported as
+// app_removed, otherwise the pool is shutting down. It is a pure helper
 // for the acquire unwind path.
 func poolDiscardReason(removing bool) string {
 	if removing {
-		return reasonFunctionRemove
+		return reasonAppRemove
 	}
 	return reasonShutdown
 }
@@ -1678,7 +1678,7 @@ func poolDiscardReason(removing bool) string {
 // signalLocked wakes every waiter. It must be called with p.mu held. A pool
 // that is closed has nobody left to wake (its notify was closed by close and
 // never replaced), so signalling is a no-op then.
-func (p *functionPool) signalLocked() {
+func (p *appPool) signalLocked() {
 	if p.closed {
 		return
 	}
@@ -1693,7 +1693,7 @@ func (p *functionPool) signalLocked() {
 // again. Waiters are always notified: a release either frees capacity or makes
 // an idle container available. A removed pool that becomes empty here is
 // deleted from the cache.
-func (p *functionPool) release(pc *pooledContainer) {
+func (p *appPool) release(pc *pooledContainer) {
 	p.mu.Lock()
 	if _, transient := p.transient[pc]; transient {
 		delete(p.transient, pc)
@@ -1705,7 +1705,7 @@ func (p *functionPool) release(pc *pooledContainer) {
 		if p.closed {
 			reason = reasonShutdown
 		} else if removing {
-			reason = reasonFunctionRemove
+			reason = reasonAppRemove
 		}
 		// Wake a stale-request waiter now that a transient slot has freed.
 		p.publishPoolGaugesLocked()
@@ -1728,7 +1728,7 @@ func (p *functionPool) release(pc *pooledContainer) {
 	case p.closed:
 		drop, reason = true, reasonShutdown
 	case p.removing:
-		drop, reason = true, reasonFunctionRemove
+		drop, reason = true, reasonAppRemove
 	case pc.retired:
 		drop = true
 		reason = pc.retireReason
@@ -1778,7 +1778,7 @@ func (p *functionPool) release(pc *pooledContainer) {
 // containerLease is one invocation's hold on a pooled container. release must
 // be called exactly once; it is idempotent.
 type containerLease struct {
-	pool *functionPool
+	pool *appPool
 	pc   *pooledContainer
 	once sync.Once
 }

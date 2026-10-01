@@ -7,7 +7,7 @@ import (
 )
 
 // Remove drops the persisted git config and the managed checkout directory. It
-// NEVER touches /functions (materialized function directories are left exactly
+// NEVER touches /apps (materialized app directories are left exactly
 // as they are; a later manual choice determines their fate) and NEVER deletes
 // the SSH key.
 //

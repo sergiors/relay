@@ -278,7 +278,7 @@ func TestPlanRequirementsOnlyInstallUsesUv(t *testing.T) {
 }
 
 // TestPlanInstallsManagedOtelAPI pins the trace-propagation build change: every
-// Python function image installs the OpenTelemetry API with uv into the system
+// Python app image installs the OpenTelemetry API with uv into the system
 // environment (where the bootstrap and any user SDK resolve it), the spec is
 // shell-safe (a range, unlike Node's exact pin, because the Python API version
 // is coupled to the user's SDK), and the install stays OUT of the reusable

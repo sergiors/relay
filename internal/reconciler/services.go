@@ -1,6 +1,6 @@
-// The service reconciler (services.go) reconciles a function's persistent
+// The service reconciler (services.go) reconciles an app's persistent
 // service containers to its template. At startup and on every reconcile of the
-// owning function, it lists the daemon's service containers, classifies each
+// owning app, it lists the daemon's service containers, classifies each
 // against the desired configuration, and converges the running set to the
 // template's declared services and replica counts.
 //
@@ -13,15 +13,15 @@
 // so a service is never taken to zero replicas by a failed replacement.
 //
 // The component is deliberately small and the owning layer (worker wiring) is
-// what decides when to invoke it. Containers owned by OTHER functions are never
-// touched here: each function's reconcile owns only its own containers, and
-// SweepOrphans is the single cross-function pass (called once at startup with
-// the set of live function names) that removes containers whose function no
+// what decides when to invoke it. Containers owned by OTHER apps are never
+// touched here: each app's reconcile owns only its own containers, and
+// SweepOrphans is the single cross-app pass (called once at startup with
+// the set of live app names) that removes containers whose app no
 // longer exists. ShutdownCleanup is the graceful-shutdown counterpart: it
 // removes service containers owned by this worker only; startup convergence
 // remains the crash-recovery path when shutdown cleanup did not execute.
 //
-// Identity is the service's stable template name (function.Service.Name) and the
+// Identity is the service's stable template name (app.Service.Name) and the
 // replica slot is relay.replica; both are label-derived and are the only
 // grouping keys. The configured source descriptor (relay.identity) is compared
 // as the desired IMPLEMENTATION, never as identity: a source change under the
@@ -37,7 +37,7 @@
 //     cheap no-op) is safe and gives crash replacement within the default 30s
 //     cadence without a separate services-only loop.
 //   - RemoveAll (via the reconciler's RemoveServices hook) must run BEFORE the
-//     function's images are retired, because running service containers still
+//     app's images are retired, because running service containers still
 //     reference those images.
 //   - Routing (Traefik) for routed services (a service declaring a host) is
 //     validated before any container action for that service: the routing
@@ -67,7 +67,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/routing"
 	"relay/internal/runtime"
@@ -78,16 +78,16 @@ import (
 // not here.
 type Docker interface {
 	// ResolveServiceImage resolves one service's configured source to the image
-	// a container should run: the function image for an `entrypoint` source, or
+	// a container should run: the app image for an `entrypoint` source, or
 	// an inspected/pulled external image for an `image` source. It is resolved
 	// BEFORE any container action, so a pull failure preserves healthy
 	// containers.
 	ResolveServiceImage(
 		ctx context.Context,
 		fnName string,
-		tmpl *function.Template,
-		svc function.Service,
-		functionImage string,
+		tmpl *app.Template,
+		svc app.Service,
+		appImage string,
 	) (runtime.ServiceImage, error)
 	// StartService creates and starts one service replica and returns only
 	// after Docker confirms it is RUNNING. A non-nil error (create/start
@@ -99,9 +99,9 @@ type Docker interface {
 	StartService(ctx context.Context, spec runtime.ServiceSpec, replica int) (string, error)
 	ServiceContainerList(ctx context.Context) ([]runtime.ServiceContainer, error)
 	StopServiceContainers(ctx context.Context, containers []runtime.ServiceContainer) error
-	// RemoveFunctionServiceContainers stops and removes every service container
-	// belonging to one function, returning how many were removed.
-	RemoveFunctionServiceContainers(ctx context.Context, fnName string) (int, error)
+	// RemoveAppServiceContainers stops and removes every service container
+	// belonging to one app, returning how many were removed.
+	RemoveAppServiceContainers(ctx context.Context, fnName string) (int, error)
 	// NetworkExists reports whether a Docker network exists on the daemon. The
 	// service reconciler uses it to refuse routed services whose routing
 	// network is missing; Relay never creates networks.
@@ -129,7 +129,7 @@ type SecretResolver interface {
 // runner's error style ("no secret provider is configured").
 func BuildEnv(
 	ctx context.Context,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	port int,
 	preparedEnv []string,
 	secrets SecretResolver,
@@ -141,7 +141,7 @@ func BuildEnv(
 	}
 	for _, sb := range tmpl.SecretList() {
 		if secrets == nil {
-			return nil, fmt.Errorf("function references secret %q but no secret provider is configured", sb.Ref)
+			return nil, fmt.Errorf("app references secret %q but no secret provider is configured", sb.Ref)
 		}
 		val, err := secrets.Resolve(ctx, sb.Ref.String())
 		if err != nil {
@@ -162,7 +162,7 @@ type reconcileAuthorityKey struct{}
 
 // withReconcileAuthority attaches a supersession check to ctx. current reports
 // whether the request that owns ctx is still the authoritative desired state
-// for its function. Reconcile consults it at the commit boundary — immediately
+// for its app. Reconcile consults it at the commit boundary — immediately
 // before it would stop a superseded generation — so a request a newer desired
 // state has already superseded does NOT stop the old generation it was about to
 // replace (the last usable generation), and instead cleans only the provisional
@@ -237,7 +237,7 @@ func reconcileAuthorityFrom(ctx context.Context) func() bool {
 // is NOT a rename: it replaces the same replica slots via start-before-stop.
 //
 // Container ownership is always label-derived. A container belongs to fnName
-// when its Function == fnName; containers of other functions are never touched.
+// when its App == fnName; containers of other apps are never touched.
 // The ownership predicate is NOT hostname-scoped — services must be
 // reconcilable across worker restarts on the same host (same as the runtime).
 func Reconcile(
@@ -245,8 +245,8 @@ func Reconcile(
 	reconcileTimeout time.Duration,
 	docker Docker,
 	fnName string,
-	tmpl *function.Template,
-	functionImage string,
+	tmpl *app.Template,
+	appImage string,
 	preparedEnv []string,
 	serviceNetworks []string,
 	secrets SecretResolver,
@@ -254,7 +254,7 @@ func Reconcile(
 	log *slog.Logger,
 ) (bool, error) {
 	return reconcileWithObserver(
-		ctx, reconcileTimeout, docker, fnName, tmpl, functionImage, preparedEnv,
+		ctx, reconcileTimeout, docker, fnName, tmpl, appImage, preparedEnv,
 		serviceNetworks, secrets, traefik, log, nil,
 	)
 }
@@ -264,8 +264,8 @@ func reconcileWithObserver(
 	reconcileTimeout time.Duration,
 	docker Docker,
 	fnName string,
-	tmpl *function.Template,
-	functionImage string,
+	tmpl *app.Template,
+	appImage string,
 	preparedEnv []string,
 	serviceNetworks []string,
 	secrets SecretResolver,
@@ -357,12 +357,12 @@ func reconcileWithObserver(
 	// stops a running old generation.
 	var provisional []runtime.ServiceContainer
 
-	desired := make(map[string]function.Service, len(tmpl.Services))
+	desired := make(map[string]app.Service, len(tmpl.Services))
 	for _, svc := range tmpl.Services {
 		desired[svc.Name] = svc
 	}
 
-	// Classify this function's containers by service NAME. Containers whose
+	// Classify this app's containers by service NAME. Containers whose
 	// service name is no longer in the template (removed service, or an old name
 	// after a rename) are collected and stopped only AFTER every desired service
 	// has converged below: start-before-stop ordering means a service whose
@@ -372,8 +372,8 @@ func reconcileWithObserver(
 	var removed []runtime.ServiceContainer
 	byService := make(map[string][]runtime.ServiceContainer)
 	for _, ctr := range containers {
-		if ctr.Function != fnName {
-			// Another function owns this container; its reconcile handles it.
+		if ctr.App != fnName {
+			// Another app owns this container; its reconcile handles it.
 			continue
 		}
 		if _, ok := desired[ctr.Name]; !ok {
@@ -481,7 +481,7 @@ func reconcileWithObserver(
 			}
 			log.Debug("Service: routing configured",
 				append([]any{
-					"function", fnName,
+					"app", fnName,
 					"service", name,
 					"host", svc.Host,
 					"network", routeNetwork,
@@ -494,7 +494,7 @@ func reconcileWithObserver(
 		// entirely: its existing (healthy) containers are preserved rather than
 		// replaced on a failed resolution. This is the ordering guarantee that a
 		// transient registry outage never tears down a working service.
-		resolved, err := docker.ResolveServiceImage(preCtx, fnName, tmpl, svc, functionImage)
+		resolved, err := docker.ResolveServiceImage(preCtx, fnName, tmpl, svc, appImage)
 		preCancel()
 		if err != nil {
 			fail(fmt.Errorf("service %q: %w", name, err))
@@ -530,7 +530,7 @@ func reconcileWithObserver(
 		// serving its old env/secrets indefinitely. The hash is order-sensitive
 		// and covers the exact slice StartService applies.
 		envHash := runtime.EnvHash(env)
-		// resources are the function's effective per-container limits; their
+		// resources are the app's effective per-container limits; their
 		// fingerprint is compared against each container's relay.resources label
 		// below, so a resource-only template change replaces the running service
 		// even though the image reference (and image fingerprint) are unchanged.
@@ -580,7 +580,7 @@ func reconcileWithObserver(
 		// deficit slot below.
 		newSpec := func() runtime.ServiceSpec {
 			return runtime.ServiceSpec{
-				Function:  fnName,
+				App:       fnName,
 				Name:      name,
 				SourceRef: sourceRef,
 				Port:      svc.Port,
@@ -669,12 +669,12 @@ func reconcileWithObserver(
 					// the next reconcile. Leaving them out of stale is the
 					// suppression: they are not stopped this pass.
 					log.Warn("Service: replacement failed; keeping old replica",
-						"function", fnName, "service", name, "replica", slot, "error", err)
+						"app", fnName, "service", name, "replica", slot, "error", err)
 				} else {
 					// No old fallback for this slot: retain unavailable
 					// semantics and retry on the next reconcile.
 					log.Warn("Service: replica unavailable",
-						"function", fnName, "service", name, "replica", slot, "error", err)
+						"app", fnName, "service", name, "replica", slot, "error", err)
 				}
 				// Usable olds stay as fallbacks; a non-usable old can never
 				// serve, so it is cleaned up even when the replacement failed.
@@ -696,7 +696,7 @@ func reconcileWithObserver(
 			// the replacement is the only running generation).
 			if fallback != nil && startedID != "" {
 				provisional = append(provisional, runtime.ServiceContainer{
-					ID: startedID, Function: fnName, Name: name,
+					ID: startedID, App: fnName, Name: name,
 					State: container.StateRunning,
 				})
 			}
@@ -739,7 +739,7 @@ func reconcileWithObserver(
 			if keep, ok := lowestUsableStale(stale); ok {
 				stale = removeStaleID(stale, keep.ID)
 				log.Warn("Service: no replacement could be confirmed; keeping a running replica",
-					"function", fnName, "service", name, "replica", keep.Replica)
+					"app", fnName, "service", name, "replica", keep.Replica)
 			}
 		}
 
@@ -752,7 +752,7 @@ func reconcileWithObserver(
 		// the pass for the newer request to converge.
 		if superseded() {
 			log.Info("Service: pass superseded; preserving old generation",
-				"function", fnName, "service", name)
+				"app", fnName, "service", name)
 			cleanupProvisional(bounded, docker, fnName, name, provisional, log)
 			provisional = nil
 			abortPass = true
@@ -780,7 +780,7 @@ func reconcileWithObserver(
 	// but deferring the stop until every desired service has converged means a
 	// RENAME (which is indistinguishable from a removal plus an addition under
 	// name grouping) cannot have its old generation torn down before the new
-	// name's replicas are running. Removed-service and removed-function cleanup
+	// name's replicas are running. Removed-service and removed-app cleanup
 	// still removes every generation.
 	//
 	// They are skipped entirely when the pass was superseded or a desired service
@@ -792,10 +792,10 @@ func reconcileWithObserver(
 	// removal once the desired set converges.
 	if abortPass || superseded() {
 		log.Info("Service: pass superseded; preserving removed services",
-			"function", fnName, "removed", len(removed))
+			"app", fnName, "removed", len(removed))
 	} else if len(removed) > 0 && desiredFailed {
 		log.Warn("Service: desired services did not converge; preserving removed services",
-			"function", fnName, "removed", len(removed))
+			"app", fnName, "removed", len(removed))
 	} else if len(removed) > 0 {
 		sort.Slice(removed, func(i, j int) bool { return removed[i].ID < removed[j].ID })
 		changed = true
@@ -834,7 +834,7 @@ func cleanupProvisional(
 	defer stopCancel()
 	if err := docker.StopServiceContainers(stopCtx, provisional); err != nil {
 		log.Warn("Service: remove provisional replacement failed",
-			"function", fnName, "service", name, "count", len(provisional), "error", err)
+			"app", fnName, "service", name, "count", len(provisional), "error", err)
 	}
 }
 
@@ -915,17 +915,17 @@ func routingLabelsMatch(desired, actual map[string]string) bool {
 }
 
 // RemoveAll stops and removes every service container belonging to fnName,
-// delegating to the Docker implementation's RemoveFunctionServiceContainers.
-// Used when a function is removed: its service containers must be stopped before
+// delegating to the Docker implementation's RemoveAppServiceContainers.
+// Used when an app is removed: its service containers must be stopped before
 // its images are retired (see the reconciler's RemoveServices hook ordering).
 func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logger) {
-	n, err := docker.RemoveFunctionServiceContainers(ctx, fnName)
+	n, err := docker.RemoveAppServiceContainers(ctx, fnName)
 	if err != nil {
-		log.Warn("Service: remove function containers failed", "function", fnName, "error", err)
+		log.Warn("Service: remove app containers failed", "app", fnName, "error", err)
 		return
 	}
 	if n > 0 {
-		log.Info("Service: removed function containers", "function", fnName, "count", n)
+		log.Info("Service: removed app containers", "app", fnName, "count", n)
 	}
 }
 
@@ -934,8 +934,8 @@ func RemoveAll(ctx context.Context, docker Docker, fnName string, log *slog.Logg
 // Relay shutdown removes this worker's persistent service containers; crash
 // recovery remains handled by startup reconciliation.
 //
-// It exists as its own smallest operation because RemoveAll is function-scoped
-// and SweepOrphans is cross-function (neither is hostname-scoped by design);
+// It exists as its own smallest operation because RemoveAll is app-scoped
+// and SweepOrphans is cross-app (neither is hostname-scoped by design);
 // here ownership is hostname-scoped only. The returned count is the number of
 // this worker's containers selected for removal.
 //
@@ -982,9 +982,9 @@ func (c *ServiceReconciler) ShutdownCleanup(ctx context.Context, hostname string
 
 // ServiceReconciler ties Reconcile, RemoveAll, SweepOrphans, and ShutdownCleanup
 // to a single
-// Docker implementation, secret resolver, and logger. Function-scoped Apply
+// Docker implementation, secret resolver, and logger. App-scoped Apply
 // calls are serialized by ServiceCoordinator in the worker; the mutex remains
-// around cross-function cleanup operations.
+// around cross-app cleanup operations.
 type ServiceReconciler struct {
 	docker  Docker
 	secrets SecretResolver
@@ -1068,21 +1068,21 @@ func NewServiceReconciler(
 // Apply converges fnName's services to tmpl+image: it runs Reconcile and logs
 // the outcome — Info when the pass changed state, Debug when it was a no-op
 // verification pass, Warn when it errored. It is intentionally non-fatal: a
-// service-convergence failure must not fail the function's reconcile. The
-// Info/Debug distinction means an unchanged function (periodic self-healing
+// service-convergence failure must not fail the app's reconcile. The
+// Info/Debug distinction means an unchanged app (periodic self-healing
 // tick) does not log at Info; only converges that actually changed or failed do.
 //
 // ctx is the LIFECYCLE context, NOT a pre-bounded pass budget: Reconcile
 // derives its own fresh per-operation bounds from it and the injected
 // reconcileTimeout, so a caller must pass a lifecycle-rooted context (not a
-// short deadline wrapped around the whole pass). image is the function's own
+// short deadline wrapped around the whole pass). image is the app's own
 // prepared image, used only by `entrypoint` sources. Callers that run Apply
-// concurrently must provide function-level serialization (ServiceCoordinator
+// concurrently must provide app-level serialization (ServiceCoordinator
 // does this for the worker).
 func (c *ServiceReconciler) Apply(
 	ctx context.Context,
 	fnName string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 	preparedEnv []string,
 ) error {
@@ -1090,14 +1090,14 @@ func (c *ServiceReconciler) Apply(
 }
 
 func (c *ServiceReconciler) ApplyWithStatus(
-	ctx context.Context, fnName string, tmpl *function.Template, image string,
+	ctx context.Context, fnName string, tmpl *app.Template, image string,
 	preparedEnv []string, reconcileStarted func(),
 ) error {
 	return c.apply(ctx, fnName, tmpl, image, preparedEnv, reconcileStarted)
 }
 
 func (c *ServiceReconciler) apply(
-	ctx context.Context, fnName string, tmpl *function.Template, image string,
+	ctx context.Context, fnName string, tmpl *app.Template, image string,
 	preparedEnv []string, reconcileStarted func(),
 ) error {
 	replicas := 0
@@ -1108,7 +1108,7 @@ func (c *ServiceReconciler) apply(
 	// Observe every pass exactly once, including the periodic no-op
 	// verification: the duration covers the whole Reconcile call and the outcome
 	// is the closed changed/unchanged/error set. A nil registry is a no-op. The
-	// function label is the existing bounded dimension.
+	// app label is the existing bounded dimension.
 	start := time.Now()
 	changed, err := reconcileWithObserver(
 		ctx, c.reconcileTimeout, c.docker, fnName, tmpl, image, preparedEnv,
@@ -1117,7 +1117,7 @@ func (c *ServiceReconciler) apply(
 	c.observeReconcile(fnName, changed, err, time.Since(start))
 	if err != nil {
 		c.log.Warn("Service: reconciled with errors",
-			"function", fnName,
+			"app", fnName,
 			"replicas", replicas,
 			"error", err,
 		)
@@ -1125,14 +1125,14 @@ func (c *ServiceReconciler) apply(
 	}
 	if changed {
 		c.log.Info("Service: reconciled",
-			"function", fnName,
+			"app", fnName,
 			"services", len(tmpl.Services),
 			"replicas", replicas,
 		)
 		return nil
 	}
 	c.log.Debug("Service: unchanged",
-		"function", fnName,
+		"app", fnName,
 		"services", len(tmpl.Services),
 		"replicas", replicas,
 	)
@@ -1158,16 +1158,16 @@ func (c *ServiceReconciler) observeReconcile(
 		outcome = metrics.ServiceOutcomeChanged
 	}
 	c.metrics.IncLabels(metrics.MetricServiceReconciles, []metrics.Label{
-		{Name: "function", Value: fnName},
+		{Name: "app", Value: fnName},
 		{Name: "outcome", Value: outcome},
 	})
 	c.metrics.ObserveDurationLabels(metrics.MetricServiceReconcileDuration, []metrics.Label{
-		{Name: "function", Value: fnName},
+		{Name: "app", Value: fnName},
 	}, d)
 }
 
 // Remove stops and removes every service container belonging to fnName. Called
-// by the reconciler's RemoveServices hook BEFORE the function's images are
+// by the reconciler's RemoveServices hook BEFORE the app's images are
 // retired.
 func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 	c.mu.Lock()
@@ -1175,12 +1175,12 @@ func (c *ServiceReconciler) Remove(ctx context.Context, fnName string) {
 	RemoveAll(ctx, c.docker, fnName, c.log)
 }
 
-// SweepOrphans stops and removes every service container whose function is not
-// in liveFunctions (a function removed while Relay was down, or stale containers
+// SweepOrphans stops and removes every service container whose app is not
+// in liveApps (an app removed while Relay was down, or stale containers
 // from a previous boot on this host). hostname is deliberately NOT part of the
 // predicate, matching the runtime's documented same-host-restart limitation.
-// Called once at startup after the per-function Applys.
-func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[string]bool) {
+// Called once at startup after the per-app Applys.
+func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveApps map[string]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1191,7 +1191,7 @@ func (c *ServiceReconciler) SweepOrphans(ctx context.Context, liveFunctions map[
 	}
 	var stale []runtime.ServiceContainer
 	for _, ct := range containers {
-		if !liveFunctions[ct.Function] {
+		if !liveApps[ct.App] {
 			stale = append(stale, ct)
 		}
 	}

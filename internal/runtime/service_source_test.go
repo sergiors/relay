@@ -11,7 +11,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -32,19 +32,19 @@ func newClockManager(t *testing.T, cli *client.Client, now func() time.Time) *Ma
 	return m
 }
 
-// TestResolveEntrypointServiceUsesFunctionImage: an `entrypoint` source resolves
-// to the function's own image plus the runtime-specific launch command, touching
+// TestResolveEntrypointServiceUsesAppImage: an `entrypoint` source resolves
+// to the app's own image plus the runtime-specific launch command, touching
 // no Docker source resolution.
-func TestResolveEntrypointServiceUsesFunctionImage(t *testing.T) {
+func TestResolveEntrypointServiceUsesAppImage(t *testing.T) {
 	m := newClockManager(t, nil, time.Now)
-	tmpl := &function.Template{Runtime: "node24"}
-	svc := function.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1}
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Entrypoint: "app/service.js", Port: 80, Replicas: 1}
 
-	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-fn-fn:abc")
+	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "relay-app-fn:abc")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if got.Ref != "relay-fn-fn:abc" {
+	if got.Ref != "relay-app-fn:abc" {
 		t.Fatalf("ref = %q, want the function image", got.Ref)
 	}
 	if len(got.Entry) != 2 || got.Entry[0] != "node" || got.Entry[1] != "/app/app/service.js" {
@@ -81,7 +81,7 @@ func TestPullDueClockSeam(t *testing.T) {
 	if !m.pullDue("fn", "nginx:2") {
 		t.Fatal("an unseen source reference must be pull-due")
 	}
-	// A different function has its own window.
+	// A different app has its own window.
 	if !m.pullDue("other", "nginx:1") {
 		t.Fatal("an unseen function must be pull-due")
 	}
@@ -101,8 +101,8 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
 
-	tmpl := &function.Template{Runtime: "node24"}
-	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err != nil {
@@ -124,7 +124,7 @@ func TestResolveExternalServiceImagePullAtMostHourlyAndImmediateOnChange(t *test
 	}
 
 	// A changed source reference (a different image) is checked immediately.
-	changed := function.Service{Image: "ghcr.io/acme/api:1.3", Port: 80, Replicas: 1}
+	changed := app.Service{Image: "ghcr.io/acme/api:1.3", Port: 80, Replicas: 1}
 	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, changed, ""); err != nil {
 		t.Fatalf("changed resolve: %v", err)
 	}
@@ -152,8 +152,8 @@ func TestResolveExternalServiceImageFailedPullDoesNotAdvance(t *testing.T) {
 		dockerRoute{method: http.MethodGet, path: "/images/", body: `{"Id":"sha256:cafe"}`},
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
-	tmpl := &function.Template{Runtime: "node24"}
-	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	if _, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, ""); err == nil {
 		t.Fatal("expected the failed pull to surface")
@@ -188,8 +188,8 @@ func TestResolveExternalServiceImageMissingLocalPullsImmediately(t *testing.T) {
 	// A recorded successful check would suppress a remote check for a PRESENT
 	// image, but a missing local image must still be pulled.
 	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
-	tmpl := &function.Template{Runtime: "node24"}
-	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	_, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err == nil || !strings.Contains(err.Error(), "registry down") {
@@ -211,8 +211,8 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 	)
 	m := newClockManager(t, cli, func() time.Time { return now })
 	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
-	tmpl := &function.Template{Runtime: "node24"}
-	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	tmpl := &app.Template{Runtime: "node24"}
+	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	got, err := m.ResolveServiceImage(context.Background(), "fn", tmpl, svc, "")
 	if err != nil {
@@ -227,17 +227,17 @@ func TestResolveExternalServiceImagePresentWithinWindowSkipsPull(t *testing.T) {
 }
 
 // TestResolveServiceImageDispatchesBySource pins the two-source dispatch: an
-// entrypoint source resolves through the runtime entry map against the function
+// entrypoint source resolves through the runtime entry map against the app
 // image, while an image source resolves to the external reference with its
 // content ID. Both leave no spurious build.
 func TestResolveServiceImageDispatchesBySource(t *testing.T) {
-	entryTmpl := &function.Template{Runtime: "node24"}
-	entrySvc := function.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
-	entry, err := newClockManager(t, nil, time.Now).ResolveServiceImage(context.Background(), "fn", entryTmpl, entrySvc, "relay-fn-fn:abc")
+	entryTmpl := &app.Template{Runtime: "node24"}
+	entrySvc := app.Service{Entrypoint: "service.js", Port: 80, Replicas: 1}
+	entry, err := newClockManager(t, nil, time.Now).ResolveServiceImage(context.Background(), "fn", entryTmpl, entrySvc, "relay-app-fn:abc")
 	if err != nil {
 		t.Fatalf("entrypoint resolve: %v", err)
 	}
-	if entry.Ref != "relay-fn-fn:abc" || len(entry.Entry) != 2 {
+	if entry.Ref != "relay-app-fn:abc" || len(entry.Entry) != 2 {
 		t.Fatalf("entrypoint resolved = %+v, want the function image and an entry override", entry)
 	}
 
@@ -245,8 +245,8 @@ func TestResolveServiceImageDispatchesBySource(t *testing.T) {
 	cli := newScriptedDockerClient(t, dockerRoute{method: http.MethodGet, path: "/images/", body: `{"Id":"sha256:cafe"}`})
 	m := newClockManager(t, cli, func() time.Time { return now })
 	m.recordPullCheck("fn", "ghcr.io/acme/api:1.2", now)
-	imgSvc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
-	img, err := m.ResolveServiceImage(context.Background(), "fn", &function.Template{}, imgSvc, "")
+	imgSvc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	img, err := m.ResolveServiceImage(context.Background(), "fn", &app.Template{}, imgSvc, "")
 	if err != nil {
 		t.Fatalf("image resolve: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestResolveServiceImageDispatchesBySource(t *testing.T) {
 	}
 }
 
-// TestForgetServicePullChecks scopes removal to one function.
+// TestForgetServicePullChecks scopes removal to one app.
 func TestForgetServicePullChecks(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	m := newClockManager(t, nil, func() time.Time { return now })
@@ -276,18 +276,18 @@ func TestForgetServicePullChecks(t *testing.T) {
 }
 
 // TestPrepareRuntimeLessTemplateSucceeds: a template whose only services use
-// external `image` sources has no runtime and no function image; Prepare still
-// succeeds (the function is available for service convergence) and carries the
+// external `image` sources has no runtime and no app image; Prepare still
+// succeeds (the app is available for service convergence) and carries the
 // fingerprint, without attempting a build.
 func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - name: web\n    image: nginx:1.27\n    port: 80\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	tmpl := &function.Template{Services: []function.Service{{Image: "nginx:1.27", Port: 80, Replicas: 1}}}
+	tmpl := &app.Template{Services: []app.Service{{Image: "nginx:1.27", Port: 80, Replicas: 1}}}
 	m := newClockManager(t, nil, time.Now)
 
-	got, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
+	got, err := m.Prepare(context.Background(), app.App{Name: "fn", Dir: dir, Template: tmpl})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestPrepareRuntimeLessTemplateSucceeds(t *testing.T) {
 }
 
 // TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly pins the narrow-input
-// optimization: an external-image-only function never builds an image from
+// optimization: an external-image-only app never builds an image from
 // source, so its fingerprint is over template.yaml ALONE. An unrelated source
 // file (even an unreadable one) must neither be read nor affect the digest, and
 // a template edit must still change it.
@@ -315,13 +315,13 @@ func TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "handler.py"), []byte("x\n"), 0o200); err != nil {
 		t.Fatalf("write handler: %v", err)
 	}
-	tmpl, err := function.ParseTemplate([]byte(tmplYAML))
+	tmpl, err := app.ParseTemplate([]byte(tmplYAML))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
 	m := newClockManager(t, nil, time.Now)
 
-	got, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
+	got, err := m.Prepare(context.Background(), app.App{Name: "fn", Dir: dir, Template: tmpl})
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestPrepareRuntimeLessTemplateFingerprintsTemplateOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(changed), 0o644); err != nil {
 		t.Fatalf("rewrite template: %v", err)
 	}
-	next, err := m.Prepare(context.Background(), function.Function{Name: "fn", Dir: dir, Template: tmpl})
+	next, err := m.Prepare(context.Background(), app.App{Name: "fn", Dir: dir, Template: tmpl})
 	if err != nil {
 		t.Fatalf("prepare after template edit: %v", err)
 	}

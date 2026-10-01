@@ -57,7 +57,7 @@ func startCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 			}
 
 			// Process boundary: acquire the single-instance lock before the
-			// worker touches Redis, Docker, or /functions. The lock is held for
+			// worker touches Redis, Docker, or /apps. The lock is held for
 			// the whole runtime lifetime via the deferred Close.
 			lock, err := processlock.Acquire(deps.LockPath)
 			if err != nil {

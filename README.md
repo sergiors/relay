@@ -1,20 +1,22 @@
 # Relay
 
-Relay is a self-hosted runtime for running event-driven functions, schedules, and persistent services on infrastructure you already control.
+Relay is a self-hosted runtime for running event-driven apps — functions, schedules, and persistent services — on infrastructure you already control.
 
-It can execute short-lived handlers in response to events, publish scheduled work, and keep long-running applications such as APIs, workers, gateways, and consumers converged from the same declarative model.
+It can execute short-lived functions in response to events, publish scheduled work that runs the same functions, and keep long-running applications such as APIs, workers, gateways, and consumers converged from the same declarative model.
 
-For event-driven workloads, Relay consumes events from Redis Streams, matches them against declarative rules, executes handlers in isolated Docker containers, retries failures, and dead-letters exhausted invocations.
+For event-driven workloads, Relay consumes events from Redis Streams, matches them against declarative rules, executes the matched functions in isolated Docker containers, retries failures, and dead-letters exhausted invocations.
 
 Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
+
+**An app is the unit of source, configuration, and deployment.** Within an app, event-driven **functions** (its handlers), schedules, and optional persistent services share one declarative model. Functions remain a first-class Relay workload — schedules publish function work onto the same event pipeline, while services are long-lived containers that stay outside it. Start with a function. Add a service when you need one.
 
 Relay does not care where events originate:
 
 ```text
-Producer → Redis Stream → Relay → Function Handler
+Producer → Redis Stream → Relay → App Function (handler)
 ```
 
-Functions, schedules, and persistent services share the same deployment model while keeping their execution semantics independent.
+Functions, schedules, and persistent services are declared within an app and share the same deployment model while keeping their execution semantics independent.
 
 ## What you get
 
@@ -23,20 +25,22 @@ Functions, schedules, and persistent services share the same deployment model wh
 - **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries, and startup catch-up.
 - **Persistent services** — run APIs, workers, gateways, consumers, and other long-running processes from managed-runtime entrypoints or external container images, with replicas, Docker networks, resource limits, environment configuration, secrets, and optional Traefik routing.
 - **Resource controls** — per-container memory, CPU, and PID limits.
-- **Configuration and secrets** — environment values and secret references shared across functions, schedules, and services.
+- **Configuration and secrets** — environment values and secret references shared across apps, schedules, and services.
 - **Observability** — persisted statistics, Prometheus metrics, structured logs, and OpenTelemetry tracing.
 - **Operations** — health checks, manual invocation, DLQ inspection/replay, Git synchronization, and ordered teardown in which an aggregate deadline caps best-effort cleanup while dependency barriers have their own per-step bound.
 - **One runtime process** — `relay start` runs in the foreground and leaves supervision to Docker, systemd, Kubernetes, or another process manager.
 
 ## How it works
 
-Relay manages three workload models:
+Relay has two workloads: **functions** (triggered by events or schedules) and **services** (always long-lived):
 
 ```text
-Events       → Function handlers
-Schedules    → Published occurrences → Function handlers
-Services     → Continuously reconciled containers
+Functions    Events       → matched invocation
+             Schedules    → published occurrence → matched invocation
+Services     → continuously reconciled containers
 ```
+
+Both triggers land in the same event pipeline; services never do. An app may declare any mix of these.
 
 ### Events
 
@@ -54,7 +58,7 @@ runner
 isolated container
 ```
 
-A stream message may match multiple functions or handlers. Relay only acknowledges the message after every matched invocation reaches a terminal state.
+A stream message may match multiple apps or handlers. Relay only acknowledges the message after every matched invocation reaches a terminal state.
 
 ### Schedules
 
@@ -88,7 +92,7 @@ long-running containers
 
 Relay keeps those containers aligned with the declared service configuration, restarting or replacing them when necessary.
 
-Relay watches `/functions` for changes. When a function changes, Relay reconciles only the affected function and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image.
+Relay watches `/apps` for changes. When an app changes, Relay reconciles only the affected app and rebuilds its managed image only when build inputs actually change. Container-only changes such as resource limits do not require a new image.
 
 ## Guarantees
 
@@ -96,7 +100,7 @@ Relay is designed around explicit delivery, recovery, and convergence semantics.
 
 - **Handler execution is at-least-once, not exactly-once.** A crash after a handler performs a side effect but before completion is recorded may cause the handler to run again. Handlers should be idempotent where side effects require it.
 - **Matched work is not acknowledged while unresolved.** Running invocations, retry backoff, and other non-terminal states keep the Redis message pending.
-- **Unavailable functions do not turn matched work into unmatched work.** Their invocations remain recoverable rather than being acknowledged as if nothing matched.
+- **Unavailable apps do not turn matched work into unmatched work.** Their invocations remain recoverable rather than being acknowledged as if nothing matched.
 - **Retries preserve invocation coordination.** Stale claim owners cannot overwrite newer invocation state.
 - **Exhausted invocations enter the DLQ.** DLQ state is tracked per invocation rather than per whole stream message.
 - **Schedule publication is deduplicated cluster-wide.** Multiple workers may evaluate the same cron occurrence, but only one stream entry is admitted for that logical occurrence.
@@ -104,7 +108,7 @@ Relay is designed around explicit delivery, recovery, and convergence semantics.
 - **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
 - **Persistent services converge toward declared state.** Relay continuously reconciles service containers against their configured replicas and runtime configuration.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
-- **Resource limits are per container.** Increasing function concurrency or service replicas multiplies the possible aggregate resource usage.
+- **Resource limits are per container.** Increasing app concurrency or service replicas multiplies the possible aggregate resource usage.
 - **Shutdown uses a cleanup budget and strict dependency barriers.** Relay performs ordered graceful teardown under an aggregate deadline that caps each best-effort cleanup step (for example metrics, webhook, service-container cleanup, and the stats flush) by the budget remaining at that point; when a best-effort step misses its bound the timeout is logged, its context is cancelled, and the registry proceeds without waiting for that operation to finish — an uncooperative operation may therefore continue in the background — though every later step is still attempted. Steps that gate a shared dependency (scheduler, reconciler, startup housekeeping, the service coordinator, and the background loops) are quiescence barriers: each has a per-step timeout used only to log and cancel the step, after which the registry waits for the operation to actually exit before advancing. Cancellation requests a stop but does not instantly terminate in-flight work, so those strict joins can extend total shutdown beyond the aggregate deadline — a wedged dependency-holding operation is waited out rather than used to close a resource another operation is still using.
 
 ## Quick start
@@ -114,7 +118,7 @@ Relay requires:
 - Redis
 - access to a Docker Engine
 
-The bundled `compose.yaml` starts Relay with Redis and a Docker socket proxy and mounts the example functions at `/functions`.
+The bundled `compose.yaml` starts Relay with Redis and a Docker socket proxy and mounts the example apps at `/apps`.
 
 ```sh
 docker compose up -d
@@ -162,13 +166,13 @@ REDIS_GROUP=relay \
 ./relay start
 ```
 
-Relay reads functions from the fixed `/functions` root.
+Relay reads apps from the fixed `/apps` root.
 
-## Functions
+## Apps
 
-Each function is a direct child of `/functions` and contains a `template.yaml`.
+Each app is a direct child of `/apps` and contains a `template.yaml`.
 
-A small event-driven function might look like:
+A small event-driven app might look like:
 
 ```yaml
 runtime: node24
@@ -188,7 +192,7 @@ events:
     retries: 2
 ```
 
-Relay-managed runtime functions are prepared as reusable container images and executed through the runtime pool.
+Relay-managed runtime apps are prepared as reusable container images and executed through the runtime pool.
 
 The same template can also declare:
 
@@ -199,7 +203,7 @@ The same template can also declare:
 - resource limits
 - routing
 
-See [docs/functions.md](docs/functions.md) for the full function model and [docs/events.md](docs/events.md) for matching, retries, ACK, and DLQ behavior.
+See [docs/apps.md](docs/apps.md) for the full app model and [docs/events.md](docs/events.md) for matching, retries, ACK, and DLQ behavior.
 
 ## Persistent services
 
@@ -211,7 +215,7 @@ Services can either reuse Relay's managed runtime or run an external container i
 
 ### Managed runtime services
 
-A managed service uses the same source tree and runtime image model as Relay-managed functions.
+A managed service uses the same source tree and runtime image model as an event-driven app.
 
 For example:
 
@@ -234,12 +238,12 @@ services:
 
 Relay prepares the runtime image and keeps the declared service replicas running.
 
-This is useful when the same application contains both event-driven handlers and long-running processes:
+This is useful when the same app contains both event-driven functions and long-running processes:
 
 ```text
-application
-├── event handlers
-├── scheduled handlers
+app
+├── event functions
+├── scheduled functions
 └── persistent API / worker
 ```
 
@@ -270,7 +274,7 @@ External image
   Relay does not build or own that image
 ```
 
-Services may use function-level environment variables, secrets, the worker-global `NETWORKS`, resources, replicas, and routing configuration.
+Services may use app-level environment variables, secrets, the worker-global `NETWORKS`, resources, replicas, and routing configuration.
 
 Routed services may additionally use `TRAEFIK_NETWORK`.
 
@@ -280,6 +284,8 @@ In short:
 Functions are invoked.
 Services are converged.
 ```
+
+Start with a function. Add a service when you need one.
 
 See [docs/services.md](docs/services.md).
 
@@ -305,7 +311,7 @@ See [docs/schedules.md](docs/schedules.md).
 
 Relay distinguishes between image identity and container configuration.
 
-Managed runtime images may be shared by event-driven functions and managed-runtime services.
+Managed runtime images may be shared by event-driven apps and managed-runtime services.
 
 They are rebuilt only when their build inputs change.
 
@@ -336,9 +342,9 @@ relay health
 relay stats
 relay stats reset
 
-relay function ls
-relay function inspect <name>
-relay function invoke <name>
+relay app ls
+relay app inspect <name>
+relay app invoke <name>
 
 relay secret ls
 relay secret set <name>
@@ -371,7 +377,7 @@ See [docs/cli.md](docs/cli.md) for the detailed CLI reference.
 | Document                                       | Covers                                                                                     |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | [docs/configuration.md](docs/configuration.md) | Relay environment variables, defaults, and process-level configuration                     |
-| [docs/functions.md](docs/functions.md)         | Function layout, templates, runtimes, environment, secrets, resources, and warm containers |
+| [docs/apps.md](docs/apps.md)         | App layout, templates, runtimes, environment, secrets, resources, and warm containers |
 | [docs/events.md](docs/events.md)               | Event matching, dispatch, retries, ACK semantics, invocation state, and DLQ                |
 | [docs/schedules.md](docs/schedules.md)         | Cron syntax, timezones, occurrence identity, publication deduplication, and recovery       |
 | [docs/services.md](docs/services.md)           | Persistent services, external images, routing, networks, replicas, and resources           |

@@ -50,11 +50,11 @@ func TestIntegrationSweepOrphanContainers(t *testing.T) {
 	// Our orphan: relay labels + our hostname, left running (as a crashed prior
 	// process would leave a mid-invocation container).
 	ours := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelType: ContainerTypeEvent, labelFunction: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelHostname: "test-host", labelHandler: "index.hi",
 	})
 	// Another worker's orphan: different hostname, must survive.
 	theirs := createOrphanContainer(t, cli, ctx, map[string]string{
-		labelType: ContainerTypeEvent, labelFunction: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
+		labelType: ContainerTypeEvent, labelApp: "orphan-fn", labelHostname: "other-host", labelHandler: "index.hi",
 	})
 	// Unrelated container: no relay labels, must survive.
 	unrelated := createOrphanContainer(t, cli, ctx, map[string]string{"app": "whatever"})

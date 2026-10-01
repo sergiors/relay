@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -30,7 +30,7 @@ func (panicExecutor) Execute(context.Context, *runtime.Prepared, string, []byte,
 // a panicking executor.
 func TestHandleExecutorPanicTreatedAsFailedAttempt(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, panicExecutor{})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", 0, panicExecutor{})}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -49,7 +49,7 @@ func TestHandleExecutorPanicTreatedAsFailedAttempt(t *testing.T) {
 	}
 	// The panic must be counted as a failed invocation, not a success.
 	got := m.Snapshot()
-	if !strings.Contains(got, "handler_invocations_total{function=user-events,handler=index.run,outcome=failure} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=user-events,handler=index.run,outcome=failure} count=1") {
 		t.Errorf("expected one failure invocation; got:\n%s", got)
 	}
 	if strings.Contains(got, "outcome=success") {
@@ -64,7 +64,7 @@ func TestHandleExecutorPanicTreatedAsFailedAttempt(t *testing.T) {
 // records the 2m backoff. This proves a panic flows through the same
 // retry/exhaustion machinery as any other failure.
 func TestHandleExecutorPanicSchedulesRetry(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", function.DefaultRetries, panicExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", app.DefaultRetries, panicExecutor{})}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -96,7 +96,7 @@ func TestHandleExecutorPanicSchedulesRetry(t *testing.T) {
 // bug is visible and attributable.
 func TestHandlePanicLogsStack(t *testing.T) {
 	logger, buf := bufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "user-events", 0, panicExecutor{})}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "user-events", 0, panicExecutor{})}, logger, nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 

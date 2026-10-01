@@ -11,7 +11,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -60,19 +60,19 @@ func buildRoute(capture func(*http.Request)) dockerRoute {
 	}
 }
 
-// TestFunctionImageBuildGetsIndependentTenMinuteDeadline proves a Dockerfile
+// TestAppImageBuildGetsIndependentTenMinuteDeadline proves a Dockerfile
 // build issued through Manager.Prepare is bounded by buildTimeout (10m), NOT by
 // the short reconcile budget the worker uses for normal service operations. The
 // deadline is observed on the actual ImageBuild HTTP request.
-func TestFunctionImageBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
+func TestAppImageBuildGetsIndependentTenMinuteDeadline(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := function.Function{
+	fn := app.App{
 		Name:     "build-deadline",
 		Dir:      dir,
-		Template: &function.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "node24"},
 	}
 
 	var got buildDeadline
@@ -120,7 +120,7 @@ func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := function.Function{Name: "cancel-build", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "cancel-build", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
@@ -171,10 +171,10 @@ func TestLifecycleCancellationCancelsActiveBuild(t *testing.T) {
 
 // TestServiceImageSourceKeepsCallerShortDeadline proves the service `image`
 // source does NOT inherit the long build timeout: its ImageInspect is issued
-// under the caller's short reconcile deadline, because only managed function/
+// under the caller's short reconcile deadline, because only managed app/
 // dependency Dockerfile builds get the independent 10m bound.
 func TestServiceImageSourceKeepsCallerShortDeadline(t *testing.T) {
-	svc := function.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
+	svc := app.Service{Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}
 
 	inspectDeadline := &buildDeadline{}
 	cli := newScriptedDockerClient(t,
@@ -190,7 +190,7 @@ func TestServiceImageSourceKeepsCallerShortDeadline(t *testing.T) {
 
 	shortCtx, shortCancel := context.WithTimeout(context.Background(), reconcileShort)
 	defer shortCancel()
-	if _, err := m.ResolveServiceImage(shortCtx, "fn", &function.Template{Runtime: "node24"}, svc, ""); err != nil {
+	if _, err := m.ResolveServiceImage(shortCtx, "fn", &app.Template{Runtime: "node24"}, svc, ""); err != nil {
 		t.Fatalf("resolve (image source): %v", err)
 	}
 	if !inspectDeadline.seen || !inspectDeadline.ok {

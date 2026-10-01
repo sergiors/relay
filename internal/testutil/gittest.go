@@ -27,7 +27,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
-// DefaultTemplate is the minimal function template committed at fn/template.yaml
+// DefaultTemplate is the minimal app template committed at fn/template.yaml
 // when Options.Template is empty.
 const DefaultTemplate = "runtime: node24\n"
 

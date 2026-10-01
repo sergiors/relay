@@ -2,26 +2,26 @@
 // workflow for Relay.
 //
 // Git is NOT an automatic part of the runtime. `relay start` never polls, never
-// watches a repository, and never fetches: the worker only watches /functions
+// watches a repository, and never fetches: the worker only watches /apps
 // for filesystem changes (see internal/reconciler). Git synchronization exists
 // as a separate, explicit operator command that downloads a repository once,
-// deterministically rewrites /functions to match a configured ref, and then
+// deterministically rewrites /apps to match a configured ref, and then
 // lets the existing reconciler pick up the resulting directory tree. The flow is
 // always manual:
 //
 //	relay git keygen     # generate an SSH deploy key once
 //	relay git set <repo> # remember the SSH repository to sync
-//	relay git sync       # when desired, materialize the repo into /functions
+//	relay git sync       # when desired, materialize the repo into /apps
 //	relay git status     # inspect the current sync state
 //	relay git remove     # forget the source and drop the checkout
 //
-// Only `relay git sync` ever modifies /functions. When a git source is
-// configured and a sync has run, /functions is treated as fully managed by git:
+// Only `relay git sync` ever modifies /apps. When a git source is
+// configured and a sync has run, /apps is treated as fully managed by git:
 // a sync rewrites it to reflect exactly the configured repository/path, removing
 // any directory it does not contain (the "deterministic replace" rule). Source
 // selection honors .gitignore rules via the shared internal/source policy: an
-// ignored function directory is not materialized and an ignored file inside a
-// function is not copied, while the applicable .gitignore files themselves are
+// ignored app directory is not materialized and an ignored file inside a
+// app is not copied, while the applicable .gitignore files themselves are
 // copied (they are the policy). See Sync's documentation and README.md "Git" for
 // the precise contract.
 //

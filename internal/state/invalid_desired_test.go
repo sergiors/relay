@@ -14,7 +14,7 @@ func TestRecordInvalidDesiredFreshRowIsUnavailable(t *testing.T) {
 
 	c.RecordInvalidDesired("broken", &boomErr{})
 
-	detail, ok := c.GetFunction("broken")
+	detail, ok := c.GetApp("broken")
 	if !ok {
 		t.Fatal("a present invalid function must be visible as a row")
 	}
@@ -54,7 +54,7 @@ func TestRecordInvalidDesiredPreservesActiveGeneration(t *testing.T) {
 
 	c.RecordInvalidDesired("fn", &boomErr{})
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after invalid desired")
 	}
@@ -105,8 +105,8 @@ func TestRecordInvalidDesiredObserverNotified(t *testing.T) {
 	}
 }
 
-// TestActiveImagesListsRecordedImages pins the narrow read seam: only functions
-// with a recorded image appear, keyed by name; a function with no image (never
+// TestActiveImagesListsRecordedImages pins the narrow read seam: only apps
+// with a recorded image appear, keyed by name; an app with no image (never
 // prepared) is omitted.
 func TestActiveImagesListsRecordedImages(t *testing.T) {
 	c := openTestState(t)

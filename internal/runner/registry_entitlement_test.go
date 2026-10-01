@@ -14,7 +14,7 @@ import (
 // delivery admitted against image A holds a pinned snapshot for A's whole
 // delivery; after B supersedes A in the registry, a NEW snapshot pins B's image
 // and never A's, and a non-blocking retirement of A (the runner's
-// RemoveImageNow shape, also used by the startup sweep and function removal) is
+// RemoveImageNow shape, also used by the startup sweep and app removal) is
 // DEFERRED while the in-flight snapshot still pins A. The pins are real admitted
 // references from the runtime lease coordinator (via leaseExecutor), so the
 // assertions are on the authoritative admission gate, not a fake counter.
@@ -22,11 +22,11 @@ func TestRegistryPostSwapAdmissionPinsNewImageOnly(t *testing.T) {
 	exec := newLeaseExecutor()
 	reg := New(nil, testutil.DiscardLogger()).Registry()
 
-	const imgA = "relay-fn-a:v1"
-	const imgB = "relay-fn-a:v2"
+	const imgA = "relay-app-a:v1"
+	const imgB = "relay-app-a:v2"
 
 	pfA := preparedWithLease(t, "a", imgA, exec)
-	reg.Set([]*PreparedFunction{pfA})
+	reg.Set([]*PreparedApp{pfA})
 
 	// Delivery A takes its snapshot and pins A's image (as Handle does).
 	snapA := reg.snapshotPinned()
@@ -64,7 +64,7 @@ func TestRegistryPostSwapAdmissionPinsNewImageOnly(t *testing.T) {
 	}
 
 	// A non-blocking retirement of A (RemoveImageNow: the startup-sweep and
-	// function-removal shape) must DEFER while the in-flight snapshot still
+	// app-removal shape) must DEFER while the in-flight snapshot still
 	// pins A, and must leave the image reusable.
 	if err := exec.mgr.RemoveImageNow(context.Background(), imgA); !errors.Is(err, runtime.ErrImageRetiring) {
 		t.Fatalf("RemoveImageNow(A) with the in-flight snapshot = %v, want ErrImageRetiring", err)

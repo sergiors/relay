@@ -7,20 +7,20 @@ import (
 	"sync"
 )
 
-// Function output forwarding: container stdout/stderr is forwarded to the Relay
+// App output forwarding: container stdout/stderr is forwarded to the Relay
 // process output. Forwarding is a raw transport, deliberately NOT routed
 // through slog — it must stream live while the container runs (not buffered
 // until exit), must work regardless of Relay's LOG_LEVEL, and must NOT be
 // inferred into log severity levels. Relay acts as a passthrough; the exact
-// bytes the function writes (Python print/logging, Node console.log/console.error,
+// bytes the app writes (Python print/logging, Node console.log/console.error,
 // anything) arrive verbatim, line by line, on the process output.
 
-// outputMu guards functionOut; SetFunctionOutput and writeFunctionOutput both
+// outputMu guards appOut; SetAppOutput and writeAppOutput both
 // take it so the sink can be redirected from tests without racing in-flight
 // forwarders from other goroutines.
 var (
-	outputMu    sync.Mutex
-	functionOut io.Writer = os.Stdout
+	outputMu sync.Mutex
+	appOut   io.Writer = os.Stdout
 )
 
 // maxPending bounds the per-stream line buffer. A container line longer than
@@ -28,7 +28,7 @@ var (
 // growing the buffer unboundedly, bounding per-invocation memory.
 const maxPending = 4 << 10 // 4 KiB
 
-// SetFunctionOutput redirects function container output to w. It returns the
+// SetAppOutput redirects app container output to w. It returns the
 // previous sink so callers can restore it (used by tests). A nil w falls back
 // to os.Stdout.
 //
@@ -38,31 +38,31 @@ const maxPending = 4 << 10 // 4 KiB
 // join (and hence the invocation's return). The default sink (os.Stdout) and
 // ordinary in-memory test buffers are non-blocking. A slow destination (a
 // network writer, a bounded channel) must wrap itself with its own buffering or
-// async flush before calling SetFunctionOutput.
-func SetFunctionOutput(w io.Writer) io.Writer {
+// async flush before calling SetAppOutput.
+func SetAppOutput(w io.Writer) io.Writer {
 	outputMu.Lock()
 	defer outputMu.Unlock()
-	prev := functionOut
+	prev := appOut
 	if w == nil {
 		w = os.Stdout
 	}
-	functionOut = w
+	appOut = w
 	return prev
 }
 
-// writeFunctionOutput copies p to the current function-output sink, serializing
+// writeAppOutput copies p to the current app-output sink, serializing
 // on outputMu because multiple in-flight invocations may forward concurrently.
 // It is a best-effort raw transport: both write errors and sink panics are
 // swallowed (recovered) so a broken or panicking sink can never fail an
 // invocation or break the container lifecycle. It always returns a nil error:
 // stdcopy aborts its whole copy on a writer error, which would break the reader
 // goroutine and its cleanup joins.
-func writeFunctionOutput(p []byte) (int, error) {
+func writeAppOutput(p []byte) (int, error) {
 	outputMu.Lock()
 	defer outputMu.Unlock()
 	defer func() { _ = recover() }()
 
-	sink := functionOut
+	sink := appOut
 	if sink == nil {
 		sink = os.Stdout
 	}
@@ -72,7 +72,7 @@ func writeFunctionOutput(p []byte) (int, error) {
 
 // streamForwarder demultiplexes one container stream's raw bytes into completed
 // lines, prefixing each with a static [...] context and emitting it through
-// the function-output sink in a single write. One forwarder is used per stream
+// the app-output sink in a single write. One forwarder is used per stream
 // (stdout and stderr) so interleaving between the two never merges partial
 // lines. It buffers at most maxPending bytes of an incomplete trailing line.
 type streamForwarder struct {
@@ -84,13 +84,13 @@ type streamForwarder struct {
 }
 
 // newStreamForwarder returns a streamForwarder for stream ("stdout"/"stderr").
-// The function/handler are taken from meta when non-empty, else from the direct
+// The app/handler are taken from meta when non-empty, else from the direct
 // fn/handler params — Execute always sets both identically, so they agree; the
 // override just keeps direct callers that pass a meta working. A non-empty
 // message or event id from meta is appended to the prefix.
 func newStreamForwarder(stream, fn, handler string, meta RunMeta) *streamForwarder {
-	if meta.Function != "" {
-		fn = meta.Function
+	if meta.App != "" {
+		fn = meta.App
 	}
 	if meta.Handler != "" {
 		handler = meta.Handler
@@ -100,12 +100,12 @@ func newStreamForwarder(stream, fn, handler string, meta RunMeta) *streamForward
 
 // outputPrefix builds the static line prefix for one stream:
 //
-//	[<function>/<handler>[@<message_id|event_id>]] <stream>:
+//	[<app>/<handler>[@<message_id|event_id>]] <stream>:
 //
-// The function/handler come from the direct params (always set by Execute). A
+// The app/handler come from the direct params (always set by Execute). A
 // non-empty message or event id on the metadata is appended after '@' when
 // present (message id preferred over event id); otherwise the bracket holds just
-// function/handler. The prefix is computed once and reused for every line.
+// app/handler. The prefix is computed once and reused for every line.
 func outputPrefix(fn, handler, stream string, meta RunMeta) []byte {
 	prefix := make([]byte, 0, 32)
 	prefix = append(prefix, "["...)
@@ -166,8 +166,8 @@ func (f *streamForwarder) flush() {
 }
 
 // emit writes prefix + content (+ optional trailing newline) to the
-// function-output sink. A trailing '\r' (CRLF) on the content is trimmed. The
-// write is best-effort and panic-safe via writeFunctionOutput.
+// app-output sink. A trailing '\r' (CRLF) on the content is trimmed. The
+// write is best-effort and panic-safe via writeAppOutput.
 func (f *streamForwarder) emit(content []byte, newline bool) {
 	if len(content) > 0 && content[len(content)-1] == '\r' {
 		content = content[:len(content)-1]
@@ -178,5 +178,5 @@ func (f *streamForwarder) emit(content []byte, newline bool) {
 	if newline {
 		buf = append(buf, '\n')
 	}
-	_, _ = writeFunctionOutput(buf)
+	_, _ = writeAppOutput(buf)
 }

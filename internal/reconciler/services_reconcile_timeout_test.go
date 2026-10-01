@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -74,7 +74,7 @@ func (d *phaseDocker) record(op string, ctx context.Context) {
 }
 
 func (d *phaseDocker) ResolveServiceImage(
-	ctx context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	ctx context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	d.record("resolve", ctx)
 	if d.blockResolve {
@@ -86,14 +86,14 @@ func (d *phaseDocker) ResolveServiceImage(
 		// governed elsewhere, not the pre-resolution reconcile budget.
 		time.Sleep(d.resolveDelay)
 	}
-	if svc.Source() == function.ServiceSourceImage {
+	if svc.Source() == app.ServiceSourceImage {
 		return runtime.ServiceImage{Ref: svc.Image, ID: "sha256:img"}, nil
 	}
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 
 func (d *phaseDocker) StartService(ctx context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
@@ -128,7 +128,7 @@ func (d *phaseDocker) StopServiceContainers(ctx context.Context, _ []runtime.Ser
 	return nil
 }
 
-func (d *phaseDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {
+func (d *phaseDocker) RemoveAppServiceContainers(_ context.Context, _ string) (int, error) {
 	return 0, nil
 }
 
@@ -157,10 +157,10 @@ func (d *phaseDocker) startCount() int {
 
 // slowResolveServiceTemplate is a single `image`-source service, the shape whose
 // resolution may run a remote inspect/pull.
-func slowResolveServiceTemplate() *function.Template {
-	return &function.Template{
+func slowResolveServiceTemplate() *app.Template {
+	return &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 80, Replicas: 1}},
 	}
 }
 

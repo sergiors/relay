@@ -14,7 +14,7 @@ import (
 )
 
 // concurrencyTrackingExecutor records the peak concurrent executions, so a test
-// can assert the runner's global and per-function concurrency caps are honored.
+// can assert the runner's global and per-app concurrency caps are honored.
 // Each execution blocks briefly so concurrent Handles overlap.
 type concurrencyTrackingExecutor struct {
 	mu       sync.Mutex
@@ -69,7 +69,7 @@ func runConcurrent(t *testing.T, r *Runner, n int) {
 	wg.Wait()
 }
 
-// runTwo fires n concurrent Handles against each of this runner's two functions
+// runTwo fires n concurrent Handles against each of this runner's two apps
 // ("a" and "b", both always-matching) and waits.
 func runTwo(t *testing.T, r *Runner, n int) {
 	t.Helper()
@@ -93,7 +93,7 @@ func runTwo(t *testing.T, r *Runner, n int) {
 // concurrent executions, and all complete.
 func TestRunnerGlobalConcurrencyDefault(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 
 	runConcurrent(t, r, 12)
 
@@ -113,7 +113,7 @@ func TestRunnerGlobalConcurrencyDefault(t *testing.T) {
 // concurrency.
 func TestRunnerGlobalConcurrencyExplicit(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(2)
 
 	runConcurrent(t, r, 12)
@@ -126,13 +126,13 @@ func TestRunnerGlobalConcurrencyExplicit(t *testing.T) {
 	}
 }
 
-// TestRunnerPerFunctionDefault proves the per-function default (2) is applied
+// TestRunnerPerAppDefault proves the per-app default (2) is applied
 // to a template whose Concurrency is 0 (unparsed): many concurrent Handles of a
-// single function never exceed 2 concurrent executions per function.
-func TestRunnerPerFunctionDefault(t *testing.T) {
+// single app never exceed 2 concurrent executions per app.
+func TestRunnerPerAppDefault(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
-	// Raise the global cap so the per-function limit is the binding one.
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
+	// Raise the global cap so the per-app limit is the binding one.
 	r.SetMaxConcurrency(16)
 
 	runConcurrent(t, r, 16)
@@ -145,11 +145,11 @@ func TestRunnerPerFunctionDefault(t *testing.T) {
 	}
 }
 
-// TestRunnerPerFunctionExplicit1 proves an explicit per-function concurrency of
-// 1 strictly serializes the function's executions.
-func TestRunnerPerFunctionExplicit1(t *testing.T) {
+// TestRunnerPerAppExplicit1 proves an explicit per-app concurrency of
+// 1 strictly serializes the app's executions.
+func TestRunnerPerAppExplicit1(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 30 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	runConcurrent(t, r, 8)
@@ -162,13 +162,13 @@ func TestRunnerPerFunctionExplicit1(t *testing.T) {
 	}
 }
 
-// TestRunnerGlobalSharedAcrossFunctions proves the global cap is shared across
-// distinct functions: two functions firing 12 concurrent Handles against the
+// TestRunnerGlobalSharedAcrossApps proves the global cap is shared across
+// distinct apps: two apps firing 12 concurrent Handles against the
 // same global cap of 2 never exceed 2 in total. A single shared executor
-// measures the global peak (the union of both functions' executions).
-func TestRunnerGlobalSharedAcrossFunctions(t *testing.T) {
+// measures the global peak (the union of both apps' executions).
+func TestRunnerGlobalSharedAcrossApps(t *testing.T) {
 	shared := &concurrencyTrackingExecutor{blockDur: 30 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithConcurrency(t, "a", 8, shared),
 		fnWithConcurrency(t, "b", 8, shared),
 	}, testutil.DiscardLogger(), nil)
@@ -176,24 +176,24 @@ func TestRunnerGlobalSharedAcrossFunctions(t *testing.T) {
 
 	runTwo(t, r, 12)
 
-	// The shared executor's peak is the global peak across both functions.
+	// The shared executor's peak is the global peak across both apps.
 	if got := shared.peakConcurrency(); got > 2 {
 		t.Fatalf("global peak concurrency across functions = %d, want <= 2", got)
 	}
-	// 12 concurrent Handles on each of two functions both match every event, so
-	// every Handle executes both functions: 12*2 Handles * 2 functions = 48 calls.
+	// 12 concurrent Handles on each of two apps both match every event, so
+	// every Handle executes both apps: 12*2 Handles * 2 apps = 48 calls.
 	if got := shared.callCount(); got != 48 {
 		t.Fatalf("executor calls = %d, want 48 (12 Handles * 2 functions * 2 funcs each)", got)
 	}
 }
 
-// TestRunnerPerFunctionIndependent proves each function's concurrency is
-// independent: two functions each with concurrency 2 and a high-enough global
+// TestRunnerPerAppIndependent proves each app's concurrency is
+// independent: two apps each with concurrency 2 and a high-enough global
 // cap (8) let both saturate to 2 concurrently, so the total can reach 4 while
 // each stays within its own cap. One shared executor measures the union.
-func TestRunnerPerFunctionIndependent(t *testing.T) {
+func TestRunnerPerAppIndependent(t *testing.T) {
 	shared := &concurrencyTrackingExecutor{blockDur: 30 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithConcurrency(t, "a", 2, shared),
 		fnWithConcurrency(t, "b", 2, shared),
 	}, testutil.DiscardLogger(), nil)
@@ -201,11 +201,11 @@ func TestRunnerPerFunctionIndependent(t *testing.T) {
 
 	runTwo(t, r, 8)
 
-	// The union of both per-function slots can reach up to 2+2 = 4.
+	// The union of both per-app slots can reach up to 2+2 = 4.
 	if got := shared.peakConcurrency(); got > 4 {
 		t.Fatalf("total peak concurrency across functions = %d, want <= 4 (2+2)", got)
 	}
-	// Both functions saturating must produce real overlap (>= 2).
+	// Both apps saturating must produce real overlap (>= 2).
 	if got := shared.peakConcurrency(); got < 2 {
 		t.Fatalf("total peak concurrency across functions = %d, want >= 2", got)
 	}
@@ -218,7 +218,7 @@ func TestRunnerPerFunctionIndependent(t *testing.T) {
 func TestRunnerSlotTimeoutLeavesPending(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(1)
 	// Test override (package-internal field): keep the wait short so the timeout
 	// path is exercised quickly without a 30s wait.
@@ -262,7 +262,7 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	m := metrics.New()
 	release := make(chan struct{})
 	exec := newBlockingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), m)
 	r.SetMaxConcurrency(1)
 	r.slotWait = 50 * time.Millisecond
 

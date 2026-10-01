@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -85,7 +85,7 @@ func dlqTestEntry(id, originalID, function, handler, event, timestamp string) st
 		Consumer:        "worker-1",
 		Event:           event,
 		Reason:          fmt.Sprintf("invocation exhausted: function %q handler %q exhausted after 5 handler attempts", function, handler),
-		Function:        function,
+		App:             function,
 		Handler:         handler,
 		Deliveries:      9,
 		HandlerAttempts: 5,
@@ -136,7 +136,7 @@ func TestDLQHelpFlagsAndUnknownCommand(t *testing.T) {
 }
 
 // TestDLQListColumnsAndOrder verifies ls renders one row per entry in stream
-// order with ID, source message, function, handler, attempts, and age, and that
+// order with ID, source message, app, handler, attempts, and age, and that
 // two entries from the SAME source message ID are listed as distinct rows.
 func TestDLQListColumnsAndOrder(t *testing.T) {
 	store := &fakeDLQStore{entries: []stream.DLQEntry{
@@ -157,7 +157,7 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 		t.Fatalf("expected header + 3 rows, got %d:\n%s", len(lines), out)
 	}
 	hdr := lines[0]
-	for _, col := range []string{"ID", "ORIGINAL", "FUNCTION", "HANDLER", "ATTEMPTS", "AGE"} {
+	for _, col := range []string{"ID", "ORIGINAL", "APP", "HANDLER", "ATTEMPTS", "AGE"} {
 		if !strings.Contains(hdr, col) {
 			t.Fatalf("header missing %q: %q", col, hdr)
 		}
@@ -172,7 +172,7 @@ func TestDLQListColumnsAndOrder(t *testing.T) {
 	if !strings.HasPrefix(lines[3], "1700000000001-0") {
 		t.Fatalf("row 3 wrong: %q", lines[3])
 	}
-	// Both same-source rows render their exact function/handler and attempts.
+	// Both same-source rows render their exact app/handler and attempts.
 	for _, row := range []string{lines[1], lines[2]} {
 		if !strings.Contains(row, "events/1699999999999-0") ||
 			!strings.Contains(row, "alpha") || !strings.Contains(row, "5") {
@@ -191,7 +191,7 @@ func TestDLQListEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dlq ls empty: %v", err)
 	}
-	if got := normWS(out); got != "ID ORIGINAL FUNCTION HANDLER ATTEMPTS AGE" {
+	if got := normWS(out); got != "ID ORIGINAL APP HANDLER ATTEMPTS AGE" {
 		t.Fatalf("empty ls = %q", got)
 	}
 }
@@ -223,7 +223,7 @@ func TestDLQInspectFieldsAndPrettyEvent(t *testing.T) {
 		"Original ID: 1699999999999-0",
 		"Group: relay",
 		"Consumer: worker-1",
-		"Function: alpha",
+		"App: alpha",
 		"Handler: events.a.handler",
 		"Handler attempts: 5",
 		"Deliveries: 9",
@@ -485,7 +485,7 @@ func dlqReplayRunner(t *testing.T, store *fakeDLQStore, exec *dlqReplayExecutor)
 
 	// Two matching event rules: a replay must run only the recorded handler, not
 	// every matching rule.
-	tmpl, err := function.ParseTemplate([]byte(`runtime: node24
+	tmpl, err := app.ParseTemplate([]byte(`runtime: node24
 events:
   - handler: events.created.handler
     pattern: {}
@@ -496,17 +496,17 @@ events:
 		t.Fatalf("parse template: %v", err)
 	}
 	prepared := runner.NewPrepared(
-		function.Function{Name: "user-events", Template: tmpl},
+		app.App{Name: "user-events", Template: tmpl},
 		&runtime.Prepared{Name: "user-events", Image: "x"},
 		exec,
 	)
-	run := runner.New([]*runner.PreparedFunction{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	run := runner.New([]*runner.PreparedApp{prepared}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	startTestSocketWithReplayer(t, deps.SocketPath, run)
 	return deps
 }
 
 // TestDLQReplayExecutesExactHandlerAndDeletes verifies the end-to-end replay: the
-// exact stored function/handler/event reaches the live runner over the socket,
+// exact stored app/handler/event reaches the live runner over the socket,
 // only that handler executes, the success line is printed, and the entry is
 // deleted.
 func TestDLQReplayExecutesExactHandlerAndDeletes(t *testing.T) {
@@ -577,9 +577,9 @@ func TestDLQReplayFailedHandlerKeepsEntry(t *testing.T) {
 	}
 }
 
-// TestDLQReplayUnknownFunctionKeepsEntry verifies a function no longer in the
+// TestDLQReplayUnknownAppKeepsEntry verifies an app no longer in the
 // registry is surfaced and the entry kept.
-func TestDLQReplayUnknownFunctionKeepsEntry(t *testing.T) {
+func TestDLQReplayUnknownAppKeepsEntry(t *testing.T) {
 	store := &fakeDLQStore{entries: []stream.DLQEntry{
 		dlqTestEntry("1-0", "1-0", "ghost", "events.created.handler", `{}`, "2026-09-23T10:00:00Z"),
 	}}
@@ -596,7 +596,7 @@ func TestDLQReplayUnknownFunctionKeepsEntry(t *testing.T) {
 }
 
 // TestDLQReplayMalformedPlaceholderNotReplayable verifies a malformed-message
-// placeholder (no function/handler, non-JSON event) is rejected as
+// placeholder (no app/handler, non-JSON event) is rejected as
 // non-replayable BEFORE dialing the worker: the error names why, it never
 // reports a misleading socket-unavailability, no invalid JSON is encoded, and
 // the entry is kept.

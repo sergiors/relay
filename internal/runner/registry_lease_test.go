@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
 
-// leaseExecutor is a test Executor whose prepared-function publications carry
+// leaseExecutor is a test Executor whose prepared-app publications carry
 // REAL admitted leases from a runtime.Manager's lease coordinator, so the
 // runner's snapshot pinning can be asserted against the authoritative gate
 // without Docker.
@@ -23,9 +23,9 @@ func (e *leaseExecutor) Execute(context.Context, *runtime.Prepared, string, []by
 	return nil
 }
 
-// preparedWithLease builds a PreparedFunction whose publication carries a real
+// preparedWithLease builds a PreparedApp whose publication carries a real
 // admitted lease on image, mirroring the production Prepare→NewPrepared transfer.
-func preparedWithLease(t *testing.T, name, image string, exec *leaseExecutor) *PreparedFunction {
+func preparedWithLease(t *testing.T, name, image string, exec *leaseExecutor) *PreparedApp {
 	t.Helper()
 	pf, err := leasePrepared(exec, name, image)
 	if err != nil {
@@ -44,10 +44,10 @@ func TestRegistrySnapshotPinHoldsUntilRelease(t *testing.T) {
 	exec := newLeaseExecutor()
 	reg := New(nil, testutil.DiscardLogger()).Registry()
 
-	pf := preparedWithLease(t, "a", "relay-fn-a:v1", exec)
-	reg.Set([]*PreparedFunction{pf})
+	pf := preparedWithLease(t, "a", "relay-app-a:v1", exec)
+	reg.Set([]*PreparedApp{pf})
 
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 1 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 1 {
 		t.Fatalf("publication lease count = %d, want 1", got)
 	}
 
@@ -56,20 +56,20 @@ func TestRegistrySnapshotPinHoldsUntilRelease(t *testing.T) {
 	if snap.pinFor(pf) == nil {
 		t.Fatal("snapshot must pin the published image")
 	}
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 2 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 2 {
 		t.Fatalf("lease count after snapshot = %d, want 2 (publication + snapshot pin)", got)
 	}
 
 	// Supersede the entry: its publication lease is released after the swap, but
 	// the snapshot's shared pin keeps the image admitted.
 	reg.Replace("a", nil)
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 1 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 1 {
 		t.Fatalf("lease count after supersede = %d, want 1 (snapshot pin only)", got)
 	}
 
 	// Releasing the snapshot drops the last reference, so the image can drain.
 	snap.release()
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 0 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 0 {
 		t.Fatalf("lease count after snapshot release = %d, want 0", got)
 	}
 }
@@ -80,9 +80,9 @@ func TestRegistryReplaceReleasesSupersededPublication(t *testing.T) {
 	exec := newLeaseExecutor()
 	reg := New(nil, testutil.DiscardLogger()).Registry()
 
-	reg.Set([]*PreparedFunction{preparedWithLease(t, "a", "relay-fn-a:v1", exec)})
+	reg.Set([]*PreparedApp{preparedWithLease(t, "a", "relay-app-a:v1", exec)})
 	reg.Replace("a", nil)
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 0 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 0 {
 		t.Fatalf("lease count after supersede with no snapshot = %d, want 0", got)
 	}
 }
@@ -96,16 +96,16 @@ func TestHandlePinsImageAcrossDelivery(t *testing.T) {
 	r := New(nil, testutil.DiscardLogger())
 	reg := r.Registry()
 
-	lease, err := exec.mgr.AcquireImageLease("relay-fn-a:v1")
+	lease, err := exec.mgr.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	pf := NewPrepared(function.Function{
+	pf := NewPrepared(app.App{
 		Name:     "a",
-		Template: &function.Template{Runtime: "node24", Events: []function.EventRule{alwaysMatchRule(time.Second)}},
-	}, &runtime.Prepared{Name: "a", Image: "relay-fn-a:v1"}, exec)
+		Template: &app.Template{Runtime: "node24", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
+	}, &runtime.Prepared{Name: "a", Image: "relay-app-a:v1"}, exec)
 	pf.lease = lease
-	reg.Set([]*PreparedFunction{pf})
+	reg.Set([]*PreparedApp{pf})
 
 	done := make(chan struct{})
 	go func() {
@@ -114,13 +114,13 @@ func TestHandlePinsImageAcrossDelivery(t *testing.T) {
 	}()
 	exec.waitEntered()
 
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 2 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 2 {
 		t.Fatalf("lease count during Handle = %d, want 2 (publication + delivery pin)", got)
 	}
 
 	close(exec.release)
 	<-done
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 1 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 1 {
 		t.Fatalf("lease count after Handle = %d, want 1 (publication only)", got)
 	}
 }
@@ -149,14 +149,14 @@ func (e *blockingExec) waitEntered() { <-e.entered }
 // leasePrepared is preparedWithLease without *testing.T, so a concurrent churn
 // goroutine can build a publication carrying a real admitted lease and report an
 // acquire failure without calling t.Fatalf off the test goroutine.
-func leasePrepared(exec *leaseExecutor, name, image string) (*PreparedFunction, error) {
+func leasePrepared(exec *leaseExecutor, name, image string) (*PreparedApp, error) {
 	lease, err := exec.mgr.AcquireImageLease(image)
 	if err != nil {
 		return nil, err
 	}
-	pf := NewPrepared(function.Function{
+	pf := NewPrepared(app.App{
 		Name:     name,
-		Template: &function.Template{Runtime: "node24", Events: []function.EventRule{alwaysMatchRule(time.Second)}},
+		Template: &app.Template{Runtime: "node24", Events: []app.EventRule{alwaysMatchRule(time.Second)}},
 	}, &runtime.Prepared{Name: name, Image: image}, exec)
 	pf.lease = lease
 	return pf, nil
@@ -171,7 +171,7 @@ func leasePrepared(exec *leaseExecutor, name, image string) (*PreparedFunction, 
 // it, so the image reaches zero.
 func TestRegistrySnapshotPinConcurrentChurn(t *testing.T) {
 	exec := newLeaseExecutor()
-	r := New([]*PreparedFunction{preparedWithLease(t, "a", "relay-fn-a:v1", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{preparedWithLease(t, "a", "relay-app-a:v1", exec)}, testutil.DiscardLogger())
 	reg := r.Registry()
 
 	const iterations = 200
@@ -200,7 +200,7 @@ func TestRegistrySnapshotPinConcurrentChurn(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for j := 0; j < iterations; j++ {
-			pf, err := leasePrepared(exec, "a", "relay-fn-a:v1")
+			pf, err := leasePrepared(exec, "a", "relay-app-a:v1")
 			if err != nil {
 				buildErr <- err
 				return
@@ -219,13 +219,13 @@ func TestRegistrySnapshotPinConcurrentChurn(t *testing.T) {
 
 	// Churn is over and every snapshot pin has been released: exactly the final
 	// publication lease remains.
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 1 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 1 {
 		t.Fatalf("lease count after churn = %d, want 1 (last publication only)", got)
 	}
 	// Removing the entry releases the last publication, so the image drains
 	// completely: no reference was stranded or double-released.
 	reg.Replace("a", nil)
-	if got := exec.mgr.LeaseCount("relay-fn-a:v1"); got != 0 {
+	if got := exec.mgr.LeaseCount("relay-app-a:v1"); got != 0 {
 		t.Fatalf("lease count after final removal = %d, want 0 (no stranded pin)", got)
 	}
 }

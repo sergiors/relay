@@ -15,12 +15,12 @@ import (
 func TestImageCoordinatorAcquireRetireDrain(t *testing.T) {
 	c := newImageCoordinator()
 
-	l1, err := c.acquire("relay-fn-a:x")
+	l1, err := c.acquire("relay-app-a:x")
 	if err != nil || l1 == nil {
 		t.Fatalf("first acquire = (%v, %v), want a lease", l1, err)
 	}
 
-	drained, owner := c.beginRetire("relay-fn-a:x")
+	drained, owner := c.beginRetire("relay-app-a:x")
 	if !owner {
 		t.Fatal("first beginRetire must own removal")
 	}
@@ -31,7 +31,7 @@ func TestImageCoordinatorAcquireRetireDrain(t *testing.T) {
 	}
 
 	// A new independent lease is rejected once retirement is committed.
-	if _, err := c.acquire("relay-fn-a:x"); !errors.Is(err, ErrImageRetiring) {
+	if _, err := c.acquire("relay-app-a:x"); !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("acquire after retire = %v, want ErrImageRetiring", err)
 	}
 
@@ -54,10 +54,10 @@ func TestImageCoordinatorAcquireRetireDrain(t *testing.T) {
 // not own removal, so two removers can never race an ImageRemove.
 func TestImageCoordinatorDuplicateRetireNotOwner(t *testing.T) {
 	c := newImageCoordinator()
-	if _, owner := c.beginRetire("relay-fn-a:x"); !owner {
+	if _, owner := c.beginRetire("relay-app-a:x"); !owner {
 		t.Fatal("first beginRetire must own")
 	}
-	if _, owner := c.beginRetire("relay-fn-a:x"); owner {
+	if _, owner := c.beginRetire("relay-app-a:x"); owner {
 		t.Fatal("second beginRetire must NOT own removal")
 	}
 }
@@ -66,17 +66,17 @@ func TestImageCoordinatorDuplicateRetireNotOwner(t *testing.T) {
 // retirement gate, so the image is reusable and a later pass can retry.
 func TestImageCoordinatorFailedRetireRetryable(t *testing.T) {
 	c := newImageCoordinator()
-	drained, owner := c.beginRetire("relay-fn-a:x")
+	drained, owner := c.beginRetire("relay-app-a:x")
 	if !owner {
 		t.Fatal("beginRetire must own")
 	}
 	<-drained
-	c.finishRetire("relay-fn-a:x", false)
+	c.finishRetire("relay-app-a:x", false)
 
-	if c.retired("relay-fn-a:x") {
+	if c.retired("relay-app-a:x") {
 		t.Fatal("a failed retirement must clear the gate")
 	}
-	if _, err := c.acquire("relay-fn-a:x"); err != nil {
+	if _, err := c.acquire("relay-app-a:x"); err != nil {
 		t.Fatalf("image must be reusable after a failed removal, got %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestImageCoordinatorFailedRetireRetryable(t *testing.T) {
 // drain point).
 func TestImageCoordinatorShareAfterReleaseRefused(t *testing.T) {
 	c := newImageCoordinator()
-	l, err := c.acquire("relay-fn-a:x")
+	l, err := c.acquire("relay-app-a:x")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestImageCoordinatorShareAfterReleaseRefused(t *testing.T) {
 // prove no reference is stranded or resurrected.
 func TestImageCoordinatorConcurrentShareRelease(t *testing.T) {
 	c := newImageCoordinator()
-	l, err := c.acquire("relay-fn-a:x")
+	l, err := c.acquire("relay-app-a:x")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestImageCoordinatorConcurrentShareRelease(t *testing.T) {
 	wg.Wait()
 	l.Release()
 
-	drained, owner := c.beginRetire("relay-fn-a:x")
+	drained, owner := c.beginRetire("relay-app-a:x")
 	if !owner {
 		t.Fatal("beginRetire must own")
 	}
@@ -134,9 +134,9 @@ func TestManagerExecuteRetiringImageRejected(t *testing.T) {
 	m := &Manager{hostname: "test-host"}
 	// Commit retirement with no holders, then wait for the (empty) drain is not
 	// needed: acquire must reject immediately.
-	m.leaseCoord().beginRetire("relay-fn-a:x")
+	m.leaseCoord().beginRetire("relay-app-a:x")
 
-	err := m.Execute(context.Background(), &Prepared{Name: "a", Image: "relay-fn-a:x"}, "h", nil, nil)
+	err := m.Execute(context.Background(), &Prepared{Name: "a", Image: "relay-app-a:x"}, "h", nil, nil)
 	if err == nil || !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("Execute against a retiring image = %v, want wrapped ErrImageRetiring", err)
 	}
@@ -149,13 +149,13 @@ func TestManagerExecuteRetiringImageRejected(t *testing.T) {
 // without needing a Docker daemon.
 func TestManagerSnapshotLeaseSharesUnderRetirement(t *testing.T) {
 	m := &Manager{}
-	lease, err := m.AcquireImageLease("relay-fn-a:x")
+	lease, err := m.AcquireImageLease("relay-app-a:x")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer lease.Release()
 
-	drained, owner := m.leaseCoord().beginRetire("relay-fn-a:x")
+	drained, owner := m.leaseCoord().beginRetire("relay-app-a:x")
 	if !owner {
 		t.Fatal("beginRetire must own")
 	}
@@ -172,7 +172,7 @@ func TestManagerSnapshotLeaseSharesUnderRetirement(t *testing.T) {
 	} else {
 		shared.Release()
 	}
-	if _, err := m.AcquireImageLease("relay-fn-a:x"); !errors.Is(err, ErrImageRetiring) {
+	if _, err := m.AcquireImageLease("relay-app-a:x"); !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("fresh acquire while retiring = %v, want ErrImageRetiring", err)
 	}
 }
@@ -180,11 +180,11 @@ func TestManagerSnapshotLeaseSharesUnderRetirement(t *testing.T) {
 // TestManagerIsImageRetiring pins the diagnostic accessor.
 func TestManagerIsImageRetiring(t *testing.T) {
 	m := &Manager{}
-	if m.IsImageRetiring("relay-fn-a:x") {
+	if m.IsImageRetiring("relay-app-a:x") {
 		t.Fatal("a fresh image must not be retiring")
 	}
-	m.leaseCoord().beginRetire("relay-fn-a:x")
-	if !m.IsImageRetiring("relay-fn-a:x") {
+	m.leaseCoord().beginRetire("relay-app-a:x")
+	if !m.IsImageRetiring("relay-app-a:x") {
 		t.Fatal("a committed image must report retiring")
 	}
 }
@@ -218,13 +218,13 @@ func TestManagerLeaseCoordSingleAuthority(t *testing.T) {
 // begin.
 func TestImageCoordinatorBeginShutdownGatesRemoval(t *testing.T) {
 	c := newImageCoordinator()
-	if _, owner, err := c.beginRemoval("relay-fn-a:x"); err != nil || !owner {
+	if _, owner, err := c.beginRemoval("relay-app-a:x"); err != nil || !owner {
 		t.Fatalf("beginRemoval before shutdown = (owner=%v, err=%v), want owned", owner, err)
 	}
-	c.finishRemoval("relay-fn-a:x", true)
+	c.finishRemoval("relay-app-a:x", true)
 
 	c.beginShutdown()
-	if _, _, err := c.beginRemoval("relay-fn-a:y"); !errors.Is(err, ErrManagerShuttingDown) {
+	if _, _, err := c.beginRemoval("relay-app-a:y"); !errors.Is(err, ErrManagerShuttingDown) {
 		t.Fatalf("beginRemoval after shutdown = %v, want ErrManagerShuttingDown", err)
 	}
 	if err := c.beginRemovalOp(); !errors.Is(err, ErrManagerShuttingDown) {
@@ -237,7 +237,7 @@ func TestImageCoordinatorBeginShutdownGatesRemoval(t *testing.T) {
 // cancels the operation's derived context (the shutdown context).
 func TestImageCoordinatorWaitRetirementsJoins(t *testing.T) {
 	c := newImageCoordinator()
-	_, owner, err := c.beginRemoval("relay-fn-a:x")
+	_, owner, err := c.beginRemoval("relay-app-a:x")
 	if err != nil || !owner {
 		t.Fatalf("beginRemoval = (owner=%v, err=%v), want owned", owner, err)
 	}
@@ -277,7 +277,7 @@ func TestImageCoordinatorWaitRetirementsJoins(t *testing.T) {
 	default:
 	}
 
-	c.finishRemoval("relay-fn-a:x", false)
+	c.finishRemoval("relay-app-a:x", false)
 	select {
 	case <-waiting:
 	case <-time.After(2 * time.Second):
@@ -291,11 +291,11 @@ func TestImageCoordinatorWaitRetirementsJoins(t *testing.T) {
 // beginRetire (a test-simulated in-progress retirement) stays open across reset.
 func TestImageCoordinatorResetDoesNotWakeWaiter(t *testing.T) {
 	c := newImageCoordinator()
-	lease, err := c.acquire("relay-fn-a:x")
+	lease, err := c.acquire("relay-app-a:x")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	drained, owner := c.beginRetire("relay-fn-a:x")
+	drained, owner := c.beginRetire("relay-app-a:x")
 	if !owner {
 		t.Fatal("beginRetire must own")
 	}

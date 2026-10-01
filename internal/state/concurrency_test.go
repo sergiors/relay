@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -70,9 +70,9 @@ func TestConcurrentGlobalStatsWrites(t *testing.T) {
 	assertNoBusy(t, buf)
 }
 
-// TestConcurrentFunctionStatsWrites writes distinct per-function rows from many
+// TestConcurrentAppStatsWrites writes distinct per-app rows from many
 // goroutines concurrently, then verifies every row exists with its exact value.
-func TestConcurrentFunctionStatsWrites(t *testing.T) {
+func TestConcurrentAppStatsWrites(t *testing.T) {
 	c, buf := captureLogger(t)
 	const k = 30
 
@@ -82,26 +82,26 @@ func TestConcurrentFunctionStatsWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := "fn-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
-			c.RecordFunctionStats(FunctionStats{Function: name, EventsMatchedTotal: int64(i + 1)})
+			c.RecordAppStats(AppStats{App: name, EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
 
-	all := c.AllFunctionStats()
+	all := c.AllAppStats()
 	if len(all) != k {
-		t.Fatalf("AllFunctionStats len = %d, want %d", len(all), k)
+		t.Fatalf("AllAppStats len = %d, want %d", len(all), k)
 	}
 	for _, fs := range all {
 		want := int64(0)
 		for i := 0; i < k; i++ {
 			name := "fn-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
-			if fs.Function == name {
+			if fs.App == name {
 				want = int64(i + 1)
 				break
 			}
 		}
 		if fs.EventsMatchedTotal != want {
-			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsMatchedTotal, want)
+			t.Fatalf("function %q events = %d, want %d", fs.App, fs.EventsMatchedTotal, want)
 		}
 	}
 	assertNoBusy(t, buf)
@@ -114,9 +114,9 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 	c, buf := captureLogger(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	const m = 8
-	// Precompute the function values up front: fnFor calls t.TempDir(), which is
+	// Precompute the app values up front: fnFor calls t.TempDir(), which is
 	// not safe to call from goroutines.
-	fns := make([]function.Function, m)
+	fns := make([]app.App, m)
 	for i := 0; i < m; i++ {
 		fns[i] = fnFor(t, "fn-"+string(rune('a'+i)), tmpl)
 		c.RecordDiscovered(fns[i])
@@ -158,9 +158,9 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 				return
 			default:
 			}
-			fns := make([]FunctionStats, 0, m)
+			fns := make([]AppStats, 0, m)
 			for i := 0; i < m; i++ {
-				fns = append(fns, FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
+				fns = append(fns, AppStats{App: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
 			}
 			_ = c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 100}, fns)
 		}
@@ -170,21 +170,21 @@ func TestConcurrentReconcileAndStats(t *testing.T) {
 	cancel()
 	wg.Wait()
 
-	// State must be consistent: every function present, global stats present.
-	if got := len(c.ListFunctions()); got != m {
-		t.Fatalf("ListFunctions len = %d, want %d", got, m)
+	// State must be consistent: every app present, global stats present.
+	if got := len(c.ListApps()); got != m {
+		t.Fatalf("ListApps len = %d, want %d", got, m)
 	}
 	if _, ok := c.Stats(); !ok {
 		t.Fatal("expected global stats row after concurrent reconcile+flush")
 	}
-	if got := len(c.AllFunctionStats()); got != m {
-		t.Fatalf("AllFunctionStats len = %d, want %d", got, m)
+	if got := len(c.AllAppStats()); got != m {
+		t.Fatalf("AllAppStats len = %d, want %d", got, m)
 	}
 	assertNoBusy(t, buf)
 }
 
 // TestConcurrentReadsDuringWrites runs a writer goroutine (stats snapshot) while
-// reader goroutines call Stats/ListFunctions/GetFunction concurrently. Readers
+// reader goroutines call Stats/ListApps/GetApp concurrently. Readers
 // must return data or empty without panicking, and no lock/busy error may
 // surface.
 func TestConcurrentReadsDuringWrites(t *testing.T) {
@@ -209,7 +209,7 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 			}
 			_ = c.RecordStatsSnapshot(context.Background(),
 				Stats{EventsMatchedTotal: 1},
-				[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 1}})
+				[]AppStats{{App: "alpha", EventsMatchedTotal: 1}})
 		}
 	}()
 
@@ -224,9 +224,9 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 				default:
 				}
 				_, _ = c.Stats()
-				_ = c.ListFunctions()
-				_, _ = c.GetFunction("alpha")
-				_, _ = c.FunctionStats("alpha")
+				_ = c.ListApps()
+				_, _ = c.GetApp("alpha")
+				_, _ = c.AppStats("alpha")
 			}
 		}()
 	}
@@ -278,7 +278,7 @@ func TestReopenUnderConcurrency(t *testing.T) {
 }
 
 // TestPersistenceAfterConcurrency is a deterministic correctness check: distinct
-// function_stats rows written concurrently plus one final global RecordStats
+// app_stats rows written concurrently plus one final global RecordStats
 // must all be readable with exact values after Close+reopen.
 func TestPersistenceAfterConcurrency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db.sqlite3")
@@ -295,7 +295,7 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			c1.RecordFunctionStats(FunctionStats{Function: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
+			c1.RecordAppStats(AppStats{App: "fn-" + string(rune('a'+i)), EventsMatchedTotal: int64(i + 1)})
 		}(i)
 	}
 	wg.Wait()
@@ -310,20 +310,20 @@ func TestPersistenceAfterConcurrency(t *testing.T) {
 	}
 	defer c2.Close()
 
-	all := c2.AllFunctionStats()
+	all := c2.AllAppStats()
 	if len(all) != k {
-		t.Fatalf("AllFunctionStats len = %d, want %d", len(all), k)
+		t.Fatalf("AllAppStats len = %d, want %d", len(all), k)
 	}
 	for _, fs := range all {
 		want := int64(0)
 		for i := 0; i < k; i++ {
-			if fs.Function == "fn-"+string(rune('a'+i)) {
+			if fs.App == "fn-"+string(rune('a'+i)) {
 				want = int64(i + 1)
 				break
 			}
 		}
 		if fs.EventsMatchedTotal != want {
-			t.Fatalf("function %q events = %d, want %d", fs.Function, fs.EventsMatchedTotal, want)
+			t.Fatalf("function %q events = %d, want %d", fs.App, fs.EventsMatchedTotal, want)
 		}
 	}
 	gs, ok := c2.Stats()

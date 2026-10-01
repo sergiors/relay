@@ -15,7 +15,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -127,7 +127,7 @@ func ourClassicIntermediates(ctx context.Context, cli *client.Client, own map[st
 	}
 	var out []string
 	for _, c := range list.Items {
-		if _, ok := c.Labels[labelFunction]; ok {
+		if _, ok := c.Labels[labelApp]; ok {
 			continue // a Relay execution container, not a build intermediate
 		}
 		if !isClassicBuilderIntermediateCmd(c.Command) {
@@ -141,7 +141,7 @@ func ourClassicIntermediates(ctx context.Context, cli *client.Client, own map[st
 }
 
 // TestIntegrationRebuildLeavesNoIntermediateContainers verifies that rebuilding
-// a function (v1 -> v2) does not leak classic-builder intermediate containers.
+// an app (v1 -> v2) does not leak classic-builder intermediate containers.
 // After each build it computes the image layers that build created (from the
 // built image's history, minus the pre-build layer set) and asserts no
 // intermediate-shaped container ran in any of them. It exercises the real daemon
@@ -174,9 +174,9 @@ events:
     pattern:
       event_name: [INSERT]
 `)
-	fn := function.Function{Name: "rebuild-int", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "rebuild-int", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
-	// Track the relay-fn-* images this test creates so t.Cleanup can remove them
+	// Track the relay-app-* images this test creates so t.Cleanup can remove them
 	// (intermediates are expected to be gone by the fix; if the test fails they
 	// are left visible for debugging). t.Cleanup runs after the test's deferred
 	// cancel() has fired, so use a fresh context here rather than the cancelled
@@ -208,10 +208,10 @@ events:
 		writeFile(t, dir, "index.js", "export function hi(e){ console.log('"+ver+"-"+strconv.FormatInt(nonce, 10)+"'); }\n")
 
 		// Remove this version's target image first (it is this test's own
-		// relay-fn-rebuild-int:* namespace) so each Prepare is a REAL build, not
+		// relay-app-rebuild-int:* namespace) so each Prepare is a REAL build, not
 		// a cache reuse: the assertion must observe a build's intermediates, and
 		// a reused image would leave nothing to attribute.
-		fp, err := function.Fingerprint(dir)
+		fp, err := app.Fingerprint(dir)
 		if err != nil {
 			t.Fatalf("fingerprint %s: %v", ver, err)
 		}
@@ -277,7 +277,7 @@ events:
 	// fail parsing it, failing the build deterministically.
 	writeFile(t, dir, "package.json", "{ not json")
 
-	fn := function.Function{Name: "failed-build-int", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "failed-build-int", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 	// Snapshot the container set BEFORE the failed build.
 	preList, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
@@ -334,7 +334,7 @@ events:
 	t.Logf("failed build left %d intermediate container(s): %v", len(leakedIntermediates), leakedIntermediates)
 
 	// Cleanup: force-remove the leftover intermediate containers and any
-	// relay-fn-failed-build-int:* image the failed build created. t.Cleanup runs
+	// relay-app-failed-build-int:* image the failed build created. t.Cleanup runs
 	// after the test's deferred cancel() has fired, so use a fresh context.
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -342,7 +342,7 @@ events:
 		for _, id := range leakedIntermediates {
 			_ = removeContainer(cli, id)
 		}
-		// Remove any tagged relay-fn-failed-build-int:* image (the failed build
+		// Remove any tagged relay-app-failed-build-int:* image (the failed build
 		// may or may not have produced a tagged image).
 		imgs, err := cli.ImageList(cleanupCtx, client.ImageListOptions{})
 		if err != nil {
@@ -350,7 +350,7 @@ events:
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-failed-build-int:") {
+				if strings.HasPrefix(tag, "relay-app-failed-build-int:") {
 					cleanupImage(cli, cleanupCtx, tag)
 					break
 				}
@@ -360,7 +360,7 @@ events:
 }
 
 // TestIntegrationConcurrentDepBuilds verifies two concurrent Prepare calls for
-// the same function version (two Manager instances, as two worker replicas
+// the same app version (two Manager instances, as two worker replicas
 // would) both succeed and resolve to exactly ONE dependency image — the shared,
 // content-addressed layer is build-once under a build race. The dependency
 // reference is derived deterministically from the manifest with the production
@@ -372,12 +372,12 @@ func TestIntegrationConcurrentDepBuilds(t *testing.T) {
 	defer cancel()
 
 	// Register cleanup FIRST (before any Fatalf) so a mid-test failure never
-	// leaks the dep-layer nor function images into the sibling tests that follow
+	// leaks the dep-layer nor app images into the sibling tests that follow
 	// on the shared daemon. The dep cleanup is scoped to this test's own
 	// additions (delta vs snapshot).
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-race:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-race:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -389,7 +389,7 @@ events:
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
-	fn := function.Function{Name: "dep-race", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-race", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	wantDep := expectedDependencyRef(t, fn)
 
 	start := make(chan struct{})
@@ -419,7 +419,7 @@ events:
 		case err := <-errs:
 			t.Fatalf("concurrent prepare failed: %v", err)
 		case p := <-results:
-			// Two concurrent Prepare calls build the SAME function image
+			// Two concurrent Prepare calls build the SAME app image
 			// ref. The second build can briefly un-tag/rebuild the ref while
 			// the daemon finishes, so poll for the ref to exist rather than
 			// asserting at the instant this goroutine finished.

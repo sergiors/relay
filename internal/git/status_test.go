@@ -92,15 +92,15 @@ func TestStatusKeyExistsAfterKeygen(t *testing.T) {
 }
 
 // TestRemoveIdempotent verifies remove drops config+checkout and leaves
-// /functions and the SSH key untouched, and that a second remove succeeds
+// /apps and the SSH key untouched, and that a second remove succeeds
 // (idempotent), reporting nothing to remove.
 func TestRemoveIdempotent(t *testing.T) {
 	e := fixture(t, false)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
 	mustSync(t, e, cfg)
 
-	// Plant a function file in /functions and generate a key before remove.
-	writeFile(t, filepath.Join(e.functions, "saved", "note.txt"), "keep me\n")
+	// Plant an app file in /apps and generate a key before remove.
+	writeFile(t, filepath.Join(e.apps, "saved", "note.txt"), "keep me\n")
 	if _, err := GenerateKey(e.sshDir); err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
@@ -116,8 +116,8 @@ func TestRemoveIdempotent(t *testing.T) {
 	if _, err := os.Stat(e.checkout); !os.IsNotExist(err) {
 		t.Fatal("checkout dir not removed")
 	}
-	// /functions and the key survive.
-	if _, err := os.Stat(filepath.Join(e.functions, "saved", "note.txt")); err != nil {
+	// /apps and the key survive.
+	if _, err := os.Stat(filepath.Join(e.apps, "saved", "note.txt")); err != nil {
 		t.Fatalf("functions touched by remove: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(e.sshDir, PrivateKeyFile)); err != nil {

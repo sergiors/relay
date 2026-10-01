@@ -17,7 +17,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -32,8 +32,8 @@ func TestIntegrationExecutionConfigEnvExcludesDynamicEnv(t *testing.T) {
 	testutil.RequireDocker(t)
 	m, _ := newManager(t)
 	sink := &pollingSink{}
-	prev := SetFunctionOutput(sink)
-	t.Cleanup(func() { SetFunctionOutput(prev) })
+	prev := SetAppOutput(sink)
+	t.Cleanup(func() { SetAppOutput(prev) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -63,7 +63,7 @@ export async function env(event) {
   await new Promise(r => setTimeout(r, event.blockMs ?? 0));
 }
 `)
-	fn := function.Function{Name: "env-boundary-e2e", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "env-boundary-e2e", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -73,7 +73,7 @@ export async function env(event) {
 	// secret) via the request-frame path.
 	extraEnv := []string{"GREETING=" + envValue, "TOKEN=" + secretValue}
 	execCtx := context.WithValue(context.Background(), runMetaKey{},
-		RunMeta{Hostname: "test-host", Function: "env-boundary-e2e", Handler: "index.env", Image: prepared.Image})
+		RunMeta{Hostname: "test-host", App: "env-boundary-e2e", Handler: "index.env", Image: prepared.Image})
 	done := make(chan error, 1)
 	go func() {
 		done <- m.Execute(execCtx, prepared, "index.env", []byte(`{"event_name":"INSERT","blockMs":2000}`), extraEnv)
@@ -87,7 +87,7 @@ export async function env(event) {
 		t.Fatalf("handler did not observe TOKEN via the frame; sink:\n%s", sink.String())
 	}
 
-	id := findContainerByLabel(ctx, m.cli, labelFunction, "env-boundary-e2e")
+	id := findContainerByLabel(ctx, m.cli, labelApp, "env-boundary-e2e")
 	if id == "" {
 		t.Fatal("execution container not found while the handler runs")
 	}

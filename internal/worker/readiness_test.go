@@ -270,15 +270,15 @@ func TestProbeReadinessSkipsDockerDuringRedisOutage(t *testing.T) {
 	}
 }
 
-// TestReadinessNotGatedByStateTracingServicesOrFunctionFailure pins the
+// TestReadinessNotGatedByStateTracingServicesOrAppFailure pins the
 // explicit exclusion list: readiness is decided ONLY from the worker lifecycle
 // boundary plus the live dependency probe (Redis consumer, Docker, NETWORKS).
 // It exercises the real seams Run uses for the non-gating concerns — tracing
-// setup (disabled/failed), a nil state handle, a startup function-load issue,
+// setup (disabled/failed), a nil state handle, a startup app-load issue,
 // and the asynchronous housekeeping pass — BEFORE crossing the ready boundary,
 // and asserts the worker is still ready. Those phases are best-effort and
 // asynchronous, so they must never gate consumption.
-func TestReadinessNotGatedByStateTracingServicesOrFunctionFailure(t *testing.T) {
+func TestReadinessNotGatedByStateTracingServicesOrAppFailure(t *testing.T) {
 	// Tracing: a disabled/absent configuration yields a usable provider; a setup
 	// failure is non-fatal observability. Either way it must not gate readiness.
 	// Setup installs a global provider, so restore the previous one afterwards so
@@ -298,8 +298,8 @@ func TestReadinessNotGatedByStateTracingServicesOrFunctionFailure(t *testing.T) 
 	// State: a nil handle models an unopenable SQLite database (logged, never
 	// fatal). It is not an input to readiness.
 
-	// Function failure: an invalid desired definition stays out of the loaded
-	// set; it is a per-function concern and does not gate worker readiness.
+	// App failure: an invalid desired definition stays out of the loaded
+	// set; it is a per-app concern and does not gate worker readiness.
 
 	// Asynchronous service/housekeeping convergence: started before the ready
 	// boundary and deliberately not awaited. A no-op barrier stands in for a

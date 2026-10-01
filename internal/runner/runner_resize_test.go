@@ -6,27 +6,27 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
-// TestRunnerPerFunctionSemaphoreResizedLive proves a function's per-function
+// TestRunnerPerAppSemaphoreResizedLive proves an app's per-app
 // semaphore is resized in place when its resolved template concurrency changes,
 // without a restart: the new (smaller) bound is enforced on the next Handle
-// using the already-registered function. The global cap is raised so the
-// per-function bound is the binding one.
-func TestRunnerPerFunctionSemaphoreResizedLive(t *testing.T) {
+// using the already-registered app. The global cap is raised so the
+// per-app bound is the binding one.
+func TestRunnerPerAppSemaphoreResizedLive(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
-	// Warm the per-function semaphore at capacity 4.
+	// Warm the per-app semaphore at capacity 4.
 	runConcurrent(t, r, 8)
 	if got := exec.peakConcurrency(); got > 4 {
 		t.Fatalf("initial peak = %d, want <= 4", got)
 	}
 
-	// Swap the function to concurrency 1 (same runner, no restart) and reset the
+	// Swap the app to concurrency 1 (same runner, no restart) and reset the
 	// peak observation.
 	r.Registry().Replace("f", fnWithConcurrency(t, "f", 1, exec))
 	exec.resetPeak()
@@ -52,12 +52,12 @@ func TestRunnerPerFunctionSemaphoreResizedLive(t *testing.T) {
 // releases to the semaphore pointer it captured, so replacing the map entry on a
 // resize never strands a held slot (a shrink cannot block a release on a full
 // new channel). A holding invocation keeps the sole slot of a concurrency-1
-// function; the function is then resized to a larger bound while it is in
+// app; the app is then resized to a larger bound while it is in
 // flight; both the original holder and later invocations must complete.
 func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	firstDone := make(chan struct{})
@@ -67,7 +67,7 @@ func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 	}()
 	holding.waitEntered()
 
-	// Resize the function while the holding invocation owns the old semaphore's
+	// Resize the app while the holding invocation owns the old semaphore's
 	// only slot.
 	r.Registry().Replace("f", fnWithConcurrency(t, "f", 3, holding))
 
@@ -94,23 +94,23 @@ func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 	}
 }
 
-// TestRunnerRemoveFunctionSemaphore proves removal drops a function's semaphore
+// TestRunnerRemoveAppSemaphore proves removal drops an app's semaphore
 // so a later recreation of the same name starts from the fresh bound rather than
 // inheriting a stale one.
-func TestRunnerRemoveFunctionSemaphore(t *testing.T) {
+func TestRunnerRemoveAppSemaphore(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 20 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 5, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 5, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	// Warm the semaphore at 5.
 	runConcurrent(t, r, 5)
-	r.RemoveFunctionSemaphore("f")
+	r.RemoveAppSemaphore("f")
 
 	r.fnSemsMu.Lock()
 	_, ok := r.fnSems["f"]
 	r.fnSemsMu.Unlock()
 	if ok {
-		t.Fatal("RemoveFunctionSemaphore must drop the per-function semaphore")
+		t.Fatal("RemoveAppSemaphore must drop the per-function semaphore")
 	}
 
 	// Recreate at 1: a fresh semaphore must enforce 1, not the stale 5.
@@ -122,13 +122,13 @@ func TestRunnerRemoveFunctionSemaphore(t *testing.T) {
 	}
 }
 
-// TestRunnerPerFunctionSemaphoreRaceSafety hammers concurrent swaps with
+// TestRunnerPerAppSemaphoreRaceSafety hammers concurrent swaps with
 // differing concurrency against concurrent Handles. Its value is under -race:
 // the resize replaces map entries under fnSemsMu and each acquisition releases
 // to its captured pointer.
-func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
+func TestRunnerPerAppSemaphoreRaceSafety(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 2, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 2, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(16)
 
 	var wg sync.WaitGroup
@@ -177,7 +177,7 @@ func TestRunnerPerFunctionSemaphoreRaceSafety(t *testing.T) {
 // registry entry already raised.
 func TestRunnerSemaphoreResizeIsRegistryAuthoritative(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
 
 	// Install a semaphore at the current bound.
 	_, s := r.concurrencySems("f", 4)
@@ -193,15 +193,15 @@ func TestRunnerSemaphoreResizeIsRegistryAuthoritative(t *testing.T) {
 	}
 }
 
-// TestRunnerPerFunctionSemaphoreClipsToGlobal proves the per-function semaphore
-// is sized to min(template concurrency, MAX_CONCURRENCY): a function asking for
+// TestRunnerPerAppSemaphoreClipsToGlobal proves the per-app semaphore
+// is sized to min(template concurrency, MAX_CONCURRENCY): an app asking for
 // 15 under a global cap of 8 gets a capacity-8 semaphore (not 15), matching the
 // runtime's clipped warm-pool bound. A later live reconcile to 4 resizes it to
-// 4. This is the runner half of "function concurrency 15 with MAX_CONCURRENCY=8
+// 4. This is the runner half of "app concurrency 15 with MAX_CONCURRENCY=8
 // => effective live capacity 8".
-func TestRunnerPerFunctionSemaphoreClipsToGlobal(t *testing.T) {
+func TestRunnerPerAppSemaphoreClipsToGlobal(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
-	r := NewWithMetrics([]*PreparedFunction{fnWithConcurrency(t, "f", 15, exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 15, exec)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(8)
 
 	// The installed semaphore capacity is the effective bound, not the raw 15.
@@ -231,7 +231,7 @@ func TestRunnerPerFunctionSemaphoreClipsToGlobal(t *testing.T) {
 
 // TestRunnerEffectiveConcurrencyClipsAndDefaults pins the clip rule directly: a
 // value above the global cap is clipped, one below is untouched, a
-// zero/negative template value falls back to the function default, and a
+// zero/negative template value falls back to the app default, and a
 // zero-valued Runner's global falls back to DefaultMaxConcurrency.
 func TestRunnerEffectiveConcurrencyClipsAndDefaults(t *testing.T) {
 	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
@@ -243,8 +243,8 @@ func TestRunnerEffectiveConcurrencyClipsAndDefaults(t *testing.T) {
 	if got := r.effectiveConcurrency("abs", 4); got != 4 {
 		t.Fatalf("effectiveConcurrency(4) = %d, want 4", got)
 	}
-	if got := r.effectiveConcurrency("abs", 0); got != function.DefaultConcurrency {
-		t.Fatalf("effectiveConcurrency(0) = %d, want %d", got, function.DefaultConcurrency)
+	if got := r.effectiveConcurrency("abs", 0); got != app.DefaultConcurrency {
+		t.Fatalf("effectiveConcurrency(0) = %d, want %d", got, app.DefaultConcurrency)
 	}
 
 	var zero Runner

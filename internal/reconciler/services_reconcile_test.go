@@ -12,7 +12,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -20,8 +20,8 @@ import (
 
 // fakeContainer is one in-memory service container.
 type fakeContainer struct {
-	id       string
-	function string
+	id      string
+	appName string
 	// entrypoint is the service's stable identity (relay.service, the template
 	// service name). The historical field name is kept; fixtures set it to the
 	// name (which equals the source string in most of them).
@@ -97,7 +97,7 @@ func (f *fakeDocker) recordEvent(ev string) { f.events = append(f.events, ev) }
 // entrypoint sources resolve through runtime.ServiceEntry, and image sources
 // resolve to the source reference (with a deterministic content ID). A resolveErr
 // forces a resolution failure for the matching source reference.
-func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmpl *function.Template, svc function.Service, functionImage string) (runtime.ServiceImage, error) {
+func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmpl *app.Template, svc app.Service, appImage string) (runtime.ServiceImage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	identity := svc.SourceRef()
@@ -106,7 +106,7 @@ func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmp
 		return runtime.ServiceImage{}, err
 	}
 	switch svc.Source() {
-	case function.ServiceSourceImage:
+	case app.ServiceSourceImage:
 		id := f.resolvedImages[identity]
 		if id == "" {
 			id = identity + "-id"
@@ -117,7 +117,7 @@ func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmp
 		if err != nil {
 			return runtime.ServiceImage{}, err
 		}
-		return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+		return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 	}
 }
 
@@ -132,7 +132,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 	id := fmt.Sprintf("id-%d", f.nextID)
 	f.ctrs[id] = &fakeContainer{
 		id:         id,
-		function:   spec.Function,
+		appName:    spec.App,
 		entrypoint: spec.Name,
 		sourceRef:  spec.SourceRef,
 		image:      spec.Image,
@@ -176,7 +176,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 	for _, c := range f.ctrs {
 		out = append(out, runtime.ServiceContainer{
 			ID:        c.id,
-			Function:  c.function,
+			App:       c.appName,
 			Name:      c.entrypoint,
 			SourceRef: c.effectiveSourceRef(),
 			Image:     c.image,
@@ -215,12 +215,12 @@ func (f *fakeDocker) StopServiceContainers(_ context.Context, containers []runti
 	return firstErr
 }
 
-func (f *fakeDocker) RemoveFunctionServiceContainers(_ context.Context, fnName string) (int, error) {
+func (f *fakeDocker) RemoveAppServiceContainers(_ context.Context, fnName string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var toRemove []string
 	for id, c := range f.ctrs {
-		if c.function == fnName {
+		if c.appName == fnName {
 			f.stops = append(f.stops, c.id)
 			f.recordEvent("remove:" + c.id)
 			toRemove = append(toRemove, id)
@@ -278,7 +278,7 @@ func (f *fakeDocker) runningCount(fn, service string) int {
 	defer f.mu.Unlock()
 	n := 0
 	for _, c := range f.ctrs {
-		if c.function == fn && c.entrypoint == service && c.state == container.StateRunning {
+		if c.appName == fn && c.entrypoint == service && c.state == container.StateRunning {
 			n++
 		}
 	}
@@ -291,7 +291,7 @@ func (f *fakeDocker) replicas(fn, service string) []int {
 	defer f.mu.Unlock()
 	var slots []int
 	for _, c := range f.ctrs {
-		if c.function == fn && c.entrypoint == service && c.state == container.StateRunning {
+		if c.appName == fn && c.entrypoint == service && c.state == container.StateRunning {
 			slots = append(slots, c.replica)
 		}
 	}
@@ -299,13 +299,13 @@ func (f *fakeDocker) replicas(fn, service string) []int {
 	return slots
 }
 
-// countForFunction returns how many containers belong to fn regardless of state.
-func (f *fakeDocker) countForFunction(fn string) int {
+// countForApp returns how many containers belong to fn regardless of state.
+func (f *fakeDocker) countForApp(fn string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	n := 0
 	for _, c := range f.ctrs {
-		if c.function == fn {
+		if c.appName == fn {
 			n++
 		}
 	}
@@ -314,11 +314,11 @@ func (f *fakeDocker) countForFunction(fn string) int {
 
 // serviceTemplate builds a template with the given services. Runtimes default
 // to node24 so ServiceEntry succeeds.
-func serviceTemplate(runtimeName string, services ...function.Service) *function.Template {
+func serviceTemplate(runtimeName string, services ...app.Service) *app.Template {
 	if runtimeName == "" {
 		runtimeName = "node24"
 	}
-	return &function.Template{Runtime: runtimeName, Services: services}
+	return &app.Template{Runtime: runtimeName, Services: services}
 }
 
 // serviceEnvHash is the relay.env_hash label a started container carries for the
@@ -335,7 +335,7 @@ func serviceEnvHash(port int) string {
 // seeded fakeContainers in converged-state tests set this so they model a
 // container Relay itself created; omitting it models a legacy/unlabeled one.
 func serviceResources() string {
-	return function.DefaultResourceLimits().Fingerprint()
+	return app.DefaultResourceLimits().Fingerprint()
 }
 
 // testReconcileTimeout is the normal-operation budget the service tests pass to
@@ -348,21 +348,21 @@ const testReconcileTimeout = 30 * time.Second
 // no secrets, no service networks, and a discarded logger — the common shape
 // across the service tests. The lifecycle context is unbounded; Reconcile
 // derives its own per-operation bounds from the explicit timeout.
-func reconcile(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, cfg routing.TraefikConfig) (bool, error) {
+func reconcile(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
 	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, nil, nil, cfg, testutil.DiscardLogger())
 }
 
 // reconcileNetworks runs Reconcile with an explicit worker-global network set,
 // for the global-network tests.
-func reconcileNetworks(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, networks []string, cfg routing.TraefikConfig) (bool, error) {
+func reconcileNetworks(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, networks []string, cfg routing.TraefikConfig) (bool, error) {
 	t.Helper()
 	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, nil, networks, nil, cfg, testutil.DiscardLogger())
 }
 
 func TestReconcileInitialCreation(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -385,7 +385,7 @@ func TestReconcileInitialCreation(t *testing.T) {
 
 func TestReconcileScaleUp(t *testing.T) {
 	f := newFakeDocker()
-	svc := function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}
+	svc := app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}
 	if _, err := reconcile(t, f, "fn", serviceTemplate("node24", svc), "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestReconcileScaleUp(t *testing.T) {
 
 func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 	f := newFakeDocker()
-	svc := function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 3}
+	svc := app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 3}
 	if _, err := reconcile(t, f, "fn", serviceTemplate("node24", svc), "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 3: %v", err)
 	}
@@ -436,8 +436,8 @@ func TestReconcileScaleDownKeepsLowestReplicas(t *testing.T) {
 func TestReconcileServiceRemoved(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24",
-		function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2},
-		function.Service{Name: "old.js", Entrypoint: "old.js", Port: 80, Replicas: 1},
+		app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2},
+		app.Service{Name: "old.js", Entrypoint: "old.js", Port: 80, Replicas: 1},
 	)
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -447,7 +447,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 	}
 
 	// Remove old.js from the template; only service.js remains.
-	reduced := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	reduced := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", reduced, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile reduced: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestReconcileServiceRemoved(t *testing.T) {
 
 func TestReconcilePortChange(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestReconcilePortChange(t *testing.T) {
 	}
 
 	// Change the port: the now-stale-config container must be replaced.
-	changed := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1})
+	changed := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 3000, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", changed, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile changed: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestReconcilePortChange(t *testing.T) {
 	f.mu.Lock()
 	var running *fakeContainer
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+		if c.appName == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
 			running = c
 		}
 	}
@@ -497,7 +497,7 @@ func TestReconcilePortChange(t *testing.T) {
 
 func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile img-1: %v", err)
 	}
@@ -515,7 +515,7 @@ func TestReconcileImageChangeReplacesAll(t *testing.T) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" {
+		if c.appName == "fn" && c.entrypoint == "service.js" {
 			if c.image != "img-2" {
 				t.Errorf("container %s image = %q, want img-2", c.id, c.image)
 			}
@@ -529,14 +529,14 @@ func TestReconcileImageChangeReplacesAll(t *testing.T) {
 // stale-by-image pin for the image-retirement ordering.
 func TestReconcileServiceStaleByImage(t *testing.T) {
 	f := newFakeDocker()
-	// A running container for the old image on the desired function/entrypoint/
+	// A running container for the old image on the desired app/entrypoint/
 	// port/replica slot.
 	f.ctrs["old-1"] = &fakeContainer{
-		id: "old-1", function: "fn", entrypoint: "service.js",
+		id: "old-1", appName: "fn", entrypoint: "service.js",
 		image: "img-old", port: 80, replica: 0, state: container.StateRunning,
 	}
 
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 	var running *fakeContainer
 	f.mu.Lock()
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+		if c.appName == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
 			running = c
 		}
 	}
@@ -571,7 +571,7 @@ func TestReconcileServiceStaleByImage(t *testing.T) {
 
 func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -584,7 +584,7 @@ func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 	f.mu.Lock()
 	var toCrash string
 	for id, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+		if c.appName == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
 			toCrash = id
 			break
 		}
@@ -608,7 +608,7 @@ func TestReconcileCrashedReplicaRecreated(t *testing.T) {
 func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	// A Replica == -1 container (legacy/unlabeled) is always stale and replaced.
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -620,7 +620,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	// Force the container to appear unlabeled (replica -1).
 	f.mu.Lock()
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" {
+		if c.appName == "fn" && c.entrypoint == "service.js" {
 			c.replica = -1
 		}
 	}
@@ -634,7 +634,7 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	}
 	f.mu.Lock()
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" {
+		if c.appName == "fn" && c.entrypoint == "service.js" {
 			if c.replica != 0 {
 				t.Fatalf("replica = %d, want 0 (relabeled on replacement)", c.replica)
 			}
@@ -643,18 +643,18 @@ func TestReconcileUnlabeledReplicaTreatedStale(t *testing.T) {
 	f.mu.Unlock()
 }
 
-func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
+func TestReconcileLeavesOtherAppContainersUntouched(t *testing.T) {
 	f := newFakeDocker()
-	// Another function "other" pre-exists with a running container.
+	// Another app "other" pre-exists with a running container.
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function:  "other",
+		App:       "other",
 		Name:      "svc.js",
 		SourceRef: "svc.js", Port: 80, Image: "img-other",
 	}, 0); err != nil {
 		t.Fatalf("start other: %v", err)
 	}
 
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile fn: %v", err)
 	}
@@ -662,7 +662,7 @@ func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
 	if got := f.runningCount("other", "svc.js"); got != 1 {
 		t.Fatalf("other running = %d, want 1 (untouched)", got)
 	}
-	if got := f.countForFunction("other"); got != 1 {
+	if got := f.countForApp("other"); got != 1 {
 		t.Fatalf("other count = %d, want 1", got)
 	}
 }
@@ -670,12 +670,12 @@ func TestReconcileLeavesOtherFunctionContainersUntouched(t *testing.T) {
 func TestReconcileStopFailureDoesNotAbort(t *testing.T) {
 	// A Stop failure is surfaced but convergence of the rest still proceeds.
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	// Inject a running container for a service that will be REMOVED from the
 	// template, and make stopping that exact id fail.
 	f.mu.Lock()
-	f.ctrs["id-1"] = &fakeContainer{id: "id-1", function: "fn", entrypoint: "old.js", image: "img-1", port: 80, replica: 0, state: container.StateRunning}
+	f.ctrs["id-1"] = &fakeContainer{id: "id-1", appName: "fn", entrypoint: "old.js", image: "img-1", port: 80, replica: 0, state: container.StateRunning}
 	f.mu.Unlock()
 	f.failStopFor = "id-1"
 
@@ -695,7 +695,7 @@ func TestReconcileStopFailureDoesNotAbort(t *testing.T) {
 
 func TestRemoveAll(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -704,19 +704,19 @@ func TestRemoveAll(t *testing.T) {
 	}
 
 	RemoveAll(context.Background(), f, "fn", testutil.DiscardLogger())
-	if got := f.countForFunction("fn"); got != 0 {
+	if got := f.countForApp("fn"); got != 0 {
 		t.Fatalf("count after RemoveAll = %d, want 0", got)
 	}
 }
 
 func TestSweepOrphans(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "live", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile live: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function:  "ghost",
+		App:       "ghost",
 		Name:      "svc.js",
 		SourceRef: "svc.js", Port: 80, Image: "img-ghost",
 	}, 0); err != nil {
@@ -729,16 +729,16 @@ func TestSweepOrphans(t *testing.T) {
 	if got := f.runningCount("live", "service.js"); got != 1 {
 		t.Fatalf("live running = %d, want 1 (untouched)", got)
 	}
-	if got := f.countForFunction("ghost"); got != 0 {
+	if got := f.countForApp("ghost"); got != 0 {
 		t.Fatalf("ghost count = %d, want 0 (orphaned)", got)
 	}
 }
 
 func TestBuildEnvOrdering(t *testing.T) {
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime: "node24",
 		Env:     map[string]string{"A": "template", "PORT": "9999"}, // PORT override attempt
-		Secrets: map[string]function.SecretRef{"SECRET": "my-secret"},
+		Secrets: map[string]app.SecretRef{"SECRET": "my-secret"},
 	}
 	provider := &fakeSecretResolver{values: map[string]string{"my-secret": "s3cr3t"}}
 
@@ -758,9 +758,9 @@ func TestBuildEnvOrdering(t *testing.T) {
 }
 
 func TestBuildEnvMissingProviderErrors(t *testing.T) {
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime: "node24",
-		Secrets: map[string]function.SecretRef{"SECRET": "my-secret"},
+		Secrets: map[string]app.SecretRef{"SECRET": "my-secret"},
 	}
 	_, err := BuildEnv(context.Background(), tmpl, 3000, nil, nil)
 	if err == nil {
@@ -770,7 +770,7 @@ func TestBuildEnvMissingProviderErrors(t *testing.T) {
 
 // reconcileEnv runs Reconcile with a secret resolver and prepared env, for the
 // env/secret staleness tests.
-func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
+func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *app.Template, image string, preparedEnv []string, secrets SecretResolver) (bool, error) {
 	t.Helper()
 	return Reconcile(context.Background(), testReconcileTimeout, d, fn, tmpl, image, preparedEnv, nil, secrets, routing.TraefikConfig{}, testutil.DiscardLogger())
 }
@@ -781,7 +781,7 @@ func reconcileEnv(t *testing.T, d Docker, fn string, tmpl *function.Template, im
 // regression the relay.env_hash label exists to catch.
 func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 	f := newFakeDocker()
-	start := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	start := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	start.Env = map[string]string{"MODE": "a"}
 	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=a: %v", err)
@@ -792,7 +792,7 @@ func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 	}
 
 	// Same image reference, changed env value -> stale by env hash.
-	changed := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	changed := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=b: %v", err)
@@ -810,13 +810,13 @@ func TestReconcileEnvChangeReplacesContainer(t *testing.T) {
 // previous container stale (the desired effective env shrank), so it is replaced.
 func TestReconcileEnvRemovedReplacesContainer(t *testing.T) {
 	f := newFakeDocker()
-	withEnv := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	withEnv := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	withEnv.Env = map[string]string{"FEATURE": "on"}
 	if _, err := reconcile(t, f, "fn", withEnv, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile with env: %v", err)
 	}
 
-	withoutEnv := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	withoutEnv := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", withoutEnv, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile without env: %v", err)
 	}
@@ -837,8 +837,8 @@ func TestReconcileEnvRemovedReplacesContainer(t *testing.T) {
 // replacement for.
 func TestReconcileSecretRotationReplacesContainer(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
-	tmpl.Secrets = map[string]function.SecretRef{"TOKEN": "api-token"}
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	tmpl.Secrets = map[string]app.SecretRef{"TOKEN": "api-token"}
 
 	provider := &fakeSecretResolver{values: map[string]string{"api-token": "v1"}}
 	if _, err := reconcileEnv(t, f, "fn", tmpl, "", nil, provider); err != nil {
@@ -879,7 +879,7 @@ func TestReconcileSecretRotationReplacesContainer(t *testing.T) {
 // running container (no churn), pinning that the env-hash comparison is exact.
 func TestReconcileEnvUnchangedKeepsContainer(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	tmpl.Env = map[string]string{"MODE": "stable"}
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
@@ -901,11 +901,11 @@ func TestReconcileEnvUnchangedKeepsContainer(t *testing.T) {
 func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["legacy-1"] = &fakeContainer{
-		id: "legacy-1", function: "fn", entrypoint: "service.js",
+		id: "legacy-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		// No envHash: a pre-label container.
 	}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -926,13 +926,13 @@ func TestReconcileLegacyContainerWithoutEnvHashReplaced(t *testing.T) {
 // unchanged by an env edit) is replaced on an env change.
 func TestReconcileImageSourceEnvChangeReplaces(t *testing.T) {
 	f := newFakeDocker()
-	start := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
+	start := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
 	start.Env = map[string]string{"MODE": "a"}
 	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=a: %v", err)
 	}
 
-	changed := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
+	changed := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 3000, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=b: %v", err)
@@ -968,15 +968,15 @@ func (f *fakeSecretResolver) Resolve(_ context.Context, name string) (string, er
 func TestReconcileEmptyDesiredRemovesLeftovers(t *testing.T) {
 	f := newFakeDocker()
 	// Two leftovers from a previous boot: one for a removed service, one for a
-	// function that no longer declares any services at all.
-	f.ctrs["leftover-1"] = &fakeContainer{id: "leftover-1", function: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
-	f.ctrs["leftover-2"] = &fakeContainer{id: "leftover-2", function: "fn", entrypoint: "other.js", image: "img-old", port: 3000, replica: 0, state: container.StateRunning}
+	// app that no longer declares any services at all.
+	f.ctrs["leftover-1"] = &fakeContainer{id: "leftover-1", appName: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
+	f.ctrs["leftover-2"] = &fakeContainer{id: "leftover-2", appName: "fn", entrypoint: "other.js", image: "img-old", port: 3000, replica: 0, state: container.StateRunning}
 
 	tmpl := serviceTemplate("node24") // no services
 	if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 0 {
+	if got := f.countForApp("fn"); got != 0 {
 		t.Fatalf("leftover containers = %d, want 0", got)
 	}
 }
@@ -987,10 +987,10 @@ func TestReconcileEmptyDesiredRemovesLeftovers(t *testing.T) {
 // cannot produce a runnable image is never torn down for nothing.
 func TestReconcileUnsupportedRuntimePreservesContainersAndFails(t *testing.T) {
 	f := newFakeDocker()
-	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", function: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
+	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", appName: "fn", entrypoint: "service.js", image: "img-old", port: 80, replica: 0, state: container.StateRunning}
 
 	// An unsupported runtime makes ServiceEntry fail for any entrypoint.
-	tmpl := serviceTemplate("rust", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("rust", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable entrypoint (unsupported runtime)")
@@ -998,7 +998,7 @@ func TestReconcileUnsupportedRuntimePreservesContainersAndFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "unsupported runtime") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 1 {
+	if got := f.countForApp("fn"); got != 1 {
 		t.Fatalf("existing containers must be preserved on a resolve failure, got %d", got)
 	}
 	if len(f.stops) != 0 {
@@ -1010,7 +1010,7 @@ func TestReconcileUnsupportedRuntimePreservesContainersAndFails(t *testing.T) {
 // resolves via ServiceEntry and starts replicas with the correct launch path.
 func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "app/service.js", Entrypoint: "app/service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "app/service.js", Entrypoint: "app/service.js", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1022,7 +1022,7 @@ func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 	defer f.mu.Unlock()
 	var started []string
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "app/service.js" {
+		if c.appName == "fn" && c.entrypoint == "app/service.js" {
 			started = c.entry
 		}
 	}
@@ -1035,7 +1035,7 @@ func TestReconcileNestedEntrypointResolvesAndStarts(t *testing.T) {
 // replicas start with that launch path.
 func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("python3.14", function.Service{Name: "app/main.py", Entrypoint: "app/main.py", Port: 8000, Replicas: 1})
+	tmpl := serviceTemplate("python3.14", app.Service{Name: "app/main.py", Entrypoint: "app/main.py", Port: 8000, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -1046,7 +1046,7 @@ func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 	defer f.mu.Unlock()
 	var started []string
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "app/main.py" {
+		if c.appName == "fn" && c.entrypoint == "app/main.py" {
 			started = c.entry
 		}
 	}
@@ -1060,9 +1060,9 @@ func TestReconcilePythonServiceStartsWithModuleExecution(t *testing.T) {
 // failure, preserves existing containers, and never starts replicas.
 func TestReconcilePythonNonPyEntrypointPreservesAndFails(t *testing.T) {
 	f := newFakeDocker()
-	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", function: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
+	f.ctrs["keep-1"] = &fakeContainer{id: "keep-1", appName: "fn", entrypoint: "app/main.js", image: "img-old", port: 8000, replica: 0, state: container.StateRunning}
 
-	tmpl := serviceTemplate("python3.14", function.Service{Name: "app/main.js", Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
+	tmpl := serviceTemplate("python3.14", app.Service{Name: "app/main.js", Entrypoint: "app/main.js", Port: 8000, Replicas: 1})
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil {
 		t.Fatal("expected an error for the unresolvable python entrypoint")
@@ -1070,7 +1070,7 @@ func TestReconcilePythonNonPyEntrypointPreservesAndFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "python services require a .py") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 1 {
+	if got := f.countForApp("fn"); got != 1 {
 		t.Fatalf("existing containers must be preserved on a resolve failure, got %d", got)
 	}
 	// The preserved container is the pre-existing one (never a fresh start for
@@ -1089,11 +1089,11 @@ func TestReconcilePythonNonPyEntrypointPreservesAndFails(t *testing.T) {
 func TestReconcileUnchangedIsNoOp(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["id-1"] = &fakeContainer{
-		id: "id-1", function: "fn", entrypoint: "service.js",
+		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
 	if err != nil {
@@ -1131,13 +1131,13 @@ func TestReconcileListErrorSurfaces(t *testing.T) {
 type listErrDocker struct{ err error }
 
 func (d *listErrDocker) ResolveServiceImage(
-	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 func (d *listErrDocker) StartService(context.Context, runtime.ServiceSpec, int) (string, error) {
 	return "", nil
@@ -1148,7 +1148,7 @@ func (d *listErrDocker) ServiceContainerList(context.Context) ([]runtime.Service
 func (d *listErrDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *listErrDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *listErrDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 func (d *listErrDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
@@ -1158,7 +1158,7 @@ func (d *listErrDocker) NetworkExists(context.Context, string) (bool, error) { r
 // attempted (fail() records the first error without aborting the loop).
 func TestReconcileStartServiceFailureContinues(t *testing.T) {
 	f := &startFailDocker{failReplica: 0}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
 	if err == nil {
@@ -1179,13 +1179,13 @@ type startFailDocker struct {
 }
 
 func (d *startFailDocker) ResolveServiceImage(
-	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 func (d *startFailDocker) StartService(_ context.Context, _ runtime.ServiceSpec, replica int) (string, error) {
 	d.started = append(d.started, replica)
@@ -1200,7 +1200,7 @@ func (d *startFailDocker) ServiceContainerList(context.Context) ([]runtime.Servi
 func (d *startFailDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *startFailDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *startFailDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 func (d *startFailDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
@@ -1220,11 +1220,11 @@ func (c *captureLogger) String() string { return c.buf.String() }
 func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["id-1"] = &fakeContainer{
-		id: "id-1", function: "fn", entrypoint: "service.js",
+		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelDebug)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
@@ -1248,7 +1248,7 @@ func TestApplyNoOpLogsDebugNotInfo(t *testing.T) {
 // the Info "Service: reconciled" line (and performs the change).
 func TestApplyChangedLogsInfo(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
@@ -1269,10 +1269,10 @@ func TestApplyChangedLogsInfo(t *testing.T) {
 func TestApplyChangedStaleReplacement(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["old-1"] = &fakeContainer{
-		id: "old-1", function: "fn", entrypoint: "service.js",
+		id: "old-1", appName: "fn", entrypoint: "service.js",
 		image: "img-old", port: 80, replica: 0, state: container.StateRunning,
 	}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	logger, capture := newCaptureLogger(slog.LevelInfo)
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
@@ -1289,7 +1289,7 @@ func TestApplyChangedStaleReplacement(t *testing.T) {
 	defer f.mu.Unlock()
 	var running *fakeContainer
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
+		if c.appName == "fn" && c.entrypoint == "service.js" && c.state == container.StateRunning {
 			running = c
 		}
 	}
@@ -1307,7 +1307,7 @@ func TestApplyErrorLogsWarn(t *testing.T) {
 	f := newFakeDocker()
 	f.mu.Lock()
 	f.ctrs["id-1"] = &fakeContainer{
-		id: "id-1", function: "fn", entrypoint: "old.js",
+		id: "id-1", appName: "fn", entrypoint: "old.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 	}
 	f.mu.Unlock()
@@ -1340,7 +1340,7 @@ func newCaptureLogger(level slog.Level) (*slog.Logger, *captureLogger) {
 func TestReconcileImageServiceStartPreservesImageEntrypoint(t *testing.T) {
 	f := newFakeDocker()
 	f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:cafe"
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -1361,7 +1361,7 @@ func TestReconcileImageServiceStartPreservesImageEntrypoint(t *testing.T) {
 // even though the image reference string is unchanged.
 func TestReconcileImageContentChangeReplacesContainer(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:latest", Image: "ghcr.io/acme/api:latest", Port: 8080, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:latest", Image: "ghcr.io/acme/api:latest", Port: 8080, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -1380,7 +1380,7 @@ func TestReconcileImageContentChangeReplacesContainer(t *testing.T) {
 	f.mu.Lock()
 	var running []*fakeContainer
 	for _, c := range f.ctrs {
-		if c.function == "fn" && c.state == container.StateRunning {
+		if c.appName == "fn" && c.state == container.StateRunning {
 			running = append(running, c)
 		}
 	}
@@ -1403,7 +1403,7 @@ func TestReconcileResolveFailurePreservesHealthyContainer(t *testing.T) {
 	f.mu.Lock()
 	f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:cafe"
 	f.mu.Unlock()
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
@@ -1433,13 +1433,13 @@ func TestReconcileResolveFailurePreservesHealthyContainer(t *testing.T) {
 func TestReconcileRemovedImageServiceStopped(t *testing.T) {
 	f := newFakeDocker()
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "ghcr.io/acme/old:1",
 		SourceRef: "ghcr.io/acme/old:1", Port: 80, Image: "ghcr.io/acme/old:1",
 	}, 0); err != nil {
 		t.Fatalf("seed old service: %v", err)
 	}
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/new:1", Image: "ghcr.io/acme/new:1", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/new:1", Image: "ghcr.io/acme/new:1", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

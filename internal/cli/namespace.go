@@ -9,7 +9,7 @@ import (
 )
 
 // namespaceAction returns the Action shared by the pure grouping (namespace)
-// commands (git, function, secret). These commands own no runtime work
+// commands (git, app, secret). These commands own no runtime work
 // themselves; they only dispatch to their subcommands. A bare invocation
 // (e.g. `relay git`) means the operator asked for the command with no further
 // token, so we show that command's own help rather than erroring — the list of

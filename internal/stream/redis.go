@@ -46,7 +46,7 @@ const (
 )
 
 // MaxRuleTimeout is the upper bound on any rule's handler timeout. It is the
-// same value as function.MaxTimeout (kept in sync; function is a leaf package
+// same value as app.MaxTimeout (kept in sync; app is a leaf package
 // and stream may import it, not the reverse). It feeds the runner's runtime cap
 // (see runner.SetMaxHandlerTimeout, wired in internal/worker), which becomes
 // the maximum persisted running deadline an invocation can carry.
@@ -89,7 +89,7 @@ type ConsumerConfig struct {
 	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
 	MaxBufferedEvents int
 	// ScheduleRunner, when set, executes messages identified as schedule
-	// occurrences directly against the named function/schedule/handler,
+	// occurrences directly against the named app/schedule/handler,
 	// bypassing event matching. msgID is the message's real Redis stream ID, so
 	// the runner can stamp it on the execution container's relay.message_id
 	// label (the same identity the invocation-state machinery uses). The runner
@@ -221,7 +221,7 @@ type groupCreator interface {
 // It is the single stream-level bootstrap both Consumer.EnsureGroup and the
 // worker's external-dependency preflight delegate to, so these semantics have
 // exactly one implementation. The worker invokes it as a startup prerequisite
-// before any function is loaded or fingerprinted and before the state DB and
+// before any app is loaded or fingerprinted and before the state DB and
 // runtime workload initialization (the Redis client and tracing already exist;
 // the Docker manager is opened afterwards, see internal/worker); an embedder
 // invokes it before Consume.
@@ -822,7 +822,7 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 // retries_total counter counts message reclaims (actual re-delivery events, not
 // executions): a reclaim is counted even when the invocation is skipped as
 // protected, because a redelivery DID occur. This is distinct from the
-// per-function function_retries_total (runner), which counts failed handler
+// per-app function_retries_total (runner), which counts failed handler
 // executions only.
 //
 // Backpressure: the reclaimed message also counts against the bounded local
@@ -859,7 +859,7 @@ func (c *Consumer) deliverClaimed(
 // to the DLQ on a non-retryable failure or when every non-complete invocation is
 // exhausted, or leaves the message pending for a later retry.
 //
-// Panic boundary: a recover is registered at the top of the function so a panic
+// Panic boundary: a recover is registered at the top of the app so a panic
 // anywhere in the handler handoff (including the runner's matching/pre-pass code
 // that sits OUTSIDE its per-invocation recover) is converted into the standard
 // failure path: the message is left pending (no ACK) and a later reclaim retries
@@ -1063,7 +1063,7 @@ func (c *Consumer) processMessage(
 }
 
 // processScheduleMessage routes a schedule-occurrence message directly to the
-// ScheduleRunner (which resolves the function's current timeout from the
+// ScheduleRunner (which resolves the app's current timeout from the
 // registry), bypassing event matching entirely. It shares the exact delivery
 // contract of processMessage: invocation state protects redeliveries
 // (complete/running/backoff/exhausted), and the message is ACKed on success,
@@ -1077,10 +1077,10 @@ func (c *Consumer) processMessage(
 // counters (received/matched/unmatched): they bypass event matching, so they
 // have no meaningful matched/unmatched class and would otherwise break the
 // partition invariant. Schedule activity is accounted by the schedule
-// publication counters and the per-function handler counters.
+// publication counters and the per-app handler counters.
 func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, deliveryNum int64, occ schedule.Occurrence) (string, error) {
 	c.log.Debug("Schedule: executing occurrence",
-		"function", occ.Function,
+		"app", occ.App,
 		"schedule", occ.Schedule,
 		"handler", occ.Handler,
 		"occurrence_id", occ.ID(),
@@ -1117,7 +1117,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))
 
-	err := c.scheduleRunner(handlerCtx, msgID, occ.Function, occ.Schedule, occ.Handler, occ.Payload())
+	err := c.scheduleRunner(handlerCtx, msgID, occ.App, occ.Schedule, occ.Handler, occ.Payload())
 	if err != nil {
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {
@@ -1134,7 +1134,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			)
 			return "pending", nil
 		}
-		// An obsolete invocation: the function or its schedule entry/handler was
+		// An obsolete invocation: the app or its schedule entry/handler was
 		// removed from the current configuration while the message was pending.
 		// That removal is an intentional configuration change, so the message is
 		// terminal but MUST NOT be retried or routed to the DLQ — acknowledge it
@@ -1144,7 +1144,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 		// (exhaustion implies retries were attempted, which an obsolete
 		// occurrence never is).
 		if errors.Is(err, ErrInvocationObsolete) {
-			c.log.Debug("Schedule: occurrence obsolete (function or schedule removed); acknowledging",
+			c.log.Debug("Schedule: occurrence obsolete (app or schedule removed); acknowledging",
 				"message_id", msgID,
 				"delivery_attempt", deliveryNum,
 				"reason", err,
@@ -1277,8 +1277,8 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 // writes rather than losing the message.
 //
 // Per-invocation entries: reason is the runner's terminal *HandlerExhaustedError
-// carrying the exact function/handler and exhausted attempt for every terminal
-// invocation, so a message matching several functions or handlers produces one
+// carrying the exact app/handler and exhausted attempt for every terminal
+// invocation, so a message matching several apps or handlers produces one
 // precisely-attributed entry each (see dlqEntrySpecs). A reason without that
 // typed metadata (a malformed message routed pre-handler) produces a single
 // placeholder entry with an explicit handler_attempts of 0, never one invented
@@ -1327,7 +1327,7 @@ func (c *Consumer) routeToDLQ(
 		spec.trace = c.dlqTraceFor(ctx, msg.ID, spec.invocation)
 		entry := dlqPayload(
 			c.stream, msg.ID, c.group, c.consumer,
-			event, spec.reason, spec.function, spec.handler, deliveries, spec.attempts, spec.trace,
+			event, spec.reason, spec.app, spec.handler, deliveries, spec.attempts, spec.trace,
 		)
 		if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
 			Stream: c.dlqStream,
@@ -1361,7 +1361,7 @@ func (c *Consumer) routeToDLQ(
 		c.log.Error("Message: invocation routed to DLQ",
 			"message_id", msg.ID,
 			"dlq_stream", c.dlqStream,
-			"function", spec.function,
+			"app", spec.app,
 			"handler", spec.handler,
 			"handler_attempts", spec.attempts,
 			"delivery_attempt", deliveries,

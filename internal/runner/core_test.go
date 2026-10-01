@@ -18,7 +18,7 @@ import (
 func TestHandleSkipsCompletedInvocation(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), m)
 
 	// First delivery: no invocation state, so the handler runs and records success.
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
@@ -43,7 +43,7 @@ func TestHandleSkipsCompletedInvocation(t *testing.T) {
 
 	got := m.Snapshot()
 	// The skip must not add a second success invocation.
-	if !strings.Contains(got, "handler_invocations_total{function=user-events,handler=index.run,outcome=success} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=user-events,handler=index.run,outcome=success} count=1") {
 		t.Errorf("expected exactly one success invocation; got:\n%s", got)
 	}
 	if strings.Contains(got, "outcome=failure") {
@@ -55,7 +55,7 @@ func TestHandleSkipsCompletedInvocation(t *testing.T) {
 // records the invocation via MarkComplete so a later redelivery can skip it.
 func TestHandleMarksCompleteOnExecution(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -75,7 +75,7 @@ func TestHandleMarksCompleteOnExecution(t *testing.T) {
 // bookkeeping).
 func TestHandleWithoutInvocationStateStillExecutes(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestHandleWithoutInvocationStateStillExecutes(t *testing.T) {
 // happens and the executor is never called.
 func TestHandleClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	prog.startErr = errors.New("redis down")
@@ -118,7 +118,7 @@ func TestHandleClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
 // handler timeout caps a rule's (larger) timeout: the executor observes the
 // capped deadline and Handle returns a deadline error.
 func TestSetMaxHandlerTimeoutCapsRuleTimeout(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{fnWithTimeout(t, "user-events", time.Hour, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithTimeout(t, "user-events", time.Hour, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
 	r.SetMaxHandlerTimeout(50 * time.Millisecond)
 
 	start := time.Now()
@@ -140,7 +140,7 @@ func TestSetMaxHandlerTimeoutCapsRuleTimeout(t *testing.T) {
 // rule's own (small) timeout is honored and not shortened to some default: the
 // executor observes a deadline at least as long as the rule timeout.
 func TestSetMaxHandlerTimeoutUncappedByDefault(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{fnWithTimeout(t, "user-events", 200*time.Millisecond, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithTimeout(t, "user-events", 200*time.Millisecond, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
 	// SetMaxHandlerTimeout deliberately NOT called (cap stays 0 = uncapped).
 
 	start := time.Now()
@@ -166,7 +166,7 @@ func TestSetMaxHandlerTimeoutUncappedByDefault(t *testing.T) {
 // cross-replica ACK-hazard fix).
 func TestHandleTryStartGuardsInFlightInvocation(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	// Freeze the clock and mark the invocation running with a future deadline.
@@ -188,7 +188,7 @@ func TestHandleTryStartGuardsInFlightInvocation(t *testing.T) {
 // running deadline has passed, Handle executes it again (the marker is stale).
 func TestHandleExecutesAfterDeadlineExpires(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	now := time.Now()
@@ -211,7 +211,7 @@ func TestHandleExecutesAfterDeadlineExpires(t *testing.T) {
 // (not eligible) rather than re-run.
 func TestHandleFailureSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -247,7 +247,7 @@ func TestHandleFailureSchedulesRetry(t *testing.T) {
 // (executor returns ctx.Err) causes Handle to error and RecordFailure to be
 // called, scheduling a retry backoff.
 func TestHandleTimeoutSchedulesRetry(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{fnWithTimeout(t, "user-events", 50*time.Millisecond, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fnWithTimeout(t, "user-events", 50*time.Millisecond, ctxAwareExecutor{})}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -274,7 +274,7 @@ func TestHandleTimeoutSchedulesRetry(t *testing.T) {
 // which errors with "unsupported type".
 func TestHandleMarshalErrorSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", exec)}, testutil.DiscardLogger(), nil)
 
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)

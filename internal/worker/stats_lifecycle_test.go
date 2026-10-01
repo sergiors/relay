@@ -54,10 +54,10 @@ func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	reg.Add(metrics.MetricEventsMatched, 3)
 	reg.Add(metrics.MetricHandlerSuccess, 2)
-	reg.IncLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}})
+	reg.IncLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -84,7 +84,7 @@ func TestStatsPersistWithMetricsDisabled(t *testing.T) {
 	if gs.EventsMatchedTotal != 3 || gs.HandlerSuccessTotal != 2 {
 		t.Fatalf("persisted globals = %+v, want events 3 success 2", gs)
 	}
-	a, ok := st.FunctionStats("alpha")
+	a, ok := st.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 1 {
 		t.Fatalf("persisted alpha = %+v, ok=%v; want events 1", a, ok)
 	}
@@ -113,7 +113,7 @@ func TestMetricsEnabledExposesSingleAccountingRegistry(t *testing.T) {
 	})
 
 	st := openTempState(t)
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 
 	// ONE accounted event on the single registry.
 	reg.Inc(metrics.MetricEventsMatched)
@@ -142,11 +142,11 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	f := newStatsFlusher(st, reg)
 
 	reg.Add(metrics.MetricEventsMatched, 100)
-	reg.AddLabels(metrics.MetricFunctionEventsMatched, []metrics.Label{{Name: "function", Value: "alpha"}}, 4)
+	reg.AddLabels(metrics.MetricAppEventsMatched, []metrics.Label{{Name: "app", Value: "alpha"}}, 4)
 	f.flush(context.Background())
 	if gs, _ := st.Stats(); gs.EventsMatchedTotal != 100 {
 		t.Fatalf("pre-reset persisted events = %d, want 100", gs.EventsMatchedTotal)
@@ -160,7 +160,7 @@ func TestStatsResetWithMetricsDisabled(t *testing.T) {
 	if gs, _ := st.Stats(); gs.EventsMatchedTotal != 0 {
 		t.Fatalf("persisted events after reset = %d, want 0", gs.EventsMatchedTotal)
 	}
-	if a, _ := st.FunctionStats("alpha"); a.EventsMatchedTotal != 0 {
+	if a, _ := st.AppStats("alpha"); a.EventsMatchedTotal != 0 {
 		t.Fatalf("persisted function events after reset = %d, want 0", a.EventsMatchedTotal)
 	}
 	if got := reg.Counter(metrics.MetricEventsMatched); got != 100 {
@@ -189,7 +189,7 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 		t.Fatal("precondition: metrics server must be nil when disabled")
 	}
 	st := openTempState(t)
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	reg.Add(metrics.MetricEventsMatched, 42)
 	reg.Add(metrics.MetricHandlerSuccess, 30)
 
@@ -209,9 +209,9 @@ func TestFinalStatsFlushWithMetricsDisabled(t *testing.T) {
 // persisted totals and the first flush writes them back rather than zeroing.
 func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
 	st := openTempState(t)
-	st.RecordDiscovered(stateFunction("alpha", t.TempDir()))
+	st.RecordDiscovered(stateApp("alpha", t.TempDir()))
 	st.RecordStats(state.Stats{EventsMatchedTotal: 100, HandlerSuccessTotal: 70})
-	st.RecordFunctionStats(state.FunctionStats{Function: "alpha", EventsMatchedTotal: 9})
+	st.RecordAppStats(state.AppStats{App: "alpha", EventsMatchedTotal: 9})
 
 	reg, srv := setupMetrics(config.Config{}, lifecycleLogger())
 	if srv != nil {
@@ -244,7 +244,7 @@ func TestStatsRestoreWithMetricsDisabled(t *testing.T) {
 	if !ok || gs.EventsMatchedTotal != 100 || gs.HandlerSuccessTotal != 70 {
 		t.Fatalf("post-restart flush = %+v, ok=%v; want restored totals preserved", gs, ok)
 	}
-	if a, _ := st.FunctionStats("alpha"); a.EventsMatchedTotal != 9 {
+	if a, _ := st.AppStats("alpha"); a.EventsMatchedTotal != 9 {
 		t.Fatalf("post-restart function events = %d, want 9", a.EventsMatchedTotal)
 	}
 }

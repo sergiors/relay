@@ -47,7 +47,7 @@ func TestFireRetriesSameOccurrenceThenSucceeds(t *testing.T) {
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 8 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 8 * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a")
@@ -60,7 +60,7 @@ func TestFireRetriesSameOccurrenceThenSucceeds(t *testing.T) {
 	}
 	// Every attempt targeted the same occurrence ID.
 	wantDue := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	wantID := schedule.Occurrence{Function: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: wantDue}.ID()
+	wantID := schedule.Occurrence{App: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: wantDue}.ID()
 	if n := fp.callsFor(wantID); n != 3 {
 		t.Fatalf("attempts for occurrence %q = %d, want 3 (ID must not be recomputed)", wantID, n)
 	}
@@ -81,7 +81,7 @@ func TestFireSuccessPathSingleAttempt(t *testing.T) {
 	s := NewWithMetrics(fp, testLogger(), m)
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a")
@@ -111,7 +111,7 @@ func TestPublishCancellationStopsRetries(t *testing.T) {
 	if !ok {
 		t.Fatal("no occurrence found")
 	}
-	o := schedule.Occurrence{Function: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: due}
+	o := schedule.Occurrence{App: "fn", Schedule: "jobs.a", Handler: "jobs.a", ScheduledAt: due}
 
 	// A pre-cancelled context stops before the first attempt.
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -148,7 +148,7 @@ func TestFireRetriesShareOneTrace(t *testing.T) {
 	s := New(fp, testLogger())
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a")
@@ -336,12 +336,12 @@ func TestCatchUpLatestOnlyWithinHorizon(t *testing.T) {
 	// Daily at 03:00: the latest missed occurrence is 03:00 today (7h before
 	// now). The prior day's 03:00 is >24h before now, so it is intentionally
 	// dropped.
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	// Every 5 minutes: the latest missed occurrence is 10:00 today.
-	s.ReplaceFunction("fn2", schedTemplate("jobs.b", "*/5 * * * *", "", ""))
+	s.ReplaceApp("fn2", schedTemplate("jobs.b", "*/5 * * * *", "", ""))
 	// Daily at 23:00: the latest occurrence is YESTERDAY 23:00 (11h before now);
 	// today's 23:00 is still in the FUTURE and must not be synthesized.
-	s.ReplaceFunction("fn3", schedTemplate("jobs.c", "0 23 * * *", "", ""))
+	s.ReplaceApp("fn3", schedTemplate("jobs.c", "0 23 * * *", "", ""))
 
 	n := s.CatchUp(context.Background())
 	if n != 3 {
@@ -357,7 +357,7 @@ func TestCatchUpLatestOnlyWithinHorizon(t *testing.T) {
 		"fn3/jobs.c": time.Date(2026, 7, 1, 23, 0, 0, 0, time.UTC),
 	}
 	for _, c := range calls {
-		key := c.Function + "/" + c.Handler
+		key := c.App + "/" + c.Handler
 		w, ok := want[key]
 		if !ok {
 			t.Fatalf("unexpected catch-up occurrence %q", key)
@@ -375,7 +375,7 @@ func TestCatchUpLatestOnlyWithinHorizon(t *testing.T) {
 }
 
 // TestCatchUpRunsOnce pins that the startup catch-up is once-per-Scheduler:
-// live ReplaceFunction converges future occurrences only and never synthesizes
+// live ReplaceApp converges future occurrences only and never synthesizes
 // additional catch-up.
 func TestCatchUpRunsOnce(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC)
@@ -385,12 +385,12 @@ func TestCatchUpRunsOnce(t *testing.T) {
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
 
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	if n := s.CatchUp(context.Background()); n != 1 {
 		t.Fatalf("first catch-up = %d, want 1", n)
 	}
 	// A live change converges future occurrences; a second catch-up is a no-op.
-	s.ReplaceFunction("fn", schedTemplate("jobs.b", "0 4 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.b", "0 4 * * *", "", ""))
 	if n := s.CatchUp(context.Background()); n != 0 {
 		t.Fatalf("second catch-up = %d, want 0 (once per Scheduler)", n)
 	}
@@ -409,7 +409,7 @@ func TestCatchUpRepeatedIsDeduped(t *testing.T) {
 		s := New(pub, testLogger())
 		s.now = func() time.Time { return now }
 		s.wait = noWait
-		s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+		s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 		n := s.CatchUp(context.Background())
 		if i == 0 && n != 1 {
 			t.Fatalf("first worker catch-up = %d, want 1 (winner)", n)
@@ -434,7 +434,7 @@ func TestCatchUpCancellationAborts(t *testing.T) {
 	s := New(fp, testLogger())
 	s.now = func() time.Time { return now }
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -453,7 +453,7 @@ func TestCatchUpExcludesFutureAndOlderOccurrences(t *testing.T) {
 	fp := newFakePublisher(4)
 	s := New(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.wait = noWait
 
 	// Exactly on the boundary.
@@ -471,7 +471,7 @@ func TestCatchUpExcludesFutureAndOlderOccurrences(t *testing.T) {
 	s2 := New(fp2, testLogger())
 	s2.wait = noWait
 	defer func() { _ = s2.Stop(context.Background()) }()
-	s2.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s2.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s2.now = func() time.Time { return time.Date(2026, 7, 2, 3, 0, 30, 0, time.UTC) }
 	if n := s2.CatchUp(context.Background()); n != 1 {
 		t.Fatalf("catch-up after boundary = %d, want 1", n)
@@ -492,7 +492,7 @@ func TestCatchUpExhaustionCounts(t *testing.T) {
 	s.now = func() time.Time { return now }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 
 	if n := s.CatchUp(context.Background()); n != 0 {
 		t.Fatalf("exhausted catch-up = %d, want 0", n)

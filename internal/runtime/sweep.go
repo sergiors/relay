@@ -80,7 +80,7 @@ func (m *Manager) SweepOrphanContainers(ctx context.Context, hostname string) (i
 			}
 			m.log.Warn("Orphan sweep: remove container failed",
 				"container", c.ID,
-				"function", c.Labels[labelFunction],
+				"app", c.Labels[labelApp],
 				"handler", c.Labels[labelHandler],
 				"error", err,
 			)

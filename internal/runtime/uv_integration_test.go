@@ -18,7 +18,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -132,9 +132,9 @@ def run(event):
     print("six version " + six.__version__)
 `
 
-// newUvPythonFunction builds a Python function directory whose handler imports
+// newUvPythonApp builds a Python app directory whose handler imports
 // six, with the given dependency manifests written into it.
-func newUvPythonFunction(t *testing.T, name string, manifests map[string]string) function.Function {
+func newUvPythonApp(t *testing.T, name string, manifests map[string]string) app.App {
 	t.Helper()
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -148,7 +148,7 @@ events:
 	for fileName, content := range manifests {
 		writeFile(t, dir, fileName, content)
 	}
-	return function.Function{Name: name, Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 }
 
 // TestIntegrationRequirementsInstalledWithUvAndExecutes verifies the classic
@@ -162,13 +162,13 @@ func TestIntegrationRequirementsInstalledWithUvAndExecutes(t *testing.T) {
 
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-uv-req:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-uv-req:"))
 
-	fn := newUvPythonFunction(t, "uv-req", map[string]string{
+	fn := newUvPythonApp(t, "uv-req", map[string]string{
 		"requirements.txt": "six==1.16.0\n",
 	})
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -196,14 +196,14 @@ func TestIntegrationNativeUvProjectExecutes(t *testing.T) {
 
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-uv-native:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-uv-native:"))
 
-	fn := newUvPythonFunction(t, "uv-native", map[string]string{
+	fn := newUvPythonApp(t, "uv-native", map[string]string{
 		"pyproject.toml": uvFixturePyproject,
 		"uv.lock":        uvLockFixture,
 	})
 	m, _ := newManager(t)
-	out := newFunctionOutputSink(t)
+	out := newAppOutputSink(t)
 
 	prepared, err := m.Prepare(ctx, fn)
 	if err != nil {
@@ -221,14 +221,14 @@ func TestIntegrationNativeUvProjectExecutes(t *testing.T) {
 }
 
 // TestIntegrationPythonNoDepsHasUvBinary verifies uv is copied into a Python
-// runtime image even when the function declares no dependencies, by building the
-// function image and running `uv --version` in a one-off container from it.
+// runtime image even when the app declares no dependencies, by building the
+// app image and running `uv --version` in a one-off container from it.
 func TestIntegrationPythonNoDepsHasUvBinary(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-uv-nodeps:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-uv-nodeps:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -239,7 +239,7 @@ events:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
-	fn := function.Function{Name: "uv-nodeps", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "uv-nodeps", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	m, _ := newManager(t)
 	p, err := m.Prepare(ctx, fn)
@@ -250,7 +250,7 @@ events:
 		t.Errorf("a function with no deps must have no dependency layer, got %q", p.Dependency)
 	}
 
-	// Run the built function image with a uv version probe as the command; the
+	// Run the built app image with a uv version probe as the command; the
 	// image's own ENTRYPOINT must be overridden so the probe runs.
 	out, err := runImageCommand(ctx, t, p.Image, []string{"uv", "--version"})
 	if err != nil {

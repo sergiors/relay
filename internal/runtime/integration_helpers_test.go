@@ -19,7 +19,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -32,12 +32,12 @@ func writeFile(t *testing.T, dir, name, content string) {
 // newManager returns a Manager wired to a logger that writes into the returned
 // buffer, capturing Relay operational logs for assertions. The manager owns
 // hostname "test-host" so container-ownership tests are deterministic. Close is
-// registered as cleanup: Manager.Close discards the per-function reused
+// registered as cleanup: Manager.Close discards the per-app reused
 // execution containers it may have started.
 //
 // Handler stdout/stderr is NO LONGER routed through the logger (it is forwarded
-// as a raw transport to the function-output sink; see output.go and
-// newFunctionOutputSink), so handler-output assertions must read from that sink,
+// as a raw transport to the app-output sink; see output.go and
+// newAppOutputSink), so handler-output assertions must read from that sink,
 // not from this operational log buffer. The logger level is nevertheless kept at
 // DEBUG here so the operational-line assertions these tests make are unaffected.
 func newManager(t *testing.T) (*Manager, *bytes.Buffer) {
@@ -75,8 +75,8 @@ func findContainerByLabel(ctx context.Context, cli *client.Client, key, value st
 
 // countContainersByLabel counts All containers carrying the exact
 // relay.<key>=<value> label. It complements findContainerByLabel for
-// pool-size assertions (at most one container per function before Phase 2,
-// up to the function's concurrency now).
+// pool-size assertions (at most one container per app before Phase 2,
+// up to the app's concurrency now).
 func countContainersByLabel(ctx context.Context, cli *client.Client, key, value string) int {
 	list, err := cli.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
@@ -173,8 +173,8 @@ func imageExistsInDaemon(cli *client.Client, ctx context.Context, ref string) bo
 	return err == nil
 }
 
-// mPrepare builds a function via a fresh Manager wired to a discard logger.
-func mPrepare(ctx context.Context, t *testing.T, fn function.Function) (*Prepared, error) {
+// mPrepare builds an app via a fresh Manager wired to a discard logger.
+func mPrepare(ctx context.Context, t *testing.T, fn app.App) (*Prepared, error) {
 	t.Helper()
 	m, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 	if err != nil {
@@ -215,7 +215,7 @@ func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) s
 
 // cleanupImagePrefixes force-removes every local image whose repo tag starts with
 // any of the given prefixes. It is t.Cleanup glue so dependency-layer tests never
-// leak relay-dep-* / relay-fn-* images onto a shared daemon.
+// leak relay-dep-* / relay-app-* images onto a shared daemon.
 func cleanupImagePrefixes(cli *client.Client, prefixes ...string) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -303,14 +303,14 @@ func cleanupNewDepImagesSince(cli *client.Client, before map[string]bool) func()
 	}
 }
 
-// expectedDependencyRef computes the dependency image reference a function's
+// expectedDependencyRef computes the dependency image reference an app's
 // current manifest set must resolve to, using the exact production helpers
 // Prepare uses (lookup -> engine Plan -> DependencyFingerprint -> depImageRef).
 // Integration tests use it to name the shared, content-addressed dependency
 // image deterministically, instead of inferring it from a before/after tag
 // delta that is racy when the image already exists on a shared daemon. It fails
-// the test if the function declares no dependency layer.
-func expectedDependencyRef(t *testing.T, fn function.Function) string {
+// the test if the app declares no dependency layer.
+func expectedDependencyRef(t *testing.T, fn app.App) string {
 	t.Helper()
 	if fn.Template == nil {
 		t.Fatalf("function %q has no template", fn.Name)

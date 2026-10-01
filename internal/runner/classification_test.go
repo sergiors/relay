@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -14,13 +14,13 @@ import (
 
 // TestHandleClassifiesUnmatchedEvent pins the unmatched branch: an event that
 // matches no rule is counted once as received+unmatched (never matched), the
-// function-engaged counter is not touched, and Handle returns nil so the stream
+// app-engaged counter is not touched, and Handle returns nil so the stream
 // layer ACKs it (an unmatched event is terminal and never retried).
 func TestHandleClassifiesUnmatchedEvent(t *testing.T) {
 	m := metrics.New()
-	// A function that declares no event rules matches nothing.
+	// An app that declares no event rules matches nothing.
 	pf := buildFn(fnSpec{name: "selective"}, &countingExecutor{})
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle unmatched: %v", err)
@@ -35,19 +35,19 @@ func TestHandleClassifiesUnmatchedEvent(t *testing.T) {
 	if got := m.Counter(metrics.MetricEventsMatched); got != 0 {
 		t.Errorf("events_matched_total = %d, want 0", got)
 	}
-	if len(m.FunctionStatsSnapshot()) != 0 {
-		t.Errorf("unmatched event must not engage a function: %+v", m.FunctionStatsSnapshot())
+	if len(m.AppStatsSnapshot()) != 0 {
+		t.Errorf("unmatched event must not engage a function: %+v", m.AppStatsSnapshot())
 	}
 }
 
-// TestHandleClassifiesMatchedEventWithNoRulesOnOtherFunction pins that the
-// partition is computed from the full rule set: a function with no matching
-// rules does not contribute, while a function that matches marks the event
+// TestHandleClassifiesMatchedEventWithNoRulesOnOtherApp pins that the
+// partition is computed from the full rule set: an app with no matching
+// rules does not contribute, while an app that matches marks the event
 // matched. received == matched + unmatched.
-func TestHandleClassifiesMatchedEventWithNoRulesOnOtherFunction(t *testing.T) {
+func TestHandleClassifiesMatchedEventWithNoRulesOnOtherApp(t *testing.T) {
 	m := metrics.New()
 	noRule := buildFn(fnSpec{name: "norule"}, &countingExecutor{})
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		noRule,
 		alwaysMatchFn(t, "matched", &countingExecutor{}),
 	}, testutil.DiscardLogger(), m)
@@ -63,22 +63,22 @@ func TestHandleClassifiesMatchedEventWithNoRulesOnOtherFunction(t *testing.T) {
 		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
 	// Only "matched" is engaged.
-	if fs := m.FunctionStatsSnapshot(); len(fs) != 1 || fs[0].Function != "matched" {
+	if fs := m.AppStatsSnapshot(); len(fs) != 1 || fs[0].App != "matched" {
 		t.Errorf("only the matching function may be engaged: %+v", fs)
 	}
 }
 
-// TestHandleCountsFunctionOnceDespiteMultipleMatchingRules pins that a function
+// TestHandleCountsAppOnceDespiteMultipleMatchingRules pins that an app
 // with several matching rules is engaged once per logical event, not once per
 // rule, while every rule still runs.
-func TestHandleCountsFunctionOnceDespiteMultipleMatchingRules(t *testing.T) {
+func TestHandleCountsAppOnceDespiteMultipleMatchingRules(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	pf := buildFn(fnSpec{name: "multi", rules: []function.EventRule{
-		{Handler: "a.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: function.DefaultRetries},
-		{Handler: "b.run", Pattern: function.Pattern{}, Timeout: time.Second, Retries: function.DefaultRetries},
+	pf := buildFn(fnSpec{name: "multi", rules: []app.EventRule{
+		{Handler: "a.run", Pattern: app.Pattern{}, Timeout: time.Second, Retries: app.DefaultRetries},
+		{Handler: "b.run", Pattern: app.Pattern{}, Timeout: time.Second, Retries: app.DefaultRetries},
 	}}, exec)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
@@ -86,7 +86,7 @@ func TestHandleCountsFunctionOnceDespiteMultipleMatchingRules(t *testing.T) {
 	if exec.count() != 2 {
 		t.Fatalf("executor calls = %d, want 2 (both matching rules run)", exec.count())
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 {
 		t.Fatalf("function must be engaged once for the event: %+v", fs)
 	}
@@ -100,7 +100,7 @@ func TestHandleCountsFunctionOnceDespiteMultipleMatchingRules(t *testing.T) {
 // the matched class, and it is not counted unmatched.
 func TestHandleFailureStaysMatched(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "a", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -118,11 +118,11 @@ func TestHandleFailureStaysMatched(t *testing.T) {
 // TestHandleClassificationClaimedOnceAcrossRedeliveries pins the invariant end
 // to end: with invocation state, repeated deliveries of the same logical event
 // (a retrying failure) count received/matched exactly once, while the
-// per-function engaged counter also stays at one.
+// per-app engaged counter also stays at one.
 func TestHandleClassificationClaimedOnceAcrossRedeliveries(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "a", function.DefaultRetries, exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "a", app.DefaultRetries, exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -141,7 +141,7 @@ func TestHandleClassificationClaimedOnceAcrossRedeliveries(t *testing.T) {
 	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
 		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 {
 		t.Errorf("function engaged = %+v, want matched 1", fs)
 	}
@@ -154,7 +154,7 @@ func TestHandleClassificationClaimedOnceAcrossRedeliveries(t *testing.T) {
 func TestHandleClassificationCountsNothingOnClaimError(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "a", exec)}, testutil.DiscardLogger(), m)
 
 	prog := newFakeInvocationState()
 	prog.classifyErr = context.DeadlineExceeded
@@ -176,8 +176,8 @@ func TestHandleClassificationCountsNothingOnClaimError(t *testing.T) {
 		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
 	// The handler still ran (and recorded its own success), but the
-	// function-engaged classification counter must stay at zero.
-	fs := m.FunctionStatsSnapshot()
+	// app-engaged classification counter must stay at zero.
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].EventsMatchedTotal != 0 {
 		t.Errorf("claim error must not engage a function: %+v", fs)
 	}
@@ -188,7 +188,7 @@ func TestHandleClassificationCountsNothingOnClaimError(t *testing.T) {
 // treated as a distinct logical event.
 func TestHandleWithoutInvocationStateCountsEveryCall(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &countingExecutor{})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "a", &countingExecutor{})}, testutil.DiscardLogger(), m)
 
 	for i := 0; i < 3; i++ {
 		if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
@@ -204,19 +204,19 @@ func TestHandleWithoutInvocationStateCountsEveryCall(t *testing.T) {
 }
 
 // TestHandleMatchedButUnavailableIsMatchedNotUnmatched pins the core fix: an event
-// that matches ONLY a configured-but-unavailable function is classified MATCHED,
-// not unmatched, and the function is counted as engaged — even though the
+// that matches ONLY a configured-but-unavailable app is classified MATCHED,
+// not unmatched, and the app is counted as engaged — even though the
 // invocation cannot run. No handler attempt is claimed (no TryStart) and no
 // handler execution counter is touched, because no handler ran.
 func TestHandleMatchedButUnavailableIsMatchedNotUnmatched(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
-	if !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (matched but unavailable is retryable)", err)
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("handle error = %v, want ErrAppUnavailable (matched but unavailable is retryable)", err)
 	}
 	if errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (unavailability must not DLQ)", err)
@@ -230,8 +230,8 @@ func TestHandleMatchedButUnavailableIsMatchedNotUnmatched(t *testing.T) {
 	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
 		t.Errorf("events_unmatched_total = %d, want 0 (matched, not unmatched)", got)
 	}
-	fs := m.FunctionStatsSnapshot()
-	if len(fs) != 1 || fs[0].Function != "broken" || fs[0].EventsMatchedTotal != 1 {
+	fs := m.AppStatsSnapshot()
+	if len(fs) != 1 || fs[0].App != "broken" || fs[0].EventsMatchedTotal != 1 {
 		t.Fatalf("unavailable function must be engaged as matched: %+v", fs)
 	}
 	// No handler ran: no attempt claimed, no handler execution counters.
@@ -248,15 +248,15 @@ func TestHandleMatchedButUnavailableIsMatchedNotUnmatched(t *testing.T) {
 }
 
 // TestHandleMixedFanOutAvailableCompletesUnavailablePending pins the mixed
-// fan-out contract: a message matching an AVAILABLE function (which completes)
-// and an UNAVAILABLE function (which cannot run) must run the available
+// fan-out contract: a message matching an AVAILABLE app (which completes)
+// and an UNAVAILABLE app (which cannot run) must run the available
 // invocation to completion while returning a retryable error for the
 // unavailable one, so the message stays pending and is not ACKed. The available
 // invocation's completion is persisted so a redelivery skips it.
 func TestHandleMixedFanOutAvailableCompletesUnavailablePending(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "available", exec),
 		unavailableMatchFn(t, "broken"),
 	}, testutil.DiscardLogger(), m)
@@ -264,8 +264,8 @@ func TestHandleMixedFanOutAvailableCompletesUnavailablePending(t *testing.T) {
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
-	if !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (unavailable sibling unresolved)", err)
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("handle error = %v, want ErrAppUnavailable (unavailable sibling unresolved)", err)
 	}
 	if exec.count() != 1 {
 		t.Fatalf("available executor calls = %d, want 1 (available invocation must still run)", exec.count())
@@ -285,8 +285,8 @@ func TestHandleMixedFanOutAvailableCompletesUnavailablePending(t *testing.T) {
 
 	// Redelivery: the completed available invocation must NOT re-run; the
 	// unavailable one is still unresolved, so the message stays pending.
-	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("redelivery error = %v, want ErrFunctionUnavailable", err)
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("redelivery error = %v, want ErrAppUnavailable", err)
 	}
 	if exec.count() != 1 {
 		t.Fatalf("available executor calls after redelivery = %d, want 1 (no re-run)", exec.count())
@@ -302,7 +302,7 @@ func TestHandleMixedFanOutUnresolvedWorkCompletesAfterAvailable(t *testing.T) {
 	m := metrics.New()
 	availableExec := &countingExecutor{}
 	recoveredExec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "available", availableExec),
 		unavailableMatchFn(t, "broken"),
 	}, testutil.DiscardLogger(), m)
@@ -310,14 +310,14 @@ func TestHandleMixedFanOutUnresolvedWorkCompletesAfterAvailable(t *testing.T) {
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	// Delivery 1: available completes, broken is unresolved → pending.
-	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("delivery 1 error = %v, want ErrFunctionUnavailable", err)
+	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("delivery 1 error = %v, want ErrAppUnavailable", err)
 	}
 	if availableExec.count() != 1 {
 		t.Fatalf("available executions = %d, want 1", availableExec.count())
 	}
 
-	// The function is rebuilt and becomes available; the unavailable entry is
+	// The app is rebuilt and becomes available; the unavailable entry is
 	// swapped for a runnable one with the SAME name (preserving invocation-state
 	// identity/dedup).
 	r.Registry().Replace("broken", alwaysMatchFn(t, "broken", recoveredExec))
@@ -338,16 +338,16 @@ func TestHandleMixedFanOutUnresolvedWorkCompletesAfterAvailable(t *testing.T) {
 }
 
 // TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure pins that an
-// unavailable match never counts as a handler failure/attempt: the per-function
+// unavailable match never counts as a handler failure/attempt: the per-app
 // failure, retry, and DLQ counters stay untouched (no handler ran), while the
-// function is still engaged as matched. This is the "no handler attempt when no
+// app is still engaged as matched. This is the "no handler attempt when no
 // handler ran" invariant.
 func TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
 
-	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("handle error = %v, want ErrFunctionUnavailable", err)
+	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("handle error = %v, want ErrAppUnavailable", err)
 	}
 	if got := m.Counter(metrics.MetricHandlerFailure); got != 0 {
 		t.Errorf("handler_failure_total = %d, want 0 (no handler ran)", got)
@@ -358,7 +358,7 @@ func TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure(t *testing.T) {
 	if got := m.Counter(metrics.MetricDLQEntries); got != 0 {
 		t.Errorf("dlq_entries_total = %d, want 0 (unavailability must not DLQ)", got)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 ||
 		fs[0].HandlerFailureTotal != 0 || fs[0].RetriesTotal != 0 || fs[0].DLQTotal != 0 {
 		t.Fatalf("per-function stats must record engagement only: %+v", fs)
@@ -370,7 +370,7 @@ func TestHandleUnavailableOnlyDoesNotIncrementHandlerFailure(t *testing.T) {
 // complete is unresolved and holds the message pending — this worker cannot
 // attribute the exhausted attempt count from an unavailable entry, and ACKing or
 // DLQing would race another replica's write or drop metadata, so unavailability
-// alone never routes to the DLQ. Once the function becomes available again, the
+// alone never routes to the DLQ. Once the app becomes available again, the
 // normal path reads the persisted exhausted marker and routes the message to the
 // DLQ with the correct attempt metadata.
 func TestHandleUnavailableExhaustedStaysPendingNotDLQ(t *testing.T) {
@@ -381,10 +381,10 @@ func TestHandleUnavailableExhaustedStaysPendingNotDLQ(t *testing.T) {
 	prog.exhausted["broken/index.run"] = 1
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	unavailable := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	unavailable := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
 	err := unavailable.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
-	if !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("handle error = %v, want ErrFunctionUnavailable (unavailable stays pending)", err)
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("handle error = %v, want ErrAppUnavailable (unavailable stays pending)", err)
 	}
 	if errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("handle error = %v, must NOT be ErrInvocationExhausted (unavailability must not DLQ)", err)
@@ -392,7 +392,7 @@ func TestHandleUnavailableExhaustedStaysPendingNotDLQ(t *testing.T) {
 
 	// Once available again, the persisted exhausted marker drives the normal DLQ
 	// routing with the correct attempt count.
-	recovered := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "broken", &countingExecutor{})}, testutil.DiscardLogger(), m)
+	recovered := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "broken", &countingExecutor{})}, testutil.DiscardLogger(), m)
 	err = recovered.Handle(ctx, "1757-0", map[string]any{"status": "ok"})
 	if !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("recovered handle error = %v, want ErrInvocationExhausted", err)
@@ -406,16 +406,16 @@ func TestHandleUnavailableExhaustedStaysPendingNotDLQ(t *testing.T) {
 // TestHandleUnavailableMatchMetricsClaimedOnceAcrossRedeliveries pins that the
 // matched classification for an unavailable match is claimed exactly once across
 // redeliveries: repeated pending deliveries do not double-count received/matched,
-// and the function-engaged counter also stays at one.
+// and the app-engaged counter also stays at one.
 func TestHandleUnavailableMatchMetricsClaimedOnceAcrossRedeliveries(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	for i := 0; i < 3; i++ {
-		if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrFunctionUnavailable) {
-			t.Fatalf("delivery %d error = %v, want ErrFunctionUnavailable", i+1, err)
+		if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); !errors.Is(err, ErrAppUnavailable) {
+			t.Fatalf("delivery %d error = %v, want ErrAppUnavailable", i+1, err)
 		}
 	}
 	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
@@ -427,7 +427,7 @@ func TestHandleUnavailableMatchMetricsClaimedOnceAcrossRedeliveries(t *testing.T
 	if got := m.Counter(metrics.MetricEventsUnmatched); got != 0 {
 		t.Errorf("events_unmatched_total = %d, want 0", got)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 || fs[0].EventsMatchedTotal != 1 {
 		t.Fatalf("function engagement must be claimed once: %+v", fs)
 	}

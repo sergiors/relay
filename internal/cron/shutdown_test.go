@@ -59,7 +59,7 @@ func (b *blockingPublisher) callCount() int {
 func TestStopStrictlyJoinsInFlightCallbackAfterBound(t *testing.T) {
 	fp := newBlockingPublisher()
 	s := New(fp, testLogger())
-	s.ReplaceFunction("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
+	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
 	fireNow(t, s, "fn/jobs.a")

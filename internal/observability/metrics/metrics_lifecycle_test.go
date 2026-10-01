@@ -7,43 +7,43 @@ import (
 	"time"
 )
 
-// seedFunction increments every function-carrying vec for name, so a function
-// has a series in each of the functionMetrics collectors. handler duration and
-// function build are observed as histograms; handler_invocations_total gets
+// seedApp increments every app-carrying vec for name, so an app
+// has a series in each of the appMetrics collectors. handler duration and
+// app build are observed as histograms; handler_invocations_total gets
 // both success and failure outcomes; the runtime pool vecs get one series each.
-func seedFunction(r *Registry, name string) {
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", name}, {"handler", "x"}})
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", name}, {"handler", "x"}})
-	r.IncLabels(MetricBuildFailures, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionRetries, []Label{{"function", name}})
-	r.IncLabels(MetricFunctionDLQ, []Label{{"function", name}})
-	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", name}, {"handler", "x"}}, time.Millisecond)
-	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", name}}, time.Millisecond)
-	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", name}, {"state", RuntimeStateIdle}}, 1)
-	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", name}}, 2)
-	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", name}, {"outcome", RuntimeOutcomeCold}})
-	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", name}, {"reason", "shutdown"}})
-	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", name}}, time.Millisecond)
-	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", name}})
-	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", name}, {"status", "ready"}}, 1)
-	r.IncLabels(MetricServiceReconciles, []Label{{"function", name}, {"outcome", ServiceOutcomeChanged}})
-	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", name}}, time.Millisecond)
+func seedApp(r *Registry, name string) {
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", name}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"app", name}, {"handler", "x"}})
+	r.IncLabels(MetricAppBuildFailures, []Label{{"app", name}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", name}})
+	r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"app", name}})
+	r.IncLabels(MetricFunctionHandlerFailure, []Label{{"app", name}})
+	r.IncLabels(MetricFunctionRetries, []Label{{"app", name}})
+	r.IncLabels(MetricFunctionDLQ, []Label{{"app", name}})
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", name}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricAppBuild, []Label{{"app", name}}, time.Millisecond)
+	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"app", name}, {"state", RuntimeStateIdle}}, 1)
+	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"app", name}}, 2)
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"app", name}, {"outcome", RuntimeOutcomeCold}})
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"app", name}, {"reason", "shutdown"}})
+	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"app", name}}, time.Millisecond)
+	r.IncLabels(MetricRuntimeContainerWaits, []Label{{"app", name}})
+	r.SetGaugeLabels(MetricAppStatus, []Label{{"app", name}, {"status", "ready"}}, 1)
+	r.IncLabels(MetricServiceReconciles, []Label{{"app", name}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"app", name}}, time.Millisecond)
 }
 
 // seriesPresent reports whether the snapshot contains a series whose rendered
-// name carries the given metric name and the function label value. The metric
+// name carries the given metric name and the app label value. The metric
 // argument is the canonical (relay_-prefixed) name; the snapshot renders
 // display names (prefix stripped, see sampleName), so the prefix is trimmed
-// before prefixing the line. sampleName sorts labels by name, so the function
+// before prefixing the line. sampleName sorts labels by name, so the app
 // label may be followed by another label (",other=..."), by the closing brace
 // ("}>"), or be the entire label set ("} count=...") — the check matches the
-// function label token with any of those following contexts.
+// app label token with any of those following contexts.
 func seriesPresent(t *testing.T, snapshot, metric, name string) bool {
 	t.Helper()
-	token := "function=" + name
+	token := "app=" + name
 	for line := range strings.SplitSeq(snapshot, "\n") {
 		if !strings.HasPrefix(line, metricDisplayName(metric)+"{") {
 			continue
@@ -62,23 +62,23 @@ func seriesPresent(t *testing.T, snapshot, metric, name string) bool {
 	return false
 }
 
-// assertNoFunctionSeries asserts no series across any of the functionMetrics
-// functionMetrics vecs carries function=name.
-func assertNoFunctionSeries(t *testing.T, r *Registry, name string) {
+// assertNoAppSeries asserts no series across any of the appMetrics
+// appMetrics vecs carries app=name.
+func assertNoAppSeries(t *testing.T, r *Registry, name string) {
 	t.Helper()
 	s := r.Snapshot()
-	for _, m := range functionMetrics {
+	for _, m := range appMetrics {
 		if seriesPresent(t, s, m, name) {
 			t.Fatalf("expected no %s series for %q, but found one in:\n%s", m, name, s)
 		}
 	}
 }
 
-// assertFunctionSeries asserts every one of the functionMetrics vecs has a series for name.
-func assertFunctionSeries(t *testing.T, r *Registry, name string) {
+// assertAppSeries asserts every one of the appMetrics vecs has a series for name.
+func assertAppSeries(t *testing.T, r *Registry, name string) {
 	t.Helper()
 	s := r.Snapshot()
-	for _, m := range functionMetrics {
+	for _, m := range appMetrics {
 		if !seriesPresent(t, s, m, name) {
 			t.Fatalf("expected %s series for %q, but missing in:\n%s", m, name, s)
 		}
@@ -86,7 +86,7 @@ func assertFunctionSeries(t *testing.T, r *Registry, name string) {
 }
 
 // seedGlobals sets distinctive global counters/gauges and returns their total
-// values so a test can assert they never change under function cleanup.
+// values so a test can assert they never change under app cleanup.
 func seedGlobals(r *Registry) map[string]int64 {
 	r.Inc(MetricEventsMatched)
 	r.SeedCounter(MetricEventsMatched, 4)
@@ -119,42 +119,42 @@ func assertGlobalTotals(t *testing.T, r *Registry, want map[string]int64) {
 	}
 }
 
-// Series exist for a function across all functionMetrics vecs while the
-// function exists, with a second function's series isolated alongside.
-func TestFunctionSeriesExistWhileFunctionExists(t *testing.T) {
+// Series exist for an app across all appMetrics vecs while the
+// app exists, with a second app's series isolated alongside.
+func TestAppSeriesExistWhileAppExists(t *testing.T) {
 	r := New()
-	seedFunction(r, "foo")
-	seedFunction(r, "bar")
-	assertFunctionSeries(t, r, "foo")
-	assertFunctionSeries(t, r, "bar")
+	seedApp(r, "foo")
+	seedApp(r, "bar")
+	assertAppSeries(t, r, "foo")
+	assertAppSeries(t, r, "bar")
 }
 
-// RemoveFunction removes exactly foo's series across all functionMetrics vecs, leaves
+// RemoveApp removes exactly foo's series across all appMetrics vecs, leaves
 // bar's series untouched in each, and leaves every global metric unchanged.
-func TestRemoveFunctionDeletesOnlyFunctionSeries(t *testing.T) {
+func TestRemoveAppDeletesOnlyAppSeries(t *testing.T) {
 	r := New()
-	seedFunction(r, "foo")
-	seedFunction(r, "bar")
+	seedApp(r, "foo")
+	seedApp(r, "bar")
 	globals := seedGlobals(r)
 
-	r.RemoveFunction("foo")
+	r.RemoveApp("foo")
 
 	assertGlobalTotals(t, r, globals)
-	assertNoFunctionSeries(t, r, "foo")
+	assertNoAppSeries(t, r, "foo")
 	// bar's series survive in every vec.
-	assertFunctionSeries(t, r, "bar")
+	assertAppSeries(t, r, "bar")
 }
 
-// RemoveFunction on handler_invocations_total must delete BOTH outcome series
+// RemoveApp on handler_invocations_total must delete BOTH outcome series
 // for foo (DeletePartialMatch path) while leaving bar's intact.
-func TestRemoveFunctionDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
+func TestRemoveAppDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
 	r := New()
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "foo"}, {"handler", "x"}})
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", "foo"}, {"handler", "x"}})
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "bar"}, {"handler", "x"}})
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"function", "bar"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "foo"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"app", "foo"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "bar"}, {"handler", "x"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "failure"}, {"app", "bar"}, {"handler", "x"}})
 
-	r.RemoveFunction("foo")
+	r.RemoveApp("foo")
 
 	s := r.Snapshot()
 	if seriesPresent(t, s, MetricHandlerInvocations, "foo") {
@@ -168,27 +168,27 @@ func TestRemoveFunctionDeletesBothHandlerInvocationsOutcomes(t *testing.T) {
 	}
 }
 
-// TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries verifies function
+// TestRemoveAppDeletesRuntimePoolMultiLabelSeries verifies app
 // lifecycle cleanup deletes the warm-container pool series, which carry an
 // extra variable label (state/outcome/reason) and therefore require the
 // DeletePartialMatch path: foo's series in EVERY value of each extra label are
 // removed while bar's survive.
-func TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries(t *testing.T) {
+func TestRemoveAppDeletesRuntimePoolMultiLabelSeries(t *testing.T) {
 	r := New()
 	for _, fn := range []string{"foo", "bar"} {
 		for _, state := range []string{RuntimeStateIdle, RuntimeStateBusy, RuntimeStateStarting} {
-			r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", fn}, {"state", state}}, 1)
+			r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"app", fn}, {"state", state}}, 1)
 		}
 		for _, outcome := range []string{RuntimeOutcomeWarm, RuntimeOutcomeCold} {
-			r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", fn}, {"outcome", outcome}})
+			r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"app", fn}, {"outcome", outcome}})
 		}
 		for _, reason := range []string{"timeout", "image_changed", "shutdown"} {
-			r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", fn}, {"reason", reason}})
+			r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"app", fn}, {"reason", reason}})
 		}
-		r.IncLabels(MetricRuntimeContainerWaits, []Label{{"function", fn}})
+		r.IncLabels(MetricRuntimeContainerWaits, []Label{{"app", fn}})
 	}
 
-	r.RemoveFunction("foo")
+	r.RemoveApp("foo")
 
 	s := r.Snapshot()
 	for _, m := range []string{
@@ -205,23 +205,23 @@ func TestRemoveFunctionDeletesRuntimePoolMultiLabelSeries(t *testing.T) {
 		}
 	}
 	// Re-incrementing foo starts fresh, not from foo's pre-removal value.
-	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", "foo"}, {"outcome", RuntimeOutcomeCold}})
-	r.RemoveFunction("foo")
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"app", "foo"}, {"outcome", RuntimeOutcomeCold}})
+	r.RemoveApp("foo")
 	if seriesPresent(t, r.Snapshot(), MetricRuntimeContainerAcquires, "foo") {
 		t.Fatal("re-added foo must be removable again")
 	}
 }
 
-// TestRemoveFunctionDeletesRuntimePoolSingleLabelSeries verifies the
-// single-function-label pool vecs (capacity, acquire duration) are deleted by
+// TestRemoveAppDeletesRuntimePoolSingleLabelSeries verifies the
+// single-app-label pool vecs (capacity, acquire duration) are deleted by
 // label value, independent of the multi-label vecs above.
-func TestRemoveFunctionDeletesRuntimePoolSingleLabelSeries(t *testing.T) {
+func TestRemoveAppDeletesRuntimePoolSingleLabelSeries(t *testing.T) {
 	r := New()
 	for _, fn := range []string{"foo", "bar"} {
-		r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", fn}}, 2)
-		r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", fn}}, time.Millisecond)
+		r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"app", fn}}, 2)
+		r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"app", fn}}, time.Millisecond)
 	}
-	r.RemoveFunction("foo")
+	r.RemoveApp("foo")
 	s := r.Snapshot()
 	for _, m := range []string{MetricRuntimePoolCapacity, MetricRuntimeContainerAcquireDuration} {
 		if seriesPresent(t, s, m, "foo") {
@@ -233,15 +233,15 @@ func TestRemoveFunctionDeletesRuntimePoolSingleLabelSeries(t *testing.T) {
 	}
 }
 
-// TestRemoveFunctionDeletesHandlerDurationMultiLabel verifies RemoveFunction on
+// TestRemoveAppDeletesHandlerDurationMultiLabel verifies RemoveApp on
 // handler_duration_seconds deletes foo's multi-label histogram series
 // (DeleteLabelValues path) while leaving bar's intact.
-func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
+func TestRemoveAppDeletesHandlerDurationMultiLabel(t *testing.T) {
 	r := New()
-	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
-	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "bar"}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "foo"}, {"handler", "x"}}, time.Millisecond)
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "bar"}, {"handler", "x"}}, time.Millisecond)
 
-	r.RemoveFunction("foo")
+	r.RemoveApp("foo")
 
 	s := r.Snapshot()
 	if seriesPresent(t, s, MetricHandlerDuration, "foo") {
@@ -254,72 +254,72 @@ func TestRemoveFunctionDeletesHandlerDurationMultiLabel(t *testing.T) {
 
 // After removal, re-incrementing foo creates a FRESH series at the new value,
 // not the pre-removal one.
-func TestRemoveFunctionReAddStartsFreshCount(t *testing.T) {
+func TestRemoveAppReAddStartsFreshCount(t *testing.T) {
 	r := New()
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
-	r.RemoveFunction("foo")
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "foo"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "foo"}})
+	r.RemoveApp("foo")
 
-	r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
+	r.IncLabels(MetricAppEventsMatched, []Label{{"app", "foo"}})
 	s := r.Snapshot()
-	if !strings.Contains(s, "function_events_matched_total{function=foo} count=1") {
+	if !strings.Contains(s, "app_events_matched_total{app=foo} count=1") {
 		t.Fatalf("re-added foo must count 1, not the stale value; got:\n%s", s)
 	}
 }
 
-// Nil-receiver RemoveFunction and SweepFunctionMetrics must not panic.
-func TestFunctionCleanupNilReceiverNoPanic(t *testing.T) {
+// Nil-receiver RemoveApp and SweepAppMetrics must not panic.
+func TestAppCleanupNilReceiverNoPanic(t *testing.T) {
 	var r *Registry
-	r.RemoveFunction("foo")
-	r.SweepFunctionMetrics(map[string]bool{"bar": true})
+	r.RemoveApp("foo")
+	r.SweepAppMetrics(map[string]bool{"bar": true})
 }
 
-// SweepFunctionMetrics deletes series for functions absent from the live set,
+// SweepAppMetrics deletes series for apps absent from the live set,
 // keeps live ones, leaves globals untouched, and a nil/empty map removes all
-// function series but never globals.
-func TestSweepFunctionMetrics(t *testing.T) {
+// app series but never globals.
+func TestSweepAppMetrics(t *testing.T) {
 	r := New()
-	seedFunction(r, "keep")
-	seedFunction(r, "remove")
+	seedApp(r, "keep")
+	seedApp(r, "remove")
 	globals := seedGlobals(r)
 
-	r.SweepFunctionMetrics(map[string]bool{"keep": true})
+	r.SweepAppMetrics(map[string]bool{"keep": true})
 
 	assertGlobalTotals(t, r, globals)
-	assertNoFunctionSeries(t, r, "remove")
-	if !seriesPresent(t, r.Snapshot(), MetricFunctionEventsMatched, "keep") {
+	assertNoAppSeries(t, r, "remove")
+	if !seriesPresent(t, r.Snapshot(), MetricAppEventsMatched, "keep") {
 		t.Fatal("keep's series must survive the sweep")
 	}
 
-	// A nil/empty live map removes every function series but never globals.
-	r.SweepFunctionMetrics(map[string]bool{})
-	assertNoFunctionSeries(t, r, "keep")
+	// A nil/empty live map removes every app series but never globals.
+	r.SweepAppMetrics(map[string]bool{})
+	assertNoAppSeries(t, r, "keep")
 	assertGlobalTotals(t, r, globals)
 }
 
-// Race: writers increment foo's function_* vecs while deleters call
-// RemoveFunction and SweepFunctionMetrics, concurrent with Snapshot /
-// FunctionStatsSnapshot readers. After writers+deleters stop, a final sweep must
+// Race: writers increment foo's app_* vecs while deleters call
+// RemoveApp and SweepAppMetrics, concurrent with Snapshot /
+// AppStatsSnapshot readers. After writers+deleters stop, a final sweep must
 // leave foo absent with no permanent stale recreation, bar intact, and globals
 // exactly equal to their seeded totals.
-func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
+func TestRemoveAppConcurrentWithWriters(t *testing.T) {
 	r := New()
-	seedFunction(r, "bar")
+	seedApp(r, "bar")
 	globals := seedGlobals(r)
 
 	const writers = 4
 	const iters = 500
 	var wg sync.WaitGroup
 
-	// Writers: repeatedly create foo's function-scoped series.
+	// Writers: repeatedly create foo's app-scoped series.
 	for i := 0; i < writers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
-				r.IncLabels(MetricFunctionEventsMatched, []Label{{"function", "foo"}})
-				r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"function", "foo"}})
-				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "foo"}, {"handler", "x"}}, time.Millisecond)
+				r.IncLabels(MetricAppEventsMatched, []Label{{"app", "foo"}})
+				r.IncLabels(MetricFunctionHandlerSuccess, []Label{{"app", "foo"}})
+				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "foo"}, {"handler", "x"}}, time.Millisecond)
 			}
 		}()
 	}
@@ -336,10 +336,10 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					r.RemoveFunction("foo")
-					r.SweepFunctionMetrics(map[string]bool{"bar": true})
+					r.RemoveApp("foo")
+					r.SweepAppMetrics(map[string]bool{"bar": true})
 					r.Snapshot()
-					r.FunctionStatsSnapshot()
+					r.AppStatsSnapshot()
 				}
 			}
 		}()
@@ -350,23 +350,23 @@ func TestRemoveFunctionConcurrentWithWriters(t *testing.T) {
 	delWG.Wait()
 
 	// Convergence: after all writers stop, sweep repeatedly (bounded) until foo
-	// no longer appears in the function_stats view.
+	// no longer appears in the app_stats view.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		r.SweepFunctionMetrics(map[string]bool{"bar": true})
-		if byFn(r.FunctionStatsSnapshot(), "foo").Function == "" {
+		r.SweepAppMetrics(map[string]bool{"bar": true})
+		if byFn(r.AppStatsSnapshot(), "foo").App == "" {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	// One final sweep removes everything remaining.
-	r.SweepFunctionMetrics(map[string]bool{"bar": true})
+	r.SweepAppMetrics(map[string]bool{"bar": true})
 
-	if byFn(r.FunctionStatsSnapshot(), "foo").Function != "" {
-		t.Fatalf("foo must be absent from FunctionStatsSnapshot after convergence:\n%+v", r.FunctionStatsSnapshot())
+	if byFn(r.AppStatsSnapshot(), "foo").App != "" {
+		t.Fatalf("foo must be absent from AppStatsSnapshot after convergence:\n%+v", r.AppStatsSnapshot())
 	}
-	assertNoFunctionSeries(t, r, "foo")
-	if !seriesPresent(t, r.Snapshot(), MetricFunctionEventsMatched, "bar") {
+	assertNoAppSeries(t, r, "foo")
+	if !seriesPresent(t, r.Snapshot(), MetricAppEventsMatched, "bar") {
 		t.Fatal("bar's series must survive the concurrent cleanup")
 	}
 	// Globals equal their exact seeded totals.

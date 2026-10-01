@@ -18,7 +18,7 @@ import (
 )
 
 // newUnitPublisher builds a Publisher with the unexported test seams set: no
-// Redis is contacted (client is a never-dialed stub), the envelope function is
+// Redis is contacted (client is a never-dialed stub), the envelope app is
 // the real one unless overridden, and runScript is the supplied fake returning
 // (res, err). It mirrors how production wires the seams.
 func newUnitPublisher(t *testing.T, m *metrics.Registry, res int, scriptErr error) *SchedulePublisher {
@@ -33,7 +33,7 @@ func newUnitPublisher(t *testing.T, m *metrics.Registry, res int, scriptErr erro
 }
 
 func unitOccurrence() Occurrence {
-	return Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: fixedInstant}
+	return Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: fixedInstant}
 }
 
 // TestPublishOccurrenceBranchMatrix drives the three result branches of the

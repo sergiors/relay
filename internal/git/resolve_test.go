@@ -139,7 +139,7 @@ func TestSyncResolvesFreshRemoteBranch(t *testing.T) {
 
 	// First sync: clone + materialize the initial content.
 	mustSync(t, e, cfg)
-	b, err := os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, err := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if err != nil {
 		t.Fatalf("read materialized template: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestSyncResolvesFreshRemoteBranch(t *testing.T) {
 	if !strings.Contains(out.String(), newHash.String()[:7]) {
 		t.Fatalf("summary %q does not pin the NEW short hash %s", out.String(), newHash.String()[:7])
 	}
-	b, err = os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, err = os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if err != nil {
 		t.Fatalf("read materialized template after re-sync: %v", err)
 	}

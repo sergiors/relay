@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // buildContextTempPrefixes are the transient build-context temp directories the
-// runtime creates (one per function image build, one per dependency build) and
+// runtime creates (one per app image build, one per dependency build) and
 // must ALWAYS remove via its deferred os.RemoveAll; a leftover is a disk leak.
 var buildContextTempPrefixes = []string{"relay-build-", "relay-dep-build-"}
 
@@ -49,7 +49,7 @@ func isolatedTmpdir(t *testing.T) string {
 	return base
 }
 
-// TestBuildContextTempDirRemovedOnBuildSuccess proves the function image's
+// TestBuildContextTempDirRemovedOnBuildSuccess proves the app image's
 // transient build directory is removed after a successful build. The temp dir is
 // observed present at the ImageBuild request (so the assertion cannot pass
 // vacuously if a future refactor stops creating one) and absent once Prepare
@@ -71,7 +71,7 @@ func TestBuildContextTempDirRemovedOnBuildSuccess(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "ctx-success", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-success", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	if _, err := m.Prepare(context.Background(), fn); err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestBuildContextTempDirRemovedOnBuildSuccess(t *testing.T) {
 	}
 }
 
-// TestBuildContextTempDirRemovedOnBuildFailure proves the function image's
+// TestBuildContextTempDirRemovedOnBuildFailure proves the app image's
 // transient build directory is removed when the build fails (the daemon returns
 // an error message in the stream), so a failing build cannot accumulate temp
 // directories.
@@ -104,7 +104,7 @@ func TestBuildContextTempDirRemovedOnBuildFailure(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "ctx-failure", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-failure", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	if _, err := m.Prepare(context.Background(), fn); err == nil {
 		t.Fatal("expected the scripted build failure to surface")
 	}
@@ -116,7 +116,7 @@ func TestBuildContextTempDirRemovedOnBuildFailure(t *testing.T) {
 	}
 }
 
-// TestBuildContextTempDirRemovedOnBuildCancellation proves the function image's
+// TestBuildContextTempDirRemovedOnBuildCancellation proves the app image's
 // transient build directory is removed when the build is cancelled mid-flight
 // (manager lifecycle cancellation while the daemon request is blocked). This is
 // the cancellation half of "no temp leaks": the deferred removal in buildImage
@@ -151,7 +151,7 @@ func TestBuildContextTempDirRemovedOnBuildCancellation(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, lifecycle)
 
-	fn := function.Function{Name: "ctx-cancel", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "ctx-cancel", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	done := make(chan error, 1)
 	go func() {
 		_, err := m.Prepare(context.Background(), fn)

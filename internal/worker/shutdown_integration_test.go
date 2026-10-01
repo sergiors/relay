@@ -30,7 +30,7 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/reconciler"
 	"relay/internal/runner"
@@ -41,8 +41,8 @@ import (
 )
 
 // workerConfig carries the test-controlled constants that replace the package
-// CONSTANTS (function.Dir, state.DBPath) and the env-derived values in Run().
-// The worker binary reads the literal "/functions" and "/var/lib/relay/...",
+// CONSTANTS (app.Dir, state.DBPath) and the env-derived values in Run().
+// The worker binary reads the literal "/apps" and "/var/lib/relay/...",
 // which are not writable on the host, so the test forks the wiring IN-PROCESS
 // with these values instead (the same pattern TestIntegrationMetricsEndpoint
 // uses, but with the FULL wiring including the real Consume loop and real Docker
@@ -106,7 +106,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	t.Cleanup(cancel)
 
 	// Mirror the FIRST step of Run()'s external-dependency preflight: the
-	// Redis stream/group bootstrap runs before functions are loaded or the
+	// Redis stream/group bootstrap runs before apps are loaded or the
 	// state DB is opened. Run uses the package-level stream.EnsureGroup (the
 	// consumer method delegates to it), so this exercises the same path. The
 	// remaining wiring below is bespoke to this shutdown test (it needs concrete
@@ -115,10 +115,10 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 		t.Fatalf("ensure group: %v", err)
 	}
 
-	loader := function.NewLoader(cfg.fnRoot, logger)
+	loader := app.NewLoader(cfg.fnRoot, logger)
 	functions, err := loader.Load()
 	if err != nil {
-		t.Fatalf("load functions: %v", err)
+		t.Fatalf("load apps: %v", err)
 	}
 
 	st, err := state.Open(cfg.statePath)
@@ -147,7 +147,7 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 	_, _ = manager.SweepOrphanContainers(sweepCtx, cfg.consumerName)
 	sweepCancel()
 
-	var prepared []*runner.PreparedFunction
+	var prepared []*runner.PreparedApp
 	fingerprints := make(map[string]string, len(functions))
 	for _, fn := range functions {
 		p, err := manager.Prepare(context.Background(), fn)
@@ -215,10 +215,10 @@ func startWorker(t *testing.T, cfg workerConfig) *workerEnv {
 
 	rec := reconciler.New(
 		reconciler.Config{
-			Root:           cfg.fnRoot,
-			State:          st,
-			Retire:         func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
-			RemoveFunction: runWorker.RemoveFunctionImages,
+			Root:      cfg.fnRoot,
+			State:     st,
+			Retire:    func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
+			RemoveApp: runWorker.RemoveAppImages,
 		},
 		runWorker.Registry(),
 		manager,
@@ -373,14 +373,14 @@ func TestIntegrationGracefulShutdownMidHandler(t *testing.T) {
 	fnRoot := t.TempDir()
 	statePath := filepath.Join(t.TempDir(), "db.sqlite3")
 
-	// Derive a unique, length-capped function name from the test name + a
+	// Derive a unique, length-capped app name from the test name + a
 	// nanosecond stamp so concurrent runs on one daemon cannot collide on the
-	// execution container labels or the function directory. testutil.UniqueName
-	// guarantees the name stays within function.ValidName's 63-char cap even for
+	// execution container labels or the app directory. testutil.UniqueName
+	// guarantees the name stays within app.ValidName's 63-char cap even for
 	// a long test name.
 	fnName := testutil.UniqueName(t, "shutdown")
 
-	// Write the function. The handler sleeps 30s while the rule timeout is 25s,
+	// Write the app. The handler sleeps 30s while the rule timeout is 25s,
 	// so TryStart persists a running deadline (now+25s) that comfortably exceeds
 	// the shutdown point — the handler is genuinely mid-execution when we cancel.
 	fnDir := filepath.Join(fnRoot, fnName)
@@ -418,7 +418,7 @@ export async function slow(event) {
 	// lives in the request frame and the output prefix — so the identity label
 	// set is the stable wait predicate.)
 	containerID := waitForContainer(t, dcli, map[string]string{
-		"relay.function": fnName,
+		"relay.app":      fnName,
 		"relay.hostname": consumerName,
 	})
 	t.Logf("in-flight container %s observed", containerID)
@@ -492,7 +492,7 @@ export async function slow(event) {
 	// Docker cleanup completed: the in-flight container is gone (AutoRemove after
 	// the kill, plus the deferred best-effort remove).
 	if !waitForContainerGone(t, dcli, map[string]string{
-		"relay.function": fnName,
+		"relay.app":      fnName,
 		"relay.hostname": consumerName,
 	}) {
 		t.Error("in-flight container should have been removed after shutdown")

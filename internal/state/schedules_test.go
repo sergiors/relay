@@ -22,14 +22,14 @@ schedules:
 `
 
 // TestScheduleRoundTrip seeds a template with schedules through
-// RecordReconcileSuccess and asserts GetFunction returns the resolved rows
+// RecordReconcileSuccess and asserts GetApp returns the resolved rows
 // (name, handler, verbatim cron, effective timezone name, resolved timeout).
 func TestScheduleRoundTrip(t *testing.T) {
 	st := openTestState(t)
 	tmpl := mustTemplate(t, schedulesTmpl)
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -73,7 +73,7 @@ schedules:
 `)
 	st.RecordReconcileSuccess("demo", "img2", "fp2", time.Now(), fnFor(t, "demo", changed))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}
@@ -96,7 +96,7 @@ func TestScheduleRemovalClearsRows(t *testing.T) {
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
 	st.RecordRemoved("demo")
-	if _, ok := st.GetFunction("demo"); ok {
+	if _, ok := st.GetApp("demo"); ok {
 		t.Fatal("function row should be gone after removal")
 	}
 }
@@ -108,7 +108,7 @@ func TestScheduleEmptyStored(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl) // no schedules key
 	st.RecordReconcileSuccess("demo", "img", "fp", time.Now(), fnFor(t, "demo", tmpl))
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected function")
 	}

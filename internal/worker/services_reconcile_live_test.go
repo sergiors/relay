@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/reconciler"
 	"relay/internal/routing"
 	"relay/internal/runner"
@@ -73,7 +73,7 @@ func (d *ctxRecordDocker) maybeBlock(method string, ctx context.Context) bool {
 }
 
 func (d *ctxRecordDocker) ResolveServiceImage(
-	ctx context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	ctx context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	d.record("resolve", ctx)
 	if d.maybeBlock("resolve", ctx) {
@@ -83,7 +83,7 @@ func (d *ctxRecordDocker) ResolveServiceImage(
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 
 func (d *ctxRecordDocker) StartService(ctx context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
@@ -107,7 +107,7 @@ func (d *ctxRecordDocker) StopServiceContainers(ctx context.Context, _ []runtime
 	return nil
 }
 
-func (d *ctxRecordDocker) RemoveFunctionServiceContainers(ctx context.Context, _ string) (int, error) {
+func (d *ctxRecordDocker) RemoveAppServiceContainers(ctx context.Context, _ string) (int, error) {
 	d.record("remove", ctx)
 	if d.maybeBlock("remove", ctx) {
 		return 0, ctx.Err()
@@ -186,15 +186,15 @@ func (d *ctxRecordDocker) waitCount(t *testing.T, op string, n int) {
 
 // applyServiceTemplate is a single entrypoint service whose convergence touches
 // resolve, env, and start — the ops the live/startup paths must bound.
-func applyServiceTemplate() *function.Template {
-	return &function.Template{
+func applyServiceTemplate() *app.Template {
+	return &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 }
 
 // startCoordinatorFixture builds a started coordinator over a fresh fake, and
-// returns the coordinator plus a stop function that cancels the lifecycle and
+// returns the coordinator plus a stop app that cancels the lifecycle and
 // joins the workers. The worker lifecycle is the parent in production; here a
 // test-owned context stands in for it.
 func startCoordinatorFixture(t *testing.T, svcCtrl *reconciler.ServiceReconciler) (*reconciler.ServiceCoordinator, func()) {
@@ -292,8 +292,8 @@ func TestEnqueueLiveServicesUsesRegistryPreparedEnv(t *testing.T) {
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{runner.NewPrepared(
-		function.Function{Name: "fn", Template: applyServiceTemplate()},
+	reg.Set([]*runner.PreparedApp{runner.NewPrepared(
+		app.App{Name: "fn", Template: applyServiceTemplate()},
 		&runtime.Prepared{Name: "fn", Image: "img", Env: []string{"PLAN=1"}},
 		nil,
 	)})
@@ -338,8 +338,8 @@ func TestEnqueueStartupServicesApplyUsesLifecycleNotPassBudget(t *testing.T) {
 	coordinator.Start(lifecycle)
 
 	tmpl := applyServiceTemplate()
-	prepared := []*runner.PreparedFunction{
-		runner.NewPrepared(function.Function{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
+	prepared := []*runner.PreparedApp{
+		runner.NewPrepared(app.App{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
 	}
 
 	enqueueStartupServices(prepared, coordinator, logger)
@@ -358,7 +358,7 @@ func TestEnqueueStartupServicesApplyUsesLifecycleNotPassBudget(t *testing.T) {
 }
 
 // TestEnqueueStartupServicesStandaloneRemoveBounded pins the removal published
-// by enqueueStartupServices: an unavailable function whose template declares no
+// by enqueueStartupServices: an unavailable app whose template declares no
 // services is removed on ITS OWN fresh reconcileTimeout bound (derived by the
 // coordinator, not the unbounded lifecycle), and startup does not block on it
 // (EnqueueRemove, not RemoveAndWait).
@@ -369,9 +369,9 @@ func TestEnqueueStartupServicesStandaloneRemoveBounded(t *testing.T) {
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
-	tmpl := &function.Template{Runtime: "node24"} // no services
-	fn := function.Function{Name: "broken", Template: tmpl}
-	prepared := []*runner.PreparedFunction{runner.NewUnavailable(fn)}
+	tmpl := &app.Template{Runtime: "node24"} // no services
+	fn := app.App{Name: "broken", Template: tmpl}
+	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
 	enqueueStartupServices(prepared, coordinator, logger)
 
@@ -405,9 +405,9 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 
 	// The removal's remove call blocks until the coordinator lifecycle is
 	// cancelled, so enqueueStartupServices must return immediately.
-	tmpl := &function.Template{Runtime: "node24"} // no services
-	fn := function.Function{Name: "broken", Template: tmpl}
-	prepared := []*runner.PreparedFunction{runner.NewUnavailable(fn)}
+	tmpl := &app.Template{Runtime: "node24"} // no services
+	fn := app.App{Name: "broken", Template: tmpl}
+	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
 	returned := make(chan struct{})
 	go func() {
@@ -423,7 +423,7 @@ func TestEnqueueStartupServicesStandaloneRemoveNonBlocking(t *testing.T) {
 }
 
 // TestEnqueueStartupServicesUnavailableWithServicesSkips proves the other
-// standalone branch: an unavailable function that still declares services is
+// standalone branch: an unavailable app that still declares services is
 // left alone (no remove, no enqueue), so its possibly-serving containers are
 // preserved.
 func TestEnqueueStartupServicesUnavailableWithServicesSkips(t *testing.T) {
@@ -434,8 +434,8 @@ func TestEnqueueStartupServicesUnavailableWithServicesSkips(t *testing.T) {
 	defer stop()
 
 	tmpl := applyServiceTemplate()
-	fn := function.Function{Name: "broken", Template: tmpl}
-	prepared := []*runner.PreparedFunction{runner.NewUnavailable(fn)}
+	fn := app.App{Name: "broken", Template: tmpl}
+	prepared := []*runner.PreparedApp{runner.NewUnavailable(fn)}
 
 	enqueueStartupServices(prepared, coordinator, logger)
 	if err := coordinator.Wait(context.Background()); err != nil {

@@ -29,7 +29,7 @@ func TestRetireImageShutdownDeferredNotRetried(t *testing.T) {
 	exec := &blockingExecutor{removeErrIsShutdown: true}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 
 	// Deterministic gate: the async attempt signals when it has reached its
 	// terminal classification (the signal is deferred until after the
@@ -42,7 +42,7 @@ func TestRetireImageShutdownDeferredNotRetried(t *testing.T) {
 	var once sync.Once
 	r.imageCleanupAttemptDone = func(string) { once.Do(func() { close(attemptDone) }) }
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	waitCleanupAttemptDone(t, attemptDone)
 
 	if got := exec.removedImages(); len(got) != 0 {
@@ -73,13 +73,13 @@ func TestRetireImageRemovalShutdownDeferredNotRetried(t *testing.T) {
 	exec := &blockingExecutor{removeErrShutdownOnly: true, referenced: map[string]bool{}}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 
 	attemptDone := make(chan struct{})
 	var once sync.Once
 	r.imageCleanupAttemptDone = func(string) { once.Do(func() { close(attemptDone) }) }
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	waitCleanupAttemptDone(t, attemptDone)
 
 	if got := exec.removedImages(); len(got) != 0 {

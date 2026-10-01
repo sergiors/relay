@@ -23,26 +23,26 @@ func frame(stream byte, payload string) []byte {
 	return buf
 }
 
-// newFunctionOutputSink installs a bytes.Buffer as the function-output sink and
+// newAppOutputSink installs a bytes.Buffer as the app-output sink and
 // returns it, registering restoration of the previous sink. Container
 // stdout/stderr is transport-forwarded here (not to the logger), so every
 // handler-output assertion reads from this buffer. It lives in a plain _test.go
 // file (no integration tag) so both the unit and integration-tagged tests in
 // this package share one helper.
-func newFunctionOutputSink(t *testing.T) *bytes.Buffer {
+func newAppOutputSink(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	buf := &bytes.Buffer{}
-	prev := SetFunctionOutput(buf)
-	t.Cleanup(func() { SetFunctionOutput(prev) })
+	prev := SetAppOutput(buf)
+	t.Cleanup(func() { SetAppOutput(prev) })
 	return buf
 }
 
-// awaitFunctionOutput polls the function-output sink until every wanted
+// awaitAppOutput polls the app-output sink until every wanted
 // substring is present and returns the full buffer contents. Handler output is
 // forwarded to the sink asynchronously: it is usually complete when Execute
 // returns, but under load the lines can trail the invocation response, so an
 // immediate read is not a reliable assertion basis.
-func awaitFunctionOutput(t *testing.T, ctx context.Context, out *bytes.Buffer, wants ...string) string {
+func awaitAppOutput(t *testing.T, ctx context.Context, out *bytes.Buffer, wants ...string) string {
 	t.Helper()
 	if !pollUntil(ctx, 10*time.Second, func() bool {
 		logs := out.String()
@@ -74,7 +74,7 @@ func runForwarders(t *testing.T, out, errW *streamForwarder, frames []byte) {
 }
 
 func TestForwardStdout(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, bytes.Join([][]byte{
@@ -87,7 +87,7 @@ func TestForwardStdout(t *testing.T) {
 }
 
 func TestForwardStderr(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, bytes.Join([][]byte{
@@ -99,7 +99,7 @@ func TestForwardStderr(t *testing.T) {
 }
 
 func TestForwardInterleaved(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	// Alternate stdout/stderr; per-stream frame order must be preserved even
@@ -152,7 +152,7 @@ func matches(got, want []string) bool {
 }
 
 func TestForwardMultiLineSingleFrame(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, frame(1, "a\nb\nc\n"))
@@ -162,7 +162,7 @@ func TestForwardMultiLineSingleFrame(t *testing.T) {
 }
 
 func TestForwardTrailingPartialLine(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	// No trailing newline: the flush at EOF must emit it as a single line
@@ -174,7 +174,7 @@ func TestForwardTrailingPartialLine(t *testing.T) {
 }
 
 func TestForwardOverCapPartialLine(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	// A single line larger than maxPending with no newline must be emitted as a
@@ -193,7 +193,7 @@ func TestForwardOverCapPartialLine(t *testing.T) {
 }
 
 func TestForwardEmptyStream(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, nil)
@@ -203,7 +203,7 @@ func TestForwardEmptyStream(t *testing.T) {
 }
 
 func TestForwardBlankLinesPreserved(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, frame(1, "a\n\nb\n"))
@@ -213,7 +213,7 @@ func TestForwardBlankLinesPreserved(t *testing.T) {
 }
 
 func TestForwardTrimsCR(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
 	runForwarders(t, out, errW, frame(1, "line\r\nnext\r\n"))
@@ -262,7 +262,7 @@ func lineHasAll(forwarded string, subs ...string) bool {
 }
 
 func TestForwardPrefixIncludesMessageID(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{MessageID: "1791234567890-0", EventID: "evt_x"})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{MessageID: "1791234567890-0", EventID: "evt_x"})
 	runForwarders(t, out, errW, frame(1, "hi\n"))
@@ -273,7 +273,7 @@ func TestForwardPrefixIncludesMessageID(t *testing.T) {
 }
 
 func TestForwardPrefixUsesEventIDWhenNoMessageID(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+	sink := newAppOutputSink(t)
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{EventID: "evt_777"})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{EventID: "evt_777"})
 	runForwarders(t, out, errW, frame(1, "hi\n"))
@@ -282,11 +282,11 @@ func TestForwardPrefixUsesEventIDWhenNoMessageID(t *testing.T) {
 	}
 }
 
-func TestForwardPrefersMetaFunctionHandler(t *testing.T) {
-	sink := newFunctionOutputSink(t)
+func TestForwardPrefersMetaAppHandler(t *testing.T) {
+	sink := newAppOutputSink(t)
 	// Direct params say fn/h but meta (authoritative when set) says meta-fn/meta-h.
-	out := newStreamForwarder("stdout", "fn", "h", RunMeta{Function: "meta-fn", Handler: "meta-h"})
-	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{Function: "meta-fn", Handler: "meta-h"})
+	out := newStreamForwarder("stdout", "fn", "h", RunMeta{App: "meta-fn", Handler: "meta-h"})
+	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{App: "meta-fn", Handler: "meta-h"})
 	runForwarders(t, out, errW, frame(1, "hi\n"))
 	if got, want := sink.String(), "[meta-fn/meta-h] stdout: hi\n"; got != want {
 		t.Fatalf("meta function/handler prefix = %q, want %q", got, want)
@@ -302,8 +302,8 @@ type panicWriter struct{}
 func (panicWriter) Write([]byte) (int, error) { panic("sink exploded") }
 
 func TestForwardPanickingSinkDoesNotPanic(t *testing.T) {
-	prev := SetFunctionOutput(panicWriter{})
-	defer SetFunctionOutput(prev)
+	prev := SetAppOutput(panicWriter{})
+	defer SetAppOutput(prev)
 
 	out := newStreamForwarder("stdout", "fn", "h", RunMeta{})
 	errW := newStreamForwarder("stderr", "fn", "h", RunMeta{})
@@ -314,24 +314,24 @@ func TestForwardPanickingSinkDoesNotPanic(t *testing.T) {
 	}, nil))
 }
 
-func TestSetFunctionOutputNilFallsBack(t *testing.T) {
-	// SetFunctionOutput(nil) must fall back to os.Stdout without panicking; the
+func TestSetAppOutputNilFallsBack(t *testing.T) {
+	// SetAppOutput(nil) must fall back to os.Stdout without panicking; the
 	// os.Stdout identity can't be asserted, so this only proves the call returns
 	// the previous sink and does not crash.
-	prev := SetFunctionOutput(&bytes.Buffer{})
-	restored := SetFunctionOutput(nil)
+	prev := SetAppOutput(&bytes.Buffer{})
+	restored := SetAppOutput(nil)
 	if restored == nil {
-		t.Fatal("SetFunctionOutput(nil) returned nil previous sink")
+		t.Fatal("SetAppOutput(nil) returned nil previous sink")
 	}
-	SetFunctionOutput(prev)
+	SetAppOutput(prev)
 }
 
-func TestWriteFunctionOutputNilWriterNoPanic(t *testing.T) {
+func TestWriteAppOutputNilWriterNoPanic(t *testing.T) {
 	// A nil sink must fall back to os.Stdout: the write succeeds, does not panic,
 	// and reports the full length.
-	prev := SetFunctionOutput(nil)
-	defer SetFunctionOutput(prev)
-	if n, err := writeFunctionOutput([]byte("x")); err != nil || n != 1 {
-		t.Fatalf("writeFunctionOutput nil sink: n=%d err=%v", n, err)
+	prev := SetAppOutput(nil)
+	defer SetAppOutput(prev)
+	if n, err := writeAppOutput([]byte("x")); err != nil || n != 1 {
+		t.Fatalf("writeAppOutput nil sink: n=%d err=%v", n, err)
 	}
 }

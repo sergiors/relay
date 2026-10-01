@@ -14,28 +14,28 @@ import (
 
 // cliGitPaths carries the redirected dirs the CLI git tests use for assertions.
 type cliGitPaths struct {
-	configPath, checkoutDir, sshDir, functionsDir string
+	configPath, checkoutDir, sshDir, appsDir string
 }
 
 // redirectGitDirs points the CLI git paths at temp dirs so tests never touch
-// /var/lib/relay or /functions, and returns the redirected paths. It also clears
+// /var/lib/relay or /apps, and returns the redirected paths. It also clears
 // the git sync transport seam (gitCloneURL) so a test that wants a local
 // filesystem source opts in explicitly; the previous values are restored on
 // cleanup.
 func redirectGitDirs(t *testing.T) cliGitPaths {
 	t.Helper()
-	oldCfg, oldCo, oldSSH, oldFn := gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir
+	oldCfg, oldCo, oldSSH, oldFn := gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir
 	oldClone := gitCloneURL
 	gitCloneURL = ""
 	p := cliGitPaths{
-		configPath:   filepath.Join(t.TempDir(), "git", "source.json"),
-		checkoutDir:  filepath.Join(t.TempDir(), "git", "checkout"),
-		sshDir:       filepath.Join(t.TempDir(), "ssh"),
-		functionsDir: filepath.Join(t.TempDir(), "functions"),
+		configPath:  filepath.Join(t.TempDir(), "git", "source.json"),
+		checkoutDir: filepath.Join(t.TempDir(), "git", "checkout"),
+		sshDir:      filepath.Join(t.TempDir(), "ssh"),
+		appsDir:     filepath.Join(t.TempDir(), "functions"),
 	}
-	gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir = p.configPath, p.checkoutDir, p.sshDir, p.functionsDir
+	gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir = p.configPath, p.checkoutDir, p.sshDir, p.appsDir
 	t.Cleanup(func() {
-		gitConfigPath, gitCheckoutDir, gitSSHDir, gitFunctionsDir = oldCfg, oldCo, oldSSH, oldFn
+		gitConfigPath, gitCheckoutDir, gitSSHDir, gitAppsDir = oldCfg, oldCo, oldSSH, oldFn
 		gitCloneURL = oldClone
 	})
 	return p
@@ -559,7 +559,7 @@ func TestGitCommandsDoNotUseLogger(t *testing.T) {
 	}
 }
 
-// seedLocalBareRepo builds a local work repo with one function and a bare remote
+// seedLocalBareRepo builds a local work repo with one app and a bare remote
 // cloned from it via the shared testutil fixture, returning the bare path. It lets
 // a CLI git sync run end to end against a filesystem source (no SSH, no network)
 // through the CLI's gitCloneURL transport seam while the persisted repository
@@ -596,7 +596,7 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 		t.Fatalf("git sync: %v", err)
 	}
 	// The user-facing progress is complete on the writer.
-	for _, step := range []string{"Syncing...", "Cloned ", "Resolved", "Materialized 1 function(s): fn", "Sync complete"} {
+	for _, step := range []string{"Syncing...", "Cloned ", "Resolved", "Materialized 1 app(s): fn", "Sync complete"} {
 		if !strings.Contains(out, step) {
 			t.Fatalf("git sync writer output missing %q:\n%s", step, out)
 		}
@@ -605,8 +605,8 @@ func TestGitSyncCLIStepsAreWriterOnlyAtDebug(t *testing.T) {
 	if logs.Len() != 0 {
 		t.Fatalf("CLI git sync emitted process-log output:\n%s", logs.String())
 	}
-	// The sync actually materialized the function.
-	if _, err := os.Stat(filepath.Join(p.functionsDir, "fn", "template.yaml")); err != nil {
+	// The sync actually materialized the app.
+	if _, err := os.Stat(filepath.Join(p.appsDir, "fn", "template.yaml")); err != nil {
 		t.Fatalf("function not materialized: %v", err)
 	}
 }

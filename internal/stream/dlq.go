@@ -34,10 +34,10 @@ type DLQEntry struct {
 	Event string
 	// Reason is the human-readable exhaustion reason.
 	Reason string
-	// Function and Handler identify the exact exhausted invocation; both are
+	// App and Handler identify the exact exhausted invocation; both are
 	// "-" for a malformed message that never reached a handler.
-	Function string
-	Handler  string
+	App     string
+	Handler string
 	// Deliveries is the Redis Stream/PEL delivery count (diagnostic only).
 	Deliveries int64
 	// HandlerAttempts is the handler execution attempt that exhausted the
@@ -55,7 +55,7 @@ type DLQEntry struct {
 }
 
 // Replayable reports whether the entry attributes a real handler invocation
-// that `relay dlq replay` can re-execute: both Function and Handler name the
+// that `relay dlq replay` can re-execute: both App and Handler name the
 // exact exhausted invocation recorded when it was dead-lettered. A
 // malformed-message placeholder (a message routed to the DLQ before it reached a
 // handler) carries dlqNoHandler ("-") for both and has no invocation to replay,
@@ -63,7 +63,7 @@ type DLQEntry struct {
 // There is deliberately no reinterpretation of the placeholder as a real
 // invocation.
 func (e DLQEntry) Replayable() bool {
-	return e.Function != "" && e.Function != dlqNoHandler &&
+	return e.App != "" && e.App != dlqNoHandler &&
 		e.Handler != "" && e.Handler != dlqNoHandler
 }
 
@@ -94,7 +94,7 @@ func ParseDLQEntry(id string, values map[string]any) (DLQEntry, error) {
 	if e.Reason, err = dlqString(values, "reason"); err != nil {
 		return DLQEntry{}, err
 	}
-	if e.Function, err = dlqString(values, "function"); err != nil {
+	if e.App, err = dlqString(values, "app"); err != nil {
 		return DLQEntry{}, err
 	}
 	if e.Handler, err = dlqString(values, "handler"); err != nil {

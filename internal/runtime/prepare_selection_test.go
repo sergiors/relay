@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/plan"
 	"relay/internal/source"
 )
@@ -59,7 +59,7 @@ func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	fp, err := function.FingerprintSelection(selection)
+	fp, err := app.FingerprintSelection(selection)
 	if err != nil {
 		t.Fatalf("fingerprint selection: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "selected", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "selected", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	got, err := m.PrepareWithFingerprintAndSelection(context.Background(), fn, fp, selection)
 	if err != nil {
 		t.Fatalf("prepare with supplied selection: %v", err)
@@ -87,7 +87,7 @@ func TestPrepareWithSelectionUsesSuppliedSelection(t *testing.T) {
 	// The tag is the snapshot-derived identity: it must be the digest over the
 	// bytes actually staged under the supplied policy, not the caller's pre-edit
 	// value (which predates the .gitignore).
-	wantFP, err := function.FingerprintSelection(selection)
+	wantFP, err := app.FingerprintSelection(selection)
 	if err != nil {
 		t.Fatalf("reference snapshot fingerprint: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestEnsureDependencyImageUsesSuppliedFingerprint(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "dep-once", Dir: t.TempDir(), Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-once", Dir: t.TempDir(), Template: &app.Template{Runtime: "python3.14"}}
 	spec, err := lookup("python3.14")
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
@@ -156,7 +156,7 @@ func TestEnsureDependencyImageUsesSuppliedFingerprint(t *testing.T) {
 // TestPrepareComputesDependencyFingerprintOnce is the per-prepare counter
 // regression for the dependency digest: Manager.depFingerprint is the narrow
 // injectable seam (default: dependencyFingerprintFrom), and Prepare must call it
-// EXACTLY once for a dependency-bearing function — the single value names the
+// EXACTLY once for a dependency-bearing app — the single value names the
 // tag, is stamped as the label, and is threaded into ensureDependencyImage's
 // build. A second computation (e.g. re-deriving the fingerprint inside
 // ensureDependencyImage) would be counted here.
@@ -168,10 +168,10 @@ func TestPrepareComputesDependencyFingerprintOnce(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
 		t.Fatalf("write requirements: %v", err)
 	}
-	fn := function.Function{Name: "dep-once-prepare", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-once-prepare", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
-	// Both the dependency image and the function image report absent, so the
-	// dependency and function builds both run.
+	// Both the dependency image and the app image report absent, so the
+	// dependency and app builds both run.
 	cli := newScriptedDockerClient(t,
 		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 		dockerRoute{method: http.MethodPost, path: "/build", body: `{}`},
@@ -196,19 +196,19 @@ func TestPrepareComputesDependencyFingerprintOnce(t *testing.T) {
 	}
 }
 
-// TestSelectAndFingerprintFunctionsNoRuntimeNoSelection pins the no-runtime half
+// TestSelectAndFingerprintAppsNoRuntimeNoSelection pins the no-runtime half
 // of the startup helper: a template needing no runtime yields a template-only
 // fingerprint and a nil selection (no tree is walked or staged).
-func TestSelectAndFingerprintFunctionsNoRuntimeNoSelection(t *testing.T) {
+func TestSelectAndFingerprintAppsNoRuntimeNoSelection(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	tmpl, err := function.ParseTemplate([]byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"))
+	tmpl, err := app.ParseTemplate([]byte("services:\n  - name: web\n    image: nginx:alpine\n    port: 80\n"))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	selection, fp, err := function.SelectAndFingerprintFunction(dir, tmpl)
+	selection, fp, err := app.SelectAndFingerprintApp(dir, tmpl)
 	if err != nil {
 		t.Fatalf("select and fingerprint: %v", err)
 	}
@@ -220,22 +220,22 @@ func TestSelectAndFingerprintFunctionsNoRuntimeNoSelection(t *testing.T) {
 	}
 }
 
-// TestSelectAndFingerprintFunctionsRuntimeReturnsSelection pins the runtime
+// TestSelectAndFingerprintAppsRuntimeReturnsSelection pins the runtime
 // half: the selection is resolved and the digest matches FingerprintSelection
 // over it, so the two are coherent by construction.
-func TestSelectAndFingerprintFunctionsRuntimeReturnsSelection(t *testing.T) {
+func TestSelectAndFingerprintAppsRuntimeReturnsSelection(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	selection, fp, err := function.SelectAndFingerprintFunction(dir, &function.Template{Runtime: "node24"})
+	selection, fp, err := app.SelectAndFingerprintApp(dir, &app.Template{Runtime: "node24"})
 	if err != nil {
 		t.Fatalf("select and fingerprint: %v", err)
 	}
 	if selection == nil {
 		t.Fatal("runtime-backed function must resolve a selection")
 	}
-	want, err := function.FingerprintSelection(selection)
+	want, err := app.FingerprintSelection(selection)
 	if err != nil {
 		t.Fatalf("fingerprint selection: %v", err)
 	}

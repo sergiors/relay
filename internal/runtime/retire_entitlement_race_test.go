@@ -14,7 +14,7 @@ import (
 // not protect this manager's image, whose removal this manager's gate governs, so
 // Execute acquires its own reference from the executing manager's coordinator.
 func TestExecuteCarriedLeaseFromAnotherManagerAcquiresOwn(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	foreign := &Manager{}
 
@@ -55,7 +55,7 @@ func TestExecuteCarriedLeaseFromAnotherManagerAcquiresOwn(t *testing.T) {
 // coordinator's retireEntered hook as the exact commit signal rather than a
 // delay-based assertion.
 func TestImageCoordinatorRemovalWaitsForEveryIndependentReference(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 	c := newImageCoordinator()
 
 	first, err := c.acquire(image)
@@ -141,7 +141,7 @@ func TestImageCoordinatorRemovalWaitsForEveryIndependentReference(t *testing.T) 
 // execution. The removal stays parked on the carried admission pin (which the
 // caller owns) and proceeds only once that pin is released.
 func TestExecuteCarriedEntitlementReleasedOnFailedCreate(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	dels := 0
 	cli := newScriptedDockerClient(t,

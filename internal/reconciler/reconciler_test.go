@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 )
@@ -29,7 +29,7 @@ type fakeBuilder struct {
 	fail    bool
 }
 
-func (f *fakeBuilder) Prepare(ctx context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (f *fakeBuilder) Prepare(ctx context.Context, fn app.App) (*runtime.Prepared, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.prepCnt++
@@ -66,17 +66,17 @@ func writeFnDir(t *testing.T, root, name string) string {
 	return dir
 }
 
-func initialFn(name, dir string) *runner.PreparedFunction {
+func initialFn(name, dir string) *runner.PreparedApp {
 	tmpl := mustParse(template)
 	return runner.NewPrepared(
-		function.Function{Name: name, Dir: dir, Template: tmpl},
+		app.App{Name: name, Dir: dir, Template: tmpl},
 		&runtime.Prepared{Name: name, Image: "img-" + name},
 		&fakeBuilder{},
 	)
 }
 
-func mustParse(s string) *function.Template {
-	t, err := function.ParseTemplate([]byte(s))
+func mustParse(s string) *app.Template {
+	t, err := app.ParseTemplate([]byte(s))
 	if err != nil {
 		panic(err)
 	}
@@ -85,14 +85,14 @@ func mustParse(s string) *function.Template {
 
 // A dir present on disk but not in the registry is built (Prepare called) and
 // added.
-func TestReconcileNewFunctionDiscovered(t *testing.T) {
+func TestReconcileNewAppDiscovered(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "brand-new")
 
 	b := &fakeBuilder{}
 	r, reg := newTestReconciler(t, root, b, nil, nil)
 
-	r.reconcileFunction("brand-new")
+	r.reconcileApp("brand-new")
 
 	if b.prepares() != 1 {
 		t.Fatalf("expected 1 prepare call, got %d", b.prepares())
@@ -102,16 +102,16 @@ func TestReconcileNewFunctionDiscovered(t *testing.T) {
 	}
 }
 
-// An identical function is not rebuilt.
+// An identical app is not rebuilt.
 func TestReconcileUnchangedFingerprintSkipped(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "stable")
 
 	fn := initialFn("stable", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	r.reconcileFunction("stable")
+	r.reconcileApp("stable")
 
 	if b.prepares() != 0 {
 		t.Fatalf("expected 0 prepare calls for unchanged function, got %d", b.prepares())
@@ -122,20 +122,20 @@ func TestReconcileUnchangedFingerprintSkipped(t *testing.T) {
 }
 
 // Editing content changes the fingerprint, triggering a rebuild and swap.
-func TestReconcileChangedFunctionRebuilt(t *testing.T) {
+func TestReconcileChangedAppRebuilt(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "changing")
 
 	fn := initialFn("changing", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Change source content.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
-	r.reconcileFunction("changing")
+	r.reconcileApp("changing")
 
 	if b.prepares() != 1 {
 		t.Fatalf("expected 1 prepare call after change, got %d", b.prepares())
@@ -145,21 +145,21 @@ func TestReconcileChangedFunctionRebuilt(t *testing.T) {
 	}
 }
 
-// A broken template must NOT drop the previously-active function or rebuild.
+// A broken template must NOT drop the previously-active app or rebuild.
 func TestReconcileInvalidTemplateKeepsOld(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "guarded")
 
 	fn := initialFn("guarded", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Break the template.
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("runtime: python9.9\n"), 0o644); err != nil {
 		t.Fatalf("write broken template: %v", err)
 	}
 
-	r.reconcileFunction("guarded")
+	r.reconcileApp("guarded")
 
 	if b.prepares() != 0 {
 		t.Fatalf("expected 0 prepares for invalid template, got %d", b.prepares())
@@ -177,13 +177,13 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 
 	fn := initialFn("tobe-removed", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
-	// Remove the whole directory -> function dropped.
+	// Remove the whole directory -> app dropped.
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("removeall: %v", err)
 	}
-	r.reconcileFunction("tobe-removed")
+	r.reconcileApp("tobe-removed")
 	if reg.GetByName("tobe-removed") != nil {
 		t.Fatal("removed dir should drop the function from the registry")
 	}
@@ -194,10 +194,10 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 		t.Fatalf("mkdir midcopy: %v", err)
 	}
 	midFn := initialFn("midcopy", mid)
-	reg.Set([]*runner.PreparedFunction{midFn})
-	seedCurrent(r, midFn.Function())
+	reg.Set([]*runner.PreparedApp{midFn})
+	seedCurrent(r, midFn.App())
 
-	r.reconcileFunction("midcopy")
+	r.reconcileApp("midcopy")
 	if reg.GetByName("midcopy") == nil {
 		t.Fatal("dir without template must not be removed")
 	}
@@ -206,7 +206,7 @@ func TestReconcileMissingDirsRetainsActive(t *testing.T) {
 	}
 }
 
-// A failed rebuild keeps the old active version and does not drop the function;
+// A failed rebuild keeps the old active version and does not drop the app;
 // because the stored fingerprint stays the old one, a later pass retries the
 // build even without another file change.
 func TestReconcileFailedBuildRetainsOld(t *testing.T) {
@@ -215,14 +215,14 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 
 	fn := initialFn("flaky", dir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{fn}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{fn}, nil)
 
 	// Change content so a rebuild is warranted, then make it fail.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 	b.fail = true
-	r.reconcileFunction("flaky")
+	r.reconcileApp("flaky")
 	if b.prepares() != 1 {
 		t.Fatalf("expected 1 failed prepare attempt, got %d", b.prepares())
 	}
@@ -232,14 +232,14 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 	}
 	// A second pass retries because the stored fingerprint still matches the OLD
 	// build, not the changed sources.
-	r.reconcileFunction("flaky")
+	r.reconcileApp("flaky")
 	if b.prepares() != 2 {
 		t.Fatalf("expected a retry on the next pass, got %d", b.prepares())
 	}
 
 	// Success replaces the old version.
 	b.fail = false
-	r.reconcileFunction("flaky")
+	r.reconcileApp("flaky")
 	if b.prepares() != 3 {
 		t.Fatalf("expected a success prepare, got %d", b.prepares())
 	}
@@ -248,24 +248,24 @@ func TestReconcileFailedBuildRetainsOld(t *testing.T) {
 	}
 }
 
-// A function whose startup build failed is retried by the reconciler without a
+// An app whose startup build failed is retried by the reconciler without a
 // source change.
-func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
+func TestUnavailableAppRetriedOnPeriodicReconcile(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "recover")
 
 	tmpl := mustParse(template)
 	// Startup failed: registered as unavailable (no image).
-	unavail := runner.NewUnavailable(function.Function{Name: "recover", Dir: dir, Template: tmpl})
+	unavail := runner.NewUnavailable(app.App{Name: "recover", Dir: dir, Template: tmpl})
 	b := &fakeBuilder{}
 
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{unavail})
+	reg.Set([]*runner.PreparedApp{unavail})
 	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	seedCurrent(r, unavail.Function())
+	seedCurrent(r, unavail.App())
 
-	// Even with an unchanged fingerprint, the unavailable function is rebuilt.
-	r.reconcileFunction("recover")
+	// Even with an unchanged fingerprint, the unavailable app is rebuilt.
+	r.reconcileApp("recover")
 	if b.prepares() != 1 {
 		t.Fatalf("expected 1 prepare to recover the unavailable function, got %d", b.prepares())
 	}
@@ -275,19 +275,19 @@ func TestUnavailableFunctionRetriedOnPeriodicReconcile(t *testing.T) {
 }
 
 // TestReconcileAllDiscoversAndRemoves verifies the periodic backstop:
-// reconcileAll reconciles every on-disk function AND every registered function
+// reconcileAll reconciles every on-disk app AND every registered app
 // whose directory vanished (removal). It drives the real single pump so the
 // semantics match production.
 func TestReconcileAllDiscoversAndRemoves(t *testing.T) {
 	root := t.TempDir()
-	// One live dir on disk + one registered function whose dir is gone.
+	// One live dir on disk + one registered app whose dir is gone.
 	liveDir := writeFnDir(t, root, "live")
 	goneDir := writeFnDir(t, root, "gone")
 
 	live := initialFn("live", liveDir)
 	gone := initialFn("gone", goneDir)
 	b := &fakeBuilder{}
-	r, reg := newTestReconciler(t, root, b, []*runner.PreparedFunction{live, gone}, nil)
+	r, reg := newTestReconciler(t, root, b, []*runner.PreparedApp{live, gone}, nil)
 
 	// Remove "gone" only from disk; the registry still knows it.
 	if err := os.RemoveAll(goneDir); err != nil {
@@ -332,12 +332,12 @@ func TestReconcileSameImageRetireSkipped(t *testing.T) {
 	dir := writeFnDir(t, root, "same")
 
 	fn := runner.NewPrepared(
-		function.Function{Name: "same", Dir: dir, Template: mustParse(template)},
+		app.App{Name: "same", Dir: dir, Template: mustParse(template)},
 		&runtime.Prepared{Name: "same", Image: "img-same"},
 		&fixedImageBuilder{image: "img-same"},
 	)
 	var retires int
-	r, reg := newTestReconciler(t, root, &fixedImageBuilder{image: "img-same"}, []*runner.PreparedFunction{fn},
+	r, reg := newTestReconciler(t, root, &fixedImageBuilder{image: "img-same"}, []*runner.PreparedApp{fn},
 		func(cfg *Config) { cfg.Retire = func(string, string) { retires++ } })
 
 	// Change content so a rebuild is warranted; the builder returns the SAME
@@ -345,7 +345,7 @@ func TestReconcileSameImageRetireSkipped(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction("same")
+	r.reconcileApp("same")
 
 	if retires != 0 {
 		t.Fatalf("retire calls = %d, want 0 (same image is never retired)", retires)
@@ -358,7 +358,7 @@ func TestReconcileSameImageRetireSkipped(t *testing.T) {
 // fixedImageBuilder always returns the same image reference.
 type fixedImageBuilder struct{ image string }
 
-func (b *fixedImageBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (b *fixedImageBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
 	return &runtime.Prepared{Name: fn.Name, Image: b.image}, nil
 }
 

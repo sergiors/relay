@@ -123,7 +123,7 @@ func (s *Selection) Dir() string { return s.dir }
 // Sub returns a Selection over a subdirectory of the selected tree. It shares the
 // parent's root and compiled rules, so root-relative matching (and therefore
 // ancestor rules) still applies; only the walked subtree changes. It is how the
-// materializer selects one function directory without re-reading rules.
+// materializer selects one app directory without re-reading rules.
 func (s *Selection) Sub(dir string) (*Selection, error) {
 	dir = filepath.Clean(dir)
 	rel, err := filepath.Rel(s.dir, dir)

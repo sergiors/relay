@@ -12,7 +12,7 @@ import (
 )
 
 // invocationTrace is the durable trace-identity seam for one invocation attempt:
-// the invocation-state handle, the invocation's stable "<function>/<handler>"
+// the invocation-state handle, the invocation's stable "<app>/<handler>"
 // ID, and the 1-based handler attempt (0 when unknown, e.g. a state-free
 // manual/replay caller). It lets runInvocation read the trace lineage recorded by
 // the invocation's PREVIOUS attempt and link the new function.invoke span to it,
@@ -85,7 +85,7 @@ func (t invocationTrace) retryLink() []trace.SpanStartOption {
 // startInvocationSpan begins the end-to-end `function.invoke` span shared by
 // every runner invocation path (event rule, schedule occurrence, manual
 // invocation). The attributes are low-cardinality configuration identities: the
-// function name, the handler, and the declared runtime. The event payload is
+// app name, the handler, and the declared runtime. The event payload is
 // never attached. Extra opts let a caller attach a retry span link (and any
 // further per-attempt option) without changing the shared attribute set.
 func startInvocationSpan(
@@ -95,9 +95,9 @@ func startInvocationSpan(
 ) (context.Context, trace.Span) {
 	base := []trace.SpanStartOption{
 		trace.WithAttributes(
-			attribute.String("function.name", fnName),
-			attribute.String("function.handler", handler),
-			attribute.String("function.runtime", runtimeName),
+			attribute.String("relay.app.name", fnName),
+			attribute.String("relay.handler.name", handler),
+			attribute.String("relay.app.runtime", runtimeName),
 		),
 	}
 	return tracing.Start(ctx, "function.invoke", append(base, opts...)...)
@@ -128,8 +128,8 @@ func startReplaySpan(ctx context.Context, fnName, handler, lineage string) (cont
 	opts := []trace.SpanStartOption{
 		trace.WithNewRoot(),
 		trace.WithAttributes(
-			attribute.String("function.name", fnName),
-			attribute.String("function.handler", handler),
+			attribute.String("relay.app.name", fnName),
+			attribute.String("relay.handler.name", handler),
 		),
 	}
 	if link, ok := tracing.SpanContextFromString(lineage); ok {
@@ -138,20 +138,20 @@ func startReplaySpan(ctx context.Context, fnName, handler, lineage string) (cont
 	return tracing.Start(ctx, "dlq.replay", opts...)
 }
 
-// startManualInvokeSpan begins the worker-side `function.manual_invoke` root
-// operation span around a manual `relay function invoke`. It is always a NEW
+// startManualInvokeSpan begins the worker-side `app.manual_invoke` root
+// operation span around a manual `relay app invoke`. It is always a NEW
 // ROOT so an operator invocation is traced on the worker without requiring the
 // CLI to carry trace context. Every matching rule's `function.invoke` runs as
 // its child.
 func startManualInvokeSpan(ctx context.Context, fnName string) (context.Context, trace.Span) {
-	return tracing.Start(ctx, "function.manual_invoke",
+	return tracing.Start(ctx, "app.manual_invoke",
 		trace.WithNewRoot(),
-		trace.WithAttributes(attribute.String("function.name", fnName)),
+		trace.WithAttributes(attribute.String("relay.app.name", fnName)),
 	)
 }
 
 // finishOperationSpan records the terminal outcome of a worker-side operation
-// span (dlq.replay, function.manual_invoke): an error records the error and sets
+// span (dlq.replay, app.manual_invoke): an error records the error and sets
 // codes.Error, success sets codes.Ok. The result attribute is the
 // low-cardinality "success"/"failure" outcome.
 func finishOperationSpan(span trace.Span, err error) {

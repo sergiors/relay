@@ -22,7 +22,7 @@ import (
 // the time.After cases are deadlock failure bounds only, never a delay used as
 // synchronization. There are no sleeps.
 func TestExecuteContainerCreateVsRetire(t *testing.T) {
-	const image = "relay-fn-a:v1"
+	const image = "relay-app-a:v1"
 
 	// The /containers/create route signals that the cold start reached the
 	// daemon, then blocks until the test releases it (or its request context is
@@ -54,7 +54,7 @@ func TestExecuteContainerCreateVsRetire(t *testing.T) {
 		// pre-create identity resolution inspects the image (absent here, so it
 		// degrades to the reference identity and the create proceeds).
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
-		dockerRoute{method: http.MethodGet, path: "/images/relay-fn-a:v1/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
+		dockerRoute{method: http.MethodGet, path: "/images/relay-app-a:v1/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { dels++ }},
 	)
 

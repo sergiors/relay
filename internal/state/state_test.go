@@ -9,21 +9,21 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
-func mustTemplate(t *testing.T, s string) *function.Template {
+func mustTemplate(t *testing.T, s string) *app.Template {
 	t.Helper()
-	tmpl, err := function.ParseTemplate([]byte(s))
+	tmpl, err := app.ParseTemplate([]byte(s))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
 	return tmpl
 }
 
-func fnFor(t *testing.T, name string, tmpl *function.Template) function.Function {
+func fnFor(t *testing.T, name string, tmpl *app.Template) app.App {
 	t.Helper()
-	return function.Function{Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl}
+	return app.App{Name: name, Dir: filepath.Join(t.TempDir(), name), Template: tmpl}
 }
 
 func openTestState(t *testing.T) *State {
@@ -65,7 +65,7 @@ func TestOpenIdempotentAndReopen(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer c2.Close()
-	if _, ok := c2.GetFunction("alpha"); !ok {
+	if _, ok := c2.GetApp("alpha"); !ok {
 		t.Fatal("expected function to survive reopen")
 	}
 }
@@ -77,7 +77,7 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after discovered")
 	}
@@ -90,7 +90,7 @@ func TestDiscoveredThenSuccessReplacesActiveFields(t *testing.T) {
 
 	c.RecordReconcileSuccess("fn", "img-fn", "fp-new", time.Now(), fnFor(t, "fn", tmpl))
 
-	detail, ok = c.GetFunction("fn")
+	detail, ok = c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
@@ -131,7 +131,7 @@ func TestDiscoveryPreservesActiveGenerationAndOutcome(t *testing.T) {
 
 	c.RecordDiscoveredWithFingerprint(fn, "fp-desired-next")
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after rediscovery")
 	}
@@ -155,7 +155,7 @@ func TestDiscoveryPreservesActiveGenerationAndOutcome(t *testing.T) {
 }
 
 // TestDiscoveryFreshRowRecordsDesiredFingerprintOnly pins that the first write
-// for a function (no prior row) records the desired fingerprint with an empty
+// for an app (no prior row) records the desired fingerprint with an empty
 // active generation and no fabricated reconcile outcome.
 func TestDiscoveryFreshRowRecordsDesiredFingerprintOnly(t *testing.T) {
 	c := openTestState(t)
@@ -163,7 +163,7 @@ func TestDiscoveryFreshRowRecordsDesiredFingerprintOnly(t *testing.T) {
 
 	c.RecordDiscoveredWithFingerprint(fnFor(t, "fn", tmpl), "fp-first")
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after discovery")
 	}
@@ -198,7 +198,7 @@ func TestSuccessReplacesActiveAndConvergesDesiredGeneration(t *testing.T) {
 
 	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
@@ -227,7 +227,7 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
 	c.RecordPreparingWithFingerprint("fn", fn, "fp-v2")
 
-	detail, _ := c.GetFunction("fn")
+	detail, _ := c.GetApp("fn")
 	if detail.Status != StatusPreparing {
 		t.Fatalf("status = %q, want preparing", detail.Status)
 	}
@@ -240,7 +240,7 @@ func TestPreparingRecordsDesiredFingerprintAndRetainsActive(t *testing.T) {
 
 	c.RecordReconcileFailure("fn", &boomErr{})
 
-	detail, _ = c.GetFunction("fn")
+	detail, _ = c.GetApp("fn")
 	if detail.Status != StatusDegraded {
 		t.Fatalf("status = %q after failure, want degraded", detail.Status)
 	}
@@ -256,19 +256,19 @@ func TestReconcileStatusTransitionsRetainHealthyGeneration(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	c.RecordReconcileSuccess("fn", "img-v1", "fp-v1", time.Now(), fn)
 	c.RecordPreparing("fn", fn)
-	if got, _ := c.GetFunction("fn"); got.Status != StatusPreparing || got.Image != "img-v1" {
+	if got, _ := c.GetApp("fn"); got.Status != StatusPreparing || got.Image != "img-v1" {
 		t.Fatalf("preparing status/image = %q/%q, want preparing/img-v1", got.Status, got.Image)
 	}
 	c.RecordReconcileBuilding("fn")
-	if got, _ := c.GetFunction("fn"); got.Status != StatusBuilding {
+	if got, _ := c.GetApp("fn"); got.Status != StatusBuilding {
 		t.Fatalf("building status = %q, want building", got.Status)
 	}
 	c.RecordReconciling("fn")
-	if got, _ := c.GetFunction("fn"); got.Status != StatusReconciling {
+	if got, _ := c.GetApp("fn"); got.Status != StatusReconciling {
 		t.Fatalf("reconciling status = %q, want reconciling", got.Status)
 	}
 	c.RecordServiceFailure("fn", &boomErr{})
-	got, _ := c.GetFunction("fn")
+	got, _ := c.GetApp("fn")
 	if got.Status != StatusDegraded || got.Image != "img-v1" {
 		t.Fatalf("service failed status/image = %q/%q, want degraded/img-v1", got.Status, got.Image)
 	}
@@ -280,13 +280,13 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 	fn := fnFor(t, "fn", tmpl)
 	c.RecordDiscovered(fn)
 	c.RecordReconcileFailure("fn", &boomErr{})
-	got, _ := c.GetFunction("fn")
+	got, _ := c.GetApp("fn")
 	if got.Status != StatusUnavailable {
 		t.Fatalf("image failure status = %q, want unavailable", got.Status)
 	}
 	c.RecordPreparing("fn", fn)
 	c.RecordServiceFailure("fn", &boomErr{})
-	got, _ = c.GetFunction("fn")
+	got, _ = c.GetApp("fn")
 	if got.Status != StatusUnavailable {
 		t.Fatalf("service failure status = %q, want unavailable", got.Status)
 	}
@@ -294,7 +294,7 @@ func TestReconcileFailuresWithoutActiveImageAreUnavailable(t *testing.T) {
 
 // noRuntimeServiceTmpl is a no-runtime, external-image service-only template: it
 // has no event/schedule handlers and its single service brings its own image, so
-// a successful prepare produces NO function image (PreparedAt is the only usable
+// a successful prepare produces NO app image (PreparedAt is the only usable
 // generation marker).
 const noRuntimeServiceTmpl = `services:
   - name: api
@@ -302,27 +302,27 @@ const noRuntimeServiceTmpl = `services:
     port: 8080
 `
 
-// TestImageLessPreparedFunctionTransitionsToDegradedOnFailure pins the
+// TestImageLessPreparedAppTransitionsToDegradedOnFailure pins the
 // no-runtime external-image service-only case: a successful generation with an
-// EMPTY function Image but a non-empty PreparedAt is still usable, so a later
+// EMPTY app Image but a non-empty PreparedAt is still usable, so a later
 // failed prepare or service reconcile must report degraded rather than
 // unavailable. A never-successful row (discovered but never prepared) has
 // neither marker and stays unavailable.
-func TestImageLessPreparedFunctionTransitionsToDegradedOnFailure(t *testing.T) {
+func TestImageLessPreparedAppTransitionsToDegradedOnFailure(t *testing.T) {
 	t.Run("reconcile failure", func(t *testing.T) {
 		c := openTestState(t)
 		tmpl := mustTemplate(t, noRuntimeServiceTmpl)
 		fn := fnFor(t, "svc", tmpl)
 
-		// Successful no-runtime prepare: no function image, but prepared.
+		// Successful no-runtime prepare: no app image, but prepared.
 		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
-		if got, _ := c.GetFunction("svc"); got.Image != "" || got.PreparedAt == "" {
+		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt == "" {
 			t.Fatalf("precondition: image=%q prepared_at=%q, want empty image with prepared_at set",
 				got.Image, got.PreparedAt)
 		}
 
 		c.RecordReconcileFailure("svc", &boomErr{})
-		got, _ := c.GetFunction("svc")
+		got, _ := c.GetApp("svc")
 		if got.Status != StatusDegraded {
 			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
 		}
@@ -338,7 +338,7 @@ func TestImageLessPreparedFunctionTransitionsToDegradedOnFailure(t *testing.T) {
 
 		c.RecordReconcileSuccess("svc", "", "fp-svc", time.Now(), fn)
 		c.RecordServiceFailure("svc", &boomErr{})
-		got, _ := c.GetFunction("svc")
+		got, _ := c.GetApp("svc")
 		if got.Status != StatusDegraded {
 			t.Fatalf("status = %q, want degraded (image-less but prepared generation is usable)", got.Status)
 		}
@@ -351,19 +351,19 @@ func TestImageLessPreparedFunctionTransitionsToDegradedOnFailure(t *testing.T) {
 
 		// Discovered but never prepared: no image and no prepared_at.
 		c.RecordDiscovered(fn)
-		if got, _ := c.GetFunction("svc"); got.Image != "" || got.PreparedAt != "" {
+		if got, _ := c.GetApp("svc"); got.Image != "" || got.PreparedAt != "" {
 			t.Fatalf("precondition: image=%q prepared_at=%q, want both empty", got.Image, got.PreparedAt)
 		}
 
 		c.RecordReconcileFailure("svc", &boomErr{})
-		got, _ := c.GetFunction("svc")
+		got, _ := c.GetApp("svc")
 		if got.Status != StatusUnavailable {
 			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
 		}
 
 		c.RecordPreparing("svc", fn)
 		c.RecordServiceFailure("svc", &boomErr{})
-		got, _ = c.GetFunction("svc")
+		got, _ = c.GetApp("svc")
 		if got.Status != StatusUnavailable {
 			t.Fatalf("status = %q, want unavailable (no successful generation ever)", got.Status)
 		}
@@ -382,7 +382,7 @@ func TestReconcileFailureKeepsPriorActiveAndMarksFailed(t *testing.T) {
 
 	c.RecordReconcileFailure("fn", &boomErr{})
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after failure")
 	}
@@ -429,7 +429,7 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	t1 := clock
 	c.RecordReconcileSuccess("fn", img1, fp1, t1, fn)
 
-	d1, ok := c.GetFunction("fn")
+	d1, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
@@ -447,7 +447,7 @@ func TestRecordReconcileSuccessAdvancesLastReconcileAt(t *testing.T) {
 	t2 := clock
 	c.RecordReconcileSuccess("fn", img1, fp1, t2, fn)
 
-	d2, ok := c.GetFunction("fn")
+	d2, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after second success")
 	}
@@ -478,7 +478,7 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 
 	// (i) success on the existing row persists status + timestamp.
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fn)
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
@@ -492,7 +492,7 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	// (ii) re-discovery preserves the outcome view and active generation, and
 	// resets the public status to preparing.
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
-	detail, ok = c.GetFunction("fn")
+	detail, ok = c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row after re-discovery")
 	}
@@ -510,7 +510,7 @@ func TestLastReconcileSurvivesDiscoveredUpsert(t *testing.T) {
 	}
 }
 
-// removal deletes the function row and its snapshot.
+// removal deletes the app row and its snapshot.
 func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
@@ -518,25 +518,25 @@ func TestRemovalDeletesRowAndHandlers(t *testing.T) {
 
 	c.RecordRemoved("fn")
 
-	if _, ok := c.GetFunction("fn"); ok {
+	if _, ok := c.GetApp("fn"); ok {
 		t.Fatal("expected fn to be removed")
 	}
 	// Re-adding must not resurrect stale handlers (the old snapshot was deleted).
 	c.RecordDiscovered(fnFor(t, "fn", tmpl))
-	if _, ok := c.GetFunction("fn"); !ok {
+	if _, ok := c.GetApp("fn"); !ok {
 		t.Fatal("expected fn re-added")
 	}
 }
 
-// ListFunctions returns rows sorted by name with the expected shape.
-func TestListFunctionsShapeAndSort(t *testing.T) {
+// ListApps returns rows sorted by name with the expected shape.
+func TestListAppsShapeAndSort(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	c.RecordReconcileSuccess("zeta", "i-z", "f-z", time.Now(), fnFor(t, "zeta", tmpl))
 	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
 	c.RecordReconcileSuccess("mid", "i-m", "f-m", time.Now(), fnFor(t, "mid", tmpl))
 
-	rows := c.ListFunctions()
+	rows := c.ListApps()
 	if len(rows) != 3 {
 		t.Fatalf("rows = %d, want 3", len(rows))
 	}
@@ -551,34 +551,34 @@ func TestListFunctionsShapeAndSort(t *testing.T) {
 	}
 }
 
-// GetFunction of an unknown name returns false with an empty detail.
-func TestGetFunctionUnknownReturnsFalse(t *testing.T) {
+// GetApp of an unknown name returns false with an empty detail.
+func TestGetAppUnknownReturnsFalse(t *testing.T) {
 	c := openTestState(t)
-	detail, ok := c.GetFunction("nope")
+	detail, ok := c.GetApp("nope")
 	if ok {
 		t.Fatalf("expected not found, got %+v", detail)
 	}
 }
 
-// RebuildFromFS populates an empty DB from a real functions tree using the real
+// RebuildFromFS populates an empty DB from a real apps tree using the real
 // loader + fingerprint. A non-empty DB is left untouched.
 func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 
 	c := openTestState(t)
 	if err := c.RebuildFromFS(root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	rows := c.ListFunctions()
+	rows := c.ListApps()
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
 	if rows[0].Name != "demo" || rows[0].Runtime != "python3.14" || rows[0].Status != StatusPreparing {
 		t.Fatalf("unexpected rebuild row: %+v", rows[0])
 	}
-	detail, ok := c.GetFunction("demo")
+	detail, ok := c.GetApp("demo")
 	if !ok {
 		t.Fatal("expected demo detail")
 	}
@@ -590,7 +590,7 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 	if err := c.RebuildFromFS(root); err != nil {
 		t.Fatalf("second rebuild: %v", err)
 	}
-	if got := len(c.ListFunctions()); got != 1 {
+	if got := len(c.ListApps()); got != 1 {
 		t.Fatalf("rebuild on non-empty DB changed row count to %d, want 1", got)
 	}
 }
@@ -606,14 +606,14 @@ func TestRebuildFromFSOnEmptyDB(t *testing.T) {
 // value), which this test also pins as the standalone behavior.
 func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) {
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 	dir := filepath.Join(root, "demo")
 
-	fn, err := function.LoadSingle(root, "demo")
+	fn, err := app.LoadSingle(root, "demo")
 	if err != nil {
 		t.Fatalf("load single: %v", err)
 	}
-	computed, err := function.Fingerprint(dir)
+	computed, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("def handler(e): return 999\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
-	changed, err := function.Fingerprint(dir)
+	changed, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint after change: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 	c := openTestState(t)
 	c.RecordDiscoveredWithFingerprint(fn, computed)
 
-	detail, ok := c.GetFunction("demo")
+	detail, ok := c.GetApp("demo")
 	if !ok {
 		t.Fatal("expected demo row")
 	}
@@ -652,30 +652,30 @@ func TestRecordDiscoveredWithFingerprintPersistsCallerFingerprint(t *testing.T) 
 	// The legacy API keeps its recompute semantics for standalone callers: it
 	// observes the changed source and persists the new digest as the desired one.
 	c.RecordDiscovered(fn)
-	detail, _ = c.GetFunction("demo")
+	detail, _ = c.GetApp("demo")
 	if detail.DesiredFingerprint != changed {
 		t.Fatalf("RecordDiscovered desired_fingerprint = %q, want recomputed %q", detail.DesiredFingerprint, changed)
 	}
 }
 
-// TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet proves the worker's
+// TestRebuildFromAppsUsesCallerFingerprintsAndLoadedSet proves the worker's
 // rebuild seed consumes the already-loaded set and caller fingerprints without
-// re-reading /functions: the function's Dir does not exist on disk, yet the row
+// re-reading /apps: the app's Dir does not exist on disk, yet the row
 // is written with the supplied fingerprint. A second call on a now-populated DB
 // is a no-op.
-func TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet(t *testing.T) {
+func TestRebuildFromAppsUsesCallerFingerprintsAndLoadedSet(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	// A Dir that was never created: if the rebuild tried to load or fingerprint
 	// from it, this test would observe an error or an empty fingerprint.
-	fn := function.Function{Name: "ghost", Dir: filepath.Join(t.TempDir(), "missing"), Template: tmpl}
+	fn := app.App{Name: "ghost", Dir: filepath.Join(t.TempDir(), "missing"), Template: tmpl}
 	const callerFP = "caller-supplied-fingerprint"
 
-	if err := c.RebuildFromFunctions([]DiscoveredFunction{{Function: fn, Fingerprint: callerFP}}); err != nil {
-		t.Fatalf("rebuild from functions: %v", err)
+	if err := c.RebuildFromApps([]DiscoveredApp{{App: fn, Fingerprint: callerFP}}); err != nil {
+		t.Fatalf("rebuild from apps: %v", err)
 	}
 
-	detail, ok := c.GetFunction("ghost")
+	detail, ok := c.GetApp("ghost")
 	if !ok {
 		t.Fatal("expected ghost row after rebuild")
 	}
@@ -687,27 +687,27 @@ func TestRebuildFromFunctionsUsesCallerFingerprintsAndLoadedSet(t *testing.T) {
 	}
 
 	// A populated DB is never overwritten by a second seed.
-	fn2 := function.Function{Name: "other", Dir: filepath.Join(t.TempDir(), "other"), Template: tmpl}
-	if err := c.RebuildFromFunctions([]DiscoveredFunction{{Function: fn2, Fingerprint: "other-fp"}}); err != nil {
-		t.Fatalf("second rebuild from functions: %v", err)
+	fn2 := app.App{Name: "other", Dir: filepath.Join(t.TempDir(), "other"), Template: tmpl}
+	if err := c.RebuildFromApps([]DiscoveredApp{{App: fn2, Fingerprint: "other-fp"}}); err != nil {
+		t.Fatalf("second rebuild from apps: %v", err)
 	}
-	if _, ok := c.GetFunction("other"); ok {
+	if _, ok := c.GetApp("other"); ok {
 		t.Fatal("rebuild on a non-empty DB must be a no-op")
 	}
 }
 
 // RecordReconcileSuccess round-trips a fingerprint-versioned image reference
-// like "relay-fn-user-events:3f8a2c1d..." exactly, since the state DB is the
+// like "relay-app-user-events:3f8a2c1d..." exactly, since the state DB is the
 // authoritative persisted holder of the full fingerprinted image.
 func TestRecordReconcileSuccessRoundTripsFingerprintedImage(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
-	img := "relay-fn-user-events:3f8a2c1d9b6e4a17"
+	img := "relay-app-user-events:3f8a2c1d9b6e4a17"
 	fp := "3f8a2c1d9b6e4a1700aa11bb22cc33dd44ee55ff66778899aabbccddeeff0011"
 	c.RecordReconcileSuccess("user-events", img, fp, time.Now(), fnFor(t, "user-events", tmpl))
 
-	detail, ok := c.GetFunction("user-events")
+	detail, ok := c.GetApp("user-events")
 	if !ok {
 		t.Fatal("expected row after success")
 	}
@@ -750,17 +750,17 @@ func TestRelativeAgo(t *testing.T) {
 // TestPruneRemovedSweepsReservedStagingRow pins the buggy-discovery cleanup: a
 // persisted row for a Relay-owned staging name (git's ".sync-*") is stale debris
 // and is pruned even when a transient directory of that name exists on disk. A
-// genuinely present normal function survives, and the reserved prune removes its
-// function_stats too.
+// genuinely present normal app survives, and the reserved prune removes its
+// app_stats too.
 func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	// A reserved name that (from a previous bad discovery) has a state row and
-	// function_stats, plus a transient stage directory on disk.
+	// app_stats, plus a transient stage directory on disk.
 	c.RecordReconcileSuccess(".sync-old", "img-stage", "fp-stage", time.Now(), fnFor(t, ".sync-old", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: ".sync-old", EventsMatchedTotal: 3})
-	// A normal function that must survive.
+	c.RecordAppStats(AppStats{App: ".sync-old", EventsMatchedTotal: 3})
+	// A normal app that must survive.
 	c.RecordReconcileSuccess("kept", "img-kept", "fp-kept", time.Now(), fnFor(t, "kept", tmpl))
 
 	root := t.TempDir()
@@ -773,13 +773,13 @@ func TestPruneRemovedSweepsReservedStagingRow(t *testing.T) {
 
 	c.PruneRemoved(root)
 
-	if _, ok := c.GetFunction(".sync-old"); ok {
+	if _, ok := c.GetApp(".sync-old"); ok {
 		t.Fatal("a reserved staging row must be pruned (stale debris), even while the dir exists")
 	}
-	if _, ok := c.FunctionStats(".sync-old"); ok {
-		t.Fatal("a reserved staging row's function_stats must be pruned too")
+	if _, ok := c.AppStats(".sync-old"); ok {
+		t.Fatal("a reserved staging row's app_stats must be pruned too")
 	}
-	if _, ok := c.GetFunction("kept"); !ok {
+	if _, ok := c.GetApp("kept"); !ok {
 		t.Fatal("a normal function must survive the reserved prune")
 	}
 }
@@ -801,29 +801,29 @@ func TestPruneRemovedDoesNotDropRealHiddenInvalidDir(t *testing.T) {
 
 	c.PruneRemoved(root)
 
-	if _, ok := c.GetFunction(".hidden"); !ok {
+	if _, ok := c.GetApp(".hidden"); !ok {
 		t.Fatal("a non-reserved hidden directory present on disk must not be pruned as reserved")
 	}
 }
 
-// PruneRemoved removes state for functions missing from the authoritative dir,
-// INCLUDING their snapshot and function_stats, while keeping functions that
+// PruneRemoved removes state for apps missing from the authoritative dir,
+// INCLUDING their snapshot and app_stats, while keeping apps that
 // still exist on disk and leaving the global stats row untouched.
-func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
+func TestPruneRemovedSweepsStaleApps(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
 	// "gone" exists only in the DB; "kept" exists on disk too. Give both state
-	// rows (snapshot + function_stats) so the sweep must clean them inclusively.
+	// rows (snapshot + app_stats) so the sweep must clean them inclusively.
 	c.RecordReconcileSuccess("gone", "img", "fp", time.Now(), fnFor(t, "gone", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsMatchedTotal: 5})
+	c.RecordAppStats(AppStats{App: "gone", EventsMatchedTotal: 5})
 	c.RecordReconcileSuccess("kept", "img", "fp", time.Now(), fnFor(t, "kept", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "kept", EventsMatchedTotal: 9})
+	c.RecordAppStats(AppStats{App: "kept", EventsMatchedTotal: 9})
 	// The global stats row must never be touched by pruning.
 	want := Stats{EventsMatchedTotal: 55}
 	c.RecordStats(want)
 
-	// Real roots: create "kept", leave "gone" out, plus a stray non-function
+	// Real roots: create "kept", leave "gone" out, plus a stray non-app
 	// file to confirm only dirs matter.
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "kept"), 0o755); err != nil {
@@ -836,20 +836,20 @@ func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 	c.PruneRemoved(root)
 
 	// "gone" fully removed.
-	if _, ok := c.GetFunction("gone"); ok {
+	if _, ok := c.GetApp("gone"); ok {
 		t.Fatal("gone function row must be pruned")
 	}
-	if _, ok := c.FunctionStats("gone"); ok {
-		t.Fatal("gone function_stats must be pruned")
+	if _, ok := c.AppStats("gone"); ok {
+		t.Fatal("gone app_stats must be pruned")
 	}
 
-	// "kept" survives with its function_stats.
-	if _, ok := c.GetFunction("kept"); !ok {
+	// "kept" survives with its app_stats.
+	if _, ok := c.GetApp("kept"); !ok {
 		t.Fatal("kept function row must survive")
 	}
-	ks, ok := c.FunctionStats("kept")
+	ks, ok := c.AppStats("kept")
 	if !ok || ks.EventsMatchedTotal != 9 {
-		t.Fatalf("kept function_stats = %+v, ok=%v; want events 9", ks, ok)
+		t.Fatalf("kept app_stats = %+v, ok=%v; want events 9", ks, ok)
 	}
 
 	// Global stats untouched.
@@ -862,7 +862,7 @@ func TestPruneRemovedSweepsStaleFunctions(t *testing.T) {
 	}
 }
 
-// PruneRemoved is a no-op when the DB is empty and never drops a function that
+// PruneRemoved is a no-op when the DB is empty and never drops an app that
 // still exists on disk even if its state row predates the disk contents.
 func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 	c := openTestState(t)
@@ -875,15 +875,15 @@ func TestPruneRemovedEmptyDBAndMissingDirName(t *testing.T) {
 		t.Fatalf("mkdir demo: %v", err)
 	}
 	c.PruneRemoved(root)
-	if _, ok := c.GetFunction("demo"); !ok {
+	if _, ok := c.GetApp("demo"); !ok {
 		t.Fatal("demo must survive pruning while present on disk")
 	}
 }
 
 // TestPruneRemovedNotResurrectedByDiscovery pins the removal/discovery
 // interaction at the worker startup boundary: the startup sweep prunes a
-// removed function's row (including its active generation) and the subsequent
-// discovery pass only upserts functions actually loaded from disk, so the pruned
+// removed app's row (including its active generation) and the subsequent
+// discovery pass only upserts apps actually loaded from disk, so the pruned
 // row is not resurrected by the discovery-preservation behavior.
 func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 	c := openTestState(t)
@@ -902,10 +902,10 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 	c.PruneRemoved(root)
 	c.RecordDiscoveredWithFingerprint(fnFor(t, "kept", tmpl), "fp-kept-next")
 
-	if _, ok := c.GetFunction("gone"); ok {
+	if _, ok := c.GetApp("gone"); ok {
 		t.Fatal("pruned function must not be resurrected by the discovery pass")
 	}
-	detail, ok := c.GetFunction("kept")
+	detail, ok := c.GetApp("kept")
 	if !ok {
 		t.Fatal("kept function must survive")
 	}
@@ -915,7 +915,7 @@ func TestPruneRemovedNotResurrectedByDiscovery(t *testing.T) {
 }
 
 // TestEnvSecretsMappingsPersisted verifies the env names and secret REFERENCE
-// names round-trip through the functions table, and that the env values are
+// names round-trip through the apps table, and that the env values are
 // REDACTED: the literal template env values must never appear in the persisted
 // snapshot (the DB is a local file an operator can read). Env-var keys are
 // preserved so inspect can render them; values are the fixed marker.
@@ -934,7 +934,7 @@ events:
 `)
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row")
 	}
@@ -954,7 +954,7 @@ events:
 	}
 
 	// The raw stored snapshot must not contain any literal env value.
-	data, _, _ := rawFunctionData(t, c, "fn")
+	data, _, _ := rawAppData(t, c, "fn")
 	for _, leaked := range []string{"https://api.example.com", "postgres://user:pass@host/db"} {
 		if strings.Contains(data, leaked) {
 			t.Errorf("raw snapshot leaked literal env value %q:\n%s", leaked, data)
@@ -973,7 +973,7 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 	c.RecordReconcileSuccess("fn", "img", "fp", time.Now(), fnFor(t, "fn", tmpl))
 
-	detail, ok := c.GetFunction("fn")
+	detail, ok := c.GetApp("fn")
 	if !ok {
 		t.Fatal("expected row")
 	}
@@ -986,9 +986,9 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 
 	// A directly-constructed Template (nil Env/Secrets maps) must not panic and
 	// must also persist nil maps.
-	direct := &function.Template{Runtime: "node24"}
+	direct := &app.Template{Runtime: "node24"}
 	c.RecordReconcileSuccess("direct", "img", "fp", time.Now(), fnFor(t, "direct", direct))
-	d, ok := c.GetFunction("direct")
+	d, ok := c.GetApp("direct")
 	if !ok {
 		t.Fatal("expected direct row")
 	}
@@ -998,7 +998,7 @@ func TestEnvSecretsMappingsNilWhenAbsent(t *testing.T) {
 }
 
 // TestStatsRelationalMetadataColumns pins the schema shape: only the stable
-// metadata columns exist on stats/function_stats (plus data), so no counter is
+// metadata columns exist on stats/app_stats (plus data), so no counter is
 // duplicated as a column.
 func TestStatsRelationalMetadataColumns(t *testing.T) {
 	c := openTestState(t)
@@ -1013,14 +1013,14 @@ func TestStatsRelationalMetadataColumns(t *testing.T) {
 		t.Errorf("stats must have exactly id/data/updated_at, got %v", statsCols)
 	}
 
-	fnCols := tableColumnSet(t, c, "function_stats")
-	for _, want := range []string{"function_name", "data", "updated_at"} {
+	fnCols := tableColumnSet(t, c, "app_stats")
+	for _, want := range []string{"app_name", "data", "updated_at"} {
 		if !fnCols[want] {
-			t.Errorf("function_stats missing metadata column %q: %v", want, fnCols)
+			t.Errorf("app_stats missing metadata column %q: %v", want, fnCols)
 		}
 	}
 	if len(fnCols) != 3 {
-		t.Errorf("function_stats must have exactly function_name/data/updated_at, got %v", fnCols)
+		t.Errorf("app_stats must have exactly app_name/data/updated_at, got %v", fnCols)
 	}
 }
 
@@ -1046,22 +1046,22 @@ func tableColumnSet(t *testing.T, c *State, table string) map[string]bool {
 }
 
 // TestFreshSchemaHasCurrentColumns checks the current schema shape directly:
-// initSchema must create the functions table with exactly name/data/updated_at,
+// initSchema must create the apps table with exactly name/data/updated_at,
 // and must NOT create any of the removed child tables. The whole nested
-// function configuration (handlers, schedules, services, env/secrets)
-// lives inside functions.data, so there are no per-handler/schedule/service
+// app configuration (handlers, schedules, services, env/secrets)
+// lives inside apps.data, so there are no per-handler/schedule/service
 // tables.
 func TestFreshSchemaHasCurrentColumns(t *testing.T) {
 	c := openTestState(t)
 
-	fnCols := tableColumnSet(t, c, "functions")
+	fnCols := tableColumnSet(t, c, "apps")
 	for _, want := range []string{"name", "data", "updated_at"} {
 		if !fnCols[want] {
-			t.Errorf("functions missing current column %q: %v", want, fnCols)
+			t.Errorf("apps missing current column %q: %v", want, fnCols)
 		}
 	}
 	if len(fnCols) != 3 {
-		t.Errorf("functions must have exactly name/data/updated_at, got %v", fnCols)
+		t.Errorf("apps must have exactly name/data/updated_at, got %v", fnCols)
 	}
 
 	for _, table := range []string{"handlers", "schedules", "services"} {

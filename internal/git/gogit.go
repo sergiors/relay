@@ -109,7 +109,7 @@ func (g *goGitRepo) resolveRef(ref string) (plumbing.Hash, error) {
 
 	// Bare branch name: the freshly fetched remote-tracking ref is authoritative.
 	// Only after it fails do we fall back to a tag, then (last resort) the bare
-	// name itself. See the function doc comment for the stale-local-trap WHY.
+	// name itself. See the app doc comment for the stale-local-trap WHY.
 	if h, err := g.resolveRevision(plumbing.Revision("refs/remotes/origin/" + ref)); err == nil {
 		return h, nil
 	}

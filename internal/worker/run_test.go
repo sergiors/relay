@@ -621,7 +621,7 @@ func (s *preflightSpy) deps() preflightDeps {
 // then Docker runtime-manager readiness, then NETWORKS verification, then the
 // manager's deferred maintenance loop — on the success path, and yields the
 // manager the later phases use. A "load" sentinel appended only after the call
-// succeeds stands in for function loading/fingerprinting, proving the whole
+// succeeds stands in for app loading/fingerprinting, proving the whole
 // preflight completes (including starting the manager loop LAST) before any
 // later phase starts.
 func TestExternalPreflightOrder(t *testing.T) {
@@ -633,7 +633,7 @@ func TestExternalPreflightOrder(t *testing.T) {
 	if manager == nil {
 		t.Fatal("runExternalPreflight returned a nil manager on success")
 	}
-	// Function loading/preparation begins only once the preflight succeeds.
+	// App loading/preparation begins only once the preflight succeeds.
 	spy.order = append(spy.order, "load")
 	want := []string{"group", "manager", "networks", "maintenance", "load"}
 	if len(spy.order) != len(want) {
@@ -656,7 +656,7 @@ func TestExternalPreflightOrder(t *testing.T) {
 // stops every later step: a Redis/group failure never opens the manager, a
 // manager failure never verifies networks, and a network failure never starts
 // the manager's maintenance loop. Each failure is returned (not merely logged).
-// This is the boundary that keeps function loading, every later phase, and any
+// This is the boundary that keeps app loading, every later phase, and any
 // manager background loop from running against a broken external dependency.
 func TestExternalPreflightShortCircuitsOnFailure(t *testing.T) {
 	cases := []struct {
@@ -749,7 +749,7 @@ func TestExternalPreflightCancellationIsGraceful(t *testing.T) {
 // context.Canceled while the lifecycle context is cancelled, and the result is
 // errStartupInterrupted with a nil manager — never a NETWORKS failure. The
 // recorded step order is exactly the three preflight steps, proving no later
-// phase (function loading/fingerprinting) continued after the interrupted
+// phase (app loading/fingerprinting) continued after the interrupted
 // network step.
 func TestExternalPreflightNetworkCancellationIsGraceful(t *testing.T) {
 	var logs bytes.Buffer

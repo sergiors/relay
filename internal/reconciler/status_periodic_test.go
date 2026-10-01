@@ -7,29 +7,29 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
 	"relay/internal/testutil"
 )
 
-// readyServicesReconciler builds a reconciler over a function that declares one
+// readyServicesReconciler builds a reconciler over an app that declares one
 // service, with the registry carrying an available (prepared) entry and the
 // state row recorded as ready — the state of an unchanged, already-converged
-// function that the periodic tick verifies. It returns the reconciler, the
-// function, and the state handle.
-func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, function.Function, *state.State) {
+// app that the periodic tick verifies. It returns the reconciler, the
+// app, and the state handle.
+func readyServicesReconciler(t *testing.T, root, name string) (*Reconciler, app.App, *state.State) {
 	t.Helper()
 	dir := writeServicesDir(t, root, name)
 	tmpl := mustParse(servicesTemplate)
-	fn := function.Function{Name: name, Dir: dir, Template: tmpl}
+	fn := app.App{Name: name, Dir: dir, Template: tmpl}
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: name, Image: "img-" + name}, &fakeBuilder{})
-	r, _, st := newTestStateReconciler(t, root, &fakeBuilder{}, []*runner.PreparedFunction{pf}, nil)
-	// newTestStateReconciler's seeding records the function as discovered
+	r, _, st := newTestStateReconciler(t, root, &fakeBuilder{}, []*runner.PreparedApp{pf}, nil)
+	// newTestStateReconciler's seeding records the app as discovered
 	// (preparing); make it ready, the status an unchanged periodic tick verifies.
-	fp, err := function.Fingerprint(dir)
+	fp, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -48,13 +48,13 @@ func TestUnchangedPeriodicPathDoesNotRecordPreparing(t *testing.T) {
 
 	// A converged pass: the hook completes without firing reconcile-start,
 	// exactly as the coordinator does for a no-op verification.
-	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		onComplete(nil)
 	}
 
-	before, _ := st.GetFunction(fn.Name)
-	r.reconcileFunction(fn.Name)
-	after, ok := st.GetFunction(fn.Name)
+	before, _ := st.GetApp(fn.Name)
+	r.reconcileApp(fn.Name)
+	after, ok := st.GetApp(fn.Name)
 	if !ok {
 		t.Fatal("expected state row")
 	}
@@ -79,19 +79,19 @@ func TestNoOpPeriodicPassStaysReadyWithoutReconciling(t *testing.T) {
 	root := t.TempDir()
 	r, fn, st := readyServicesReconciler(t, root, "svc-noop")
 
-	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		// A converged pass performs no corrective work: no onReconcileStart.
 		onComplete(nil)
 	}
 
-	r.reconcileFunction(fn.Name)
-	after, _ := st.GetFunction(fn.Name)
+	r.reconcileApp(fn.Name)
+	after, _ := st.GetApp(fn.Name)
 	if after.Status != state.StatusReady {
 		t.Fatalf("status = %q, want ready after a no-op periodic pass", after.Status)
 	}
 }
 
-// statusProbeBuilder records the persisted function status observed at the
+// statusProbeBuilder records the persisted app status observed at the
 // Prepare boundary, proving the reconciler wrote preparing BEFORE preparing the
 // new generation's image.
 type statusProbeBuilder struct {
@@ -101,8 +101,8 @@ type statusProbeBuilder struct {
 	image string
 }
 
-func (b *statusProbeBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
-	if d, ok := b.st.GetFunction(b.name); ok {
+func (b *statusProbeBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
+	if d, ok := b.st.GetApp(b.name); ok {
 		b.seen = d.Status
 	}
 	return &runtime.Prepared{Name: fn.Name, Image: b.image}, nil
@@ -119,7 +119,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-change")
 	tmpl := mustParse(servicesTemplate)
-	fn := function.Function{Name: "svc-change", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "svc-change", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -130,12 +130,12 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v1"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	probe := &statusProbeBuilder{st: st, name: fn.Name, image: "img-v2"}
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServices: func(string, *function.Template, string) {},
+		UpdateServices: func(string, *app.Template, string) {},
 	}, reg, probe, testutil.DiscardLogger())
 	seedCurrent(r, fn)
 
@@ -143,7 +143,7 @@ func TestActualDesiredChangeRecordsPreparingBeforePrepare(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction(fn.Name)
+	r.reconcileApp(fn.Name)
 
 	if probe.seen != state.StatusPreparing {
 		t.Fatalf("status observed at Prepare = %q, want preparing (recorded before the build)", probe.seen)
@@ -158,7 +158,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-order")
 	tmpl := mustParse(servicesTemplate)
-	fn := function.Function{Name: "svc-order", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "svc-order", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -169,18 +169,18 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-svc-order"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	var seen []string
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			onReconcileStart()
-			if d, ok := st.GetFunction(name); ok {
+			if d, ok := st.GetApp(name); ok {
 				seen = append(seen, d.Status)
 			}
 			onComplete(nil)
-			if d, ok := st.GetFunction(name); ok {
+			if d, ok := st.GetApp(name); ok {
 				seen = append(seen, d.Status)
 			}
 		},
@@ -190,7 +190,7 @@ func TestReconcilingReadyOrderingOnChange(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction(fn.Name)
+	r.reconcileApp(fn.Name)
 
 	want := []string{state.StatusReconciling, state.StatusReady}
 	if len(seen) != len(want) {
@@ -212,30 +212,30 @@ func TestCorrectivePeriodicPassCanReconcile(t *testing.T) {
 	r, fn, st := readyServicesReconciler(t, root, "svc-heal")
 
 	var seen []string
-	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		onReconcileStart()
-		if d, ok := st.GetFunction(name); ok {
+		if d, ok := st.GetApp(name); ok {
 			seen = append(seen, d.Status)
 		}
 		onComplete(nil)
-		if d, ok := st.GetFunction(name); ok {
+		if d, ok := st.GetApp(name); ok {
 			seen = append(seen, d.Status)
 		}
 	}
 
-	r.reconcileFunction(fn.Name)
+	r.reconcileApp(fn.Name)
 
 	if len(seen) != 2 || seen[0] != state.StatusReconciling || seen[1] != state.StatusReady {
 		t.Fatalf("persisted statuses on a corrective pass = %v, want [reconciling ready]", seen)
 	}
-	after, _ := st.GetFunction(fn.Name)
+	after, _ := st.GetApp(fn.Name)
 	if after.Image != "img-"+fn.Name {
 		t.Fatalf("image = %q, want the retained active image", after.Image)
 	}
 }
 
 // TestServiceLifecycleNeverPublishesBuilding pins the removal of the service
-// build status: a real desired-generation change for a function with only
+// build status: a real desired-generation change for an app with only
 // services (an entrypoint service here) must never observe the persisted
 // "building" status. The service path has no Relay-owned Dockerfile build, so
 // the only transitions are the reconciler's preparing -> reconciling -> ready.
@@ -244,7 +244,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-nobuild")
 	tmpl := mustParse(servicesTemplate)
-	fn := function.Function{Name: "svc-nobuild", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "svc-nobuild", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -255,17 +255,17 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 
 	pf := runner.NewPrepared(fn, &runtime.Prepared{Name: fn.Name, Image: "img-v2"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	seen := map[string]int{}
 	sample := func(name string) {
-		if d, ok := st.GetFunction(name); ok {
+		if d, ok := st.GetApp(name); ok {
 			seen[d.Status]++
 		}
 	}
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			sample(name) // observed after the reconciler wrote preparing, before the seam
 			onReconcileStart()
 			sample(name)
@@ -278,7 +278,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction(fn.Name)
+	r.reconcileApp(fn.Name)
 
 	if seen[state.StatusBuilding] != 0 {
 		t.Fatalf("service lifecycle observed building %d times, want 0 (statuses seen: %v)",
@@ -290,7 +290,7 @@ func TestServiceLifecycleNeverPublishesBuilding(t *testing.T) {
 }
 
 // TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing pins that a periodic
-// tick for an unchanged function whose status is building (an active
+// tick for an unchanged app whose status is building (an active
 // managed-runtime build's status) must NOT regress the public status to
 // preparing: the skip branch no longer writes preparing, and a no-op
 // verification writes nothing.
@@ -300,19 +300,19 @@ func TestActiveBuildPlusPeriodicTickDoesNotBecomePreparing(t *testing.T) {
 
 	// An active build's status stands in the store.
 	st.RecordReconcileBuilding(fn.Name)
-	before, _ := st.GetFunction(fn.Name)
+	before, _ := st.GetApp(fn.Name)
 	if before.Status != state.StatusBuilding {
 		t.Fatalf("precondition: status = %q, want building", before.Status)
 	}
 
-	// A periodic tick verifies an unchanged, available function with a no-op
+	// A periodic tick verifies an unchanged, available app with a no-op
 	// service pass.
-	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 	}
 
-	r.reconcileFunction(fn.Name)
+	r.reconcileApp(fn.Name)
 
-	after, _ := st.GetFunction(fn.Name)
+	after, _ := st.GetApp(fn.Name)
 	if after.Status != state.StatusBuilding {
 		t.Fatalf("status = %q, want building (periodic tick must not become preparing)", after.Status)
 	}
@@ -334,23 +334,23 @@ func TestPeriodicSkipPathStaleCallbacksRemainGuarded(t *testing.T) {
 		onComplete  func(error)
 	}
 	var captured []callbacks
-	r.updateServicesWithStatus = func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+	r.updateServicesWithStatus = func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 		captured = append(captured, callbacks{onReconcile: onReconcileStart, onComplete: onComplete})
 	}
 
-	r.reconcileFunction(fn.Name) // generation 1 (skip)
-	r.reconcileFunction(fn.Name) // generation 2 (skip), now current
+	r.reconcileApp(fn.Name) // generation 1 (skip)
+	r.reconcileApp(fn.Name) // generation 2 (skip), now current
 
 	if len(captured) != 2 {
 		t.Fatalf("captured %d callback sets, want 2", len(captured))
 	}
-	before, _ := st.GetFunction(fn.Name)
+	before, _ := st.GetApp(fn.Name)
 
 	// The stale generation 1 begins and completes: both must be ignored.
 	captured[0].onReconcile()
 	captured[0].onComplete(nil)
 
-	after, _ := st.GetFunction(fn.Name)
+	after, _ := st.GetApp(fn.Name)
 	if after.Status != state.StatusReady {
 		t.Fatalf("status = %q, want ready (stale callbacks must not land)", after.Status)
 	}

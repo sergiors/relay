@@ -9,17 +9,17 @@ import (
 )
 
 // TestImageRef verifies the fingerprint-versioned format
-// "relay-fn-<name>:<16hex>" and that it is deterministic.
+// "relay-app-<name>:<16hex>" and that it is deterministic.
 func TestImageRef(t *testing.T) {
 	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cases := []struct {
 		name, fp, want string
 	}{
-		{"user-events", fp, "relay-fn-user-events:0123456789abcdef"},
-		{"welcome_email", fp, "relay-fn-welcome_email:0123456789abcdef"},
-		{"jobs.v2", fp, "relay-fn-jobs.v2:0123456789abcdef"},
+		{"user-events", fp, "relay-app-user-events:0123456789abcdef"},
+		{"welcome_email", fp, "relay-app-welcome_email:0123456789abcdef"},
+		{"jobs.v2", fp, "relay-app-jobs.v2:0123456789abcdef"},
 		// The tag is only the first 16 hex chars; the rest is dropped.
-		{"a", "abcdef1234567890xyz", "relay-fn-a:abcdef1234567890"},
+		{"a", "abcdef1234567890xyz", "relay-app-a:abcdef1234567890"},
 	}
 	for _, tc := range cases {
 		if got := ImageRef(tc.name, tc.fp); got != tc.want {
@@ -46,7 +46,7 @@ func TestImageRefDeterministic(t *testing.T) {
 // fingerprint is shorter than 16 chars (defensive; production fingerprints are
 // always 64 hex chars).
 func TestImageRefShortFingerprint(t *testing.T) {
-	if got, want := ImageRef("fn", "abc"), "relay-fn-fn:abc"; got != want {
+	if got, want := ImageRef("fn", "abc"), "relay-app-fn:abc"; got != want {
 		t.Errorf("ImageRef(fn, abc) = %q, want %q", got, want)
 	}
 }
@@ -64,8 +64,8 @@ func TestRepoForNameRoundTripsThroughNameFromRepo(t *testing.T) {
 
 	for _, repo := range []string{
 		"python:3.14-slim", // foreign repo
-		"relay-fn-",        // prefix with an empty name
-		"relay-dep-abc",    // the dependency namespace, not functions
+		"relay-app-",       // prefix with an empty name
+		"relay-dep-abc",    // the dependency namespace, not apps
 	} {
 		if got, ok := nameFromRepo(repo); ok || got != "" {
 			t.Errorf("nameFromRepo(%q) = %q, %v; want rejection", repo, got, ok)
@@ -73,32 +73,32 @@ func TestRepoForNameRoundTripsThroughNameFromRepo(t *testing.T) {
 	}
 }
 
-// TestFunctionNameFromImage verifies the image -> function scoping guard: only a
-// tagged relay-fn-<name>:<tag> reference yields a name; an untagged reference or
+// TestAppNameFromImage verifies the image -> app scoping guard: only a
+// tagged relay-app-<name>:<tag> reference yields a name; an untagged reference or
 // a foreign namespace is rejected. This is what limits a re-activation to the
-// activating function's own image.
-func TestFunctionNameFromImage(t *testing.T) {
+// activating app's own image.
+func TestAppNameFromImage(t *testing.T) {
 	cases := []struct {
 		image  string
 		want   string
 		wantOK bool
 	}{
-		{"relay-fn-user-events:0123456789abcdef", "user-events", true},
-		{"relay-fn-a:tag", "a", true},
-		{"relay-fn-a", "", false},           // no tag
+		{"relay-app-user-events:0123456789abcdef", "user-events", true},
+		{"relay-app-a:tag", "a", true},
+		{"relay-app-a", "", false},          // no tag
 		{"python:3.14-slim", "", false},     // foreign namespace
 		{"relay-dep-abc:latest", "", false}, // dependency namespace
 	}
 	for _, tc := range cases {
-		got, ok := functionNameFromImage(tc.image)
+		got, ok := appNameFromImage(tc.image)
 		if got != tc.want || ok != tc.wantOK {
-			t.Errorf("functionNameFromImage(%q) = %q, %v; want %q, %v", tc.image, got, ok, tc.want, tc.wantOK)
+			t.Errorf("appNameFromImage(%q) = %q, %v; want %q, %v", tc.image, got, ok, tc.want, tc.wantOK)
 		}
 	}
 }
 
-// TestNameFromRepoRejectsBarePrefix pins that the bare "relay-fn-" prefix (no
-// function name) is not a valid Relay repo.
+// TestNameFromRepoRejectsBarePrefix pins that the bare "relay-app-" prefix (no
+// app name) is not a valid Relay repo.
 func TestNameFromRepoRejectsBarePrefix(t *testing.T) {
 	if _, ok := nameFromRepo(relayRepoPrefix); ok {
 		t.Fatalf("nameFromRepo(%q) accepted an empty function name", relayRepoPrefix)
@@ -106,10 +106,10 @@ func TestNameFromRepoRejectsBarePrefix(t *testing.T) {
 }
 
 // TestRelayTagsFiltersToStrictManagedImages verifies the client-side listing
-// filter is strict and label-derived: only images carrying relay.type=function
-// AND a relay.function agreeing with their relay-fn-<name> repository are
-// collected, grouped by function name. A prefix-only image (no managed labels),
-// a mislabeled image (label names another function), a dependency image, and a
+// filter is strict and label-derived: only images carrying relay.type=app
+// AND a relay.app agreeing with their relay-app-<name> repository are
+// collected, grouped by app name. A prefix-only image (no managed labels),
+// a mislabeled image (label names another app), a dependency image, and a
 // foreign image are all ignored. It drives the real relayTags call over a
 // scripted daemon so the URL/decoding path is exercised too.
 func TestRelayTagsFiltersToStrictManagedImages(t *testing.T) {
@@ -117,16 +117,16 @@ func TestRelayTagsFiltersToStrictManagedImages(t *testing.T) {
 		method: http.MethodGet,
 		path:   "/images/json",
 		body: labeledImageListJSON(
-			scriptedImage{tags: []string{"relay-fn-a:aaaaaaaaaaaaaaaa"}, labels: functionLabels("a")},
-			scriptedImage{tags: []string{"relay-fn-a:bbbbbbbbbbbbbbbb"}, labels: functionLabels("a")},
-			scriptedImage{tags: []string{"relay-fn-b:cccccccccccccccc"}, labels: functionLabels("b")},
+			scriptedImage{tags: []string{"relay-app-a:aaaaaaaaaaaaaaaa"}, labels: appImageLabelsForTest("a")},
+			scriptedImage{tags: []string{"relay-app-a:bbbbbbbbbbbbbbbb"}, labels: appImageLabelsForTest("a")},
+			scriptedImage{tags: []string{"relay-app-b:cccccccccccccccc"}, labels: appImageLabelsForTest("b")},
 			// Prefix-only: no managed labels -> never Relay-owned.
-			scriptedImage{tags: []string{"relay-fn-legacy:dddddddddddddddd"}},
-			// Mislabeled: relay.function says "other" but the repo is a -> not
+			scriptedImage{tags: []string{"relay-app-legacy:dddddddddddddddd"}},
+			// Mislabeled: relay.app says "other" but the repo is a -> not
 			// the repository's owner.
-			scriptedImage{tags: []string{"relay-fn-a:eeeeeeeeeeeeeeee"}, labels: functionLabels("other")},
-			// relay.type=function but no relay.function -> not owned.
-			scriptedImage{tags: []string{"relay-fn-a:ffffffffffffffff"}, labels: map[string]string{labelType: ImageTypeFunction}},
+			scriptedImage{tags: []string{"relay-app-a:eeeeeeeeeeeeeeee"}, labels: appImageLabelsForTest("other")},
+			// relay.type=app but no relay.app -> not owned.
+			scriptedImage{tags: []string{"relay-app-a:ffffffffffffffff"}, labels: map[string]string{labelType: ImageTypeApp}},
 			scriptedImage{tags: []string{"relay-dep-deadbeef:latest"}, labels: map[string]string{labelType: ImageTypeDependency}},
 			scriptedImage{tags: []string{"python:3.14-slim"}},
 		),
@@ -138,7 +138,7 @@ func TestRelayTagsFiltersToStrictManagedImages(t *testing.T) {
 		t.Fatalf("relayTags: %v", err)
 	}
 	if len(byName) != 2 {
-		t.Fatalf("collected functions = %v, want only a and b", byName)
+		t.Fatalf("collected apps = %v, want only a and b", byName)
 	}
 	if len(byName["a"]) != 2 {
 		t.Errorf("fn a tags = %v, want two", byName["a"])
@@ -148,15 +148,15 @@ func TestRelayTagsFiltersToStrictManagedImages(t *testing.T) {
 	}
 }
 
-// functionLabels builds the strict managed function-image label set for name
-// (relay.type=function + relay.function=name), matching what the builder stamps.
-func functionLabels(name string) map[string]string {
-	return map[string]string{labelType: ImageTypeFunction, labelFunction: name}
+// appImageLabels builds the strict managed app-image label set for name
+// (relay.type=app + relay.app=name), matching what the builder stamps.
+func appImageLabelsForTest(name string) map[string]string {
+	return map[string]string{labelType: ImageTypeApp, labelApp: name}
 }
 
-// TestManagedFunctionImageName pins the single ownership predicate directly:
-// prefix + relay.type=function + a matching relay.function are all required.
-func TestManagedFunctionImageName(t *testing.T) {
+// TestManagedAppImageName pins the single ownership predicate directly:
+// prefix + relay.type=app + a matching relay.app are all required.
+func TestManagedAppImageName(t *testing.T) {
 	cases := []struct {
 		name   string
 		repo   string
@@ -164,40 +164,40 @@ func TestManagedFunctionImageName(t *testing.T) {
 		want   string
 		wantOK bool
 	}{
-		{"managed", "relay-fn-a", functionLabels("a"), "a", true},
-		{"prefix only", "relay-fn-a", nil, "", false},
-		{"untyped labels", "relay-fn-a", map[string]string{labelFunction: "a"}, "", false},
-		{"mislabeled function", "relay-fn-a", functionLabels("b"), "", false},
-		{"missing function label", "relay-fn-a", map[string]string{labelType: ImageTypeFunction}, "", false},
+		{"managed", "relay-app-a", appImageLabelsForTest("a"), "a", true},
+		{"prefix only", "relay-app-a", nil, "", false},
+		{"untyped labels", "relay-app-a", map[string]string{labelApp: "a"}, "", false},
+		{"mislabeled app", "relay-app-a", appImageLabelsForTest("b"), "", false},
+		{"missing app label", "relay-app-a", map[string]string{labelType: ImageTypeApp}, "", false},
 		{"dependency type", "relay-dep-x", map[string]string{labelType: ImageTypeDependency}, "", false},
-		{"foreign repo", "python", functionLabels("python"), "", false},
+		{"foreign repo", "python", appImageLabelsForTest("python"), "", false},
 	}
 	for _, tc := range cases {
-		got, ok := managedFunctionImageName(tc.repo, tc.labels)
+		got, ok := managedAppImageName(tc.repo, tc.labels)
 		if got != tc.want || ok != tc.wantOK {
-			t.Errorf("managedFunctionImageName(%q) = %q, %v; want %q, %v", tc.repo, got, ok, tc.want, tc.wantOK)
+			t.Errorf("managedAppImageName(%q) = %q, %v; want %q, %v", tc.repo, got, ok, tc.want, tc.wantOK)
 		}
 	}
 }
 
-// TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages pins the GC
-// ownership rule at the production retirement primitives (FunctionImageTags ->
-// RemoveImageNow, the sequence the runner's function-removal path drives):
-// FunctionImageTags returns only Relay's own relay-fn-<name> tags carrying the
+// TestAppImageTagsScopesRetirementToRelayOwnedAppImages pins the GC
+// ownership rule at the production retirement primitives (AppImageTags ->
+// RemoveImageNow, the sequence the runner's app-removal path drives):
+// AppImageTags returns only Relay's own relay-app-<name> tags carrying the
 // strict managed-image labels, so an external `image`-source service's reference
-// (referenced by a running service container), another function's repo, and a
-// prefix-only "relay-fn-*" image with no labels are never removal candidates.
+// (referenced by a running service container), another app's repo, and a
+// prefix-only "relay-app-*" image with no labels are never removal candidates.
 // The scripted daemon has no DELETE route for the external reference; the
 // transport fails the test if one is sent.
-func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.T) {
+func TestAppImageTagsScopesRetirementToRelayOwnedAppImages(t *testing.T) {
 	const (
 		fn      = "svc-ext"
 		extRef  = "ghcr.io/acme/api:1.2"
-		ownTag  = "relay-fn-svc-ext:0000000000000000"
-		otherFn = "relay-fn-other:1111111111111111"
-		legacy  = "relay-fn-svc-ext:9999999999999999"
+		ownTag  = "relay-app-svc-ext:0000000000000000"
+		otherFn = "relay-app-other:1111111111111111"
+		legacy  = "relay-app-svc-ext:9999999999999999"
 	)
-	containers := `[{"Id":"c1","Labels":{"relay.type":"service","relay.function":"` + fn + `",` +
+	containers := `[{"Id":"c1","Labels":{"relay.type":"service","relay.app":"` + fn + `",` +
 		`"relay.identity":"` + extRef + `","relay.image":"` + extRef + `"}}]`
 	dels := 0
 	cli := newScriptedDockerClient(t,
@@ -206,9 +206,9 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 		// before any DELETE.
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: containers},
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
-			scriptedImage{tags: []string{ownTag}, labels: functionLabels(fn)},
-			scriptedImage{tags: []string{otherFn}, labels: functionLabels("other")},
-			// A prefix-only image named for the SAME function but with no
+			scriptedImage{tags: []string{ownTag}, labels: appImageLabelsForTest(fn)},
+			scriptedImage{tags: []string{otherFn}, labels: appImageLabelsForTest("other")},
+			// A prefix-only image named for the SAME app but with no
 			// managed labels: never a candidate.
 			scriptedImage{tags: []string{legacy}},
 			scriptedImage{tags: []string{extRef}},
@@ -218,15 +218,15 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
-	tags, err := m.FunctionImageTags(context.Background(), fn)
+	tags, err := m.AppImageTags(context.Background(), fn)
 	if err != nil {
-		t.Fatalf("FunctionImageTags: %v", err)
+		t.Fatalf("AppImageTags: %v", err)
 	}
-	// The only candidate is the function's own LABELED tag (ownTag); extRef is a
-	// running service's external reference, otherFn is another function's repo,
+	// The only candidate is the app's own LABELED tag (ownTag); extRef is a
+	// running service's external reference, otherFn is another app's repo,
 	// and legacy is a prefix-only image, so none is ever returned.
 	if len(tags) != 1 || tags[0] != ownTag {
-		t.Fatalf("FunctionImageTags = %v, want exactly [%s]", tags, ownTag)
+		t.Fatalf("AppImageTags = %v, want exactly [%s]", tags, ownTag)
 	}
 
 	removed := 0
@@ -245,14 +245,14 @@ func TestFunctionImageTagsScopesRetirementToRelayOwnedFunctionImages(t *testing.
 }
 
 // TestRemoveImagesExceptStrictOwnership pins the startup sweep's ownership
-// scope: only strict managed function images are removal candidates, an active
+// scope: only strict managed app images are removal candidates, an active
 // labeled image in the keep set is preserved, a stale labeled image is removed,
 // and prefix-only or external images are never touched.
 func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
 	const (
-		active   = "relay-fn-a:0000000000000000"
-		stale    = "relay-fn-a:1111111111111111"
-		legacy   = "relay-fn-legacy:2222222222222222"
+		active   = "relay-app-a:0000000000000000"
+		stale    = "relay-app-a:1111111111111111"
+		legacy   = "relay-app-legacy:2222222222222222"
 		external = "ghcr.io/acme/api:1.2"
 	)
 	var deleted []string
@@ -261,8 +261,8 @@ func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
 		// stale image, so it is removable.
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
-			scriptedImage{tags: []string{active}, labels: functionLabels("a")},
-			scriptedImage{tags: []string{stale}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{active}, labels: appImageLabelsForTest("a")},
+			scriptedImage{tags: []string{stale}, labels: appImageLabelsForTest("a")},
 			scriptedImage{tags: []string{legacy}},
 			scriptedImage{tags: []string{external}},
 		)},
@@ -282,14 +282,14 @@ func TestRemoveImagesExceptStrictOwnership(t *testing.T) {
 	}
 }
 
-// TestRemoveImagesExceptKeepsLabeledActive pins that a labeled function image in
+// TestRemoveImagesExceptKeepsLabeledActive pins that a labeled app image in
 // the keep set is never removed even though it matches the ownership predicate.
 func TestRemoveImagesExceptKeepsLabeledActive(t *testing.T) {
-	const active = "relay-fn-a:0000000000000000"
+	const active = "relay-app-a:0000000000000000"
 	deletes := 0
 	cli := newScriptedDockerClient(t,
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
-			scriptedImage{tags: []string{active}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{active}, labels: appImageLabelsForTest("a")},
 		)},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { deletes++ }},
 	)

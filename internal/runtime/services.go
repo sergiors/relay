@@ -15,7 +15,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/python"
 )
 
@@ -25,15 +25,15 @@ import (
 // never confuse the two populations.
 
 // ServiceSpec describes one desired service replica's container. The service
-// IDENTITY is its stable template name (function.Service.Name): relay.service is
-// stamped with it and it is what Reconcile uses to group a function's containers
+// IDENTITY is its stable template name (app.Service.Name): relay.service is
+// stamped with it and it is what Reconcile uses to group an app's containers
 // by service, so a source change under the same name replaces the same replicas.
 // relay.identity additionally records the configured source descriptor
-// (function.Service.SourceRef) — the entrypoint file or image reference — which
+// (app.Service.SourceRef) — the entrypoint file or image reference — which
 // is used only to resolve the container image/entry and to compare the desired
 // IMPLEMENTATION; it never identifies a service.
 type ServiceSpec struct {
-	Function string
+	App string
 	// Name is the service's stable identity (relay.service): the template's
 	// service name. It is the container grouping key and the logical replica
 	// identity.
@@ -54,13 +54,13 @@ type ServiceSpec struct {
 	// runtime-resolved command for an entrypoint source.
 	Entry []string
 	Env   []string // runtime env (plan env), no RELAY_HANDLER
-	// Resources are the function's EFFECTIVE per-container resource limits,
+	// Resources are the app's EFFECTIVE per-container resource limits,
 	// applied to this service container exactly as to an invocation container.
 	// A zero value is normalized to the package defaults, so a hand-built spec
 	// never creates a container with a zero (unlimited) limit. The reconciler
 	// stamps their fingerprint as relay.resources so a changed spec is detected
 	// and the container replaced.
-	Resources function.ResourceLimits
+	Resources app.ResourceLimits
 	// Labels are EXTRA labels the caller wants on the container (routing
 	// labels supplied by the service reconciler). They are merged onto the
 	// relay ownership set, with Relay ownership keys always winning: a caller
@@ -87,8 +87,8 @@ type ServiceSpec struct {
 // ownership predicate, because services must be reconcilable across worker
 // restarts on the same host.
 type ServiceContainer struct {
-	ID       string
-	Function string
+	ID  string
+	App string
 	// Name is the service's stable identity, parsed from its relay.service
 	// label: the template's service name. It is the grouping key Reconcile uses
 	// and the logical replica identity.
@@ -157,7 +157,7 @@ const serviceContainerNameTokenCap = 16
 const serviceIdentityHashLen = 16
 
 // sanitizeContainerNamePart replaces any character outside [A-Za-z0-9_.-] with
-// '-'. Function names are already validated to a legal docker repo charset, but
+// '-'. App names are already validated to a legal docker repo charset, but
 // the service identity is an arbitrary descriptor (a file path or image
 // reference), so it is sanitized defensively.
 func sanitizeContainerNamePart(s string) string {
@@ -175,10 +175,10 @@ func sanitizeContainerNamePart(s string) string {
 }
 
 // serviceContainerName derives the deterministic LOGICAL container name for a
-// replica: relay-svc-<function>-<name>-<hash>-<replica>. Function and service
+// replica: relay-svc-<app>-<name>-<hash>-<replica>. App and service
 // names are both validated to a legal docker repo charset, so the name part is
 // sanitized only defensively. The name ends with a collision-resistant hash
-// suffix derived from the FULL function name and service name, so distinct names
+// suffix derived from the FULL app name and service name, so distinct names
 // that sanitize to the same readable base still get distinct names. The readable
 // base is trimmed to make room for the suffix, so the suffix and the replica
 // index are never lost to the cap.
@@ -189,9 +189,9 @@ func sanitizeContainerNamePart(s string) string {
 // new container before the old one is stopped), and Docker rejects duplicate
 // container names. StartService therefore creates the container under
 // serviceContainerNameForStart, which appends a per-start uniqueness token.
-func serviceContainerName(functionName, serviceName string, replica int) string {
-	suffix := "-" + serviceNameHash(functionName, serviceName) + "-" + strconv.Itoa(replica)
-	base := "relay-svc-" + functionName + "-" + sanitizeContainerNamePart(serviceName)
+func serviceContainerName(appName, serviceName string, replica int) string {
+	suffix := "-" + serviceNameHash(appName, serviceName) + "-" + strconv.Itoa(replica)
+	base := "relay-svc-" + appName + "-" + sanitizeContainerNamePart(serviceName)
 	maxBase := serviceContainerNameLenCap - len(suffix)
 	if maxBase < 0 {
 		maxBase = 0
@@ -211,14 +211,14 @@ func serviceContainerName(functionName, serviceName string, replica int) string 
 // The token is random (newRequestID) — never derived from configuration — so
 // the resulting name is deliberately NOT stable across starts. That is safe
 // because Relay never derives ownership, grouping, or a replica slot from a
-// container name: every predicate is label-derived (relay.type, relay.function,
+// container name: every predicate is label-derived (relay.type, relay.app,
 // relay.service, relay.replica). The physical name remains greppable (it keeps
 // the logical prefix and replica suffix) and is bounded Docker-safe: the
 // logical name is capped at serviceContainerNameLenCap and the token at
 // serviceContainerNameTokenCap, so the physical name is always shorter than
 // Docker's name limit.
-func serviceContainerNameForStart(functionName, serviceName string, replica int) string {
-	return serviceContainerName(functionName, serviceName, replica) + "-" + newRequestID()
+func serviceContainerNameForStart(appName, serviceName string, replica int) string {
+	return serviceContainerName(appName, serviceName, replica) + "-" + newRequestID()
 }
 
 // serviceContainerNamePhysicalLenCap is the upper bound on a physical service
@@ -228,12 +228,12 @@ func serviceContainerNameForStart(functionName, serviceName string, replica int)
 const serviceContainerNamePhysicalLenCap = serviceContainerNameLenCap + 1 + serviceContainerNameTokenCap
 
 // serviceNameHash returns the fixed-length hex collision-resistant suffix for a
-// service name. It hashes the FULL function name and the FULL service name
+// service name. It hashes the FULL app name and the FULL service name
 // (never the sanitized or truncated base) with a NUL separator, so the two
 // inputs cannot run together across the join and distinct names hash apart even
 // when their sanitized bases coincide.
-func serviceNameHash(functionName, serviceName string) string {
-	sum := sha256.Sum256([]byte(functionName + "\x00" + serviceName))
+func serviceNameHash(appName, serviceName string) string {
+	sum := sha256.Sum256([]byte(appName + "\x00" + serviceName))
 	return hex.EncodeToString(sum[:])[:serviceIdentityHashLen]
 }
 
@@ -304,7 +304,7 @@ func NetworksLabel(networks ...string) string {
 // The digest is deliberately UNSALTED (a plain SHA-256 of the NUL-joined
 // Config.Env entries): the reconciler compares a discovered container's label
 // against a freshly computed desired hash on every pass and across worker
-// restarts, so the value must be a deterministic function of the environment
+// restarts, so the value must be a deterministic app of the environment
 // alone. A salt would require a stable key persisted somewhere, and without such
 // a key it would change across restarts and break deterministic reconciliation
 // (spuriously replacing every service container). A salted digest with a
@@ -328,7 +328,7 @@ func EnvHash(env []string) string {
 }
 
 // serviceLabels is the total, greppable label set stamped on every service
-// container: relay.type=service plus relay.function + relay.hostname make a
+// container: relay.type=service plus relay.app + relay.hostname make a
 // service container recognizable to Relay while the strict relay.type guard
 // lets sweeps/reconcilers distinguish the service population from one-shot
 // invocation containers. relay.service is the service IDENTITY (the template's
@@ -350,7 +350,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
 	labels := map[string]string{
 		labelType:      ContainerTypeService,
-		labelFunction:  spec.Function,
+		labelApp:       spec.App,
 		labelService:   spec.Name,
 		labelIdentity:  spec.SourceRef,
 		labelImage:     spec.Image,
@@ -370,7 +370,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 		labels[k] = v
 	}
 	labels[labelType] = ContainerTypeService
-	labels[labelFunction] = spec.Function
+	labels[labelApp] = spec.App
 	labels[labelService] = spec.Name
 	labels[labelIdentity] = spec.SourceRef
 	labels[labelImage] = spec.Image
@@ -423,7 +423,7 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // name is unique per start (serviceContainerNameForStart) so a replacement can
 // coexist with the container it replaces during a zero-downtime swap.
 //
-// Service containers deliberately do NOT go through the per-function execution
+// Service containers deliberately do NOT go through the per-app execution
 // containerCache: they are not leased, pooled, warmed, or generation-drained.
 // The cache exists for one-shot invocation containers (Execute), each leased for
 // one event and reused across invocations; a persistent service container is
@@ -435,13 +435,13 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 // entrypoint sources.
 //
 // One image serves both invocations and services: Manager.Prepare builds the
-// function image (its ENTRYPOINT is the invocation bootstrap), and the service
+// app image (its ENTRYPOINT is the invocation bootstrap), and the service
 // entrypoint is overridden per-container via spec.Entry. This keeps image
-// retirement grouped under FunctionImageTags with no separate service images.
+// retirement grouped under AppImageTags with no separate service images.
 // An `image` source instead runs its external reference with Entry empty.
 func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica int) (string, error) {
 	// Pin the service image for the whole create+start window. For a Relay-owned
-	// image (an entrypoint-source service runs the function image) this prevents
+	// image (an entrypoint-source service runs the app image) this prevents
 	// a concurrent retirement from committing removal between the caller's
 	// reference check and the container create. admitLease uses the request's
 	// admitted lease carried on ctx (a service pass that enqueued with a lease)
@@ -471,7 +471,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		ExposedPorts: network.PortSet{network.MustParsePort(fmt.Sprintf("%d/tcp", spec.Port)): {}},
 	}
 	if len(spec.Entry) > 0 {
-		// An entrypoint-source service overrides the function image's
+		// An entrypoint-source service overrides the app image's
 		// invocation-bootstrap entrypoint with the long-lived service command
 		// (e.g. ["node", "/app/service.js"]). An image service leaves
 		// Entry empty so the container preserves the image's own
@@ -487,7 +487,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		HostConfig: hardenedHostConfig(false, spec.Resources),
 		// A unique physical name per start, so the replacement generation can
 		// be created while the generation it replaces is still running.
-		Name: serviceContainerNameForStart(spec.Function, spec.Name, replica),
+		Name: serviceContainerNameForStart(spec.App, spec.Name, replica),
 	}
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
@@ -516,7 +516,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	discard := func(reason string, cause error) error {
 		if rmErr := removeContainerContext(ctx, m.cli, id); rmErr != nil {
 			m.log.Warn("Service: discard failed container",
-				"function", spec.Function,
+				"app", spec.App,
 				"service", spec.Name,
 				"replica", replica,
 				"container", id,
@@ -545,7 +545,7 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 	}
 
 	m.log.Info("Service: started",
-		"function", spec.Function,
+		"app", spec.App,
 		"service", spec.Name,
 		"replica", replica,
 		"container", id,
@@ -555,9 +555,9 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 
 // ServiceContainerList discovers every service container on the daemon. The
 // filter is a strict relay.type=service match (isServiceContainer) — deliberately
-// NOT combined with a non-empty relay.function check: stale containers (a
-// function removed while Relay was down) must still be discovered and returned so
-// the reconciler's cross-function orphan sweep can identify and remove them.
+// NOT combined with a non-empty relay.app check: stale containers (a
+// app removed while Relay was down) must still be discovered and returned so
+// the reconciler's cross-app orphan sweep can identify and remove them.
 // Hostname is deliberately NOT part of discovery — services must be reconcilable
 // across worker restarts on the same host — but it IS included in the result for
 // logging. Replica is parsed from labelReplica, defaulting to -1 when
@@ -594,7 +594,7 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 		}
 		out = append(out, ServiceContainer{
 			ID:        c.ID,
-			Function:  c.Labels[labelFunction],
+			App:       c.Labels[labelApp],
 			Name:      c.Labels[labelService],
 			SourceRef: c.Labels[labelIdentity],
 			Image:     c.Labels[labelImage],
@@ -636,7 +636,7 @@ func (m *Manager) NetworkExists(ctx context.Context, network string) (bool, erro
 
 // VerifyNetworks checks that every named Docker network exists, returning the
 // first missing network name (and false) when one does not. It is the startup
-// pre-flight the worker performs before any function is prepared or any
+// pre-flight the worker performs before any app is prepared or any
 // container created, for the worker-global NETWORKS set: the networks are
 // infrastructure owned OUTSIDE Relay, so a missing one is an operator condition
 // Relay reports rather than fixes — it NEVER creates a network. A non-not-found
@@ -690,7 +690,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 				}
 				m.log.Warn("Service: stop container failed",
 					"container", c.ID,
-					"function", c.Function,
+					"app", c.App,
 					"service", c.Name,
 					"error", err,
 				)
@@ -703,7 +703,7 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 			}
 			m.log.Warn("Service: remove container failed",
 				"container", c.ID,
-				"function", c.Function,
+				"app", c.App,
 				"service", c.Name,
 				"error", err,
 			)
@@ -712,17 +712,17 @@ func (m *Manager) StopServiceContainers(ctx context.Context, containers []Servic
 	return firstErr
 }
 
-// RemoveFunctionServiceContainers stops and removes every service container
-// belonging to the named function (relay.type=service AND relay.function=fnName),
+// RemoveAppServiceContainers stops and removes every service container
+// belonging to the named app (relay.type=service AND relay.app=fnName),
 // returning how many were removed.
-func (m *Manager) RemoveFunctionServiceContainers(ctx context.Context, fnName string) (int, error) {
+func (m *Manager) RemoveAppServiceContainers(ctx context.Context, fnName string) (int, error) {
 	containers, err := m.ServiceContainerList(ctx)
 	if err != nil {
 		return 0, err
 	}
 	var fnContainers []ServiceContainer
 	for _, c := range containers {
-		if c.Function == fnName {
+		if c.App == fnName {
 			fnContainers = append(fnContainers, c)
 		}
 	}
@@ -769,7 +769,7 @@ func validateServiceEntrypoint(entrypoint string) error {
 // ServiceEntry returns the container entrypoint override for a service
 // entrypoint file on the given runtime, or an error for an unsupported runtime
 // or an invalid entrypoint. One image serves both invocations and services
-// (the function image's bootstrap entrypoint is overridden per-container), so
+// (the app image's bootstrap entrypoint is overridden per-container), so
 // this is the only service-specific knowledge the generic layers need — no
 // separate plan or image per service — and the runtime switch here is the
 // sanctioned dispatch point.
@@ -778,9 +778,9 @@ func validateServiceEntrypoint(entrypoint string) error {
 // decides how that file is executed:
 //
 //   - node24 runs the file directly: `node /app/<entrypoint>`. The `/app/`
-//     prefix is the image WORKDIR where the function directory is COPYied, so a
+//     prefix is the image WORKDIR where the app directory is COPYied, so a
 //     nested entrypoint like "app/service.js" resolves to /app/app/service.js.
-//   - python3.14 executes the file as a MODULE under the function directory
+//   - python3.14 executes the file as a MODULE under the app directory
 //     (`python -m <module>`, e.g. "app/main.py" → `python -m app.main`), so
 //     package-relative imports (`from .deps import ...`) work. The conversion
 //     and its Python-specific validation live in python.ServiceCommand.

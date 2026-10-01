@@ -77,16 +77,16 @@ type TraefikConfig struct {
 }
 
 // hostnamePattern mirrors the service `host` hostname rule in
-// internal/function (RFC-1123-style labels): case-insensitive alphanumeric
+// internal/app (RFC-1123-style labels): case-insensitive alphanumeric
 // labels separated by dots, each label 1-63 chars and not hyphen-bounded. It
-// is duplicated here rather than importing internal/function: routing is a
-// template-unaware leaf (see the package comment), and function already
+// is duplicated here rather than importing internal/app: routing is a
+// template-unaware leaf (see the package comment), and app already
 // depends on the source layer, so the reverse import would invert the
 // dependency direction for one regexp.
 var hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
 
 // validateHostname reports whether host is a valid hostname, using the same
-// rules as the service `host` validation in internal/function: non-empty, at
+// rules as the service `host` validation in internal/app: non-empty, at
 // most 253 characters, no whitespace, and matching hostnamePattern. Empty is
 // NOT valid here — callers that allow the "no host" (unrouted) case exclude it
 // first. This helper is the shared rule for the override value (Validate) and
@@ -122,7 +122,7 @@ func validateHostname(host string) error {
 // first label), and a label-only host has an empty domain, so that empty
 // domain is exactly what gets replaced.
 //
-// OverrideHost itself does NOT re-validate: it stays a pure mapping function
+// OverrideHost itself does NOT re-validate: it stays a pure mapping app
 // so the label builder needs no error path. Validation of the derived host
 // belongs with the per-service routing check (see ValidateHost), which runs
 // before any container/network work.
@@ -228,10 +228,10 @@ func MissingNetwork(network string) error {
 //	traefik.http.routers.<id>.middlewares                       = <middleware>
 //	traefik.http.middlewares.<middleware>.stripprefix.prefixes  = <path>
 //
-// <middleware> is PathMiddlewareID(functionName, serviceName): the deterministic
+// <middleware> is PathMiddlewareID(appName, serviceName): the deterministic
 // service id plus the "-path" infix and the same collision-resistant hash
 // suffix. It is distinct from <id>, so adding a path can never overwrite the
-// router/service slices, and it is per-service (the id already encodes function
+// router/service slices, and it is per-service (the id already encodes app
 // + service name), so two services on the same host with different paths get
 // distinct middleware names. An empty path adds NOTHING — the host-only label
 // set is byte-for-byte the pre-path behavior.
@@ -250,7 +250,7 @@ func MissingNetwork(network string) error {
 //	                            traefik.http.routers.<id>.tls.certresolver = <cfg.CertResolver>
 //	cfg.Priority     != nil → traefik.http.routers.<id>.priority           = <cfg.Priority>
 //
-// The path argument is expected to be canonical (see function.Template parsing):
+// The path argument is expected to be canonical (see app.Template parsing):
 // leading "/", no trailing slash except root, no "//". TraefikLabels treats it
 // as opaque and does not re-validate it.
 //
@@ -261,13 +261,13 @@ func MissingNetwork(network string) error {
 // template's original host is preserved for callers. An empty host still
 // yields a NIL map regardless of the override: unrouted means unrouted.
 func TraefikLabels(
-	functionName, serviceName, host, path string, port int, cfg TraefikConfig,
+	appName, serviceName, host, path string, port int, cfg TraefikConfig,
 ) map[string]string {
 	if host == "" {
 		return nil
 	}
 
-	id := ServiceProviderID(functionName, serviceName)
+	id := ServiceProviderID(appName, serviceName)
 	rule := fmt.Sprintf("Host(`%s`)", cfg.OverrideHost(host))
 	if path != "" {
 		rule = fmt.Sprintf("%s && PathPrefix(`%s`)", rule, path)
@@ -280,7 +280,7 @@ func TraefikLabels(
 	}
 
 	if path != "" {
-		middleware := PathMiddlewareID(functionName, serviceName)
+		middleware := PathMiddlewareID(appName, serviceName)
 		labels[fmt.Sprintf("traefik.http.routers.%s.middlewares", id)] = middleware
 		labels[fmt.Sprintf("traefik.http.middlewares.%s.stripprefix.prefixes", middleware)] = path
 	}
@@ -317,15 +317,15 @@ func TraefikLabels(
 // absorbs the suffix at the cap and always remains collision-resistant (see
 // ServiceProviderID). Only [a-z0-9-] characters result, so the name is safe in
 // Traefik's label grammar.
-func PathMiddlewareID(functionName, serviceName string) string {
-	return serviceProviderID(functionName, serviceName, "path")
+func PathMiddlewareID(appName, serviceName string) string {
+	return serviceProviderID(appName, serviceName, "path")
 }
 
 // ServiceProviderID derives the deterministic, Traefik-safe router/service id
-// for one service: `relay-<function>-<service>-<hash>`.
+// for one service: `relay-<app>-<service>-<hash>`.
 //
 // Traefik router/service names appearing in labels must be identifier-safe, but
-// the function name and service name are NOT guaranteed to be: a function or
+// the app name and service name are NOT guaranteed to be: an app or
 // service name may contain dots. So every character outside [a-z0-9-] is
 // sanitized to "-" and consecutive "-" are collapsed, per part. The id is keyed
 // on the service's STABLE NAME, never its source: a source change under the same
@@ -338,28 +338,28 @@ func PathMiddlewareID(functionName, serviceName string) string {
 // collapse to the same readable base, either because differing characters
 // sanitize to the same "-" or because a long name is truncated at the cap. The
 // id therefore ends with a fixed-length hex suffix derived from the FULL,
-// unmodified function name and service name, which makes distinct names distinct
+// unmodified app name and service name, which makes distinct names distinct
 // ids with overwhelming probability while leaving the readable prefix intact.
 // The suffix is always preserved at the cap: the readable base is trimmed to
 // make room.
-func ServiceProviderID(functionName, serviceName string) string {
-	return serviceProviderID(functionName, serviceName, "")
+func ServiceProviderID(appName, serviceName string) string {
+	return serviceProviderID(appName, serviceName, "")
 }
 
 // serviceProviderID builds a Traefik-safe identifier from the readable
-// `relay-<function>-<service>` base plus a collision-resistant hash suffix.
+// `relay-<app>-<service>` base plus a collision-resistant hash suffix.
 // infix, when non-empty (e.g. "path"), is inserted between the base and the
 // hash so the middleware namespace stays distinct from the router/service one
 // while both remain collision-safe. The readable base is trimmed to fit the cap
 // before the suffix is appended, so the suffix (and therefore collision
 // resistance) is never lost to truncation.
-func serviceProviderID(functionName, serviceName, infix string) string {
-	base := strings.Trim("relay-"+traefikSafePart(functionName)+"-"+traefikSafePart(serviceName), "-")
+func serviceProviderID(appName, serviceName, infix string) string {
+	base := strings.Trim("relay-"+traefikSafePart(appName)+"-"+traefikSafePart(serviceName), "-")
 	if base == "" {
 		base = "relay"
 	}
 
-	suffix := "-" + identityHash(functionName, serviceName)
+	suffix := "-" + identityHash(appName, serviceName)
 	if infix != "" {
 		suffix = "-" + infix + suffix
 	}
@@ -373,12 +373,12 @@ func serviceProviderID(functionName, serviceName, infix string) string {
 }
 
 // identityHash returns the fixed-length hex collision-resistant suffix for a
-// service. It hashes the FULL function name and the FULL service name (never the
+// service. It hashes the FULL app name and the FULL service name (never the
 // sanitized or truncated base) with a NUL separator, so the two inputs cannot
 // run together across the join. The separator and the full inputs are exactly
 // what makes distinct names hash apart even when their sanitized bases coincide.
-func identityHash(functionName, serviceName string) string {
-	sum := sha256.Sum256([]byte(functionName + "\x00" + serviceName))
+func identityHash(appName, serviceName string) string {
+	sum := sha256.Sum256([]byte(appName + "\x00" + serviceName))
 	return hex.EncodeToString(sum[:])[:identityHashLen]
 }
 

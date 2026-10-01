@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -17,7 +17,7 @@ import (
 // This file pins the PRE-ADMISSION config-refresh boundary: an UNADMITTED
 // schedule occurrence (scheduleName != "" and no pinned descriptor) may block
 // arbitrarily long in reserveSlots waiting for a concurrency slot, during which
-// a reload can hot-swap or remove the function. The schedule/config snapshot
+// a reload can hot-swap or remove the app. The schedule/config snapshot
 // that becomes the atomic first claim's proposal MUST therefore be re-read from
 // the registry AFTER the slot is admitted, so a completed reload is observed
 // (or the occurrence is obsoleted). A descriptor already pinned by an earlier
@@ -63,19 +63,19 @@ func (e *schedLeaseExecutor) callCount() int {
 	return e.calls
 }
 
-// schedLeaseFn builds a schedule-carrying PreparedFunction whose publication
+// schedLeaseFn builds a schedule-carrying PreparedApp whose publication
 // carries a real admitted lease on image (mirroring the production
 // Prepare→NewPrepared transfer), with effective concurrency 1 so a single
 // held global slot parks the next InvokeHandler.
-func schedLeaseFn(t *testing.T, name, image string, exec *schedLeaseExecutor, schedules ...function.Schedule) *PreparedFunction {
+func schedLeaseFn(t *testing.T, name, image string, exec *schedLeaseExecutor, schedules ...app.Schedule) *PreparedApp {
 	t.Helper()
 	lease, err := exec.mgr.AcquireImageLease(image)
 	if err != nil {
 		t.Fatalf("acquire lease for %s: %v", image, err)
 	}
-	pf := NewPrepared(function.Function{
+	pf := NewPrepared(app.App{
 		Name: name,
-		Template: &function.Template{
+		Template: &app.Template{
 			Runtime:     "node24",
 			Concurrency: 1,
 			Schedules:   schedules,
@@ -104,9 +104,9 @@ func releaseGlobalSlot(r *Runner) {
 func TestInvokeHandlerPreAdmissionRefreshUsesReloadedSchedule(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		exec := newSchedLeaseExecutor()
-		old := schedLeaseFn(t, "fn", "relay-fn-fn:v1", exec,
+		old := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
-		r := NewWithMetrics([]*PreparedFunction{old}, testutil.DiscardLogger(), nil)
+		r := NewWithMetrics([]*PreparedApp{old}, testutil.DiscardLogger(), nil)
 		r.SetMaxConcurrency(1)
 		holdGlobalSlot(r)
 
@@ -121,7 +121,7 @@ func TestInvokeHandlerPreAdmissionRefreshUsesReloadedSchedule(t *testing.T) {
 		synctest.Wait()
 
 		// Reload while it waits: same schedule NAME, NEW handler/timeout/retries.
-		fresh := schedLeaseFn(t, "fn", "relay-fn-fn:v2", exec,
+		fresh := schedLeaseFn(t, "fn", "relay-app-fn:v2", exec,
 			sched("cleanup", "jobs.new", 7*time.Second, 1))
 		r.Registry().Replace("fn", fresh)
 
@@ -144,30 +144,30 @@ func TestInvokeHandlerPreAdmissionRefreshUsesReloadedSchedule(t *testing.T) {
 		// Lease hygiene: the stale lookup pin was dropped on the swap and the
 		// stale publication was released by the Replace, so the stale image is
 		// fully drained; the fresh image is held only by its publication.
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v1"); got != 0 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v1"); got != 0 {
 			t.Fatalf("stale image lease count = %d, want 0 (lookup pin released on swap)", got)
 		}
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v2"); got != 1 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v2"); got != 1 {
 			t.Fatalf("fresh image lease count = %d, want 1 (publication only, run pin released)", got)
 		}
-		// Dropping the function releases the fresh publication too: no pin leaked.
+		// Dropping the app releases the fresh publication too: no pin leaked.
 		r.Registry().Replace("fn", nil)
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v2"); got != 0 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v2"); got != 0 {
 			t.Fatalf("fresh image lease count after removal = %d, want 0 (no stranded pin)", got)
 		}
 	})
 }
 
-// TestInvokeHandlerPreAdmissionRefreshFunctionRemovedObsolete blocks an
+// TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete blocks an
 // occurrence in the slot wait, removes the FUNCTION, then releases the slot.
 // The pre-admission refresh observes the removal, so the occurrence is
 // obsolete: no execution, no descriptor, no state.
-func TestInvokeHandlerPreAdmissionRefreshFunctionRemovedObsolete(t *testing.T) {
+func TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		exec := newSchedLeaseExecutor()
-		pf := schedLeaseFn(t, "fn", "relay-fn-fn:v1", exec,
+		pf := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
-		r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+		r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 		r.SetMaxConcurrency(1)
 		holdGlobalSlot(r)
 
@@ -180,7 +180,7 @@ func TestInvokeHandlerPreAdmissionRefreshFunctionRemovedObsolete(t *testing.T) {
 		}()
 		synctest.Wait()
 
-		// The function is removed while the occurrence waits for its slot.
+		// The app is removed while the occurrence waits for its slot.
 		r.Registry().Replace("fn", nil)
 		releaseGlobalSlot(r)
 
@@ -198,23 +198,23 @@ func TestInvokeHandlerPreAdmissionRefreshFunctionRemovedObsolete(t *testing.T) {
 			t.Fatalf("obsolete occurrence touched state: attempts=%v marks=%v failures=%v exhausted=%v",
 				prog.attempts, prog.marks, prog.failures, prog.exhausted)
 		}
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v1"); got != 0 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v1"); got != 0 {
 			t.Fatalf("image lease count = %d, want 0 (lookup pin released, publication removed)", got)
 		}
 	})
 }
 
 // TestInvokeHandlerPreAdmissionRefreshScheduleRemovedObsolete blocks an
-// occurrence in the slot wait, reloads the function WITHOUT the schedule NAME,
+// occurrence in the slot wait, reloads the app WITHOUT the schedule NAME,
 // then releases the slot. The pre-admission refresh no longer finds the NAME,
 // so it proposes nothing and the atomic admission reports the never-admitted
 // occurrence obsolete: no execution, no descriptor, no state.
 func TestInvokeHandlerPreAdmissionRefreshScheduleRemovedObsolete(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		exec := newSchedLeaseExecutor()
-		old := schedLeaseFn(t, "fn", "relay-fn-fn:v1", exec,
+		old := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
-		r := NewWithMetrics([]*PreparedFunction{old}, testutil.DiscardLogger(), nil)
+		r := NewWithMetrics([]*PreparedApp{old}, testutil.DiscardLogger(), nil)
 		r.SetMaxConcurrency(1)
 		holdGlobalSlot(r)
 
@@ -227,9 +227,9 @@ func TestInvokeHandlerPreAdmissionRefreshScheduleRemovedObsolete(t *testing.T) {
 		}()
 		synctest.Wait()
 
-		// The reload keeps the function but drops the "cleanup" NAME (a
-		// DIFFERENT schedule remains, so the function is still configured).
-		fresh := schedLeaseFn(t, "fn", "relay-fn-fn:v2", exec,
+		// The reload keeps the app but drops the "cleanup" NAME (a
+		// DIFFERENT schedule remains, so the app is still configured).
+		fresh := schedLeaseFn(t, "fn", "relay-app-fn:v2", exec,
 			sched("other", "jobs.other", 5*time.Second, 0))
 		r.Registry().Replace("fn", fresh)
 		releaseGlobalSlot(r)
@@ -249,10 +249,10 @@ func TestInvokeHandlerPreAdmissionRefreshScheduleRemovedObsolete(t *testing.T) {
 		}
 		// The refreshed lookup's pin is released on the obsolete return; the
 		// removed name's stale publication was released by the Replace.
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v1"); got != 0 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v1"); got != 0 {
 			t.Fatalf("stale image lease count = %d, want 0 (lookup pin released)", got)
 		}
-		if got := exec.mgr.LeaseCount("relay-fn-fn:v2"); got != 1 {
+		if got := exec.mgr.LeaseCount("relay-app-fn:v2"); got != 1 {
 			t.Fatalf("fresh image lease count = %d, want 1 (publication only)", got)
 		}
 	})

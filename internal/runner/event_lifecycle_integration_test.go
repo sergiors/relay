@@ -246,7 +246,7 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // handler A: always succeeds
 	bExec := &countingExecutor{fail: true} // handler B: always fails
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, aExec),
 		fnWithRetries(t, "beta", 1, bExec),
 	}, testutil.DiscardLogger(), nil)
@@ -315,8 +315,8 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 	}
 	// The DLQ entry names the exact exhausted invocation (B), not the message or
 	// a sibling that succeeded.
-	if m.Values["function"] != "beta" || m.Values["handler"] != "index.run" {
-		t.Errorf("function/handler = %v/%v, want beta/index.run", m.Values["function"], m.Values["handler"])
+	if m.Values["app"] != "beta" || m.Values["handler"] != "index.run" {
+		t.Errorf("function/handler = %v/%v, want beta/index.run", m.Values["app"], m.Values["handler"])
 	}
 	// handler_attempts is the execution attempt that exhausted (2), attributed
 	// from the invocation retry state.
@@ -346,14 +346,14 @@ func TestIntegrationEventSuccessAndExhaustionRoutesToDLQ(t *testing.T) {
 // per-invocation DLQ contract end to end: one message matching a successful
 // handler A and TWO always-failing handlers B and C (retries:0, so each exhausts
 // on attempt 1) must produce exactly TWO DLQ entries — one per exhausted
-// invocation — each carrying its own exact function/handler and
+// invocation — each carrying its own exact app/handler and
 // handler_attempts, while the successful A is never dead-lettered.
 func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing.T) {
 	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // A: succeeds, must never be DLQ'd
 	bExec := &countingExecutor{fail: true} // B: exhausts attempt 1
 	cExec := &countingExecutor{fail: true} // C: exhausts attempt 1
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, aExec),
 		fnWithRetries(t, "beta", 0, bExec),
 		fnWithRetries(t, "gamma", 0, cExec),
@@ -384,7 +384,7 @@ func TestIntegrationMultipleExhaustionsProducePerInvocationDLQEntries(t *testing
 
 	byInv := map[string]redis.XMessage{}
 	for _, m := range e.dlqEntries(id) {
-		fn, _ := m.Values["function"].(string)
+		fn, _ := m.Values["app"].(string)
 		h, _ := m.Values["handler"].(string)
 		byInv[fn+"/"+h] = m
 	}
@@ -419,7 +419,7 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 	_ = redisAvailable(t)
 	aExec := &countingExecutor{}           // A: succeeds
 	bExec := &countingExecutor{fail: true} // B: exhausts on its first failure (retries:0)
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithRetries(t, "alpha", 0, aExec),
 		fnWithRetries(t, "beta", 0, bExec),
 	}, testutil.DiscardLogger(), nil)
@@ -484,21 +484,21 @@ func TestIntegrationDLQWriteFailureRecoveryReRoutesAfterExhaustion(t *testing.T)
 
 // TestIntegrationMatchedButUnavailableStaysPendingThenCompletes is the end-to-end
 // regression for the matched-but-unavailable fix. A message matching ONLY a
-// configured-but-unavailable function must:
+// configured-but-unavailable app must:
 //
 //   - be delivered into the PEL and STAY pending across reclaim cycles (never
-//     ACKed and never DLQ'd) while the function is unavailable — unavailability
+//     ACKed and never DLQ'd) while the app is unavailable — unavailability
 //     alone must not dead-letter, and it must not be treated as unmatched (which
 //     would ACK it);
-//   - once the function is rebuilt and becomes available (the registry entry is
+//   - once the app is rebuilt and becomes available (the registry entry is
 //     swapped for a runnable one under the SAME name, preserving invocation-state
 //     identity), a reclaim redelivery must run the handler, ACK the message, and
 //     clear the invocation-state key.
 func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T) {
 	_ = redisAvailable(t)
 	recovered := &countingExecutor{}
-	// Start with the function registered but unavailable (image not built).
-	r := NewWithMetrics([]*PreparedFunction{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), nil)
+	// Start with the app registered but unavailable (image not built).
+	r := NewWithMetrics([]*PreparedApp{unavailableMatchFn(t, "broken")}, testutil.DiscardLogger(), nil)
 	e := newEventEnv(t)
 	id := e.xadd(`{"a":1}`)
 	e.start(r.Handle)
@@ -524,7 +524,7 @@ func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T)
 		t.Fatalf("unavailable function must not execute: calls = %d, want 0", recovered.count())
 	}
 
-	// The function is rebuilt and becomes available under the SAME name, so the
+	// The app is rebuilt and becomes available under the SAME name, so the
 	// invocation identity is preserved. A reclaim redelivery runs the handler,
 	// ACKs the message, and clears the invocation-state key.
 	r.Registry().Replace("broken", alwaysMatchFn(t, "broken", recovered))
@@ -544,15 +544,15 @@ func TestIntegrationMatchedButUnavailableStaysPendingThenCompletes(t *testing.T)
 }
 
 // TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending pins the
-// mixed fan-out contract end to end: one message matching an AVAILABLE function
-// (which succeeds and is marked complete) and an UNAVAILABLE function (which
+// mixed fan-out contract end to end: one message matching an AVAILABLE app
+// (which succeeds and is marked complete) and an UNAVAILABLE app (which
 // cannot run) stays pending across reclaims. The available invocation runs
 // exactly once — it is NOT re-run by the reclaims — while the unavailable
 // invocation remains unresolved, so the message is never ACKed and never DLQ'd.
 func TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending(t *testing.T) {
 	_ = redisAvailable(t)
 	availableExec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "available", availableExec),
 		unavailableMatchFn(t, "broken"),
 	}, testutil.DiscardLogger(), nil)

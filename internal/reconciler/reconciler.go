@@ -13,7 +13,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/source"
@@ -28,13 +28,13 @@ const (
 	DefaultQueueSize = 64
 )
 
-// Builder prepares a function image and executes invocations against it. It is
+// Builder prepares an app image and executes invocations against it. It is
 // a concrete-need interface so reconcile logic can be unit-tested without Docker
 // or a Redis stream; the runtime Manager satisfies it in production.
 type Builder interface {
 	Prepare(
 		ctx context.Context,
-		fn function.Function,
+		fn app.App,
 	) (*runtime.Prepared, error)
 	Execute(
 		ctx context.Context,
@@ -47,7 +47,7 @@ type Builder interface {
 
 // selectionPreparer is the OPTIONAL extension of Builder implemented by the
 // runtime Manager (but not by the test fakes). Its method accepts the source
-// selection the reconciler already resolved to compute the function's
+// selection the reconciler already resolved to compute the app's
 // fingerprint, so a rebuild does not re-derive the selection between the hash
 // and the build: the tag the reconciler compared and the bytes the build stages
 // come from one policy read. A Builder that does not implement it keeps the
@@ -55,7 +55,7 @@ type Builder interface {
 type selectionPreparer interface {
 	PrepareWithFingerprintAndSelection(
 		ctx context.Context,
-		fn function.Function,
+		fn app.App,
 		fingerprint string,
 		selection *source.Selection,
 	) (*runtime.Prepared, error)
@@ -65,38 +65,38 @@ type selectionPreparer interface {
 // Manager (but not by the test fakes). Resource limits deliberately do not
 // participate in the image fingerprint, so a resource-only template change does
 // NOT trigger a rebuild and therefore never reaches Prepare. The reconciler
-// calls SetFunctionResources on its unchanged-fingerprint skip path so the live
+// calls SetAppResources on its unchanged-fingerprint skip path so the live
 // warm pool rotates containers to the new limits (idle ones discarded, busy ones
 // drained) without touching the image. A Builder that does not implement it
 // (fakes, non-Manager builders) ignores the change, exactly as before.
 type resourceSetter interface {
-	SetFunctionResources(name string, limits function.ResourceLimits)
+	SetAppResources(name string, limits app.ResourceLimits)
 }
 
 // Config tunes the reconciler. A zero value applies the package defaults.
 type Config struct {
-	// Root is the functions root. Required.
+	// Root is the apps root. Required.
 	Root string
-	// Debounce is how long an event storm for one function waits before its
+	// Debounce is how long an event storm for one app waits before its
 	// single reconcile fires. Defaults to DefaultDebounce.
 	Debounce time.Duration
 	// Interval is the periodic reconciliation period, a backstop for watches that
 	// miss events. Defaults to DefaultInterval.
 	Interval time.Duration
 	// Fingerprint, when non-nil, replaces the package-level
-	// function.SelectAndFingerprintFunction that reconcileFunction uses to derive
-	// a function's source selection and content fingerprint. It is a narrow test
+	// app.SelectAndFingerprintApp that reconcileApp uses to derive
+	// an app's source selection and content fingerprint. It is a narrow test
 	// seam (production leaves it nil) so a test can count how many times ONE
-	// reconcile resolves a function's identity without touching the filesystem.
-	Fingerprint func(dir string, tmpl *function.Template) (*source.Selection, string, error)
+	// reconcile resolves an app's identity without touching the filesystem.
+	Fingerprint func(dir string, tmpl *app.Template) (*source.Selection, string, error)
 	// State is an optional state-view sink. When non-nil, reconcile outcomes
 	// (discovered/updated/removed/failed/skipped) are recorded in it; when nil
 	// the reconciler behaves exactly as before (no state writes). Errors from
 	// state calls are logged, never fatal.
 	State *state.State
-	// Retire, when set, is called after a function's registry entry is swapped
+	// Retire, when set, is called after an app's registry entry is swapped
 	// to a new image AND its persistent service containers have been converged
-	// to that new image, passing the function name and the superseded image
+	// to that new image, passing the app name and the superseded image
 	// reference (the version being replaced). Retiring after service converge
 	// guarantees a running service container on the old image has been replaced
 	// before the old image is retire-eligible; the runner-side reference guard is
@@ -105,24 +105,24 @@ type Config struct {
 	// or equal image is skipped by the caller. Ignoring the name is fine — the
 	// image reference already embeds it.
 	Retire func(name, oldImage string)
-	// RemoveFunction, when set, is called after a function directory vanishes
+	// RemoveApp, when set, is called after an app directory vanishes
 	// (and its registry entry and state are dropped) so the runner can retire
-	// every version of that function's images. Nil-safe.
-	RemoveFunction func(name string)
-	// UpdateSchedules, when set, is called after a function's new version is
+	// every version of that app's images. Nil-safe.
+	RemoveApp func(name string)
+	// UpdateSchedules, when set, is called after an app's new version is
 	// prepared and swapped into the registry (both discovery and update paths;
 	// never on the skip path), so the scheduler can converge its cron jobs to
 	// the template's schedules. Nil-safe. It does NOT purge previously-published
 	// schedule dedup keys or stream entries: those represent occurrences valid
 	// when published and expire via the key TTL / stream retention.
-	UpdateSchedules func(name string, tmpl *function.Template)
-	// UpdateServices, when set, is called after a function's new version is
+	UpdateSchedules func(name string, tmpl *app.Template)
+	// UpdateServices, when set, is called after an app's new version is
 	// prepared and swapped into the registry (discovery and update paths; never
 	// on the skip path and never on build failure), so the service reconciler
-	// (services.go) can converge the function's persistent containers to the new
+	// (services.go) can converge the app's persistent containers to the new
 	// template+image.
-	// It is ALSO called on the skip path (unchanged, already-available function)
-	// when the function declares services, so crashed service replicas are
+	// It is ALSO called on the skip path (unchanged, already-available app)
+	// when the app declares services, so crashed service replicas are
 	// recreated within the periodic reconcile cadence without a separate
 	// services-only loop — Reconcile is idempotent, so this is a cheap no-op
 	// when converged. Nil-safe.
@@ -132,21 +132,21 @@ type Config struct {
 	// UpdateServicesWithStatus / UpdateServicesObservationWithStatus instead, so
 	// this one is the fallback for a Builder, test, or embedding host that wants
 	// service convergence without status reporting. When any status-aware hook is
-	// set it takes precedence (see reconcileFunction), so the two are never both
+	// set it takes precedence (see reconcileApp), so the two are never both
 	// invoked for one convergence.
-	UpdateServices                      func(name string, tmpl *function.Template, image string)
-	UpdateServicesWithStatus            func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
-	UpdateServicesObservationWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	UpdateServices                      func(name string, tmpl *app.Template, image string)
+	UpdateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
+	UpdateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	// RemoveServices, when set, is called in remove() immediately BEFORE
-	// RemoveFunction and the function's images are retired. The ordering
-	// invariant: running service containers reference the function's images, so
+	// RemoveApp and the app's images are retired. The ordering
+	// invariant: running service containers reference the app's images, so
 	// those containers must be stopped and removed before the images are
 	// retire-eligible. Nil-safe.
 	RemoveServices func(name string)
 }
 
-// Watches Root, debounces per-function events, and swaps the registry when a
-// function's content fingerprint changes.
+// Watches Root, debounces per-app events, and swaps the registry when a
+// app's content fingerprint changes.
 type Reconciler struct {
 	root     string
 	debounce time.Duration
@@ -156,20 +156,20 @@ type Reconciler struct {
 	builder Builder
 	log     *slog.Logger
 	st      *state.State
-	// fingerprint resolves a function's selection and content fingerprint. It
-	// defaults to function.SelectAndFingerprintFunction and is overridden by
+	// fingerprint resolves an app's selection and content fingerprint. It
+	// defaults to app.SelectAndFingerprintApp and is overridden by
 	// Config.Fingerprint for tests that need to observe (or count) the ONE
 	// resolution per reconcile.
-	fingerprint func(dir string, tmpl *function.Template) (*source.Selection, string, error)
-	// retire/removeFunction/updateSchedules/updateServices/removeServices are
+	fingerprint func(dir string, tmpl *app.Template) (*source.Selection, string, error)
+	// retire/removeApp/updateSchedules/updateServices/removeServices are
 	// optional image-lifecycle, schedule-convergence, and service-convergence
 	// hooks (see Config).
 	retire                              func(name, oldImage string)
-	removeFunction                      func(name string)
-	updateSchedules                     func(name string, tmpl *function.Template)
-	updateServices                      func(name string, tmpl *function.Template, image string)
-	updateServicesWithStatus            func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
-	updateServicesObservationWithStatus func(name string, tmpl *function.Template, image string, onReconcileStart func(), onComplete func(error))
+	removeApp                           func(name string)
+	updateSchedules                     func(name string, tmpl *app.Template)
+	updateServices                      func(name string, tmpl *app.Template, image string)
+	updateServicesWithStatus            func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
+	updateServicesObservationWithStatus func(name string, tmpl *app.Template, image string, onReconcileStart func(), onComplete func(error))
 	removeServices                      func(name string)
 
 	mu           sync.Mutex
@@ -177,7 +177,7 @@ type Reconciler struct {
 	generations  map[string]uint64
 	timers       map[string]*time.Timer
 
-	incoming chan string   // debounced, per-function trigger queue
+	incoming chan string   // debounced, per-app trigger queue
 	done     chan struct{} // closed on shutdown to unblock pump/timer sends
 
 	ctx     context.Context
@@ -192,7 +192,7 @@ type Reconciler struct {
 }
 
 // New builds a Reconciler. The registry must already be populated with the
-// startup-loaded functions (available or not) so reconciliation can compare
+// startup-loaded apps (available or not) so reconciliation can compare
 // against and swap them.
 func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger) *Reconciler {
 	if cfg.Debounce == 0 {
@@ -207,7 +207,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 	// may inject one to observe the single per-reconcile resolution.
 	fingerprint := cfg.Fingerprint
 	if fingerprint == nil {
-		fingerprint = function.SelectAndFingerprintFunction
+		fingerprint = app.SelectAndFingerprintApp
 	}
 
 	return &Reconciler{
@@ -220,7 +220,7 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 		st:                                  cfg.State,
 		fingerprint:                         fingerprint,
 		retire:                              cfg.Retire,
-		removeFunction:                      cfg.RemoveFunction,
+		removeApp:                           cfg.RemoveApp,
 		updateSchedules:                     cfg.UpdateSchedules,
 		updateServices:                      cfg.UpdateServices,
 		updateServicesWithStatus:            cfg.UpdateServicesWithStatus,
@@ -234,8 +234,8 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 	}
 }
 
-// Seed records the fingerprint for a currently-loaded function so the first
-// reconcile pass does not rebuild a function that was already prepared at
+// Seed records the fingerprint for a currently-loaded app so the first
+// reconcile pass does not rebuild an app that was already prepared at
 // startup. The fingerprint is SUPPLIED by the caller: it is the identity the
 // prepared image was ACTUALLY built from (runtime.Prepared.Fingerprint, derived
 // from the source snapshot Prepare captured), so Seed never re-reads the source
@@ -248,9 +248,9 @@ func New(cfg Config, reg *runner.Registry, builder Builder, logger *slog.Logger)
 // detected: the first reconcile rescans the tree and finds it different from the
 // recorded built identity, so it observes the change as a rebuild — never a
 // missed update. An empty value is stored as-is; because no real fingerprint is
-// empty, the first reconcile simply treats the function as changed and rebuilds
-// it (the desired behavior for an unprepared function).
-func (r *Reconciler) Seed(fn function.Function, fingerprint string) {
+// empty, the first reconcile simply treats the app as changed and rebuilds
+// it (the desired behavior for an unprepared app).
+func (r *Reconciler) Seed(fn app.App, fingerprint string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.fingerprints[fn.Name] = fingerprint
@@ -260,7 +260,7 @@ func (r *Reconciler) Seed(fn function.Function, fingerprint string) {
 // SYNCHRONOUSLY, without starting the background loops. It is the ordering seam
 // the worker uses to establish change detection BEFORE trusting the supplied
 // startup fingerprints: the worker calls PrepareWatch, then Seed for each
-// startup function, then Start. Any change after the watch is installed is
+// startup app, then Start. Any change after the watch is installed is
 // observed as an fsnotify event; a change between the startup fingerprint scan
 // and this point is also caught, because Seed stores the identity the image was
 // ACTUALLY built from (the snapshot capture inside Prepare), and the first
@@ -339,11 +339,11 @@ func (r *Reconciler) Enqueue(name string) {
 	r.timers[name] = t
 }
 
-// dispatch feeds a function into the single reconciler goroutine (the pump).
+// dispatch feeds an app into the single reconciler goroutine (the pump).
 // The send blocks when the queue is full (there is no default case): the caller
 // is a debounce timer goroutine, so backpressure simply delays that timer
 // rather than dropping the reconcile. Both the debounce timers and the periodic
-// pass converge here so no two reconciles of the same function ever run
+// pass converge here so no two reconciles of the same app ever run
 // concurrently. incoming is never closed; done lets a sender parked on a full
 // queue unblock at shutdown. If both cases are ready the select chooses at
 // random, so done is not strictly prioritized, but either outcome is safe: a
@@ -356,8 +356,8 @@ func (r *Reconciler) dispatch(name string) {
 	}
 }
 
-// pump consumes function names serially, so distinct functions can queue
-// independently but no function is ever reconciled twice concurrently. It exits
+// pump consumes app names serially, so distinct apps can queue
+// independently but no app is ever reconciled twice concurrently. It exits
 // when done is closed, without relying on incoming ever being closed.
 func (r *Reconciler) pump() {
 	defer r.loops.Done()
@@ -370,16 +370,16 @@ func (r *Reconciler) pump() {
 				delete(r.timers, name)
 			}
 			r.mu.Unlock()
-			r.reconcileFunction(name)
+			r.reconcileApp(name)
 		case <-r.done:
 			return
 		}
 	}
 }
 
-// ticker periodically reconciles every known function, catching events the
-// watcher missed. This periodic audit INTENTIONALLY re-hashes each function's
-// selected content (reconcileFunction's SelectAndFingerprintFunction) even when
+// ticker periodically reconciles every known app, catching events the
+// watcher missed. This periodic audit INTENTIONALLY re-hashes each app's
+// selected content (reconcileApp's SelectAndFingerprintApp) even when
 // no fsnotify event fired: it is the backstop for a missed create/add/remove,
 // an fsnotify overflow, or a transient "unavailable" retry, and it is what makes
 // change detection correct on Docker Desktop bind mounts, where fsnotify
@@ -404,7 +404,7 @@ func (r *Reconciler) ticker() {
 }
 
 // eventLoop forwards fsnotify events into the debounce queue, mapping their paths
-// to function names and maintaining watches on newly created/removed directories.
+// to app names and maintaining watches on newly created/removed directories.
 func (r *Reconciler) eventLoop() {
 	defer r.loops.Done()
 	for {
@@ -420,7 +420,7 @@ func (r *Reconciler) eventLoop() {
 			if ev.Op&(fsnotify.Create|fsnotify.Remove|fsnotify.Rename|fsnotify.Write) == 0 {
 				continue
 			}
-			if name, affected := r.functionForPath(ev.Name); affected {
+			if name, affected := r.appForPath(ev.Name); affected {
 				r.Enqueue(name)
 			}
 			// Maintain watches on created/renamed directories (recursive watch).
@@ -452,21 +452,21 @@ func (r *Reconciler) eventLoop() {
 	}
 }
 
-// functionForPath maps an event path to the affected function name: the first
+// appForPath maps an event path to the affected app name: the first
 // path segment under the root. A Relay-owned transient staging directory
-// (function.IsReservedDir, e.g. git's ".sync-*") is never a function, so its
+// (app.IsReservedDir, e.g. git's ".sync-*") is never an app, so its
 // events are filtered here and no debounce timer is ever armed for it.
-func (r *Reconciler) functionForPath(path string) (string, bool) {
+func (r *Reconciler) appForPath(path string) (string, bool) {
 	name, ok := r.rootChildName(path)
-	if !ok || function.IsReservedDir(name) {
+	if !ok || app.IsReservedDir(name) {
 		return "", false
 	}
 	return name, true
 }
 
-// rootChildName returns the first path segment of p relative to the functions
+// rootChildName returns the first path segment of p relative to the apps
 // root, and whether p is at or below the root with a non-empty relative path.
-// It is the shared basis for mapping an event path to a function name and for
+// It is the shared basis for mapping an event path to an app name and for
 // deciding whether a path lies inside a reserved root child, so the two can
 // never disagree about which root child a path belongs to.
 func (r *Reconciler) rootChildName(p string) (string, bool) {
@@ -484,20 +484,20 @@ func (r *Reconciler) rootChildName(p string) (string, bool) {
 }
 
 // isReservedDirPath reports whether p is, or is inside, a Relay-owned reserved
-// directory directly under the functions root (function.IsReservedDir). The
+// directory directly under the apps root (app.IsReservedDir). The
 // check is on the FIRST path segment under r.root, so a reserved ROOT CHILD and
 // all of its descendants are skipped, while a nested real directory whose name
 // merely looks reserved (e.g. root/<valid-fn>/.sync-x) is not.
 func (r *Reconciler) isReservedDirPath(p string) bool {
 	name, ok := r.rootChildName(p)
-	return ok && function.IsReservedDir(name)
+	return ok && app.IsReservedDir(name)
 }
 
 // addWatchRecursive watches root and every subdirectory so events beneath nested
 // dirs are seen. A Relay-owned reserved directory directly under the root
-// (function.IsReservedDir, git's ".sync-*") and its whole subtree are
-// deliberately NOT watched: such a directory is never a function, so watching it
-// would only consume inotify handles and surface events that functionForPath
+// (app.IsReservedDir, git's ".sync-*") and its whole subtree are
+// deliberately NOT watched: such a directory is never an app, so watching it
+// would only consume inotify handles and surface events that appForPath
 // immediately discards. filepath.WalkDir is used with SkipDir to prune the
 // reserved subtree, which also means its descendants are never visited.
 //
@@ -555,8 +555,8 @@ func (r *Reconciler) removeWatchRecursive(path string) {
 
 // reconcileAll discovers current child dirs and reconciles each, so periodic
 // checks also handle removal (a dir present in the registry but gone from disk)
-// and retry previously failed builds. Each discovered function is dispatched
-// through the same single pump so reconciles stay serialized per function.
+// and retry previously failed builds. Each discovered app is dispatched
+// through the same single pump so reconciles stay serialized per app.
 func (r *Reconciler) reconcileAll() {
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(r.root)
@@ -572,9 +572,9 @@ func (r *Reconciler) reconcileAll() {
 		if !e.IsDir() {
 			continue
 		}
-		if function.IsReservedDir(e.Name()) {
+		if app.IsReservedDir(e.Name()) {
 			// A Relay-owned transient staging directory (git's ".sync-*") is
-			// never a function and never a desired definition: it is neither
+			// never an app and never a desired definition: it is neither
 			// dispatched for reconcile nor recorded as seen, so it cannot
 			// produce a warning or an invalid state row while it briefly exists.
 			continue
@@ -582,7 +582,7 @@ func (r *Reconciler) reconcileAll() {
 		seen[e.Name()] = true
 		r.dispatch(e.Name())
 	}
-	// Functions still registered but no longer on disk were removed.
+	// Apps still registered but no longer on disk were removed.
 	for _, name := range r.reg.Names() {
 		if !seen[name] {
 			r.dispatch(name)
@@ -590,17 +590,17 @@ func (r *Reconciler) reconcileAll() {
 	}
 }
 
-// reconcileFunction is the core decision point for one function. It is serialized
+// reconcileApp is the core decision point for one app. It is serialized
 // per name by the pump; when called directly (Reconcile/reconcileAll) callers
 // coordinate it.
-func (r *Reconciler) reconcileFunction(name string) {
+func (r *Reconciler) reconcileApp(name string) {
 	// A Relay-owned transient staging directory (git's ".sync-*") is never a
-	// function and never a desired definition. It is filtered before dispatch
-	// (functionForPath, reconcileAll), but guard here too so a direct/stale
+	// app and never a desired definition. It is filtered before dispatch
+	// (appForPath, reconcileAll), but guard here too so a direct/stale
 	// caller can never turn a stage directory into a warning, an invalid state
-	// row, or a removal of a healthy function. It is deliberately not treated as
+	// row, or a removal of a healthy app. It is deliberately not treated as
 	// ErrInvalidPath (which would record an invalid desired definition).
-	if function.IsReservedDir(name) {
+	if app.IsReservedDir(name) {
 		return
 	}
 	// LoadSingle enforces the SAME path policy as startup discovery (a legal
@@ -609,8 +609,8 @@ func (r *Reconciler) reconcileFunction(name string) {
 	// would have rejected. A missing directory wraps fs.ErrNotExist (a removal);
 	// an invalid path is ErrInvalidPath and RETAINS the previously-loaded
 	// version rather than letting an invalid path remove or replace a healthy
-	// function.
-	fn, err := function.LoadSingle(r.root, name)
+	// app.
+	fn, err := app.LoadSingle(r.root, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// Directory gone -> remove from registry. In-flight invocations keep
@@ -618,37 +618,37 @@ func (r *Reconciler) reconcileFunction(name string) {
 			r.remove(name)
 			return
 		}
-		if errors.Is(err, function.ErrNotReady) {
+		if errors.Is(err, app.ErrNotReady) {
 			// Directory exists but template isn't there yet (mid-copy); wait for
-			// more events rather than dropping a previously-active function. The
+			// more events rather than dropping a previously-active app. The
 			// desired definition is present but not yet loadable, so record the
 			// invalid/failed view (retaining any active generation) while the
 			// runtime registry is untouched: a mid-copy never removes a healthy
-			// function.
+			// app.
 			r.recordInvalidDesired(name, err)
 			return
 		}
-		if errors.Is(err, function.ErrInvalidPath) {
+		if errors.Is(err, app.ErrInvalidPath) {
 			// An invalid path (bad name, symlink, non-directory, not a direct
-			// child) can never be a function; retain any previously-loaded
+			// child) can never be an app; retain any previously-loaded
 			// version rather than removing or replacing it. The present invalid
 			// desired definition is recorded so its stale ready view is not left
 			// behind.
 			r.log.Warn(
-				"Function: invalid path; retaining previous version",
-				"function", name,
+				"App: invalid path; retaining previous version",
+				"app", name,
 				"error", err,
 			)
 			r.recordInvalidDesired(name, err)
 			return
 		}
 		// A flaky read/stat (permissions, I/O) is not a removal: don't drop the
-		// function, but surface it so staleness isn't silently ignored. The entry
+		// app, but surface it so staleness isn't silently ignored. The entry
 		// is present, so record the failed desired view (the active generation is
 		// preserved and the registry untouched).
 		r.log.Warn(
-			"Function: load error; retaining previous version",
-			"function", name,
+			"App: load error; retaining previous version",
+			"app", name,
 			"error", err,
 		)
 		r.recordInvalidDesired(name, err)
@@ -656,20 +656,20 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 	dir := fn.Dir
 
-	// Compute the fingerprint AND (for a runtime-backed function) the resolved
+	// Compute the fingerprint AND (for a runtime-backed app) the resolved
 	// source selection in ONE traversal, then carry BOTH into the rebuild below.
 	// The selection is handed to the Manager's selection-aware Prepare so the
 	// build stages exactly the source this hash was derived from, with no second
 	// policy read that a concurrent .gitignore edit could diverge. For a
 	// no-runtime template the selection is nil (no image is built) and the
 	// template-only fingerprint is passed through untouched. The resolver is the
-	// injected seam (production: function.SelectAndFingerprintFunction), invoked
+	// injected seam (production: app.SelectAndFingerprintApp), invoked
 	// exactly once per reconcile.
 	selection, fp, err := r.fingerprint(dir, fn.Template)
 	if err != nil {
 		r.log.Warn(
-			"Function: fingerprint error; retaining previous version",
-			"function", name,
+			"App: fingerprint error; retaining previous version",
+			"app", name,
 			"error", err,
 		)
 		// The desired definition is present and parseable but its source could
@@ -687,15 +687,15 @@ func (r *Reconciler) reconcileFunction(name string) {
 	cur := r.reg.GetByName(name)
 	// Skip a rebuild only when the current build is healthy AND content is
 	// unchanged. A previously-failed build (unavailable) is retried even if the
-	// fingerprint is stable, so a broken function recovers without edits.
+	// fingerprint is stable, so a broken app recovers without edits.
 	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp {
 		// Skipped checks are deliberately NOT persisted as the last reconcile:
 		// RecordReconcileSuccess/Failure record the last MEANINGFUL operation and
 		// its timestamp; a periodic no-op must not hide a recent success or
 		// failure. It is surfaced in debug logging only.
 		r.log.Debug(
-			"Function: unchanged; reconcile skipped",
-			"function", name,
+			"App: unchanged; reconcile skipped",
+			"app", name,
 		)
 		// Resource limits do not participate in the image fingerprint, so a
 		// resource-only template change lands on this skip path. Publish the
@@ -704,9 +704,9 @@ func (r *Reconciler) reconcileFunction(name string) {
 		// no-ops an unchanged value, so a truly-unchanged periodic tick does not
 		// churn. Non-Manager builders ignore it.
 		if rs, ok := r.builder.(resourceSetter); ok {
-			rs.SetFunctionResources(name, fn.Template.ResourceLimits())
+			rs.SetAppResources(name, fn.Template.ResourceLimits())
 		}
-		// A skip path is NOT a full no-op when the function declares services:
+		// A skip path is NOT a full no-op when the app declares services:
 		// without converging here, a crashed service replica would only be
 		// repaired on the next content change. Reconcile is idempotent — when
 		// the desired set is already running it lists containers once and
@@ -726,7 +726,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 				// meaningful source work that is still completing.
 				generation := r.currentGenerationNumber(name)
 				// This is a periodic VERIFICATION of an unchanged, already-
-				// available function: it must not claim that a new generation is
+				// available app: it must not claim that a new generation is
 				// being prepared. No RecordPreparing here — the public status is
 				// only moved to preparing when an actual desired-generation change
 				// is detected (the rebuild path below).
@@ -771,8 +771,8 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	r.log.Debug(
-		"Function: changed; rebuilding",
-		"function", name,
+		"App: changed; rebuilding",
+		"app", name,
 	)
 	r.mu.Lock()
 	r.generations[name]++
@@ -789,8 +789,8 @@ func (r *Reconciler) reconcileFunction(name string) {
 	built, err := r.prepareImage(r.prepareContext(name, generation), fn, fp, selection)
 	if err != nil {
 		r.log.Error(
-			"Function: reload failed; retaining previous version",
-			"function", name,
+			"App: reload failed; retaining previous version",
+			"app", name,
 			"error", err,
 			"duration", time.Since(start),
 			"outcome", "failed",
@@ -857,7 +857,7 @@ func (r *Reconciler) reconcileFunction(name string) {
 		r.updateSchedules(name, fn.Template)
 	}
 
-	// After the scheduler converges, converge the function's persistent service
+	// After the scheduler converges, converge the app's persistent service
 	// containers to the freshly prepared template and image. This runs on both
 	// discovery and update paths (the registry now serves the new version), and
 	// not on the skip path above nor on a build failure (where the previous
@@ -893,14 +893,14 @@ func (r *Reconciler) reconcileFunction(name string) {
 	}
 
 	if cur == nil {
-		r.log.Info("Function: discovered",
-			"function", name,
+		r.log.Info("App: discovered",
+			"app", name,
 			"duration", time.Since(start),
 			"outcome", "discovered",
 		)
 	} else {
-		r.log.Info("Function: updated",
-			"function", name,
+		r.log.Info("App: updated",
+			"app", name,
 			"duration", time.Since(start),
 			"outcome", "updated",
 		)
@@ -919,8 +919,8 @@ func (r *Reconciler) currentGenerationNumber(name string) uint64 {
 	return r.generations[name]
 }
 
-// prepareImage builds the function's image, passing the fingerprint the
-// reconciler already computed (and, for a runtime-backed function, the source
+// prepareImage builds the app's image, passing the fingerprint the
+// reconciler already computed (and, for a runtime-backed app, the source
 // selection it was computed from) when the builder supports it. The runtime
 // Manager does, so a live rebuild hands it BOTH the tag identity it compared and
 // the exact policy to stage: the selection is never re-derived and the
@@ -928,13 +928,13 @@ func (r *Reconciler) currentGenerationNumber(name string) uint64 {
 // the selection once and derives the built identity from that capture; the
 // caller records the RETURNED fingerprint. A test or non-Manager Builder that
 // only implements Builder falls back to Prepare, which computes them itself;
-// those fakes do not care about the identity anyway. fp is "" only for a function
+// those fakes do not care about the identity anyway. fp is "" only for an app
 // the reconciler could not hash (which then never reaches here: a fingerprint
 // error retains the previous version), so the value supplied is always the one
 // just compared.
 func (r *Reconciler) prepareImage(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	fp string,
 	selection *source.Selection,
 ) (*runtime.Prepared, error) {
@@ -945,8 +945,8 @@ func (r *Reconciler) prepareImage(
 }
 
 // prepareContext roots a Prepare call in the reconciler context and installs the
-// function-image build observer that publishes status=building at the ACTUAL
-// managed-runtime image build boundary (runtime.WithFunctionBuildObserver). The
+// app-image build observer that publishes status=building at the ACTUAL
+// managed-runtime image build boundary (runtime.WithAppBuildObserver). The
 // callback is generation-guarded, so a stale in-flight completion cannot
 // overwrite a newer generation's status. When no state sink is wired, the plain
 // reconciler context is returned.
@@ -955,7 +955,7 @@ func (r *Reconciler) prepareContext(name string, generation uint64) context.Cont
 	if r.st == nil {
 		return ctx
 	}
-	return runtime.WithFunctionBuildObserver(ctx, func() {
+	return runtime.WithAppBuildObserver(ctx, func() {
 		if r.currentGeneration(name, generation) {
 			r.st.RecordReconcileBuilding(name)
 		}
@@ -965,7 +965,7 @@ func (r *Reconciler) prepareContext(name string, generation uint64) context.Cont
 // recordInvalidDesired records a present-but-unloadable desired definition into
 // the state view (degraded with a retained active generation, or unavailable
 // without one) while leaving the runtime registry untouched. It is the shared
-// seam for every reconcileFunction failure that is NOT a removal and NOT a valid
+// seam for every reconcileApp failure that is NOT a removal and NOT a valid
 // desired generation that failed to build: ErrNotReady (mid-copy),
 // ErrInvalidPath, a flaky read/stat, and a fingerprint error. State is a view
 // only — the previously-loaded version stays served — so an operator sees the
@@ -979,7 +979,7 @@ func (r *Reconciler) prepareContext(name string, generation uint64) context.Cont
 // nothing). Forgetting it forces the next reconcile to re-resolve the identity,
 // so a restored definition is re-verified and a real success replaces the
 // failure — the same "retry even when the fingerprint is stable" behavior an
-// unavailable function already has. It never writes a success itself.
+// unavailable app already has. It never writes a success itself.
 func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	r.mu.Lock()
 	delete(r.fingerprints, name)
@@ -990,7 +990,7 @@ func (r *Reconciler) recordInvalidDesired(name string, err error) {
 	r.st.RecordInvalidDesired(name, err)
 }
 
-// remove drops a function from the registry and forgets its fingerprint.
+// remove drops an app from the registry and forgets its fingerprint.
 func (r *Reconciler) remove(name string) {
 	r.reg.Replace(name, nil)
 	r.mu.Lock()
@@ -999,30 +999,30 @@ func (r *Reconciler) remove(name string) {
 	if r.st != nil {
 		r.st.RecordRemoved(name)
 	}
-	// The directory is gone, so every version of this function's images is now
+	// The directory is gone, so every version of this app's images is now
 	// garbage. Let the runner retire all of them (once idle) when wired. The
-	// wired RemoveFunction hook also deletes the function's Prometheus series at
+	// wired RemoveApp hook also deletes the app's Prometheus series at
 	// this same retirement point (the reconciler itself stays metrics-free; the
 	// worker wires the metrics deletion by wrapping the hook).
 	//
-	// RemoveServices runs FIRST, before RemoveFunction retires the images: a
-	// running service container still references the function's images, so those
+	// RemoveServices runs FIRST, before RemoveApp retires the images: a
+	// running service container still references the app's images, so those
 	// containers must be stopped and removed before the images become
 	// retire-eligible. Nil-safe.
 	if r.removeServices != nil {
 		r.removeServices(name)
 	}
-	if r.removeFunction != nil {
-		r.removeFunction(name)
+	if r.removeApp != nil {
+		r.removeApp(name)
 	}
 	r.log.Info(
-		"Function: removed",
-		"function", name,
+		"App: removed",
+		"app", name,
 	)
 }
 
-// isAvailable reports whether a prepared function has a usable image.
-func isAvailable(pf *runner.PreparedFunction) bool {
+// isAvailable reports whether a prepared app has a usable image.
+func isAvailable(pf *runner.PreparedApp) bool {
 	return pf.Prepared() != nil
 }
 

@@ -3,7 +3,7 @@
 // This file defines the nil-safe Registry facade over a dedicated Prometheus
 // registry, including the counters/histograms/gauges, the instrumented mutation
 // and readback methods, the Prometheus exposition Handler, and the Snapshot /
-// FunctionStatsSnapshot gather routines. It deliberately holds NO lifecycle
+// AppStatsSnapshot gather routines. It deliberately holds NO lifecycle
 // code and NO routing — the HTTP server (Server), the gauge refresher
 // (Refresher), and the periodic snapshot logger (MetricsLogger) each live in
 // their own file.
@@ -82,20 +82,32 @@ const (
 	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
 	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
 	MetricHandlerInvocations       = metricNamespacePrefix + "handler_invocations_total"
-	MetricBuildFailures            = metricNamespacePrefix + "build_failures_total"
-	// MetricFunctionEventsMatched counts a function once per logical event for
-	// which at least one of its rules matched — a functions-engaged counter,
+	// MetricAppBuildFailures counts failed app image and dependency-image
+	// builds. It is APP lifecycle (whether an app could be prepared), not handler
+	// execution, so it keeps the app_ namespace alongside the app identity
+	// label — matching MetricAppBuild, the build-duration histogram.
+	MetricAppBuildFailures = metricNamespacePrefix + "app_build_failures_total"
+	// MetricAppEventsMatched counts an app once per logical event for
+	// which at least one of its rules matched — an apps-engaged counter,
 	// distinct from the message-level MetricEventsMatched (an event matching two
-	// functions counts once globally and once per function here). Like the
+	// apps counts once globally and once per app here). Like the
 	// global counters it is classified once per logical event across
-	// redeliveries.
-	MetricFunctionEventsMatched  = metricNamespacePrefix + "function_events_matched_total"
+	// redeliveries. It is an APP lifecycle/engagement counter, so it keeps the
+	// app_ namespace.
+	MetricAppEventsMatched = metricNamespacePrefix + "app_events_matched_total"
+
+	// MetricFunction* are handler-EXECUTION counters (attempts, retries,
+	// exhaustion), not app lifecycle: their HELP describes handler work, so they
+	// carry the function_ namespace rather than app_. Their identity dimension is
+	// still the "app" LABEL (the app the handler belongs to), which is what
+	// AppStatsSnapshot and app lifecycle cleanup key on — only the metric name
+	// reflects that they count executions, not apps.
 	MetricFunctionHandlerSuccess = metricNamespacePrefix + "function_handler_success_total"
 	MetricFunctionHandlerFailure = metricNamespacePrefix + "function_handler_failure_total"
 	MetricFunctionRetries        = metricNamespacePrefix + "function_retries_total"
 	MetricFunctionDLQ            = metricNamespacePrefix + "function_dlq_total"
 	MetricHandlerDuration        = metricNamespacePrefix + "handler_duration_seconds"
-	MetricFunctionBuild          = metricNamespacePrefix + "function_build_seconds"
+	MetricAppBuild               = metricNamespacePrefix + "app_build_seconds"
 	MetricPendingEntries         = metricNamespacePrefix + "pending_entries"
 	MetricPendingOldestAge       = metricNamespacePrefix + "pending_oldest_age_seconds"
 	MetricBufferedEvents         = metricNamespacePrefix + "buffered_events"
@@ -109,16 +121,16 @@ const (
 	// for successful processing.
 	MetricMissingPayload = metricNamespacePrefix + "missing_payload_total"
 
-	// MetricFunctionStatus is the one-hot lifecycle status gauge. Exactly one
-	// status series per function holds 1 (the function's current public status)
+	// MetricAppStatus is the one-hot lifecycle status gauge. Exactly one
+	// status series per app holds 1 (the app's current public status)
 	// and every other allowed status holds 0, so a dashboard can read the
-	// function's lifecycle without summing series. The status label is a closed
-	// set (FunctionStatuses below), so cardinality is bounded by
-	// function × 6; the values mirror the state package's public lifecycle
+	// app's lifecycle without summing series. The status label is a closed
+	// set (AppStatuses below), so cardinality is bounded by
+	// app × 6; the values mirror the state package's public lifecycle
 	// statuses by convention — this leaf observability package deliberately does
 	// not import state. A status write creates/updates all six series eagerly
-	// (one-hot); a function removal/prune deletes all of them.
-	MetricFunctionStatus = metricNamespacePrefix + "function_status"
+	// (one-hot); an app removal/prune deletes all of them.
+	MetricAppStatus = metricNamespacePrefix + "app_status"
 
 	// MetricRedisReadErrors counts failed Redis READ commands by the finite
 	// RedisOp* operation label. It exists to separate an actual read failure
@@ -135,17 +147,17 @@ const (
 	// ServiceReconciler.Apply outcome (changed/unchanged/error), including the
 	// periodic no-op verification passes; MetricServiceReconcileDuration
 	// observes each pass's wall-clock duration. Both are labeled by the bounded
-	// function dimension, and the outcome label is a closed three-value set.
+	// app dimension, and the outcome label is a closed three-value set.
 	MetricServiceReconciles        = metricNamespacePrefix + "service_reconciles_total"
 	MetricServiceReconcileDuration = metricNamespacePrefix + "service_reconcile_duration_seconds"
 
 	// Warm-container pool observability (Phase 4). The state gauge is labeled by
-	// function and by a fixed state set (idle/busy/starting); acquires are split
+	// app and by a fixed state set (idle/busy/starting); acquires are split
 	// into the warm (reused idle container) and cold (freshly started) outcomes;
 	// discards are labeled by the finite existing discard reasons; the acquire
 	// histogram is observed for SUCCESSFUL acquires only; waits counts acquires
-	// that had to block at the pool bound. Capacity is the function's resolved
-	// per-function concurrency (the pool's bound).
+	// that had to block at the pool bound. Capacity is the app's resolved
+	// per-app concurrency (the pool's bound).
 	MetricRuntimeContainers               = metricNamespacePrefix + "runtime_containers"
 	MetricRuntimePoolCapacity             = metricNamespacePrefix + "runtime_pool_capacity"
 	MetricRuntimeContainerAcquires        = metricNamespacePrefix + "runtime_container_acquires_total"
@@ -179,17 +191,20 @@ const (
 //     invocations that exhausted their retries; MetricFunctionDLQ counts the
 //     exhaustion commit, which may precede the actual write.
 //   - The handler invocation counters are per rule EXECUTION, not per logical
-//     event, and span the event, schedule, and manual invocation paths.
+//     event, and span the event, schedule, and manual invocation paths. That is
+//     why the per-app handler-execution counters are named function_* (execution
+//     work) while carrying the app label (the app the handler belongs to);
+//     app_events_matched_total and the app lifecycle families keep app_.
 var metricHelp = map[string]string{
 	MetricEventsReceived:  "Logical incoming events (messages that decoded to an event object) handled by the runner, classified exactly once per logical event across redeliveries/retries. Schedule occurrences are excluded.",
-	MetricEventsMatched:   "Logical incoming events for which at least one function rule matched, classified exactly once per logical event across redeliveries/retries. A handler failure does not move an event out of this class.",
-	MetricEventsUnmatched: "Logical incoming events for which no function rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
+	MetricEventsMatched:   "Logical incoming events for which at least one app rule matched, classified exactly once per logical event across redeliveries/retries. A handler failure does not move an event out of this class.",
+	MetricEventsUnmatched: "Logical incoming events for which no app rule matched, classified exactly once per logical event across redeliveries/retries. Unmatched events are acknowledged and never retried.",
 
 	MetricRetries:                      "Message reclaims: idle pending entries the stream consumer reclaimed and re-delivered, counted once per reclaim even when the message is not processed (buffer full) or every invocation is skipped as protected. This is a redelivery counter, not handler retries; distinct from function_retries_total, which counts failed handler executions.",
 	MetricDLQEntries:                   "Successful dead-letter writes: entries actually written to the Redis DLQ stream, counted once per successful XADD. One write per exhausted invocation, plus one placeholder write for a malformed message that never reached a handler. A failed DLQ write is not counted, and invocation exhaustion is counted separately by function_dlq_total.",
 	MetricHandlerSuccess:               "Successful handler executions across event, schedule, and manual invocations, counted once per handler attempt.",
 	MetricHandlerFailure:               "Failed handler attempts across event, schedule, and manual invocations, counted once per attempt; a failed attempt that will retry is counted here too.",
-	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-function).",
+	MetricConcurrencyWaits:             "Concurrency slot acquisitions that had to block before executing an invocation, regardless of eventual success; each blocked acquisition counts once per slot (worker-global and per-app).",
 	MetricScheduleOccurrencesPublished: "Schedule occurrences newly published to the event stream by this worker after the distributed publish-if-new check.",
 	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
 	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; a failed attempt is counted here before any bounded retry.",
@@ -197,40 +212,40 @@ var metricHelp = map[string]string{
 	MetricSchedulePublishExhausted:     "Schedule occurrences whose bounded publication retry budget was exhausted without a success or duplicate; the occurrence is lost on this worker (other workers may still publish it).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
 
-	MetricHandlerInvocations:              "Handler invocation outcomes by function and handler, counted once per handler attempt; outcome is success or failure.",
-	MetricBuildFailures:                   "Function image and dependency-image build failures by function.",
-	MetricFunctionEventsMatched:           "Logical events for which at least one of this function's rules matched, counted once per logical event per function across redeliveries/retries (deduped across the function's matching rules). A handler failure does not move an event out of this class.",
-	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the function, counted once per handler attempt across event, schedule, and manual invocations.",
-	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the function, counted once per attempt; a failed attempt that will retry is counted here too.",
-	MetricFunctionRetries:                 "Handler retries: failed handler attempts attributed to the function that will be retried according to the rule's retry budget (handler retries, not stream message reclaims).",
-	MetricFunctionDLQ:                     "Invocations attributed to the function that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. This counts the exhaustion COMMIT, not a successful DLQ write: it is incremented when the invocation's terminal exhausted marker is committed, which happens before the message-level DLQ XADD (that write occurs after every exhausted sibling invocation in the same delivery has finished and is counted by dlq_entries_total only on success).",
-	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by function and outcome; warm leases an existing idle container, cold starts a fresh container.",
-	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by function and finite teardown reason.",
+	MetricHandlerInvocations:              "Handler invocation outcomes by app and handler, counted once per handler attempt; outcome is success or failure.",
+	MetricAppBuildFailures:                "App image and dependency-image build failures by app.",
+	MetricAppEventsMatched:                "Logical events for which at least one of this app's rules matched, counted once per logical event per app across redeliveries/retries (deduped across the app's matching rules). A handler failure does not move an event out of this class.",
+	MetricFunctionHandlerSuccess:          "Successful handler executions attributed to the app, counted once per handler attempt across event, schedule, and manual invocations.",
+	MetricFunctionHandlerFailure:          "Failed handler attempts attributed to the app, counted once per attempt; a failed attempt that will retry is counted here too.",
+	MetricFunctionRetries:                 "Handler retries: failed handler attempts attributed to the app that will be retried according to the rule's retry budget (handler retries, not stream message reclaims).",
+	MetricFunctionDLQ:                     "Invocations attributed to the app that exhausted their retry budget and were marked terminal for the dead-letter queue, counted once per exhausted invocation. This counts the exhaustion COMMIT, not a successful DLQ write: it is incremented when the invocation's terminal exhausted marker is committed, which happens before the message-level DLQ XADD (that write occurs after every exhausted sibling invocation in the same delivery has finished and is counted by dlq_entries_total only on success).",
+	MetricRuntimeContainerAcquires:        "Successful warm-container pool acquires by app and outcome; warm leases an existing idle container, cold starts a fresh container.",
+	MetricRuntimeContainerDiscards:        "Warm-container pool container discards by app and finite teardown reason.",
 	MetricRuntimeContainerWaits:           "Warm-container pool acquires that had to block at the pool's capacity bound, regardless of eventual success.",
-	MetricHandlerDuration:                 "Handler attempt duration in seconds by function and handler, observed for each success and each failure attributed to a handler attempt.",
-	MetricFunctionBuild:                   "Function image and dependency-image build duration in seconds by function.",
-	MetricRuntimeContainerAcquireDuration: "Warm-container pool acquire duration in seconds by function, observed for successful acquires only and including any capacity wait.",
+	MetricHandlerDuration:                 "Handler attempt duration in seconds by app and handler, observed for each success and each failure attributed to a handler attempt.",
+	MetricAppBuild:                        "App image and dependency-image build duration in seconds by app.",
+	MetricRuntimeContainerAcquireDuration: "Warm-container pool acquire duration in seconds by app, observed for successful acquires only and including any capacity wait.",
 
 	MetricPendingEntries:      "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
 	MetricPendingOldestAge:    "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
 	MetricBufferedEvents:      "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
 	MetricInFlightInvocations: "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
 	MetricMissingPayload:      "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
-	MetricRuntimeContainers:   "Current number of warm-container pool containers by function and state (idle, busy, or starting).",
-	MetricRuntimePoolCapacity: "Current resolved per-function concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
+	MetricRuntimeContainers:   "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
+	MetricRuntimePoolCapacity: "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
 
-	MetricFunctionStatus:           "Current public lifecycle status of the function as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
+	MetricAppStatus:                "Current public lifecycle status of the app as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
 	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",
-	MetricServiceReconciles:        "Service convergence passes by function and outcome; counted once per ServiceReconciler pass, including periodic no-op verification passes.",
-	MetricServiceReconcileDuration: "Service convergence pass duration in seconds by function, observed for every pass (changed, unchanged, or failed).",
+	MetricServiceReconciles:        "Service convergence passes by app and outcome; counted once per ServiceReconciler pass, including periodic no-op verification passes.",
+	MetricServiceReconcileDuration: "Service convergence pass duration in seconds by app, observed for every pass (changed, unchanged, or failed).",
 }
 
-// FunctionStatuses is the closed set of public lifecycle statuses surfaced by
-// MetricFunctionStatus. It mirrors the state package's persisted statuses
+// AppStatuses is the closed set of public lifecycle statuses surfaced by
+// MetricAppStatus. It mirrors the state package's persisted statuses
 // (preparing/building/reconciling/ready/degraded/unavailable) by convention;
 // this leaf observability package does not import state, so the two lists are
 // kept in sync deliberately. The order here is the canonical one-hot order.
-var FunctionStatuses = []string{
+var AppStatuses = []string{
 	"preparing",
 	"building",
 	"reconciling",
@@ -261,7 +276,7 @@ const (
 )
 
 // Runtime pool gauge label values. They are a closed set so the
-// runtime_containers gauge's cardinality stays bounded by function × 3.
+// runtime_containers gauge's cardinality stays bounded by app × 3.
 const (
 	RuntimeStateIdle     = "idle"
 	RuntimeStateBusy     = "busy"
@@ -296,121 +311,121 @@ type Registry struct {
 	histogramVecs map[string]*labeledHistogramVec
 	gaugeVecs     map[string]*labeledGaugeVec
 
-	// restoredMu guards restoredDiscards, the Relay-side per-function discard
-	// aggregate restored from persisted state at startup (see SeedFunctionStat).
+	// restoredMu guards restoredDiscards, the Relay-side per-app discard
+	// aggregate restored from persisted state at startup (see SeedAppStat).
 	restoredMu sync.RWMutex
 
-	// restoredDiscards maps a function name to the cumulative warm-container
+	// restoredDiscards maps an app name to the cumulative warm-container
 	// pool discard total recovered from SQLite at worker startup. Persisted
-	// discards are stored as one per-function aggregate across the real, finite
+	// discards are stored as one per-app aggregate across the real, finite
 	// teardown reasons, so the total cannot be reconstructed into causal
 	// per-reason series. Rather than invent a synthetic Prometheus reason (which
 	// would make an a-causal `reason="restored"` series look like a real teardown
 	// cause), the restored aggregate is kept here and added to the live per-reason
 	// series when a cumulative total is reported (RuntimePoolCounters and
-	// FunctionStatsSnapshot). This keeps the exposed per-reason series strictly
+	// AppStatsSnapshot). This keeps the exposed per-reason series strictly
 	// causal while the restored total stays monotonic across restarts. It is a
-	// metrics-internal baseline, never exposed on /metrics; SeedFunctionStat
-	// seeds it, and RemoveFunction / SweepFunctionMetrics / DeleteRuntimePool
-	// clear it alongside the function's series.
+	// metrics-internal baseline, never exposed on /metrics; SeedAppStat
+	// seeds it, and RemoveApp / SweepAppMetrics / DeleteRuntimePool
+	// clear it alongside the app's series.
 	restoredDiscards map[string]int64
 
-	// funcTimestampsMu guards funcTimestamps, the per-function latest
-	// execution-history timestamps (see SetFunctionTimestamp for the semantics
+	// appTimestampsMu guards appTimestamps, the per-app latest
+	// execution-history timestamps (see SetAppTimestamp for the semantics
 	// and the deliberate non-Prometheus representation).
-	funcTimestampsMu sync.RWMutex
+	appTimestampsMu sync.RWMutex
 
-	// funcTimestamps maps a function name to its latest per-kind unix-seconds
-	// timestamps. It is the latest-known-value stage of the per-function stats
+	// appTimestamps maps an app name to its latest per-kind unix-seconds
+	// timestamps. It is the latest-known-value stage of the per-app stats
 	// pipeline: the runner overwrites entries as executions happen, and the
-	// worker's periodic SQLite snapshot (via FunctionStatsSnapshot) persists
+	// worker's periodic SQLite snapshot (via AppStatsSnapshot) persists
 	// whatever it last read. Timestamps are RELAY-side state (when did this
-	// function's handler last run?), not scrape-time observations, so they are
+	// app's handler last run?), not scrape-time observations, so they are
 	// deliberately NOT Prometheus vecs — a gauge that flips forward on every
 	// execution would be misuse, and the worker must read a coherent
 	// latest-value struct rather than scrape four series. Removal paths
-	// (RemoveFunction / SweepFunctionMetrics) delete entries alongside the
-	// function's series so a removed function cannot linger here.
-	funcTimestamps map[string][functionTimestampCount]int64
+	// (RemoveApp / SweepAppMetrics) delete entries alongside the
+	// app's series so a removed app cannot linger here.
+	appTimestamps map[string][appTimestampCount]int64
 }
 
-// FunctionTimestampKind selects exactly one of the four per-function
-// execution-history timestamps (see SetFunctionTimestamp). The constants are
-// ordered to also serve as indexes into a function's timestamp array.
-type FunctionTimestampKind int
+// AppTimestampKind selects exactly one of the four per-app
+// execution-history timestamps (see SetAppTimestamp). The constants are
+// ordered to also serve as indexes into an app's timestamp array.
+type AppTimestampKind int
 
 const (
-	// FunctionTimestampExecution is the last handler-execution attempt: set
+	// AppTimestampExecution is the last handler-execution attempt: set
 	// when an invocation attempt actually begins (when TryStart claims the
 	// invocation on the event path, or when the schedule path begins
 	// executing). Retries are executions: every claimed attempt updates it.
-	FunctionTimestampExecution FunctionTimestampKind = iota
-	// FunctionTimestampSuccess is the last successful handler execution.
-	FunctionTimestampSuccess
-	// FunctionTimestampFailure is the last failed handler execution attempt
+	AppTimestampExecution AppTimestampKind = iota
+	// AppTimestampSuccess is the last successful handler execution.
+	AppTimestampSuccess
+	// AppTimestampFailure is the last failed handler execution attempt
 	// (a failed attempt that will still retry counts here — it is not
 	// reserved for DLQ-routed failures).
-	FunctionTimestampFailure
-	// FunctionTimestampDLQ is the last invocation that exhausted its retries
+	AppTimestampFailure
+	// AppTimestampDLQ is the last invocation that exhausted its retries
 	// (the exhaustion commit), i.e. the last retry exhaustion, not a
 	// successfully written DLQ entry. It is the DLQ attribution point, set
 	// only where the runner commits an exhausted invocation — not on every
 	// failure, and not on a message-level DLQ write.
-	FunctionTimestampDLQ
+	AppTimestampDLQ
 
-	// functionTimestampCount bounds the kind space (array size below).
-	functionTimestampCount
+	// appTimestampCount bounds the kind space (array size below).
+	appTimestampCount
 )
 
-// SetFunctionTimestamp records the latest value for exactly one of the four
-// kinds on function. The runner always passes time.Now(), and startup seeding
-// (SeedFunctionStat) passes the persisted value BEFORE any live execution, so a
+// SetAppTimestamp records the latest value for exactly one of the four
+// kinds on app. The runner always passes time.Now(), and startup seeding
+// (SeedAppStat) passes the persisted value BEFORE any live execution, so a
 // simple overwrite is the correct update rule — there is never a case where a
 // caller supplies an older value that must lose to a newer one. Zero values may
 // be passed (they stand for "never observed"); seeding deliberately skips them
 // before calling, so a persisted zero/empty never materializes as an entry. A
 // nil receiver is a no-op; unknown kinds are ignored. It is nil-safe.
-func (r *Registry) SetFunctionTimestamp(function string, kind FunctionTimestampKind, ts int64) {
-	if r == nil || kind < 0 || kind >= functionTimestampCount {
+func (r *Registry) SetAppTimestamp(name string, kind AppTimestampKind, ts int64) {
+	if r == nil || kind < 0 || kind >= appTimestampCount {
 		return
 	}
-	r.funcTimestampsMu.Lock()
-	defer r.funcTimestampsMu.Unlock()
-	if r.funcTimestamps == nil {
-		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
+	r.appTimestampsMu.Lock()
+	defer r.appTimestampsMu.Unlock()
+	if r.appTimestamps == nil {
+		r.appTimestamps = make(map[string][appTimestampCount]int64)
 	}
-	arr := r.funcTimestamps[function]
+	arr := r.appTimestamps[name]
 	arr[kind] = ts
-	r.funcTimestamps[function] = arr
+	r.appTimestamps[name] = arr
 }
 
-// deleteFunctionTimestamps drops function's timestamp entry entirely. It is
-// shared by RemoveFunction and SweepFunctionMetrics so both retirement paths
+// deleteAppTimestamps drops app's timestamp entry entirely. It is
+// shared by RemoveApp and SweepAppMetrics so both retirement paths
 // clear the Relay-side timestamps too, not only the Prometheus series. The
-// caller must hold funcTimestampsMu.
-func (r *Registry) deleteFunctionTimestamps(function string) {
-	delete(r.funcTimestamps, function)
+// caller must hold appTimestampsMu.
+func (r *Registry) deleteAppTimestamps(name string) {
+	delete(r.appTimestamps, name)
 }
 
-// restoredDiscardsFor returns the internal per-function discard baseline seeded
-// from persisted state. It takes restoredMu so SeedFunctionStat can run
+// restoredDiscardsFor returns the internal per-app discard baseline seeded
+// from persisted state. It takes restoredMu so SeedAppStat can run
 // concurrently with readers; a missing entry reads 0. It is nil-safe.
-func (r *Registry) restoredDiscardsFor(function string) int64 {
+func (r *Registry) restoredDiscardsFor(name string) int64 {
 	if r == nil {
 		return 0
 	}
 	r.restoredMu.RLock()
 	defer r.restoredMu.RUnlock()
-	return r.restoredDiscards[function]
+	return r.restoredDiscards[name]
 }
 
-// deleteRestoredDiscards drops function's internal restored discard baseline.
-// It is shared by RemoveFunction, SweepFunctionMetrics, and DeleteRuntimePool
+// deleteRestoredDiscards drops app's internal restored discard baseline.
+// It is shared by RemoveApp, SweepAppMetrics, and DeleteRuntimePool
 // so every retirement path clears the Relay-side baseline alongside the
-// function's Prometheus series.
-func (r *Registry) deleteRestoredDiscards(function string) {
+// app's Prometheus series.
+func (r *Registry) deleteRestoredDiscards(name string) {
 	r.restoredMu.Lock()
-	delete(r.restoredDiscards, function)
+	delete(r.restoredDiscards, name)
 	r.restoredMu.Unlock()
 }
 
@@ -481,44 +496,45 @@ func New() *Registry {
 		r.counters[name] = c
 	}
 
-	// Handler invocation outcomes, broken out by function and handler. The
+	// Handler invocation outcomes, broken out by app and handler. The
 	// outcome label (success/failure) is the first of the canonical order; the
 	// runner passes labels unsorted, so routing matches by name below.
 	handlerInvocations := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricHandlerInvocations,
 		Help: metricHelp[MetricHandlerInvocations],
-	}, []string{"outcome", "function", "handler"})
+	}, []string{"outcome", "app", "handler"})
 	reg.MustRegister(handlerInvocations)
 	r.counterVecs[MetricHandlerInvocations] = &labeledCounterVec{
-		order: []string{"outcome", "function", "handler"},
+		order: []string{"outcome", "app", "handler"},
 		vec:   handlerInvocations,
 	}
 
-	// Image build failures, per function. Function names are validated to
-	// [a-z0-9][a-z0-9._-]* and bounded by the function count, so this label is
-	// low-cardinality.
+	// App image/dependency build failures, per app. App names are validated to
+	// [a-z0-9][a-z0-9._-]* and bounded by the app count, so this label is
+	// low-cardinality. It is app lifecycle, so the name is app_-prefixed like
+	// MetricAppBuild.
 	buildFailures := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: MetricBuildFailures,
-		Help: metricHelp[MetricBuildFailures],
-	}, []string{"function"})
+		Name: MetricAppBuildFailures,
+		Help: metricHelp[MetricAppBuildFailures],
+	}, []string{"app"})
 	reg.MustRegister(buildFailures)
-	r.counterVecs[MetricBuildFailures] = &labeledCounterVec{
-		order: []string{"function"},
+	r.counterVecs[MetricAppBuildFailures] = &labeledCounterVec{
+		order: []string{"app"},
 		vec:   buildFailures,
 	}
 
-	// Per-function operational counters, fed by the runner and read by the
-	// worker's FunctionStatsSnapshot. Each is keyed by function name only, so
-	// the worker can enumerate per-function attribution without scraping the
-	// multi-label handler_invocations_total vec. The function label is
-	// low-cardinality (bounded by the function count), matching build_failures.
+	// Per-app operational counters, fed by the runner and read by the
+	// worker's AppStatsSnapshot. Each is keyed by app name only, so
+	// the worker can enumerate per-app attribution without scraping the
+	// multi-label handler_invocations_total vec. The app label is
+	// low-cardinality (bounded by the app count), matching app_build_failures_total.
 	//
-	// Semantics (see runner.Handle): MetricFunctionEventsMatched counts a
-	// function once per logical event for which at least one of its rules
-	// matched — a functions-engaged counter, distinct from the message-level
+	// Semantics (see runner.Handle): MetricAppEventsMatched counts a
+	// app once per logical event for which at least one of its rules
+	// matched — a apps-engaged counter, distinct from the message-level
 	// MetricEventsMatched. handler success/failure are per rule execution.
 	// MetricFunctionRetries counts every failing rule execution that will be
-	// retried (a retry driver); MetricFunctionDLQ counts a function once when
+	// retried (a retry driver); MetricFunctionDLQ counts an app once when
 	// its failing rule execution is the one that exhausts the rule's retry
 	// budget (attempt >= 1+retries, per-invocation) and the invocation's
 	// terminal exhausted marker is committed. It is incremented at that
@@ -526,16 +542,20 @@ func New() *Registry {
 	// (that happens after all exhausted siblings in the same delivery finish)
 	// and may never be followed by one if that write fails — so it counts
 	// exhaustions, not successfully written DLQ entries (dlq_entries_total).
+	//
+	// The four handler-execution counters carry the function_ namespace while
+	// their identity label stays "app": they count handler work attributed to an
+	// app, not app lifecycle, and their HELP says so.
 	for _, name := range []string{
-		MetricFunctionEventsMatched,
+		MetricAppEventsMatched,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
 		MetricFunctionDLQ,
 	} {
-		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: metricHelp[name]}, []string{"function"})
+		vec := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: metricHelp[name]}, []string{"app"})
 		reg.MustRegister(vec)
-		r.counterVecs[name] = &labeledCounterVec{order: []string{"function"}, vec: vec}
+		r.counterVecs[name] = &labeledCounterVec{order: []string{"app"}, vec: vec}
 	}
 
 	// Handler and image-build durations. Both are histograms; the old hand-rolled
@@ -545,24 +565,24 @@ func New() *Registry {
 		Name:    MetricHandlerDuration,
 		Help:    metricHelp[MetricHandlerDuration],
 		Buckets: buckets,
-	}, []string{"function", "handler"})
+	}, []string{"app", "handler"})
 	reg.MustRegister(handlerDuration)
 	r.histogramVecs[MetricHandlerDuration] = &labeledHistogramVec{
-		order: []string{"function", "handler"},
+		order: []string{"app", "handler"},
 		vec:   handlerDuration,
 	}
 
-	// Image builds are always labeled by function (see runtime/manager.go); there
+	// Image builds are always labeled by app (see runtime/manager.go); there
 	// is deliberately no unlabeled build timer, which would otherwise collide
 	// with the labeled histogram under the same name.
 	buildDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    MetricFunctionBuild,
-		Help:    metricHelp[MetricFunctionBuild],
+		Name:    MetricAppBuild,
+		Help:    metricHelp[MetricAppBuild],
 		Buckets: buckets,
-	}, []string{"function"})
+	}, []string{"app"})
 	reg.MustRegister(buildDuration)
-	r.histogramVecs[MetricFunctionBuild] = &labeledHistogramVec{
-		order: []string{"function"},
+	r.histogramVecs[MetricAppBuild] = &labeledHistogramVec{
+		order: []string{"app"},
 		vec:   buildDuration,
 	}
 
@@ -589,48 +609,48 @@ func New() *Registry {
 		r.gauges[name] = g
 	}
 
-	// Warm-container pool observability. All four are function-scoped (the
+	// Warm-container pool observability. All four are app-scoped (the
 	// existing low-cardinality label) plus a small closed value set, and all are
 	// wired from the runtime pool's authoritative state (see
-	// internal/runtime/container_cache.go). They are added to functionMetrics so
-	// a removed function's series are deleted alongside its other series.
+	// internal/runtime/container_cache.go). They are added to appMetrics so
+	// a removed app's series are deleted alongside its other series.
 	poolContainers := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: MetricRuntimeContainers,
 		Help: metricHelp[MetricRuntimeContainers],
-	}, []string{"function", "state"})
+	}, []string{"app", "state"})
 	reg.MustRegister(poolContainers)
 	r.gaugeVecs[MetricRuntimeContainers] = &labeledGaugeVec{
-		order: []string{"function", "state"},
+		order: []string{"app", "state"},
 		vec:   poolContainers,
 	}
 
 	poolCapacity := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: MetricRuntimePoolCapacity,
 		Help: metricHelp[MetricRuntimePoolCapacity],
-	}, []string{"function"})
+	}, []string{"app"})
 	reg.MustRegister(poolCapacity)
 	r.gaugeVecs[MetricRuntimePoolCapacity] = &labeledGaugeVec{
-		order: []string{"function"},
+		order: []string{"app"},
 		vec:   poolCapacity,
 	}
 
 	containerAcquires := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerAcquires,
 		Help: metricHelp[MetricRuntimeContainerAcquires],
-	}, []string{"function", "outcome"})
+	}, []string{"app", "outcome"})
 	reg.MustRegister(containerAcquires)
 	r.counterVecs[MetricRuntimeContainerAcquires] = &labeledCounterVec{
-		order: []string{"function", "outcome"},
+		order: []string{"app", "outcome"},
 		vec:   containerAcquires,
 	}
 
 	containerDiscards := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerDiscards,
 		Help: metricHelp[MetricRuntimeContainerDiscards],
-	}, []string{"function", "reason"})
+	}, []string{"app", "reason"})
 	reg.MustRegister(containerDiscards)
 	r.counterVecs[MetricRuntimeContainerDiscards] = &labeledCounterVec{
-		order: []string{"function", "reason"},
+		order: []string{"app", "reason"},
 		vec:   containerDiscards,
 	}
 
@@ -638,10 +658,10 @@ func New() *Registry {
 		Name:    MetricRuntimeContainerAcquireDuration,
 		Help:    metricHelp[MetricRuntimeContainerAcquireDuration],
 		Buckets: buckets,
-	}, []string{"function"})
+	}, []string{"app"})
 	reg.MustRegister(containerAcquireDuration)
 	r.histogramVecs[MetricRuntimeContainerAcquireDuration] = &labeledHistogramVec{
-		order: []string{"function"},
+		order: []string{"app"},
 		vec:   containerAcquireDuration,
 	}
 
@@ -650,25 +670,25 @@ func New() *Registry {
 	containerWaits := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricRuntimeContainerWaits,
 		Help: metricHelp[MetricRuntimeContainerWaits],
-	}, []string{"function"})
+	}, []string{"app"})
 	reg.MustRegister(containerWaits)
 	r.counterVecs[MetricRuntimeContainerWaits] = &labeledCounterVec{
-		order: []string{"function"},
+		order: []string{"app"},
 		vec:   containerWaits,
 	}
 
-	// Function lifecycle status as a one-hot gauge. The status label is the
-	// closed FunctionStatuses set; SetFunctionStatus writes all six series for a
-	// function atomically (one 1, five 0), and the status removal path deletes
-	// them all alongside the function's other series.
-	functionStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: MetricFunctionStatus,
-		Help: metricHelp[MetricFunctionStatus],
-	}, []string{"function", "status"})
-	reg.MustRegister(functionStatus)
-	r.gaugeVecs[MetricFunctionStatus] = &labeledGaugeVec{
-		order: []string{"function", "status"},
-		vec:   functionStatus,
+	// App lifecycle status as a one-hot gauge. The status label is the
+	// closed AppStatuses set; SetAppStatus writes all six series for a
+	// app atomically (one 1, five 0), and the status removal path deletes
+	// them all alongside the app's other series.
+	appStatusVec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricAppStatus,
+		Help: metricHelp[MetricAppStatus],
+	}, []string{"app", "status"})
+	reg.MustRegister(appStatusVec)
+	r.gaugeVecs[MetricAppStatus] = &labeledGaugeVec{
+		order: []string{"app", "status"},
+		vec:   appStatusVec,
 	}
 
 	// Redis read failures, labeled solely by the finite operation set. No error
@@ -684,14 +704,14 @@ func New() *Registry {
 	}
 
 	// Service convergence passes: outcome counter (changed/unchanged/error) and
-	// duration histogram, both by the bounded function label.
+	// duration histogram, both by the bounded app label.
 	serviceReconciles := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: MetricServiceReconciles,
 		Help: metricHelp[MetricServiceReconciles],
-	}, []string{"function", "outcome"})
+	}, []string{"app", "outcome"})
 	reg.MustRegister(serviceReconciles)
 	r.counterVecs[MetricServiceReconciles] = &labeledCounterVec{
-		order: []string{"function", "outcome"},
+		order: []string{"app", "outcome"},
 		vec:   serviceReconciles,
 	}
 
@@ -699,10 +719,10 @@ func New() *Registry {
 		Name:    MetricServiceReconcileDuration,
 		Help:    metricHelp[MetricServiceReconcileDuration],
 		Buckets: buckets,
-	}, []string{"function"})
+	}, []string{"app"})
 	reg.MustRegister(serviceReconcileDuration)
 	r.histogramVecs[MetricServiceReconcileDuration] = &labeledHistogramVec{
-		order: []string{"function"},
+		order: []string{"app"},
 		vec:   serviceReconcileDuration,
 	}
 
@@ -770,20 +790,20 @@ func (r *Registry) SeedCounter(name string, v int64) {
 	r.Add(name, v)
 }
 
-// SeedFunctionStat restores a function's persisted cumulative counters into the
-// per-function CounterVecs, and its persisted execution-history timestamps into
+// SeedAppStat restores an app's persisted cumulative counters into the
+// per-app CounterVecs, and its persisted execution-history timestamps into
 // the timestamp map (zero values are SKIPPED: a persisted zero/empty timestamp
 // stands for "never observed" and must not materialize as an entry that could
 // later look newer than nothing). It is the labeled counterpart of SeedCounter:
-// the worker calls it at startup for every function_stats row so idle functions
+// the worker calls it at startup for every app_stats row so idle apps
 // keep their prior totals instead of being reset by the first snapshot. A nil
 // receiver is a no-op.
-func (r *Registry) SeedFunctionStat(f FunctionStat) {
+func (r *Registry) SeedAppStat(f AppStat) {
 	if r == nil {
 		return
 	}
-	labels := []Label{{Name: "function", Value: f.Function}}
-	r.AddLabels(MetricFunctionEventsMatched, labels, f.EventsMatchedTotal)
+	labels := []Label{{Name: "app", Value: f.App}}
+	r.AddLabels(MetricAppEventsMatched, labels, f.EventsMatchedTotal)
 	r.AddLabels(MetricFunctionHandlerSuccess, labels, f.HandlerSuccessTotal)
 	r.AddLabels(MetricFunctionHandlerFailure, labels, f.HandlerFailureTotal)
 	r.AddLabels(MetricFunctionRetries, labels, f.RetriesTotal)
@@ -792,55 +812,55 @@ func (r *Registry) SeedFunctionStat(f FunctionStat) {
 	// over the warm/cold outcome set, so they are added back to their causal
 	// series. Discards were persisted as one aggregate across the real reasons
 	// and cannot be reconstructed causally, so the total is kept as an internal
-	// per-function baseline (restoredDiscards) and folded into the cumulative
-	// total read back by RuntimePoolCounters / FunctionStatsSnapshot — the
+	// per-app baseline (restoredDiscards) and folded into the cumulative
+	// total read back by RuntimePoolCounters / AppStatsSnapshot — the
 	// exposed per-reason series stay strictly causal. Seeding a pool series also
-	// makes a function with pool activity but no event counters surface in
-	// FunctionStatsSnapshot.
+	// makes an app with pool activity but no event counters surface in
+	// AppStatsSnapshot.
 	if f.WarmAcquiresTotal > 0 {
 		r.AddLabels(MetricRuntimeContainerAcquires,
-			[]Label{{Name: "function", Value: f.Function}, {Name: "outcome", Value: RuntimeOutcomeWarm}}, f.WarmAcquiresTotal)
+			[]Label{{Name: "app", Value: f.App}, {Name: "outcome", Value: RuntimeOutcomeWarm}}, f.WarmAcquiresTotal)
 	}
 	if f.ColdStartsTotal > 0 {
 		r.AddLabels(MetricRuntimeContainerAcquires,
-			[]Label{{Name: "function", Value: f.Function}, {Name: "outcome", Value: RuntimeOutcomeCold}}, f.ColdStartsTotal)
+			[]Label{{Name: "app", Value: f.App}, {Name: "outcome", Value: RuntimeOutcomeCold}}, f.ColdStartsTotal)
 	}
 	if f.DiscardedTotal > 0 {
 		r.restoredMu.Lock()
 		if r.restoredDiscards == nil {
 			r.restoredDiscards = make(map[string]int64)
 		}
-		r.restoredDiscards[f.Function] += f.DiscardedTotal
+		r.restoredDiscards[f.App] += f.DiscardedTotal
 		r.restoredMu.Unlock()
 	}
-	r.funcTimestampsMu.Lock()
-	if r.funcTimestamps == nil {
-		r.funcTimestamps = make(map[string][functionTimestampCount]int64)
+	r.appTimestampsMu.Lock()
+	if r.appTimestamps == nil {
+		r.appTimestamps = make(map[string][appTimestampCount]int64)
 	}
-	arr := r.funcTimestamps[f.Function]
+	arr := r.appTimestamps[f.App]
 	if f.LastExecution > 0 {
-		arr[FunctionTimestampExecution] = f.LastExecution
+		arr[AppTimestampExecution] = f.LastExecution
 	}
 	if f.LastSuccess > 0 {
-		arr[FunctionTimestampSuccess] = f.LastSuccess
+		arr[AppTimestampSuccess] = f.LastSuccess
 	}
 	if f.LastFailure > 0 {
-		arr[FunctionTimestampFailure] = f.LastFailure
+		arr[AppTimestampFailure] = f.LastFailure
 	}
 	if f.LastDLQ > 0 {
-		arr[FunctionTimestampDLQ] = f.LastDLQ
+		arr[AppTimestampDLQ] = f.LastDLQ
 	}
 	// Store the (possibly untouched) array only when at least one timestamp was
-	// seeded — a function with no counters and no timestamps gains nothing.
+	// seeded — an app with no counters and no timestamps gains nothing.
 	if f.LastExecution > 0 || f.LastSuccess > 0 || f.LastFailure > 0 || f.LastDLQ > 0 {
-		r.funcTimestamps[f.Function] = arr
+		r.appTimestamps[f.App] = arr
 	}
-	r.funcTimestampsMu.Unlock()
+	r.appTimestampsMu.Unlock()
 }
 
 // ObserveDuration records a single duration observation against the labeled
 // histogram for name (see ObserveDurationLabels). A nil receiver is a no-op.
-// The only caller that once used the unlabeled form (MetricFunctionBuild in
+// The only caller that once used the unlabeled form (MetricAppBuild in
 // runtime/manager.go) now records the labeled version, so an unlabeled histogram
 // is unnecessary and this method routes to the labeled one.
 func (r *Registry) ObserveDuration(name string, d time.Duration) {
@@ -886,44 +906,44 @@ func (r *Registry) SetGaugeLabels(name string, labels []Label, v float64) {
 	}
 }
 
-// SetFunctionStatus writes the one-hot lifecycle status series for a function:
+// SetAppStatus writes the one-hot lifecycle status series for an app:
 // exactly the series for status is set to 1 and every other allowed
-// FunctionStatuses value is set to 0, so the exposed set is always coherent and
-// bounded by function × len(FunctionStatuses). The write is a no-op for an
+// AppStatuses value is set to 0, so the exposed set is always coherent and
+// bounded by app × len(AppStatuses). The write is a no-op for an
 // unknown status (only the closed set is representable) and for a nil receiver.
-// It creates any missing series, so a function's first status write surfaces all
+// It creates any missing series, so an app's first status write surfaces all
 // six series rather than only the current one. It never touches Prometheus
 // counters (one-hot gauges are set, not incremented).
-func (r *Registry) SetFunctionStatus(function, status string) {
-	if r == nil || !isFunctionStatus(status) {
+func (r *Registry) SetAppStatus(name, status string) {
+	if r == nil || !isAppStatus(status) {
 		return
 	}
-	for _, s := range FunctionStatuses {
+	for _, s := range AppStatuses {
 		v := 0.0
 		if s == status {
 			v = 1
 		}
-		r.SetGaugeLabels(MetricFunctionStatus, []Label{{Name: "function", Value: function}, {Name: "status", Value: s}}, v)
+		r.SetGaugeLabels(MetricAppStatus, []Label{{Name: "app", Value: name}, {Name: "status", Value: s}}, v)
 	}
 }
 
-// RemoveFunctionStatus deletes every MetricFunctionStatus series labeled
-// function=name, so a removed/pruned function leaves no stale one-hot status
-// behind. It is idempotent and nil-safe. RemoveFunction/SweepFunctionMetrics
-// also delete these series through the shared function-scoped cleanup (the vec is
-// in functionMetrics and classified partial); this method exists for the status
+// RemoveAppStatus deletes every MetricAppStatus series labeled
+// app=name, so a removed/pruned app leaves no stale one-hot status
+// behind. It is idempotent and nil-safe. RemoveApp/SweepAppMetrics
+// also delete these series through the shared app-scoped cleanup (the vec is
+// in appMetrics and classified partial); this method exists for the status
 // observer's explicit removal so a status removal never has to go through the
 // broader cleanup.
-func (r *Registry) RemoveFunctionStatus(name string) {
+func (r *Registry) RemoveAppStatus(name string) {
 	if r == nil {
 		return
 	}
-	r.deleteFunction(MetricFunctionStatus, name)
+	r.deleteApp(MetricAppStatus, name)
 }
 
-// isFunctionStatus reports whether status is one of the closed FunctionStatuses.
-func isFunctionStatus(status string) bool {
-	for _, s := range FunctionStatuses {
+// isAppStatus reports whether status is one of the closed AppStatuses.
+func isAppStatus(status string) bool {
+	for _, s := range AppStatuses {
 		if s == status {
 			return true
 		}
@@ -947,12 +967,13 @@ func (r *Registry) Counter(name string) int64 {
 	return int64(m.Counter.GetValue())
 }
 
-// FunctionStat is the per-function operational snapshot read from the
-// function_* CounterVecs. It is the metrics-side view the worker maps into the
-// state layer's function_stats table.
-type FunctionStat struct {
-	Function string
-	// EventsMatchedTotal counts a function once per logical event at least one
+// AppStat is the per-app operational snapshot read from the
+// app-labeled per-app CounterVecs (app_events_matched_total plus the
+// function_* handler-execution counters). It is the metrics-side view the
+// worker maps into the state layer's app_stats table.
+type AppStat struct {
+	App string
+	// EventsMatchedTotal counts an app once per logical event at least one
 	// of its rules matched. HandlerSuccessTotal/HandlerFailureTotal are per rule
 	// execution. RetriesTotal counts failed handler attempts that will retry
 	// (handler retries, not stream message reclaims). DLQTotal counts the
@@ -968,14 +989,14 @@ type FunctionStat struct {
 	// DiscardedTotal is the sum of the live, causal per-reason series PLUS the
 	// internal restored baseline (persisted state seeded at startup), so it stays
 	// monotonic across restarts without exposing a synthetic reason series. They
-	// are the metrics-side source for the persisted per-function pool counters
+	// are the metrics-side source for the persisted per-app pool counters
 	// and the standalone CLI's Runtime pool section.
 	WarmAcquiresTotal int64
 	ColdStartsTotal   int64
 	DiscardedTotal    int64
 
-	// Unix-seconds timestamps (0 = never observed), fed by SetFunctionTimestamp
-	// and seeded from SQLite at startup (see SeedFunctionStat). They mirror the
+	// Unix-seconds timestamps (0 = never observed), fed by SetAppTimestamp
+	// and seeded from SQLite at startup (see SeedAppStat). They mirror the
 	// runner's execution-history attribution:
 	//   - LastExecution: the last handler-execution attempt (retries included,
 	//     since every claimed attempt is an execution).
@@ -990,62 +1011,62 @@ type FunctionStat struct {
 	LastDLQ       int64
 }
 
-// FunctionStatsSnapshot reads the per-function CounterVecs — the five
+// AppStatsSnapshot reads the per-app CounterVecs — the five
 // operational counters (events matched, handler success/failure, retries, DLQ)
 // plus the warm-container pool acquires/discards counters
 // (discards summed across every live reason, plus the internal restored
-// baseline) — and, for every function that has at
+// baseline) — and, for every app that has at
 // least one series, fills the four execution-history timestamp fields from the
-// timestamp map (a function with counters but no timestamp entry gets zeros). A
+// timestamp map (an app with counters but no timestamp entry gets zeros). A
 // timestamp-only entry (in place but no series,
 // i.e. all counters zero) does NOT create a snapshot entry on its own: the
 // series absence and Prometheus's zero-value lazy semantics make such an entry
 // inconsistent with the counters, and the state layer's case-guarded upsert
 // preserves persisted timestamps across empty incoming values anyway — so
 // dropping a timestamp-only read here never erases SQLite history.
-// It is nil-safe and returns nil when no function has been attributed yet. The
-// relay_function_* metrics are Relay-specific, so this Relay-specific helper
-// lives here rather than in the worker.
-func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
+// It is nil-safe and returns nil when no app has been attributed yet. The
+// app-labeled Relay-specific metrics are gathered here, so this Relay-specific
+// helper lives here rather than in the worker.
+func (r *Registry) AppStatsSnapshot() []AppStat {
 	if r == nil {
 		return nil
 	}
 	// Read the timestamp map under its lock FIRST, so a timestamp entry alone
 	// (all counters benignly zero) still surfaces in the snapshot, and counters
 	// then fill the (possibly zero) timestamp fields for counter-only
-	// functions.
-	tsByFn := make(map[string][functionTimestampCount]int64)
-	r.funcTimestampsMu.RLock()
-	for fn, arr := range r.funcTimestamps {
+	// apps.
+	tsByFn := make(map[string][appTimestampCount]int64)
+	r.appTimestampsMu.RLock()
+	for fn, arr := range r.appTimestamps {
 		tsByFn[fn] = arr
 	}
-	r.funcTimestampsMu.RUnlock()
-	// Gather the whole registry once and group the relay_function_* series by
-	// function name. The label order is fixed to ["function"], so the single
-	// label value is the name.
+	r.appTimestampsMu.RUnlock()
+	// Gather the whole registry once and group the app-labeled
+	// per-app series by app name. The label order is fixed to ["app"], so the
+	// single label value is the name.
 	families, err := r.reg.Gather()
 	if err != nil {
 		return nil
 	}
-	byName := make(map[string]*FunctionStat)
+	byName := make(map[string]*AppStat)
 	for _, f := range families {
 		name := f.GetName()
-		if !isFunctionMetric(name) {
+		if !isAppMetric(name) {
 			continue
 		}
 		for _, m := range f.GetMetric() {
-			fn := labelValue(m, "function")
+			fn := labelValue(m, "app")
 			if fn == "" {
 				continue
 			}
 			fs := byName[fn]
 			if fs == nil {
-				fs = &FunctionStat{Function: fn}
+				fs = &AppStat{App: fn}
 				byName[fn] = fs
 			}
 			v := int64(m.Counter.GetValue())
 			switch name {
-			case MetricFunctionEventsMatched:
+			case MetricAppEventsMatched:
 				fs.EventsMatchedTotal = v
 			case MetricFunctionHandlerSuccess:
 				fs.HandlerSuccessTotal = v
@@ -1068,9 +1089,9 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 		}
 	}
 	// Fold the internal restored discard baseline into the cumulative
-	// per-function total. Persisted discards could not be reconstructed into
+	// per-app total. Persisted discards could not be reconstructed into
 	// causal per-reason series, so the baseline lives outside Prometheus; adding
-	// it here keeps DiscardedTotal monotonic across restarts (and lets a function
+	// it here keeps DiscardedTotal monotonic across restarts (and lets an app
 	// with ONLY a restored discard total still surface, preserving the prior
 	// behavior of the removed synthetic series). The exposed per-reason series
 	// remain strictly causal.
@@ -1081,42 +1102,42 @@ func (r *Registry) FunctionStatsSnapshot() []FunctionStat {
 		}
 		fs := byName[fn]
 		if fs == nil {
-			fs = &FunctionStat{Function: fn}
+			fs = &AppStat{App: fn}
 			byName[fn] = fs
 		}
 		fs.DiscardedTotal += baseline
 	}
 	r.restoredMu.RUnlock()
-	// Merge the timestamp map into the grouped stats: only functions that
+	// Merge the timestamp map into the grouped stats: only apps that
 	// already surfaced via series get their timestamp fields filled (see the
 	// doc comment's rationale for NOT creating timestamp-only entries).
 	for fn, arr := range tsByFn {
 		if fs, ok := byName[fn]; ok {
-			fs.LastExecution = arr[FunctionTimestampExecution]
-			fs.LastSuccess = arr[FunctionTimestampSuccess]
-			fs.LastFailure = arr[FunctionTimestampFailure]
-			fs.LastDLQ = arr[FunctionTimestampDLQ]
+			fs.LastExecution = arr[AppTimestampExecution]
+			fs.LastSuccess = arr[AppTimestampSuccess]
+			fs.LastFailure = arr[AppTimestampFailure]
+			fs.LastDLQ = arr[AppTimestampDLQ]
 		}
 	}
 	if len(byName) == 0 {
 		return nil
 	}
-	out := make([]FunctionStat, 0, len(byName))
+	out := make([]AppStat, 0, len(byName))
 	for _, fs := range byName {
 		out = append(out, *fs)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Function < out[j].Function })
+	sort.Slice(out, func(i, j int) bool { return out[i].App < out[j].App })
 	return out
 }
 
-// isFunctionMetric reports whether name is one of the per-function CounterVecs
-// read by FunctionStatsSnapshot. It includes the warm-container pool counters
+// isAppMetric reports whether name is one of the per-app CounterVecs
+// read by AppStatsSnapshot. It includes the warm-container pool counters
 // (acquires and discards) so their cumulative totals are persisted alongside
 // the operational counters; the pool's gauges/histogram are deliberately absent
-// (they are not cumulative per-function snapshots).
-func isFunctionMetric(name string) bool {
+// (they are not cumulative per-app snapshots).
+func isAppMetric(name string) bool {
 	switch name {
-	case MetricFunctionEventsMatched,
+	case MetricAppEventsMatched,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
@@ -1128,38 +1149,38 @@ func isFunctionMetric(name string) bool {
 	return false
 }
 
-// functionMetrics lists the labeled vecs that carry the function label, in
-// registration order. Function lifecycle cleanup iterates it so a removed
-// function's series are deleted across every function-scoped collector in one
+// appMetrics lists the labeled vecs that carry the app label, in
+// registration order. App lifecycle cleanup iterates it so a removed
+// app's series are deleted across every app-scoped collector in one
 // pass. Global (unlabeled) metrics are deliberately absent: they are
 // process-lifetime and never deleted.
-var functionMetrics = []string{
+var appMetrics = []string{
 	MetricHandlerInvocations,
-	MetricBuildFailures,
-	MetricFunctionEventsMatched,
+	MetricAppBuildFailures,
+	MetricAppEventsMatched,
 	MetricFunctionHandlerSuccess,
 	MetricFunctionHandlerFailure,
 	MetricFunctionRetries,
 	MetricFunctionDLQ,
 	MetricHandlerDuration,
-	MetricFunctionBuild,
+	MetricAppBuild,
 	MetricRuntimeContainers,
 	MetricRuntimePoolCapacity,
 	MetricRuntimeContainerAcquires,
 	MetricRuntimeContainerDiscards,
 	MetricRuntimeContainerAcquireDuration,
 	MetricRuntimeContainerWaits,
-	MetricFunctionStatus,
+	MetricAppStatus,
 	MetricServiceReconciles,
 	MetricServiceReconcileDuration,
 }
 
-// isFunctionCarryingMetric reports whether name is one of the labeled vecs that
-// carry the function label (see functionMetrics). It is the sweep's filter: a
-// family is only swept when its series are function-scoped, so global metrics
+// isAppCarryingMetric reports whether name is one of the labeled vecs that
+// carry the app label (see appMetrics). It is the sweep's filter: a
+// family is only swept when its series are app-scoped, so global metrics
 // are never touched.
-func isFunctionCarryingMetric(name string) bool {
-	for _, n := range functionMetrics {
+func isAppCarryingMetric(name string) bool {
+	for _, n := range appMetrics {
 		if n == name {
 			return true
 		}
@@ -1167,10 +1188,10 @@ func isFunctionCarryingMetric(name string) bool {
 	return false
 }
 
-// functionRemovedRuntimeMetrics lists the warm-container pool vecs for the
+// appRemovedRuntimeMetrics lists the warm-container pool vecs for the
 // narrow deletion performed by DeleteRuntimePool. It is a subset of
-// functionMetrics.
-var functionRemovedRuntimeMetrics = []string{
+// appMetrics.
+var appRemovedRuntimeMetrics = []string{
 	MetricRuntimeContainers,
 	MetricRuntimePoolCapacity,
 	MetricRuntimeContainerAcquires,
@@ -1180,64 +1201,64 @@ var functionRemovedRuntimeMetrics = []string{
 }
 
 // DeleteRuntimePool deletes only the warm-container pool series labeled
-// function=name, leaving every other function-scoped collector untouched. It is
-// the runtime's own cleanup hook: containerCache.removeFunction calls it while
+// app=name, leaving every other app-scoped collector untouched. It is
+// the runtime's own cleanup hook: containerCache.removeApp calls it while
 // holding the removal tombstone (both the cache lock and, when a pool exists,
 // the pool lock), so no concurrent pool metric writer can recreate a deleted
-// series. The broader Registry.RemoveFunction (the worker's hook) deletes all of
-// a function's series too; this narrower method lets the runtime be
+// series. The broader Registry.RemoveApp (the worker's hook) deletes all of
+// an app's series too; this narrower method lets the runtime be
 // self-sufficient without reaching into the runner's collectors. Nil-safe and
 // idempotent, and it does not create any series.
 func (r *Registry) DeleteRuntimePool(name string) {
 	if r == nil {
 		return
 	}
-	for _, n := range functionRemovedRuntimeMetrics {
-		r.deleteFunction(n, name)
+	for _, n := range appRemovedRuntimeMetrics {
+		r.deleteApp(n, name)
 	}
-	// Drop the internal restored discard baseline too, so a removed function's
+	// Drop the internal restored discard baseline too, so a removed app's
 	// restored aggregate is not folded into a (now nonexistent) pool total.
 	r.deleteRestoredDiscards(name)
 }
 
-// RemoveFunction deletes every metric series labeled function=<name> across all
-// function-scoped vecs. Global metrics and other functions' series are
+// RemoveApp deletes every metric series labeled app=<name> across all
+// app-scoped vecs. Global metrics and other apps' series are
 // untouched. Nil-safe; unknown names are a no-op. It is the reconciliation-time
-// cleanup: when a function directory vanishes, the wired RemoveFunction hook
+// cleanup: when an app directory vanishes, the wired RemoveApp hook
 // (see internal/worker) calls this so its stale Prometheus series do not linger
 // on /metrics after SQLite state is dropped.
 //
 // MetricHandlerInvocations and MetricHandlerDuration carry a second
-// variable label alongside function (outcome/handler respectively), and
+// variable label alongside app (outcome/handler respectively), and
 // prometheus DeleteLabelValues requires a value for EVERY variable label — so
-// those two are deleted by partial match on the function label. Every
-// single-function-label vec is deleted by label value. DeletePartialMatch and
+// those two are deleted by partial match on the app label. Every
+// single-app-label vec is deleted by label value. DeletePartialMatch and
 // DeleteLabelValues each lock the vec's metricMap internally, so no additional
 // lock is taken here. It is idempotent: calling it repeatedly (or for a name
 // with no series) is safe and a no-op. The Relay-side timestamp entry is deleted
-// alongside the series, so a removed function never lingers in
-// FunctionStatsSnapshot via its timestamps.
-func (r *Registry) RemoveFunction(name string) {
+// alongside the series, so a removed app never lingers in
+// AppStatsSnapshot via its timestamps.
+func (r *Registry) RemoveApp(name string) {
 	if r == nil {
 		return
 	}
-	for _, n := range functionMetrics {
-		r.deleteFunction(n, name)
+	for _, n := range appMetrics {
+		r.deleteApp(n, name)
 	}
-	r.funcTimestampsMu.Lock()
-	r.deleteFunctionTimestamps(name)
-	r.funcTimestampsMu.Unlock()
+	r.appTimestampsMu.Lock()
+	r.deleteAppTimestamps(name)
+	r.appTimestampsMu.Unlock()
 	r.deleteRestoredDiscards(name)
 }
 
-// SweepFunctionMetrics deletes stale function-scoped series for every function
+// SweepAppMetrics deletes stale app-scoped series for every app
 // name NOT in live. It is used by the worker's stats flush to enforce the
-// "removed function => no exposed series" invariant even when an in-flight
-// invocation recreates a series after RemoveFunction: the live set comes from
-// the state database (state.FunctionNames), and any series whose function is not
-// live is swept. Global metrics and live functions' series are untouched.
+// "removed app => no exposed series" invariant even when an in-flight
+// invocation recreates a series after RemoveApp: the live set comes from
+// the state database (state.AppNames), and any series whose app is not
+// live is swept. Global metrics and live apps' series are untouched.
 // Nil-safe; a Gather error returns silently (metrics are best-effort).
-func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
+func (r *Registry) SweepAppMetrics(live map[string]bool) {
 	if r == nil {
 		return
 	}
@@ -1247,31 +1268,31 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 	}
 	for _, f := range families {
 		name := f.GetName()
-		if !isFunctionCarryingMetric(name) {
+		if !isAppCarryingMetric(name) {
 			continue
 		}
-		// Collect the function label values present in this family, then delete
+		// Collect the app label values present in this family, then delete
 		// each that is not live. Deleting inside the same pass is fine: gathered
 		// metrics are a snapshot, and the delete APIs lock the vec internally.
 		for _, m := range f.GetMetric() {
-			fn := labelValue(m, "function")
+			fn := labelValue(m, "app")
 			if fn == "" || live[fn] {
 				continue
 			}
-			r.deleteFunction(name, fn)
+			r.deleteApp(name, fn)
 		}
 	}
-	// Sweep the timestamp map with the same live set, so a removed function's
+	// Sweep the timestamp map with the same live set, so a removed app's
 	// Relay-side execution-history entry is dropped alongside its series.
-	r.funcTimestampsMu.Lock()
-	for fn := range r.funcTimestamps {
+	r.appTimestampsMu.Lock()
+	for fn := range r.appTimestamps {
 		if !live[fn] {
-			delete(r.funcTimestamps, fn)
+			delete(r.appTimestamps, fn)
 		}
 	}
-	r.funcTimestampsMu.Unlock()
+	r.appTimestampsMu.Unlock()
 	// Sweep the internal restored discard baseline with the same live set so a
-	// removed function's restored aggregate is not folded into a future snapshot.
+	// removed app's restored aggregate is not folded into a future snapshot.
 	r.restoredMu.Lock()
 	for fn := range r.restoredDiscards {
 		if !live[fn] {
@@ -1281,26 +1302,26 @@ func (r *Registry) SweepFunctionMetrics(live map[string]bool) {
 	r.restoredMu.Unlock()
 }
 
-// deleteFunction removes every series labeled function=fn from the named vec,
+// deleteApp removes every series labeled app=fn from the named vec,
 // using the delete strategy appropriate to its label set. It is shared by
-// RemoveFunction and SweepFunctionMetrics so both retirement paths behave
-// identically. Each vec that carries function plus another variable label — the
-// counter MetricHandlerInvocations (outcome,function,handler), the histogram
-// MetricHandlerDuration (function,handler), and the runtime pool gauges/counters
-// (function,state/outcome/reason) — is deleted by partial match: prometheus
+// RemoveApp and SweepAppMetrics so both retirement paths behave
+// identically. Each vec that carries app plus another variable label — the
+// counter MetricHandlerInvocations (outcome,app,handler), the histogram
+// MetricHandlerDuration (app,handler), and the runtime pool gauges/counters
+// (app,state/outcome/reason) — is deleted by partial match: prometheus
 // DeleteLabelValues requires a value for EVERY variable label, so passing only
-// the function name matches nothing on a multi-label vec. Every
-// single-function-label vec is deleted by label value directly.
+// the app name matches nothing on a multi-label vec. Every
+// single-app-label vec is deleted by label value directly.
 //
-// WARNING: any NEW vec carrying the function label must be added to
-// functionMetrics AND, when it has more than the single function variable
+// WARNING: any NEW vec carrying the app label must be added to
+// appMetrics AND, when it has more than the single app variable
 // label, classified for DeletePartialMatch by setting the `partial` flag below —
-// otherwise function lifecycle cleanup silently misses it.
-func (r *Registry) deleteFunction(name, fn string) {
-	partial := isPartialFunctionMetric(name)
+// otherwise app lifecycle cleanup silently misses it.
+func (r *Registry) deleteApp(name, fn string) {
+	partial := isPartialAppMetric(name)
 	if lc, ok := r.counterVecs[name]; ok {
 		if partial {
-			lc.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+			lc.vec.DeletePartialMatch(prometheus.Labels{"app": fn})
 		} else {
 			lc.vec.DeleteLabelValues(fn)
 		}
@@ -1308,33 +1329,33 @@ func (r *Registry) deleteFunction(name, fn string) {
 	}
 	if lh, ok := r.histogramVecs[name]; ok {
 		if partial {
-			lh.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+			lh.vec.DeletePartialMatch(prometheus.Labels{"app": fn})
 		} else {
-			// MetricFunctionBuild, MetricRuntimeContainerAcquireDuration.
+			// MetricAppBuild, MetricRuntimeContainerAcquireDuration.
 			lh.vec.DeleteLabelValues(fn)
 		}
 		return
 	}
 	if gv, ok := r.gaugeVecs[name]; ok {
 		if partial {
-			gv.vec.DeletePartialMatch(prometheus.Labels{"function": fn})
+			gv.vec.DeletePartialMatch(prometheus.Labels{"app": fn})
 		} else {
 			gv.vec.DeleteLabelValues(fn)
 		}
 	}
 }
 
-// isPartialFunctionMetric reports whether the named function-carrying vec has
-// more than the single function variable label, and therefore must be deleted
-// with DeletePartialMatch (see deleteFunction).
-func isPartialFunctionMetric(name string) bool {
+// isPartialAppMetric reports whether the named app-carrying vec has
+// more than the single app variable label, and therefore must be deleted
+// with DeletePartialMatch (see deleteApp).
+func isPartialAppMetric(name string) bool {
 	switch name {
 	case MetricHandlerInvocations,
 		MetricHandlerDuration,
 		MetricRuntimeContainers,
 		MetricRuntimeContainerAcquires,
 		MetricRuntimeContainerDiscards,
-		MetricFunctionStatus,
+		MetricAppStatus,
 		MetricServiceReconciles:
 		return true
 	}
@@ -1371,7 +1392,7 @@ func (r *Registry) Gauge(name string) float64 {
 
 // GaugeLabels returns the current value of the labeled gauge name under the
 // given label subset, or 0 when the metric or series has no value yet. It is the
-// read counterpart of SetGaugeLabels used by the `relay function inspect`
+// read counterpart of SetGaugeLabels used by the `relay app inspect`
 // runtime-pool section (which reads live gauges) and by tests. A nil receiver
 // returns 0.
 func (r *Registry) GaugeLabels(name string, labels []Label) float64 {
@@ -1451,12 +1472,12 @@ func labelValuesMatch(m *dto.Metric, order, want []string) bool {
 }
 
 // RuntimePoolCounters reads the cumulative warm-container pool counters for one
-// function: warm acquires, cold starts, and discards (all reasons summed). It is
+// app: warm acquires, cold starts, and discards (all reasons summed). It is
 // a convenience for the runtime's PoolSnapshot, and it reads only EXISTING
 // series from a single Gather — unlike CounterLabels it never creates a
 // zero-valued series as a side effect of an inspect read. A nil receiver
 // returns zeros.
-func (r *Registry) RuntimePoolCounters(function string) (warm, cold, discarded int64) {
+func (r *Registry) RuntimePoolCounters(name string) (warm, cold, discarded int64) {
 	if r == nil {
 		return 0, 0, 0
 	}
@@ -1468,7 +1489,7 @@ func (r *Registry) RuntimePoolCounters(function string) (warm, cold, discarded i
 		switch f.GetName() {
 		case MetricRuntimeContainerAcquires:
 			for _, m := range f.GetMetric() {
-				if labelValue(m, "function") != function {
+				if labelValue(m, "app") != name {
 					continue
 				}
 				switch labelValue(m, "outcome") {
@@ -1480,7 +1501,7 @@ func (r *Registry) RuntimePoolCounters(function string) (warm, cold, discarded i
 			}
 		case MetricRuntimeContainerDiscards:
 			for _, m := range f.GetMetric() {
-				if labelValue(m, "function") == function {
+				if labelValue(m, "app") == name {
 					discarded += int64(m.Counter.GetValue())
 				}
 			}
@@ -1488,7 +1509,7 @@ func (r *Registry) RuntimePoolCounters(function string) (warm, cold, discarded i
 	}
 	// Add the internal restored baseline so the cumulative total stays monotonic
 	// across restarts without exposing a synthetic reason series.
-	discarded += r.restoredDiscardsFor(function)
+	discarded += r.restoredDiscardsFor(name)
 	return warm, cold, discarded
 }
 

@@ -4,20 +4,20 @@ import (
 	"strings"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
-// TestUniqueRespectsFunctionNameCap pins Unique's output to function.ValidName
+// TestUniqueRespectsAppNameCap pins Unique's output to app.ValidName
 // for a very long raw test name, the exact shape that broke the integration
 // suite when the old construction appended a stamp without truncating.
-func TestUniqueRespectsFunctionNameCap(t *testing.T) {
+func TestUniqueRespectsAppNameCap(t *testing.T) {
 	long := "TestIntegrationGracefulShutdownMidHandler/with-a-deeply/nested/subtest-name-that-is-far-too-long"
 	got := Unique("shutdown", long)
 
 	if len(got) > nameMaxLen {
 		t.Fatalf("Unique() = %q (%d chars), want <= %d", got, len(got), nameMaxLen)
 	}
-	if err := function.ValidName(got); err != nil {
+	if err := app.ValidName(got); err != nil {
 		t.Fatalf("Unique() = %q is not a valid function name: %v", got, err)
 	}
 	if !strings.HasPrefix(got, "shutdown-") {
@@ -29,7 +29,7 @@ func TestUniqueRespectsFunctionNameCap(t *testing.T) {
 // and the trailing decimal nanosecond stamp.
 func TestUniqueIsSanitizedAndStamped(t *testing.T) {
 	got := Unique("recon", "Test Thing/With Spaces")
-	if err := function.ValidName(got); err != nil {
+	if err := app.ValidName(got); err != nil {
 		t.Fatalf("Unique() = %q is not a valid function name: %v", got, err)
 	}
 	if !strings.HasPrefix(got, "recon-test-thing-with-spaces-") {
@@ -45,7 +45,7 @@ func TestUniqueIsSanitizedAndStamped(t *testing.T) {
 // usable (all separators trimmed), which must still yield a valid name.
 func TestUniqueEmptySanitizedComponent(t *testing.T) {
 	got := Unique("svc", "-")
-	if err := function.ValidName(got); err != nil {
+	if err := app.ValidName(got); err != nil {
 		t.Fatalf("Unique() = %q is not a valid function name: %v", got, err)
 	}
 }
@@ -53,7 +53,7 @@ func TestUniqueEmptySanitizedComponent(t *testing.T) {
 // TestUniqueNameMatchesUnique keeps the *testing.T and pure variants in sync.
 func TestUniqueNameMatchesUnique(t *testing.T) {
 	got := UniqueName(t, "recon")
-	if err := function.ValidName(got); err != nil {
+	if err := app.ValidName(got); err != nil {
 		t.Fatalf("UniqueName() = %q is not a valid function name: %v", got, err)
 	}
 	if !strings.HasPrefix(got, "recon-"+sanitizeNameComponent(t.Name())+"-") {

@@ -13,7 +13,7 @@ import (
 
 // healthCommand builds the `relay health` subcommand. It reports whether the
 // RUNNING worker is healthy by dialing the worker's control socket
-// (worker.CheckReady) — the same socket `function inspect` and `stats reset`
+// (worker.CheckReady) — the same socket `app inspect` and `stats reset`
 // use — and exits 0 only when the worker reports ready with its live
 // dependencies healthy, 1 otherwise. It is the single user-facing
 // health/readiness query.

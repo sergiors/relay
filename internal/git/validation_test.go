@@ -203,7 +203,7 @@ func TestSyncFromConfigRejectsInvalidConfigBeforeOps(t *testing.T) {
 			dir := t.TempDir()
 			o := NewSyncOptions()
 			o.CheckoutDir = filepath.Join(dir, "checkout")
-			o.FunctionsDir = filepath.Join(dir, "functions")
+			o.AppsDir = filepath.Join(dir, "functions")
 			o.CloneURL = filepath.Join(dir, "remote.git")
 			ops := &countingOps{}
 			auth := &countingBuilder{}
@@ -219,7 +219,7 @@ func TestSyncFromConfigRejectsInvalidConfigBeforeOps(t *testing.T) {
 			if _, serr := os.Stat(o.CheckoutDir); !os.IsNotExist(serr) {
 				t.Fatalf("checkout dir was touched: %v", serr)
 			}
-			if _, serr := os.Stat(o.FunctionsDir); !os.IsNotExist(serr) {
+			if _, serr := os.Stat(o.AppsDir); !os.IsNotExist(serr) {
 				t.Fatalf("functions dir was touched: %v", serr)
 			}
 		})
@@ -247,7 +247,7 @@ func TestSyncFromConfigRejectsInvalidOverridesBeforeOps(t *testing.T) {
 			dir := t.TempDir()
 			o := NewSyncOptions()
 			o.CheckoutDir = filepath.Join(dir, "checkout")
-			o.FunctionsDir = filepath.Join(dir, "functions")
+			o.AppsDir = filepath.Join(dir, "functions")
 			c.opts(&o)
 			ops := &countingOps{}
 			auth := &countingBuilder{}
@@ -266,7 +266,7 @@ func TestSyncFromConfigRejectsInvalidOverridesBeforeOps(t *testing.T) {
 
 // TestSyncRejectsHandEditedInvalidConfigFile pins the end-to-end file path: a
 // hand-edited invalid source.json is rejected by Sync before it constructs any
-// transport, creates a checkout, or materializes /functions.
+// transport, creates a checkout, or materializes /apps.
 func TestSyncRejectsHandEditedInvalidConfigFile(t *testing.T) {
 	for _, raw := range []string{
 		`{"repository":"https://github.com/a/r","ref":"main"}`,
@@ -286,7 +286,7 @@ func TestSyncRejectsHandEditedInvalidConfigFile(t *testing.T) {
 		o := NewSyncOptions()
 		o.ConfigPath = cfgPath
 		o.CheckoutDir = filepath.Join(dir, "checkout")
-		o.FunctionsDir = filepath.Join(dir, "functions")
+		o.AppsDir = filepath.Join(dir, "functions")
 		o.CloneURL = filepath.Join(dir, "remote.git")
 
 		if err := Sync(context.Background(), o); err == nil {
@@ -295,7 +295,7 @@ func TestSyncRejectsHandEditedInvalidConfigFile(t *testing.T) {
 		if _, serr := os.Stat(o.CheckoutDir); !os.IsNotExist(serr) {
 			t.Fatalf("checkout created for invalid config: %v", serr)
 		}
-		if _, serr := os.Stat(o.FunctionsDir); !os.IsNotExist(serr) {
+		if _, serr := os.Stat(o.AppsDir); !os.IsNotExist(serr) {
 			t.Fatalf("functions dir created for invalid config: %v", serr)
 		}
 	}
@@ -345,7 +345,7 @@ func TestValidationErrorsNeverLeakKeyMaterial(t *testing.T) {
 	o := NewSyncOptions()
 	o.ConfigPath = cfgPath
 	o.CheckoutDir = filepath.Join(dir, "checkout")
-	o.FunctionsDir = filepath.Join(dir, "functions")
+	o.AppsDir = filepath.Join(dir, "functions")
 	o.SSHDir = sshDir
 	o.CloneURL = filepath.Join(dir, "remote.git")
 	syncErr := Sync(context.Background(), o)

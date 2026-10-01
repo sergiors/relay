@@ -3,7 +3,7 @@ package runtime
 import (
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 )
 
@@ -14,12 +14,12 @@ import (
 func TestManagerEffectiveConcurrencyClipsToGlobal(t *testing.T) {
 	clipped := &Manager{maxConcurrency: 8}
 
-	fn15 := function.Function{Name: "f", Template: &function.Template{Concurrency: 15}}
+	fn15 := app.App{Name: "f", Template: &app.Template{Concurrency: 15}}
 	if got := clipped.effectiveConcurrency(fn15); got != 8 {
 		t.Fatalf("effectiveConcurrency(concurrency 15, MAX_CONCURRENCY 8) = %d, want 8", got)
 	}
 
-	fn4 := function.Function{Name: "f", Template: &function.Template{Concurrency: 4}}
+	fn4 := app.App{Name: "f", Template: &app.Template{Concurrency: 4}}
 	if got := clipped.effectiveConcurrency(fn4); got != 4 {
 		t.Fatalf("effectiveConcurrency(concurrency 4, MAX_CONCURRENCY 8) = %d, want 4 (below cap)", got)
 	}
@@ -34,10 +34,10 @@ func TestManagerEffectiveConcurrencyClipsToGlobal(t *testing.T) {
 		t.Fatalf("DefaultMaxConcurrency = %d, want 8 (mirrors runner/config)", DefaultMaxConcurrency)
 	}
 
-	// A template that omits concurrency keeps function.DefaultConcurrency.
-	fnDefault := function.Function{Name: "g", Template: &function.Template{}}
-	if got := uncapped.effectiveConcurrency(fnDefault); got != function.DefaultConcurrency {
-		t.Fatalf("effectiveConcurrency(default template) = %d, want %d", got, function.DefaultConcurrency)
+	// A template that omits concurrency keeps app.DefaultConcurrency.
+	fnDefault := app.App{Name: "g", Template: &app.Template{}}
+	if got := uncapped.effectiveConcurrency(fnDefault); got != app.DefaultConcurrency {
+		t.Fatalf("effectiveConcurrency(default template) = %d, want %d", got, app.DefaultConcurrency)
 	}
 }
 
@@ -81,12 +81,12 @@ func TestResolveManagerOptionsNetworks(t *testing.T) {
 }
 
 // TestManagerClampedConcurrencyDrivesPoolAndSnapshot proves the capped effective
-// bound is the one that actually drives the warm pool: a function with template
+// bound is the one that actually drives the warm pool: an app with template
 // concurrency 15 under MAX_CONCURRENCY 8 warms a pool of capacity 8 (gauge,
 // snapshot, and acquisition), and a later reconcile to template concurrency 4
-// shrinks it to 4. This is the runtime half of "function concurrency 15 with
+// shrinks it to 4. This is the runtime half of "app concurrency 15 with
 // MAX_CONCURRENCY=8 => effective live pool capacity 8", with the same rule
-// applied to the runner's per-function semaphore.
+// applied to the runner's per-app semaphore.
 func TestManagerClampedConcurrencyDrivesPoolAndSnapshot(t *testing.T) {
 	reg := metrics.New()
 	m := &Manager{maxConcurrency: 8, metrics: reg}
@@ -94,7 +94,7 @@ func TestManagerClampedConcurrencyDrivesPoolAndSnapshot(t *testing.T) {
 	m.containers.metrics = reg
 	ff := &fakeFactory{}
 
-	fn15 := function.Function{Name: "fn-cap", Template: &function.Template{Concurrency: 15}}
+	fn15 := app.App{Name: "fn-cap", Template: &app.Template{Concurrency: 15}}
 	max := m.effectiveConcurrency(fn15)
 	if max != 8 {
 		t.Fatalf("effective max = %d, want 8", max)
@@ -115,8 +115,8 @@ func TestManagerClampedConcurrencyDrivesPoolAndSnapshot(t *testing.T) {
 
 	// A later reconcile to template concurrency 4 (still below the cap) resizes
 	// the live pool to exactly 4.
-	fn4 := function.Function{Name: "fn-cap", Template: &function.Template{Concurrency: 4}}
-	m.containers.setFunctionConcurrency("fn-cap", m.effectiveConcurrency(fn4))
+	fn4 := app.App{Name: "fn-cap", Template: &app.Template{Concurrency: 4}}
+	m.containers.setAppConcurrency("fn-cap", m.effectiveConcurrency(fn4))
 	if got := poolMax(m.containers, "fn-cap"); got != 4 {
 		t.Fatalf("pool max after later reconcile = %d, want 4", got)
 	}
@@ -131,7 +131,7 @@ func TestManagerClampedConcurrencyDrivesPoolAndSnapshot(t *testing.T) {
 // TestManagerClipConcurrencyHandBuiltPrepared pins the Execute path's guard: a
 // hand-built Prepared carrying the raw template value (15) is clipped to the
 // worker-global cap (8), so a direct caller cannot warm a pool larger than the
-// runner would admit. A zero/negative prepared value keeps the function default.
+// runner would admit. A zero/negative prepared value keeps the app default.
 func TestManagerClipConcurrencyHandBuiltPrepared(t *testing.T) {
 	m := &Manager{maxConcurrency: 8}
 	if got := m.clipConcurrency(15); got != 8 {
@@ -140,8 +140,8 @@ func TestManagerClipConcurrencyHandBuiltPrepared(t *testing.T) {
 	if got := m.clipConcurrency(4); got != 4 {
 		t.Fatalf("clipConcurrency(4) = %d, want 4", got)
 	}
-	if got := m.clipConcurrency(0); got != function.DefaultConcurrency {
-		t.Fatalf("clipConcurrency(0) = %d, want %d", got, function.DefaultConcurrency)
+	if got := m.clipConcurrency(0); got != app.DefaultConcurrency {
+		t.Fatalf("clipConcurrency(0) = %d, want %d", got, app.DefaultConcurrency)
 	}
 	// Direct construction (zero maxConcurrency) clips to the default global cap.
 	var direct Manager

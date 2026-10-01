@@ -10,17 +10,17 @@ import (
 )
 
 // secretNamePattern restricts the characters a secret name may contain. It is
-// deliberately the same shape as a function name (see internal/function) so a
+// deliberately the same shape as an app name (see internal/app) so a
 // secret reference is always a safe, single path component: it can never
 // contain a path separator, an absolute path, or "..", which is what lets the
 // store resolve it to a file under the secrets directory without any escaping
-// risk. The rule is duplicated in internal/function (which is a leaf package and
+// risk. The rule is duplicated in internal/app (which is a leaf package and
 // cannot import this one); the two are pinned equivalent by a cross-check test
 // in this package.
 var secretNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-// maxSecretNameLen caps secret-name length, matching the function-name cap so a
-// secret reference can always be a valid function name too.
+// maxSecretNameLen caps secret-name length, matching the app-name cap so a
+// secret reference can always be a valid app name too.
 const maxSecretNameLen = 63
 
 // ValidateName reports whether name is a legal secret name, returning nil when

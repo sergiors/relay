@@ -64,7 +64,7 @@ func spanNames(spans tracetest.SpanStubs) []string {
 // TestContainerCacheExecuteEmitsAcquireAndInvokeSpans proves the cache execute
 // path emits runtime.acquire and runtime.invoke child spans, with runtime.invoke
 // parented to runtime.acquire's sibling (both under the caller context) and
-// carrying the function/image attributes.
+// carrying the app/image attributes.
 func TestContainerCacheExecuteEmitsAcquireAndInvokeSpans(t *testing.T) {
 	rec := withSpanRecorder(t)
 	cc, ff := newTestCache()
@@ -85,8 +85,8 @@ func TestContainerCacheExecuteEmitsAcquireAndInvokeSpans(t *testing.T) {
 	if acquire == nil || invoke == nil {
 		t.Fatalf("missing acquire/invoke spans; got %v", spanNames(spans))
 	}
-	if got := attrString(*acquire, "relay.function"); got != "fn-a" {
-		t.Errorf("runtime.acquire relay.function = %q, want fn-a", got)
+	if got := attrString(*acquire, "relay.app"); got != "fn-a" {
+		t.Errorf("runtime.acquire relay.app = %q, want fn-a", got)
 	}
 	if got := attrString(*invoke, "relay.image"); got != "img-1" {
 		t.Errorf("runtime.invoke relay.image = %q, want img-1", got)

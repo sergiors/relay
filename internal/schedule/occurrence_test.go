@@ -7,10 +7,10 @@ import (
 )
 
 // Deterministic ID: the exact string is
-// "schedule:<function>:<schedule name>:<UTC RFC3339>".
+// "schedule:<app>:<schedule name>:<UTC RFC3339>".
 func TestOccurrenceIDDeterministic(t *testing.T) {
 	inst := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	o := Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: inst}
+	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: inst}
 	want := "schedule:courses:cleanup:" + inst.Format(time.RFC3339)
 	if got := o.ID(); got != want {
 		t.Fatalf("ID = %q, want %q", got, want)
@@ -27,8 +27,8 @@ func TestOccurrenceIDOffsetIndependent(t *testing.T) {
 	rome := time.FixedZone("Rome", 2*3600)
 	local := time.Date(2026, 7, 1, 8, 0, 0, 0, rome)
 	utc := time.Date(2026, 7, 1, 6, 0, 0, 0, time.UTC)
-	a := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: local}
-	b := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: utc}
+	a := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: local}
+	b := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: utc}
 	if a.ID() != b.ID() {
 		t.Fatalf("IDs differ for equal instants: %q vs %q", a.ID(), b.ID())
 	}
@@ -39,8 +39,8 @@ func TestOccurrenceIDOffsetIndependent(t *testing.T) {
 func TestOccurrenceIDTruncatesSubSecond(t *testing.T) {
 	whole := time.Date(2026, 7, 1, 6, 0, 0, 0, time.UTC)
 	jitter := time.Date(2026, 7, 1, 6, 0, 0, 999_000_000, time.UTC)
-	a := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: whole}
-	b := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: jitter}
+	a := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: whole}
+	b := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: jitter}
 	if a.ID() != b.ID() {
 		t.Fatalf("IDs differ across sub-second jitter: %q vs %q", a.ID(), b.ID())
 	}
@@ -55,35 +55,35 @@ func TestOccurrenceIDDSTStable(t *testing.T) {
 	}
 	local := time.Date(2026, 7, 1, 8, 0, 0, 0, rome)   // CEST (+02:00)
 	utc := time.Date(2026, 7, 1, 6, 0, 0, 0, time.UTC) // the same instant
-	a := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: local}
-	b := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: utc}
+	a := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: local}
+	b := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: utc}
 	if a.ID() != b.ID() {
 		t.Fatalf("IDs differ for the same DST instant: %q vs %q", a.ID(), b.ID())
 	}
 }
 
 // Identity distinguishes occurrences: different instants, different schedule
-// names, or different functions never collide. The HANDLER is deliberately NOT
+// names, or different apps never collide. The HANDLER is deliberately NOT
 // part of the identity: a handler change under the same schedule keeps the same
 // occurrence id (the occurrence is the schedule's, not the handler's).
 func TestOccurrenceIDDistinct(t *testing.T) {
 	t1 := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	t2 := time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
-	if a, b := (Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()),
-		(Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: t2}.ID()); a == b {
+	if a, b := (Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()),
+		(Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: t2}.ID()); a == b {
 		t.Fatalf("distinct instants collided: %q", a)
 	}
-	if a, b := (Occurrence{Function: "fn", Schedule: "s1", Handler: "h", ScheduledAt: t1}.ID()),
-		(Occurrence{Function: "fn", Schedule: "s2", Handler: "h", ScheduledAt: t1}.ID()); a == b {
+	if a, b := (Occurrence{App: "fn", Schedule: "s1", Handler: "h", ScheduledAt: t1}.ID()),
+		(Occurrence{App: "fn", Schedule: "s2", Handler: "h", ScheduledAt: t1}.ID()); a == b {
 		t.Fatalf("distinct schedule names collided: %q", a)
 	}
-	if a, b := (Occurrence{Function: "fn1", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()),
-		(Occurrence{Function: "fn2", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()); a == b {
+	if a, b := (Occurrence{App: "fn1", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()),
+		(Occurrence{App: "fn2", Schedule: "s", Handler: "h", ScheduledAt: t1}.ID()); a == b {
 		t.Fatalf("distinct functions collided: %q", a)
 	}
 	// A handler change under the same schedule does NOT change the identity.
-	if a, b := (Occurrence{Function: "fn", Schedule: "s", Handler: "old", ScheduledAt: t1}.ID()),
-		(Occurrence{Function: "fn", Schedule: "s", Handler: "new", ScheduledAt: t1}.ID()); a != b {
+	if a, b := (Occurrence{App: "fn", Schedule: "s", Handler: "old", ScheduledAt: t1}.ID()),
+		(Occurrence{App: "fn", Schedule: "s", Handler: "new", ScheduledAt: t1}.ID()); a != b {
 		t.Fatalf("a handler change must not change the occurrence id: %q vs %q", a, b)
 	}
 }
@@ -94,13 +94,13 @@ func TestOccurrenceIDDistinct(t *testing.T) {
 // several per-minute firings onto one key.
 func TestOccurrenceIDSecondsDistinct(t *testing.T) {
 	base := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
-	a := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: base}
-	b := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: base.Add(30 * time.Second)}
+	a := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: base}
+	b := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: base.Add(30 * time.Second)}
 	if a.ID() == b.ID() {
 		t.Fatalf("occurrences 30s apart collided: %q", a.ID())
 	}
 	// Sub-second jitter within the same whole second still collapses.
-	jitter := Occurrence{Function: "fn", Schedule: "s", Handler: "h", ScheduledAt: base.Add(500 * time.Millisecond)}
+	jitter := Occurrence{App: "fn", Schedule: "s", Handler: "h", ScheduledAt: base.Add(500 * time.Millisecond)}
 	if a.ID() != jitter.ID() {
 		t.Fatalf("sub-second jitter split one occurrence: %q vs %q", a.ID(), jitter.ID())
 	}
@@ -109,7 +109,7 @@ func TestOccurrenceIDSecondsDistinct(t *testing.T) {
 // Envelope round-trip: ParseEnvelope(o.Envelope()) reconstructs the same
 // Occurrence, with the ID recomputed from the fields.
 func TestEnvelopeRoundTrip(t *testing.T) {
-	o := Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 500000000, time.UTC)}
+	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 500000000, time.UTC)}
 	raw, err := o.Envelope()
 	if err != nil {
 		t.Fatalf("Envelope: %v", err)
@@ -118,8 +118,8 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseEnvelope: %v", err)
 	}
-	if got.Function != o.Function || got.Schedule != o.Schedule || got.Handler != o.Handler {
-		t.Fatalf("ParseEnvelope = %+v, want function/schedule/handler %q/%q/%q", got, o.Function, o.Schedule, o.Handler)
+	if got.App != o.App || got.Schedule != o.Schedule || got.Handler != o.Handler {
+		t.Fatalf("ParseEnvelope = %+v, want app/schedule/handler %q/%q/%q", got, o.App, o.Schedule, o.Handler)
 	}
 	// The parsed scheduled_at is truncated to the second (identity normalization);
 	// the recomputed ID must equal the original's.
@@ -134,7 +134,7 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 // IsScheduleEvent recognizes schedule messages and ignores normal events,
 // source-with-missing-fields events, tampered occurrence_id, and invalid dates.
 func TestIsScheduleEvent(t *testing.T) {
-	o := Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
+	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 	raw, err := o.Envelope()
 	if err != nil {
 		t.Fatalf("Envelope: %v", err)
@@ -148,8 +148,8 @@ func TestIsScheduleEvent(t *testing.T) {
 	if !ok {
 		t.Fatal("schedule envelope not recognized")
 	}
-	if got.Function != o.Function || got.Schedule != o.Schedule || got.Handler != o.Handler {
-		t.Fatalf("IsScheduleEvent = %+v, want %q/%q/%q", got, o.Function, o.Schedule, o.Handler)
+	if got.App != o.App || got.Schedule != o.Schedule || got.Handler != o.Handler {
+		t.Fatalf("IsScheduleEvent = %+v, want %q/%q/%q", got, o.App, o.Schedule, o.Handler)
 	}
 
 	// A normal event is untouched.
@@ -159,13 +159,13 @@ func TestIsScheduleEvent(t *testing.T) {
 
 	// source==relay.schedule but missing required fields -> not a schedule.
 	for _, missing := range []map[string]any{
-		{"source": "relay.schedule", "function": "f", "schedule": "s", "handler": "h"},
-		{"source": "relay.schedule", "function": "f", "schedule": "s", "scheduled_at": "2026-07-01T08:00:00Z"},
-		{"source": "relay.schedule", "function": "f", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
+		{"source": "relay.schedule", "app": "f", "schedule": "s", "handler": "h"},
+		{"source": "relay.schedule", "app": "f", "schedule": "s", "scheduled_at": "2026-07-01T08:00:00Z"},
+		{"source": "relay.schedule", "app": "f", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
 		{"source": "relay.schedule", "schedule": "s", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
-		{"source": "relay.schedule", "function": "", "schedule": "s", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
-		{"source": "relay.schedule", "function": "f", "schedule": "", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
-		{"source": "relay.schedule", "function": "f", "schedule": "s", "handler": "h", "scheduled_at": "not-a-date"},
+		{"source": "relay.schedule", "app": "", "schedule": "s", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
+		{"source": "relay.schedule", "app": "f", "schedule": "", "handler": "h", "scheduled_at": "2026-07-01T08:00:00Z"},
+		{"source": "relay.schedule", "app": "f", "schedule": "s", "handler": "h", "scheduled_at": "not-a-date"},
 	} {
 		if _, ok := IsScheduleEvent(missing); ok {
 			t.Fatalf("event with missing/invalid fields recognized as schedule: %+v", missing)
@@ -189,9 +189,9 @@ func TestIsScheduleEvent(t *testing.T) {
 }
 
 // Payload exposes exactly source and scheduled_at — never the internal
-// coordination fields (function/schedule/handler/occurrence_id).
+// coordination fields (app/schedule/handler/occurrence_id).
 func TestOccurrencePayloadFields(t *testing.T) {
-	o := Occurrence{Function: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
+	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 	var m map[string]any
 	if err := jsonUnmarshal(o.Payload(), &m); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
@@ -205,7 +205,7 @@ func TestOccurrencePayloadFields(t *testing.T) {
 	if m["scheduled_at"] != "2026-07-01T08:00:00Z" {
 		t.Fatalf("scheduled_at = %v, want 2026-07-01T08:00:00Z", m["scheduled_at"])
 	}
-	for _, internal := range []string{"function", "schedule", "handler", "occurrence_id"} {
+	for _, internal := range []string{"app", "schedule", "handler", "occurrence_id"} {
 		if _, ok := m[internal]; ok {
 			t.Fatalf("payload leaks %q; internal fields must not be exposed: %v", internal, m)
 		}

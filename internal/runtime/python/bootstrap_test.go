@@ -24,7 +24,7 @@ const relaySentinel = "@@RELAY@@"
 // cover the rest of the invocation protocol (sentinel framing, module import,
 // async handlers, env rotation, error handling), so they are no longer
 // duplicated as brittle substring checks. The sys.path assertion is kept because
-// it pins the specific import contract: function sources are importable by
+// it pins the specific import contract: app sources are importable by
 // module name (the package-relative service entrypoint depends on it).
 func TestBootstrapIsEmbeddedAndAddsAppToSysPath(t *testing.T) {
 	if len(Bootstrap) == 0 {

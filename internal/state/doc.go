@@ -1,14 +1,14 @@
-// Package state persists a read-mostly operator snapshot of Relay's function
+// Package state persists a read-mostly operator snapshot of Relay's app
 // state in a local SQLite database.
 //
-// The state database is a state VIEW, not the source of truth: /functions (the
+// The state database is a state VIEW, not the source of truth: /apps (the
 // filesystem root the loader reads) is authoritative. It is not immutable or
 // read-only — the worker writes it (the startup/discovery state phase, the
 // reconcile outcomes, the periodic stats flush) and `relay stats reset` writes
 // it — but it is read-mostly in that no read path mutates it and it never
 // drives matching, image building, or reconciliation decisions. The database is
 // rebuilt automatically when empty. It exists so operators can introspect what
-// Relay has loaded and how the last reconcile of each function went, independent
+// Relay has loaded and how the last reconcile of each app went, independent
 // of Redis or Docker.
 //
 // State Model:
@@ -23,7 +23,7 @@
 //     process that died mid-work.
 //   - last_reconcile_status: "success" | "failed"
 //     (skipped periodic checks are not recorded; the snapshot reflects the last
-//     MEANINGFUL reconcile — a success or a failure — so an unchanged-function
+//     MEANINGFUL reconcile — a success or a failure — so an unchanged-app
 //     periodic pass never overwrites them)
 //
 // Desired vs active: the LAST USABLE generation (Image/Fingerprint/PreparedAt)
@@ -51,15 +51,15 @@
 // SQLite-view boundary: this database is a VIEW, never the source of truth. It
 // records what was loaded/prepared/served for operators, but it never drives
 // matching, image building, scheduling, or execution decisions — those are
-// rebuilt from /functions. An invalid function therefore stays out of the
+// rebuilt from /apps. An invalid app therefore stays out of the
 // runtime registry entirely; only its state row reflects the invalid desired
 // state, and only the persisted active image is consulted (conservatively) by
 // the startup image keep-set.
 //
-// Function storage model:
+// App storage model:
 //
-//   - functions(name TEXT PRIMARY KEY, data BLOB NOT NULL, updated_at TEXT NOT
-//     NULL) stores ONE whole per-function snapshot as a JSON object in data,
+//   - apps(name TEXT PRIMARY KEY, data BLOB NOT NULL, updated_at TEXT NOT
+//     NULL) stores ONE whole per-app snapshot as a JSON object in data,
 //     written through SQLite's jsonb(?) (binary JSON / JSONB format) and read
 //     back with json(data). Only the stable name key and the write timestamp
 //     stay as columns. The nested configuration — the env names (each value is
@@ -84,27 +84,27 @@
 //
 // Stats persistence model:
 //
-// The stats and function_stats tables store the latest persisted ABSOLUTE
+// The stats and app_stats tables store the latest persisted ABSOLUTE
 // snapshot of Relay's operational counters — idempotent, no deltas. Only stable
 // relational metadata is kept as columns: stats.id and stats.updated_at, and
-// function_stats.function_name and function_stats.updated_at. The evolving
+// app_stats.app_name and app_stats.updated_at. The evolving
 // counter/gauge/execution-history payload is a JSON object — stored as binary
 // JSON (JSONB) in the data BLOB column — marshalled and unmarshalled ONLY
 // through stats_json.go; the worker, CLI, runtime, and metrics layers pass typed
-// Stats/FunctionStats values and never touch the JSON. This keeps the schema
+// Stats/AppStats values and never touch the JSON. This keeps the schema
 // stable as instrumentation grows: absent fields decode to zero. The typed
 // structs are the source of truth. There is no migration or backward
 // compatibility for payloads written by a different schema.
 //
-// In addition to the event/handler counters, function_stats carries the
+// In addition to the event/handler counters, app_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,
-// discarded) so the standalone `relay function inspect` process can render the
+// discarded) so the standalone `relay app inspect` process can render the
 // Runtime pool section without access to the worker's in-memory pool. The LIVE
 // pool gauges (capacity, container counts by lease state) are deliberately NOT
 // persisted: a persisted live gauge would go stale between flushes. The worker
 // flushes the current in-memory metrics registry into them every 5 seconds
 // (fixed, non-configurable) via RecordStatsSnapshot, which writes the global
-// row and every per-function row in one short transaction. SQLite is never on
+// row and every per-app row in one short transaction. SQLite is never on
 // the event path: the runner and stream consumer update only the Prometheus
 // registry, and the flush merely mirrors that store. A failed flush is retried
 // next tick with the current values (absolute snapshots make this safe); a hard
@@ -114,7 +114,7 @@
 // them. Redis event-processing correctness never depends on SQLite stats.
 //
 // `relay stats reset` zeroes the cumulative fields IN PLACE: the global stats
-// row and every function_stats row survive, decoded from their typed JSON
+// row and every app_stats row survive, decoded from their typed JSON
 // payloads, while the live gauges and any known unrelated field are preserved.
 // A running worker performs the reset over its socket, under the same lock as
 // the flush, so its in-memory totals are reset too and no captured pre-reset
@@ -148,6 +148,6 @@
 //     before the transaction opens (see RebuildFromFS/RecordDiscovered), so a
 //     write transaction never blocks on the filesystem. Callers that already
 //     hold the loaded set and a fingerprint (the worker's startup state phase)
-//     use RebuildFromFunctions + RecordDiscoveredWithFingerprint so no state
-//     write re-reads /functions.
+//     use RebuildFromApps + RecordDiscoveredWithFingerprint so no state
+//     write re-reads /apps.
 package state

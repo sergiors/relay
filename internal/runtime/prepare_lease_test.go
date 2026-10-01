@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // TestPrepareReuseTransfersImageLease pins that a reuse Prepare admits the
-// function image lease and transfers it to the returned handle, so the caller
+// app image lease and transfers it to the returned handle, so the caller
 // (the registry publication) owns admitted authority from before the existence
 // probe through publication.
 func TestPrepareReuseTransfersImageLease(t *testing.T) {
@@ -20,11 +20,11 @@ func TestPrepareReuseTransfersImageLease(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := function.Function{Name: "reuse-lease", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "reuse-lease", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
 	// The image exists (200 on inspect) and the bootstrap label matches, so
 	// Prepare takes the reuse path without a build.
-	fp, err := function.FingerprintFunction(dir, fn.Template)
+	fp, err := app.FingerprintApp(dir, fn.Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -61,8 +61,8 @@ func TestPrepareRetiringImageRejected(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	fn := function.Function{Name: "retiring-lease", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-	fp, err := function.FingerprintFunction(dir, fn.Template)
+	fn := app.App{Name: "retiring-lease", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fp, err := app.FingerprintApp(dir, fn.Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -79,17 +79,17 @@ func TestPrepareRetiringImageRejected(t *testing.T) {
 	}
 }
 
-// TestPrepareNoRuntimeTakesNoLease pins that a no-runtime function (no image)
+// TestPrepareNoRuntimeTakesNoLease pins that a no-runtime app (no image)
 // acquires no lease, preserving the no-Docker behavior.
 func TestPrepareNoRuntimeTakesNoLease(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("services:\n  - image: nginx:alpine\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
 	}
-	fn := function.Function{
+	fn := app.App{
 		Name:     "no-runtime-lease",
 		Dir:      dir,
-		Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
+		Template: &app.Template{Services: []app.Service{{Image: "nginx:alpine"}}},
 	}
 	cli := newScriptedDockerClient(t)
 	m := newLifecycleManager(t, cli, context.Background())
@@ -104,8 +104,8 @@ func TestPrepareNoRuntimeTakesNoLease(t *testing.T) {
 }
 
 // bootstrapForTest returns the bootstrap label hash Prepare computes for the
-// function, by planning it exactly as Prepare does.
-func bootstrapForTest(t *testing.T, fn function.Function) string {
+// app, by planning it exactly as Prepare does.
+func bootstrapForTest(t *testing.T, fn app.App) string {
 	t.Helper()
 	spec, err := lookup(fn.Template.Runtime)
 	if err != nil {

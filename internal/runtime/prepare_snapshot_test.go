@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // stagedContextContents reads a build-context tar captured from the daemon
@@ -64,7 +64,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 
 	// The reference digest over the original selected source: exactly what the
 	// snapshot captured before the mutation must yield.
-	reference, err := function.CaptureSourceSnapshot(mustSelect(t, dir))
+	reference, err := app.CaptureSourceSnapshot(mustSelect(t, dir))
 	if err != nil {
 		t.Fatalf("capture reference snapshot: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 	// fresh .gitignore also appears, but because it is NOT part of the captured
 	// policy it must not be staged either (the snapshot reflects the captured
 	// selection, not a re-walk).
-	m.afterSourceSnapshot = func(_ *function.SourceSnapshot) {
+	m.afterSourceSnapshot = func(_ *app.SourceSnapshot) {
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function h(){ return 'mutated'; }\n"), 0o644); err != nil {
 			t.Fatalf("mutate source: %v", err)
 		}
@@ -95,7 +95,7 @@ func TestPrepareTagAndStagedBytesShareOneSnapshot(t *testing.T) {
 		}
 	}
 
-	fn := function.Function{Name: "snapshot-coherent", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "snapshot-coherent", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	got, err := m.Prepare(context.Background(), fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -146,7 +146,7 @@ func TestPrepareSnapshotFailureRejectsBuild(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "unreadable", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "unreadable", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	if _, err := m.Prepare(context.Background(), fn); err == nil {
 		t.Fatal("Prepare must fail when a selected file cannot be captured")
 	}
@@ -174,7 +174,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	}
 
 	// Reference digest over the original selected source: what the capture held.
-	reference, err := function.CaptureSourceSnapshot(mustSelect(t, dir))
+	reference, err := app.CaptureSourceSnapshot(mustSelect(t, dir))
 	if err != nil {
 		t.Fatalf("capture reference snapshot: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, context.Background())
 
-	fn := function.Function{Name: "blocked-build", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "blocked-build", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	type result struct {
 		prepared *Prepared
 		err      error
@@ -228,7 +228,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 	}
 	// The live tree now hashes differently: a post-build rescan would produce
 	// this value, which is NOT what the in-flight build staged.
-	onDisk, err := function.FingerprintFunction(dir, fn.Template)
+	onDisk, err := app.FingerprintApp(dir, fn.Template)
 	if err != nil {
 		t.Fatalf("on-disk fingerprint: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestPrepareMutationDuringBlockedBuildKeepsCapturedIdentity(t *testing.T) {
 // releases the captured source bytes on every path: the snapshot retained via the
 // afterSourceSnapshot seam has its entries cleared once Prepare returns, whether
 // the build succeeded or failed. The deferred Discard is what keeps a long-lived
-// process from retaining every prepared function's source in memory.
+// process from retaining every prepared app's source in memory.
 func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -281,10 +281,10 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 			)
 			m := newLifecycleManager(t, cli, context.Background())
 
-			var captured *function.SourceSnapshot
-			m.afterSourceSnapshot = func(s *function.SourceSnapshot) { captured = s }
+			var captured *app.SourceSnapshot
+			m.afterSourceSnapshot = func(s *app.SourceSnapshot) { captured = s }
 
-			fn := function.Function{Name: "release-" + tc.name, Dir: dir, Template: &function.Template{Runtime: "node24"}}
+			fn := app.App{Name: "release-" + tc.name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 			_, err := m.Prepare(context.Background(), fn)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected the scripted build failure to surface")
@@ -332,10 +332,10 @@ func TestPrepareReleasesSnapshotOnCancellation(t *testing.T) {
 	)
 	m := newLifecycleManager(t, cli, lifecycle)
 
-	var captured *function.SourceSnapshot
-	m.afterSourceSnapshot = func(s *function.SourceSnapshot) { captured = s }
+	var captured *app.SourceSnapshot
+	m.afterSourceSnapshot = func(s *app.SourceSnapshot) { captured = s }
 
-	fn := function.Function{Name: "release-cancel", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "release-cancel", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	done := make(chan error, 1)
 	go func() {
 		_, err := m.Prepare(context.Background(), fn)

@@ -22,14 +22,14 @@ var statsJSONKeys = []string{
 	"oldest_pending_age_seconds",
 }
 
-// functionStatsJSONRequiredKeys is the exact set of ALWAYS-present payload keys
-// expected in function_stats.data: the counters (emitted even when 0, since
+// appStatsJSONRequiredKeys is the exact set of ALWAYS-present payload keys
+// expected in app_stats.data: the counters (emitted even when 0, since
 // they are absolute snapshots) plus the four execution-history timestamps. The
 // timestamps are additionally omitempty: when a timestamp is empty the key is
 // absent, which is what makes the flush merge preserve a stored value. The set
-// deliberately excludes the relational function_name and updated_at, and the
+// deliberately excludes the relational app_name and updated_at, and the
 // live pool gauges.
-var functionStatsJSONRequiredKeys = []string{
+var appStatsJSONRequiredKeys = []string{
 	"events_matched_total",
 	"handler_success_total",
 	"handler_failure_total",
@@ -52,13 +52,13 @@ func rawStatsData(t *testing.T, c *State) (data, updatedAt string) {
 	return data, updatedAt
 }
 
-// rawFunctionStatsData reads function_stats.data rendered back to JSON text plus
+// rawAppStatsData reads app_stats.data rendered back to JSON text plus
 // updated_at for name. A stored value that is not valid JSON renders as an empty
 // string.
-func rawFunctionStatsData(t *testing.T, c *State, name string) (data, updatedAt string) {
+func rawAppStatsData(t *testing.T, c *State, name string) (data, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT CASE WHEN json_valid(data, 5) THEN json(data) END, updated_at FROM function_stats WHERE function_name = ?`, name).Scan(&data, &updatedAt); err != nil {
+		`SELECT CASE WHEN json_valid(data, 5) THEN json(data) END, updated_at FROM app_stats WHERE app_name = ?`, name).Scan(&data, &updatedAt); err != nil {
 		t.Fatalf("read raw function stats: %v", err)
 	}
 	return data, updatedAt
@@ -76,11 +76,11 @@ func rawStatsBlob(t *testing.T, c *State) (data []byte, typeof, updatedAt string
 	return data, typeof, updatedAt
 }
 
-// rawFunctionStatsBlob is the per-function counterpart of rawStatsBlob.
-func rawFunctionStatsBlob(t *testing.T, c *State, name string) (data []byte, typeof, updatedAt string) {
+// rawAppStatsBlob is the per-app counterpart of rawStatsBlob.
+func rawAppStatsBlob(t *testing.T, c *State, name string) (data []byte, typeof, updatedAt string) {
 	t.Helper()
 	if err := c.db.QueryRowContext(context.Background(),
-		`SELECT data, typeof(data), updated_at FROM function_stats WHERE function_name = ?`, name).Scan(&data, &typeof, &updatedAt); err != nil {
+		`SELECT data, typeof(data), updated_at FROM app_stats WHERE app_name = ?`, name).Scan(&data, &typeof, &updatedAt); err != nil {
 		t.Fatalf("read raw function stats blob: %v", err)
 	}
 	return data, typeof, updatedAt
@@ -178,15 +178,15 @@ func TestStatsPayloadIsCentralizedJSON(t *testing.T) {
 	}
 }
 
-// TestFunctionStatsPayloadIsCentralizedJSON pins the per-function storage
-// contract: function_name and updated_at stay relational columns, the payload
+// TestAppStatsPayloadIsCentralizedJSON pins the per-app storage
+// contract: app_name and updated_at stay relational columns, the payload
 // is SQLite binary JSON (JSONB) with exactly the expected keys (including the
 // pool counters and timestamps), and the LIVE pool gauges are absent.
-func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
+func TestAppStatsPayloadIsCentralizedJSON(t *testing.T) {
 	c := openTestState(t)
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	in := FunctionStats{
-		Function:            "alpha",
+	in := AppStats{
+		App:                 "alpha",
 		EventsMatchedTotal:  5,
 		HandlerSuccessTotal: 4,
 		HandlerFailureTotal: 1,
@@ -197,15 +197,15 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 		DiscardedTotal:      2,
 		LastExecutionAt:     exec,
 	}
-	c.RecordFunctionStats(in)
+	c.RecordAppStats(in)
 
-	if _, typeof, _ := rawFunctionStatsBlob(t, c, "alpha"); typeof != "blob" {
-		t.Fatalf("function_stats.data storage class = %q, want blob (JSONB)", typeof)
+	if _, typeof, _ := rawAppStatsBlob(t, c, "alpha"); typeof != "blob" {
+		t.Fatalf("app_stats.data storage class = %q, want blob (JSONB)", typeof)
 	}
-	data, updatedAt := rawFunctionStatsData(t, c, "alpha")
+	data, updatedAt := rawAppStatsData(t, c, "alpha")
 	// last_execution_at is present (it was set); the other three timestamps are
 	// empty and intentionally omitted.
-	assertJSONKeys(t, data, functionStatsJSONRequiredKeys,
+	assertJSONKeys(t, data, appStatsJSONRequiredKeys,
 		[]string{"last_execution_at", "last_success_at", "last_failure_at", "last_dlq_at"})
 	if !strings.Contains(data, `"last_execution_at"`) {
 		t.Fatalf("expected the populated timestamp in the payload: %s", data)
@@ -218,14 +218,14 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 	// Relational metadata must not be duplicated in the payload. Use a key-set
 	// check (not a bare substring) so a counter value that merely contains the
 	// word cannot false-positive.
-	assertJSONKeysAbsent(t, data, "function", "updated_at", "function_name")
+	assertJSONKeysAbsent(t, data, "app", "updated_at", "app_name")
 	// The live pool gauges are never persisted.
 	assertJSONKeysAbsent(t, data, "capacity", "containers", "busy", "idle", "starting")
 	if updatedAt == "" {
-		t.Fatal("function_stats.updated_at column must be set")
+		t.Fatal("app_stats.updated_at column must be set")
 	}
 
-	got, ok := c.FunctionStats("alpha")
+	got, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected function stats row")
 	}
@@ -233,10 +233,10 @@ func TestFunctionStatsPayloadIsCentralizedJSON(t *testing.T) {
 	if got != in {
 		t.Fatalf("round trip = %+v, want %+v", got, in)
 	}
-	// The function name comes from the relational key even though the payload
+	// The app name comes from the relational key even though the payload
 	// omits it.
-	if got.Function != "alpha" {
-		t.Fatalf("Function = %q, want alpha (from the key column)", got.Function)
+	if got.App != "alpha" {
+		t.Fatalf("App = %q, want alpha (from the key column)", got.App)
 	}
 }
 
@@ -269,10 +269,10 @@ func TestStatsAbsentJSONFieldsZero(t *testing.T) {
 	}
 }
 
-// TestFunctionStatsAbsentJSONFieldsZero is the per-function counterpart: an
-// empty payload object yields the zero FunctionStats (with Function filled from
+// TestAppStatsAbsentJSONFieldsZero is the per-app counterpart: an
+// empty payload object yields the zero AppStats (with App filled from
 // the key) and a partial payload zero-fills the absent timestamps.
-func TestFunctionStatsAbsentJSONFieldsZero(t *testing.T) {
+func TestAppStatsAbsentJSONFieldsZero(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 	for _, row := range []struct{ name, data string }{
@@ -280,21 +280,21 @@ func TestFunctionStatsAbsentJSONFieldsZero(t *testing.T) {
 		{"partial", `{"events_matched_total":7,"warm_acquires_total":2}`},
 	} {
 		if _, err := c.db.ExecContext(ctx,
-			`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
+			`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
 			row.name, row.data, "2020-01-01T00:00:00Z"); err != nil {
 			t.Fatalf("seed %s: %v", row.name, err)
 		}
 	}
 
-	e, ok := c.FunctionStats("empty")
+	e, ok := c.AppStats("empty")
 	if !ok {
 		t.Fatal("expected empty payload row to be readable")
 	}
-	if e != (FunctionStats{Function: "empty", UpdatedAt: "2020-01-01T00:00:00Z"}) {
+	if e != (AppStats{App: "empty", UpdatedAt: "2020-01-01T00:00:00Z"}) {
 		t.Fatalf("empty payload = %+v, want zero payload with metadata", e)
 	}
 
-	p, ok := c.FunctionStats("partial")
+	p, ok := c.AppStats("partial")
 	if !ok {
 		t.Fatal("expected partial payload row to be readable")
 	}
@@ -326,58 +326,58 @@ func TestInvalidStatsJSONSurfacesErrors(t *testing.T) {
 	}
 }
 
-// TestInvalidFunctionStatsJSONSurfacesErrors pins the per-function counterpart:
-// a corrupt payload is logged, FunctionStats reads as unreadable, and
-// AllFunctionStats skips just the corrupt row while returning the good ones.
-func TestInvalidFunctionStatsJSONSurfacesErrors(t *testing.T) {
+// TestInvalidAppStatsJSONSurfacesErrors pins the per-app counterpart:
+// a corrupt payload is logged, AppStats reads as unreadable, and
+// AllAppStats skips just the corrupt row while returning the good ones.
+func TestInvalidAppStatsJSONSurfacesErrors(t *testing.T) {
 	c, buf := captureLogger(t)
 	ctx := context.Background()
 	// The corrupt row is seeded as raw bytes bypassing jsonb() (which would
 	// reject it at write time), simulating on-disk corruption; the good row is a
 	// normal JSONB write.
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)`,
+		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
 		"broken", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed broken: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
+		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, jsonb(?), ?)`,
 		"good", `{"events_matched_total":3}`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed good: %v", err)
 	}
 
-	if _, ok := c.FunctionStats("broken"); ok {
-		t.Fatal("corrupt function_stats payload must read as unreadable (ok=false)")
+	if _, ok := c.AppStats("broken"); ok {
+		t.Fatal("corrupt app_stats payload must read as unreadable (ok=false)")
 	}
-	if _, ok := c.FunctionStats("good"); !ok {
-		t.Fatal("good function_stats payload must remain readable")
+	if _, ok := c.AppStats("good"); !ok {
+		t.Fatal("good app_stats payload must remain readable")
 	}
 
-	all := c.AllFunctionStats()
-	if len(all) != 1 || all[0].Function != "good" || all[0].EventsMatchedTotal != 3 {
-		t.Fatalf("AllFunctionStats = %+v, want only the good row", all)
+	all := c.AllAppStats()
+	if len(all) != 1 || all[0].App != "good" || all[0].EventsMatchedTotal != 3 {
+		t.Fatalf("AllAppStats = %+v, want only the good row", all)
 	}
-	if logs := buf.String(); !strings.Contains(logs, "read function stats failed") || !strings.Contains(logs, "broken") {
+	if logs := buf.String(); !strings.Contains(logs, "read app stats failed") || !strings.Contains(logs, "broken") {
 		t.Fatalf("expected a useful per-function decode error in the log, got:\n%s", logs)
 	}
 }
 
-// TestRecordFunctionStatsSelfHealsInvalidJSON verifies the read-modify-write
+// TestRecordAppStatsSelfHealsInvalidJSON verifies the read-modify-write
 // upsert replaces a corrupt payload with the incoming absolute snapshot, so a
 // bad row self-heals on the next record.
-func TestRecordFunctionStatsSelfHealsInvalidJSON(t *testing.T) {
+func TestRecordAppStatsSelfHealsInvalidJSON(t *testing.T) {
 	c := openTestState(t)
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)`,
+		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
 		"alpha", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 4, LastExecutionAt: exec})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 4, LastExecutionAt: exec})
 
-	got, ok := c.FunctionStats("alpha")
+	got, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha to be readable after self-heal")
 	}
@@ -414,8 +414,8 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 	}
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	global := Stats{EventsMatchedTotal: 100, PendingEntries: 9, OldestPendingAgeSeconds: 42}
-	fn := FunctionStats{
-		Function:           "alpha",
+	fn := AppStats{
+		App:                "alpha",
 		EventsMatchedTotal: 10,
 		WarmAcquiresTotal:  7,
 		ColdStartsTotal:    3,
@@ -424,7 +424,7 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 		LastDLQAt:          exec,
 	}
 	c1.RecordStats(global)
-	c1.RecordFunctionStats(fn)
+	c1.RecordAppStats(fn)
 	if err := c1.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestStatsJSONReopenRoundTrip(t *testing.T) {
 		t.Fatalf("global after reopen = %+v, want %+v", gs, global)
 	}
 
-	got, ok := c2.FunctionStats("alpha")
+	got, ok := c2.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after reopen")
 	}
@@ -461,17 +461,17 @@ func TestRecordStatsSnapshotMergesTimestampsThroughJSON(t *testing.T) {
 	c := openTestState(t)
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	c.RecordFunctionStats(FunctionStats{
-		Function: "alpha", EventsMatchedTotal: 1, WarmAcquiresTotal: 7, LastExecutionAt: exec,
+	c.RecordAppStats(AppStats{
+		App: "alpha", EventsMatchedTotal: 1, WarmAcquiresTotal: 7, LastExecutionAt: exec,
 	})
 
 	// A flush observing no timestamp must preserve the stored one, while the
 	// absolute counters replace.
 	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 2},
-		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 2, WarmAcquiresTotal: 9}}); err != nil {
+		[]AppStats{{App: "alpha", EventsMatchedTotal: 2, WarmAcquiresTotal: 9}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	got, ok := c.FunctionStats("alpha")
+	got, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha after snapshot")
 	}
@@ -491,21 +491,21 @@ func TestRecordStatsSnapshotSelfHealsInvalidJSON(t *testing.T) {
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 	ctx := context.Background()
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO function_stats (function_name, data, updated_at) VALUES (?, ?, ?)`,
+		`INSERT INTO app_stats (app_name, data, updated_at) VALUES (?, ?, ?)`,
 		"alpha", `{not-json`, "2020-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("seed corrupt row: %v", err)
 	}
 
 	exec := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 1},
-		[]FunctionStats{{Function: "alpha", EventsMatchedTotal: 3, LastExecutionAt: exec}}); err != nil {
+		[]AppStats{{App: "alpha", EventsMatchedTotal: 3, LastExecutionAt: exec}}); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	got, ok := c.FunctionStats("alpha")
+	got, ok := c.AppStats("alpha")
 	if !ok || got.EventsMatchedTotal != 3 || got.LastExecutionAt != exec {
 		t.Fatalf("self-healed row = %+v, ok=%v", got, ok)
 	}
-	if logs := buf.String(); !strings.Contains(logs, "read function stats failed") {
+	if logs := buf.String(); !strings.Contains(logs, "read app stats failed") {
 		t.Fatalf("expected a decode warning for the corrupt row, got:\n%s", logs)
 	}
 }

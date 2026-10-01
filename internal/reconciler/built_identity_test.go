@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/source"
@@ -25,13 +25,13 @@ type diskIdentityBuilder struct {
 	built          []string
 }
 
-func (b *diskIdentityBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (b *diskIdentityBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
 	return b.build(fn)
 }
 
 func (b *diskIdentityBuilder) PrepareWithFingerprintAndSelection(
 	_ context.Context,
-	fn function.Function,
+	fn app.App,
 	_ string,
 	_ *source.Selection,
 ) (*runtime.Prepared, error) {
@@ -39,8 +39,8 @@ func (b *diskIdentityBuilder) PrepareWithFingerprintAndSelection(
 	return b.build(fn)
 }
 
-func (b *diskIdentityBuilder) build(fn function.Function) (*runtime.Prepared, error) {
-	fp, err := function.FingerprintFunction(fn.Dir, fn.Template)
+func (b *diskIdentityBuilder) build(fn app.App) (*runtime.Prepared, error) {
+	fp, err := app.FingerprintApp(fn.Dir, fn.Template)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +58,7 @@ func (b *diskIdentityBuilder) Execute(context.Context, *runtime.Prepared, string
 
 // TestReconcileRealBuiltGenerationsTrackSourceAndConverge exercises the
 // startup/live shared contract end to end with real digests (not sentinels): a
-// function is seeded with generation A, edited and rebuilt to a distinct
+// app is seeded with generation A, edited and rebuilt to a distinct
 // generation B, re-reconciled unchanged (which must SKIP, proving the recorded
 // built identity is the live content), then edited again and rebuilt to a third
 // distinct generation C. Each rebuild records the identity the builder actually
@@ -70,21 +70,21 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 	dir := writeFnDir(t, root, "gen")
 	fn := initialFn("gen", dir)
 
-	genA, err := function.FingerprintFunction(dir, fn.Function().Template)
+	genA, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint A: %v", err)
 	}
 
 	b := &diskIdentityBuilder{}
 	var retired []string
-	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedFunction{fn},
+	r, reg, st := newTestStateReconciler(t, root, b, []*runner.PreparedApp{fn},
 		func(cfg *Config, _ *state.State) {
 			cfg.Retire = func(_ string, oldImage string) { retired = append(retired, oldImage) }
 		})
 
 	// Generation A is unchanged from the seeded state: the reconcile must skip,
 	// so no build is issued.
-	r.reconcileFunction("gen")
+	r.reconcileApp("gen")
 	if b.selectionCalls != 0 {
 		t.Fatalf("selection-aware Prepare calls = %d, want 0 for an unchanged generation A", b.selectionCalls)
 	}
@@ -93,7 +93,7 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('B'); }\n"), 0o644); err != nil {
 		t.Fatalf("write B: %v", err)
 	}
-	genB, err := function.FingerprintFunction(dir, fn.Function().Template)
+	genB, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint B: %v", err)
 	}
@@ -101,14 +101,14 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 		t.Fatal("test setup: the edit must change the fingerprint")
 	}
 
-	r.reconcileFunction("gen")
+	r.reconcileApp("gen")
 	if b.selectionCalls != 1 {
 		t.Fatalf("selection-aware Prepare calls = %d, want 1 after the edit to B", b.selectionCalls)
 	}
 	if b.built[0] != genB {
 		t.Fatalf("builder built %q, want the live digest %q", b.built[0], genB)
 	}
-	detailB, ok := st.GetFunction("gen")
+	detailB, ok := st.GetApp("gen")
 	if !ok {
 		t.Fatal("expected a gen row")
 	}
@@ -124,7 +124,7 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 
 	// Re-reconcile with no further change: the recorded built identity equals the
 	// live digest, so this must SKIP. A stale/mislabeled record would rebuild.
-	r.reconcileFunction("gen")
+	r.reconcileApp("gen")
 	if b.selectionCalls != 1 {
 		t.Fatalf("selection-aware Prepare calls = %d after B, want 1 (B must converge to a skip)", b.selectionCalls)
 	}
@@ -133,7 +133,7 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('C'); }\n"), 0o644); err != nil {
 		t.Fatalf("write C: %v", err)
 	}
-	genC, err := function.FingerprintFunction(dir, fn.Function().Template)
+	genC, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint C: %v", err)
 	}
@@ -141,14 +141,14 @@ func TestReconcileRealBuiltGenerationsTrackSourceAndConverge(t *testing.T) {
 		t.Fatalf("test setup: C must be distinct from A and B (A=%s B=%s C=%s)", genA, genB, genC)
 	}
 
-	r.reconcileFunction("gen")
+	r.reconcileApp("gen")
 	if b.selectionCalls != 2 {
 		t.Fatalf("selection-aware Prepare calls = %d, want 2 after the edit to C", b.selectionCalls)
 	}
 	if b.built[1] != genC {
 		t.Fatalf("builder built %q, want the live digest %q", b.built[1], genC)
 	}
-	detailC, ok := st.GetFunction("gen")
+	detailC, ok := st.GetApp("gen")
 	if !ok {
 		t.Fatal("expected a gen row after C")
 	}

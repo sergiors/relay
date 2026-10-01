@@ -271,8 +271,8 @@ func TestConcurrentIncrementAndRender(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < iters; j++ {
 				r.Inc(MetricEventsReceived)
-				r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
-				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, time.Millisecond)
+				r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
+				r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "a"}, {"handler", "x"}}, time.Millisecond)
 				r.SetGauge(MetricPendingEntries, 1)
 			}
 		}()

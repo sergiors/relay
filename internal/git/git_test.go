@@ -21,29 +21,29 @@ import (
 	"relay/internal/testutil"
 )
 
-// fixtureTemplate is the function committed by fixture: one handler with an
+// fixtureTemplate is the app committed by fixture: one handler with an
 // INSERT pattern, distinct from testutil.DefaultTemplate so git package tests can
 // assert on the handler.
 const fixtureTemplate = "runtime: node24\nevents:\n  - handler: foo.handler\n    pattern:\n      event_name: [INSERT]\n"
 
 // testEnv bundles the temp dirs and a local fixture repo for a sync test.
 type testEnv struct {
-	work, bare, checkout, functions, gitDir, sshDir string
+	work, bare, checkout, apps, gitDir, sshDir string
 }
 
 // fixture builds a local working repo and a bare "remote" origin. The working
-// repo starts with one function "fn" committed to branch "main" and a second
+// repo starts with one app "fn" committed to branch "main" and a second
 // branch "other" at the same commit, and (optionally) a tag. It returns the
 // paths; e.bare is the CloneURL for sync tests.
 func fixture(t *testing.T, withTag bool) testEnv {
 	t.Helper()
 	e := testEnv{
-		work:      filepath.Join(t.TempDir(), "work"),
-		bare:      filepath.Join(t.TempDir(), "remote.git"),
-		checkout:  filepath.Join(t.TempDir(), "checkout"),
-		functions: filepath.Join(t.TempDir(), "functions"),
-		gitDir:    filepath.Join(t.TempDir(), "git"),
-		sshDir:    filepath.Join(t.TempDir(), "ssh"),
+		work:     filepath.Join(t.TempDir(), "work"),
+		bare:     filepath.Join(t.TempDir(), "remote.git"),
+		checkout: filepath.Join(t.TempDir(), "checkout"),
+		apps:     filepath.Join(t.TempDir(), "functions"),
+		gitDir:   filepath.Join(t.TempDir(), "git"),
+		sshDir:   filepath.Join(t.TempDir(), "ssh"),
 	}
 	opts := testutil.Options{
 		Work:          e.work,
@@ -88,7 +88,7 @@ func syncOpts(t *testing.T, e testEnv, out io.Writer) SyncOptions {
 	o := NewSyncOptions()
 	o.ConfigPath = filepath.Join(e.gitDir, "source.json")
 	o.CheckoutDir = e.checkout
-	o.FunctionsDir = e.functions
+	o.AppsDir = e.apps
 	o.CloneURL = e.bare
 	o.Out = out
 	return o
@@ -138,8 +138,8 @@ func TestValidateRepositoryURL(t *testing.T) {
 }
 
 func TestValidatePath(t *testing.T) {
-	if err := validatePath("pkg/functions"); err != nil {
-		t.Errorf("validatePath(pkg/functions): %v, want nil", err)
+	if err := validatePath("pkg/apps"); err != nil {
+		t.Errorf("validatePath(pkg/apps): %v, want nil", err)
 	}
 	for _, p := range []string{"../x", "/abs", "a/../../b", "..", ".", "a/../..", `back\slash`} {
 		if err := validatePath(p); err == nil {

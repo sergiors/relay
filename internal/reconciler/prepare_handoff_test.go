@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/source"
 )
@@ -28,14 +28,14 @@ type selectionSpyBuilder struct {
 	builtFingerprint string
 }
 
-func (s *selectionSpyBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (s *selectionSpyBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
 	s.plainCalls++
 	return &runtime.Prepared{Name: fn.Name, Image: "img-" + fn.Name}, nil
 }
 
 func (s *selectionSpyBuilder) PrepareWithFingerprintAndSelection(
 	_ context.Context,
-	fn function.Function,
+	fn app.App,
 	fingerprint string,
 	selection *source.Selection,
 ) (*runtime.Prepared, error) {
@@ -55,12 +55,12 @@ func (s *selectionSpyBuilder) Execute(context.Context, *runtime.Prepared, string
 }
 
 // TestReconcileHandsComputedFingerprintAndSelectionToBuilder is the live-rebuild
-// handoff regression: the reconciler computes each function's fingerprint and
-// resolves its source selection ONCE (SelectAndFingerprintFunction), then hands
+// handoff regression: the reconciler computes each app's fingerprint and
+// resolves its source selection ONCE (SelectAndFingerprintApp), then hands
 // BOTH to the selection-aware builder so the runtime Manager never re-hashes the
 // tree nor re-derives the policy. The supplied fingerprint equals an independent
-// FingerprintFunction computation, and the selection is the one for the
-// function directory — so the tag the reconciler compared and the selection the
+// FingerprintApp computation, and the selection is the one for the
+// app directory — so the tag the reconciler compared and the selection the
 // build stages are the same read.
 func TestReconcileHandsComputedFingerprintAndSelectionToBuilder(t *testing.T) {
 	root := t.TempDir()
@@ -69,7 +69,7 @@ func TestReconcileHandsComputedFingerprintAndSelectionToBuilder(t *testing.T) {
 	b := &selectionSpyBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
 
-	r.reconcileFunction("handoff")
+	r.reconcileApp("handoff")
 
 	if b.selectionCalls != 1 {
 		t.Fatalf("selection-aware Prepare calls = %d, want 1", b.selectionCalls)
@@ -77,7 +77,7 @@ func TestReconcileHandsComputedFingerprintAndSelectionToBuilder(t *testing.T) {
 	if b.plainCalls != 0 {
 		t.Fatalf("plain Prepare calls = %d, want 0 when the builder supports selection", b.plainCalls)
 	}
-	wantFP, err := function.FingerprintFunction(dir, mustParse(template))
+	wantFP, err := app.FingerprintApp(dir, mustParse(template))
 	if err != nil {
 		t.Fatalf("reference fingerprint: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestReconcileResolvesIdentityOnceAndHandsExactValuesToBuilder(t *testing.T)
 	var injected *source.Selection
 	b := &selectionSpyBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, func(cfg *Config) {
-		cfg.Fingerprint = func(dir string, _ *function.Template) (*source.Selection, string, error) {
+		cfg.Fingerprint = func(dir string, _ *app.Template) (*source.Selection, string, error) {
 			resolverCalls++
 			sel, err := source.ForDir(dir)
 			if err != nil {
@@ -122,7 +122,7 @@ func TestReconcileResolvesIdentityOnceAndHandsExactValuesToBuilder(t *testing.T)
 		}
 	})
 
-	r.reconcileFunction("counted")
+	r.reconcileApp("counted")
 
 	if resolverCalls != 1 {
 		t.Fatalf("identity resolver calls = %d, want exactly 1 for one reconcile", resolverCalls)
@@ -157,9 +157,9 @@ func TestReconcileRecordsBuiltIdentityNotPreBuildScan(t *testing.T) {
 	r, _, st := newTestStateReconciler(t, root, b, nil, nil)
 
 	// Seed a prior successful row so the rebuild is observed as a desired change.
-	st.RecordDiscovered(function.Function{Name: "drift", Dir: filepath.Join(root, "drift"), Template: mustParse(template)})
+	st.RecordDiscovered(app.App{Name: "drift", Dir: filepath.Join(root, "drift"), Template: mustParse(template)})
 
-	r.reconcileFunction("drift")
+	r.reconcileApp("drift")
 
 	if b.selectionCalls != 1 {
 		t.Fatalf("selection-aware Prepare calls = %d, want 1", b.selectionCalls)
@@ -167,7 +167,7 @@ func TestReconcileRecordsBuiltIdentityNotPreBuildScan(t *testing.T) {
 	if b.gotFingerprint == builtIdentity {
 		t.Fatal("fixture precondition: the reconciler must supply the pre-build scan, not the built identity")
 	}
-	detail, ok := st.GetFunction("drift")
+	detail, ok := st.GetApp("drift")
 	if !ok {
 		t.Fatal("expected a drift row")
 	}
@@ -184,7 +184,7 @@ func TestReconcileRecordsBuiltIdentityNotPreBuildScan(t *testing.T) {
 	// re-detected until the tree is restored or the image rebuilds from it. This
 	// is the behavior that closes the TOCTOU window (an image is never treated as
 	// current for bytes it did not bake).
-	r.reconcileFunction("drift")
+	r.reconcileApp("drift")
 	if b.selectionCalls != 2 {
 		t.Fatalf("selection-aware Prepare calls after the second reconcile = %d, want 2", b.selectionCalls)
 	}
@@ -200,7 +200,7 @@ func TestReconcileFallsBackToPlainPrepareForTestBuilders(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
 
-	r.reconcileFunction("fallback")
+	r.reconcileApp("fallback")
 
 	if b.prepares() != 1 {
 		t.Fatalf("plain Prepare calls = %d, want 1 for a builder without the selection seam", b.prepares())
@@ -224,7 +224,7 @@ func TestReconcileHandoffSelectionStagesSameTreeAsFingerprint(t *testing.T) {
 
 	b := &selectionSpyBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
-	r.reconcileFunction("coherent")
+	r.reconcileApp("coherent")
 
 	if b.gotSelection == nil {
 		t.Fatal("expected a resolved selection")

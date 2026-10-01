@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // capturingContainer is a reusableContainer that records the per-invocation
@@ -54,16 +54,16 @@ func (c *capturingContainer) lastEnv() map[string]string {
 // TestExecuteDynamicEnvNotAttachedToSpans proves the runtime's
 // acquire/invoke/execute spans never carry an env value or resolved secret: the
 // dynamic env travels only in the request frame, and spans record stable,
-// low-cardinality attributes (function/image) only.
+// low-cardinality attributes (app/image) only.
 func TestExecuteDynamicEnvNotAttachedToSpans(t *testing.T) {
 	rec := withSpanRecorder(t)
 	m := &Manager{maxConcurrency: 4}
 	m.containers = newContainerCache()
 	c := &capturingContainer{}
-	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		return c, nil
 	}
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 1}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 1}
 	const secret = "CANARY-SECRET-VALUE-in-spans"
 	if err := m.Execute(context.Background(), prepared, "h", []byte(`{}`), []string{"SECRET=" + secret}); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -95,7 +95,7 @@ func TestExecuteContainerEnvIsPlanOnlyDynamicEnvIsFrameOnly(t *testing.T) {
 	var mu sync.Mutex
 	var seenCreateEnv []string
 	c := &capturingContainer{}
-	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, env []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, env []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		mu.Lock()
 		seenCreateEnv = append([]string(nil), env...)
 		mu.Unlock()
@@ -104,7 +104,7 @@ func TestExecuteContainerEnvIsPlanOnlyDynamicEnvIsFrameOnly(t *testing.T) {
 
 	prepared := &Prepared{
 		Name:        "fn",
-		Image:       "relay-fn-fn:tag",
+		Image:       "relay-app-fn:tag",
 		Fingerprint: "fp",
 		Env:         []string{"PYTHONDONTWRITEBYTECODE=1"},
 		Concurrency: 1,
@@ -145,10 +145,10 @@ func TestExecuteDynamicEnvChangesPerInvocationFrame(t *testing.T) {
 	m.containers = newContainerCache()
 
 	c := &capturingContainer{}
-	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		return c, nil
 	}
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 1}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 1}
 
 	if err := m.Execute(context.Background(), prepared, "h", []byte(`{}`), []string{"TOKEN=v1"}); err != nil {
 		t.Fatalf("execute v1: %v", err)

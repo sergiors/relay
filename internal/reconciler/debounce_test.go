@@ -26,8 +26,8 @@ func assertNoSpurious(t *testing.T, b *fakeBuilder, want, holdSeconds int) {
 	}
 }
 
-// Many quick Enqueue calls for the same function should fire exactly one
-// reconcile (the pump consumes the debounced name once). Distinct functions
+// Many quick Enqueue calls for the same app should fire exactly one
+// reconcile (the pump consumes the debounced name once). Distinct apps
 // queue independently.
 func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	root := t.TempDir()
@@ -42,7 +42,7 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	// per burst proves coalescing.
 	go r.pump()
 
-	// A burst of rapid events for the same function.
+	// A burst of rapid events for the same app.
 	for i := 0; i < 20; i++ {
 		r.Enqueue("coalesced")
 	}
@@ -62,8 +62,8 @@ func TestDebounceCoalescesRapidEvents(t *testing.T) {
 	}
 }
 
-// Two functions each reconcile independently after their own debounce windows.
-func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
+// Two apps each reconcile independently after their own debounce windows.
+func TestDebounceDistinctAppsIndependent(t *testing.T) {
 	root := t.TempDir()
 	writeFnDir(t, root, "a")
 	writeFnDir(t, root, "b")
@@ -89,7 +89,7 @@ func TestDebounceDistinctFunctionsIndependent(t *testing.T) {
 	}
 }
 
-func TestFunctionForPath(t *testing.T) {
+func TestAppForPath(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "functions")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -108,9 +108,9 @@ func TestFunctionForPath(t *testing.T) {
 		{root + "/", "", false},
 	}
 	for _, c := range cases {
-		name, ok := r.functionForPath(c.path)
+		name, ok := r.appForPath(c.path)
 		if ok != c.ok || name != c.name {
-			t.Errorf("functionForPath(%q) = (%q,%v), want (%q,%v)", c.path, name, ok, c.name, c.ok)
+			t.Errorf("appForPath(%q) = (%q,%v), want (%q,%v)", c.path, name, ok, c.name, c.ok)
 		}
 	}
 }
@@ -122,10 +122,10 @@ func TestWatcherAddsNestedDirWatch(t *testing.T) {
 	root := t.TempDir()
 	dir := writeFnDir(t, root, "base")
 
-	// Register base as a healthy, seeded function so an unchanged base would not
+	// Register base as a healthy, seeded app so an unchanged base would not
 	// rebuild; only the nested change forces a rebuild, proving the watcher saw it.
 	b := &fakeBuilder{}
-	r, _ := newTestReconciler(t, root, b, []*runner.PreparedFunction{initialFn("base", dir)}, nil)
+	r, _ := newTestReconciler(t, root, b, []*runner.PreparedApp{initialFn("base", dir)}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,7 +134,7 @@ func TestWatcherAddsNestedDirWatch(t *testing.T) {
 	// a fixed amount, so the nested create below is guaranteed to be observed.
 	waitAllWatched(t, r, []string{root})
 
-	// Create a new nested subdirectory under a function.
+	// Create a new nested subdirectory under an app.
 	nested := filepath.Join(root, "base", "deep")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
 		t.Fatalf("mkdir nested: %v", err)

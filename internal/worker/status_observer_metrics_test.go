@@ -10,26 +10,26 @@ import (
 
 // TestWireStatusObserverProjectsTransitions pins the worker's state→metrics
 // bridge: discovery moves the one-hot status to preparing, a success to ready,
-// and a removal deletes the function's status series.
+// and a removal deletes the app's status series.
 func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	st := openTempState(t)
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
 
-	fn := stateFunction("alpha", t.TempDir())
+	fn := stateApp("alpha", t.TempDir())
 	st.RecordDiscoveredWithFingerprint(fn, "fp")
 
 	// Discovery -> preparing (one-hot: preparing 1, others 0).
-	if got := reg.GaugeLabels(metrics.MetricFunctionStatus, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "status", Value: state.StatusPreparing}}); got != 1 {
+	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusPreparing}}); got != 1 {
 		t.Fatalf("preparing = %v, want 1", got)
 	}
-	if got := reg.GaugeLabels(metrics.MetricFunctionStatus, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 0 {
+	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 0 {
 		t.Fatalf("ready = %v, want 0", got)
 	}
 
 	// Success -> ready.
 	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn)
-	if got := reg.GaugeLabels(metrics.MetricFunctionStatus, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
+	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
 		t.Fatalf("ready after success = %v, want 1", got)
 	}
 
@@ -38,7 +38,7 @@ func TestWireStatusObserverProjectsTransitions(t *testing.T) {
 	st.RecordRemoved("alpha")
 	series := reg.Snapshot()
 	for _, s := range []string{"preparing", "building", "reconciling", "ready", "degraded", "unavailable"} {
-		if containsLabel(series, "function_status{function=alpha,status="+s+"}") {
+		if containsLabel(series, "app_status{app=alpha,status="+s+"}") {
 			t.Fatalf("alpha status %q must be deleted:\n%s", s, series)
 		}
 	}
@@ -51,19 +51,19 @@ func TestWireStatusObserverNilSafe(t *testing.T) {
 
 	st := openTempState(t)
 	wireStatusObserver(st, nil)
-	fn := stateFunction("beta", t.TempDir())
+	fn := stateApp("beta", t.TempDir())
 	st.RecordDiscoveredWithFingerprint(fn, "fp") // must not panic
 }
 
-// TestStatsResetDoesNotTouchFunctionStatus pins that `reset stats` (the
+// TestStatsResetDoesNotTouchAppStatus pins that `reset stats` (the
 // worker-owned subtraction baseline) leaves the one-hot status gauge untouched:
 // status is a current-state gauge, not a cumulative total, so it must never be
 // reset or baselined. The Prometheus counters stay monotonic too.
-func TestStatsResetDoesNotTouchFunctionStatus(t *testing.T) {
+func TestStatsResetDoesNotTouchAppStatus(t *testing.T) {
 	st := openTempState(t)
 	reg := metrics.New()
 	wireStatusObserver(st, reg)
-	fn := stateFunction("alpha", t.TempDir())
+	fn := stateApp("alpha", t.TempDir())
 	st.RecordDiscoveredWithFingerprint(fn, "fp")
 	st.RecordReconcileSuccess("alpha", "img", "fp", time.Now(), fn)
 
@@ -73,8 +73,8 @@ func TestStatsResetDoesNotTouchFunctionStatus(t *testing.T) {
 		t.Fatalf("ResetStats: %v", err)
 	}
 
-	if got := reg.GaugeLabels(metrics.MetricFunctionStatus, []metrics.Label{{Name: "function", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
-		t.Fatalf("function_status ready after reset = %v, want 1 (reset must not touch status)", got)
+	if got := reg.GaugeLabels(metrics.MetricAppStatus, []metrics.Label{{Name: "app", Value: "alpha"}, {Name: "status", Value: state.StatusReady}}); got != 1 {
+		t.Fatalf("app_status ready after reset = %v, want 1 (reset must not touch status)", got)
 	}
 	if got := reg.Counter(metrics.MetricEventsMatched); got != 100 {
 		t.Fatalf("events after reset = %d, want 100 (Prometheus monotonic)", got)

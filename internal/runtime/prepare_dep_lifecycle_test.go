@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // countingRaceGate parks N concurrent scripted daemon calls and signals exactly
@@ -91,16 +91,16 @@ func (g *countingRaceGate) parked(req *http.Request, slot <-chan struct{}) {
 	}
 }
 
-// dependencyLifecycleFixture writes one dependency-bearing Python function and
+// dependencyLifecycleFixture writes one dependency-bearing Python app and
 // returns it with the exact image and dependency references production derives,
 // so a test can name both without a real daemon.
-func dependencyLifecycleFixture(t *testing.T, name string) (function.Function, string, string) {
+func dependencyLifecycleFixture(t *testing.T, name string) (app.App, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	writeRaceSource(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeRaceSource(t, dir, "requirements.txt", "six==1.16.0\n")
-	fn := function.Function{Name: name, Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
-	fp, err := function.Fingerprint(dir)
+	fn := app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
+	fp, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint %q: %v", name, err)
 	}
@@ -110,7 +110,7 @@ func dependencyLifecycleFixture(t *testing.T, name string) (function.Function, s
 // TestPrepareDependencyLeaseReleasedOnDependencyBuildFailure pins the failure
 // half of the dependency lease: when the dependency image build fails, Prepare
 // must release BOTH the dependency lease (admitted before the probe/build) and
-// the function lease, so a failed preparation never pins an image. The gate is
+// the app lease, so a failed preparation never pins an image. The gate is
 // proven clear by a fresh independent acquire succeeding.
 func TestPrepareDependencyLeaseReleasedOnDependencyBuildFailure(t *testing.T) {
 	fn, image, depRef := dependencyLifecycleFixture(t, "dep-build-fail")
@@ -150,12 +150,12 @@ func TestPrepareDependencyLeaseReleasedOnDependencyBuildFailure(t *testing.T) {
 	lease.Release()
 }
 
-// TestPrepareDependencyLeaseReleasedOnFunctionBuildFailure pins the sibling
-// failure half: the dependency build succeeds, then the function image build
+// TestPrepareDependencyLeaseReleasedOnAppBuildFailure pins the sibling
+// failure half: the dependency build succeeds, then the app image build
 // (which consumes the layer via FROM) fails. The dependency lease held across
 // that build must still be released, leaving the now-orphaned dependency
 // collectible — the very next GC pass removes it.
-func TestPrepareDependencyLeaseReleasedOnFunctionBuildFailure(t *testing.T) {
+func TestPrepareDependencyLeaseReleasedOnAppBuildFailure(t *testing.T) {
 	fn, image, depRef := dependencyLifecycleFixture(t, "fn-build-fail")
 
 	dels := 0
@@ -185,7 +185,7 @@ func TestPrepareDependencyLeaseReleasedOnFunctionBuildFailure(t *testing.T) {
 	if got := m.LeaseCount(image); got != 0 {
 		t.Fatalf("function lease count after a failed function build = %d, want 0", got)
 	}
-	// No function image was tagged, so the dependency is genuinely orphaned.
+	// No app image was tagged, so the dependency is genuinely orphaned.
 	// The lease being released is what lets the very same GC pass remove it.
 	removed, err := m.CleanupUnusedDependencies(context.Background())
 	if err != nil {
@@ -256,7 +256,7 @@ func TestPrepareDependencyLeaseReleasedOnCancellation(t *testing.T) {
 }
 
 // TestPrepareMultipleDependencyLeasesSpanGC is the N-concurrent-preparations
-// proof for the shared, content-addressed dependency layer. Two functions with
+// proof for the shared, content-addressed dependency layer. Two apps with
 // identical manifests resolve to ONE dependency image; while both preparations
 // are parked in its build, each holds its OWN lease, so the count is 2 and GC
 // must keep the layer. Releasing one preparation leaves the other pinning it; GC
@@ -289,7 +289,7 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 	m := newLifecycleManager(t, cli, context.Background())
 
 	done := make(chan error, 2)
-	for _, fn := range []function.Function{fnA, fnB} {
+	for _, fn := range []app.App{fnA, fnB} {
 		fn := fn
 		go func() {
 			_, err := m.Prepare(context.Background(), fn)
@@ -342,7 +342,7 @@ func TestPrepareMultipleDependencyLeasesSpanGC(t *testing.T) {
 	if removed != 1 || dels != 1 {
 		t.Fatalf("GC removed %d (DELETE %d) after both released, want 1 and 1", removed, dels)
 	}
-	// Sanity: the two function images are distinct per function name.
+	// Sanity: the two app images are distinct per app name.
 	if imageA == imageB {
 		t.Fatalf("distinct functions must have distinct image references, both %s", imageA)
 	}

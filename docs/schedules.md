@@ -1,6 +1,6 @@
 # Schedules
 
-A `schedules` list in `template.yaml` makes a function's handler run on a cron
+A `schedules` list in `template.yaml` makes an app's handler run on a cron
 schedule. Scheduled invocations reuse the entire event execution path: the same
 runtime image lifecycle, secrets, timeout cap, concurrency slots, retry/DLQ
 machinery, and handler metrics.
@@ -11,7 +11,7 @@ gocron (every worker) → atomic publish-if-new → Redis Stream
 ```
 
 A template must still declare at least one event or service; `schedules` alone
-is not a valid template (see [functions.md](functions.md)).
+is not a valid template (see [apps.md](apps.md)).
 
 ## Cron expressions
 
@@ -19,7 +19,7 @@ Each entry requires a stable `name`, a `handler`, and `cron`:
 
 ```yaml
 schedules:
-  - name: nightly-cleanup # stable identity (mandatory, unique per function)
+  - name: nightly-cleanup # stable identity (mandatory, unique per app)
     handler: jobs.cleanup.handler
     cron: "0 3 * * *" # minute hour day-of-month month day-of-week
     timezone: Europe/Rome # optional IANA timezone, default UTC
@@ -29,8 +29,8 @@ schedules:
 
 `name` is the schedule's stable identity: it keys the cron job, the occurrence
 identity, and the runner's configuration resolution. It follows the same
-conservative rule as a function name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no
-trailing `.`) and must be unique among a function's schedules. **Multiple
+conservative rule as an app name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no
+trailing `.`) and must be unique among an app's schedules. **Multiple
 schedules may share a handler** (the same job at different times); each name is
 an independently addressable schedule. Editing a schedule's cron, handler,
 timezone, timeout, or retries under the same `name` replaces only that job.
@@ -50,11 +50,11 @@ Rejected by design:
 - **`@every <duration>`.** It is a relative delay anchored to each worker's own
   job start, so workers do not agree on an occurrence.
 
-An invalid cron expression or timezone fails template validation (the function
+An invalid cron expression or timezone fails template validation (the app
 is logged and skipped). An embedded `TZ=`/`CRON_TZ=` prefix in the expression is
 rejected — use the `timezone` field.
 
-`relay function inspect` shows the raw expression plus a best-effort
+`relay app inspect` shows the raw expression plus a best-effort
 human-readable description in 24-hour time (display only).
 
 ## Timezone and identity
@@ -65,7 +65,7 @@ UTC and encodes the zone in the expression, so DST and offset changes are
 handled by Go and the cron parser. `Local` is rejected.
 
 An occurrence's identity is deterministic —
-`schedule:<function>:<schedule name>:<scheduled_at RFC3339 UTC>` — derived from
+`schedule:<app>:<schedule name>:<scheduled_at RFC3339 UTC>` — derived from
 the absolute instant normalized to **UTC**, never from a timezone representation.
 The configured timezone therefore affects **when** a schedule fires, never the
 identity, so DST and offset changes cannot split or merge occurrences. The
@@ -132,7 +132,7 @@ when another schedule shares its handler; removing one name never obsoletes
 another. Already published occurrences are not purged from Redis; they expire via
 the dedup TTL and stream retention.
 
-An occurrence still pending when its function or schedule is removed is
+An occurrence still pending when its app or schedule is removed is
 treated as **obsolete** if it has not yet been admitted: it is acknowledged
 as terminal rather than retried forever or dead-lettered, because the
 referenced configuration was intentionally removed.
@@ -159,10 +159,10 @@ frozen at the occurrence's **first successful admission**:
 
 The handler is not part of the schedule occurrence identity. Occurrences are
 identified by the schedule resource, while execution remains tied to the
-`function/handler` invocation that was actually admitted and run. The pinned
+`app/handler` invocation that was actually admitted and run. The pinned
 descriptor preserves the admitted schedule context and execution contract;
 per-invocation state and DLQ attribution remain keyed by that
-`function/handler`.
+`app/handler`.
 
 ## The guarantee
 
@@ -179,5 +179,5 @@ duplicate.
 
 Schedule occurrences bypass event matching, so they do **not** advance the
 event-classification counters (`events_received_total`, `events_matched_total`,
-`events_unmatched_total`, `function_events_matched_total`). They have their own
+`events_unmatched_total`, `app_events_matched_total`). They have their own
 coordination counters (see [operations.md](operations.md)).

@@ -20,8 +20,8 @@ func newTestDemuxer(t *testing.T, fn string) (*protocolDemuxer, *[]string, func(
 	// Install a recording sink wrapper: every forwarded line (with its
 	// streamForwarder prefix) is recorded, newline-split.
 	rec := &recordingSink{lines: &lines}
-	prev := SetFunctionOutput(rec)
-	t.Cleanup(func() { SetFunctionOutput(prev) })
+	prev := SetAppOutput(rec)
+	t.Cleanup(func() { SetAppOutput(prev) })
 	d := newProtocolDemuxer(fn)
 	return d, &lines, func() { rec.mu.Lock(); defer rec.mu.Unlock() }
 }
@@ -51,7 +51,7 @@ func (r *recordingSink) Write(p []byte) (int, error) {
 func TestDemuxerForwardsUserLines(t *testing.T) {
 	d, lines, restore := newTestDemuxer(t, "fn")
 	defer restore()
-	d.begin(RunMeta{Function: "fn", Handler: "mod.h", MessageID: "m1"})
+	d.begin(RunMeta{App: "fn", Handler: "mod.h", MessageID: "m1"})
 	if _, err := d.Write([]byte("hello\nworld\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestDemuxerFlushesTrailingPartialAtEOF(t *testing.T) {
 func TestDemuxerStderrForwarding(t *testing.T) {
 	d, lines, restore := newTestDemuxer(t, "fn")
 	defer restore()
-	d.begin(RunMeta{Function: "fn", Handler: "mod.h", EventID: "evt"})
+	d.begin(RunMeta{App: "fn", Handler: "mod.h", EventID: "evt"})
 	sink := stderrSink{d: d}
 	if _, err := sink.Write([]byte("bad\n")); err != nil {
 		t.Fatalf("write: %v", err)

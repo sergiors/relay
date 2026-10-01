@@ -8,7 +8,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // ptr returns a pointer to v. It is a tiny helper for the pointer-typed fields
@@ -16,7 +16,7 @@ import (
 // literals rather than requiring a local variable.
 func ptr[T any](v T) *T { return &v }
 
-// resourceHostConfig maps a function's EFFECTIVE resource limits onto Docker's
+// resourceHostConfig maps an app's EFFECTIVE resource limits onto Docker's
 // HostConfig resource fields. It is the single conversion point for every Relay
 // container kind (event/schedule/manual invocation containers and both service
 // source kinds), so the Docker field mapping (bytes → Memory, cores → NanoCPUs,
@@ -25,7 +25,7 @@ func ptr[T any](v T) *T { return &v }
 // A zero/partial ResourceLimits is normalized to the package defaults via
 // OrDefault before mapping, so a hand-built value can never produce a Docker
 // HostConfig with a zero limit (which would mean "unlimited" to the daemon).
-func resourceHostConfig(limits function.ResourceLimits) container.Resources {
+func resourceHostConfig(limits app.ResourceLimits) container.Resources {
 	limits = limits.OrDefault()
 	return container.Resources{
 		Memory:    limits.MemoryBytes,
@@ -38,12 +38,12 @@ func resourceHostConfig(limits function.ResourceLimits) container.Resources {
 // every Relay container is created with: all capabilities dropped, the resolved
 // memory/CPU/pids limits, a read-only rootfs, and a bounded /tmp tmpfs as the
 // only writable path. The security baseline is internal and not configuration;
-// the resource limits are per-function configuration mapped by
+// the resource limits are per-app configuration mapped by
 // resourceHostConfig. Networking is left enabled (outbound access is a
-// legitimate function need). autoRemove is true for one-shot invocation
+// legitimate app need). autoRemove is true for one-shot invocation
 // containers (the daemon removes them the moment they exit) and false for
 // persistent service containers (the reconciler owns their removal).
-func hardenedHostConfig(autoRemove bool, limits function.ResourceLimits) *container.HostConfig {
+func hardenedHostConfig(autoRemove bool, limits app.ResourceLimits) *container.HostConfig {
 	return &container.HostConfig{
 		AutoRemove:     autoRemove,
 		Resources:      resourceHostConfig(limits),

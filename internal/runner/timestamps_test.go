@@ -6,22 +6,22 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
-// execStats finds the FunctionStat for name in the registry's snapshot, or a
+// execStats finds the AppStat for name in the registry's snapshot, or a
 // zero value when absent.
-func execStats(m *metrics.Registry, name string) metrics.FunctionStat {
-	fs := m.FunctionStatsSnapshot()
+func execStats(m *metrics.Registry, name string) metrics.AppStat {
+	fs := m.AppStatsSnapshot()
 	for _, f := range fs {
-		if f.Function == name {
+		if f.App == name {
 			return f
 		}
 	}
-	return metrics.FunctionStat{}
+	return metrics.AppStat{}
 }
 
 // TestFirstExecutionSetsTimestamps pins the simplest attribution: the very
@@ -29,7 +29,7 @@ func execStats(m *metrics.Registry, name string) metrics.FunctionStat {
 // never precedes last execution), and leaves failure/DLQ untouched.
 func TestFirstExecutionSetsTimestamps(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", &countingExecutor{})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", &countingExecutor{})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
@@ -53,7 +53,7 @@ func TestFirstExecutionSetsTimestamps(t *testing.T) {
 // set last_dlq (a retryable failure is not a DLQ attribution).
 func TestFailureSetsExecutionAndFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
@@ -82,7 +82,7 @@ func TestFailureSetsExecutionAndFailure(t *testing.T) {
 func TestRetryAttemptsUpdateTimestampsThenSuccessPreservesFailure(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -134,7 +134,7 @@ func TestRetryAttemptsUpdateTimestampsThenSuccessPreservesFailure(t *testing.T) 
 func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{fnWithRetries(t, "alpha", 1, exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "alpha", 1, exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -161,7 +161,7 @@ func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 
 	// A later redelivery of the now-terminal invocation takes the skip path:
 	// none of the four timestamps may move again (the DLQ was already
-	// attributed at the original exhausting attempt). Only function_events
+	// attributed at the original exhausting attempt). Only app_events
 	// keeps counting the match. The redelivery still re-reports exhaustion so
 	// the stream re-routes a message whose DLQ write or post-DLQ XACK failed
 	// (it must not ACK a message with no DLQ entry).
@@ -182,7 +182,7 @@ func TestExhaustedAttemptSetsDLQOnlyOnExhaustion(t *testing.T) {
 func TestExecuteRuleTerminalSkipDoesNotUpdateTimestamps(t *testing.T) {
 	m := metrics.New()
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "alpha", exec)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -213,7 +213,7 @@ func TestExecuteRuleTerminalSkipDoesNotUpdateTimestamps(t *testing.T) {
 func TestInvokeHandlerTimestamps(t *testing.T) {
 	// Success case.
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "alpha", &countingExecutor{}, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{schedFn(t, "alpha", &countingExecutor{}, app.DefaultTimeout)}, testutil.DiscardLogger(), m)
 	if err := r.InvokeHandler(context.Background(), "1-0", "alpha", "sched", "index.run", []byte(`{}`)); err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestInvokeHandlerTimestamps(t *testing.T) {
 
 	// Failure case (retryable: the schedule carries the default retry count).
 	m2 := metrics.New()
-	r2 := NewWithMetrics([]*PreparedFunction{schedFn(t, "beta", &countingExecutor{fail: true}, function.DefaultTimeout)}, testutil.DiscardLogger(), m2)
+	r2 := NewWithMetrics([]*PreparedApp{schedFn(t, "beta", &countingExecutor{fail: true}, app.DefaultTimeout)}, testutil.DiscardLogger(), m2)
 	if err := r2.InvokeHandler(context.Background(), "1-1", "beta", "sched", "index.run", []byte(`{}`)); err == nil {
 		t.Fatal("expected InvokeHandler to fail")
 	}
@@ -252,7 +252,7 @@ func TestInvokeHandlerTimestamps(t *testing.T) {
 // last_dlq must be stamped at that point.
 func TestInvokeHandlerExhaustedSetsDLQ(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "alpha", &countingExecutor{fail: true}, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{schedFn(t, "alpha", &countingExecutor{fail: true}, app.DefaultTimeout)}, testutil.DiscardLogger(), m)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 

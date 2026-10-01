@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// writeFunctionsDir creates a real functions tree (root/demo with a template and
+// writeAppsDir creates a real apps tree (root/demo with a template and
 // source) so RebuildFromFS has something to scan. It mirrors the setup in
 // TestRebuildFromFSOnEmptyDB.
-func writeFunctionsDir(t *testing.T, root string) {
+func writeAppsDir(t *testing.T, root string) {
 	t.Helper()
 	dir := filepath.Join(root, "demo")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -56,7 +56,7 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 
 	// Run the normal startup path pieces that touch the DB.
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 	if err := c2.RebuildFromFS(root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -73,19 +73,19 @@ func TestRestartPreservesGlobalStats(t *testing.T) {
 	}
 }
 
-// TestRestartPreservesFunctionStats guards the per-function counterpart of the
-// restart bug: reopening the DB and rediscovering an already-known function must
-// not reset its persisted per-function counters.
-func TestRestartPreservesFunctionStats(t *testing.T) {
+// TestRestartPreservesAppStats guards the per-app counterpart of the
+// restart bug: reopening the DB and rediscovering an already-known app must
+// not reset its persisted per-app counters.
+func TestRestartPreservesAppStats(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db.sqlite3")
 	c1, err := Open(path)
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	alpha := FunctionStats{Function: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0}
-	beta := FunctionStats{Function: "beta", EventsMatchedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1}
-	c1.RecordFunctionStats(alpha)
-	c1.RecordFunctionStats(beta)
+	alpha := AppStats{App: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0}
+	beta := AppStats{App: "beta", EventsMatchedTotal: 20, HandlerSuccessTotal: 15, HandlerFailureTotal: 5, RetryTotal: 3, DLQTotal: 1}
+	c1.RecordAppStats(alpha)
+	c1.RecordAppStats(beta)
 	_ = c1.Close()
 
 	c2, err := Open(path)
@@ -95,14 +95,14 @@ func TestRestartPreservesFunctionStats(t *testing.T) {
 	defer c2.Close()
 
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 	if err := c2.RebuildFromFS(root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	// Rediscover an already-known function; must not touch its stats row.
+	// Rediscover an already-known app; must not touch its stats row.
 	c2.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
-	a, ok := c2.FunctionStats("alpha")
+	a, ok := c2.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after restart")
 	}
@@ -111,7 +111,7 @@ func TestRestartPreservesFunctionStats(t *testing.T) {
 		t.Fatalf("alpha stats after restart = %+v, want %+v", a, alpha)
 	}
 
-	b, ok := c2.FunctionStats("beta")
+	b, ok := c2.AppStats("beta")
 	if !ok {
 		t.Fatal("expected beta stats after restart")
 	}
@@ -120,36 +120,36 @@ func TestRestartPreservesFunctionStats(t *testing.T) {
 		t.Fatalf("beta stats after restart = %+v, want %+v", b, beta)
 	}
 
-	all := c2.AllFunctionStats()
+	all := c2.AllAppStats()
 	if len(all) != 2 {
-		t.Fatalf("AllFunctionStats len = %d, want 2: %+v", len(all), all)
+		t.Fatalf("AllAppStats len = %d, want 2: %+v", len(all), all)
 	}
-	if all[0].Function != "alpha" || all[1].Function != "beta" {
-		t.Fatalf("AllFunctionStats not in name order: %+v", all)
+	if all[0].App != "alpha" || all[1].App != "beta" {
+		t.Fatalf("AllAppStats not in name order: %+v", all)
 	}
 	all[0].UpdatedAt = alpha.UpdatedAt
 	all[1].UpdatedAt = beta.UpdatedAt
 	if all[0] != alpha || all[1] != beta {
-		t.Fatalf("AllFunctionStats = %+v, want %+v and %+v", all, alpha, beta)
+		t.Fatalf("AllAppStats = %+v, want %+v and %+v", all, alpha, beta)
 	}
 }
 
-// TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats is a belt-and-braces guard on
-// the discovery path: RebuildFromFS on a DB whose functions table is already
-// populated must not touch the function_stats rows.
-func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
+// TestRebuildFromFSOnNonEmptyDBKeepsAppStats is a belt-and-braces guard on
+// the discovery path: RebuildFromFS on a DB whose apps table is already
+// populated must not touch the app_stats rows.
+func TestRebuildFromFSOnNonEmptyDBKeepsAppStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordDiscovered(fnFor(t, "demo", tmpl)) // populate the functions table
-	c.RecordFunctionStats(FunctionStats{Function: "demo", EventsMatchedTotal: 7, HandlerSuccessTotal: 5})
+	c.RecordDiscovered(fnFor(t, "demo", tmpl)) // populate the apps table
+	c.RecordAppStats(AppStats{App: "demo", EventsMatchedTotal: 7, HandlerSuccessTotal: 5})
 
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 	if err := c.RebuildFromFS(root); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	s, ok := c.FunctionStats("demo")
+	s, ok := c.AppStats("demo")
 	if !ok {
 		t.Fatal("expected function stats row after rebuild")
 	}
@@ -161,7 +161,7 @@ func TestRebuildFromFSOnNonEmptyDBKeepsFunctionStats(t *testing.T) {
 // TestRestartResetsBuildingStatusToPreparing guards the restart boundary: a
 // "building" status is an in-flight marker for a build that only this process
 // was driving. If the worker dies mid-build, that status persists; on restart
-// the startup discovery (RecordDiscovered) must re-seed the function as
+// the startup discovery (RecordDiscovered) must re-seed the app as
 // preparing rather than leaving a stale building state that would never clear.
 // The same reset must cover stale ready/reconciling values from the crashed
 // process. The status is asserted after reopening the same DB (a simulated
@@ -177,7 +177,7 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	fn := fnFor(t, "demo", tmpl)
 	c1.RecordDiscovered(fn)
 	c1.RecordReconcileBuilding("demo")
-	if got, _ := c1.GetFunction("demo"); got.Status != StatusBuilding {
+	if got, _ := c1.GetApp("demo"); got.Status != StatusBuilding {
 		t.Fatalf("pre-restart status = %q, want building", got.Status)
 	}
 	_ = c1.Close()
@@ -190,11 +190,11 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	}
 	defer c2.Close()
 
-	if got, _ := c2.GetFunction("demo"); got.Status != StatusBuilding {
+	if got, _ := c2.GetApp("demo"); got.Status != StatusBuilding {
 		t.Fatalf("status after reopen = %q, want the persisted building status", got.Status)
 	}
 	c2.RecordDiscovered(fn)
-	got, ok := c2.GetFunction("demo")
+	got, ok := c2.GetApp("demo")
 	if !ok {
 		t.Fatal("expected demo function after restart discovery")
 	}
@@ -203,22 +203,22 @@ func TestRestartResetsBuildingStatusToPreparing(t *testing.T) {
 	}
 }
 
-// TestRecordDiscoveredDoesNotResetFunctionStats is a unit-level guard: recording
-// a function's discovery must not reset its persisted per-function counters or
+// TestRecordDiscoveredDoesNotResetAppStats is a unit-level guard: recording
+// an app's discovery must not reset its persisted per-app counters or
 // updated_at.
-func TestRecordDiscoveredDoesNotResetFunctionStats(t *testing.T) {
+func TestRecordDiscoveredDoesNotResetAppStats(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 10, HandlerSuccessTotal: 8, HandlerFailureTotal: 2, RetryTotal: 1, DLQTotal: 0})
 
-	before, ok := c.FunctionStats("alpha")
+	before, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats before discovery")
 	}
 
 	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
 
-	after, ok := c.FunctionStats("alpha")
+	after, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected alpha stats after discovery")
 	}

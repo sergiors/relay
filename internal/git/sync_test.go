@@ -17,7 +17,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // mustSync runs a sync against the test env's bare remote and fails the test on
@@ -33,14 +33,14 @@ func mustSync(t *testing.T, e testEnv, cfg Config) bytes.Buffer {
 }
 
 // TestInitialSync verifies the first sync clones the repo, checks out the ref,
-// materializes function dirs into the target, and records Synced/commit in the
+// materializes app dirs into the target, and records Synced/commit in the
 // config file.
 func TestInitialSync(t *testing.T) {
 	e := fixture(t, true)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
 	out := mustSync(t, e, cfg)
 
-	b, err := os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, err := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if err != nil {
 		t.Fatalf("read materialized template: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestInitialSync(t *testing.T) {
 }
 
 // TestContentChangeAndRemoval pins incremental behavior: a changed file is
-// refreshed and a removed function directory disappears from /functions.
+// refreshed and a removed app directory disappears from /apps.
 func TestContentChangeAndRemoval(t *testing.T) {
 	e := fixture(t, false)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
@@ -75,23 +75,23 @@ func TestContentChangeAndRemoval(t *testing.T) {
 	// Update fn's content, add fn2.
 	updateFnAndAdd(t, e, "main", "fn", "runtime: python3.14\n# changed\n", "fn2")
 	mustSync(t, e, cfg)
-	b, _ := os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, _ := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if !strings.Contains(string(b), "# changed") {
 		t.Fatalf("fn content not refreshed: %q", string(b))
 	}
-	if _, err := os.Stat(filepath.Join(e.functions, "fn2")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn2")); err != nil {
 		t.Fatalf("fn2 missing: %v", err)
 	}
 
-	// Remove fn from the repo, sync, fn must vanish from /functions.
+	// Remove fn from the repo, sync, fn must vanish from /apps.
 	removeFnFromRepo(t, e, "main", "fn")
 	mustSync(t, e, cfg)
-	if _, err := os.Stat(filepath.Join(e.functions, "fn")); !os.IsNotExist(err) {
-		t.Fatal("fn still in /functions after removal from repo")
+	if _, err := os.Stat(filepath.Join(e.apps, "fn")); !os.IsNotExist(err) {
+		t.Fatal("fn still in /apps after removal from repo")
 	}
 }
 
-// updateFnAndAdd updates fn's template content and adds a new function on the
+// updateFnAndAdd updates fn's template content and adds a new app on the
 // given branch, then pushes both to the bare remote.
 func updateFnAndAdd(t *testing.T, e testEnv, branch, fnName, content, extraName string) {
 	t.Helper()
@@ -126,7 +126,7 @@ func removeFnFromRepo(t *testing.T, e testEnv, branch, fnName string) {
 	}); err != nil {
 		t.Fatalf("checkout %s: %v", branch, err)
 	}
-	// Remove every tracked file under the function dir first (git rm), then the
+	// Remove every tracked file under the app dir first (git rm), then the
 	// directory on disk. Removing the dir via wt.Remove("fn") fails because the
 	// index holds individual files, so we remove each tracked file and drop the
 	// empty directory.
@@ -163,18 +163,18 @@ func pushBranchs(t *testing.T, e testEnv, branches ...string) {
 }
 
 // TestRefChange verifies switching the configured ref to another branch makes
-// /functions reflect the other branch's content.
+// /apps reflect the other branch's content.
 func TestRefChange(t *testing.T) {
 	e := fixture(t, false)
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "other"}
 	// Distinct content only on 'other'.
 	updateFnAndAdd(t, e, "other", "fn", "runtime: node24\n#other\n", "otherfn")
 	mustSync(t, e, cfg)
-	b, _ := os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, _ := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if !strings.Contains(string(b), "#other") {
 		t.Fatalf("fn content = %q, want other-branch content", string(b))
 	}
-	if _, err := os.Stat(filepath.Join(e.functions, "otherfn")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "otherfn")); err != nil {
 		t.Fatalf("otherfn missing: %v", err)
 	}
 }
@@ -187,7 +187,7 @@ func TestTagRefResolves(t *testing.T) {
 	e := fixture(t, true) // creates tag v1 at the initial commit
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "v1"}
 	mustSync(t, e, cfg)
-	b, err := os.ReadFile(filepath.Join(e.functions, "fn", "template.yaml"))
+	b, err := os.ReadFile(filepath.Join(e.apps, "fn", "template.yaml"))
 	if err != nil {
 		t.Fatalf("materialized function missing via tag: %v", err)
 	}
@@ -197,36 +197,36 @@ func TestTagRefResolves(t *testing.T) {
 }
 
 // TestDeterministicReplace pins the core rule: a directory planted in the
-// target /functions that is NOT in the repo is removed once a git source is
-// configured and synced, so /functions reflects the repo exactly.
+// target /apps that is NOT in the repo is removed once a git source is
+// configured and synced, so /apps reflects the repo exactly.
 func TestDeterministicReplace(t *testing.T) {
 	e := fixture(t, false)
 	// Plant an extra operator dir before the first sync.
-	writeFile(t, filepath.Join(e.functions, "stray", "template.yaml"), "runtime: node\n")
+	writeFile(t, filepath.Join(e.apps, "stray", "template.yaml"), "runtime: node\n")
 	cfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
 	mustSync(t, e, cfg)
-	if _, err := os.Stat(filepath.Join(e.functions, "stray")); !os.IsNotExist(err) {
-		t.Fatal("stray dir survived a deterministic sync; /functions must reflect the repo exactly")
+	if _, err := os.Stat(filepath.Join(e.apps, "stray")); !os.IsNotExist(err) {
+		t.Fatal("stray dir survived a deterministic sync; /apps must reflect the repo exactly")
 	}
-	if _, err := os.Stat(filepath.Join(e.functions, "fn")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn")); err != nil {
 		t.Fatalf("fn missing: %v", err)
 	}
 }
 
 // TestMonorepoSync pins end-to-end materialization of a monorepo source: with
-// Path set to a checkout subtree that contains function dirs, sync materializes
-// exactly those functions and only those (non-function children of the subtree
+// Path set to a checkout subtree that contains app dirs, sync materializes
+// exactly those apps and only those (non-app children of the subtree
 // are ignored, and the subtree dir itself is never materialized). It also pins
-// that deterministic removal still applies (a stray dir planted in /functions
+// that deterministic removal still applies (a stray dir planted in /apps
 // before the sync is removed), and — after that — that a second sync with a
 // Path that does not exist in the checked-out ref fails with the missing-source
-// error while leaving the already-materialized functions intact.
+// error while leaving the already-materialized apps intact.
 func TestMonorepoSync(t *testing.T) {
 	e := fixture(t, false)
 	_ = Config{Repository: "git@github.com:acme/r.git", Ref: "main"}
 
 	// Build a monorepo layout on main: services/funa, services/funb, a
-	// non-function file, and a non-function subdir. Both function names are
+	// non-app file, and a non-app subdir. Both app names are
 	// lowercase because ValidName rejects uppercase (the same rule the
 	// reconciler load applies); using valid names keeps the test about the
 	// monorepo path, not name validation. The work repo already has "fn" from
@@ -268,15 +268,15 @@ func TestMonorepoSync(t *testing.T) {
 
 	// Plant a stray dir in the target before the first sync; deterministic
 	// removal must clear it exactly like the repo-root case.
-	writeFile(t, filepath.Join(e.functions, "stray", "template.yaml"), "runtime: node\n")
+	writeFile(t, filepath.Join(e.apps, "stray", "template.yaml"), "runtime: node\n")
 
 	monoCfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main", Path: "services"}
 	out := mustSync(t, e, monoCfg)
 
-	// Both functions materialized with the correct content.
+	// Both apps materialized with the correct content.
 	wantHandler := map[string]string{"funa": "a.handler", "funb": "b.handler"}
 	for _, name := range []string{"funa", "funb"} {
-		b, err := os.ReadFile(filepath.Join(e.functions, name, "template.yaml"))
+		b, err := os.ReadFile(filepath.Join(e.apps, name, "template.yaml"))
 		if err != nil {
 			t.Fatalf("read materialized %s: %v", name, err)
 		}
@@ -284,23 +284,23 @@ func TestMonorepoSync(t *testing.T) {
 			t.Fatalf("%s template = %q, want handler %s", name, string(b), wantHandler[name])
 		}
 	}
-	// The services subtree dir and non-function children are NOT materialized.
+	// The services subtree dir and non-app children are NOT materialized.
 	for _, absent := range []string{"services", "README.md", "vendor"} {
-		if _, err := os.Stat(filepath.Join(e.functions, absent)); err == nil {
+		if _, err := os.Stat(filepath.Join(e.apps, absent)); err == nil {
 			t.Fatalf("non-function path %q materialized as a directory; want it ignored", absent)
 		}
 	}
 	// Deterministic removal applied to the planted stray.
-	if _, err := os.Stat(filepath.Join(e.functions, "stray")); !os.IsNotExist(err) {
-		t.Fatal("stray dir survived a deterministic monorepo sync; /functions must reflect the source exactly")
+	if _, err := os.Stat(filepath.Join(e.apps, "stray")); !os.IsNotExist(err) {
+		t.Fatal("stray dir survived a deterministic monorepo sync; /apps must reflect the source exactly")
 	}
-	// The summary reports exactly the two discovered functions.
-	if !strings.Contains(out.String(), "Materialized 2 function(s): funa, funb") {
-		t.Fatalf("summary = %q, want 'Materialized 2 function(s): funa, funb'", out.String())
+	// The summary reports exactly the two discovered apps.
+	if !strings.Contains(out.String(), "Materialized 2 app(s): funa, funb") {
+		t.Fatalf("summary = %q, want 'Materialized 2 app(s): funa, funb'", out.String())
 	}
 
 	// A second sync pointing at a path absent from the checked-out ref must fail
-	// with the clear missing-source error BEFORE touching /functions or the
+	// with the clear missing-source error BEFORE touching /apps or the
 	// config bookkeeping.
 	badCfg := Config{Repository: "git@github.com:acme/r.git", Ref: "main", Path: "does-not-exist"}
 	err = SyncFromConfig(context.Background(), syncOpts(t, e, io.Discard), badCfg)
@@ -310,16 +310,16 @@ func TestMonorepoSync(t *testing.T) {
 	if !strings.Contains(err.Error(), "does not exist in the checkout") {
 		t.Fatalf("sync err = %v, want clear missing-source message", err)
 	}
-	// The previously materialized functions are still intact.
+	// The previously materialized apps are still intact.
 	for name := range map[string]bool{"funa": true, "funb": true} {
-		if _, serr := os.Stat(filepath.Join(e.functions, name, "template.yaml")); serr != nil {
+		if _, serr := os.Stat(filepath.Join(e.apps, name, "template.yaml")); serr != nil {
 			t.Fatalf("function %s was removed by the failed missing-source sync: %v", name, serr)
 		}
 	}
 }
 
-// TestSyncHonorsGitignore pins end-to-end ignore handling: a function source
-// file excluded by .gitignore is NOT materialized, while the function's own
+// TestSyncHonorsGitignore pins end-to-end ignore handling: an app source
+// file excluded by .gitignore is NOT materialized, while the app's own
 // .gitignore is. The excluded file IS committed (go-git does not filter ignored
 // files from the index — verified by the fixture's explicit Add), so it truly
 // exists in the checkout: the exclusion is the shared source-selection policy,
@@ -352,42 +352,42 @@ func TestSyncHonorsGitignore(t *testing.T) {
 
 	mustSync(t, e, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
 
-	if _, err := os.Stat(filepath.Join(e.functions, "fn", "template.yaml")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", "template.yaml")); err != nil {
 		t.Fatalf("function not materialized: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.functions, "fn", "handler.js")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", "handler.js")); err != nil {
 		t.Fatalf("included source not materialized: %v", err)
 	}
-	// The root rule excludes debug.log; the function rule excludes scratch.tmp.
-	if _, err := os.Stat(filepath.Join(e.functions, "fn", "debug.log")); !os.IsNotExist(err) {
+	// The root rule excludes debug.log; the app rule excludes scratch.tmp.
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", "debug.log")); !os.IsNotExist(err) {
 		t.Fatalf("root .gitignore rule not applied during materialization; stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.functions, "fn", "scratch.tmp")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", "scratch.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("function .gitignore rule not applied during materialization; stat err = %v", err)
 	}
-	// The function's own policy travels with it so later builds/fingerprints
+	// The app's own policy travels with it so later builds/fingerprints
 	// apply the same rules.
-	if _, err := os.Stat(filepath.Join(e.functions, "fn", ".gitignore")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.apps, "fn", ".gitignore")); err != nil {
 		t.Fatalf("function .gitignore not materialized with the function: %v", err)
 	}
-	// The root .gitignore lives outside the function dir and is not copied.
-	if _, err := os.Stat(filepath.Join(e.functions, ".gitignore")); err == nil {
+	// The root .gitignore lives outside the app dir and is not copied.
+	if _, err := os.Stat(filepath.Join(e.apps, ".gitignore")); err == nil {
 		t.Fatal("root .gitignore must not be copied into the materialized function")
 	}
 }
 
-// TestSyncLoadsFunctionLoader verifies the materialized output loads cleanly
-// with the real function loader, proving format compatibility without
+// TestSyncLoadsAppLoader verifies the materialized output loads cleanly
+// with the real app loader, proving format compatibility without
 // duplicating loader logic.
-func TestSyncLoadsFunctionLoader(t *testing.T) {
+func TestSyncLoadsAppLoader(t *testing.T) {
 	e := fixture(t, false)
 	mustSync(t, e, Config{Repository: "git@github.com:acme/r.git", Ref: "main"})
-	fns, err := function.NewLoader(e.functions, testLog()).Load()
+	fns, err := app.NewLoader(e.apps, testLog()).Load()
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
 	if len(fns) != 1 || fns[0].Name != "fn" {
-		t.Fatalf("loaded functions = %+v, want [fn]", fns)
+		t.Fatalf("loaded apps = %+v, want [fn]", fns)
 	}
 }
 
@@ -478,14 +478,14 @@ func TestSyncPresentationIsWriterOnlyAndDiagnosticsStayLogged(t *testing.T) {
 		}
 	}
 	// ...and is NOT mirrored into the log.
-	for _, step := range []string{"Syncing...", "Sync complete", "function(s):", `Resolved "v1"`} {
+	for _, step := range []string{"Syncing...", "Sync complete", "app(s):", `Resolved "v1"`} {
 		if strings.Contains(logBuf.String(), step) {
 			t.Fatalf("log mirrored writer presentation %q:\n%s", step, logBuf.String())
 		}
 	}
 	// The distinct structured diagnostics are retained (operational records for
 	// the background sync path, not duplicates of the writer wording).
-	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"}
+	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized apps"}
 	for _, diag := range diags {
 		if !strings.Contains(logBuf.String(), diag) {
 			t.Fatalf("log missing diagnostic %q:\n%s", diag, logBuf.String())
@@ -507,7 +507,7 @@ func TestSyncBackgroundLogsDiagnosticsWithoutOut(t *testing.T) {
 	if err := SyncFromConfig(context.Background(), o, cfg); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized functions"}
+	diags := []string{"Checkout clone completed", "Remote fetch completed", "Ref resolution", "Materialized apps"}
 	for _, diag := range diags {
 		if !strings.Contains(logBuf.String(), diag) {
 			t.Fatalf("background log missing diagnostic %q:\n%s", diag, logBuf.String())

@@ -1,33 +1,33 @@
-// Package reconciler watches the functions root and swaps function images live.
+// Package reconciler watches the apps root and swaps app images live.
 //
 // This package drives live reload while a Builder (satisfied by the runtime
 // Manager) does the image build:
-//   - Watch: recursive fsnotify on the functions root; symlinks are not followed
-//   - Debounce: per-function timers coalesce edit storms into one reconcile
-//   - Rebuild: a changed fingerprint gates a per-function rebuild, committed to
+//   - Watch: recursive fsnotify on the apps root; symlinks are not followed
+//   - Debounce: per-app timers coalesce edit storms into one reconcile
+//   - Rebuild: a changed fingerprint gates a per-app rebuild, committed to
 //     the runner's registry as an atomic swap
 //   - Fallback: a failed build or invalid template retains the previous version;
 //     a periodic pass retries and catches events the watcher missed
 //
 // Key Guarantees:
-//   - A healthy function is never replaced until its replacement is ready
+//   - A healthy app is never replaced until its replacement is ready
 //   - A previously-failed (unavailable) build is retried when its fingerprint
-//     is stable, so a broken function recovers without further edits
+//     is stable, so a broken app recovers without further edits
 //   - Live/periodic reload applies the SAME discovery path policy as startup
-//     (function.LoadSingle): a legal single-element name and a real direct-child
+//     (app.LoadSingle): a legal single-element name and a real direct-child
 //     directory of the root, never a symlink. An invalid path (bad name, symlink
 //     — even to an in-root or outside target, non-directory) RETAINS the
-//     previously-loaded function rather than removing or replacing it; only a
+//     previously-loaded app rather than removing or replacing it; only a
 //     truly missing directory is a removal.
-//   - Relay-owned transient staging directories (function.IsReservedDir, e.g.
-//     git's ".sync-*" created directly under the functions root during
-//     materialization) are never functions: their events and periodic entries
+//   - Relay-owned transient staging directories (app.IsReservedDir, e.g.
+//     git's ".sync-*" created directly under the apps root during
+//     materialization) are never apps: their events and periodic entries
 //     are filtered before a debounce/reconcile is armed, so a live sync cannot
 //     surface a warning, a state write, or a degraded/unavailable transition for
 //     a directory that is merely mid-copy.
 //
 // Usage: New, then PrepareWatch (establish change detection synchronously),
-// then Seed each startup function with its already-computed fingerprint, then
+// then Seed each startup app with its already-computed fingerprint, then
 // Start (which reuses the watcher). Establishing the watch BEFORE seeding is
 // what makes a supplied seed safe: a change after the watch is observed as an
 // event, and a change before it is caught by the first reconcile's rescan
@@ -45,10 +45,10 @@
 // periodic stats flush), and state writes never drive reconcile decisions and
 // never fail the reconcile loop; errors are only logged.
 //
-// When Config.UpdateSchedules is set, it is called after a function's new
+// When Config.UpdateSchedules is set, it is called after an app's new
 // version is swapped into the registry (discovery and update paths only, never
 // the skip path or a failed build) so the scheduler can converge its cron jobs
-// to the template's schedules. Removal converges via RemoveFunction instead.
+// to the template's schedules. Removal converges via RemoveApp instead.
 //
 // The service reconciler (services.go) is part of this package. Service
 // convergence is driven by the Config hooks UpdateServices/RemoveServices (both

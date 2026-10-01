@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
@@ -37,15 +37,15 @@ func (e *recordingExecutor) got() ([]string, [][]byte) {
 	return append([]string(nil), e.handlers...), append([][]byte(nil), e.payloads...)
 }
 
-// replayFn builds a prepared function with one event rule AND one schedule entry
+// replayFn builds a prepared app with one event rule AND one schedule entry
 // for distinct handlers, so ReplayDLQ's handler validation can be exercised
 // against both surfaces.
-func replayFn(t *testing.T, name string, exec Executor) *PreparedFunction {
+func replayFn(t *testing.T, name string, exec Executor) *PreparedApp {
 	t.Helper()
 	return buildFn(fnSpec{
 		name:  name,
-		rules: []function.EventRule{{Handler: "events.created.handler", Pattern: function.Pattern{}, Timeout: time.Second, Retries: 0}},
-		schedules: []function.Schedule{{
+		rules: []app.EventRule{{Handler: "events.created.handler", Pattern: app.Pattern{}, Timeout: time.Second, Retries: 0}},
+		schedules: []app.Schedule{{
 			Handler:  "jobs.cleanup.handler",
 			Cron:     "0 3 * * *",
 			Location: time.UTC,
@@ -57,18 +57,18 @@ func replayFn(t *testing.T, name string, exec Executor) *PreparedFunction {
 
 // TestReplayDLQExecutesExactHandlerOnce pins the core contract: ReplayDLQ runs
 // EXACTLY the named handler once, never event matching — a second matching event
-// rule in the same function is not executed.
+// rule in the same app is not executed.
 func TestReplayDLQExecutesExactHandlerOnce(t *testing.T) {
 	exec := &recordingExecutor{}
 	// Two event rules: the replayed one and another that would match any event.
 	pf := buildFn(fnSpec{
 		name: "fn",
-		rules: []function.EventRule{
-			{Handler: "events.created.handler", Pattern: function.Pattern{}, Timeout: time.Second, Retries: 0},
-			{Handler: "events.other.handler", Pattern: function.Pattern{}, Timeout: time.Second, Retries: 0},
+		rules: []app.EventRule{
+			{Handler: "events.created.handler", Pattern: app.Pattern{}, Timeout: time.Second, Retries: 0},
+			{Handler: "events.other.handler", Pattern: app.Pattern{}, Timeout: time.Second, Retries: 0},
 		},
 	}, exec)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), metrics.New())
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), metrics.New())
 
 	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{"event_name":"INSERT"}`), ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
@@ -89,7 +89,7 @@ func TestReplayDLQExecutesExactHandlerOnce(t *testing.T) {
 // template's schedules, not its event rules) is replayable.
 func TestReplayDLQScheduleHandler(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
 	if err := r.ReplayDLQ(context.Background(), "fn", "jobs.cleanup.handler", []byte(`{}`), ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
@@ -123,17 +123,17 @@ func (e *deadlineExecutor) got() (time.Time, bool) {
 
 // TestReplayDLQUsesCurrentEventRuleTimeout pins the current-handler-timeout
 // contract for an EVENT-rule handler: the replay must bound the handler by the
-// CURRENT event rule's Timeout, not the function default. The rule timeout is
-// deliberately far above function.DefaultTimeout so the two are distinguishable;
+// CURRENT event rule's Timeout, not the app default. The rule timeout is
+// deliberately far above app.DefaultTimeout so the two are distinguishable;
 // the recorded deadline makes the assertion exact and sleep-free.
 func TestReplayDLQUsesCurrentEventRuleTimeout(t *testing.T) {
 	ruleTimeout := 45 * time.Second
 	exec := &deadlineExecutor{}
 	pf := buildFn(fnSpec{
 		name:  "fn",
-		rules: []function.EventRule{{Handler: "events.created.handler", Pattern: function.Pattern{}, Timeout: ruleTimeout, Retries: 0}},
+		rules: []app.EventRule{{Handler: "events.created.handler", Pattern: app.Pattern{}, Timeout: ruleTimeout, Retries: 0}},
 	}, exec)
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 
 	before := time.Now()
 	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
@@ -145,26 +145,26 @@ func TestReplayDLQUsesCurrentEventRuleTimeout(t *testing.T) {
 	}
 	got := deadline.Sub(before)
 	if got < ruleTimeout-time.Second || got > ruleTimeout+time.Second {
-		t.Fatalf("handler timeout = %s, want the current rule timeout %s (not the %s default)", got, ruleTimeout, function.DefaultTimeout)
+		t.Fatalf("handler timeout = %s, want the current rule timeout %s (not the %s default)", got, ruleTimeout, app.DefaultTimeout)
 	}
 }
 
 // TestReplayDLQEventRuleTimeoutCap pins that the current event rule's timeout is
 // still capped by the configured maximum. Like the manual-invoke cap test, the
-// function is built directly so the rule can carry a timeout above the
+// app is built directly so the rule can carry a timeout above the
 // template-validation cap, isolating the runner's runtime cap as the thing under
-// test. The cap (10s) is deliberately ABOVE function.DefaultTimeout (6s): the
+// test. The cap (10s) is deliberately ABOVE app.DefaultTimeout (6s): the
 // observed deadline is then distinguishable from both the raw rule timeout (1h,
-// uncapped) and the function default (6s), so the assertion proves the resolved
+// uncapped) and the app default (6s), so the assertion proves the resolved
 // rule timeout was capped rather than the default being used.
 func TestReplayDLQEventRuleTimeoutCap(t *testing.T) {
 	const cap = 10 * time.Second
 	exec := &deadlineExecutor{}
 	pf := buildFn(fnSpec{
 		name:  "fn",
-		rules: []function.EventRule{{Handler: "events.created.handler", Pattern: function.Pattern{}, Timeout: time.Hour, Retries: 0}},
+		rules: []app.EventRule{{Handler: "events.created.handler", Pattern: app.Pattern{}, Timeout: time.Hour, Retries: 0}},
 	}, exec)
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.SetMaxHandlerTimeout(cap)
 
 	before := time.Now()
@@ -177,20 +177,20 @@ func TestReplayDLQEventRuleTimeoutCap(t *testing.T) {
 	}
 	got := deadline.Sub(before)
 	if got < cap-time.Second || got > cap+time.Second {
-		t.Fatalf("handler timeout = %s, want the current rule timeout capped at %s (not the default %s)", got, cap, function.DefaultTimeout)
+		t.Fatalf("handler timeout = %s, want the current rule timeout capped at %s (not the default %s)", got, cap, app.DefaultTimeout)
 	}
 }
 
 // TestReplayDLQUsesCurrentRuntimeAndSecrets pins that replay resolves the
-// function's CURRENT template env/secrets (the live runner path), not any stored
+// app's CURRENT template env/secrets (the live runner path), not any stored
 // snapshot.
 func TestReplayDLQUsesCurrentRuntimeAndSecrets(t *testing.T) {
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}}
 	pf := fnWithEnv(t, "fn", exec,
 		map[string]string{"API_URL": "https://api.example.com"},
-		map[string]function.SecretRef{"DATABASE_URL": "db-url"})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+		map[string]app.SecretRef{"DATABASE_URL": "db-url"})
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.SetSecretProvider(prov)
 
 	if err := r.ReplayDLQ(context.Background(), "fn", "index.run", []byte(`{}`), ""); err != nil {
@@ -204,36 +204,36 @@ func TestReplayDLQUsesCurrentRuntimeAndSecrets(t *testing.T) {
 	}
 }
 
-// TestReplayDLQUnknownFunction pins ErrFunctionNotFound for a function absent
+// TestReplayDLQUnknownApp pins ErrAppNotFound for an app absent
 // from the current registry.
-func TestReplayDLQUnknownFunction(t *testing.T) {
+func TestReplayDLQUnknownApp(t *testing.T) {
 	r := New(nil, testutil.DiscardLogger())
 	err := r.ReplayDLQ(context.Background(), "ghost", "index.run", []byte(`{}`), "")
-	if !errors.Is(err, ErrFunctionNotFound) {
-		t.Fatalf("err = %v, want ErrFunctionNotFound", err)
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Fatalf("err = %v, want ErrAppNotFound", err)
 	}
 }
 
-// TestReplayDLQUnavailableFunction pins ErrFunctionUnavailable for a registered
-// but unrunnable function.
-func TestReplayDLQUnavailableFunction(t *testing.T) {
-	r := New([]*PreparedFunction{NewUnavailable(function.Function{
+// TestReplayDLQUnavailableApp pins ErrAppUnavailable for a registered
+// but unrunnable app.
+func TestReplayDLQUnavailableApp(t *testing.T) {
+	r := New([]*PreparedApp{NewUnavailable(app.App{
 		Name:     "broken",
-		Template: &function.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "node24"},
 	})}, testutil.DiscardLogger())
 
 	err := r.ReplayDLQ(context.Background(), "broken", "index.run", []byte(`{}`), "")
-	if !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("err = %v, want ErrFunctionUnavailable", err)
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("err = %v, want ErrAppUnavailable", err)
 	}
 }
 
-// TestReplayDLQRemovedHandler pins ErrHandlerNotFound when the function is
+// TestReplayDLQRemovedHandler pins ErrHandlerNotFound when the app is
 // present and runnable but the exact recorded handler is no longer in its
 // current template. The executor must never run.
 func TestReplayDLQRemovedHandler(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
 	err := r.ReplayDLQ(context.Background(), "fn", "events.removed.handler", []byte(`{}`), "")
 	if !errors.Is(err, ErrHandlerNotFound) {
@@ -251,7 +251,7 @@ func TestReplayDLQRecordsHandlerStats(t *testing.T) {
 	// Success: handler success metrics, no event/retry/DLQ.
 	m := metrics.New()
 	ok := &captureExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{replayFn(t, "fn", ok)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{replayFn(t, "fn", ok)}, testutil.DiscardLogger(), m)
 	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestReplayDLQRecordsHandlerStats(t *testing.T) {
 		"events_received_total",
 		"events_matched_total",
 		"events_unmatched_total",
-		"function_events_matched_total",
+		"app_events_matched_total",
 		"retries_total",
 		"dlq_entries_total",
 		"function_retries_total",
@@ -280,7 +280,7 @@ func TestReplayDLQRecordsHandlerStats(t *testing.T) {
 	// Failure: handler failure metric, still no event/retry/DLQ.
 	m2 := metrics.New()
 	bad := &countingExecutor{fail: true}
-	r2 := NewWithMetrics([]*PreparedFunction{replayFn(t, "fn", bad)}, testutil.DiscardLogger(), m2)
+	r2 := NewWithMetrics([]*PreparedApp{replayFn(t, "fn", bad)}, testutil.DiscardLogger(), m2)
 	if err := r2.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err == nil {
 		t.Fatal("expected a failed replay")
 	}
@@ -349,7 +349,7 @@ func (n *noopInvocationState) RecordTrace(string, string)         { n.touch() }
 // (as the stream delivery path always does), a replay leaves it untouched.
 func TestReplayDLQWritesNoBrokerState(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
 	state := &noopInvocationState{}
 	ctx := stream.WithInvocationState(context.Background(), state)
@@ -365,20 +365,20 @@ func TestReplayDLQWritesNoBrokerState(t *testing.T) {
 }
 
 // TestReplayDLQStampsInvocationMeta pins the diagnostic RunMeta of a replayed
-// handler: it carries the exact function and handler and no stream message ID
+// handler: it carries the exact app and handler and no stream message ID
 // (a replay has no source message). The type is the schedule marker because
 // ReplayDLQ reuses InvokeHandler, the single-handler execution primitive whose
 // container type is the schedule one; it remains a managed execution container
 // for the sweep's relay.type + relay.hostname ownership predicate either way.
 func TestReplayDLQStampsInvocationMeta(t *testing.T) {
 	exec := &captureExecutor{}
-	r := New([]*PreparedFunction{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{replayFn(t, "fn", exec)}, testutil.DiscardLogger())
 
 	if err := r.ReplayDLQ(context.Background(), "fn", "events.created.handler", []byte(`{}`), ""); err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
 	meta := exec.gotMeta()
-	if meta.Function != "fn" || meta.Handler != "events.created.handler" {
+	if meta.App != "fn" || meta.Handler != "events.created.handler" {
 		t.Fatalf("RunMeta = %+v", meta)
 	}
 	if meta.MessageID != "" {

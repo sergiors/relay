@@ -15,7 +15,7 @@ import (
 // TypeScript transpilation), AND the entrypoint. It is the content the
 // relay.bootstrap image label pins: an image whose label differs was built with a
 // different (stale) bootstrap, tool version, or compile step and must be rebuilt
-// even though its tag is content-current for the function source.
+// even though its tag is content-current for the app source.
 func bootstrapHash(p plan.BuildPlan) string {
 	h := sha256.New()
 	for _, f := range p.Files {
@@ -55,7 +55,7 @@ func (m *Manager) bootstrapLabelMatches(ctx context.Context, image, want string)
 	}
 	insp, err := m.cli.ImageInspect(ctx, image)
 	if err != nil {
-		m.log.Debug("Function: image inspect failed; rebuilding",
+		m.log.Debug("App: image inspect failed; rebuilding",
 			"image", image, "error", err)
 		return false
 	}
@@ -64,7 +64,7 @@ func (m *Manager) bootstrapLabelMatches(ctx context.Context, image, want string)
 		labels = insp.Config.Labels
 	}
 	if labels == nil || labels[labelBootstrap] != want {
-		m.log.Debug("Function: image has stale bootstrap; rebuilding",
+		m.log.Debug("App: image has stale bootstrap; rebuilding",
 			"image", image)
 		return false
 	}

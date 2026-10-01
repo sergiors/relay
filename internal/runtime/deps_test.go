@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/plan"
 )
 
@@ -295,7 +295,7 @@ func TestIsDepRepoMatchesRelayDepPrefix(t *testing.T) {
 	if !isDepRepo("relay-dep-abcdef1234567890") {
 		t.Error("expected a relay-dep repo to be detected")
 	}
-	if isDepRepo("relay-fn-user") {
+	if isDepRepo("relay-app-user") {
 		t.Error("a relay-fn repo must NOT be a dep repo")
 	}
 	if isDepRepo("python:3.14-slim") {
@@ -336,13 +336,13 @@ func TestDependencyFingerprintConcurrent(t *testing.T) {
 	}
 }
 
-// TestTypeScriptEditsInvalidateFunctionNotDependency pins the artifact split for
+// TestTypeScriptEditsInvalidateAppNotDependency pins the artifact split for
 // TypeScript handlers: a .ts source edit (or a tsconfig.json edit) changes the
-// function fingerprint — the transpiled output is baked into the function image —
+// app fingerprint — the transpiled output is baked into the app image —
 // while the dependency fingerprint is unchanged (it hashes the dependency
-// manifests only). A TS change therefore rebuilds the function image but reuses
+// manifests only). A TS change therefore rebuilds the app image but reuses
 // the shared relay-dep-* layer.
-func TestTypeScriptEditsInvalidateFunctionNotDependency(t *testing.T) {
+func TestTypeScriptEditsInvalidateAppNotDependency(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
@@ -367,7 +367,7 @@ func TestTypeScriptEditsInvalidateFunctionNotDependency(t *testing.T) {
 		t.Fatalf("dependency fingerprint: %v", err)
 	}
 
-	// Edit the TypeScript handler: it is function source, not dependency input.
+	// Edit the TypeScript handler: it is app source, not dependency input.
 	if err := os.WriteFile(handlerPath, []byte("export function handler(e) { return 2; }\n"), 0o644); err != nil {
 		t.Fatalf("rewrite handler.ts: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestTypeScriptEditsInvalidateFunctionNotDependency(t *testing.T) {
 		t.Error("a .ts source edit must NOT change the dependency fingerprint")
 	}
 
-	// Edit tsconfig.json: also function source (it shapes transpilation).
+	// Edit tsconfig.json: also app source (it shapes transpilation).
 	funcAfterTS := fpOf(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "tsconfig.json"), []byte(`{"compilerOptions":{"strict":false}}`+"\n"), 0o644); err != nil {
 		t.Fatalf("rewrite tsconfig: %v", err)
@@ -400,7 +400,7 @@ func TestTypeScriptEditsInvalidateFunctionNotDependency(t *testing.T) {
 }
 
 // TestTypeScriptIgnoredFileChangesNeitherFingerprint pins the shared selection
-// policy for TypeScript: a .ts file matched by .gitignore is neither function
+// policy for TypeScript: a .ts file matched by .gitignore is neither app
 // source nor dependency input, so editing it changes neither digest.
 func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
 	dir := t.TempDir()
@@ -442,10 +442,10 @@ func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
 	}
 }
 
-// fpOf computes the function fingerprint for dir, failing the test on error.
+// fpOf computes the app fingerprint for dir, failing the test on error.
 func fpOf(t *testing.T, dir string) string {
 	t.Helper()
-	f, err := function.Fingerprint(dir)
+	f, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("function fingerprint: %v", err)
 	}

@@ -13,26 +13,26 @@ import (
 // soon as it returns, so the runner can gate retirement on live executions.
 func TestHandleCountsImageRefs(t *testing.T) {
 	exec := newBlockingExecutor(make(chan struct{}))
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_ = r.Handle(context.Background(), "m", map[string]any{"status": "ok"})
 	}()
-	exec.waitEntered() // Execute is now holding ref "relay-fn-a:old"
+	exec.waitEntered() // Execute is now holding ref "relay-app-a:old"
 
-	if !r.ImageInUse("relay-fn-a:old") {
+	if !r.ImageInUse("relay-app-a:old") {
 		t.Fatal("expected image in use while Execute is running")
 	}
-	if r.ImageInUse("relay-fn-a:other") {
+	if r.ImageInUse("relay-app-a:other") {
 		t.Fatal("unrelated image must not be considered in use")
 	}
 
 	close(exec.release) // unblock Execute
 	<-done
 
-	if r.ImageInUse("relay-fn-a:old") {
+	if r.ImageInUse("relay-app-a:old") {
 		t.Fatal("expected image not in use after Handle returns")
 	}
 }
@@ -43,7 +43,7 @@ func TestHandleCountsImageRefs(t *testing.T) {
 // instead of propagating it, so the test calls Handle directly and asserts both
 // the error and the refcount release.
 func TestImageRefsReleasedOnExecutorPanic(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", panicExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", panicExecutor{})}, testutil.DiscardLogger(), nil)
 
 	err := r.Handle(context.Background(), "m", map[string]any{"status": "ok"})
 	if err == nil {
@@ -53,7 +53,7 @@ func TestImageRefsReleasedOnExecutorPanic(t *testing.T) {
 		t.Fatalf("error = %v, want it to mention the executor panic", err)
 	}
 
-	if r.ImageInUse("relay-fn-a:old") {
+	if r.ImageInUse("relay-app-a:old") {
 		t.Fatal("expected image not in use after executor panic")
 	}
 }
@@ -62,14 +62,14 @@ func TestImageRefsReleasedOnExecutorPanic(t *testing.T) {
 // cleaner), exactly once.
 func TestRetiredImageRemovedWhenNotInUse(t *testing.T) {
 	exec := &blockingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 
 	got := exec.removedImages()
-	if len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed = %v, want [relay-fn-a:old]", got)
+	if len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed = %v, want [relay-app-a:old]", got)
 	}
 }
 
@@ -77,7 +77,7 @@ func TestRetiredImageRemovedWhenNotInUse(t *testing.T) {
 // in-flight execution releases it, it is removed asynchronously.
 func TestRetiredImageNotRemovedWhileInUse(t *testing.T) {
 	exec := newBlockingExecutor(make(chan struct{}))
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -87,7 +87,7 @@ func TestRetiredImageNotRemovedWhileInUse(t *testing.T) {
 	exec.waitEntered()
 
 	// Retire while the execution holds the image: nothing is removed yet.
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	if len(exec.removedImages()) != 0 {
 		t.Fatalf("removed while in use: %v, want none", exec.removedImages())
 	}
@@ -97,17 +97,17 @@ func TestRetiredImageNotRemovedWhileInUse(t *testing.T) {
 	close(exec.release)
 	<-done
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
-	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed after idle = %v, want [relay-fn-a:old]", got)
+	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed after idle = %v, want [relay-app-a:old]", got)
 	}
 }
 
-// Function removal retires every recorded version of the function's images.
-func TestFunctionRemovalRetiresAllVersions(t *testing.T) {
-	exec := &blockingExecutor{tags: map[string][]string{"a": {"relay-fn-a:aaaa", "relay-fn-a:bbbb"}}}
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:aaaa", exec)}, testutil.DiscardLogger(), nil)
+// App removal retires every recorded version of the app's images.
+func TestAppRemovalRetiresAllVersions(t *testing.T) {
+	exec := &blockingExecutor{tags: map[string][]string{"a": {"relay-app-a:aaaa", "relay-app-a:bbbb"}}}
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:aaaa", exec)}, testutil.DiscardLogger(), nil)
 
-	r.RemoveFunctionImages("a")
+	r.RemoveAppImages("a")
 	waitFor(t, func() bool { return len(exec.removedImages()) == 2 })
 
 	got := exec.removedImages()
@@ -120,11 +120,11 @@ func TestFunctionRemovalRetiresAllVersions(t *testing.T) {
 // removal is logged and skipped, and Handle still runs normally.
 func TestImageCleanupFailureDoesNotFailInvocationHandling(t *testing.T) {
 	exec := &blockingExecutor{removeErr: true, tags: map[string][]string{}}
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
 	// Retiring with a failing cleaner must not panic; the removal is logged and
 	// skipped.
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	// Processing continues normally.
 	if err := r.Handle(context.Background(), "m", map[string]any{"status": "ok"}); err != nil {
@@ -135,10 +135,10 @@ func TestImageCleanupFailureDoesNotFailInvocationHandling(t *testing.T) {
 // A nil cleaner (fake executors that do not implement ImageCleaner) makes
 // retirement a safe no-op: no panic, and processing is unaffected.
 func TestRetirementNilCleanerSafe(t *testing.T) {
-	r := NewWithMetrics([]*PreparedFunction{newFn(t, "a")}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{newFn(t, "a")}, testutil.DiscardLogger(), nil)
 
-	r.RetireImage("relay-fn-a:old") // no cleaner -> no-op, no panic
-	r.RemoveFunctionImages("a")     // resolver nil -> no-op, no panic
+	r.RetireImage("relay-app-a:old") // no cleaner -> no-op, no panic
+	r.RemoveAppImages("a")           // resolver nil -> no-op, no panic
 	if err := r.Handle(context.Background(), "m", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -149,15 +149,15 @@ func TestRetirementNilCleanerSafe(t *testing.T) {
 // Warn is emitted. This is the runner-level pin for "never remove an image a
 // running service container depends on".
 func TestRetireImageSkippedWhileRelayContainerReferences(t *testing.T) {
-	exec := &blockingExecutor{referenced: map[string]bool{"relay-fn-a:old": true}}
+	exec := &blockingExecutor{referenced: map[string]bool{"relay-app-a:old": true}}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	// The reference never clears, so the retry chain must terminate promptly (a
 	// short backoff bounds its lifetime and prevents a test-leaked goroutine).
 	r.imageCleanupRetryDelays = []time.Duration{5 * time.Millisecond, 5 * time.Millisecond}
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	// Wait for the first skip to be logged (the guard fired); the image must not
 	// have been removed.
@@ -174,25 +174,25 @@ func TestRetireImageSkippedWhileRelayContainerReferences(t *testing.T) {
 // A retired image that was referenced by a container but whose reference clears
 // after a delay is eventually removed exactly once by the retry loop.
 func TestRetireImageRemovedAfterContainerReferenceClears(t *testing.T) {
-	exec := &blockingExecutor{referenced: map[string]bool{"relay-fn-a:old": true}}
+	exec := &blockingExecutor{referenced: map[string]bool{"relay-app-a:old": true}}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	// Shrink the retry backoff so the test observes retries quickly.
 	r.imageCleanupRetryDelays = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond}
 
 	// The image is referenced initially, so the first attempt skips.
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	// Wait until the first guard-skip fired, then clear the reference: the retry
 	// loop now removes the image exactly once.
 	waitFor(t, func() bool { return strings.Contains(buf.String(), "Image cleanup: image still in use; skipping") })
-	exec.setReferenced("relay-fn-a:old", false)
+	exec.setReferenced("relay-app-a:old", false)
 
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 	got := exec.removedImages()
-	if len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed = %v, want exactly [relay-fn-a:old]", got)
+	if len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed = %v, want exactly [relay-app-a:old]", got)
 	}
 	// No deferral Info should be logged (the removal eventually succeeded).
 	if strings.Contains(buf.String(), "deferring to a later cleanup pass") {
@@ -204,13 +204,13 @@ func TestRetireImageRemovedAfterContainerReferenceClears(t *testing.T) {
 // loop gives up cleanly: exactly ONE final Info defers the image to a later
 // cleanup pass, nothing is removed, and no repeated Warns are emitted.
 func TestRetireImageRetryGivesUpCleanly(t *testing.T) {
-	exec := &blockingExecutor{referenced: map[string]bool{"relay-fn-a:old": true}}
+	exec := &blockingExecutor{referenced: map[string]bool{"relay-app-a:old": true}}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	r.imageCleanupRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	waitFor(t, func() bool {
 		return strings.Count(buf.String(), "deferring to a later cleanup pass") == 1
@@ -239,10 +239,10 @@ func TestRetireImagePartialServiceFailureDoesNotDelete(t *testing.T) {
 	exec := &blockingExecutor{referenced: map[string]bool{}, removeErrCountdown: 1}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	r.imageCleanupRetryDelays = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond}
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	// The first RemoveImage fails AND a container reference appears (the race),
 	// so the runner must classify it as a guarded skip — no removal, no
@@ -257,45 +257,45 @@ func TestRetireImagePartialServiceFailureDoesNotDelete(t *testing.T) {
 
 	// The container is eventually replaced (reference clears); the retry loop now
 	// succeeds exactly once.
-	exec.setReferenced("relay-fn-a:old", false)
+	exec.setReferenced("relay-app-a:old", false)
 
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 	got := exec.removedImages()
-	if len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed after reference cleared = %v, want exactly [relay-fn-a:old]", got)
+	if len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed after reference cleared = %v, want exactly [relay-app-a:old]", got)
 	}
 }
 
-// A successful function-image removal fires dependency GC exactly once, off the
-// event path, after the removal succeeded: the function image that referenced
+// A successful app-image removal fires dependency GC exactly once, off the
+// event path, after the removal succeeded: the app image that referenced
 // its dependency is gone, so the now-possibly-orphaned dependency layer can be
 // pruned.
 func TestSuccessfulRemovalRunsDependencyGC(t *testing.T) {
 	exec := &blockingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 
 	// GC must have fired exactly once, after the successful removal.
 	waitFor(t, func() bool { return exec.gcCallCount() == 1 })
-	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed = %v, want [relay-fn-a:old]", got)
+	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed = %v, want [relay-app-a:old]", got)
 	}
 }
 
 // A removal that is skipped (a relay-owned container references the image
-// forever) never fires dependency GC: the function image was NOT removed, so its
+// forever) never fires dependency GC: the app image was NOT removed, so its
 // dependency is still referenced and pruning would be pointless. This pins "no
 // GC before/during a removal that did not succeed".
 func TestSkippedRemovalRunsNoDependencyGC(t *testing.T) {
-	exec := &blockingExecutor{referenced: map[string]bool{"relay-fn-a:old": true}}
+	exec := &blockingExecutor{referenced: map[string]bool{"relay-app-a:old": true}}
 
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	r.imageCleanupRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	// Wait for the retry loop to give up (exactly one deferral Info); the image
 	// was never removed, so GC must never have run.
@@ -311,15 +311,15 @@ func TestSkippedRemovalRunsNoDependencyGC(t *testing.T) {
 }
 
 // A dependency-GC failure is logged at Warn but must NOT change the outcome of
-// the function-image removal that preceded it: the removal already succeeded, so
+// the app-image removal that preceded it: the removal already succeeded, so
 // a genuine GC failure only means the dependency layer is pruned on the next
 // natural lifecycle point.
 func TestDependencyGCFailureDoesNotAffectRemoval(t *testing.T) {
 	exec := &blockingExecutor{gcErr: true}
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	waitFor(t, func() bool { return len(exec.removedImages()) == 1 })
 
 	// GC was attempted and failed: the failure is logged as a Warn ("Dependency
@@ -329,8 +329,8 @@ func TestDependencyGCFailureDoesNotAffectRemoval(t *testing.T) {
 	if !strings.Contains(buf.String(), "Dependency image cleanup failed") {
 		t.Fatalf("expected a Warn logging the dependency-GC failure, got:\n%s", buf.String())
 	}
-	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-fn-a:old" {
-		t.Fatalf("removed = %v, want [relay-fn-a:old] despite the GC failure", got)
+	if got := exec.removedImages(); len(got) != 1 || got[0] != "relay-app-a:old" {
+		t.Fatalf("removed = %v, want [relay-app-a:old] despite the GC failure", got)
 	}
 }
 
@@ -344,10 +344,10 @@ func TestRetireImageReferenceCheckErrorRetriesConservatively(t *testing.T) {
 		referenceCheckErr: errRemoveBoom,
 	}
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 	r.imageCleanupRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	waitFor(t, func() bool {
 		return strings.Count(buf.String(), "deferring to a later cleanup pass") == 1
@@ -371,9 +371,9 @@ func TestRetireImageRemovalFailureWithReconsultErrorWarns(t *testing.T) {
 		referenceCheckErrAfter: 1,
 	}
 	logger, buf := debugBufferLogger()
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, logger, nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, logger, nil)
 
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 
 	waitFor(t, func() bool {
 		return strings.Contains(buf.String(), "Image cleanup: remove retired failed")
@@ -388,7 +388,7 @@ func TestRetireImageRemovalFailureWithReconsultErrorWarns(t *testing.T) {
 // release fires the idle hook and the image is never handed to the cleaner.
 func TestRetireImageReacquireAbortsPendingRemoval(t *testing.T) {
 	exec := newBlockingExecutor(make(chan struct{}))
-	r := NewWithMetrics([]*PreparedFunction{fpClean(t, "a", "relay-fn-a:old", exec)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{fpClean(t, "a", "relay-app-a:old", exec)}, testutil.DiscardLogger(), nil)
 
 	// First invocation holds the image.
 	first := make(chan struct{})
@@ -400,7 +400,7 @@ func TestRetireImageReacquireAbortsPendingRemoval(t *testing.T) {
 
 	// Retire while the image is in use: the removal is pending on release and
 	// nothing is removed yet.
-	r.RetireImage("relay-fn-a:old")
+	r.RetireImage("relay-app-a:old")
 	if got := exec.removedImages(); len(got) != 0 {
 		t.Fatalf("removed while in use: %v, want none", got)
 	}

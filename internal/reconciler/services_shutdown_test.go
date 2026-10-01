@@ -14,19 +14,19 @@ import (
 )
 
 // TestShutdownCleanupRemovesOwnContainers: cleanup(hostname) selects exactly the
-// containers whose Hostname == hostname (2 replicas of one function) and stops
+// containers whose Hostname == hostname (2 replicas of one app) and stops
 // them all, returning the count.
 func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 	f := newFakeDocker()
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc.js",
 		SourceRef: "svc.js", Port: 80, Image: "img-1",
 	}, 0); err != nil {
 		t.Fatalf("start replica 0: %v", err)
 	}
 	if _, err := f.StartService(context.Background(), runtime.ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc.js",
 		SourceRef: "svc.js", Port: 80, Image: "img-1",
 	}, 1); err != nil {
@@ -44,7 +44,7 @@ func TestShutdownCleanupRemovesOwnContainers(t *testing.T) {
 	if got := len(f.stops); got != 2 {
 		t.Fatalf("stops = %d, want 2", got)
 	}
-	if got := f.countForFunction("fn"); got != 0 {
+	if got := f.countForApp("fn"); got != 0 {
 		t.Fatalf("containers left = %d, want 0", got)
 	}
 }
@@ -56,7 +56,7 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	f := newFakeDocker()
 	seed := func(id, hostname string) {
 		f.ctrs[id] = &fakeContainer{
-			id: id, function: "fn", entrypoint: "svc.js", image: "img-1",
+			id: id, appName: "fn", entrypoint: "svc.js", image: "img-1",
 			port: 80, replica: 0, state: container.StateRunning, hostname: hostname,
 		}
 	}
@@ -83,7 +83,7 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 	if !w2Alive || !noneAlive {
 		t.Fatalf("other workers' containers must be preserved (w2Alive=%v noneAlive=%v)", w2Alive, noneAlive)
 	}
-	if got := f.countForFunction("fn"); got != 2 {
+	if got := f.countForApp("fn"); got != 2 {
 		t.Fatalf("preserved count = %d, want 2", got)
 	}
 }
@@ -94,7 +94,7 @@ func TestShutdownCleanupPreservesOtherWorkers(t *testing.T) {
 func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["a"] = &fakeContainer{
-		id: "a", function: "fn", entrypoint: "svc.js", image: "img-1",
+		id: "a", appName: "fn", entrypoint: "svc.js", image: "img-1",
 		port: 80, replica: 0, state: container.StateRunning, hostname: "",
 	}
 
@@ -109,7 +109,7 @@ func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
 	if got := len(f.stops); got != 0 {
 		t.Fatalf("stops = %v, want none", f.stops)
 	}
-	if got := f.countForFunction("fn"); got != 1 {
+	if got := f.countForApp("fn"); got != 1 {
 		t.Fatalf("container count = %d, want 1 (untouched)", got)
 	}
 }
@@ -120,11 +120,11 @@ func TestShutdownCleanupEmptyHostnameSelectsNothing(t *testing.T) {
 func TestShutdownCleanupStopFailureDoesNotBlock(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["fail-1"] = &fakeContainer{
-		id: "fail-1", function: "fn", entrypoint: "svc.js", image: "img-1",
+		id: "fail-1", appName: "fn", entrypoint: "svc.js", image: "img-1",
 		port: 80, replica: 0, state: container.StateRunning, hostname: "w1",
 	}
 	f.ctrs["ok-1"] = &fakeContainer{
-		id: "ok-1", function: "fn", entrypoint: "svc.js", image: "img-1",
+		id: "ok-1", appName: "fn", entrypoint: "svc.js", image: "img-1",
 		port: 80, replica: 1, state: container.StateRunning, hostname: "w1",
 	}
 	f.failStopFor = "fail-1"

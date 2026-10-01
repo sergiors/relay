@@ -56,7 +56,7 @@ func statsCommand(deps Dependencies) *cli.Command {
 // cannot be written after the reset (the worker performs both under its flush
 // mutex). Only when the socket POSITIVELY reports no worker (the socket file is
 // gone or refusing connections) does it fall back to state.ResetStats, which
-// rewrites the persisted global counters and every per-function stats row to
+// rewrites the persisted global counters and every per-app stats row to
 // zero in one transaction. An ambiguous outcome — a timeout, a failed exchange,
 // or a worker that answered but could not reset — is surfaced, never silently
 // masked by a direct write: a live worker may have received the reset (or reset
@@ -69,7 +69,7 @@ func statsResetCommand(deps Dependencies) *cli.Command {
 		Name:        "reset",
 		Usage:       "Reset persisted cumulative statistics",
 		UsageText:   "relay stats reset",
-		Description: "Reset cumulative global and per-function statistics.",
+		Description: "Reset cumulative global and per-app statistics.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("stats reset: too many arguments", 2)

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
@@ -46,10 +46,10 @@ func (p *fakeProvider) count() int {
 func TestHandleInjectsEnvAndResolvedSecrets(t *testing.T) {
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}}
-	r := NewWithMetrics([]*PreparedFunction{
+	r := NewWithMetrics([]*PreparedApp{
 		fnWithEnv(t, "user-events", exec,
 			map[string]string{"API_URL": "https://api.example.com"},
-			map[string]function.SecretRef{"DATABASE_URL": "db-url"}),
+			map[string]app.SecretRef{"DATABASE_URL": "db-url"}),
 	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
@@ -74,8 +74,8 @@ func TestHandleInjectsEnvAndResolvedSecrets(t *testing.T) {
 func TestHandleSecretResolutionFailureSchedulesRetry(t *testing.T) {
 	exec := &countingExecutor{}
 	prov := &fakeProvider{err: errors.New("secret \"db-url\" not found")}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"DATABASE_URL": "db-url"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"DATABASE_URL": "db-url"}),
 	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
@@ -102,8 +102,8 @@ func TestHandleSecretResolutionFailureSchedulesRetry(t *testing.T) {
 // the reference.
 func TestHandleSecretNoProviderFails(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"TOKEN": "tok"}),
 	}, testutil.DiscardLogger(), nil)
 	// SetSecretProvider deliberately NOT called.
 
@@ -129,8 +129,8 @@ func TestHandleSecretNoProviderFails(t *testing.T) {
 func TestHandleResolvesSecretsPerInvocation(t *testing.T) {
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"tok": "v1"}}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"TOKEN": "tok"}),
 	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
@@ -168,9 +168,9 @@ func TestResolveExtraEnvReflectsCurrentTemplateSet(t *testing.T) {
 	r.SetSecretProvider(prov)
 
 	// A template that declares both an env var and a secret.
-	full := &function.Template{
+	full := &app.Template{
 		Env:     map[string]string{"FOO": "bar"},
-		Secrets: map[string]function.SecretRef{"TOKEN": "tok"},
+		Secrets: map[string]app.SecretRef{"TOKEN": "tok"},
 	}
 	got, err := r.resolveExtraEnv(context.Background(), full)
 	if err != nil {
@@ -180,7 +180,7 @@ func TestResolveExtraEnvReflectsCurrentTemplateSet(t *testing.T) {
 	assertEnvEntries(t, got, want)
 
 	// The same env var with the secret REMOVED: the frame must carry FOO only.
-	withoutSecret := &function.Template{Env: map[string]string{"FOO": "bar"}}
+	withoutSecret := &app.Template{Env: map[string]string{"FOO": "bar"}}
 	got, err = r.resolveExtraEnv(context.Background(), withoutSecret)
 	if err != nil {
 		t.Fatalf("resolve without secret: %v", err)
@@ -193,7 +193,7 @@ func TestResolveExtraEnvReflectsCurrentTemplateSet(t *testing.T) {
 	}
 
 	// Both removed: the frame is empty (the bootstrap then clears prior keys).
-	empty := &function.Template{}
+	empty := &app.Template{}
 	got, err = r.resolveExtraEnv(context.Background(), empty)
 	if err != nil {
 		t.Fatalf("resolve empty: %v", err)
@@ -230,8 +230,8 @@ func TestHandleSecretValueNeverLogged(t *testing.T) {
 	logger, buf := bufferLogger()
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"tok": "SUPERSECRETVALUE"}}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"TOKEN": "tok"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"TOKEN": "tok"}),
 	}, logger, nil)
 	r.SetSecretProvider(prov)
 
@@ -258,8 +258,8 @@ const pemValue = "-----BEGIN PRIVATE KEY-----\nMIIB\nline2\n\nindented:  value\n
 func TestHandleInjectsMultilineSecret(t *testing.T) {
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
 	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 
@@ -284,8 +284,8 @@ func TestHandleMultilineSecretValueNeverLogged(t *testing.T) {
 	logger, buf := bufferLogger()
 	exec := &captureExecutor{}
 	prov := &fakeProvider{vals: map[string]string{"rsa-private-key": pemValue}}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", exec, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", exec, nil, map[string]app.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
 	}, logger, nil)
 	r.SetSecretProvider(prov)
 
@@ -310,8 +310,8 @@ func TestHandleMultilineSecretValueNeverLogged(t *testing.T) {
 func TestHandleMultilineSecretResolutionFailureDoesNotLeak(t *testing.T) {
 	// Use the error-only provider: no value ever exists to leak.
 	prov := &fakeProvider{err: errors.New("secret \"rsa-private-key\" not found")}
-	r := NewWithMetrics([]*PreparedFunction{
-		fnWithEnv(t, "user-events", &countingExecutor{}, nil, map[string]function.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
+	r := NewWithMetrics([]*PreparedApp{
+		fnWithEnv(t, "user-events", &countingExecutor{}, nil, map[string]app.SecretRef{"PRIVATE_KEY": "rsa-private-key"}),
 	}, testutil.DiscardLogger(), nil)
 	r.SetSecretProvider(prov)
 

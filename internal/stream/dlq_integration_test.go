@@ -73,7 +73,7 @@ func TestIntegrationDLQStoreListGetDelete(t *testing.T) {
 	if len(entries) != 2 || entries[0].ID != id1 || entries[1].ID != id2 {
 		t.Fatalf("List = %+v, want [%s %s] in order", entries, id1, id2)
 	}
-	if entries[0].Function != "alpha" || entries[0].Handler != "h.a" || entries[0].HandlerAttempts != 1 {
+	if entries[0].App != "alpha" || entries[0].Handler != "h.a" || entries[0].HandlerAttempts != 1 {
 		t.Fatalf("entry 1 = %+v", entries[0])
 	}
 
@@ -81,7 +81,7 @@ func TestIntegrationDLQStoreListGetDelete(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Get(id2) = (%+v, %v, %v)", got, ok, err)
 	}
-	if got.ID != id2 || got.Function != "beta" || got.HandlerAttempts != 2 {
+	if got.ID != id2 || got.App != "beta" || got.HandlerAttempts != 2 {
 		t.Fatalf("Get(id2) = %+v", got)
 	}
 	if _, ok, err := store.Get(ctx, "0-0"); err != nil || ok {

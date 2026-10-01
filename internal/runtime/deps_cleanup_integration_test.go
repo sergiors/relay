@@ -11,14 +11,14 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
-// TestIntegrationDependencyImageLabels verifies that a function built with a
+// TestIntegrationDependencyImageLabels verifies that an app built with a
 // dependency layer stamps the managed-image labels onto BOTH the dependency
-// image and the function image, and that a reuse (second Prepare of the same
-// function) reuses the dependency layer without rebuilding it (identical dep
+// image and the app image, and that a reuse (second Prepare of the same
+// app) reuses the dependency layer without rebuilding it (identical dep
 // image ID). This is the integration proof that ImageBuildOptions.Labels lands
 // on the resulting image config (the build backend applies them as LABEL
 // equivalents), the mechanism the dependency GC reads for ownership.
@@ -30,7 +30,7 @@ func TestIntegrationDependencyImageLabels(t *testing.T) {
 
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-labels:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-labels:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -42,7 +42,7 @@ events:
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
-	fn := function.Function{Name: "dep-labels", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-labels", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	p1, err := mgr.Prepare(ctx, fn)
 	if err != nil {
@@ -61,7 +61,7 @@ events:
 		t.Fatalf("dependency image %s must exist after prepare", depRef)
 	}
 	// The daemon normalizes a plain repo reference to a :latest tag; the
-	// function image's relay.dependency label carries the untagged repo (what
+	// app image's relay.dependency label carries the untagged repo (what
 	// depImageRef produces), so normalize the candidate before comparing.
 	depRepo, _, _ := strings.Cut(depRef, ":")
 	// The 16-hex fingerprint prefix the tag embeds (depImageRef truncates the
@@ -93,7 +93,7 @@ events:
 			dlbls[labelFingerprint], depRef, depFP)
 	}
 
-	// The function image carries its own labels and references the dependency.
+	// The app image carries its own labels and references the dependency.
 	fnInsp, err := cli.ImageInspect(ctx, p1.Image)
 	if err != nil {
 		t.Fatalf("inspect function image: %v", err)
@@ -102,20 +102,20 @@ events:
 		t.Fatal("managed function image must carry config labels (ImageBuildOptions.Labels did not land)")
 	}
 	flbls := fnInsp.Config.Labels
-	if flbls[labelType] != ImageTypeFunction {
-		t.Errorf("fn relay.type = %q, want function", flbls[labelType])
+	if flbls[labelType] != ImageTypeApp {
+		t.Errorf("fn relay.type = %q, want app", flbls[labelType])
 	}
-	if flbls[labelFunction] != "dep-labels" {
-		t.Errorf("fn relay.function = %q, want dep-labels", flbls[labelFunction])
+	if flbls[labelApp] != "dep-labels" {
+		t.Errorf("fn relay.app = %q, want dep-labels", flbls[labelApp])
 	}
-	// The function image's relay.dependency is the untagged repo reference
+	// The app image's relay.dependency is the untagged repo reference
 	// (what depImageRef / Prepare produce), which the daemon normalized to
 	// depRef (with :latest) — compare to the normalized repo.
 	if flbls[labelDependency] != depRepo {
 		t.Errorf("fn relay.dependency = %q, want the dependency reference %q", flbls[labelDependency], depRepo)
 	}
 
-	// Reuse: a second Prepare of the same function must reuse the dependency
+	// Reuse: a second Prepare of the same app must reuse the dependency
 	// layer (identical dep image ID), never rebuild it.
 	depIDBefore := depInsp.ID
 	if _, err := mgr.Prepare(ctx, fn); err != nil {
@@ -132,8 +132,8 @@ events:
 }
 
 // TestIntegrationSharedDependencyGC exercises the lifecycle-driven dependency GC
-// end to end: two functions sharing one dependency fingerprint are kept while
-// any of them references the layer; once the LAST referencing function image is
+// end to end: two apps sharing one dependency fingerprint are kept while
+// any of them references the layer; once the LAST referencing app image is
 // removed the dependency layer is pruned. It also proves unmanaged images (a
 // relay-dep-* image with no relay.type label) are never touched.
 func TestIntegrationSharedDependencyGC(t *testing.T) {
@@ -144,9 +144,9 @@ func TestIntegrationSharedDependencyGC(t *testing.T) {
 
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-gc-a:", "relay-fn-dep-gc-b:", "relay-dep-evil"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-gc-a:", "relay-app-dep-gc-b:", "relay-dep-evil"))
 
-	newManaged := func(name, deps string) function.Function {
+	newManaged := func(name, deps string) app.App {
 		dir := t.TempDir()
 		writeFile(t, dir, "template.yaml", `
 runtime: python3.14
@@ -157,14 +157,14 @@ events:
 `)
 		writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 		writeFile(t, dir, "requirements.txt", deps)
-		return function.Function{Name: name, Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+		return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	}
 
 	// Per-run manifest marker. The dependency fingerprint hashes the manifest's
 	// raw bytes, so a comment gives this test a layer that is content-addressed
 	// UNIQUELY to this run: the GC contract below ends with depX becoming fully
 	// unreferenced and removable, which the daemon only honours once EVERY
-	// tagged function image inheriting depX's layers is gone. The canonical
+	// tagged app image inheriting depX's layers is gone. The canonical
 	// six==1.16.0 layer is shared daemon-wide by sibling tests and by any leak
 	// from an interrupted earlier run, so asserting its removal races them; a
 	// per-run marker makes the assertion deterministic without changing what is
@@ -211,8 +211,8 @@ events:
 	// the 217MB python base.
 	buildTestImage(ctx, t, "relay-dep-evil:1", "FROM scratch\nCMD []\n")
 
-	// Migrate A to a different manifest, then remove A's OLD function image
-	// (which references depX), so depX is then referenced only by B's function
+	// Migrate A to a different manifest, then remove A's OLD app image
+	// (which references depX), so depX is then referenced only by B's app
 	// image. The new manifest is a different SINGLE tiny package (six 1.15.0):
 	// a one-package change is the minimum that produces a new fingerprint, and it
 	// avoids the five transitive wheels `requests` would pull — the invalidation
@@ -232,7 +232,7 @@ events:
 		t.Fatalf("remove A v1 image: %v", err)
 	}
 
-	// GC now: depX is still referenced by B's function image -> kept; the
+	// GC now: depX is still referenced by B's app image -> kept; the
 	// unmanaged relay-dep-evil image must be untouched.
 	if _, err := mgr.CleanupUnusedDependencies(ctx); err != nil {
 		t.Fatalf("GC (depX still referenced): %v", err)
@@ -251,7 +251,7 @@ events:
 	if err != nil {
 		t.Fatalf("prepare B v2: %v", err)
 	}
-	// Find B's v1 image (the relay-fn-dep-gc-b tag that is NOT pb2.Image).
+	// Find B's v1 image (the relay-app-dep-gc-b tag that is NOT pb2.Image).
 	bOld := ""
 	list, err := cli.ImageList(ctx, client.ImageListOptions{})
 	if err != nil {
@@ -259,7 +259,7 @@ events:
 	}
 	for _, img := range list.Items {
 		for _, tag := range img.RepoTags {
-			if strings.HasPrefix(tag, "relay-fn-dep-gc-b:") && tag != pb2.Image {
+			if strings.HasPrefix(tag, "relay-app-dep-gc-b:") && tag != pb2.Image {
 				bOld = tag
 			}
 		}
@@ -274,7 +274,7 @@ events:
 		t.Fatalf("remove B v1 image: %v", err)
 	}
 
-	// GC now: depX has no referencing function image left -> removed. The
+	// GC now: depX has no referencing app image left -> removed. The
 	// unmanaged relay-dep-evil image is STILL untouched.
 	if _, err := mgr.CleanupUnusedDependencies(ctx); err != nil {
 		t.Fatalf("GC (depX orphaned): %v", err)

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -23,7 +23,7 @@ type coordinatorDocker struct {
 	release    chan struct{}
 }
 
-func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string, _ *function.Template, _ function.Service, image string) (runtime.ServiceImage, error) {
+func (d *coordinatorDocker) ResolveServiceImage(_ context.Context, fnName string, _ *app.Template, _ app.Service, image string) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.active++
 	if d.active > d.max {
@@ -52,7 +52,7 @@ func (d *coordinatorDocker) ServiceContainerList(context.Context) ([]runtime.Ser
 func (d *coordinatorDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *coordinatorDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *coordinatorDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 func (d *coordinatorDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
@@ -67,15 +67,15 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 	lifecycle, cancel := context.WithCancel(context.Background())
 	coordinator.Start(lifecycle)
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
 	coordinator.Enqueue("beta", tmpl, "img-b", nil)
 	<-docker.entered
-	// A third function cannot enter while both fixed workers are occupied.
+	// A third app cannot enter while both fixed workers are occupied.
 	coordinator.Enqueue("gamma", tmpl, "img-g", nil)
 	select {
 	case <-docker.entered:
@@ -112,9 +112,9 @@ func TestServiceCoordinatorLimitsConcurrencyAndCoalescesLatest(t *testing.T) {
 }
 
 func TestServiceCoordinatorStatusAuthority(t *testing.T) {
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -181,7 +181,7 @@ func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
 		cancel()
 		_ = coordinator.Join(context.Background())
 	}()
-	tmpl := &function.Template{Runtime: "node24", Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}}}
+	tmpl := &app.Template{Runtime: "node24", Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}}}
 	oldDone := make(chan struct{}, 1)
 	newDone := make(chan struct{}, 1)
 	coordinator.EnqueueWithStatus("alpha", tmpl, "img-1", nil, nil, func(error) { oldDone <- struct{}{} })
@@ -205,7 +205,7 @@ func TestServiceCoordinatorNewMeaningfulRequestSupersedesStatus(t *testing.T) {
 
 // newBlockingCoordinator builds a started coordinator whose worker resolve is
 // blocked until release is called, and returns the coordinator plus a release
-// function (idempotent) that unblocks the worker, cancels the lifecycle, and
+// app (idempotent) that unblocks the worker, cancels the lifecycle, and
 // joins the workers.
 func newBlockingCoordinator(t *testing.T) (*ServiceCoordinator, *coordinatorDocker, func()) {
 	t.Helper()
@@ -242,9 +242,9 @@ func TestServiceCoordinatorWaitCancelsPromptlyWhileBusy(t *testing.T) {
 	coordinator, docker, release := newBlockingCoordinator(t)
 	defer release()
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is now busy in ResolveServiceImage
@@ -272,9 +272,9 @@ func TestServiceCoordinatorJoinBoundedThenDrains(t *testing.T) {
 	coordinator, docker, release := newBlockingCoordinator(t)
 	defer release()
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered
@@ -327,7 +327,7 @@ func TestServiceCoordinatorEnqueueAfterShutdownIsSafe(t *testing.T) {
 	}
 }
 
-// removalBlockingDocker blocks RemoveFunctionServiceContainers until release is
+// removalBlockingDocker blocks RemoveAppServiceContainers until release is
 // closed, then reports ctx.Err if the caller's context expired first. It lets a
 // test observe whether RemoveAndWait returned before the removal actually
 // completed.
@@ -338,7 +338,7 @@ type removalBlockingDocker struct {
 }
 
 func (d *removalBlockingDocker) ResolveServiceImage(
-	_ context.Context, _ string, _ *function.Template, _ function.Service, image string,
+	_ context.Context, _ string, _ *app.Template, _ app.Service, image string,
 ) (runtime.ServiceImage, error) {
 	return runtime.ServiceImage{Ref: image, ID: image}, nil
 }
@@ -351,7 +351,7 @@ func (d *removalBlockingDocker) ServiceContainerList(context.Context) ([]runtime
 func (d *removalBlockingDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *removalBlockingDocker) RemoveFunctionServiceContainers(ctx context.Context, _ string) (int, error) {
+func (d *removalBlockingDocker) RemoveAppServiceContainers(ctx context.Context, _ string) (int, error) {
 	d.once.Do(func() { close(d.entered) })
 	select {
 	case <-d.release:
@@ -490,7 +490,7 @@ func TestServiceCoordinatorEnqueueRemoveNonBlocking(t *testing.T) {
 
 // TestServiceCoordinatorSnapshotsTemplateAtEnqueue proves Enqueue snapshots the
 // template fields the reconcile path reads, so a caller mutating its template
-// after Enqueue (as the live reconciler does when it replaces a function's
+// after Enqueue (as the live reconciler does when it replaces an app's
 // template) cannot change what the worker converges. The fake captures the
 // template passed to ResolveServiceImage; the mutation must not be visible.
 func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
@@ -501,11 +501,11 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	defer cancel()
 	coordinator.Start(lifecycle)
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
 		Env:      map[string]string{"A": "1"},
-		Secrets:  map[string]function.SecretRef{"S": "ref-1"},
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Secrets:  map[string]app.SecretRef{"S": "ref-1"},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img", []string{"PLAN=1"})
 
@@ -513,7 +513,7 @@ func TestServiceCoordinatorSnapshotsTemplateAtEnqueue(t *testing.T) {
 	tmpl.Env["A"] = "mutated"
 	tmpl.Secrets["S"] = "mutated-ref"
 	tmpl.Services[0].Port = 9999
-	tmpl.Services = append(tmpl.Services, function.Service{Name: "extra.js", Entrypoint: "extra.js", Port: 81, Replicas: 1})
+	tmpl.Services = append(tmpl.Services, app.Service{Name: "extra.js", Entrypoint: "extra.js", Port: 81, Replicas: 1})
 
 	if err := coordinator.Wait(context.Background()); err != nil {
 		t.Fatalf("wait: %v", err)
@@ -548,18 +548,18 @@ type snapshotDocker struct {
 	mu           sync.Mutex
 	seenPort     int
 	seenEnv      map[string]string
-	seenSecret   map[string]function.SecretRef
-	seenServices []function.Service
+	seenSecret   map[string]app.SecretRef
+	seenServices []app.Service
 }
 
 func (d *snapshotDocker) ResolveServiceImage(
-	_ context.Context, _ string, tmpl *function.Template, svc function.Service, image string,
+	_ context.Context, _ string, tmpl *app.Template, svc app.Service, image string,
 ) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.seenPort = svc.Port
 	d.seenEnv = tmpl.Env
 	d.seenSecret = tmpl.Secrets
-	d.seenServices = append([]function.Service(nil), tmpl.Services...)
+	d.seenServices = append([]app.Service(nil), tmpl.Services...)
 	d.mu.Unlock()
 	return runtime.ServiceImage{Ref: image, ID: image}, nil
 }
@@ -572,12 +572,12 @@ func (d *snapshotDocker) ServiceContainerList(context.Context) ([]runtime.Servic
 func (d *snapshotDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *snapshotDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *snapshotDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 func (d *snapshotDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
 
-// pauseProbeDocker records every ResolveServiceImage entry (function=image) and
+// pauseProbeDocker records every ResolveServiceImage entry (app=image) and
 // the peak concurrent count. It lets a test prove that a service pass enqueued
 // during a RunExclusive housekeeping window never starts until the window ends.
 type pauseProbeDocker struct {
@@ -588,7 +588,7 @@ type pauseProbeDocker struct {
 }
 
 func (d *pauseProbeDocker) ResolveServiceImage(
-	_ context.Context, fnName string, _ *function.Template, _ function.Service, image string,
+	_ context.Context, fnName string, _ *app.Template, _ app.Service, image string,
 ) (runtime.ServiceImage, error) {
 	d.mu.Lock()
 	d.active++
@@ -611,7 +611,7 @@ func (d *pauseProbeDocker) ServiceContainerList(context.Context) ([]runtime.Serv
 func (d *pauseProbeDocker) StopServiceContainers(context.Context, []runtime.ServiceContainer) error {
 	return nil
 }
-func (d *pauseProbeDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *pauseProbeDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 func (d *pauseProbeDocker) NetworkExists(context.Context, string) (bool, error) { return true, nil }
@@ -634,9 +634,9 @@ func TestServiceCoordinatorRunExclusivePausesScheduling(t *testing.T) {
 	defer cancel()
 	coordinator.Start(lifecycle)
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	// The initial desired state settles before housekeeping starts.
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
@@ -714,9 +714,9 @@ func TestServiceCoordinatorRunExclusiveCancelledBarrierSkipsCallback(t *testing.
 	coordinator, docker, release := newBlockingCoordinator(t)
 	defer release()
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
 	coordinator.Enqueue("alpha", tmpl, "img-1", nil)
 	<-docker.entered // the worker is busy, so the barrier cannot clear

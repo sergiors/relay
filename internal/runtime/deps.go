@@ -61,7 +61,7 @@ func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error
 // a deterministic SHA-256 over every input that shapes the installed payload.
 // The same inputs always yield the same 64-hex digest, so a dependency image
 // tagged `relay-dep-<first16>` is a content-addressed cache shared across every
-// function (and every version of that function) that declares identical deps.
+// app (and every version of that app) that declares identical deps.
 //
 // Inputs (the requirement for what makes one layer distinct from another):
 //
@@ -167,17 +167,17 @@ func hashFieldBytes(h io.Writer, value []byte) {
 // If the daemon later pulls a newer image for that tag, an existing relay-dep-*
 // image built from the older base is still reused (same tag -> same fingerprint
 // -> same cached layer). This matches the pre-existing exposure of the
-// function-image reuse path (function fingerprints never included the base image
+// app-image reuse path (app fingerprints never included the base image
 // either). Operators wanting a refresh must force it (e.g. remove the
 // relay-dep-* images); a future digest-pinning feature is the proper fix.
 //
 // depImageRef maps a dependency fingerprint to the docker reference for that
 // exact dependency layer. Dependency images are content-addressed by
-// fingerprint with NO function name: the same manifest set + runtime + arch +
-// install command is one shared image across every function that needs it, and
+// fingerprint with NO app name: the same manifest set + runtime + arch +
+// install command is one shared image across every app that needs it, and
 // a changed requirements.txt naturally yields a NEW tag (old layers are never
 // mutated). The "relay-dep-" prefix keeps dependency images in their own
-// namespace, distinct from "relay-fn-" so function-image lifecycle ops never
+// namespace, distinct from "relay-app-" so app-image lifecycle ops never
 // touch them.
 func depImageRef(fingerprint string) string {
 	if len(fingerprint) > tagPrefixLen {
@@ -187,10 +187,10 @@ func depImageRef(fingerprint string) string {
 }
 
 // depRepoPrefix is the repository-name prefix for dependency images, kept
-// separate from relayRepoPrefix ("relay-fn-") on purpose: dependency layers are
+// separate from relayRepoPrefix ("relay-app-") on purpose: dependency layers are
 // shared, content-addressed bases, so they are deliberately INVISIBLE to
-// FunctionImageTags / RemoveImagesExcept — removing a function version must
-// never remove a dependency image other functions may still depend on.
+// AppImageTags / RemoveImagesExcept — removing an app version must
+// never remove a dependency image other apps may still depend on.
 const depRepoPrefix = "relay-dep-"
 
 // isDepRepo reports whether repo is a dependency-image repository name.

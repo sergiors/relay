@@ -27,7 +27,7 @@ func TestBackoffReset(t *testing.T) {
 }
 
 // TestBackoffJitterScalesExactFactor pins that next applies the injected jitter
-// function to the base delay exactly (here the max 1.2x and min 0.8x factors),
+// app to the base delay exactly (here the max 1.2x and min 0.8x factors),
 // so the bounds test below can trust the scaling arithmetic.
 func TestBackoffJitterScalesExactFactor(t *testing.T) {
 	b := newBackoff(nil, func(f float64) float64 { return f * 1.2 })

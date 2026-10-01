@@ -8,12 +8,12 @@ import (
 
 // This file is the single boundary between the typed stats structs (the source
 // of truth) and the JSON payloads stored in the stats.data and
-// function_stats.data columns. The schema keeps only the stable relational
-// metadata as columns — the stats single-row id, the function_stats
-// function_name key, and both updated_at columns — while every evolving
+// app_stats.data columns. The schema keeps only the stable relational
+// metadata as columns — the stats single-row id, the app_stats
+// app_name key, and both updated_at columns — while every evolving
 // counter/gauge/timestamp field is marshalled here. No other package marshals
 // stats to JSON: the worker, CLI, runtime, and metrics layers only ever pass
-// typed Stats / FunctionStats values.
+// typed Stats / AppStats values.
 //
 // Storage format: the data column is a NOT NULL BLOB holding SQLite's binary
 // JSON (JSONB) format. Writes pass the marshalled JSON text through SQLite's
@@ -34,7 +34,7 @@ import (
 // json_valid flag 5 means "accept either JSON text (1) or JSONB (4)", so a row
 // written through jsonb(?) or seeded as raw JSON text both read back, while a
 // corrupt value renders NULL and surfaces as a decode error rather than a SQL
-// error from json(). It is embedded in every functions/stats/function_stats read
+// error from json(). It is embedded in every apps/stats/app_stats read
 // so the corrupt-payload handling is uniform. A NULL rendering is a decode
 // failure here because every writer stores a JSON object into a NOT NULL column.
 const jsonPayloadExpr = `CASE WHEN json_valid(data, 5) THEN json(data) END`
@@ -67,38 +67,38 @@ func unmarshalStats(data sql.NullString) (Stats, error) {
 	return s, nil
 }
 
-// marshalFunctionStats encodes fs's payload for the function_stats.data column.
-// The function name is relational metadata (function_stats.function_name) and
-// UpdatedAt is relational (function_stats.updated_at); both are excluded by
+// marshalAppStats encodes fs's payload for the app_stats.data column.
+// The app name is relational metadata (app_stats.app_name) and
+// UpdatedAt is relational (app_stats.updated_at); both are excluded by
 // their json:"-" tags. Empty execution-history timestamps are omitted
 // (omitempty), which is what makes an empty incoming value PRESERVE the
-// persisted timestamp when merging (see mergeFunctionStatsTimestamps); counters
+// persisted timestamp when merging (see mergeAppStatsTimestamps); counters
 // are always emitted — including an explicit 0 — because they are absolute
 // snapshots and must be able to reset on a legitimate zero.
-func marshalFunctionStats(fs FunctionStats) (string, error) {
+func marshalAppStats(fs AppStats) (string, error) {
 	b, err := json.Marshal(fs)
 	if err != nil {
-		return "", fmt.Errorf("marshal function stats for %q: %w", fs.Function, err)
+		return "", fmt.Errorf("marshal app stats for %q: %w", fs.App, err)
 	}
 	return string(b), nil
 }
 
-// unmarshalFunctionStats decodes a function_stats.data value rendered as JSON
+// unmarshalAppStats decodes a app_stats.data value rendered as JSON
 // text by jsonPayloadExpr. A NULL value is a corrupt payload (the column is NOT
 // NULL and every writer stores a JSON object) and returns an error; a valid
 // payload that omits fields decodes to their zero values.
-func unmarshalFunctionStats(data sql.NullString) (FunctionStats, error) {
-	var fs FunctionStats
+func unmarshalAppStats(data sql.NullString) (AppStats, error) {
+	var fs AppStats
 	if !data.Valid || data.String == "" {
-		return FunctionStats{}, fmt.Errorf("unmarshal function stats: stored payload is not valid JSON")
+		return AppStats{}, fmt.Errorf("unmarshal app stats: stored payload is not valid JSON")
 	}
 	if err := json.Unmarshal([]byte(data.String), &fs); err != nil {
-		return FunctionStats{}, fmt.Errorf("unmarshal function stats: %w", err)
+		return AppStats{}, fmt.Errorf("unmarshal app stats: %w", err)
 	}
 	return fs, nil
 }
 
-// mergeFunctionStatsTimestamps returns incoming with any empty
+// mergeAppStatsTimestamps returns incoming with any empty
 // execution-history timestamp filled from stored. Counters (including the
 // warm-container pool counters) are always taken from incoming: they are
 // absolute snapshots and a flush legitimately replaces them, even with 0. The
@@ -106,7 +106,7 @@ func unmarshalFunctionStats(data sql.NullString) (FunctionStats, error) {
 // incoming value means "no observation this flush" — it must never erase a
 // persisted timestamp. This reproduces the CASE-guarded upsert semantics the
 // explicit columns used before the payload moved into JSON.
-func mergeFunctionStatsTimestamps(stored, incoming FunctionStats) FunctionStats {
+func mergeAppStatsTimestamps(stored, incoming AppStats) AppStats {
 	if incoming.LastExecutionAt == "" {
 		incoming.LastExecutionAt = stored.LastExecutionAt
 	}

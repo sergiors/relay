@@ -14,7 +14,7 @@ import (
 
 func TestHandleRecordsSuccessMetrics(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
@@ -24,7 +24,7 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 	for _, want := range []string{
 		"events_received_total count=1",
 		"events_matched_total count=1",
-		"handler_invocations_total{function=user-events,handler=index.run,outcome=success} count=1",
+		"handler_invocations_total{app=user-events,handler=index.run,outcome=success} count=1",
 		"handler_success_total count=1",
 	} {
 		if !strings.Contains(got, want) {
@@ -41,21 +41,21 @@ func TestHandleRecordsSuccessMetrics(t *testing.T) {
 		t.Errorf("unexpected failure total; got:\n%s", got)
 	}
 	// The duration observation must be recorded (count 1, non-zero sum/max).
-	if !containsDuration(got, "handler_duration_seconds{function=user-events,handler=index.run} count=1 sum=") {
+	if !containsDuration(got, "handler_duration_seconds{app=user-events,handler=index.run} count=1 sum=") {
 		t.Errorf("expected handler_duration_seconds observation; got:\n%s", got)
 	}
 }
 
 func TestHandleRecordsFailureMetrics(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
 	}
 
 	got := m.Snapshot()
-	if !strings.Contains(got, "handler_invocations_total{function=user-events,handler=index.run,outcome=failure} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=user-events,handler=index.run,outcome=failure} count=1") {
 		t.Errorf("expected failure counter; got:\n%s", got)
 	}
 	if !strings.Contains(got, "handler_failure_total count=1") {
@@ -69,21 +69,21 @@ func TestHandleRecordsFailureMetrics(t *testing.T) {
 	}
 }
 
-// TestRemoveFunctionDeletesRunnerSeries exercises the production retirement
-// path (the worker wraps RemoveFunctionImages with metrics.RemoveFunction at the
-// reconciler's RemoveFunction hook): after Handle runs success and failure for
-// one function, RemoveFunction must drop ALL of that function's series from the
+// TestRemoveAppDeletesRunnerSeries exercises the production retirement
+// path (the worker wraps RemoveAppImages with metrics.RemoveApp at the
+// reconciler's RemoveApp hook): after Handle runs success and failure for
+// one app, RemoveApp must drop ALL of that app's series from the
 // registry while leaving the global totals intact.
-func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
+func TestRemoveAppDeletesRunnerSeries(t *testing.T) {
 	m := metrics.New()
 	// A success runner (user-events + other) and a failure runner (user-events
-	// again) share the same registry, so one function accumulates both outcomes
+	// again) share the same registry, so one app accumulates both outcomes
 	// and another is isolated.
 	success := NewWithMetrics(
-		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{}), alwaysMatchFn(t, "other", &countingExecutor{})},
+		[]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{}), alwaysMatchFn(t, "other", &countingExecutor{})},
 		testutil.DiscardLogger(), m)
 	failure := NewWithMetrics(
-		[]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})},
+		[]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})},
 		testutil.DiscardLogger(), m)
 	if err := success.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle success: %v", err)
@@ -92,7 +92,7 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 		t.Fatal("expected handle to fail")
 	}
 
-	// Both user-events and other have function series before removal.
+	// Both user-events and other have app series before removal.
 	before := m.Snapshot()
 	foundUE := false
 	for _, line := range strings.Split(before, "\n") {
@@ -118,13 +118,13 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 	wantSuccess := m.Counter(metrics.MetricHandlerSuccess)
 	wantFailure := m.Counter(metrics.MetricHandlerFailure)
 
-	m.RemoveFunction("user-events")
+	m.RemoveApp("user-events")
 
 	got := m.Snapshot()
-	// All of user-events' function-scoped series are gone — no series at all
-	// carrying the function=user-events label on any of the functionMetrics vecs.
+	// All of user-events' app-scoped series are gone — no series at all
+	// carrying the app=user-events label on any of the appMetrics vecs.
 	for _, mname := range []string{
-		metrics.MetricFunctionEventsMatched,
+		metrics.MetricAppEventsMatched,
 		metrics.MetricFunctionHandlerSuccess,
 		metrics.MetricFunctionHandlerFailure,
 		metrics.MetricHandlerInvocations,
@@ -136,8 +136,8 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 			}
 		}
 	}
-	// The other function's series survive.
-	if !strings.Contains(got, "function=other,") && !strings.Contains(got, "function=other}") {
+	// The other app's series survive.
+	if !strings.Contains(got, "app=other,") && !strings.Contains(got, "app=other}") {
 		t.Fatalf("other function's series must survive removal; got:\n%s", got)
 	}
 	// Global totals unchanged.
@@ -149,10 +149,10 @@ func TestRemoveFunctionDeletesRunnerSeries(t *testing.T) {
 	}
 }
 
-// fnLabelIs reports whether the rendered line carries the exact function label
+// fnLabelIs reports whether the rendered line carries the exact app label
 // value name (a full label value, not a prefix of another).
 func fnLabelIs(line, name string) bool {
-	token := "function=" + name
+	token := "app=" + name
 	idx := strings.Index(line, token)
 	if idx < 0 {
 		return false
@@ -172,10 +172,10 @@ func containsDuration(snapshot, prefix string) bool {
 	return false
 }
 
-func TestHandleFunctionLevelCounters(t *testing.T) {
+func TestHandleAppLevelCounters(t *testing.T) {
 	m := metrics.New()
-	// Two functions, each with a single always-matching rule.
-	r := NewWithMetrics([]*PreparedFunction{
+	// Two apps, each with a single always-matching rule.
+	r := NewWithMetrics([]*PreparedApp{
 		alwaysMatchFn(t, "a", &countingExecutor{}),
 		alwaysMatchFn(t, "b", &countingExecutor{}),
 	}, testutil.DiscardLogger(), m)
@@ -184,38 +184,38 @@ func TestHandleFunctionLevelCounters(t *testing.T) {
 		t.Fatalf("handle: %v", err)
 	}
 
-	// One event matching two functions: global message-level counter is 1, but
-	// each function is engaged once.
+	// One event matching two apps: global message-level counter is 1, but
+	// each app is engaged once.
 	if got := m.Counter(metrics.MetricEventsReceived); got != 1 {
 		t.Fatalf("events_received_total = %d, want 1", got)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 2 {
 		t.Fatalf("function stats len = %d, want 2: %+v", len(fs), fs)
 	}
 	for _, f := range fs {
 		if f.EventsMatchedTotal != 1 {
-			t.Fatalf("function %s events matched = %d, want 1", f.Function, f.EventsMatchedTotal)
+			t.Fatalf("function %s events matched = %d, want 1", f.App, f.EventsMatchedTotal)
 		}
 		if f.HandlerSuccessTotal != 1 {
-			t.Fatalf("function %s success = %d, want 1", f.Function, f.HandlerSuccessTotal)
+			t.Fatalf("function %s success = %d, want 1", f.App, f.HandlerSuccessTotal)
 		}
 		if f.HandlerFailureTotal != 0 {
-			t.Fatalf("function %s failure = %d, want 0", f.Function, f.HandlerFailureTotal)
+			t.Fatalf("function %s failure = %d, want 0", f.App, f.HandlerFailureTotal)
 		}
 	}
 }
 
-func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
+func TestHandleAppFailureRetryAndDLQ(t *testing.T) {
 	// Without invocation state, a failure counts a retry but never a DLQ: the
 	// DLQ decision needs a Redis-backed attempt count to know exhaustion.
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "a", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "a", &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 	ctx := stream.WithDeliveryAttempt(context.Background(), 2)
 	if err := r.Handle(ctx, "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 {
 		t.Fatalf("function stats len = %d, want 1: %+v", len(fs), fs)
 	}
@@ -232,12 +232,12 @@ func TestHandleFunctionFailureRetryAndDLQ(t *testing.T) {
 
 func TestHandleWithNilMetricsDoesNotPanic(t *testing.T) {
 	// NewWithMetrics(nil registry) must not panic when handling succeeds/fails.
-	r := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{})}, testutil.DiscardLogger(), nil)
 	if err := r.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
-	rf := NewWithMetrics([]*PreparedFunction{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), nil)
+	rf := NewWithMetrics([]*PreparedApp{alwaysMatchFn(t, "user-events", &countingExecutor{fail: true})}, testutil.DiscardLogger(), nil)
 	if err := rf.Handle(context.Background(), "1757-0", map[string]any{"status": "ok"}); err == nil {
 		t.Fatal("expected handle to fail")
 	}

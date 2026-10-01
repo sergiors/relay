@@ -19,19 +19,19 @@ func newMetricsCache() (*containerCache, *fakeFactory, *metrics.Registry) {
 	return cc, &fakeFactory{}, reg
 }
 
-// fnLabels is the single-function label set for a registry read.
+// fnLabels is the single-app label set for a registry read.
 func fnLabels(name string) []metrics.Label {
-	return []metrics.Label{{Name: "function", Value: name}}
+	return []metrics.Label{{Name: "app", Value: name}}
 }
 
-// stateLabels is the function+state label set for a runtime_containers read.
+// stateLabels is the app+state label set for a runtime_containers read.
 func stateLabels(name, state string) []metrics.Label {
-	return []metrics.Label{{Name: "function", Value: name}, {Name: "state", Value: state}}
+	return []metrics.Label{{Name: "app", Value: name}, {Name: "state", Value: state}}
 }
 
-// acquireLabels is the function+outcome label set for a runtime acquire read.
+// acquireLabels is the app+outcome label set for a runtime acquire read.
 func acquireLabels(name, outcome string) []metrics.Label {
-	return []metrics.Label{{Name: "function", Value: name}, {Name: "outcome", Value: outcome}}
+	return []metrics.Label{{Name: "app", Value: name}, {Name: "outcome", Value: outcome}}
 }
 
 // gauge reads a labeled runtime gauge.
@@ -46,7 +46,7 @@ func acquireCount(reg *metrics.Registry, fn, outcome string) int64 {
 
 func discardCount(reg *metrics.Registry, fn, reason string) int64 {
 	return reg.CounterLabels(metrics.MetricRuntimeContainerDiscards,
-		[]metrics.Label{{Name: "function", Value: fn}, {Name: "reason", Value: reason}})
+		[]metrics.Label{{Name: "app", Value: fn}, {Name: "reason", Value: reason}})
 }
 
 // TestPoolMetricsFirstAcquireIsCold pins the cold-start path: the first acquire
@@ -301,7 +301,7 @@ func TestPoolMetricsCancellationRecordsNoAcquire(t *testing.T) {
 // TestPoolMetricsDiscardReasons pins that each finite discard reason is counted
 // under its own label. Self-terminated reasons (timeout/process_exit/
 // protocol_error) come from the container; pool-initiated reasons
-// (image_changed/idle_timeout/shutdown/function_removed) come from the pool.
+// (image_changed/idle_timeout/shutdown/app_removed) come from the pool.
 func TestPoolMetricsDiscardReasons(t *testing.T) {
 	t.Run("self-terminated", func(t *testing.T) {
 		for _, reason := range []string{"timeout", "process_exit", "protocol_error"} {
@@ -359,18 +359,18 @@ func TestPoolMetricsDiscardReasons(t *testing.T) {
 		}
 	})
 
-	t.Run("function_removed", func(t *testing.T) {
+	t.Run("app_removed", func(t *testing.T) {
 		cc, ff, reg := newMetricsCache()
 		if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 			t.Fatalf("seed: %v", err)
 		}
-		cc.removeFunction("fn-a")
+		cc.removeApp("fn-a")
 		// Removal is a metric tombstone: the removal-time discard is deliberately
-		// NOT counted, because removeFunction deletes the function's series in the
+		// NOT counted, because removeApp deletes the app's series in the
 		// same critical section that installs the tombstone. Emitting it would
 		// recreate the very series removal just deleted.
-		if got := discardCount(reg, "fn-a", reasonFunctionRemove); got != 0 {
-			t.Fatalf("function_removed discards = %d, want 0 (tombstoned removal)", got)
+		if got := discardCount(reg, "fn-a", reasonAppRemove); got != 0 {
+			t.Fatalf("app_removed discards = %d, want 0 (tombstoned removal)", got)
 		}
 		if seriesInSnapshot(reg.Snapshot(), metrics.MetricRuntimeContainerDiscards, "fn-a") {
 			t.Fatalf("removed function must expose no discard series:\n%s", reg.Snapshot())
@@ -402,9 +402,9 @@ func TestPoolMetricsDiscardCountedOnce(t *testing.T) {
 	}
 }
 
-// TestPoolMetricsIndependentFunctions pins that one function's acquires and
-// discards never leak into another function's series.
-func TestPoolMetricsIndependentFunctions(t *testing.T) {
+// TestPoolMetricsIndependentApps pins that one app's acquires and
+// discards never leak into another app's series.
+func TestPoolMetricsIndependentApps(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("A: %v", err)
@@ -424,12 +424,12 @@ func TestPoolMetricsIndependentFunctions(t *testing.T) {
 	if got := gauge(reg, metrics.MetricRuntimePoolCapacity, fnLabels("fn-b")); got != 1 {
 		t.Fatalf("fn-b capacity = %d, want 1", got)
 	}
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if got := gauge(reg, metrics.MetricRuntimeContainers, stateLabels("fn-b", metrics.RuntimeStateIdle)); got != 1 {
 		t.Fatalf("fn-b idle gauge = %d, want 1 (fn-a removal must not touch it)", got)
 	}
-	if got := discardCount(reg, "fn-b", reasonFunctionRemove); got != 0 {
-		t.Fatalf("fn-b function_removed discards = %d, want 0", got)
+	if got := discardCount(reg, "fn-b", reasonAppRemove); got != 0 {
+		t.Fatalf("fn-b app_removed discards = %d, want 0", got)
 	}
 }
 
@@ -440,7 +440,7 @@ func TestPoolMetricsNilRegistry(t *testing.T) {
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	cc.close()
 	// A nil registry read is safe too.
 	var reg *metrics.Registry
@@ -578,9 +578,9 @@ func TestPoolMetricsDeadIdleReapedByMaintenanceEvenWithoutTimeout(t *testing.T) 
 	}
 }
 
-// TestPoolMetricsManagerRemoveDeletesSeries pins that Manager.RemoveFunction
-// deletes the function's runtime-pool series (gauges and counters) so a removed
-// function exposes no live pool state, while another function's series survive.
+// TestPoolMetricsManagerRemoveDeletesSeries pins that Manager.RemoveApp
+// deletes the app's runtime-pool series (gauges and counters) so a removed
+// app exposes no live pool state, while another app's series survive.
 func TestPoolMetricsManagerRemoveDeletesSeries(t *testing.T) {
 	reg := metrics.New()
 	m := &Manager{metrics: reg}
@@ -594,7 +594,7 @@ func TestPoolMetricsManagerRemoveDeletesSeries(t *testing.T) {
 		t.Fatalf("seed fn-b: %v", err)
 	}
 
-	m.RemoveFunction("fn-a")
+	m.RemoveApp("fn-a")
 
 	for _, metricName := range []string{
 		metrics.MetricRuntimePoolCapacity,
@@ -615,7 +615,7 @@ func TestPoolMetricsManagerRemoveDeletesSeries(t *testing.T) {
 	if got := acquireCount(reg, "fn-b", metrics.RuntimeOutcomeCold); got != 1 {
 		t.Fatalf("fn-b cold acquires = %d, want 1", got)
 	}
-	// PoolSnapshot for the removed function reports not-found.
+	// PoolSnapshot for the removed app reports not-found.
 	if _, ok := m.PoolSnapshot("fn-a"); ok {
 		t.Fatal("PoolSnapshot for a removed function must report not-found")
 	}
@@ -623,7 +623,7 @@ func TestPoolMetricsManagerRemoveDeletesSeries(t *testing.T) {
 
 // TestPoolMetricsLateReleaseAfterRemovalDoesNotRecreateSeries pins finding (2):
 // a busy container retired by a removal is discarded on its (late) release, but
-// that release must not recreate the function's removed metric series. The
+// that release must not recreate the app's removed metric series. The
 // release path funnels through recordDiscard, which observes the pool's removal
 // tombstone (p.removing) under p.mu, so the discard is suppressed.
 func TestPoolMetricsLateReleaseAfterRemovalDoesNotRecreateSeries(t *testing.T) {
@@ -643,7 +643,7 @@ func TestPoolMetricsLateReleaseAfterRemovalDoesNotRecreateSeries(t *testing.T) {
 
 	// Remove while the container is busy: its series are deleted now and the busy
 	// container is retired (discarded on release).
-	m.RemoveFunction("fn-a")
+	m.RemoveApp("fn-a")
 	if seriesInSnapshot(reg.Snapshot(), metrics.MetricRuntimeContainerDiscards, "fn-a") {
 		t.Fatalf("removal must delete fn-a's discard series:\n%s", reg.Snapshot())
 	}
@@ -654,8 +654,8 @@ func TestPoolMetricsLateReleaseAfterRemovalDoesNotRecreateSeries(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("busy execute: %v", err)
 	}
-	if got := busy.reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
-		t.Fatalf("busy removal discards = %v, want [%s]", got, reasonFunctionRemove)
+	if got := busy.reasons(); len(got) != 1 || got[0] != reasonAppRemove {
+		t.Fatalf("busy removal discards = %v, want [%s]", got, reasonAppRemove)
 	}
 	for _, metricName := range []string{
 		metrics.MetricRuntimePoolCapacity,
@@ -689,13 +689,13 @@ func TestPoolMetricsRemoveThenReactivateKeepsFreshSeries(t *testing.T) {
 	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	m.RemoveFunction("fn-a")
+	m.RemoveApp("fn-a")
 	if seriesInSnapshot(reg.Snapshot(), metrics.MetricRuntimePoolCapacity, "fn-a") {
 		t.Fatalf("removal must delete fn-a capacity series:\n%s", reg.Snapshot())
 	}
 
 	// Reactivate and warm again: a fresh pool publishes fresh series.
-	m.containers.activateFunction("fn-a", "img-1")
+	m.containers.activateApp("fn-a", "img-1")
 	ff.build = func() *fakeContainer { return &fakeContainer{} }
 	if err := runInvoke(t, m.containers, ff, "fn-a", "img-1", 3, "h"); err != nil {
 		t.Fatalf("reactivated acquire: %v", err)
@@ -754,10 +754,10 @@ func TestPoolMetricsSnapshotCountsTransientAsBusy(t *testing.T) {
 
 // seriesInSnapshot reports whether the registry snapshot (which renders display
 // names, i.e. without the relay_ prefix) contains a line for metricName labeled
-// function=name. It mirrors the metrics package's seriesPresent helper.
+// app=name. It mirrors the metrics package's seriesPresent helper.
 func seriesInSnapshot(snapshot, metricName, name string) bool {
 	display := strings.TrimPrefix(metricName, "relay_")
-	token := "function=" + name
+	token := "app=" + name
 	for _, line := range strings.Split(snapshot, "\n") {
 		if !strings.HasPrefix(line, display+"{") {
 			continue
@@ -812,14 +812,14 @@ func TestPoolMetricsRaceSafety(t *testing.T) {
 			}
 		}(i)
 	}
-	// Concurrent remove/reactivate on another function exercises the removal
+	// Concurrent remove/reactivate on another app exercises the removal
 	// publish path under contention.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 20; i++ {
-			cc.removeFunction("fn-race-removed")
-			cc.activateFunction("fn-race-removed", "")
+			cc.removeApp("fn-race-removed")
+			cc.activateApp("fn-race-removed", "")
 		}
 	}()
 	for i := 0; i < 4; i++ {

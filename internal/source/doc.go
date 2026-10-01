@@ -1,16 +1,16 @@
 // Package source provides Relay's shared source-selection policy: which files
-// under a function or checkout tree are part of the function's "source" and
+// under an app or checkout tree are part of the app's "source" and
 // which are excluded by .gitignore rules.
 //
 // It exists because three layers must agree on exactly which files are source,
 // and previously each answered the question differently:
 //
 //   - Git materialization (internal/git) copies a configured repository subtree
-//     into /functions.
+//     into /apps.
 //   - Build-context staging (internal/runtime) stages the selected source into
 //     an image build context from one immutable snapshot of the selection, so
 //     the bytes baked into an image are the same bytes its fingerprint covers.
-//   - Content fingerprinting (internal/function) hashes a function directory to
+//   - Content fingerprinting (internal/app) hashes an app directory to
 //     gate rebuilds.
 //
 // A Selection carries the resolved root relationship (a rule "scope" — normally

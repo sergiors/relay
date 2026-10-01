@@ -52,8 +52,8 @@ var publishRetryDelays = []time.Duration{
 // cron.ParseStandard with the job's CRON_TZ-prefixed spec), so Relay's
 // occurrence derivation and gocron's firing agree by construction and cannot
 // drift. Only the accepted schedule grammar reaches here: the 6-field (seconds)
-// form and `@every` are rejected before registration (see ReplaceFunction and
-// internal/function.validateCron).
+// form and `@every` are rejected before registration (see ReplaceApp and
+// internal/app.validateCron).
 func parseSchedule(expr string, loc *time.Location) (robfigcron.Schedule, error) {
 	return robfigcron.ParseStandard("CRON_TZ=" + loc.String() + " " + expr)
 }
@@ -135,7 +135,7 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence, catchUp bool) (published, resolved bool) {
 	ctx, span := tracing.Start(ctx, "schedule.publish",
 		trace.WithAttributes(
-			attribute.String("relay.function", o.Function),
+			attribute.String("relay.app", o.App),
 			attribute.String("relay.schedule", o.Schedule),
 			attribute.String("relay.handler", o.Handler),
 			attribute.Bool("relay.catchup", catchUp),
@@ -145,7 +145,7 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 
 	id := o.ID()
 	log := s.log.With(
-		"function", o.Function,
+		"app", o.App,
 		"schedule", o.Schedule,
 		"handler", o.Handler,
 		"scheduled_at", o.ScheduledAt.UTC().Format(time.RFC3339),
@@ -212,8 +212,8 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 // CatchUp performs the bounded startup catch-up: for every schedule registered
 // so far it republishes, through the same bounded retry routine as a live tick,
 // the latest occurrence missed within occurrenceHorizon. It is called by the
-// worker after seeding the startup functions and BEFORE Scheduler.Start, and
-// future occurrences then converge through ReplaceFunction as usual.
+// worker after seeding the startup apps and BEFORE Scheduler.Start, and
+// future occurrences then converge through ReplaceApp as usual.
 //
 // Policy:
 //   - At most ONE occurrence per schedule (the latest at or before a single
@@ -225,7 +225,7 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 //     worker independently performs races on one Redis key, so exactly one
 //     stream entry is written and a repeated recovery (across workers or
 //     restarts) is a harmless no-op. This is why duplicate catch-up is safe.
-//   - It runs at most once per Scheduler: live ReplaceFunction calls must never
+//   - It runs at most once per Scheduler: live ReplaceApp calls must never
 //     synthesize additional catch-up (a changed schedule converges FUTURE
 //     occurrences only).
 //
@@ -254,7 +254,7 @@ func (s *Scheduler) CatchUp(ctx context.Context) int {
 		// worker already published it) additionally increments the duplicate
 		// counter, so the two are independent.
 		s.metrics.Inc(metrics.MetricScheduleCatchUp)
-		o := schedule.Occurrence{Function: e.fn, Schedule: e.name, Handler: e.handler, ScheduledAt: due}
+		o := schedule.Occurrence{App: e.fn, Schedule: e.name, Handler: e.handler, ScheduledAt: due}
 		if pub, resolved := s.publishOccurrence(ctx, o, true); resolved && pub {
 			published++
 		}

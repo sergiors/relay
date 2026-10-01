@@ -21,15 +21,15 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
-// buildServiceHost builds a tiny node24 function directory containing a
+// buildServiceHost builds a tiny node24 app directory containing a
 // long-lived service.js (keeps node alive with an interval) alongside a trivial
-// invocation handler, then m.Prepare-builds its image and returns the function
+// invocation handler, then m.Prepare-builds its image and returns the app
 // handle plus the prepared image ref.
-func buildServiceHost(t *testing.T, ctx context.Context, fnName string) (function.Function, string) {
+func buildServiceHost(t *testing.T, ctx context.Context, fnName string) (app.App, string) {
 	t.Helper()
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -42,7 +42,7 @@ events:
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
 	// Long-lived service entrypoint in a nested subdirectory: an interval keeps
 	// node alive indefinitely. The file lives at <dir>/app/service.js, which the
-	// image COPYies to /app/app/service.js (the function dir is the /app root).
+	// image COPYies to /app/app/service.js (the app dir is the /app root).
 	//
 	// The handler stops on SIGTERM (Docker's stop signal). Without it node as PID
 	// 1 ignores SIGTERM (the kernel reserves default signal actions for PID 1),
@@ -58,7 +58,7 @@ process.on("SIGTERM", () => process.exit(0));
 console.log("started");
 setInterval(() => {}, 1 << 30);
 `)
-	fn := function.Function{Name: fnName, Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: fnName, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	prepared, err := mPrepare(ctx, t, fn)
 	if err != nil {
 		t.Fatalf("prepare %s: %v", fnName, err)
@@ -66,7 +66,7 @@ setInterval(() => {}, 1 << 30);
 	return fn, prepared.Image
 }
 
-// TestIntegrationPythonServiceModuleExecution builds a tiny python3.14 function
+// TestIntegrationPythonServiceModuleExecution builds a tiny python3.14 app
 // whose service entrypoint is app/main.py (a nested package module with a
 // package-relative import from app/deps.py), starts one replica via the module
 // execution entrypoint (python -m app.main), and asserts the container actually
@@ -83,12 +83,12 @@ func TestIntegrationPythonServiceModuleExecution(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		// Scope cleanup to THIS test's function: stopping every service container
+		// Scope cleanup to THIS test's app: stopping every service container
 		// on the daemon would also stop unrelated ones (e.g. a service a local
 		// worker owns), and a container without a SIGTERM handler costs the
 		// daemon's full 10s SIGKILL grace.
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-py-svc")
-		cleanupImagePrefixes(cli, "relay-fn-svc-py-svc:")()
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-py-svc")
+		cleanupImagePrefixes(cli, "relay-app-svc-py-svc:")()
 	})
 
 	dir := t.TempDir()
@@ -135,7 +135,7 @@ def keep_alive():
 
 keep_alive()
 `)
-	fn := function.Function{Name: "svc-py-svc", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "svc-py-svc", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 	prepared, err := mPrepare(ctx, t, fn)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
@@ -151,8 +151,8 @@ keep_alive()
 	}
 
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-py-svc",
-		Name:     "svc", SourceRef: "app/main.py",
+		App:  "svc-py-svc",
+		Name: "svc", SourceRef: "app/main.py",
 		Port:  8000,
 		Image: prepared.Image,
 		Entry: entry,
@@ -206,16 +206,16 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	// Clean up any containers this test's function ever starts, even on failure,
+	// Clean up any containers this test's app ever starts, even on failure,
 	// plus the images it builds.
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		// Scope cleanup to THIS test's function (see the note in the python
+		// Scope cleanup to THIS test's app (see the note in the python
 		// service test): stopping unrelated daemon services can cost a 10s
 		// SIGKILL grace and is not this test's to tear down.
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-lifecycle")
-		cleanupImagePrefixes(cli, "relay-fn-svc-lifecycle:")()
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-lifecycle")
+		cleanupImagePrefixes(cli, "relay-app-svc-lifecycle:")()
 	})
 
 	_, image := buildServiceHost(t, ctx, "svc-lifecycle")
@@ -228,8 +228,8 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	const replicas = 1
 	for i := 0; i < replicas; i++ {
 		if _, err := m.StartService(ctx, ServiceSpec{
-			Function: "svc-lifecycle",
-			Name:     "svc", SourceRef: "app/service.js",
+			App:  "svc-lifecycle",
+			Name: "svc", SourceRef: "app/service.js",
 			Port:  3000,
 			Image: image,
 			Entry: []string{"node", "/app/app/service.js"},
@@ -249,7 +249,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 		ids = ids[:0]
 		allRunning := true
 		for _, c := range list {
-			if c.Function == "svc-lifecycle" {
+			if c.App == "svc-lifecycle" {
 				ids = append(ids, c.ID)
 				if c.State != container.StateRunning {
 					allRunning = false
@@ -273,7 +273,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 		}
 		want := map[string]string{
 			labelType:     ContainerTypeService,
-			labelFunction: "svc-lifecycle",
+			labelApp:      "svc-lifecycle",
 			labelService:  "svc",
 			labelIdentity: "app/service.js",
 			labelImage:    image,
@@ -326,7 +326,7 @@ func TestIntegrationServiceStartListStop(t *testing.T) {
 	list, _ := m.ServiceContainerList(ctx)
 	var svcList []ServiceContainer
 	for _, c := range list {
-		if c.Function == "svc-lifecycle" {
+		if c.App == "svc-lifecycle" {
 			svcList = append(svcList, c)
 		}
 	}
@@ -354,9 +354,9 @@ func TestIntegrationServiceImageRetirement(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		// Scope cleanup to this test's function (see the python service test).
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-retire")
-		cleanupImagePrefixes(cli, "relay-fn-svc-retire:", "relay-fn-svc-other:")()
+		// Scope cleanup to this test's app (see the python service test).
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-retire")
+		cleanupImagePrefixes(cli, "relay-app-svc-retire:", "relay-app-svc-other:")()
 	})
 
 	// fn1 with v1 source.
@@ -372,7 +372,7 @@ events:
 	// SIGTERM handler so the daemon's stop is prompt (node as PID 1 ignores the
 	// default SIGTERM action; without this every stop pays the full 10s grace).
 	writeFile(t, dir1, "service.js", "process.on('SIGTERM', () => process.exit(0));\nsetInterval(() => {}, 1 << 30);\n")
-	fn1 := function.Function{Name: "svc-retire", Dir: dir1, Template: &function.Template{Runtime: "node24"}}
+	fn1 := app.App{Name: "svc-retire", Dir: dir1, Template: &app.Template{Runtime: "node24"}}
 
 	// Build v1, get its image ref. Reuse the test's single Manager for every
 	// Prepare (mPrepare would spin a fresh client+manager per call): the
@@ -385,7 +385,7 @@ events:
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	svc1, err := m.StartService(ctx, ServiceSpec{
-		Function:  "svc-retire",
+		App:       "svc-retire",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
@@ -408,7 +408,7 @@ events:
 	}
 
 	// Stop the v1 replica (so nothing references v1Ref anymore).
-	if _, err := m.RemoveFunctionServiceContainers(ctx, "svc-retire"); err != nil {
+	if _, err := m.RemoveAppServiceContainers(ctx, "svc-retire"); err != nil {
 		t.Fatalf("remove function containers: %v", err)
 	}
 
@@ -424,7 +424,7 @@ events:
 	// depends on", start a NEW replica of v2 and retire -> v2 kept, v1 removed.
 	// Re-start v2 replica so it references v2Ref.
 	svc2, err := m.StartService(ctx, ServiceSpec{
-		Function:  "svc-retire",
+		App:       "svc-retire",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 3000,
 		Image: v2Ref, Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
@@ -435,7 +435,7 @@ events:
 	waitForContainerRunning(t, ctx, cli, svc2)
 
 	// Retire svc-retire's images. v2 is referenced by the running container -> kept.
-	removed := retireFunctionImages(t, ctx, m, "svc-retire")
+	removed := retireAppImages(t, ctx, m, "svc-retire")
 	// v1 is no longer referenced -> removed. v2 kept. (Other unreferenced v-refs:
 	// none.) removed should be >= 1 (v1).
 	if removed == 0 {
@@ -448,7 +448,7 @@ events:
 		t.Error("v1 (no longer referenced) should have been removed, but still present")
 	}
 
-	// A second function's repo must be untouched. Build fn2 image.
+	// A second app's repo must be untouched. Build fn2 image.
 	dir2 := t.TempDir()
 	writeFile(t, dir2, "template.yaml", `
 runtime: node24
@@ -458,7 +458,7 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir2, "index.js", "export function hi(e){ console.log('other'); }\n")
-	fn2 := function.Function{Name: "svc-other", Dir: dir2, Template: &function.Template{Runtime: "node24"}}
+	fn2 := app.App{Name: "svc-other", Dir: dir2, Template: &app.Template{Runtime: "node24"}}
 	pOther, err := m.Prepare(ctx, fn2)
 	if err != nil {
 		t.Fatalf("prepare other: %v", err)
@@ -467,7 +467,7 @@ events:
 		t.Fatalf("other function image should exist")
 	}
 	// Retire fn1's images again (any unreferenced leftovers); fn2's must survive.
-	retireFunctionImages(t, ctx, m, "svc-retire")
+	retireAppImages(t, ctx, m, "svc-retire")
 	if !imageExistsInDaemon(cli, ctx, pOther.Image) {
 		t.Error("unrelated function's image must not be touched by retirement")
 	}
@@ -488,9 +488,9 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		// Scope cleanup to this test's function (see the python service test).
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-wait")
-		cleanupImagePrefixes(cli, "relay-fn-svc-wait:")()
+		// Scope cleanup to this test's app (see the python service test).
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-wait")
+		cleanupImagePrefixes(cli, "relay-app-svc-wait:")()
 	})
 
 	_, v1Ref := buildServiceHost(t, ctx, "svc-wait")
@@ -500,7 +500,7 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 
 	// Start ONE replica of v1 (running, references v1Ref).
 	if _, err := m.StartService(ctx, ServiceSpec{
-		Function:  "svc-wait",
+		App:       "svc-wait",
 		Name:      "svc",
 		SourceRef: "app/service.js", Port: 3000,
 		Image: v1Ref, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
@@ -527,7 +527,7 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	// Stop this test's container and wait for it to be gone. Scope the stop and
 	// the "gone" poll to svc-wait: a whole-daemon empty check would wait on
 	// unrelated service containers this test does not own.
-	if _, err := m.RemoveFunctionServiceContainers(ctx, "svc-wait"); err != nil {
+	if _, err := m.RemoveAppServiceContainers(ctx, "svc-wait"); err != nil {
 		t.Fatalf("remove function service containers: %v", err)
 	}
 	pollUntil(ctx, 30*time.Second, func() bool {
@@ -543,19 +543,19 @@ func TestIntegrationImageRetirementWaitsForServiceContainers(t *testing.T) {
 	}
 }
 
-// retireFunctionImages retires fn's superseded images through the production
-// primitives the runner's function-removal path drives: FunctionImageTags lists
-// the function's own Relay-owned tags, and each is handed to RemoveImageNow
+// retireAppImages retires fn's superseded images through the production
+// primitives the runner's app-removal path drives: AppImageTags lists
+// the app's own Relay-owned tags, and each is handed to RemoveImageNow
 // (whose container-reference guard refuses an image a service container still
 // references). Transitional refusals (ErrImageInUse / ErrImageRetiring /
 // ErrManagerShuttingDown) are the normal skip state, mirroring
 // RemoveImagesExcept and the runner's cleanup retry path, and are not counted.
 // It returns how many images were actually removed.
-func retireFunctionImages(t *testing.T, ctx context.Context, m *Manager, fn string) int {
+func retireAppImages(t *testing.T, ctx context.Context, m *Manager, fn string) int {
 	t.Helper()
-	tags, err := m.FunctionImageTags(ctx, fn)
+	tags, err := m.AppImageTags(ctx, fn)
 	if err != nil {
-		t.Fatalf("FunctionImageTags(%s): %v", fn, err)
+		t.Fatalf("AppImageTags(%s): %v", fn, err)
 	}
 	removed := 0
 	for _, tag := range tags {
@@ -583,7 +583,7 @@ func waitForServiceRunning(t *testing.T, ctx context.Context, m *Manager, fn str
 			return false
 		}
 		for _, c := range list {
-			if c.Function == fn && c.State == container.StateRunning {
+			if c.App == fn && c.State == container.StateRunning {
 				return true
 			}
 		}
@@ -602,7 +602,7 @@ func countServiceContainers(t *testing.T, ctx context.Context, m *Manager, fn st
 	}
 	n := 0
 	for _, c := range list {
-		if c.Function == fn {
+		if c.App == fn {
 			n++
 		}
 	}
@@ -631,10 +631,10 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		// Scope cleanup to this test's function (see the python service test).
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-network")
+		// Scope cleanup to this test's app (see the python service test).
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-network")
 		_, _ = cli.NetworkRemove(cc, networkName, client.NetworkRemoveOptions{})
-		cleanupImagePrefixes(cli, "relay-fn-svc-network:")()
+		cleanupImagePrefixes(cli, "relay-app-svc-network:")()
 	})
 
 	_, image := buildServiceHost(t, ctx, "svc-network")
@@ -642,8 +642,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	// Happy path: start a routed-looking service with the network + an extra
 	// Traefik label; assert both reach the container.
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-network",
-		Name:     "svc", SourceRef: "app/service.js",
+		App:  "svc-network",
+		Name: "svc", SourceRef: "app/service.js",
 		Port:     3000,
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
@@ -668,7 +668,7 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 	if labels["traefik.enable"] != "true" {
 		t.Fatalf("extra routing label missing on container: %v", labels)
 	}
-	if labels[labelType] != ContainerTypeService || labels[labelFunction] != "svc-network" ||
+	if labels[labelType] != ContainerTypeService || labels[labelApp] != "svc-network" ||
 		labels[labelIdentity] != "app/service.js" || labels[labelImage] != image ||
 		labels[labelHostname] != "test-host" {
 		t.Fatalf("relay ownership labels missing/corrupted on container: %v", labels)
@@ -684,8 +684,8 @@ func TestIntegrationServiceJoinsExternalNetwork(t *testing.T) {
 
 	// Negative: a nonexistent network fails and leaves NO container behind.
 	_, err = m.StartService(ctx, ServiceSpec{
-		Function: "svc-network",
-		Name:     "svc", SourceRef: "app/service.js",
+		App:  "svc-network",
+		Name: "svc", SourceRef: "app/service.js",
 		Port:     3000,
 		Image:    image,
 		Entry:    []string{"node", "/app/app/service.js"},
@@ -721,17 +721,17 @@ func TestIntegrationExternalImageService(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-external")
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-external")
 	})
 
-	// Build a small function image to serve as the external reference.
+	// Build a small app image to serve as the external reference.
 	dir := t.TempDir()
 	writeFile(t, dir, "index.js", "setInterval(() => {}, 1 << 30);\n")
-	tmpl, err := function.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.handler\n    pattern:\n      event_name: [INSERT]\n"))
+	tmpl, err := app.ParseTemplate([]byte("runtime: node24\nevents:\n  - handler: index.handler\n    pattern:\n      event_name: [INSERT]\n"))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
-	fn := function.Function{Name: "svc-external", Dir: dir, Template: tmpl}
+	fn := app.App{Name: "svc-external", Dir: dir, Template: tmpl}
 	prep, err := m.Prepare(ctx, fn)
 	if err != nil {
 		t.Fatalf("prepare host function: %v", err)
@@ -741,7 +741,7 @@ func TestIntegrationExternalImageService(t *testing.T) {
 		t.Fatal("prepared host function has no image")
 	}
 
-	svcTmpl := &function.Template{Services: []function.Service{{Image: ref, Port: 80, Replicas: 1}}}
+	svcTmpl := &app.Template{Services: []app.Service{{Image: ref, Port: 80, Replicas: 1}}}
 	svc := svcTmpl.Services[0]
 	// Suppress the remote pull check: the image is present locally.
 	m.recordPullCheck("svc-external", ref, time.Now())
@@ -761,7 +761,7 @@ func TestIntegrationExternalImageService(t *testing.T) {
 	}
 
 	id, err := m.StartService(ctx, ServiceSpec{
-		Function: "svc-external", Name: "svc", SourceRef: ref, Port: 80,
+		App: "svc-external", Name: "svc", SourceRef: ref, Port: 80,
 		Image: got.Ref, ImageID: got.ID, Env: []string{"PORT=80"},
 	}, 0)
 	if err != nil {
@@ -779,7 +779,7 @@ func TestIntegrationExternalImageService(t *testing.T) {
 //   - two starts for the SAME logical slot coexist, because the physical name
 //     is unique per start (Docker would reject a duplicate name otherwise).
 //
-// The image is the test's own function image with a stop-responsive long-lived
+// The image is the test's own app image with a stop-responsive long-lived
 // command, so the container stays up.
 func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
 	cli := testutil.RequireDocker(t)
@@ -790,8 +790,8 @@ func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
 	t.Cleanup(func() {
 		cc, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
-		_, _ = m.RemoveFunctionServiceContainers(cc, "svc-overlap")
-		cleanupImagePrefixes(cli, "relay-fn-svc-overlap:")()
+		_, _ = m.RemoveAppServiceContainers(cc, "svc-overlap")
+		cleanupImagePrefixes(cli, "relay-app-svc-overlap:")()
 	})
 
 	_, image := buildServiceHost(t, ctx, "svc-overlap")
@@ -799,7 +799,7 @@ func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
 	// Start two replicas of the SAME logical slot: both must succeed (unique
 	// physical names) and both must be running the instant StartService returns.
 	first, err := m.StartService(ctx, ServiceSpec{
-		Function:  "svc-overlap",
+		App:       "svc-overlap",
 		Name:      "svc",
 		SourceRef: "app/service.js", Port: 3000,
 		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},
@@ -808,7 +808,7 @@ func TestIntegrationServiceStartRunningGateAndNameOverlap(t *testing.T) {
 		t.Fatalf("first StartService: %v", err)
 	}
 	second, err := m.StartService(ctx, ServiceSpec{
-		Function:  "svc-overlap",
+		App:       "svc-overlap",
 		Name:      "svc",
 		SourceRef: "app/service.js", Port: 3000,
 		Image: image, Entry: []string{"node", "/app/app/service.js"}, Env: []string{"PORT=3000"},

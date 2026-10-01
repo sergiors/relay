@@ -1,0 +1,710 @@
+package app
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestParseRuntimePython(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Runtime != "python3.14" {
+		t.Errorf("expected runtime python3.14, got %q", tmpl.Runtime)
+	}
+}
+
+func TestParseRuntimeNode(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: node24
+events:
+  - handler: index.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Runtime != "node24" {
+		t.Errorf("expected runtime node24, got %q", tmpl.Runtime)
+	}
+}
+
+func TestParseUnsupportedRuntimeRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.12
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+	if err == nil {
+		t.Fatal("expected error for unsupported runtime")
+	}
+}
+
+func TestParseMissingRuntimeRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+	if err == nil {
+		t.Fatal("expected error for missing runtime")
+	}
+}
+
+func TestParseEventRuleMissingHandler(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - pattern:
+      status: [COMPLETED]
+`))
+	if err == nil {
+		t.Fatal("expected error for missing handler")
+	}
+}
+
+func TestParseEventRuleMissingPattern(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+`))
+	if err == nil {
+		t.Fatal("expected error for missing pattern")
+	}
+}
+
+func TestParseEventsEmpty(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events: []
+`))
+	if err == nil {
+		t.Fatal("expected error for empty events")
+	}
+}
+
+func TestParseHandlerValid(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
+	}
+	if tmpl.Events[0].Handler != "handler.main" {
+		t.Errorf("expected handler.main, got %q", tmpl.Events[0].Handler)
+	}
+}
+
+func TestParseHandlerNestedModule(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: src.email.send
+    pattern:
+      status: [COMPLETED]
+`)
+	if len(tmpl.Events) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(tmpl.Events))
+	}
+	if tmpl.Events[0].Handler != "src.email.send" {
+		t.Errorf("expected src.email.send, got %q", tmpl.Events[0].Handler)
+	}
+}
+
+func TestParseHandlerInvalid(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler string
+	}{
+		{"no dot", "handler"},
+		{"empty module", ".main"},
+		{"empty handler function", "handler."},
+		{"whitespace", "handler main"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: ` + tc.handler + `
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for handler %q", tc.handler)
+			}
+		})
+	}
+}
+
+// TestMatchingEventRules* behavior is covered in internal/event; the parser's
+// duplicate-handler rejection below is what this file keeps.
+
+// Event handler names are unique within an app: a template whose event
+// rules repeat a handler is rejected at parse time, naming the handler. This
+// replaces the old behavior where two same-handler rules both ran.
+func TestParseDuplicateEventHandlerRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "same handler and pattern",
+			yaml: `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+`,
+		},
+		{
+			name: "same handler different patterns",
+			yaml: `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.notify
+    pattern:
+      status: [FAILED]
+`,
+		},
+		{
+			name: "same handler different timeout and retries",
+			yaml: `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+    timeout: 20s
+    retries: 2
+`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(tc.yaml))
+			if err == nil {
+				t.Fatal("expected error for duplicate event handler")
+			}
+			if !strings.Contains(err.Error(), `duplicate event handler "handler.notify": each handler may be declared only once per app`) {
+				t.Fatalf("err = %v, want it to name the duplicated handler", err)
+			}
+		})
+	}
+}
+
+// Distinct event handlers parse valid regardless of pattern, timeout, or
+// retries: uniqueness is by handler name alone.
+func TestParseDistinctEventHandlersValid(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.notify
+    pattern:
+      status: [COMPLETED]
+  - handler: handler.failed
+    pattern:
+      status: [FAILED]
+    timeout: 20s
+    retries: 2
+`)
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("expected 2 rules, got %d", len(tmpl.Events))
+	}
+	if tmpl.Events[0].Handler != "handler.notify" || tmpl.Events[1].Handler != "handler.failed" {
+		t.Errorf("handlers = %q, %q", tmpl.Events[0].Handler, tmpl.Events[1].Handler)
+	}
+}
+
+func TestParseEventRuleMissingTimeoutDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if got := tmpl.Events[0].Timeout; got != DefaultTimeout {
+		t.Errorf("missing timeout rule = %s, want default %s", got, DefaultTimeout)
+	}
+}
+
+// TestParseEventRuleMissingRetriesDefaults pins the default retry count for a rule
+// that omits `retries`.
+func TestParseEventRuleMissingRetriesDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if got := tmpl.Events[0].Retries; got != DefaultRetries {
+		t.Errorf("missing retries rule = %d, want default %d", got, DefaultRetries)
+	}
+}
+
+// TestParseEventRuleExplicitRetries verifies an explicit non-negative `retries` is
+// honored, including zero (only the initial attempt).
+func TestParseEventRuleExplicitRetries(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: 2
+`)
+	if got := tmpl.Events[0].Retries; got != 2 {
+		t.Errorf("explicit retries = %d, want 2", got)
+	}
+
+	zero := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: 0
+`)
+	if got := zero.Events[0].Retries; got != 0 {
+		t.Errorf("retries: 0 = %d, want 0", got)
+	}
+}
+
+// TestParseEventRuleRetriesRejected verifies that a negative or non-integer `retries`
+// fails template validation with a clear message. yaml.v3 decodes "1.5" as a
+// float and "abc"/"true" as non-integers, so they must be rejected rather than
+// silently truncated or coerced.
+func TestParseEventRuleRetriesRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		retries string
+	}{
+		{"negative", "-1"},
+		{"string", "abc"},
+		{"float", "1.5"},
+		{"bool", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    retries: ` + tc.retries + `
+`))
+			if err == nil {
+				t.Fatalf("expected error for retries %q", tc.retries)
+			}
+			if !strings.Contains(err.Error(), "retries") {
+				t.Errorf("expected error to mention retries, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseEventRuleExplicitTimeout(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 20s
+`)
+	got := tmpl.Events[0].Timeout
+	if want := 20 * time.Second; got != want {
+		t.Errorf("explicit timeout rule = %s, want %s", got, want)
+	}
+}
+
+func TestParseEventRuleTimeoutRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		timeout string
+	}{
+		{"zero", "0s"},
+		{"negative", "-5s"},
+		{"unparseable", "soon"},
+		{"above max", "6m"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: ` + tc.timeout + `
+`))
+			if err == nil {
+				t.Fatalf("expected error for timeout %q", tc.timeout)
+			}
+		})
+	}
+}
+
+// TestParseEventRuleTimeoutMaxBoundary verifies the MaxTimeout cap: exactly MaxTimeout
+// parses, while anything above it is rejected with an error mentioning the max.
+func TestParseEventRuleTimeoutMaxBoundary(t *testing.T) {
+	// Exactly MaxTimeout is accepted.
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 5m
+`)
+	if got := tmpl.Events[0].Timeout; got != MaxTimeout {
+		t.Errorf("timeout = %s, want MaxTimeout %s", got, MaxTimeout)
+	}
+
+	// One second over MaxTimeout is rejected and the error mentions the max.
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+    timeout: 5m1s
+`))
+	if err == nil {
+		t.Fatal("expected error for timeout above MaxTimeout")
+	}
+	if !strings.Contains(err.Error(), "max") {
+		t.Errorf("expected error to mention the max, got: %v", err)
+	}
+}
+
+// TestParseEnvAndSecrets verifies both maps parse and that the secrets map
+// holds SecretRef values (a distinct type from a plain string).
+func TestParseEnvAndSecrets(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+env:
+  API_URL: https://api.example.com
+  FLAG: ""
+secrets:
+  DATABASE_URL: database-url
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Env["API_URL"] != "https://api.example.com" {
+		t.Errorf("env API_URL = %q, want https://api.example.com", tmpl.Env["API_URL"])
+	}
+	// Empty env values are allowed (flag-like variables).
+	if v, ok := tmpl.Env["FLAG"]; !ok || v != "" {
+		t.Errorf("env FLAG = %q, ok=%v; want empty value present", v, ok)
+	}
+	ref, ok := tmpl.Secrets["DATABASE_URL"]
+	if !ok {
+		t.Fatal("expected secrets DATABASE_URL")
+	}
+	if ref.String() != "database-url" {
+		t.Errorf("secret ref = %q, want database-url", ref.String())
+	}
+	// The value must be a SecretRef, not a plain string.
+	if _, isRef := any(ref).(SecretRef); !isRef {
+		t.Errorf("secrets value is %T, want SecretRef", ref)
+	}
+}
+
+// TestParseEnvSecretsDuplicateRejected verifies a variable defined in both env
+// and secrets fails validation.
+func TestParseEnvSecretsDuplicateRejected(t *testing.T) {
+	_, err := ParseTemplate([]byte(`
+runtime: python3.14
+env:
+  FOO: bar
+secrets:
+  FOO: some-secret
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+	if err == nil {
+		t.Fatal("expected error for duplicate env/secrets variable")
+	}
+	if !strings.Contains(err.Error(), "FOO") {
+		t.Errorf("expected error to name FOO, got: %v", err)
+	}
+}
+
+// TestParseReservedEnvVarRejected verifies that Relay-reserved variables
+// (RELAY_HANDLER — the platform-owned handler identity) cannot be set by a
+// template's env or secrets maps.
+func TestParseReservedEnvVarRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, block string
+	}{
+		{"env", "env:\n  RELAY_HANDLER: evil"},
+		{"secrets", "secrets:\n  RELAY_HANDLER: some-secret"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+` + tc.block + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatal("expected error for reserved env var")
+			}
+			if !strings.Contains(err.Error(), "reserved") {
+				t.Errorf("expected error to mention reserved, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseEnvVarNameInvalid verifies invalid env-var names are rejected.
+func TestParseEnvVarNameInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"leading dash", "-bad"},
+		{"leading digit", "1bad"},
+		{"space", "A B"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+env:
+  ` + tc.key + `: value
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for env var name %q", tc.key)
+			}
+			if !strings.Contains(err.Error(), "env var name") {
+				t.Errorf("expected error to mention env var name, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseSecretRefInvalid verifies invalid secret references are rejected.
+func TestParseSecretRefInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  string
+	}{
+		{"path traversal", "../etc"},
+		{"absolute", "/abs"},
+		{"uppercase with slash", "UPPER-with-slash"},
+		{"empty", ""},
+		{"trailing dot", "trail."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+secrets:
+  TOKEN: ` + tc.ref + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for secret ref %q", tc.ref)
+			}
+		})
+	}
+}
+
+// TestTemplateEnvPairsSorted verifies EnvList and SecretList return
+// name-ordered slices regardless of YAML map ordering.
+// TestParseConcurrencyOmittedDefaults pins that a template omitting the
+// top-level `concurrency` key resolves to DefaultConcurrency (2).
+func TestParseConcurrencyOmittedDefaults(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Concurrency != DefaultConcurrency {
+		t.Errorf("omitted concurrency = %d, want default %d", tmpl.Concurrency, DefaultConcurrency)
+	}
+}
+
+// TestParseConcurrencyExplicit verifies an explicit top-level `concurrency` is
+// honored.
+func TestParseConcurrencyExplicit(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+concurrency: 2
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if tmpl.Concurrency != 2 {
+		t.Errorf("concurrency: 2 = %d, want 2", tmpl.Concurrency)
+	}
+
+	five := mustParse(t, `
+runtime: python3.14
+concurrency: 5
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	if five.Concurrency != 5 {
+		t.Errorf("concurrency: 5 = %d, want 5", five.Concurrency)
+	}
+}
+
+// TestParseConcurrencyRejected verifies that a zero, negative, or non-integer
+// top-level `concurrency` fails validation with a clear message mentioning
+// "concurrency". yaml.v3 decodes "1.5" as a float and "true" as a bool, so they
+// must be rejected rather than silently coerced.
+func TestParseConcurrencyRejected(t *testing.T) {
+	cases := []struct {
+		name        string
+		concurrency string
+	}{
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"string", "abc"},
+		{"float", "1.5"},
+		{"bool", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseTemplate([]byte(`
+runtime: python3.14
+concurrency: ` + tc.concurrency + `
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`))
+			if err == nil {
+				t.Fatalf("expected error for concurrency %q", tc.concurrency)
+			}
+			if !strings.Contains(err.Error(), "concurrency") {
+				t.Errorf("expected error to mention concurrency, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestTemplateEnvPairsSorted(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+env:
+  ZETA: z
+  ALPHA: a
+  MID: m
+secrets:
+  BETA: beta-secret
+  ALPHA_SECRET: alpha-secret
+events:
+  - handler: handler.main
+    pattern:
+      status: [COMPLETED]
+`)
+	env := tmpl.EnvList()
+	if len(env) != 3 {
+		t.Fatalf("env list len = %d, want 3", len(env))
+	}
+	for i, want := range []string{"ALPHA", "MID", "ZETA"} {
+		if env[i].Name != want {
+			t.Errorf("env[%d].Name = %q, want %q", i, env[i].Name, want)
+		}
+	}
+	sec := tmpl.SecretList()
+	if len(sec) != 2 {
+		t.Fatalf("secret list len = %d, want 2", len(sec))
+	}
+	if sec[0].Name != "ALPHA_SECRET" || sec[1].Name != "BETA" {
+		t.Errorf("secret list order = %q,%q; want ALPHA_SECRET,BETA", sec[0].Name, sec[1].Name)
+	}
+	if sec[0].Ref.String() != "alpha-secret" {
+		t.Errorf("secret ref = %q, want alpha-secret", sec[0].Ref.String())
+	}
+}
+
+// TestEventRulesUnaffectedByScheduleAndServiceNames pins that adding schedule
+// and service names (and a service sharing a source) does not change the parsed
+// event rule set: events remain keyed by handler. Matching behavior is covered in
+// internal/event. This is the parse-side regression guard for the name-identity
+// change.
+func TestEventRulesUnaffectedByScheduleAndServiceNames(t *testing.T) {
+	tmpl := mustParse(t, `
+runtime: python3.14
+events:
+  - handler: events.created.handler
+    pattern:
+      event_name: [INSERT]
+  - handler: events.updated.handler
+    pattern:
+      event_name: [MODIFY]
+schedules:
+  - name: cleanup
+    handler: events.created.handler
+    cron: "0 3 * * *"
+  - name: report
+    handler: events.created.handler
+    cron: "0 4 * * *"
+services:
+  - name: api
+    entrypoint: service.js
+  - name: worker
+    entrypoint: service.js
+`)
+	if len(tmpl.Events) != 2 {
+		t.Fatalf("events = %d, want 2", len(tmpl.Events))
+	}
+	if tmpl.Events[0].Handler != "events.created.handler" || tmpl.Events[1].Handler != "events.updated.handler" {
+		t.Fatalf("event handlers = %q,%q", tmpl.Events[0].Handler, tmpl.Events[1].Handler)
+	}
+	// A schedule sharing an event handler must NOT turn that schedule into an
+	// event rule: the event rule set is exactly the two declared events.
+	if len(tmpl.Schedules) != 2 {
+		t.Fatalf("schedules = %d, want 2", len(tmpl.Schedules))
+	}
+	if len(tmpl.Services) != 2 {
+		t.Fatalf("services = %d, want 2", len(tmpl.Services))
+	}
+}

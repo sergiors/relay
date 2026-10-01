@@ -27,18 +27,18 @@ package runtime
 // containers as non-Relay and sweeps/reconciles only typed ones.)
 //
 // The same strict relay.type model classifies Relay's IMAGES. A single
-// relay.type label names either a function image or a dependency image; the
+// relay.type label names either an app image or a dependency image; the
 // label set is the source of truth for which images Relay owns and how they
 // are wired. relay.fingerprint pins the content version the image was built
-// from, relay.function names the owning function, relay.dependency names the
-// exact dependency image this function image was built FROM (a full
+// from, relay.app names the owning app, relay.dependency names the
+// exact dependency image this app image was built FROM (a full
 // "relay-dep-*" repo tag), and relay.runtime names the runtime a dependency
 // image was built for. The dependency GC reads exactly these labels and never
 // infers ownership from repository names alone.
 
 const (
 	labelType      = "relay.type"
-	labelFunction  = "relay.function"
+	labelApp       = "relay.app"
 	labelHandler   = "relay.handler"
 	labelMessageID = "relay.message_id"
 	labelEventID   = "relay.event_id"
@@ -90,7 +90,7 @@ const (
 
 	// labelResources pins the effective per-container resource configuration a
 	// service replica was created with: a short digest over the resolved
-	// memory/CPU/pids limits (function.ResourceLimits.Fingerprint). It is how a
+	// memory/CPU/pids limits (app.ResourceLimits.Fingerprint). It is how a
 	// resource-only template change replaces a running service even though the
 	// image reference (and image fingerprint) are unchanged, and it holds no raw
 	// values. A container created before the label carries none, so it is
@@ -98,20 +98,20 @@ const (
 	labelResources = "relay.resources"
 
 	// Managed-image labels. These pin the identity and wiring of a managed
-	// image (function or dependency) so the dependency GC can classify images
-	// and resolve function→dependency ownership without inferring anything
+	// image (app or dependency) so the dependency GC can classify images
+	// and resolve app→dependency ownership without inferring anything
 	// from repository names. relay.fingerprint holds the content fingerprint
 	// prefix the image was built from; relay.dependency is the full
-	// "relay-dep-*" reference the function image was built FROM (present on
-	// function images only, and only when the function declares deps);
+	// "relay-dep-*" reference the app image was built FROM (present on
+	// app images only, and only when the app declares deps);
 	// relay.runtime names the runtime spec.Name a dependency image was built
 	// for (dependency images only).
 	labelRuntime     = "relay.runtime"
 	labelFingerprint = "relay.fingerprint"
 	labelDependency  = "relay.dependency"
 	// labelBootstrap pins the content hash of the runtime-injected bootstrap
-	// (and the entrypoint) a function image was built with. Tags are
-	// fingerprinted over the FUNCTION DIR only, so an image built by a previous
+	// (and the entrypoint) an app image was built with. Tags are
+	// fingerprinted over the APP DIR only, so an image built by a previous
 	// Relay version with an older one-shot bootstrap carries the same tag as a
 	// new build would. The label lets Prepare detect stale-bootstrap images
 	// holding a current tag and rebuild them (upgrade safety for the
@@ -131,30 +131,30 @@ const (
 
 // The relay.type values for managed IMAGES. Every managed image carries exactly
 // one; the absence of a type (or an unknown type) means an image is NOT managed
-// — an unlabeled "relay-fn-*" or "relay-dep-*" image from a pre-labels build is
+// — an unlabeled "relay-app-*" or "relay-dep-*" image from a pre-labels build is
 // unmanaged for classification purposes. Both the dependency GC and the
-// function-image cleanup paths (relayTags, FunctionImageTags, RemoveImagesExcept)
+// app-image cleanup paths (relayTags, AppImageTags, RemoveImagesExcept)
 // are strict and label-derived: an unlabeled image is never removed or
 // considered a Relay version. These are exported so the builder stamps them
 // without a stringly-typed duplicate.
 const (
-	ImageTypeFunction   = "function"
+	ImageTypeApp        = "app"
 	ImageTypeDependency = "dependency"
 )
 
 // imageLabels builds the managed-image label set for a single image. imageType
-// is one of ImageTypeFunction / ImageTypeDependency; the remaining fields
+// is one of ImageTypeApp / ImageTypeDependency; the remaining fields
 // narrow that identity (see labelRuntime / labelFingerprint / labelDependency).
-// Empty fields are simply omitted, so the caller can build a function label set
-// (type+function+fingerprint+optional dependency) or a dependency label set
+// Empty fields are simply omitted, so the caller can build an app label set
+// (type+app+fingerprint+optional dependency) or a dependency label set
 // (type+runtime+fingerprint) with one helper. These labels are the strict
-// classification the dependency GC reads: an image is a managed function image
-// iff its relay.type == ImageTypeFunction and a managed dependency image iff its
+// classification the dependency GC reads: an image is a managed app image
+// iff its relay.type == ImageTypeApp and a managed dependency image iff its
 // relay.type == ImageTypeDependency.
 func imageLabels(imageType string, fnName, runtimeName, fingerprint, dependency string) map[string]string {
 	l := map[string]string{labelType: imageType}
 	if fnName != "" {
-		l[labelFunction] = fnName
+		l[labelApp] = fnName
 	}
 	if runtimeName != "" {
 		l[labelRuntime] = runtimeName
@@ -168,12 +168,12 @@ func imageLabels(imageType string, fnName, runtimeName, fingerprint, dependency 
 	return l
 }
 
-// functionImageLabels returns the managed function-image label set for a
-// function version built from the given dependency reference ("" when the
-// function declares no deps) and the bootstrap content hash the image was
+// appImageLabels returns the managed app-image label set for a
+// app version built from the given dependency reference ("" when the
+// app declares no deps) and the bootstrap content hash the image was
 // built with.
-func functionImageLabels(fnName, fingerprint, dependency, bootstrap string) map[string]string {
-	l := imageLabels(ImageTypeFunction, fnName, "", fingerprint, dependency)
+func appImageLabels(fnName, fingerprint, dependency, bootstrap string) map[string]string {
+	l := imageLabels(ImageTypeApp, fnName, "", fingerprint, dependency)
 	if bootstrap != "" {
 		l[labelBootstrap] = bootstrap
 	}
@@ -189,11 +189,11 @@ func dependencyImageLabels(runtimeName, fingerprint string) map[string]string {
 
 // isServiceContainer reports whether labels classify a container as a
 // persistent Relay service container. It is a strict equality on relay.type
-// ONLY — it does NOT require relay.function. Services list all service
-// containers regardless of function for reconciliation discovery: the stale
-// set (a function removed while Relay was down) is identified after discovery
-// from each container's Function, so requiring relay.function here would
-// wrongly exclude a service container whose owning function was deleted.
+// ONLY — it does NOT require relay.app. Services list all service
+// containers regardless of app for reconciliation discovery: the stale
+// set (an app removed while Relay was down) is identified after discovery
+// from each container's App, so requiring relay.app here would
+// wrongly exclude a service container whose owning app was deleted.
 func isServiceContainer(labels map[string]string) bool {
 	return labels[labelType] == ContainerTypeService
 }

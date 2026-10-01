@@ -13,7 +13,7 @@ import (
 // invocations all hand the SAME published *runtime.Prepared to the Executor.
 // Resource limits are resolved inside Manager.Execute (keyed by the handle's
 // Name), not in the runner, so this is the structural guarantee that all three
-// paths apply the same per-function resources without duplicating resolution.
+// paths apply the same per-app resources without duplicating resolution.
 // The runtime-level mapping and generation rotation are covered in
 // internal/runtime (manager_resources_test.go).
 func TestAllEntryPathsSharePreparedHandle(t *testing.T) {
@@ -29,7 +29,7 @@ schedules:
     cron: "0 3 * * *"
 `
 	pf := invokeFn(t, "fn", tmpl, exec)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 
 	shared := pf.Prepared()
 	if shared == nil {
@@ -44,9 +44,9 @@ schedules:
 		t.Fatalf("event path prepared = %p, want the shared handle %p", got, shared)
 	}
 
-	// Manual path (InvokeFunction).
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+	// Manual path (InvokeApp).
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if got := exec.gotPrepared(); got != shared {
 		t.Fatalf("manual path prepared = %p, want the shared handle %p", got, shared)

@@ -7,7 +7,7 @@ import (
 )
 
 // cronDescriptor is the package-level, lazily-constructed descriptor used to
-// render human-readable cron descriptions for `relay function inspect`. It is
+// render human-readable cron descriptions for `relay app inspect`. It is
 // built once with 24-hour formatting so the description never shows AM/PM.
 // ToDescription is stateless and safe for concurrent use after construction, so
 // a single shared descriptor is reused across all schedule rows.

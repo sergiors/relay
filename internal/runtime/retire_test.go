@@ -72,21 +72,21 @@ func TestRetireImageHeldByColdExecutionLease(t *testing.T) {
 
 	// A direct execution acquires its own lease (as Manager.Execute does when no
 	// lease is on ctx).
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	done := make(chan error, 1)
-	go func() { done <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { done <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 
 	// Wait deterministically until the removal owns the retirement gate. The
 	// gate commits before the drain wait, so at this exact point the removal is
 	// blocked on the held lease and has issued no DELETE. No delay-based proof
 	// is needed: the held lease is what keeps the drain open.
 	signal.wait(t)
-	if !m.IsImageRetiring("relay-fn-a:v1") {
+	if !m.IsImageRetiring("relay-app-a:v1") {
 		t.Fatal("the gate must be established once the removal owns it")
 	}
 	if dels != 0 {
@@ -122,7 +122,7 @@ func TestRetireImageRemovalFailureRetryable(t *testing.T) {
 			body: `{"message":"boom"}`, onMatch: func() { attempts++ }},
 	)
 
-	if err := m.RemoveImage(context.Background(), "relay-fn-a:v1"); err == nil {
+	if err := m.RemoveImage(context.Background(), "relay-app-a:v1"); err == nil {
 		t.Fatal("expected the failed removal to surface")
 	}
 	if attempts != 1 {
@@ -130,10 +130,10 @@ func TestRetireImageRemovalFailureRetryable(t *testing.T) {
 	}
 	// The failed removal cleared the gate: the image is retiring no more and can
 	// be leased again.
-	if m.IsImageRetiring("relay-fn-a:v1") {
+	if m.IsImageRetiring("relay-app-a:v1") {
 		t.Fatal("a failed removal must clear the retirement gate")
 	}
-	if _, err := m.AcquireImageLease("relay-fn-a:v1"); err != nil {
+	if _, err := m.AcquireImageLease("relay-app-a:v1"); err != nil {
 		t.Fatalf("image must be reusable after a failed removal, got %v", err)
 	}
 }
@@ -150,14 +150,14 @@ func TestRetireImageDuplicateIsDeferred(t *testing.T) {
 
 	// Hold a lease so the first retirement is still draining when the second
 	// arrives.
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	first := make(chan error, 1)
-	go func() { first <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { first <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 
 	// Wait deterministically until the first retirement owns the gate. The held
 	// lease then guarantees it stays blocked, so the duplicate below observes
@@ -165,7 +165,7 @@ func TestRetireImageDuplicateIsDeferred(t *testing.T) {
 	signal.wait(t)
 
 	// The duplicate is rejected immediately as retryable.
-	err = m.RemoveImage(context.Background(), "relay-fn-a:v1")
+	err = m.RemoveImage(context.Background(), "relay-app-a:v1")
 	if !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("duplicate removal = %v, want wrapped ErrImageRetiring", err)
 	}

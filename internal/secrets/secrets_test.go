@@ -4,17 +4,17 @@ import (
 	"context"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
-// TestSecretNameValidationMatchesFunctionRules pins the equivalence of the two
+// TestSecretNameValidationMatchesAppRules pins the equivalence of the two
 // duplicated secret-name validators: internal/secrets.ValidateName and
-// internal/function.ValidSecretName must agree on every valid and invalid name,
+// internal/app.ValidSecretName must agree on every valid and invalid name,
 // so a secret reference accepted by a template is always accepted by the store
-// (and vice versa). The duplication is deliberate — function is a leaf package
+// (and vice versa). The duplication is deliberate — app is a leaf package
 // and cannot import secrets — and this test is the cross-check that keeps them
 // in sync.
-func TestSecretNameValidationMatchesFunctionRules(t *testing.T) {
+func TestSecretNameValidationMatchesAppRules(t *testing.T) {
 	valid := []string{
 		"db", "database-url", "api_key", "jobs.v2", "a", "a1", "a-b_c.d",
 	}
@@ -26,16 +26,16 @@ func TestSecretNameValidationMatchesFunctionRules(t *testing.T) {
 		if err := ValidateName(name); err != nil {
 			t.Errorf("ValidateName(%q) = %v, want nil", name, err)
 		}
-		if err := function.ValidSecretName(name); err != nil {
-			t.Errorf("function.ValidSecretName(%q) = %v, want nil", name, err)
+		if err := app.ValidSecretName(name); err != nil {
+			t.Errorf("app.ValidSecretName(%q) = %v, want nil", name, err)
 		}
 	}
 	for _, name := range invalid {
 		if err := ValidateName(name); err == nil {
 			t.Errorf("ValidateName(%q) = nil, want error", name)
 		}
-		if err := function.ValidSecretName(name); err == nil {
-			t.Errorf("function.ValidSecretName(%q) = nil, want error", name)
+		if err := app.ValidSecretName(name); err == nil {
+			t.Errorf("app.ValidSecretName(%q) = nil, want error", name)
 		}
 	}
 }

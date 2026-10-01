@@ -12,7 +12,7 @@ func TestParseDLQEntryCurrentFormat(t *testing.T) {
 		"consumer":         "worker-1",
 		"event":            `{"event_name":"INSERT","id":7}`,
 		"reason":           `invocation exhausted: function "fn" handler "index.run" exhausted after 5 handler attempts`,
-		"function":         "fn",
+		"app":              "fn",
 		"handler":          "index.run",
 		"deliveries":       "7",
 		"handler_attempts": "5",
@@ -34,8 +34,8 @@ func TestParseDLQEntryCurrentFormat(t *testing.T) {
 	if e.Event != `{"event_name":"INSERT","id":7}` {
 		t.Errorf("Event = %q", e.Event)
 	}
-	if e.Function != "fn" || e.Handler != "index.run" {
-		t.Errorf("function/handler = %q/%q", e.Function, e.Handler)
+	if e.App != "fn" || e.Handler != "index.run" {
+		t.Errorf("function/handler = %q/%q", e.App, e.Handler)
 	}
 	if e.Deliveries != 7 || e.HandlerAttempts != 5 {
 		t.Errorf("deliveries/handler_attempts = %d/%d", e.Deliveries, e.HandlerAttempts)
@@ -46,7 +46,7 @@ func TestParseDLQEntryCurrentFormat(t *testing.T) {
 }
 
 // TestParseDLQEntryMalformedPlaceholder pins the malformed-message entry: the "-"
-// function/handler placeholder and explicit 0 handler_attempts parse normally
+// app/handler placeholder and explicit 0 handler_attempts parse normally
 // (there is no compatibility reinterpretation).
 func TestParseDLQEntryMalformedPlaceholder(t *testing.T) {
 	values := map[string]any{
@@ -56,7 +56,7 @@ func TestParseDLQEntryMalformedPlaceholder(t *testing.T) {
 		"consumer":         "worker-1",
 		"event":            "-",
 		"reason":           "decode event: missing 'event' field",
-		"function":         dlqNoHandler,
+		"app":              dlqNoHandler,
 		"handler":          dlqNoHandler,
 		"deliveries":       "1",
 		"handler_attempts": "0",
@@ -66,31 +66,31 @@ func TestParseDLQEntryMalformedPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseDLQEntry: %v", err)
 	}
-	if e.Function != "-" || e.Handler != "-" || e.HandlerAttempts != 0 {
+	if e.App != "-" || e.Handler != "-" || e.HandlerAttempts != 0 {
 		t.Fatalf("placeholder entry = %+v", e)
 	}
 }
 
 // TestDLQEntryReplayable pins the replayability predicate on the current
-// format: an entry that attributes a real function/handler invocation is
-// replayable, while the malformed-message placeholder ("-" function/handler)
+// format: an entry that attributes a real app/handler invocation is
+// replayable, while the malformed-message placeholder ("-" app/handler)
 // is not. There is no reinterpretation of the placeholder.
 func TestDLQEntryReplayable(t *testing.T) {
-	real := DLQEntry{Function: "fn", Handler: "index.run"}
+	real := DLQEntry{App: "fn", Handler: "index.run"}
 	if !real.Replayable() {
 		t.Fatalf("a real invocation entry must be replayable: %+v", real)
 	}
-	placeholder := DLQEntry{Function: dlqNoHandler, Handler: dlqNoHandler}
+	placeholder := DLQEntry{App: dlqNoHandler, Handler: dlqNoHandler}
 	if placeholder.Replayable() {
 		t.Fatalf("the malformed-message placeholder must not be replayable: %+v", placeholder)
 	}
 	// Either side being the placeholder is enough: a partial invocation has no
 	// exact handler to re-execute.
 	for _, e := range []DLQEntry{
-		{Function: dlqNoHandler, Handler: "index.run"},
-		{Function: "fn", Handler: dlqNoHandler},
-		{Function: "", Handler: "index.run"},
-		{Function: "fn", Handler: ""},
+		{App: dlqNoHandler, Handler: "index.run"},
+		{App: "fn", Handler: dlqNoHandler},
+		{App: "", Handler: "index.run"},
+		{App: "fn", Handler: ""},
 	} {
 		if e.Replayable() {
 			t.Fatalf("entry %+v must not be replayable", e)
@@ -104,7 +104,7 @@ func TestParseDLQEntryRejectsMissingField(t *testing.T) {
 	values := map[string]any{
 		"original_stream": "events",
 		"original_id":     "1-0",
-		// group, consumer, event, reason, function, handler, counts, timestamp absent
+		// group, consumer, event, reason, app, handler, counts, timestamp absent
 	}
 	if _, err := ParseDLQEntry("1-1", values); err == nil {
 		t.Fatal("missing fields must be rejected")
@@ -121,7 +121,7 @@ func TestParseDLQEntryRejectsBadInteger(t *testing.T) {
 		"consumer":         "worker-1",
 		"event":            `{}`,
 		"reason":           "boom",
-		"function":         "fn",
+		"app":              "fn",
 		"handler":          "index.run",
 		"deliveries":       "not-a-number",
 		"handler_attempts": "1",
@@ -142,7 +142,7 @@ func TestParseDLQEntryRejectsNonStringField(t *testing.T) {
 		"consumer":         "worker-1",
 		"event":            `{}`,
 		"reason":           42,
-		"function":         "fn",
+		"app":              "fn",
 		"handler":          "index.run",
 		"deliveries":       "1",
 		"handler_attempts": "1",
@@ -165,7 +165,7 @@ func TestParseDLQEntryTraceOptional(t *testing.T) {
 			"consumer":         "worker-1",
 			"event":            `{}`,
 			"reason":           "boom",
-			"function":         "fn",
+			"app":              "fn",
 			"handler":          "index.run",
 			"deliveries":       "1",
 			"handler_attempts": "1",

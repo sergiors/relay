@@ -274,7 +274,7 @@ func TestNewRejectsDirOutsideRoot(t *testing.T) {
 }
 
 // TestExampleFastapiServiceExcludesGeneratedVenv pins the example-hygiene
-// decision: the fastapi-service example ships a function-root .gitignore that
+// decision: the fastapi-service example ships an app-root .gitignore that
 // excludes its generated Python environment (`.venv/`) as a whole, so source
 // selection never descends into it. Without that root rule the only protection
 // is the generated `.venv/.gitignore` (content `*`), which would itself enter
@@ -284,7 +284,7 @@ func TestNewRejectsDirOutsideRoot(t *testing.T) {
 // tree to be present, since .gitignore matching is independent of the target's
 // existence.
 func TestExampleFastapiServiceExcludesGeneratedVenv(t *testing.T) {
-	dir := filepath.Join("..", "..", "examples", "functions", "fastapi-service")
+	dir := filepath.Join("..", "..", "examples", "apps", "fastapi-service")
 	selection, err := ForDir(dir)
 	if err != nil {
 		t.Fatalf("ForDir(%s): %v", dir, err)

@@ -54,13 +54,13 @@ func TestDLQPayload(t *testing.T) {
 	// deliveries (Redis/PEL) and handler_attempts (invocation retry state) are
 	// distinct, explicit fields. handler_attempts may exceed or trail deliveries
 	// depending on reclaim/redelivery, so the payload must never alias them. The
-	// exact function/handler identify the exhausted invocation this entry
+	// exact app/handler identify the exhausted invocation this entry
 	// attributes.
 	p := dlqPayload("events", "1-0", "relay", "worker-1", `{"a":1}`, "boom", "fn", "index.run", 7, 3, "")
 	if p["original_stream"] != "events" || p["original_id"] != "1-0" ||
 		p["group"] != "relay" || p["consumer"] != "worker-1" ||
 		p["event"] != `{"a":1}` || p["reason"] != "boom" ||
-		p["function"] != "fn" || p["handler"] != "index.run" ||
+		p["app"] != "fn" || p["handler"] != "index.run" ||
 		p["deliveries"] != int64(7) || p["handler_attempts"] != 3 {
 		t.Fatalf("unexpected payload: %v", p)
 	}
@@ -105,9 +105,9 @@ func TestDLQPayloadTraceOptional(t *testing.T) {
 // typed exhaustion error yields invocation metadata; any other error (a
 // malformed-message routing, a plain retryable failure) yields nothing so no
 // handler attempt is fabricated. Entries missing a positive attempt count or the
-// function/handler identity are dropped defensively.
+// app/handler identity are dropped defensively.
 func TestExhaustedInvocationsFromError(t *testing.T) {
-	iv := ExhaustedInvocation{Function: "fn", Handler: "h", Attempts: 3, Err: errors.New("boom")}
+	iv := ExhaustedInvocation{App: "fn", Handler: "h", Attempts: 3, Err: errors.New("boom")}
 	tests := []struct {
 		name string
 		err  error
@@ -115,18 +115,18 @@ func TestExhaustedInvocationsFromError(t *testing.T) {
 	}{
 		{"typed single", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{iv}}, []ExhaustedInvocation{iv}},
 		{"typed multiple", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "a", Handler: "h", Attempts: 2},
-			{Function: "b", Handler: "h", Attempts: 5},
+			{App: "a", Handler: "h", Attempts: 2},
+			{App: "b", Handler: "h", Attempts: 5},
 		}}, []ExhaustedInvocation{
-			{Function: "a", Handler: "h", Attempts: 2},
-			{Function: "b", Handler: "h", Attempts: 5},
+			{App: "a", Handler: "h", Attempts: 2},
+			{App: "b", Handler: "h", Attempts: 5},
 		}},
 		{"wrapped typed", fmt.Errorf("outer: %w", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{iv}}), []ExhaustedInvocation{iv}},
 		{"empty typed", &HandlerExhaustedError{}, nil},
 		{"non-positive attempt dropped", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "a", Handler: "h", Attempts: 0},
-			{Function: "b", Handler: "h", Attempts: 2},
-		}}, []ExhaustedInvocation{{Function: "b", Handler: "h", Attempts: 2}}},
+			{App: "a", Handler: "h", Attempts: 0},
+			{App: "b", Handler: "h", Attempts: 2},
+		}}, []ExhaustedInvocation{{App: "b", Handler: "h", Attempts: 2}}},
 		{"missing identity dropped", &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
 			{Handler: "h", Attempts: 2},
 		}}, nil},
@@ -140,7 +140,7 @@ func TestExhaustedInvocationsFromError(t *testing.T) {
 				t.Fatalf("exhaustedInvocationsFromError = %v, want %v", got, tt.want)
 			}
 			for i := range got {
-				if got[i].Function != tt.want[i].Function || got[i].Handler != tt.want[i].Handler || got[i].Attempts != tt.want[i].Attempts {
+				if got[i].App != tt.want[i].App || got[i].Handler != tt.want[i].Handler || got[i].Attempts != tt.want[i].Attempts {
 					t.Fatalf("exhaustedInvocationsFromError[%d] = %+v, want %+v", i, got[i], tt.want[i])
 				}
 			}
@@ -149,25 +149,25 @@ func TestExhaustedInvocationsFromError(t *testing.T) {
 }
 
 // TestDLQEntrySpecs pins the expansion of the runner's exhaustion signal into
-// DLQ entries: one entry per exhausted invocation with exact function/handler/
-// attempt/reason, and a single placeholder entry (function/handler "-", 0
+// DLQ entries: one entry per exhausted invocation with exact app/handler/
+// attempt/reason, and a single placeholder entry (app/handler "-", 0
 // attempts) when the error carries no typed invocation metadata (the malformed
 // message path).
 func TestDLQEntrySpecs(t *testing.T) {
 	t.Run("multiple invocations", func(t *testing.T) {
 		err := &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fnA", Handler: "index.run", Attempts: 2, Err: errors.New("first")},
-			{Function: "fnB", Handler: "jobs.clean", Attempts: 5, Err: errors.New("second")},
+			{App: "fnA", Handler: "index.run", Attempts: 2, Err: errors.New("first")},
+			{App: "fnB", Handler: "jobs.clean", Attempts: 5, Err: errors.New("second")},
 		}}
 		specs := dlqEntrySpecs(err)
 		if len(specs) != 2 {
 			t.Fatalf("specs = %d, want 2", len(specs))
 		}
-		if specs[0].function != "fnA" || specs[0].handler != "index.run" || specs[0].attempts != 2 ||
+		if specs[0].app != "fnA" || specs[0].handler != "index.run" || specs[0].attempts != 2 ||
 			specs[0].invocation != "fnA/index.run" || !strings.Contains(specs[0].reason, "first") {
 			t.Fatalf("specs[0] = %+v", specs[0])
 		}
-		if specs[1].function != "fnB" || specs[1].handler != "jobs.clean" || specs[1].attempts != 5 ||
+		if specs[1].app != "fnB" || specs[1].handler != "jobs.clean" || specs[1].attempts != 5 ||
 			specs[1].invocation != "fnB/jobs.clean" || !strings.Contains(specs[1].reason, "second") {
 			t.Fatalf("specs[1] = %+v", specs[1])
 		}
@@ -184,7 +184,7 @@ func TestDLQEntrySpecs(t *testing.T) {
 		if len(specs) != 1 {
 			t.Fatalf("specs = %d, want 1 placeholder", len(specs))
 		}
-		if specs[0].function != dlqNoHandler || specs[0].handler != dlqNoHandler ||
+		if specs[0].app != dlqNoHandler || specs[0].handler != dlqNoHandler ||
 			specs[0].attempts != 0 || specs[0].invocation != "" ||
 			specs[0].reason != "decode event: boom" {
 			t.Fatalf("placeholder spec = %+v", specs[0])
@@ -199,8 +199,8 @@ func TestHandlerExhaustedErrorUnwrap(t *testing.T) {
 	causeA := errors.New("boom-a")
 	causeB := errors.New("boom-b")
 	err := &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-		{Function: "fnA", Handler: "h", Attempts: 2, Err: causeA},
-		{Function: "fnB", Handler: "h", Attempts: 4, Err: causeB},
+		{App: "fnA", Handler: "h", Attempts: 2, Err: causeA},
+		{App: "fnB", Handler: "h", Attempts: 4, Err: causeB},
 	}}
 	if !errors.Is(err, ErrInvocationExhausted) {
 		t.Fatalf("errors.Is(err, ErrInvocationExhausted) = false, want true")
@@ -218,7 +218,7 @@ func TestHandlerExhaustedErrorUnwrap(t *testing.T) {
 }
 
 // TestHandlerExhaustedErrorReasonConsistent pins the DLQ `reason` contract: the
-// reason names the exact function/handler and the same attempt count the entry's
+// reason names the exact app/handler and the same attempt count the entry's
 // handler_attempts carries, with exactly one `invocation exhausted:` sentinel
 // prefix, never a bare/machine-only cause.
 func TestHandlerExhaustedErrorReasonConsistent(t *testing.T) {
@@ -230,15 +230,15 @@ func TestHandlerExhaustedErrorReasonConsistent(t *testing.T) {
 		{
 			name: "single invocation with cause",
 			err: &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-				{Function: "fn", Handler: "h", Attempts: 5, Err: errors.New("boom")},
+				{App: "fn", Handler: "h", Attempts: 5, Err: errors.New("boom")},
 			}},
 			want: []int{5},
 		},
 		{
 			name: "multiple invocations",
 			err: &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-				{Function: "fnA", Handler: "h", Attempts: 3},
-				{Function: "fnB", Handler: "h", Attempts: 7, Err: errors.New("boom")},
+				{App: "fnA", Handler: "h", Attempts: 3},
+				{App: "fnB", Handler: "h", Attempts: 7, Err: errors.New("boom")},
 			}},
 			want: []int{3, 7},
 		},
@@ -290,9 +290,9 @@ func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 	}, store)
 
 	specs := []dlqEntrySpec{
-		{function: "fnA", handler: "index.run", attempts: 2, invocation: "fnA/index.run"},
-		{function: "fnB", handler: "index.run", attempts: 5, invocation: "fnB/index.run"}, // absent → keep
-		{function: "fnC", handler: "index.run", attempts: 2, invocation: "fnC/index.run"},
+		{app: "fnA", handler: "index.run", attempts: 2, invocation: "fnA/index.run"},
+		{app: "fnB", handler: "index.run", attempts: 5, invocation: "fnB/index.run"}, // absent → keep
+		{app: "fnC", handler: "index.run", attempts: 2, invocation: "fnC/index.run"},
 	}
 	got := c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
 	if len(got) != 2 {
@@ -320,7 +320,7 @@ func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 
 	// A spec with no invocation (malformed placeholder) is always kept.
 	store.readErr = nil
-	ph := []dlqEntrySpec{{function: dlqNoHandler, handler: dlqNoHandler, reason: "boom"}}
+	ph := []dlqEntrySpec{{app: dlqNoHandler, handler: dlqNoHandler, reason: "boom"}}
 	if got := c.unpersistedDLQSpecs(context.Background(), "m-0", ph); len(got) != 1 {
 		t.Fatalf("placeholder specs = %+v, want the placeholder kept", got)
 	}

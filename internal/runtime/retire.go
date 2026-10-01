@@ -112,9 +112,9 @@ func (m *Manager) beginRemovalOperation(ctx context.Context) (context.Context, f
 // start, dependency consumption) so removal can never commit between the check
 // and the use.
 //
-// An empty image OR an image outside Relay's namespaces ("relay-fn-" /
+// An empty image OR an image outside Relay's namespaces ("relay-app-" /
 // "relay-dep-") is not leased: it returns (nil, nil) because Relay has no
-// ownership of it (a no-runtime function has no image to pin, and an external
+// ownership of it (a no-runtime app has no image to pin, and an external
 // service image must never be GC'd by Relay). A retired/removing image returns
 // a wrapped ErrImageRetiring: callers treat it as a retryable transitional
 // state, never a hard failure.
@@ -161,7 +161,7 @@ func WithSnapshotLease(ctx context.Context, lease *ImageLease) context.Context {
 // fresh independent reference, which a retirement in progress rejects with a
 // retryable ErrImageRetiring so the use defers rather than racing ImageRemove.
 // The returned lease (nil for an image outside Relay's namespaces, e.g. a
-// no-runtime function or an external service image) must be released by the
+// no-runtime app or an external service image) must be released by the
 // caller.
 func (m *Manager) admitLease(ctx context.Context, image string) (*ImageLease, error) {
 	coord := m.leaseCoord()
@@ -175,7 +175,7 @@ func (m *Manager) admitLease(ctx context.Context, image string) (*ImageLease, er
 
 // RetireImageLease is the single authority-aware image-removal entry point for
 // callers that have already decided an image is superseded (the runner's async
-// retirement, the function-removal path, the startup sweep). It commits the
+// retirement, the app-removal path, the startup sweep). It commits the
 // image to retirement (rejecting NEW independent leases while work admitted
 // before this point drains), invalidates the image's warm execution containers,
 // waits on ctx for every admitted lease to drain, then performs the FORCE-FREE

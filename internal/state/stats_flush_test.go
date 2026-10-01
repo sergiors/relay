@@ -7,24 +7,24 @@ import (
 )
 
 // TestRecordStatsSnapshotSingleTransaction pins the RecordStatsSnapshot contract:
-// a single short transaction that (1) prunes orphaned function_stats rows (rows
-// whose function no longer has a functions row), (2) upserts the global stats
-// row with absolute values, and (3) per-function upserts guarded by the function
+// a single short transaction that (1) prunes orphaned app_stats rows (rows
+// whose app no longer has a apps row), (2) upserts the global stats
+// row with absolute values, and (3) per-app upserts guarded by the app
 // still existing. It also proves idempotency: a repeated flush with identical
 // values never double-counts.
 func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	c := openTestState(t)
 	tmpl := mustTemplate(t, twoHandlerTmpl)
 
-	// Seed functions rows for "alpha" and "beta". Record "gone" and its
-	// function_stats, then delete ONLY its functions row directly via the
-	// unexported db handle, leaving a genuine orphaned function_stats row behind.
+	// Seed apps rows for "alpha" and "beta". Record "gone" and its
+	// app_stats, then delete ONLY its apps row directly via the
+	// unexported db handle, leaving a genuine orphaned app_stats row behind.
 	c.RecordDiscovered(fnFor(t, "alpha", tmpl))
 	c.RecordDiscovered(fnFor(t, "beta", tmpl))
 	c.RecordDiscovered(fnFor(t, "gone", tmpl))
-	c.RecordFunctionStats(FunctionStats{Function: "gone", EventsMatchedTotal: 5})
-	if _, err := c.db.ExecContext(context.Background(), `DELETE FROM functions WHERE name = 'gone'`); err != nil {
-		t.Fatalf("delete gone functions row: %v", err)
+	c.RecordAppStats(AppStats{App: "gone", EventsMatchedTotal: 5})
+	if _, err := c.db.ExecContext(context.Background(), `DELETE FROM apps WHERE name = 'gone'`); err != nil {
+		t.Fatalf("delete gone apps row: %v", err)
 	}
 	// A prior global row to prove the snapshot replaces (not accumulates) it.
 	c.RecordStats(Stats{EventsMatchedTotal: 100})
@@ -38,12 +38,12 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 		PendingEntries:          7,
 		OldestPendingAgeSeconds: 42,
 	}
-	fns := []FunctionStats{
-		{Function: "alpha", EventsMatchedTotal: 30, HandlerSuccessTotal: 25, HandlerFailureTotal: 5, RetryTotal: 1, DLQTotal: 0},
-		{Function: "beta", EventsMatchedTotal: 40, HandlerSuccessTotal: 35, HandlerFailureTotal: 5, RetryTotal: 2, DLQTotal: 1},
-		// "gone"'s stale row is present in the snapshot but its functions row was
+	fns := []AppStats{
+		{App: "alpha", EventsMatchedTotal: 30, HandlerSuccessTotal: 25, HandlerFailureTotal: 5, RetryTotal: 1, DLQTotal: 0},
+		{App: "beta", EventsMatchedTotal: 40, HandlerSuccessTotal: 35, HandlerFailureTotal: 5, RetryTotal: 2, DLQTotal: 1},
+		// "gone"'s stale row is present in the snapshot but its apps row was
 		// deleted, so it must be pruned and NOT re-created.
-		{Function: "gone", EventsMatchedTotal: 5, HandlerSuccessTotal: 5},
+		{App: "gone", EventsMatchedTotal: 5, HandlerSuccessTotal: 5},
 	}
 
 	if err := c.RecordStatsSnapshot(context.Background(), s, fns); err != nil {
@@ -61,21 +61,21 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	}
 
 	// alpha/beta upserted with the snapshot values.
-	a, ok := c.FunctionStats("alpha")
+	a, ok := c.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 30 || a.HandlerSuccessTotal != 25 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 30 success 25", a, ok)
 	}
-	b, ok := c.FunctionStats("beta")
+	b, ok := c.AppStats("beta")
 	if !ok || b.EventsMatchedTotal != 40 || b.RetryTotal != 2 {
 		t.Fatalf("beta = %+v, ok=%v; want events 40 retries 2", b, ok)
 	}
 
 	// "gone" orphan pruned and not re-created despite being present in fns.
-	if _, ok := c.FunctionStats("gone"); ok {
-		t.Fatal("orphan 'gone' function_stats must be pruned")
+	if _, ok := c.AppStats("gone"); ok {
+		t.Fatal("orphan 'gone' app_stats must be pruned")
 	}
-	if _, ok := c.GetFunction("gone"); ok {
-		t.Fatal("gone functions row must not be re-created")
+	if _, ok := c.GetApp("gone"); ok {
+		t.Fatal("gone apps row must not be re-created")
 	}
 
 	// A repeated flush with identical values: totals unchanged, updated_at
@@ -98,30 +98,30 @@ func TestRecordStatsSnapshotSingleTransaction(t *testing.T) {
 	}
 }
 
-// TestRecordStatsSnapshotConditionalUpsertGuardsRemovedFunction verifies the
-// per-function upsert guard works for a function that has NO functions row at
-// all (never discovered): the flush must not create its function_stats row.
-func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedFunction(t *testing.T) {
+// TestRecordStatsSnapshotConditionalUpsertGuardsRemovedApp verifies the
+// per-app upsert guard works for an app that has NO apps row at
+// all (never discovered): the flush must not create its app_stats row.
+func TestRecordStatsSnapshotConditionalUpsertGuardsRemovedApp(t *testing.T) {
 	c := openTestState(t)
 	c.RecordDiscovered(fnFor(t, "alpha", mustTemplate(t, twoHandlerTmpl)))
 
-	fns := []FunctionStats{
-		{Function: "alpha", EventsMatchedTotal: 10},
-		{Function: "ghost", EventsMatchedTotal: 99}, // never discovered, no functions row
+	fns := []AppStats{
+		{App: "alpha", EventsMatchedTotal: 10},
+		{App: "ghost", EventsMatchedTotal: 99}, // never discovered, no apps row
 	}
 	if err := c.RecordStatsSnapshot(context.Background(), Stats{EventsMatchedTotal: 10}, fns); err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
-	a, ok := c.FunctionStats("alpha")
+	a, ok := c.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 10 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 10", a, ok)
 	}
-	if _, ok := c.FunctionStats("ghost"); ok {
-		t.Fatal("ghost must not get a function_stats row (no functions row)")
+	if _, ok := c.AppStats("ghost"); ok {
+		t.Fatal("ghost must not get a app_stats row (no apps row)")
 	}
-	if _, ok := c.GetFunction("ghost"); ok {
-		t.Fatal("ghost must not get a functions row")
+	if _, ok := c.GetApp("ghost"); ok {
+		t.Fatal("ghost must not get a apps row")
 	}
 }
 
@@ -139,7 +139,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	// if it somehow succeeded, every bound Exec) fail, so nothing commits.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	fns := []FunctionStats{{Function: "alpha", EventsMatchedTotal: 5}}
+	fns := []AppStats{{App: "alpha", EventsMatchedTotal: 5}}
 	if err := c.RecordStatsSnapshot(ctx, Stats{EventsMatchedTotal: 500, HandlerSuccessTotal: 300}, fns); err == nil {
 		t.Fatal("expected error on a cancelled-context snapshot")
 	}
@@ -155,9 +155,9 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	if gs.HandlerSuccessTotal != 40 {
 		t.Fatalf("success after failed flush = %d, want 40 preserved", gs.HandlerSuccessTotal)
 	}
-	// Nothing from the failed flush was committed, so alpha has no function_stats.
-	if _, ok := c.FunctionStats("alpha"); ok {
-		t.Fatal("failed flush must not write function_stats")
+	// Nothing from the failed flush was committed, so alpha has no app_stats.
+	if _, ok := c.AppStats("alpha"); ok {
+		t.Fatal("failed flush must not write app_stats")
 	}
 
 	// A later successful flush with a live ctx persists the accumulated values.
@@ -173,7 +173,7 @@ func TestRecordStatsSnapshotFailureRetriesNextFlush(t *testing.T) {
 	if gs != want {
 		t.Fatalf("global stats after recovery = %+v, want %+v", gs, want)
 	}
-	a, ok := c.FunctionStats("alpha")
+	a, ok := c.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 5 {
 		t.Fatalf("alpha after recovery = %+v, ok=%v; want events 5", a, ok)
 	}

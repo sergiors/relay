@@ -8,15 +8,15 @@ import (
 )
 
 // nameMaxLen is the length cap Unique targets by default. It mirrors
-// function.ValidName's maxNameLen (internal/function/name.go): Relay function
+// app.ValidName's maxNameLen (internal/app/name.go): Relay app
 // names must be at most this many characters to remain legal docker tag
 // components. It is kept as a local constant so testutil does not take a
-// dependency on internal/function; internal/testutil's name_test.go pins the
-// two caps together by validating Unique's output with function.ValidName.
+// dependency on internal/app; internal/testutil's name_test.go pins the
+// two caps together by validating Unique's output with app.ValidName.
 const nameMaxLen = 63
 
 // sanitizeNameComponent lowercases s and replaces every character outside
-// [a-z0-9._-] with '-', yielding a component safe for a Relay function name,
+// [a-z0-9._-] with '-', yielding a component safe for a Relay app name,
 // docker image tag, or container-name component. It consolidates the
 // per-package sanitizeTestName/sanitizeName helpers the integration tests used
 // to carry (slash and space -> dash, uppercase lowered).
@@ -34,8 +34,8 @@ func sanitizeNameComponent(s string) string {
 
 // Unique returns a per-run-unique name built from prefix and the sanitized
 // rawName (typically testing.T.Name). The result is at most nameMaxLen
-// characters and matches Relay's function-name pattern [a-z0-9][a-z0-9._-]*
-// with no trailing '.', so it is safe as a function directory name, function
+// characters and matches Relay's app-name pattern [a-z0-9][a-z0-9._-]*
+// with no trailing '.', so it is safe as an app directory name, app
 // name, docker image-repo component, or container-name component.
 //
 // The form is "<prefix>-<truncated rawName>-<decimal nanosecond stamp>". The
@@ -66,7 +66,7 @@ func Unique(prefix, rawName string) string {
 }
 
 // UniqueName is Unique(prefix, t.Name()): a per-test-unique name bounded by the
-// Relay function-name cap. Callers pass a short semantic prefix such as
+// Relay app-name cap. Callers pass a short semantic prefix such as
 // "shutdown", "svc-rec", or "recon".
 func UniqueName(t *testing.T, prefix string) string {
 	t.Helper()

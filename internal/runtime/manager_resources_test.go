@@ -5,11 +5,11 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // TestExecutePublishesResourcesAndRotatesGeneration proves the runtime half of a
-// resource-only hot change: Execute resolves the function's effective limits and
+// resource-only hot change: Execute resolves the app's effective limits and
 // passes them to the container create, a change to those limits rotates the
 // container generation (new create) WITHOUT any image change, and an unchanged
 // value does not churn. It drives the real Execute path with the injectable
@@ -20,9 +20,9 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 
 	var mu sync.Mutex
 	var started []*fakeContainer
-	var seenLimits []function.ResourceLimits
+	var seenLimits []app.ResourceLimits
 	var seenImages []string
-	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, limits function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, limits app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		c := &fakeContainer{}
 		mu.Lock()
 		started = append(started, c)
@@ -41,12 +41,12 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 	}
 
 	// Publish the default resources and run once: one container, default limits.
-	m.SetFunctionResources("fn", function.DefaultResourceLimits())
+	m.SetAppResources("fn", app.DefaultResourceLimits())
 	exec()
 	if len(started) != 1 {
 		t.Fatalf("starts = %d, want 1", len(started))
 	}
-	if seenLimits[0] != function.DefaultResourceLimits() {
+	if seenLimits[0] != app.DefaultResourceLimits() {
 		t.Fatalf("create limits = %+v, want defaults", seenLimits[0])
 	}
 
@@ -58,8 +58,8 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 
 	// Change resources only: the next execute must create a new container with
 	// the new limits, and the old idle container must be discarded.
-	newLimits := function.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 500_000_000, PidsLimit: 64}
-	m.SetFunctionResources("fn", newLimits)
+	newLimits := app.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 500_000_000, PidsLimit: 64}
+	m.SetAppResources("fn", newLimits)
 	if got := started[0].reasons(); len(got) != 1 || got[0] != reasonResourcesChanged {
 		t.Fatalf("old container discard reasons = %v, want [%s]", got, reasonResourcesChanged)
 	}
@@ -72,10 +72,10 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 	}
 
 	// Setting the SAME limits again must not churn.
-	m.SetFunctionResources("fn", newLimits)
+	m.SetAppResources("fn", newLimits)
 	exec()
 	if len(started) != 2 {
-		t.Fatalf("an unchanged SetFunctionResources churned containers: starts = %d", len(started))
+		t.Fatalf("an unchanged SetAppResources churned containers: starts = %d", len(started))
 	}
 }
 
@@ -88,9 +88,9 @@ func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
 // untouched.
 func TestResourceGenerationDrainsBusyOldContainer(t *testing.T) {
 	cc, ff := newTestCache()
-	oldLimits := function.DefaultResourceLimits()
-	newLimits := function.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 64}
-	cc.setFunctionResources("fn-a", oldLimits)
+	oldLimits := app.DefaultResourceLimits()
+	newLimits := app.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 64}
+	cc.setAppResources("fn-a", oldLimits)
 	oldConfig := oldLimits.Fingerprint()
 	newConfig := newLimits.Fingerprint()
 	if oldConfig == newConfig {
@@ -109,7 +109,7 @@ func TestResourceGenerationDrainsBusyOldContainer(t *testing.T) {
 	// discarded yet.
 	newIdle := &fakeContainer{}
 	ff.build = func() *fakeContainer { return newIdle }
-	cc.setFunctionResources("fn-a", newLimits)
+	cc.setAppResources("fn-a", newLimits)
 	if got := busy.reasons(); len(got) != 0 {
 		t.Fatalf("busy old-config container discarded mid-invocation: %v", got)
 	}
@@ -144,21 +144,21 @@ func TestResourceGenerationDrainsBusyOldContainer(t *testing.T) {
 	}
 }
 
-// TestSetFunctionResourcesNoPoolRecordsOnly pins that publishing resources for a
-// function with no live pool records them (so the next acquire seeds the pool)
+// TestSetAppResourcesNoPoolRecordsOnly pins that publishing resources for a
+// app with no live pool records them (so the next acquire seeds the pool)
 // and does not panic or create state.
-func TestSetFunctionResourcesNoPoolRecordsOnly(t *testing.T) {
+func TestSetAppResourcesNoPoolRecordsOnly(t *testing.T) {
 	cc := newContainerCache()
-	limits := function.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 250_000_000, PidsLimit: 32}
-	cc.setFunctionResources("fn-a", limits)
-	if got := cc.functionResources("fn-a"); got != limits {
+	limits := app.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 250_000_000, PidsLimit: 32}
+	cc.setAppResources("fn-a", limits)
+	if got := cc.appResources("fn-a"); got != limits {
 		t.Fatalf("recorded resources = %+v, want %+v", got, limits)
 	}
-	if got := cc.functionConfig("fn-a"); got != limits.Fingerprint() {
+	if got := cc.appConfig("fn-a"); got != limits.Fingerprint() {
 		t.Fatalf("config fingerprint = %q, want %q", got, limits.Fingerprint())
 	}
-	// An unknown function reports the defaults.
-	if got := cc.functionResources("unknown"); got != function.DefaultResourceLimits() {
+	// An unknown app reports the defaults.
+	if got := cc.appResources("unknown"); got != app.DefaultResourceLimits() {
 		t.Fatalf("unknown function resources = %+v, want defaults", got)
 	}
 }

@@ -5,33 +5,33 @@ import (
 	"testing"
 )
 
-// TestRunMetadataCarriesFunctionImageAndHost verifies that runLabels maps every
+// TestRunMetadataCarriesAppImageAndHost verifies that runLabels maps every
 // RunMeta field to the exact diagnostic label keys, that empty values are
 // preserved as empty labels (total, greppable set), and that no unexpected keys
 // are introduced. The label set deliberately contains only bounded identifiers —
 // never payload content.
-func TestRunMetadataCarriesFunctionImageAndHost(t *testing.T) {
+func TestRunMetadataCarriesAppImageAndHost(t *testing.T) {
 	meta := RunMeta{
 		Type:      ContainerTypeEvent,
-		Function:  "user-events",
+		App:       "user-events",
 		Handler:   "events.created.handler",
 		MessageID: "1791234567890-0",
 		EventID:   "evt_123",
 		EventName: "INSERT",
 		Hostname:  "worker-1",
-		Image:     "relay-fn-user-events:632aca75fa306911",
+		Image:     "relay-app-user-events:632aca75fa306911",
 	}
 	got := runLabels(meta)
 
 	want := map[string]string{
 		labelType:      ContainerTypeEvent,
-		labelFunction:  "user-events",
+		labelApp:       "user-events",
 		labelHandler:   "events.created.handler",
 		labelMessageID: "1791234567890-0",
 		labelEventID:   "evt_123",
 		labelEventName: "INSERT",
 		labelHostname:  "worker-1",
-		labelImage:     "relay-fn-user-events:632aca75fa306911",
+		labelImage:     "relay-app-user-events:632aca75fa306911",
 	}
 
 	if len(got) != len(want) {
@@ -60,7 +60,7 @@ func TestRunLabelsEmptyValues(t *testing.T) {
 		t.Fatalf("label count with empty meta = %d, want 8", len(got))
 	}
 	for _, k := range []string{
-		labelType, labelFunction, labelHandler, labelMessageID, labelEventID,
+		labelType, labelApp, labelHandler, labelMessageID, labelEventID,
 		labelEventName, labelHostname, labelImage,
 	} {
 		if v, ok := got[k]; !ok || v != "" {
@@ -77,7 +77,7 @@ func TestRunMetaFromDefaults(t *testing.T) {
 		t.Fatalf("RunMetaFrom(background) = %+v, want zero value", meta)
 	}
 
-	want := RunMeta{Function: "f", Hostname: "h"}
+	want := RunMeta{App: "f", Hostname: "h"}
 	ctx := WithRunMeta(context.Background(), want)
 	if got := RunMetaFrom(ctx); got != want {
 		t.Fatalf("RunMetaFrom = %+v, want %+v", got, want)

@@ -1,7 +1,7 @@
 // Package secrets resolves secret references to values at execution time.
 //
-// A secret is a named value stored outside the function's template and image.
-// Templates reference secrets by name (see internal/function.SecretRef); this
+// A secret is a named value stored outside the app's template and image.
+// Templates reference secrets by name (see internal/app.SecretRef); this
 // package turns that reference into the value the runner injects into an
 // execution container's environment, immediately before the container is
 // created. Resolved values are never persisted, never logged, never baked into

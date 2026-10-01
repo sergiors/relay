@@ -592,7 +592,7 @@ func makeScheduler(t *testing.T, syncFn func(context.Context, git.SyncOptions) e
 	opts := git.NewSyncOptions()
 	opts.ConfigPath = filepath.Join(t.TempDir(), "source.json")
 	opts.CheckoutDir = filepath.Join(t.TempDir(), "checkout")
-	opts.FunctionsDir = filepath.Join(t.TempDir(), "functions")
+	opts.AppsDir = filepath.Join(t.TempDir(), "functions")
 	opts.CloneURL = filepath.Join(t.TempDir(), "remote.git")
 	s := NewSyncScheduler(opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.syncFn = syncFn
@@ -676,7 +676,7 @@ func TestSchedulerCoalescesConcurrentPushes(t *testing.T) {
 // converges to the remote's latest state and materializes it: a Trigger drives a
 // real git.Sync (the scheduler's default syncFn) against a local bare repo, and
 // when the scheduler returns to idle the persisted config is marked Synced —
-// i.e. the pushed source reached /functions.
+// i.e. the pushed source reached /apps.
 func TestSchedulerConvergesToLatest(t *testing.T) {
 	bare := makeBareRepo(t)
 	s, err := schedForBare(t, bare)
@@ -707,7 +707,7 @@ func schedForBare(t *testing.T, bare string) (*SyncScheduler, error) {
 	opts := git.NewSyncOptions()
 	opts.ConfigPath = filepath.Join(t.TempDir(), "source.json")
 	opts.CheckoutDir = filepath.Join(t.TempDir(), "checkout")
-	opts.FunctionsDir = filepath.Join(t.TempDir(), "functions")
+	opts.AppsDir = filepath.Join(t.TempDir(), "functions")
 	opts.CloneURL = bare
 	// Persist a config so Sync (which reads it) has a source.
 	if err := git.SetSource(opts.ConfigPath, "git@github.com:acme/backend.git", "main", "", ""); err != nil {

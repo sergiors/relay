@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // fakeContainer implements reusableContainer for pool tests.
@@ -235,7 +235,7 @@ func TestContainerPoolCreatesThenReuses(t *testing.T) {
 	}
 }
 
-func TestContainerPoolFunctionsNeverShare(t *testing.T) {
+func TestContainerPoolAppsNeverShare(t *testing.T) {
 	cc, ff := newTestCache()
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("A: %v", err)
@@ -249,7 +249,7 @@ func TestContainerPoolFunctionsNeverShare(t *testing.T) {
 }
 
 // TestContainerPoolConcurrentDistinctContainers proves that with capacity the
-// pool hands two concurrent invocations of the SAME function two distinct
+// pool hands two concurrent invocations of the SAME app two distinct
 // containers that are in flight simultaneously.
 func TestContainerPoolConcurrentDistinctContainers(t *testing.T) {
 	cc, ff := newTestCache()
@@ -423,7 +423,7 @@ func TestContainerPoolDiscardsOnImageChange(t *testing.T) {
 		t.Fatal("first container not tracked")
 	}
 
-	// Same function, new image: the idle old container is discarded immediately
+	// Same app, new image: the idle old container is discarded immediately
 	// on the new acquire and a fresh container is created.
 	if err := runInvoke(t, cc, ff, "fn-a", "img-2", 1, "h"); err != nil {
 		t.Fatalf("execute v2: %v", err)
@@ -587,7 +587,7 @@ func TestContainerPoolRetiredImageNeverPooled(t *testing.T) {
 
 // TestContainerPoolInvalidateBeforePoolExists is the deterministic regression
 // for the invalidate-vs-first-acquire race: invalidation runs BEFORE any pool
-// for the function exists (so the invalidate snapshot cannot include it), and
+// for the app exists (so the invalidate snapshot cannot include it), and
 // the first acquire must still treat the image as retired — a throwaway
 // container that is never pooled — rather than a warm one.
 func TestContainerPoolInvalidateBeforePoolExists(t *testing.T) {
@@ -695,7 +695,7 @@ func TestContainerPoolInvalidateImageIdleImmediate(t *testing.T) {
 	}
 
 	// An unrelated image invalidates nothing.
-	cc.invalidateImage("relay-fn-other:xyz")
+	cc.invalidateImage("relay-app-other:xyz")
 	if got := c1.reasons(); len(got) != 0 {
 		t.Fatalf("unrelated invalidation discarded our container: %v", got)
 	}
@@ -958,13 +958,13 @@ func TestContainerPoolCloseDiscardsTransient(t *testing.T) {
 func TestResolveConcurrencyDefaultsTemplateValue(t *testing.T) {
 	cases := []struct {
 		name string
-		fn   function.Function
+		fn   app.App
 		want int
 	}{
-		{"nil template", function.Function{}, function.DefaultConcurrency},
-		{"zero", function.Function{Template: &function.Template{Concurrency: 0}}, function.DefaultConcurrency},
-		{"negative", function.Function{Template: &function.Template{Concurrency: -3}}, function.DefaultConcurrency},
-		{"explicit", function.Function{Template: &function.Template{Concurrency: 5}}, 5},
+		{"nil template", app.App{}, app.DefaultConcurrency},
+		{"zero", app.App{Template: &app.Template{Concurrency: 0}}, app.DefaultConcurrency},
+		{"negative", app.App{Template: &app.Template{Concurrency: -3}}, app.DefaultConcurrency},
+		{"explicit", app.App{Template: &app.Template{Concurrency: 5}}, 5},
 	}
 	for _, tc := range cases {
 		if got := resolveConcurrency(tc.fn); got != tc.want {

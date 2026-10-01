@@ -313,7 +313,7 @@ func TestProcessMessageRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 	rec := withSpanRecorder(t)
 	occ := schedule.Occurrence{
-		Function:    "courses",
+		App:         "courses",
 		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),

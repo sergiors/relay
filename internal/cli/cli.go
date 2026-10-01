@@ -33,7 +33,7 @@ type DLQStore interface {
 }
 
 // OpenDLQStore resolves and opens the DLQ store for one `relay dlq` command,
-// returning the store and a cleanup func. It is a function seam so the command
+// returning the store and a cleanup func. It is an app seam so the command
 // tree never reads environment variables or constructs Redis clients itself,
 // and tests (or an embedding host) can inject a fake without mutable globals.
 // Production wires openRedisDLQStore, which follows the same config.Load +
@@ -56,14 +56,14 @@ type StartRun func(logger *slog.Logger) error
 // construction rather than from global state.
 type Dependencies struct {
 	// StatePath is the local state database the administrative commands
-	// (function, stats) open. It is read-mostly, not read-only: the read paths
-	// (function inspect, stats) only read, while `stats reset` writes (zeroing
+	// (app, stats) open. It is read-mostly, not read-only: the read paths
+	// (app inspect, stats) only read, while `stats reset` writes (zeroing
 	// the cumulative counters in place). Production: state.DBPath.
 	StatePath string
 	// SocketPath is the live worker control socket: `relay health` dials it to
 	// ask whether the running worker is healthy (worker readiness plus live
-	// dependency health), `relay function inspect` dials it for the live
-	// runtime-pool gauges, `relay function invoke` and `relay dlq replay` dial
+	// dependency health), `relay app inspect` dials it for the live
+	// runtime-pool gauges, `relay app invoke` and `relay dlq replay` dial
 	// it to run against the live runtime, and a running `relay stats reset`
 	// dials it to reset the worker's statistics. Production: worker.SocketPath.
 	SocketPath string
@@ -107,14 +107,14 @@ func DefaultDependencies() Dependencies {
 func New(logger *slog.Logger, writer io.Writer, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:            "relay",
-		Usage:           "Relay event-driven function runner",
+		Usage:           "Relay event-driven app runner",
 		HideHelpCommand: true,
 		HideVersion:     true,
 		Writer:          writer,
 		ExitErrHandler:  func(context.Context, *cli.Command, error) {},
 		Commands: []*cli.Command{
 			startCommand(logger, deps),
-			functionCommand(deps),
+			appCommand(deps),
 			dlqCommand(logger, deps),
 			secretCommand(),
 			gitCommand(),

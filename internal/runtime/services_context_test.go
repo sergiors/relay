@@ -27,7 +27,7 @@ func TestStopServiceContainersUsesCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	// An exited container: no stop call, only the removal.
-	ctrs := []ServiceContainer{{ID: "c1", Function: "fn", Name: "svc", State: container.StateExited}}
+	ctrs := []ServiceContainer{{ID: "c1", App: "fn", Name: "svc", State: container.StateExited}}
 	if err := m.StopServiceContainers(ctx, ctrs); err != nil {
 		t.Fatalf("StopServiceContainers: %v", err)
 	}

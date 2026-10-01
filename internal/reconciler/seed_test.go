@@ -7,13 +7,13 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/testutil"
 )
 
 // TestSeedSuppliedFingerprintSkipsRebuild pins the supplied-seed contract: Seed
-// stores the caller's fingerprint verbatim, so a function whose content still
+// stores the caller's fingerprint verbatim, so an app whose content still
 // matches that value skips the first reconcile instead of rebuilding. The
 // reconciler still rescans on reconcile (change detection is authoritative
 // there); Seed itself performs no scan.
@@ -22,18 +22,18 @@ func TestSeedSuppliedFingerprintSkipsRebuild(t *testing.T) {
 	dir := writeFnDir(t, root, "seeded")
 
 	fn := initialFn("seeded", dir)
-	fp, err := function.FingerprintFunction(dir, fn.Function().Template)
+	fp, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
 
 	b := &fakeBuilder{}
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{fn})
+	reg.Set([]*runner.PreparedApp{fn})
 	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, testutil.DiscardLogger())
-	r.Seed(fn.Function(), fp)
+	r.Seed(fn.App(), fp)
 
-	r.reconcileFunction("seeded")
+	r.reconcileApp("seeded")
 
 	if b.prepares() != 0 {
 		t.Fatalf("prepare count = %d, want 0 for a matching supplied seed", b.prepares())
@@ -52,21 +52,21 @@ func TestSeedStaleFingerprintForcesRebuild(t *testing.T) {
 	fn := initialFn("stale", dir)
 	b := &fakeBuilder{}
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{fn})
+	reg.Set([]*runner.PreparedApp{fn})
 	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, testutil.DiscardLogger())
 
 	// Seed the fingerprint of the ORIGINAL content, then change the content as
 	// if the edit landed between the caller's scan and the watcher.
-	orig, err := function.FingerprintFunction(dir, fn.Function().Template)
+	orig, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
-	r.Seed(fn.Function(), orig)
+	r.Seed(fn.App(), orig)
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
 
-	r.reconcileFunction("stale")
+	r.reconcileApp("stale")
 
 	if b.prepares() != 1 {
 		t.Fatalf("prepare count = %d, want 1 (a stale seed must not suppress the rebuild)", b.prepares())
@@ -119,14 +119,14 @@ func TestPrepareWatchThenSeedDetectsSubsequentChange(t *testing.T) {
 	dir := writeFnDir(t, root, "raced")
 
 	fn := initialFn("raced", dir)
-	fp, err := function.FingerprintFunction(dir, fn.Function().Template)
+	fp, err := app.FingerprintApp(dir, fn.App().Template)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
 
 	b := &fakeBuilder{}
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{fn})
+	reg.Set([]*runner.PreparedApp{fn})
 	r := New(Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour}, reg, b, testutil.DiscardLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +136,7 @@ func TestPrepareWatchThenSeedDetectsSubsequentChange(t *testing.T) {
 	if err := r.PrepareWatch(ctx); err != nil {
 		t.Fatalf("prepare watch: %v", err)
 	}
-	r.Seed(fn.Function(), fp)
+	r.Seed(fn.App(), fp)
 	go r.Start(ctx)
 
 	// A change after the seed must reach the reconciler through the watcher.
@@ -155,14 +155,14 @@ func TestPrepareWatchThenSeedDetectsSubsequentChange(t *testing.T) {
 
 // TestSeedDoesNotScanSourceTree pins the optimization itself: Seed must store
 // the supplied fingerprint verbatim without touching the filesystem. A
-// non-existent directory would make any internal FingerprintFunction call fail
+// non-existent directory would make any internal FingerprintApp call fail
 // silently (leaving no entry); the entry must instead exist with the supplied
 // value.
 func TestSeedDoesNotScanSourceTree(t *testing.T) {
 	b := &fakeBuilder{}
 	r, _ := newTestReconciler(t, t.TempDir(), b, nil, nil)
 
-	fn := function.Function{
+	fn := app.App{
 		Name:     "absent",
 		Dir:      filepath.Join(t.TempDir(), "does-not-exist"),
 		Template: mustParse(template),
@@ -178,7 +178,7 @@ func TestSeedDoesNotScanSourceTree(t *testing.T) {
 }
 
 // TestSeedEmptyFingerprintStillRebuilds pins that an empty supplied fingerprint
-// (a function the startup scan could not hash) is never treated as "unchanged":
+// (an app the startup scan could not hash) is never treated as "unchanged":
 // the first reconcile sees the mismatch and rebuilds.
 func TestSeedEmptyFingerprintStillRebuilds(t *testing.T) {
 	root := t.TempDir()
@@ -187,11 +187,11 @@ func TestSeedEmptyFingerprintStillRebuilds(t *testing.T) {
 	fn := initialFn("nofp", dir)
 	b := &fakeBuilder{}
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{fn})
+	reg.Set([]*runner.PreparedApp{fn})
 	r := New(Config{Root: root, Debounce: time.Millisecond, Interval: time.Hour}, reg, b, testutil.DiscardLogger())
-	r.Seed(fn.Function(), "")
+	r.Seed(fn.App(), "")
 
-	r.reconcileFunction("nofp")
+	r.reconcileApp("nofp")
 
 	if b.prepares() != 1 {
 		t.Fatalf("prepare count = %d, want 1 for an empty supplied fingerprint", b.prepares())

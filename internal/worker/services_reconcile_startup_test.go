@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/reconciler"
 	"relay/internal/routing"
 	"relay/internal/runner"
@@ -22,21 +22,21 @@ import (
 // deadline of every ctx passed to ServiceContainerList. Apply drives Reconcile,
 // which lists containers once per call; Reconcile now derives its own fresh
 // per-operation bound from the LIFECYCLE context the worker passes, so each
-// per-function Apply is still observable as its OWN bounded (~reconcileTimeout)
-// listing, not one shared deadline consumed across functions.
+// per-app Apply is still observable as its OWN bounded (~reconcileTimeout)
+// listing, not one shared deadline consumed across apps.
 type svcDeadlineDocker struct {
 	mu        sync.Mutex
 	deadlines []time.Time // deadline (local time) of each ServiceContainerList call; zero = no deadline
 }
 
 func (f *svcDeadlineDocker) ResolveServiceImage(
-	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 
 func (f *svcDeadlineDocker) StartService(_ context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
@@ -58,7 +58,7 @@ func (f *svcDeadlineDocker) StopServiceContainers(_ context.Context, _ []runtime
 	return nil
 }
 
-func (f *svcDeadlineDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {
+func (f *svcDeadlineDocker) RemoveAppServiceContainers(_ context.Context, _ string) (int, error) {
 	return 0, nil
 }
 
@@ -101,7 +101,7 @@ func (f *blockingListDocker) enteredOnce() {
 }
 
 func (f *blockingListDocker) ResolveServiceImage(
-	_ context.Context, _ string, _ *function.Template, _ function.Service, _ string,
+	_ context.Context, _ string, _ *app.Template, _ app.Service, _ string,
 ) (runtime.ServiceImage, error) {
 	return runtime.ServiceImage{Ref: "img"}, nil
 }
@@ -120,7 +120,7 @@ func (f *blockingListDocker) StopServiceContainers(_ context.Context, _ []runtim
 	return nil
 }
 
-func (f *blockingListDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {
+func (f *blockingListDocker) RemoveAppServiceContainers(_ context.Context, _ string) (int, error) {
 	return 0, nil
 }
 
@@ -128,7 +128,7 @@ func (f *blockingListDocker) NetworkExists(_ context.Context, _ string) (bool, e
 	return true, nil
 }
 
-// TestEnqueueStartupServicesRootedInLifecycle proves the enqueued per-function
+// TestEnqueueStartupServicesRootedInLifecycle proves the enqueued per-app
 // converge contexts are rooted in the worker lifecycle: cancelling that
 // lifecycle cancels an in-flight service converge promptly, rather than waiting
 // out the 30s reconcileTimeout. It uses a Docker fake whose list blocks until
@@ -143,12 +143,12 @@ func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 	defer cancelLifecycle()
 	coordinator.Start(lifecycle)
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime:  "node24",
-		Services: []function.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
+		Services: []app.Service{{Entrypoint: "service.js", Port: 80, Replicas: 1}},
 	}
-	prepared := []*runner.PreparedFunction{
-		runner.NewPrepared(function.Function{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
+	prepared := []*runner.PreparedApp{
+		runner.NewPrepared(app.App{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha"}, nil),
 	}
 
 	enqueueStartupServices(prepared, coordinator, logger)
@@ -171,28 +171,28 @@ func TestEnqueueStartupServicesRootedInLifecycle(t *testing.T) {
 	}
 }
 
-// TestEnqueueStartupServicesBoundedPerFunction pins the per-function timeout
+// TestEnqueueStartupServicesBoundedPerApp pins the per-app timeout
 // guarantee through the new mechanism: enqueueStartupServices enqueues each
 // desired state, the coordinator converges it with its lifecycle context, and
 // the ServiceReconciler derives a FRESH per-operation ~reconcileTimeout bound
-// from it, so each function's container listing observes its own distinct
+// from it, so each app's container listing observes its own distinct
 // deadline rather than one shared (potentially already-consumed) context.
-func TestEnqueueStartupServicesBoundedPerFunction(t *testing.T) {
+func TestEnqueueStartupServicesBoundedPerApp(t *testing.T) {
 	fake := &svcDeadlineDocker{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svcCtrl := reconciler.NewServiceReconciler(fake, nil, routing.TraefikConfig{}, logger, reconcileTimeout)
 	coordinator, stop := startCoordinatorFixture(t, svcCtrl)
 	defer stop()
 
-	tmpl := &function.Template{
+	tmpl := &app.Template{
 		Runtime: "node24",
-		Services: []function.Service{
+		Services: []app.Service{
 			{Entrypoint: "service.js", Port: 80, Replicas: 1},
 		},
 	}
-	prepared := []*runner.PreparedFunction{
-		runner.NewPrepared(function.Function{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha", Env: nil}, nil),
-		runner.NewPrepared(function.Function{Name: "beta", Template: tmpl}, &runtime.Prepared{Image: "img-beta", Env: nil}, nil),
+	prepared := []*runner.PreparedApp{
+		runner.NewPrepared(app.App{Name: "alpha", Template: tmpl}, &runtime.Prepared{Image: "img-alpha", Env: nil}, nil),
+		runner.NewPrepared(app.App{Name: "beta", Template: tmpl}, &runtime.Prepared{Image: "img-beta", Env: nil}, nil),
 	}
 
 	enqueueStartupServices(prepared, coordinator, logger)
@@ -201,13 +201,13 @@ func TestEnqueueStartupServicesBoundedPerFunction(t *testing.T) {
 	}
 
 	deadlines := fake.recordedDeadlines()
-	// Two per-function Applys, each with its own bounded listing. The orphan
+	// Two per-app Applys, each with its own bounded listing. The orphan
 	// sweep is no longer part of this helper (it is the housekeeping pass).
 	if len(deadlines) != 2 {
 		t.Fatalf("ServiceContainerList saw %d calls, want 2 (two Applys): %v", len(deadlines), deadlines)
 	}
 	// Both Applys must be bounded and each must have a DISTINCT deadline (a
-	// fresh ~reconcileTimeout bound per function, not one shared context).
+	// fresh ~reconcileTimeout bound per app, not one shared context).
 	for i, d := range deadlines {
 		if d.IsZero() {
 			t.Fatalf("Apply %d carried no deadline; want a fresh reconcileTimeout bound", i)
@@ -405,13 +405,13 @@ func newSvcShutdownDocker() *svcShutdownDocker {
 }
 
 func (f *svcShutdownDocker) ResolveServiceImage(
-	_ context.Context, _ string, tmpl *function.Template, svc function.Service, functionImage string,
+	_ context.Context, _ string, tmpl *app.Template, svc app.Service, appImage string,
 ) (runtime.ServiceImage, error) {
 	entry, err := runtime.ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 	if err != nil {
 		return runtime.ServiceImage{}, err
 	}
-	return runtime.ServiceImage{Ref: functionImage, Entry: entry}, nil
+	return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
 }
 
 func (f *svcShutdownDocker) StartService(_ context.Context, _ runtime.ServiceSpec, _ int) (string, error) {
@@ -422,7 +422,7 @@ func (f *svcShutdownDocker) NetworkExists(_ context.Context, _ string) (bool, er
 	return true, nil
 }
 
-func (f *svcShutdownDocker) RemoveFunctionServiceContainers(_ context.Context, _ string) (int, error) {
+func (f *svcShutdownDocker) RemoveAppServiceContainers(_ context.Context, _ string) (int, error) {
 	return 0, nil
 }
 
@@ -453,7 +453,7 @@ func (f *svcShutdownDocker) addService(id, hostname string) {
 	f.nextID++
 	f.containers[id] = runtime.ServiceContainer{
 		ID:       id,
-		Function: "fn",
+		App:      "fn",
 		Hostname: hostname,
 		Image:    "img-1",
 	}

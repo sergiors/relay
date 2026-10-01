@@ -17,9 +17,9 @@ import (
 	"relay/internal/testutil"
 )
 
-// writeStageDir creates a git staging directory (function.StagingPrefix) directly
+// writeStageDir creates a git staging directory (app.StagingPrefix) directly
 // under root with a valid template, mirroring what internal/git/materialize.go
-// briefly does via os.MkdirTemp(dst, ".sync-*") while copying a function in.
+// briefly does via os.MkdirTemp(dst, ".sync-*") while copying an app in.
 func writeStageDir(t *testing.T, root, name string) string {
 	t.Helper()
 	dir := filepath.Join(root, name)
@@ -42,7 +42,7 @@ func newTestStateReconcilerLogging(
 	t *testing.T,
 	root string,
 	builder Builder,
-	initial []*runner.PreparedFunction,
+	initial []*runner.PreparedApp,
 	logs *testutil.SyncBuffer,
 ) (*Reconciler, *runner.Registry, *state.State) {
 	t.Helper()
@@ -56,17 +56,17 @@ func newTestStateReconcilerLogging(
 	cfg := Config{Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st}
 	r := New(cfg, reg, builder, slog.New(slog.NewTextHandler(logs, nil)))
 	for _, pf := range initial {
-		seedCurrent(r, pf.Function())
-		st.RecordDiscovered(pf.Function())
+		seedCurrent(r, pf.App())
+		st.RecordDiscovered(pf.App())
 	}
 	return r, reg, st
 }
 
-// TestFunctionForPathIgnoresStagingDir pins the event-mapping filter: a path
-// under a Relay-owned staging directory never maps to a function name, so no
+// TestAppForPathIgnoresStagingDir pins the event-mapping filter: a path
+// under a Relay-owned staging directory never maps to an app name, so no
 // debounce timer is armed and no reconcile can run for it. Normal paths (nested
 // and top-level) are unaffected.
-func TestFunctionForPathIgnoresStagingDir(t *testing.T) {
+func TestAppForPathIgnoresStagingDir(t *testing.T) {
 	root := t.TempDir()
 	r := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
 
@@ -82,20 +82,20 @@ func TestFunctionForPathIgnoresStagingDir(t *testing.T) {
 		{root + "/real", "real", true},
 	}
 	for _, c := range cases {
-		name, ok := r.functionForPath(c.path)
+		name, ok := r.appForPath(c.path)
 		if ok != c.ok || name != c.name {
-			t.Errorf("functionForPath(%q) = (%q,%v), want (%q,%v)", c.path, name, ok, c.name, c.ok)
+			t.Errorf("appForPath(%q) = (%q,%v), want (%q,%v)", c.path, name, ok, c.name, c.ok)
 		}
 	}
 }
 
-// TestReconcileFunctionIgnoresStagingDir pins the defensive guard: even if a
-// staging name reaches reconcileFunction directly (a stale timer or a direct
+// TestReconcileAppIgnoresStagingDir pins the defensive guard: even if a
+// staging name reaches reconcileApp directly (a stale timer or a direct
 // caller), it is inert — no prepare, no runtime registry entry, and no state row
 // (neither a discovery nor an invalid desired definition). This is what stops a
 // live sync's transient ".sync-*" directory from recording degraded/unavailable
 // state.
-func TestReconcileFunctionIgnoresStagingDir(t *testing.T) {
+func TestReconcileAppIgnoresStagingDir(t *testing.T) {
 	root := t.TempDir()
 	writeStageDir(t, root, ".sync-123456")
 
@@ -103,7 +103,7 @@ func TestReconcileFunctionIgnoresStagingDir(t *testing.T) {
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconcilerLogging(t, root, b, nil, &logs)
 
-	r.reconcileFunction(".sync-123456")
+	r.reconcileApp(".sync-123456")
 
 	if b.prepares() != 0 {
 		t.Fatalf("prepares = %d, want 0 for a staging directory", b.prepares())
@@ -111,7 +111,7 @@ func TestReconcileFunctionIgnoresStagingDir(t *testing.T) {
 	if reg.GetByName(".sync-123456") != nil {
 		t.Fatal("a staging directory must never enter the runtime registry")
 	}
-	if _, ok := st.GetFunction(".sync-123456"); ok {
+	if _, ok := st.GetApp(".sync-123456"); ok {
 		t.Fatal("a staging directory must never get a state row (not even invalid)")
 	}
 	if logs := logs.String(); strings.Contains(logs, ".sync-") {
@@ -148,11 +148,11 @@ func TestReconcileAllIgnoresStagingDirKeepsNeighborAndInvalid(t *testing.T) {
 	if reg.GetByName(".sync-abc") != nil {
 		t.Fatal("the staging directory must never be dispatched into the registry")
 	}
-	if _, ok := st.GetFunction(".sync-abc"); ok {
+	if _, ok := st.GetApp(".sync-abc"); ok {
 		t.Fatal("the staging directory must never get a state row")
 	}
 	// The genuinely invalid user directory keeps its invalid desired state.
-	if got, ok := st.GetFunction("bad-user"); !ok || got.Status != state.StatusUnavailable {
+	if got, ok := st.GetApp("bad-user"); !ok || got.Status != state.StatusUnavailable {
 		t.Fatalf("bad-user = %+v ok=%v, want unavailable (invalid user behavior preserved)", got, ok)
 	}
 	if logs := logs.String(); strings.Contains(logs, ".sync-") {
@@ -162,9 +162,9 @@ func TestReconcileAllIgnoresStagingDirKeepsNeighborAndInvalid(t *testing.T) {
 
 // TestIsReservedDirPath pins the first-segment rule used by watch pruning: only
 // a reserved ROOT CHILD (and everything beneath it) is reserved. A nested real
-// directory whose own name merely looks reserved is NOT, so a valid function
-// named e.g. ".sync-x" inside a real function stays watchable — though such a
-// name is itself invalid as a function directory.
+// directory whose own name merely looks reserved is NOT, so a valid app
+// named e.g. ".sync-x" inside a real app stays watchable — though such a
+// name is itself invalid as an app directory.
 func TestIsReservedDirPath(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "functions")
 	r := New(Config{Root: root}, nil, nil, testutil.DiscardLogger())
@@ -277,7 +277,7 @@ func watchCount(r *Reconciler) int {
 // real fsnotify watcher: creating and populating a staging directory directly
 // under the root must not install watches, enqueue a reconcile, touch the
 // registry, or write any state row. Ordering is event-driven, not sleep-based:
-// once a LATER Create on the same root watch (a sentinel valid function) has been
+// once a LATER Create on the same root watch (a sentinel valid app) has been
 // reconciled, the earlier stage events on that watch have necessarily been
 // observed, so the absence assertion is deterministic.
 func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
@@ -289,7 +289,7 @@ func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
 	var logs testutil.SyncBuffer
 	b := &fakeBuilder{}
 	r, reg, st := newTestStateReconcilerLogging(t, root, b,
-		[]*runner.PreparedFunction{initialFn("real", realDir)}, &logs)
+		[]*runner.PreparedApp{initialFn("real", realDir)}, &logs)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -301,7 +301,7 @@ func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".sync-live", "index.js"), []byte("export function hi(e){}\n"), 0o644); err != nil {
 		t.Fatalf("rewrite stage index: %v", err)
 	}
-	// A sentinel valid function created AFTER the stage on the same root watch:
+	// A sentinel valid app created AFTER the stage on the same root watch:
 	// once it reconciles, eventLoop has already processed the stage's Create.
 	writeFnDir(t, root, "zzz-sentinel")
 
@@ -319,7 +319,7 @@ func TestWatcherIgnoresStagingDirEvents(t *testing.T) {
 	if reg.GetByName(".sync-live") != nil {
 		t.Fatal("a staging directory must never enter the runtime registry")
 	}
-	if _, ok := st.GetFunction(".sync-live"); ok {
+	if _, ok := st.GetApp(".sync-live"); ok {
 		t.Fatal("a staging directory must never get a state row")
 	}
 	if logs := logs.String(); strings.Contains(logs, ".sync-") {

@@ -45,7 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/git"
 	"relay/internal/secrets"
 )
@@ -107,7 +107,7 @@ type Server struct {
 // mode: a webhook source must name the secret used for HMAC verification, so an
 // empty reference disables the server rather than bind an endpoint that would
 // accept unauthenticated deliveries. Disabling the webhook never affects the
-// rest of Relay (manual sync, function serving keep working). A nil *Server
+// rest of Relay (manual sync, app serving keep working). A nil *Server
 // means the subsystem is disabled; callers must nil-check before Start,
 // mirroring how the worker nil-checks. addr is the listen address ("" never
 // reaches the worker path: the worker gates on cfg.GitWebhookAddr before
@@ -141,7 +141,7 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 		// reference there is nothing to verify against, and binding an endpoint
 		// that accepts unsigned deliveries would let anyone trigger a sync.
 		// Disable the webhook instead (the rest of Relay is unaffected: manual
-		// sync and function serving keep working). Use `relay git set
+		// sync and app serving keep working). Use `relay git set
 		// --webhook-secret <name>` and restart to enable it.
 		logServer(logger, slog.LevelWarn, "Git webhook: git source has no webhook secret configured; webhook disabled")
 		return nil
@@ -159,7 +159,7 @@ func NewServer(addr string, logger *slog.Logger, cfg Config) *Server {
 	opts := git.NewSyncOptions()
 	opts.ConfigPath = configPath
 	opts.CheckoutDir = defaultStr(cfg.CheckoutDir, git.CheckoutDir)
-	opts.FunctionsDir = defaultStr(cfg.FunctionsDir, function.Dir)
+	opts.AppsDir = defaultStr(cfg.AppsDir, app.Dir)
 	opts.SSHDir = defaultStr(cfg.SSHDir, git.SSHDir)
 	opts.Log = logger
 	scheduler := NewSyncScheduler(opts, logger)
@@ -344,7 +344,7 @@ func (s *Server) Stop(ctx context.Context) error {
 
 // Config carries the shared dependencies and high-level configuration the
 // webhook subsystem needs. Directories default to the production application
-// conventions (git.ConfigPath, git.CheckoutDir, function.Dir, git.SSHDir) when
+// conventions (git.ConfigPath, git.CheckoutDir, app.Dir, git.SSHDir) when
 // zero-valued so callers pass only what differs (tests).
 type Config struct {
 	// Secrets resolves the webhook secret reference configured in the git
@@ -354,8 +354,8 @@ type Config struct {
 	// a secrets.Provider, which never exposes a secret's value in an error.
 	Secrets secrets.Provider
 	// Optional directory overrides (zero value = production default):
-	// git.ConfigPath, git.CheckoutDir, function.Dir, git.SSHDir.
-	ConfigPath, CheckoutDir, FunctionsDir, SSHDir string
+	// git.ConfigPath, git.CheckoutDir, app.Dir, git.SSHDir.
+	ConfigPath, CheckoutDir, AppsDir, SSHDir string
 }
 
 // defaultStr returns v when non-empty, else def. It is the tiny helper the

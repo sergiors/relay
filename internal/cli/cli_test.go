@@ -91,7 +91,7 @@ func runCLIWithLoggerAndDeps(t *testing.T, logger *slog.Logger, deps Dependencie
 // deps), then call cmd.Run directly with a ctx and args including the program
 // name — no global stdout swapping or subprocess.
 func TestRootHelp(t *testing.T) {
-	commands := []string{"start", "function", "dlq", "secret", "git", "stats", "health"}
+	commands := []string{"start", "app", "dlq", "secret", "git", "stats", "health"}
 	for _, flag := range []string{"--help", "-h"} {
 		var output bytes.Buffer
 		cmd := New(slog.New(slog.NewTextHandler(io.Discard, nil)), &output, testDeps(t))
@@ -101,7 +101,7 @@ func TestRootHelp(t *testing.T) {
 		}
 		out := output.String()
 		// Scope to the COMMANDS block: the root Usage line also contains words
-		// like "function", so an unanchored search would not prove listing.
+		// like "app", so an unanchored search would not prove listing.
 		idx := strings.Index(out, "COMMANDS:")
 		if idx < 0 {
 			t.Fatalf("%s: help has no COMMANDS section:\n%s", flag, out)
@@ -124,17 +124,17 @@ func TestRootHelpContainsStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
-	// Only consider the COMMANDS block; the root Usage line ("function event
-	// relay") also contains the word "function", so an unanchored index of the
-	// whole output would point at the header.
+	// Only consider the COMMANDS block; the root Usage line ("Relay
+	// event-driven app runner") also contains the word "app", so an unanchored
+	// index of the whole output would point at the header.
 	cmds := out
 	if i := strings.Index(cmds, "COMMANDS:"); i >= 0 {
 		cmds = cmds[i:]
 	}
 	si := strings.Index(cmds, "start")
-	fi := strings.Index(cmds, "function")
+	fi := strings.Index(cmds, "app")
 	if si == -1 || fi == -1 || si > fi {
-		t.Fatalf("start should be listed before function:\n%s", out)
+		t.Fatalf("start should be listed before app:\n%s", out)
 	}
 }
 
@@ -343,9 +343,9 @@ func TestNonStartCommandsDoNotAcquireLock(t *testing.T) {
 		t.Fatalf("stat held lock: %v", err)
 	}
 
-	// deps.StatePath is a fresh temp DB, so `function ls` never touches
+	// deps.StatePath is a fresh temp DB, so `app ls` never touches
 	// /var/lib/relay (the lock is the only path under test here).
-	if _, _, err := runCLIWithDeps(t, deps, "", "function", "ls"); err != nil {
+	if _, _, err := runCLIWithDeps(t, deps, "", "app", "ls"); err != nil {
 		t.Fatalf("function ls err = %v, want nil (held lock must not matter)", err)
 	}
 	if _, _, err := runCLI(t, "", "--help"); err != nil {

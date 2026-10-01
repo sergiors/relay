@@ -203,7 +203,7 @@ func (c *imageCoordinator) lazyInit() {
 
 // acquire admits one new independent reference to image, or reports
 // ErrImageRetiring when the image has been committed to removal. An empty image
-// is not leased (nil, nil): a function with no runtime-backed image has nothing
+// is not leased (nil, nil): an app with no runtime-backed image has nothing
 // to pin.
 func (c *imageCoordinator) acquire(image string) (*ImageLease, error) {
 	if image == "" {
@@ -566,7 +566,7 @@ type imageLeaseCtxKey struct{}
 
 // WithImageLease attaches an admitted image lease to ctx. A nil lease leaves
 // ctx unchanged, so callers with no lease (fake executors, no-runtime
-// functions) remain transparent.
+// apps) remain transparent.
 func WithImageLease(ctx context.Context, lease *ImageLease) context.Context {
 	if lease == nil {
 		return ctx

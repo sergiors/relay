@@ -353,7 +353,7 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 		// handler retry state.
 		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
+			{App: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 	// The message is routed to the DLQ (and acked) on the first delivery, so it
@@ -383,8 +383,8 @@ func TestIntegrationExhaustRetriesRoutesToDLQ(t *testing.T) {
 		t.Errorf("event = %v", m.Values["event"])
 	}
 	// The entry attributes the exact exhausted invocation.
-	if m.Values["function"] != "fn" || m.Values["handler"] != "h" {
-		t.Errorf("function/handler = %v/%v, want fn/h", m.Values["function"], m.Values["handler"])
+	if m.Values["app"] != "fn" || m.Values["handler"] != "h" {
+		t.Errorf("function/handler = %v/%v, want fn/h", m.Values["app"], m.Values["handler"])
 	}
 	if m.Values["reason"] == "" {
 		t.Errorf("reason missing")
@@ -428,7 +428,7 @@ func TestIntegrationDLQEntryCarriesFinalAttemptTrace(t *testing.T) {
 		p.RecordTrace("fn/h", lineage)
 		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
+			{App: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 	testutil.WaitFor(t, 8*time.Second, "message routed to DLQ", func() bool {
@@ -527,7 +527,7 @@ func TestIntegrationDLQDeliveriesExceedHandlerAttempts(t *testing.T) {
 		// Attempt 2: exhaust (retries:1 → maxAttempts=2).
 		p.MarkExhausted("fn/h", claim)
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
+			{App: "fn", Handler: "h", Attempts: claim.Attempt, Err: ErrInvocationExhausted},
 		}}
 	})
 
@@ -606,10 +606,10 @@ func TestIntegrationMalformedEventRoutesToDLQImmediately(t *testing.T) {
 	if m.Values["handler_attempts"] != "0" {
 		t.Errorf("malformed message has no handler retry state, want handler_attempts==0, got %v", m.Values["handler_attempts"])
 	}
-	// No invocation to attribute, so function/handler are the "-" placeholder.
-	if m.Values["function"] != dlqNoHandler || m.Values["handler"] != dlqNoHandler {
+	// No invocation to attribute, so app/handler are the "-" placeholder.
+	if m.Values["app"] != dlqNoHandler || m.Values["handler"] != dlqNoHandler {
 		t.Errorf("malformed message function/handler = %v/%v, want %q placeholder",
-			m.Values["function"], m.Values["handler"], dlqNoHandler)
+			m.Values["app"], m.Values["handler"], dlqNoHandler)
 	}
 	// The malformed payload is preserved verbatim on the DLQ entry.
 	if m.Values["event"] != `{not json` {
@@ -1051,15 +1051,15 @@ func (e *testEnv) readOneIntoPEL(t *testing.T) redis.XMessage {
 // runner's aggregate after a message matches two always-failing handlers.
 func exhaustedTwo(aFn, aH string, aAttempts int, bFn, bH string, bAttempts int) *HandlerExhaustedError {
 	return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-		{Function: aFn, Handler: aH, Attempts: aAttempts},
-		{Function: bFn, Handler: bH, Attempts: bAttempts},
+		{App: aFn, Handler: aH, Attempts: aAttempts},
+		{App: bFn, Handler: bH, Attempts: bAttempts},
 	}}
 }
 
 // TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries pins the
 // stream-layer DLQ contract for a message with TWO exhausted handlers: the
 // terminal error carries both invocations and routeToDLQ must write one entry
-// per invocation, each with its own function/handler and handler_attempts, then
+// per invocation, each with its own app/handler and handler_attempts, then
 // ACK once. It drives processMessage directly against real Redis.
 func TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries(t *testing.T) {
 	testutil.RequireRedis(t)
@@ -1081,8 +1081,8 @@ func TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries(t *testi
 			p.MarkExhausted(inv, claim)
 		}
 		return &HandlerExhaustedError{Invocations: []ExhaustedInvocation{
-			{Function: "fnA", Handler: "h", Attempts: 1},
-			{Function: "fnB", Handler: "h", Attempts: 1},
+			{App: "fnA", Handler: "h", Attempts: 1},
+			{App: "fnB", Handler: "h", Attempts: 1},
 		}}
 	})
 
@@ -1092,7 +1092,7 @@ func TestIntegrationMultiInvocationExhaustionWritesPerInvocationEntries(t *testi
 	}
 	byInv := map[string]redis.XMessage{}
 	for _, m := range entries {
-		fn, _ := m.Values["function"].(string)
+		fn, _ := m.Values["app"].(string)
 		h, _ := m.Values["handler"].(string)
 		byInv[fn+"/"+h] = m
 	}

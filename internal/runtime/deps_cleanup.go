@@ -12,16 +12,16 @@ import (
 )
 
 // CleanupUnusedDependencies removes managed dependency images that no managed
-// function image references anymore. It is the lifecycle-driven tail of Relay's
-// dependency-image ownership: every successfully retired function image is
-// re-run here so a dependency layer whose last referencing function version has
+// app image references anymore. It is the lifecycle-driven tail of Relay's
+// dependency-image ownership: every successfully retired app image is
+// re-run here so a dependency layer whose last referencing app version has
 // been removed is pruned. It runs once at worker startup (after the boot sweep
-// removed superseded function images) and once after every successful
-// function-image removal in the runner — never periodically, never on a ticker,
+// removed superseded app images) and once after every successful
+// app-image removal in the runner — never periodically, never on a ticker,
 // and never forced.
 //
 // Ownership is derived purely from the managed-image labels (see labels.go):
-//   - a managed FUNCTION image is an image whose relay.type == ImageTypeFunction;
+//   - a managed APP image is an image whose relay.type == ImageTypeApp;
 //     its relay.dependency label names the exact dependency image it was built
 //     FROM. The union of those values is the referenced set.
 //   - a managed DEPENDENCY image is an image whose relay.type == ImageTypeDependency
@@ -30,11 +30,11 @@ import (
 //
 // Repository names are never the sole classification signal. An image with NO
 // relay.type label is unmanaged and ignored entirely, whether its name looks
-// like relay-dep-* or relay-fn-*: a legacy image built before this label model
+// like relay-dep-* or relay-app-*: a legacy image built before this label model
 // existed has no label, so it is left alone forever (inert garbage; backward
-// compat for pre-label builds is explicitly out of scope). The function-image
-// cleanup paths (relayTags / FunctionImageTags / RemoveImagesExcept) apply the
-// same strict, label-derived rule, so an unlabeled relay-fn-* image is likewise
+// compat for pre-label builds is explicitly out of scope). The app-image
+// cleanup paths (relayTags / AppImageTags / RemoveImagesExcept) apply the
+// same strict, label-derived rule, so an unlabeled relay-app-* image is likewise
 // never retired. A dependency image that carries the dependency label but NO
 // tagged RepoTag (a dangling image a failed build can leave behind) is also
 // skipped: GC deliberately keeps its scope tight to tagged, labeled dependency
@@ -42,7 +42,7 @@ import (
 //
 // A candidate is removed only when it is absent from the referenced set. Before
 // removing, the daemon itself is the second line of defense: a dependency image
-// that is still a parent of ANY built function image (including a function
+// that is still a parent of ANY built app image (including an app
 // image that predates labels and thus does not appear in the referenced set)
 // is refused by the daemon when no Force is given, so a removal error here is
 // treated conservatively as "still referenced; keeping" and the image is left
@@ -58,7 +58,7 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 	// Sweep every candidate; keep those referenced, remove the rest. Removal is
 	// FORCE-FREE and best-effort: the label check above is the ownership
 	// decision, and the daemon's refusal to remove an image that is still a
-	// parent is the safety net for any function image (labeled or not) that
+	// parent is the safety net for any app image (labeled or not) that
 	// still inherits this dependency's layers. Errors are conservative — never
 	// assume orphaned — so a removal that fails for any reason is skipped and
 	// retried at the next natural lifecycle point. The first genuine error is
@@ -79,7 +79,7 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 				m.log.Debug("Dependency image still in use; keeping", "dep_image", dep)
 				continue
 			}
-			// The daemon refused (a function image — labeled or legacy — still
+			// The daemon refused (an app image — labeled or legacy — still
 			// inherits this dependency's layers, or another worker is mid-build
 			// FROM it). Treat it as still referenced and keep it; the next
 			// natural lifecycle point retries. Only the first genuine error is
@@ -101,7 +101,7 @@ func (m *Manager) CleanupUnusedDependencies(ctx context.Context) (int, error) {
 
 // removeUnreferencedDependencyImage is the FORCE-FREE removal of one already
 // decision-unreferenced dependency image. It commits the image to retirement
-// through the SAME lease coordinator that gates function images and, when every
+// through the SAME lease coordinator that gates app images and, when every
 // admitted lease has drained, performs the ImageRemove.
 //
 // An active Prepare holds a dependency lease through its FROM consumption, so
@@ -163,20 +163,20 @@ func (m *Manager) removeUnreferencedDependencyImage(ctx context.Context, dep str
 }
 
 // partitionManagedImages classifies a daemon's images into dependency-image
-// removal candidates and the set of dependency references that managed function
+// removal candidates and the set of dependency references that managed app
 // images still hold. It is a pure function (no I/O) so it can be unit-tested
 // against synthetic image summaries. See CleanupUnusedDependencies for the
-// ownership semantics; this function implements the label-driven classification
+// ownership semantics; this app implements the label-driven classification
 // only.
 //
 // DANGLING images (empty RepoTags) are classified as neither: they are
 // unreachable build residue. This matters because racing same-content builds
 // (TestIntegrationConcurrentDepBuilds) or a tag-removal that the daemon refused
 // to turn into a full delete leaves the underlying image ID behind WITH its
-// labels. A dangling labeled function image must not hold its dependency
+// labels. A dangling labeled app image must not hold its dependency
 // hostage forever: its tags were removed, its lifecycle ended (nothing Relay
 // manages can start it — the reconciler, the state DB, and containers all
-// reference images by tag), so GC derives references from TAGGED function
+// reference images by tag), so GC derives references from TAGGED app
 // images only. The force-free removal path remains the final safety net: if a
 // dangling image is genuinely still a parent layer of something live, the
 // daemon refuses the dependency removal and GC conservatively keeps it.
@@ -190,8 +190,8 @@ func partitionManagedImages(items []image.Summary) (candidates []string, referen
 			continue
 		}
 		switch img.Labels[labelType] {
-		case ImageTypeFunction:
-			// A tagged managed function image holds exactly one dependency
+		case ImageTypeApp:
+			// A tagged managed app image holds exactly one dependency
 			// reference (its parent). Collect it.
 			if dependency := img.Labels[labelDependency]; dependency != "" {
 				referenced[dependency] = true

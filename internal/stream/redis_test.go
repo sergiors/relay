@@ -12,7 +12,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // TestNewConsumerDefaults consolidates the default-derivation assertions for the
@@ -76,13 +76,13 @@ func TestNewConsumerDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxRuleTimeoutMatchesFunctionMaxTimeout pins the cross-package invariant
-// that stream.MaxRuleTimeout and function.MaxTimeout are the same value. The
+// TestMaxRuleTimeoutMatchesAppMaxTimeout pins the cross-package invariant
+// that stream.MaxRuleTimeout and app.MaxTimeout are the same value. The
 // stream layer derives its reclaim threshold from this cap, so a divergence
 // would break the reclaim-while-in-flight guard.
-func TestMaxRuleTimeoutMatchesFunctionMaxTimeout(t *testing.T) {
-	if MaxRuleTimeout != function.MaxTimeout {
-		t.Errorf("stream.MaxRuleTimeout = %s, function.MaxTimeout = %s; they must match", MaxRuleTimeout, function.MaxTimeout)
+func TestMaxRuleTimeoutMatchesAppMaxTimeout(t *testing.T) {
+	if MaxRuleTimeout != app.MaxTimeout {
+		t.Errorf("stream.MaxRuleTimeout = %s, app.MaxTimeout = %s; they must match", MaxRuleTimeout, app.MaxTimeout)
 	}
 }
 

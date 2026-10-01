@@ -16,7 +16,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // executionEndpoints builds the Docker NetworkingConfig EndpointsConfig for an
@@ -37,13 +37,13 @@ func executionEndpoints(networks []string) map[string]*network.EndpointSettings 
 	return endpoints
 }
 
-// executionContainer is one reused execution container for a function. It holds
+// executionContainer is one reused execution container for an app. It holds
 // a long-running bootstrap process (python/node) speaking the line-JSON
 // invocation protocol (see protocol.go): Start creates and starts the container
 // and its output demultiplexers, Invoke performs one sequential
 // request/response exchange. All protocol I/O is serialized: the owning
-// Manager's per-function pool leases a container to exactly one invocation at a
-// time (distinct invocations of the same function run on distinct containers),
+// Manager's per-app pool leases a container to exactly one invocation at a
+// time (distinct invocations of the same app run on distinct containers),
 // and ioMu below is the belt-and-braces guard inside the container itself.
 //
 // Discard semantics: the container is discarded (killed, removed, and poisoned
@@ -57,7 +57,7 @@ type executionContainer struct {
 	fn    string
 	image string
 	// meta is the creation-time RunMeta stamped as labels. Identity fields
-	// (Type/Function/Hostname/Image) are set; per-invocation fields
+	// (Type/App/Hostname/Image) are set; per-invocation fields
 	// (Handler/MessageID/EventID/EventName) are left EMPTY because
 	// container labels are immutable at creation while this container
 	// outlives individual invocations — per-invocation attribution moves to
@@ -118,7 +118,7 @@ func startExecutionContainer(
 	fn, image string,
 	env []string,
 	networks []string,
-	limits function.ResourceLimits,
+	limits app.ResourceLimits,
 	meta RunMeta,
 ) (*executionContainer, error) {
 	createOps := client.ContainerCreateOptions{
@@ -142,7 +142,7 @@ func startExecutionContainer(
 		// recovery is free), and during its idle lifetime it simply stays
 		// running. The read-only rootfs, dropped caps, bounded /tmp tmpfs, and
 		// non-root user baked into the image are identical to the one-shot
-		// containers; only the memory/CPU/pids limits follow the function's
+		// containers; only the memory/CPU/pids limits follow the app's
 		// effective resource configuration.
 		HostConfig: hardenedHostConfig(true, limits),
 	}
@@ -267,7 +267,7 @@ func startExecutionContainer(
 	go c.monitor()
 
 	c.log.Debug("Runtime container: started",
-		"function", c.fn, "image", c.image, "container", c.id)
+		"app", c.fn, "image", c.image, "container", c.id)
 	return c, nil
 }
 
@@ -400,7 +400,7 @@ func (c *executionContainer) Invoke(ctx context.Context, handler string, eventJS
 			// An actual reuse: this container already served an invocation and
 			// just served another one. DEBUG only — never noisy INFO.
 			c.log.Debug("Runtime container: reused",
-				"function", c.fn, "image", c.image, "container", c.id)
+				"app", c.fn, "image", c.image, "container", c.id)
 		}
 		if resp.OK {
 			return nil
@@ -467,7 +467,7 @@ func (c *executionContainer) discardContext(ctx context.Context, reason string) 
 	c.attach.Close()
 	close(c.closed)
 	c.log.Debug("Runtime container: discarded",
-		"function", c.fn, "image", c.image, "container", c.id, "reason", reason)
+		"app", c.fn, "image", c.image, "container", c.id, "reason", reason)
 	return true
 }
 

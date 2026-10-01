@@ -14,30 +14,30 @@ At startup Relay:
 1. loads configuration and initializes tracing (disabled by default) and the
    metrics registry;
 2. runs the external-dependency preflight in a fixed order, before anything
-   touches `/functions` or the state DB: Redis stream/consumer-group readiness
+   touches `/apps` or the state DB: Redis stream/consumer-group readiness
    (creates the group with `MKSTREAM` at position `0`, tolerating `BUSYGROUP`),
    then Docker daemon readiness (a ping with a 10s bound), then verification that
    every configured `NETWORKS` network exists, then the runtime manager's
    warm-container maintenance loop is started;
-3. loads functions from `/functions` and computes each fingerprint once;
+3. loads apps from `/apps` and computes each fingerprint once;
 4. opens the local state database (errors are logged, never fatal);
 5. runs a conservative orphan sweep (bounded to 30s) removing only stale
    Relay containers owned by this worker hostname;
-6. prepares each function's image and starts the reconciler, scheduler, and
+6. prepares each app's image and starts the reconciler, scheduler, and
    stream consumer.
 
 A preflight failure short-circuits every later phase: Redis or the Docker daemon
 being unavailable, or a configured network missing, fails startup instead of
-letting the worker load functions, open the state DB, or create containers. The
+letting the worker load apps, open the state DB, or create containers. The
 manager is opened with deferred maintenance, so a preflight failure before the
 final step closes the manager with no background loop ever started. A lifecycle
 cancellation (SIGTERM/SIGINT) during the preflight is a graceful shutdown, not an
 error.
 
-Changes under `/functions` are reconciled live: a new directory is built and
-starts matching; edits rebuild only that function (debounced 750ms); a failed
+Changes under `/apps` are reconciled live: a new directory is built and
+starts matching; edits rebuild only that app (debounced 750ms); a failed
 rebuild keeps the previous working version; a 30s periodic pass is the backstop
-for missed watch events. `/functions` is read-only to Relay; all builds happen in
+for missed watch events. `/apps` is read-only to Relay; all builds happen in
 temporary contexts.
 
 Shutdown cancels the lifecycle first, then runs ordered teardown steps (socket,
@@ -71,14 +71,14 @@ None of these paths are environment-configurable.
 
 ### Local state database
 
-A read-mostly SQLite view of Relay's loaded functions — **not** the source of
-truth (`/functions` is) and not immutable. The worker writes it (discovery,
+A read-mostly SQLite view of Relay's loaded apps — **not** the source of
+truth (`/apps` is) and not immutable. The worker writes it (discovery,
 reconcile outcomes, a fixed 5s stats flush) and `relay stats reset` writes it;
 every other state-touching subcommand only reads. It never drives matching,
 building, or reconciliation, and a missing/broken database is recreated or
 degraded without stopping the worker.
 
-- Each function is stored as one JSON (JSONB) snapshot: runtime/status/image/
+- Each app is stored as one JSON (JSONB) snapshot: runtime/status/image/
   fingerprint/prepared-at/reconcile outcome, env **names** (values redacted) and
   secret **references** (values never stored), handlers, schedules, and services.
 - `status` lifecycle: `preparing` → `building` → `reconciling` → `ready`;
@@ -103,14 +103,14 @@ entirely from the worker. With no running worker it fails — worker health is o
 meaningful as observed by the worker that owns the dependencies.
 
 Readiness is worker-owned: the flag starts false and is set true only at the
-ready-to-consume boundary (after the external-dependency preflight, function
+ready-to-consume boundary (after the external-dependency preflight, app
 loading/preparation, and the socket/listener/loop and
 consumer/schedule/reconciler/scheduler wiring, just before consumption), and
 cleared first on shutdown; it is bound to the worker lifecycle context, so a
 lifecycle cancellation that precedes the clear also reports not-ready. In steady
 state the answer reflects live Redis consumer health, a bounded Docker ping, and
 `NETWORKS` verification, so a dependency failing reports unhealthy and recovery
-reports healthy again. Per-function degraded/unavailable/invalid status, SQLite,
+reports healthy again. Per-app degraded/unavailable/invalid status, SQLite,
 optional tracing, and asynchronous service convergence/housekeeping do not gate
 worker health.
 
@@ -118,7 +118,7 @@ There is no HTTP health/readiness endpoint; health is a CLI command.
 
 `relay stats` reads the persisted global snapshot from SQLite (no Redis, Docker,
 or worker needed; works when the runtime is down). It may lag live Prometheus by
-up to ~5s. `relay stats reset` zeroes cumulative global and per-function totals —
+up to ~5s. `relay stats reset` zeroes cumulative global and per-app totals —
 with a running worker, over the Unix socket so the in-memory source is reset too;
 otherwise directly against the database. It never touches pending events, Redis,
 containers, schedules/services, or Prometheus counters (those stay monotonic; the
@@ -140,40 +140,40 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   once per logical event across redeliveries. Schedule occurrences are excluded.
 - **Handlers/retries/DLQ:** `relay_handler_success_total`,
   `relay_handler_failure_total`, `relay_retries_total`, `relay_dlq_entries_total`,
-  `relay_handler_invocations_total{outcome,function,handler}`,
-  `relay_handler_duration_seconds{function,handler}`.
+  `relay_handler_invocations_total{outcome,app,handler}`,
+  `relay_handler_duration_seconds{app,handler}`.
   `relay_retries_total` counts stream **message reclaims** (redeliveries), not
   handler retries. `relay_dlq_entries_total` counts successful **DLQ entry
   writes** (one per exhausted invocation, plus a placeholder per malformed
   message).
-- **Per-function:** `relay_function_events_matched_total{function}`,
-  `relay_function_handler_*_total{function}`, `relay_function_retries_total`
+- **Per-app:** `relay_app_events_matched_total{app}`,
+  `relay_function_handler_*_total{app}`, `relay_function_retries_total`
   (handler retry attempts), `relay_function_dlq_total` (invocations that
   exhausted their retry budget — the exhaustion commit, **not** a successful DLQ
-  write), `relay_function_status{function,status}`.
+  write), `relay_app_status{app,status}`.
 - **Backlog/concurrency:** `relay_pending_entries`,
   `relay_pending_oldest_age_seconds` (sampled from `XPENDING` every 15s),
   `relay_buffered_events`, `relay_in_flight_invocations`,
   `relay_concurrency_waits_total`.
-- **Warm pool:** `relay_runtime_pool_capacity{function}`,
-  `relay_runtime_containers{function,state=idle|busy|starting}`,
-  `relay_runtime_container_acquires_total{function,outcome=warm|cold}`,
-  `relay_runtime_container_discards_total{function,reason}`,
-  `relay_runtime_container_waits_total{function}`,
-  `relay_runtime_container_acquire_duration_seconds{function}`.
+- **Warm pool:** `relay_runtime_pool_capacity{app}`,
+  `relay_runtime_containers{app,state=idle|busy|starting}`,
+  `relay_runtime_container_acquires_total{app,outcome=warm|cold}`,
+  `relay_runtime_container_discards_total{app,reason}`,
+  `relay_runtime_container_waits_total{app}`,
+  `relay_runtime_container_acquire_duration_seconds{app}`.
 - **Schedules:** `relay_schedule_occurrences_published_total`,
   `relay_schedule_occurrences_duplicate_total`,
   `relay_schedule_publish_failures_total`,
   `relay_schedule_publish_retries_total`,
   `relay_schedule_publish_exhausted_total`, `relay_schedule_catchup_total`.
-- **Services:** `relay_service_reconciles_total{function,outcome}`,
-  `relay_service_reconcile_duration_seconds{function}`.
+- **Services:** `relay_service_reconciles_total{app,outcome}`,
+  `relay_service_reconcile_duration_seconds{app}`.
 - **Anomaly:** `relay_missing_payload_total` (reclaimed PEL entries whose stream
   body no longer exists).
-- **Builds:** `relay_build_failures_total{function}`,
-  `relay_function_build_seconds{function}`.
+- **Builds:** `relay_app_build_failures_total{app}`,
+  `relay_app_build_seconds{app}`.
 
-Labels are bounded to function/handler/outcome and small closed sets; IDs and
+Labels are bounded to app/handler/outcome and small closed sets; IDs and
 raw errors are never labels. The metrics server is fail-fast on a taken port and
 isolated from the event path.
 
@@ -194,17 +194,17 @@ untraced.
 ### Logging
 
 Relay logs with `slog` (fixed messages + structured attributes). Execution,
-retry, failure, DLQ, reconcile, and build lines carry `function`, `handler`,
+retry, failure, DLQ, reconcile, and build lines carry `app`, `handler`,
 `message_id`, `attempt`, `duration`, and `exit_code` where available. Handler
 stdout/stderr is a raw transport forwarded verbatim, unaffected by `LOG_LEVEL`,
-prefixed `[function/handler@id] stream:`. `LOG_LEVEL` filters only Relay's own
+prefixed `[app/handler@id] stream:`. `LOG_LEVEL` filters only Relay's own
 lines.
 
 ## Secrets
 
 Secrets are files on disk under `/var/lib/relay/secrets`; templates reference
 them by name. They are never baked into images, never stored in the state
-database, never logged, and never shown by `relay function inspect` (which shows
+database, never logged, and never shown by `relay app inspect` (which shows
 references only). Manage them with `relay secret ls|set|rm`.
 
 - **Rotating** a secret value takes effect on the next event/schedule invocation
@@ -225,19 +225,19 @@ references only). Manage them with `relay secret ls|set|rm`.
 
 Git synchronization is manual by default: `relay start` never polls, watches, or
 fetches. Only `relay git sync` (or an accepted webhook delivery) updates
-`/functions`.
+`/apps`.
 
 ```sh
 relay git keygen                             # generate an SSH deploy key (once)
 relay git set git@github.com:acme/repo.git   # remember the SSH source
-relay git sync                               # materialize into /functions
+relay git sync                               # materialize into /apps
 relay git status
 relay git remove -y
 ```
 
 `relay git set` accepts SSH URLs only (scp-like or `ssh://`; no HTTPS) and
 options `--ref` (default `main`), `--path` (monorepo subdir), and
-`--webhook-secret NAME`. While a source is configured and synced, `/functions`
+`--webhook-secret NAME`. While a source is configured and synced, `/apps`
 is owned by git: a sync rewrites it to reflect exactly the repository/path,
 removing directories not in the source.
 
@@ -262,7 +262,7 @@ at startup.
 - Consumer group is created with `MKSTREAM` at position `0`; a new group over an
   existing stream replays its backlog.
 - Per-invocation state is a Redis hash keyed by message and
-  `<function>/<handler>` with forms `ok`, `running:<deadline>`, `
+  `<app>/<handler>` with forms `ok`, `running:<deadline>`, `
 next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
   transition is one atomic Lua script; active-claim transitions CAS both attempt
   and claim token, so a stale claim can never overwrite a newer claim or a
@@ -286,7 +286,7 @@ deadline_ms` is protected).
 
 The DLQ stream is `relay:<REDIS_STREAM>:dlq`. `relay dlq ls` lists entries;
 `inspect` shows one entry's metadata and original event; `rm` deletes one;
-`replay` re-executes one entry's exact function/handler once on the running
+`replay` re-executes one entry's exact app/handler once on the running
 worker and deletes it only on success (kept on failure). See [cli.md](cli.md).
 
 ## Reliability model and limitations
@@ -296,9 +296,9 @@ worker and deletes it only on success (kept on failure). See [cli.md](cli.md).
   the application's responsibility; exactly-once is not claimed.
 - Retry backoff, exhaustion limits, reclaim cadence, and the stats flush interval
   are fixed internals, not configurable.
-- `resources` are per container; there is no aggregate per-function budget.
-- Networking is enabled (outbound access is a legitimate function need);
-  per-function network policy is not implemented. Relay never creates or removes
+- `resources` are per container; there is no aggregate per-app budget.
+- Networking is enabled (outbound access is a legitimate app need);
+  per-app network policy is not implemented. Relay never creates or removes
   Docker networks: `NETWORKS` and `TRAEFIK_NETWORK` are operator-owned, verified
   before use, and a network removed from the daemon afterwards surfaces as a
   container-create failure rather than being re-created.

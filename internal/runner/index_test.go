@@ -6,7 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
+	eventmatch "relay/internal/event"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
@@ -39,11 +40,11 @@ func indexEvents() []map[string]any {
 
 // assertSnapshotEquivalent asserts that a snapshot's indexed matching agrees with
 // a full exact scan, rule for rule and in order, for every battery event.
-func assertSnapshotEquivalent(t *testing.T, snap *pinnedSnapshot, pf *PreparedFunction) {
+func assertSnapshotEquivalent(t *testing.T, snap *pinnedSnapshot, pf *PreparedApp) {
 	t.Helper()
 	for ei, event := range indexEvents() {
 		got := snap.matchingRules(pf, event)
-		want := pf.fn.Template.MatchingEventRules(event)
+		want := eventmatch.MatchingEventRules(pf.fn.Template.Events, event)
 		if len(got) != len(want) {
 			t.Fatalf("event %d: indexed %d rules, full scan %d", ei, len(got), len(want))
 		}
@@ -55,15 +56,15 @@ func assertSnapshotEquivalent(t *testing.T, snap *pinnedSnapshot, pf *PreparedFu
 	}
 }
 
-// parsedFn builds a prepared function whose template is parsed from YAML, so its
+// parsedFn builds a prepared app whose template is parsed from YAML, so its
 // event rules carry real matchers (and therefore real anchors).
-func parsedFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedFunction {
+func parsedFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedApp {
 	t.Helper()
-	tmpl, err := function.ParseTemplate([]byte(tmplYAML))
+	tmpl, err := app.ParseTemplate([]byte(tmplYAML))
 	if err != nil {
 		t.Fatalf("parse template %q: %v", name, err)
 	}
-	return NewPrepared(function.Function{Name: name, Template: tmpl}, &runtime.Prepared{Name: name, Image: "x"}, exec)
+	return NewPrepared(app.App{Name: name, Template: tmpl}, &runtime.Prepared{Name: name, Image: "x"}, exec)
 }
 
 const indexedTmplA = `runtime: node24
@@ -94,11 +95,11 @@ events:
       field: [{exists: false}]
 `
 
-// TestRegistryIndexGenerationEquivalence pins that a snapshot's per-function index
+// TestRegistryIndexGenerationEquivalence pins that a snapshot's per-app index
 // agrees with a full exact scan for every event.
 func TestRegistryIndexGenerationEquivalence(t *testing.T) {
 	pf := parsedFn(t, "alpha", indexedTmplA, &countingExecutor{})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 
 	snap := r.Registry().snapshotPinned()
 	defer snap.release()
@@ -109,11 +110,11 @@ func TestRegistryIndexGenerationEquivalence(t *testing.T) {
 }
 
 // TestRegistryIndexRebuiltOnReplace pins that a snapshot binds to the index of the
-// function generation it observed: a snapshot taken before a replacement keeps the
+// app generation it observed: a snapshot taken before a replacement keeps the
 // old generation's rules, and a later snapshot uses the new generation's rules.
 func TestRegistryIndexRebuiltOnReplace(t *testing.T) {
 	old := parsedFn(t, "alpha", indexedTmplA, &countingExecutor{})
-	r := New([]*PreparedFunction{old}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{old}, testutil.DiscardLogger())
 
 	before := r.Registry().snapshotPinned()
 	defer before.release()
@@ -134,7 +135,7 @@ func TestRegistryIndexRebuiltOnReplace(t *testing.T) {
 	if strings.Join(oldHandlers, ",") != "handler.eq" {
 		t.Fatalf("old snapshot matched %v, want the old generation's [handler.eq]", oldHandlers)
 	}
-	// The superseded entry is not in the old snapshot's function set, so a real
+	// The superseded entry is not in the old snapshot's app set, so a real
 	// Handle would never match it. `matchingRules` falls back conservatively to the
 	// entry's own full scan (never borrowing another generation's index).
 	if got := before.matchingRules(next, map[string]any{}); strings.Join(handlerNames(got), ",") != "handler.absent" {
@@ -146,7 +147,7 @@ func TestRegistryIndexRebuiltOnReplace(t *testing.T) {
 	if got := handlerNames(after.matchingRules(next, map[string]any{"score": 92})); strings.Join(got, ",") != "handler.numeric,handler.absent" {
 		t.Fatalf("new snapshot matched %v, want [handler.numeric handler.absent]", got)
 	}
-	// The superseded entry is absent from the new snapshot's function set; its
+	// The superseded entry is absent from the new snapshot's app set; its
 	// fallback runs the entry's own scan rather than the new generation's index.
 	if got := after.rulesFor(next); got == nil {
 		t.Fatal("new snapshot must index the new generation")
@@ -158,7 +159,7 @@ func TestRegistryIndexRebuiltOnReplace(t *testing.T) {
 // has no index for it and GetByName no longer finds it.
 func TestRegistryIndexRemovalExcludes(t *testing.T) {
 	pf := parsedFn(t, "alpha", indexedTmplA, &countingExecutor{})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.Registry().Replace("alpha", nil)
 
 	if got := r.Registry().GetByName("alpha"); got != nil {
@@ -170,21 +171,21 @@ func TestRegistryIndexRemovalExcludes(t *testing.T) {
 		t.Fatal("removed entry must not appear in a fresh snapshot's index")
 	}
 	if len(snap.fns) != 0 {
-		t.Fatalf("snapshot functions = %d, want 0", len(snap.fns))
+		t.Fatalf("snapshot apps = %d, want 0", len(snap.fns))
 	}
 }
 
-// TestRegistryIndexUnavailableIncluded pins that an unavailable function's entry
+// TestRegistryIndexUnavailableIncluded pins that an unavailable app's entry
 // is still indexed and still classifies as matching: an event matching only an
-// unavailable function is MATCHED, and a fresh snapshot must expose the anchor
+// unavailable app is MATCHED, and a fresh snapshot must expose the anchor
 // rather than falling back or dropping the rule.
 func TestRegistryIndexUnavailableIncluded(t *testing.T) {
-	tmpl, err := function.ParseTemplate([]byte(indexedTmplA))
+	tmpl, err := app.ParseTemplate([]byte(indexedTmplA))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	pf := NewUnavailable(function.Function{Name: "broken", Template: tmpl})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	pf := NewUnavailable(app.App{Name: "broken", Template: tmpl})
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 
 	snap := r.Registry().snapshotPinned()
 	defer snap.release()
@@ -202,8 +203,8 @@ func TestRegistryIndexUnavailableIncluded(t *testing.T) {
 // template is not indexed and its snapshot lookup falls back to a full scan
 // (which yields nothing, since a nil template cannot match).
 func TestRegistryIndexNilTemplateFallback(t *testing.T) {
-	pf := NewUnavailable(function.Function{Name: "no-template"})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+	pf := NewUnavailable(app.App{Name: "no-template"})
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 
 	snap := r.Registry().snapshotPinned()
 	defer snap.release()
@@ -216,12 +217,12 @@ func TestRegistryIndexNilTemplateFallback(t *testing.T) {
 }
 
 // TestHandleIndexedExecutionOrder pins that Handle's indexed matching executes
-// matching handlers in the existing order — registry function-name order, then
+// matching handlers in the existing order — registry app-name order, then
 // rule declaration order — and skips non-matching rules, exactly as a full scan
 // would.
 func TestHandleIndexedExecutionOrder(t *testing.T) {
 	exec := &recordingExecutor{}
-	r := New([]*PreparedFunction{
+	r := New([]*PreparedApp{
 		parsedFn(t, "beta", `runtime: node24
 events:
   - handler: beta.first
@@ -248,7 +249,7 @@ events:
 	}
 	handlers, _ := exec.got()
 	got := strings.Join(handlers, ",")
-	// alpha functions sort before beta; within a function, declaration order.
+	// alpha apps sort before beta; within an app, declaration order.
 	want := "handler.eq,handler.exists,handler.and,beta.first,beta.second"
 	if got != want {
 		t.Fatalf("execution order = %q, want %q", got, want)
@@ -260,7 +261,7 @@ events:
 // and that every consumed index generation stays internally consistent.
 func TestHandleIndexConcurrentReload(t *testing.T) {
 	names := []string{"a", "b", "c"}
-	var fns []*PreparedFunction
+	var fns []*PreparedApp
 	for _, n := range names {
 		fns = append(fns, parsedFn(t, n, indexedTmplA, &countingExecutor{}))
 	}
@@ -288,7 +289,7 @@ func TestHandleIndexConcurrentReload(t *testing.T) {
 						r.Registry().Replace(n, parsedFn(t, n, indexedTmplA, &countingExecutor{}))
 					}
 				} else {
-					r.Registry().Set([]*PreparedFunction{
+					r.Registry().Set([]*PreparedApp{
 						parsedFn(t, "a", indexedTmplA, &countingExecutor{}),
 						parsedFn(t, "b", indexedTmplB, &countingExecutor{}),
 					})
@@ -313,7 +314,7 @@ func TestHandleIndexConcurrentReload(t *testing.T) {
 }
 
 // handlerNames maps matched rules to handler names for order assertions.
-func handlerNames(rules []function.EventRule) []string {
+func handlerNames(rules []app.EventRule) []string {
 	out := make([]string, len(rules))
 	for i, r := range rules {
 		out[i] = r.Handler

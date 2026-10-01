@@ -10,14 +10,14 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	git "relay/internal/git"
 )
 
-// gitConfigPath, gitCheckoutDir, gitSSHDir, and gitFunctionsDir are the derived
+// gitConfigPath, gitCheckoutDir, gitSSHDir, and gitAppsDir are the derived
 // paths the CLI git commands operate on. They default to the fixed internal
-// paths (/var/lib/relay/... and function.Dir); tests replace them with temp dirs
-// so the commands never touch /var/lib/relay or /functions.
+// paths (/var/lib/relay/... and app.Dir); tests replace them with temp dirs
+// so the commands never touch /var/lib/relay or /apps.
 //
 // gitCloneURL is the transport seam for `git sync`, mirroring the git package's
 // SyncOptions.CloneURL. It is empty in production (sync uses the persisted,
@@ -25,16 +25,16 @@ import (
 // a real `relay git sync` runs end to end with no SSH and no network. It is
 // never persisted: Config.Repository always remains the validated SSH URL.
 var (
-	gitConfigPath   = git.ConfigPath
-	gitCheckoutDir  = git.CheckoutDir
-	gitSSHDir       = git.SSHDir
-	gitFunctionsDir = function.Dir
-	gitCloneURL     string
+	gitConfigPath  = git.ConfigPath
+	gitCheckoutDir = git.CheckoutDir
+	gitSSHDir      = git.SSHDir
+	gitAppsDir     = app.Dir
+	gitCloneURL    string
 )
 
 // gitCommand builds the `relay git ...` manual sync subcommand family. It never
 // runs automatically and never touches Redis, Docker, or the worker; it only
-// writes the local git config/key/checkout and materializes /functions (on
+// writes the local git config/key/checkout and materializes /apps (on
 // sync). It is a pure grouping command, so it uses the shared namespaceAction:
 // a bare `relay git` shows the subcommand help (there is nothing else to do with
 // just the command name), and an unknown first token is a friendly Docker-style
@@ -50,7 +50,7 @@ func gitCommand() *cli.Command {
 		Name:  "git",
 		Usage: "Manage manual Git synchronization",
 		Description: "Generate an SSH deploy key, configure a repository source, and " +
-			"manually sync it into /functions.",
+			"manually sync it into /apps.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			{
@@ -106,9 +106,9 @@ func gitCommand() *cli.Command {
 			},
 			{
 				Name:  "sync",
-				Usage: "Sync the configured source into /functions",
-				Description: "Clone/fetch/checkout the configured repository and materialize its function " +
-					"directories into /functions deterministically. Uses the process context so Ctrl-C " +
+				Usage: "Sync the configured source into /apps",
+				Description: "Clone/fetch/checkout the configured repository and materialize its app " +
+					"directories into /apps deterministically. Uses the process context so Ctrl-C " +
 					"propagates.",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if cmd.Args().Present() {
@@ -133,7 +133,7 @@ func gitCommand() *cli.Command {
 				Name:      "remove",
 				Usage:     "Remove the git source config and checkout",
 				UsageText: "relay git remove [-y]",
-				Description: "Remove the persisted git source config and the managed checkout. Leaves /functions " +
+				Description: "Remove the persisted git source config and the managed checkout. Leaves /apps " +
 					"and the SSH key untouched (the key survives because the operator registers it as a Deploy Key). " +
 					"Prompts for confirmation on the terminal with a default of No unless -y/--yes is given (for automation).",
 				Flags: []cli.Flag{
@@ -201,7 +201,7 @@ func gitSync(ctx context.Context, w io.Writer) error {
 	o := git.NewSyncOptions()
 	o.ConfigPath = gitConfigPath
 	o.CheckoutDir = gitCheckoutDir
-	o.FunctionsDir = gitFunctionsDir
+	o.AppsDir = gitAppsDir
 	o.SSHDir = gitSSHDir
 	o.CloneURL = gitCloneURL
 	o.Out = w
@@ -287,7 +287,7 @@ func readLine(in io.Reader) (string, error) {
 	return strings.TrimSuffix(line, "\n"), nil
 }
 
-// gitRemove removes the config and checkout, leaving /functions and the key.
+// gitRemove removes the config and checkout, leaving /apps and the key.
 // It takes no logger: the removal report on w IS the complete record of this
 // single-step command.
 func gitRemove(w io.Writer) error {

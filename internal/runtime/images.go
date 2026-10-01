@@ -11,37 +11,37 @@ import (
 )
 
 // relayRepoPrefix is the repository name prefix shared by every Relay-owned
-// function image (also the prefix ImageRef emits). The prefix NAMES the
+// app image (also the prefix ImageRef emits). The prefix NAMES the
 // namespace but is no longer the ownership decision: an image is a Relay
-// function image only when it also carries the strict managed-image labels
-// (relay.type=function, and a relay.function agreeing with the repository name).
+// app image only when it also carries the strict managed-image labels
+// (relay.type=app, and a relay.app agreeing with the repository name).
 // Nothing outside the prefix is ever touched, and a prefix-only image (a
-// pre-labels build, or a foreign image merely named "relay-fn-*") is never
+// pre-labels build, or a foreign image merely named "relay-app-*") is never
 // removed or considered a Relay version.
-const relayRepoPrefix = "relay-fn-"
+const relayRepoPrefix = "relay-app-"
 
 // tagPrefixLen is the number of hex fingerprint characters used as the docker
-// tag. The full fingerprint is a 64-hex SHA-256 over the function directory;
+// tag. The full fingerprint is a 64-hex SHA-256 over the app directory;
 // that remains authoritative everywhere it is persisted (SQLite, Prepared). The
 // tag prefix is an opaque, collision-safe short handle: 16 hex chars = 64 bits,
-// and a birthday collision at the function-version counts Relay deals with (a
-// handful per function, tens of functions) is astronomically unlikely. Git's
+// and a birthday collision at the app-version counts Relay deals with (a
+// handful per app, tens of apps) is astronomically unlikely. Git's
 // default short-hash length is 7–12 chars (28–48 bits); 16 chars is comfortably
 // beyond that while staying well inside docker's tag length limit combined with
-// a validated name (name ≤ 63 chars, "relay-fn-" prefix, ":<16hex>" suffix → ≤
+// a validated name (name ≤ 63 chars, "relay-app-" prefix, ":<16hex>" suffix → ≤
 // ~89 chars < 128). A full-fingerprint tag would add nothing but length: the
 // fingerprint still uniquely determines the tag, so equality on the tag is
 // equality on the source.
 const tagPrefixLen = 16
 
-// ImageRef maps a validated function name and its content fingerprint to the
+// ImageRef maps a validated app name and its content fingerprint to the
 // docker image reference for that exact source version. No sanitizing is needed
-// for the name: function names are validated at load time (internal/function) to
+// for the name: app names are validated at load time (internal/app) to
 // be [a-z0-9][a-z0-9._-]* and not end in '.', so they are already legal docker
 // repository names. The reference always carries the short fingerprint tag, so
-// every distinct source version of a function is a distinct docker image and can
+// every distinct source version of an app is a distinct docker image and can
 // be built, reused, and retired independently without ever clobbering a sibling
-// version. The "relay-fn-" prefix namespaces all of Relay's images so they never
+// version. The "relay-app-" prefix namespaces all of Relay's images so they never
 // collide with unrelated images on the same daemon.
 //
 // Defensive on short input: fingerprints are always 64 chars in practice, but a
@@ -51,19 +51,19 @@ func ImageRef(name, fingerprint string) string {
 	if len(fingerprint) > tagPrefixLen {
 		fingerprint = fingerprint[:tagPrefixLen]
 	}
-	return "relay-fn-" + name + ":" + fingerprint
+	return "relay-app-" + name + ":" + fingerprint
 }
 
-// repoForName returns the repository name (without tag) that a function's images
-// all share, e.g. "relay-fn-user-events".
+// repoForName returns the repository name (without tag) that an app's images
+// all share, e.g. "relay-app-user-events".
 func repoForName(name string) string {
 	return relayRepoPrefix + name
 }
 
-// nameFromRepo strips the relay-fn- prefix back to the function name, returning
+// nameFromRepo strips the relay-app- prefix back to the app name, returning
 // ("", false) when repo is not Relay-owned. Every Relay version image's repo is
-// exactly "relay-fn-<name>" (validated names never contain ':' or '/'), so the
-// remainder is unambiguously the function name.
+// exactly "relay-app-<name>" (validated names never contain ':' or '/'), so the
+// remainder is unambiguously the app name.
 func nameFromRepo(repo string) (string, bool) {
 	if !strings.HasPrefix(repo, relayRepoPrefix) {
 		return "", false
@@ -75,12 +75,12 @@ func nameFromRepo(repo string) (string, bool) {
 	return name, true
 }
 
-// functionNameFromImage returns the function name encoded in a Relay-owned
-// image reference ("relay-fn-<name>:<tag>"), reporting false for a reference
+// appNameFromImage returns the app name encoded in a Relay-owned
+// image reference ("relay-app-<name>:<tag>"), reporting false for a reference
 // without a tag or outside the Relay namespace. It is the scoping guard that
-// ensures a re-activation can only un-retire the activating function's OWN
-// image, never a foreign function's retired reference.
-func functionNameFromImage(image string) (string, bool) {
+// ensures a re-activation can only un-retire the activating app's OWN
+// image, never a foreign app's retired reference.
+func appNameFromImage(image string) (string, bool) {
 	repo, _, ok := strings.Cut(image, ":")
 	if !ok {
 		return "", false
@@ -88,16 +88,16 @@ func functionNameFromImage(image string) (string, bool) {
 	return nameFromRepo(repo)
 }
 
-// relayTags lists every local image that is a MANAGED Relay function image,
+// relayTags lists every local image that is a MANAGED Relay app image,
 // returning name -> set of full tags. Ownership is strict and label-derived: an
-// image qualifies only when its relay.type is ImageTypeFunction AND its
-// relay.function label is present and equals the function name encoded in its
-// relay-fn-<name> repository. It lists all images and filters client-side rather
+// image qualifies only when its relay.type is ImageTypeApp AND its
+// relay.app label is present and equals the app name encoded in its
+// relay-app-<name> repository. It lists all images and filters client-side rather
 // than using server-side filters: a single client implementation reused by every
 // cleanup path, no dependency on a specific Engine API filter version.
 //
 // A prefix-only image (no managed-image labels — a pre-labels Relay build, or a
-// foreign image merely named "relay-fn-*") is NEVER returned, so it can never be
+// foreign image merely named "relay-app-*") is NEVER returned, so it can never be
 // retired, garbage-collected, or considered a Relay version. This matches the
 // strict label model the dependency GC already uses. It is lifecycle-owned (see
 // beginRemovalOperation): once shutdown begins the listing is refused, and a
@@ -119,7 +119,7 @@ func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}
 			if !ok {
 				continue
 			}
-			name, ok := managedFunctionImageName(repo, img.Labels)
+			name, ok := managedAppImageName(repo, img.Labels)
 			if !ok {
 				continue
 			}
@@ -132,28 +132,28 @@ func (m *Manager) relayTags(ctx context.Context) (map[string]map[string]struct{}
 	return byName, nil
 }
 
-// managedFunctionImageName classifies one image (its repository and its full
-// label set) as a managed Relay function image. It reports the owning function
+// managedAppImageName classifies one image (its repository and its full
+// label set) as a managed Relay app image. It reports the owning app
 // name only when all of the following hold, and otherwise ("", false):
 //
-//   - the repository is exactly "relay-fn-<name>" (the Relay function namespace);
-//   - relay.type == ImageTypeFunction (the strict managed-image classification);
-//   - relay.function is present and equals that repository-derived <name>, so a
-//     mislabeled or spoofed image whose label points at a different function is
+//   - the repository is exactly "relay-app-<name>" (the Relay app namespace);
+//   - relay.type == ImageTypeApp (the strict managed-image classification);
+//   - relay.app is present and equals that repository-derived <name>, so a
+//     mislabeled or spoofed image whose label points at a different app is
 //     never treated as the repository's owner.
 //
-// This is the single ownership predicate for function-image discovery, GC,
+// This is the single ownership predicate for app-image discovery, GC,
 // retirement, and cleanup. Repository names alone are never sufficient, so an
-// unlabeled "relay-fn-*" image and an external image are both left alone.
-func managedFunctionImageName(repo string, labels map[string]string) (string, bool) {
+// unlabeled "relay-app-*" image and an external image are both left alone.
+func managedAppImageName(repo string, labels map[string]string) (string, bool) {
 	name, ok := nameFromRepo(repo)
 	if !ok {
 		return "", false
 	}
-	if labels[labelType] != ImageTypeFunction {
+	if labels[labelType] != ImageTypeApp {
 		return "", false
 	}
-	if labels[labelFunction] != name {
+	if labels[labelApp] != name {
 		return "", false
 	}
 	return name, true
@@ -177,7 +177,7 @@ func (m *Manager) listImagesForRemoval(ctx context.Context) (client.ImageListRes
 }
 
 // IsRelayImage reports whether image is within one of Relay's own image
-// namespaces ("relay-fn-" or "relay-dep-"). It is the guard that keeps the
+// namespaces ("relay-app-" or "relay-dep-"). It is the guard that keeps the
 // image-lease coordinator scoped to images Relay owns: an external service
 // image must NEVER be leased, retired, or garbage-collected by Relay.
 func IsRelayImage(image string) bool {
@@ -204,7 +204,7 @@ func (m *Manager) imageExists(ctx context.Context, ref string) bool {
 }
 
 // resolvedImage is the immutable content identity Relay resolves for a managed
-// function image before leasing or creating an execution container. It pairs the
+// app image before leasing or creating an execution container. It pairs the
 // mutable reference (used for labels, spans, and image retirement, which is
 // scoped to references) with the immutable content identity (the Docker image ID
 // plus the Relay fingerprint metadata label). Warm container generations key on
@@ -215,7 +215,7 @@ func (m *Manager) imageExists(ctx context.Context, ref string) bool {
 // so an image without Relay labels (e.g. an external service image) simply
 // contributes no fingerprint and is still identified by its content ID.
 type resolvedImage struct {
-	// ref is the mutable image reference (e.g. "relay-fn-fn:abc"). It scopes
+	// ref is the mutable image reference (e.g. "relay-app-fn:abc"). It scopes
 	// image retirement (InvalidateImage/RemoveImage) and stays the relay.image
 	// label and the span attribute; it is NOT the generation identity.
 	ref string
@@ -224,7 +224,7 @@ type resolvedImage struct {
 	// a daemon hiccup); the identity then degrades to the reference.
 	id string
 	// fingerprint is the Relay fingerprint metadata (relay.fingerprint) carried
-	// by a managed function image, or the prepared content fingerprint when the
+	// by a managed app image, or the prepared content fingerprint when the
 	// label is absent. It is never required.
 	fingerprint string
 }
@@ -251,11 +251,11 @@ func (r resolvedImage) createImage() string {
 
 // imageIdentityKey builds the immutable content-identity key for a resolved
 // managed image. It embeds the reference first so identity retirement and
-// re-activation stay scoped to a function's own tag, then the Docker image ID
+// re-activation stay scoped to an app's own tag, then the Docker image ID
 // and the Relay fingerprint when known. A fallback to the reference keeps a
 // Docker-less caller (direct tests) and a transient inspect failure pooling under
 // the historical reference identity rather than rotating spuriously. An empty
-// reference (a no-runtime function) yields an empty identity, matching the
+// reference (a no-runtime app) yields an empty identity, matching the
 // historical "no image" key.
 func imageIdentityKey(ref, id, fingerprint string) string {
 	if ref == "" {
@@ -296,7 +296,7 @@ func (m *Manager) imageInspectContent(ctx context.Context, ref string) (id, fing
 // the injected seam when set (tests), the real Docker inspect otherwise, and
 // degrades to the reference-only identity when the image cannot be resolved (a
 // Docker-less direct/test caller, or a daemon hiccup) so an invocation is never
-// failed merely because identity resolution was unavailable. The function's
+// failed merely because identity resolution was unavailable. The app's
 // prepared fingerprint is the fallback metadata when the image carries no
 // relay.fingerprint label.
 func (m *Manager) resolveImageIdentity(ctx context.Context, ref, fingerprint string) resolvedImage {
@@ -543,11 +543,11 @@ func (m *Manager) removeImageLocked(ctx context.Context, image string) error {
 	return nil
 }
 
-// FunctionImageTags lists every full image reference (repo:tag) that belongs to
-// the named function's repository ("relay-fn-<name>"). It is the per-function
+// AppImageTags lists every full image reference (repo:tag) that belongs to
+// the named app's repository ("relay-app-<name>"). It is the per-app
 // listing the runner uses to retire each superseded version independently with
 // in-flight safety.
-func (m *Manager) FunctionImageTags(ctx context.Context, name string) ([]string, error) {
+func (m *Manager) AppImageTags(ctx context.Context, name string) ([]string, error) {
 	repo := repoForName(name)
 	byName, err := m.relayTags(ctx)
 	if err != nil {
@@ -564,11 +564,11 @@ func (m *Manager) FunctionImageTags(ctx context.Context, name string) ([]string,
 
 // RemoveImagesExcept removes every Relay-owned image NOT in the keep set. keep
 // maps full image references (exactly what ImageRef produces) to true. It is the
-// conservative startup sweep: after functions are loaded and prepared, the keep
-// set holds (a) each current function's expected ImageRef for its fingerprint
+// conservative startup sweep: after apps are loaded and prepared, the keep
+// set holds (a) each current app's expected ImageRef for its fingerprint
 // and (b) the last-active image recorded in state (so a recovery mid-swap never
 // removes the version that may still serve). Everything Relay-owned outside keep
-// — superseded versions of existing functions and versions of functions removed
+// — superseded versions of existing apps and versions of apps removed
 // while the worker was down — is retired. The sweep is double-defensive: the
 // keep-set covers the known-referenced images up front, and RemoveImage's
 // container-reference guard covers the transitional case where a container still
@@ -593,7 +593,7 @@ func (m *Manager) RemoveImagesExcept(ctx context.Context, keep map[string]bool) 
 					// An admitted lease (a build/execution/publication still in
 					// flight), a container still references this image, or the
 					// manager began shutting down. This is expected during the
-					// sweep; the owning function's reconcile retires it on a
+					// sweep; the owning app's reconcile retires it on a
 					// later pass. Log at debug and leave it.
 					m.log.Debug("Image cleanup: image still in use; skipping", "image", tag)
 					continue

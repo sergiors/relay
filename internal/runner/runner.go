@@ -13,7 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
+	eventmatch "relay/internal/event"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/secrets"
@@ -28,7 +29,7 @@ import (
 const DefaultMaxConcurrency = 8
 
 // slotWaitTimeout bounds how long Handle waits for a free concurrency slot
-// (global or per-function) before giving up. It is deliberately well below the
+// (global or per-app) before giving up. It is deliberately well below the
 // stream layer's default MinPendingIdle reclaim threshold (1m): if slots never
 // free within the wait, Handle returns ErrInvocationNotEligible and the message
 // stays pending, so reclaim replays it later — and locally buffered events never
@@ -39,17 +40,17 @@ const slotWaitTimeout = 30 * time.Second
 // Manual-invocation sentinel errors. They let the worker socket map a manual
 // invocation failure onto a stable wire code without inspecting error strings
 // (see internal/worker/socket.go). They are returned (wrapped) by
-// Runner.InvokeFunction.
+// Runner.InvokeApp.
 var (
-	// ErrFunctionNotFound reports a manual invocation for a function that is
+	// ErrAppNotFound reports a manual invocation for an app that is
 	// absent from the current registry (never loaded, or already removed).
-	ErrFunctionNotFound = errors.New("function not found")
-	// ErrFunctionUnavailable reports a manual invocation for a function that is
+	ErrAppNotFound = errors.New("app not found")
+	// ErrAppUnavailable reports a manual invocation for an app that is
 	// registered but not runnable (its image could not be built at
 	// startup/reconcile, so it has no Prepared handle).
-	ErrFunctionUnavailable = errors.New("function unavailable")
+	ErrAppUnavailable = errors.New("app unavailable")
 	// ErrHandlerNotFound reports a DLQ replay whose handler is no longer present
-	// in the function's CURRENT template (an intentional configuration change).
+	// in the app's CURRENT template (an intentional configuration change).
 	// The worker socket maps it onto a stable wire code and the CLI keeps the
 	// DLQ entry.
 	ErrHandlerNotFound = errors.New("handler not found")
@@ -86,7 +87,7 @@ const (
 )
 
 // Executor is the subset of the runtime Manager that invocations need. It is a
-// small interface so Handle and PreparedFunction construction can be exercised
+// small interface so Handle and PreparedApp construction can be exercised
 // in tests without a Docker daemon; the concrete *runtime.Manager satisfies it.
 type Executor interface {
 	Execute(
@@ -98,55 +99,55 @@ type Executor interface {
 	) error
 }
 
-// Registry holds the current set of prepared functions behind a lock so swaps
+// Registry holds the current set of prepared apps behind a lock so swaps
 // are atomic: Handle takes one snapshot per call and keeps it for the whole
 // invocation, so an in-flight execution never sees a half-replaced set. It is
-// exported so the reconciler can swap functions live from its own package.
+// exported so the reconciler can swap apps live from its own package.
 //
-// Alongside the function slice the registry owns an immutable candidate index
-// (function.RuleIndex) per published function, rebuilt in the SAME locked
+// Alongside the app slice the registry owns an immutable candidate index
+// (eventmatch.RuleIndex) per published app, rebuilt in the SAME locked
 // mutation as the slice. The two are published together, so a snapshot can never
-// observe a function set from one generation and an index from another. The
+// observe an app set from one generation and an index from another. The
 // index is a false-positive-only prefilter: it only narrows which rules are
 // exact-tested, and the exact matcher remains the authority on every candidate.
 type Registry struct {
 	mu  sync.RWMutex
-	fns []*PreparedFunction
-	// ruleIdx maps each published function to its immutable candidate index,
-	// built from that function's CURRENT template events. Both available and
-	// unavailable entries are indexed: an unavailable function must still be
+	fns []*PreparedApp
+	// ruleIdx maps each published app to its immutable candidate index,
+	// built from that app's CURRENT template events. Both available and
+	// unavailable entries are indexed: an unavailable app must still be
 	// classified as matching (it is never DLQ'd for unavailability alone). A
 	// hand-built entry with a nil template has no entry and falls back to a full
 	// exact scan. The map is replaced wholesale on every mutation (never mutated
 	// in place), so a snapshot's shared reference stays immutable.
-	ruleIdx map[*PreparedFunction]*function.RuleIndex
+	ruleIdx map[*PreparedApp]*eventmatch.RuleIndex
 }
 
-// buildRuleIndex derives the per-function candidate index from the current
+// buildRuleIndex derives the per-app candidate index from the current
 // prepared set. It is called while the registry lock is held, immediately after
-// the function slice is updated, so the index and the slice share one generation.
+// the app slice is updated, so the index and the slice share one generation.
 // Entries whose template is nil (only reachable from a hand-built value, never
 // the loader) are omitted; matching falls back to a full exact scan for them.
-func buildRuleIndex(fns []*PreparedFunction) map[*PreparedFunction]*function.RuleIndex {
+func buildRuleIndex(fns []*PreparedApp) map[*PreparedApp]*eventmatch.RuleIndex {
 	if len(fns) == 0 {
 		return nil
 	}
-	out := make(map[*PreparedFunction]*function.RuleIndex, len(fns))
+	out := make(map[*PreparedApp]*eventmatch.RuleIndex, len(fns))
 	for _, pf := range fns {
 		if pf == nil || pf.fn.Template == nil {
 			continue
 		}
-		out[pf] = function.NewRuleIndex(pf.fn.Template.Events)
+		out[pf] = eventmatch.NewRuleIndex(pf.fn.Template.Events)
 	}
 	return out
 }
 
-func (r *Registry) snapshot() []*PreparedFunction {
+func (r *Registry) snapshot() []*PreparedApp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	// Copy the slice header only; the underlying elements are immutable once
 	// published, so in-flight Handles keep using the snapshot even if Swap runs.
-	return append([]*PreparedFunction(nil), r.fns...)
+	return append([]*PreparedApp(nil), r.fns...)
 }
 
 // pinnedSnapshot is a snapshot of the registry whose published images are
@@ -154,22 +155,22 @@ func (r *Registry) snapshot() []*PreparedFunction {
 // lock protected the current entry. The pins are held until release is called,
 // so an image published at snapshot time cannot be removed out from under the
 // snapshot even if the entry is superseded immediately after. The pins are
-// SHARES of each entry's publication lease (see PreparedFunction.lease), so
+// SHARES of each entry's publication lease (see PreparedApp.lease), so
 // admitting them is always allowed — even while the image is retiring — because
 // the work was admitted before retirement.
 type pinnedSnapshot struct {
-	fns  []*PreparedFunction
-	pins map[*PreparedFunction]*runtime.ImageLease
+	fns  []*PreparedApp
+	pins map[*PreparedApp]*runtime.ImageLease
 	// ruleIdx is the candidate index generation published WITH fns, captured
 	// under the same read lock. It is shared immutably, so one Handle consumes
 	// exactly one index generation for the whole delivery.
-	ruleIdx map[*PreparedFunction]*function.RuleIndex
+	ruleIdx map[*PreparedApp]*eventmatch.RuleIndex
 }
 
 // rulesFor returns the immutable candidate index bound to pf in this snapshot's
 // generation, or nil when pf has no index (a nil-template entry), in which case
 // the caller must fall back to a full exact scan.
-func (s *pinnedSnapshot) rulesFor(pf *PreparedFunction) *function.RuleIndex {
+func (s *pinnedSnapshot) rulesFor(pf *PreparedApp) *eventmatch.RuleIndex {
 	if s == nil || s.ruleIdx == nil {
 		return nil
 	}
@@ -182,20 +183,20 @@ func (s *pinnedSnapshot) rulesFor(pf *PreparedFunction) *function.RuleIndex {
 // otherwise — a nil template, only reachable from a hand-built value — it falls
 // back to a full exact scan. Both paths are bound to the snapshot's generation,
 // so every match decision in one Handle call comes from one index generation.
-func (s *pinnedSnapshot) matchingRules(pf *PreparedFunction, event map[string]any) []function.EventRule {
+func (s *pinnedSnapshot) matchingRules(pf *PreparedApp, event map[string]any) []app.EventRule {
 	if ix := s.rulesFor(pf); ix != nil {
 		return ix.MatchingEventRules(event)
 	}
 	if pf == nil || pf.fn.Template == nil {
 		return nil
 	}
-	return pf.fn.Template.MatchingEventRules(event)
+	return eventmatch.MatchingEventRules(pf.fn.Template.Events, event)
 }
 
 // pinFor returns the shared publication lease pinning pf's image for this
-// snapshot, or nil (an unavailable function, a no-runtime function, or a
+// snapshot, or nil (an unavailable app, a no-runtime app, or a
 // hand-built test value).
-func (s *pinnedSnapshot) pinFor(pf *PreparedFunction) *runtime.ImageLease {
+func (s *pinnedSnapshot) pinFor(pf *PreparedApp) *runtime.ImageLease {
 	if s == nil {
 		return nil
 	}
@@ -223,8 +224,8 @@ func (r *Registry) snapshotPinned() *pinnedSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := &pinnedSnapshot{
-		fns:     append([]*PreparedFunction(nil), r.fns...),
-		pins:    make(map[*PreparedFunction]*runtime.ImageLease, len(r.fns)),
+		fns:     append([]*PreparedApp(nil), r.fns...),
+		pins:    make(map[*PreparedApp]*runtime.ImageLease, len(r.fns)),
 		ruleIdx: r.ruleIdx,
 	}
 	for _, pf := range out.fns {
@@ -235,12 +236,12 @@ func (r *Registry) snapshotPinned() *pinnedSnapshot {
 	return out
 }
 
-// getByNamePinned returns the prepared function for name PLUS a shared pin of
+// getByNamePinned returns the prepared app for name PLUS a shared pin of
 // its published image, acquired while the registry lock protects the entry. The
 // caller must release the returned lease (nil-safe) when done. It is the
 // execution-path lookup (schedule/manual) so those paths hold the image pin
 // through matching, slot waits, and handler completion.
-func (r *Registry) getByNamePinned(name string) (*PreparedFunction, *runtime.ImageLease) {
+func (r *Registry) getByNamePinned(name string) (*PreparedApp, *runtime.ImageLease) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, pf := range r.fns {
@@ -251,15 +252,15 @@ func (r *Registry) getByNamePinned(name string) (*PreparedFunction, *runtime.Ima
 	return nil, nil
 }
 
-// Set replaces the entire registry contents in one atomic step. Functions are
+// Set replaces the entire registry contents in one atomic step. Apps are
 // kept sorted by name so iteration order (and Names) is deterministic. The
 // publication lease of every superseded entry is released AFTER the swap, once
 // the new set is visible, so a snapshot taken before the swap still holds the
 // old entry's pin and a snapshot taken after holds the new entry's.
-func (r *Registry) Set(fns []*PreparedFunction) {
+func (r *Registry) Set(fns []*PreparedApp) {
 	r.mu.Lock()
 	old := r.fns
-	r.fns = append([]*PreparedFunction(nil), fns...)
+	r.fns = append([]*PreparedApp(nil), fns...)
 	sortFn(r.fns)
 	// Rebuild the candidate index in the same locked step as the slice, so a
 	// snapshot either sees both from the old generation or both from the new one.
@@ -269,13 +270,13 @@ func (r *Registry) Set(fns []*PreparedFunction) {
 }
 
 // Replace swaps the entry for name, adding it if absent. A nil pf removes the
-// entry (used when a function directory disappears). The slice stays name-sorted.
+// entry (used when an app directory disappears). The slice stays name-sorted.
 // The superseded entry's publication lease is released AFTER the swap, so any
 // snapshot that pinned it before the swap keeps the image admitted until that
 // snapshot's work drains.
-func (r *Registry) Replace(name string, pf *PreparedFunction) {
+func (r *Registry) Replace(name string, pf *PreparedApp) {
 	r.mu.Lock()
-	var superseded *PreparedFunction
+	var superseded *PreparedApp
 	replaced := false
 	for i, cur := range r.fns {
 		if cur.fn.Name == name {
@@ -301,7 +302,7 @@ func (r *Registry) Replace(name string, pf *PreparedFunction) {
 	// shared index immutable.
 	r.ruleIdx = buildRuleIndex(r.fns)
 	r.mu.Unlock()
-	// A function replacement supersedes only the old entry; an add/remove
+	// An app replacement supersedes only the old entry; an add/remove
 	// supersedes only the removed entry.
 	if superseded != nil && superseded != pf {
 		superseded.ReleasePublication()
@@ -311,11 +312,11 @@ func (r *Registry) Replace(name string, pf *PreparedFunction) {
 // releaseSuperseded releases the publication leases of the old entries that are
 // not present in the new set. An entry kept by pointer (unchanged) is not
 // released; a replaced entry is released by Replace directly.
-func releaseSuperseded(old, next []*PreparedFunction) {
+func releaseSuperseded(old, next []*PreparedApp) {
 	if len(old) == 0 {
 		return
 	}
-	keep := make(map[*PreparedFunction]bool, len(next))
+	keep := make(map[*PreparedApp]bool, len(next))
 	for _, pf := range next {
 		keep[pf] = true
 	}
@@ -326,15 +327,15 @@ func releaseSuperseded(old, next []*PreparedFunction) {
 	}
 }
 
-// sortFn orders the registry by function name so Names() and iteration are
-// deterministic regardless of the order functions were discovered or swapped in.
-func sortFn(fns []*PreparedFunction) {
+// sortFn orders the registry by app name so Names() and iteration are
+// deterministic regardless of the order apps were discovered or swapped in.
+func sortFn(fns []*PreparedApp) {
 	sort.Slice(fns, func(i, j int) bool { return fns[i].fn.Name < fns[j].fn.Name })
 }
 
-// GetByName returns the prepared function for the given name, or nil if absent,
+// GetByName returns the prepared app for the given name, or nil if absent,
 // without disturbing the running snapshot.
-func (r *Registry) GetByName(name string) *PreparedFunction {
+func (r *Registry) GetByName(name string) *PreparedApp {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, pf := range r.fns {
@@ -345,7 +346,7 @@ func (r *Registry) GetByName(name string) *PreparedFunction {
 	return nil
 }
 
-// Names returns a snapshot of the currently registered function names, so the
+// Names returns a snapshot of the currently registered app names, so the
 // reconciler can enumerate what is active without pinning the whole slice.
 func (r *Registry) Names() []string {
 	r.mu.RLock()
@@ -358,9 +359,9 @@ func (r *Registry) Names() []string {
 }
 
 // Orchestrates the flow: for each decoded event it evaluates all loaded
-// functions and, for every matching rule, executes the corresponding handler in
+// apps and, for every matching rule, executes the corresponding handler in
 // a container. It contains no Redis, matcher, or docker details; execution is
-// delegated to the runtime executor. The function set is an atomic snapshot so
+// delegated to the runtime executor. The app set is an atomic snapshot so
 // it can be reconciled (swapped) live without disrupting in-flight invocations.
 type Runner struct {
 	reg     *Registry
@@ -368,7 +369,7 @@ type Runner struct {
 	metrics *metrics.Registry
 	// refs tracks which relay images are currently executing and which have been
 	// retired but cannot be removed yet. It is what lets the runner retire
-	// superseded function versions without interrupting an in-flight execution
+	// superseded app versions without interrupting an in-flight execution
 	// (see ImageInUse / RetireImage).
 	refs *imageRefCounter
 	// cleaner resolves to the optional image lifecycle capability of the
@@ -411,9 +412,9 @@ type Runner struct {
 	// concurrent Handle calls reading it: readers get either the old or the new
 	// semaphore, both of which are internally consistent.
 	globalSem atomic.Pointer[semaphore]
-	// fnSems is a mutex-protected map of per-function semaphores, keyed by
-	// function name and created on demand. A function's semaphore is RESIZED by
-	// replacing its pointer when the function's resolved template concurrency
+	// fnSems is a mutex-protected map of per-app semaphores, keyed by
+	// app name and created on demand. An app's semaphore is RESIZED by
+	// replacing its pointer when the app's resolved template concurrency
 	// changes (see concurrencySems), so a hot-swapped concurrency takes effect
 	// without a restart. In-flight acquisitions release to the semaphore pointer
 	// they captured, so replacing the map entry never strands a held slot.
@@ -460,7 +461,7 @@ var defaultImageCleanupRetryDelays = []time.Duration{
 }
 
 // ImageCleaner is the subset of the runtime Manager that image retirement
-// needs. It is a small interface so the runner can retire superseded function
+// needs. It is a small interface so the runner can retire superseded app
 // images without depending on the runtime package concretely; test fakes that
 // do not implement it simply yield a nil cleaner (no retirement).
 // ContainerInvalidator is the optional capability of the runtime executor
@@ -486,55 +487,55 @@ type ImageCleaner interface {
 	// references an image before removing it, and to decide (conservatively) how
 	// to interpret a RemoveImage failure.
 	ImageReferencedByManagedContainer(ctx context.Context, image string) (bool, error)
-	// FunctionImageTags lists every local image tag (full references) belonging
-	// to a function's repository, so the runner can retire each version with
+	// AppImageTags lists every local image tag (full references) belonging
+	// to an app's repository, so the runner can retire each version with
 	// in-flight safety.
-	FunctionImageTags(ctx context.Context, name string) ([]string, error)
+	AppImageTags(ctx context.Context, name string) ([]string, error)
 	// CleanupUnusedDependencies removes managed dependency images no managed
-	// function image references anymore. Lifecycle-driven: call it after a
-	// managed function image was successfully removed, so a dependency layer
-	// whose last referencing function version just disappeared is pruned. It is
+	// app image references anymore. Lifecycle-driven: call it after a
+	// managed app image was successfully removed, so a dependency layer
+	// whose last referencing app version just disappeared is pruned. It is
 	// best-effort and must not affect the outcome of the removal that preceded
 	// it.
 	CleanupUnusedDependencies(ctx context.Context) (int, error)
 }
 
-// Pairs a loaded function with its prepared image and the executor used to run
-// invocations. A function whose image could not be built is marked unavailable
+// Pairs a loaded app with its prepared image and the executor used to run
+// invocations. An app whose image could not be built is marked unavailable
 // and skipped during execution.
-type PreparedFunction struct {
-	fn        function.Function
+type PreparedApp struct {
+	fn        app.App
 	prepared  *runtime.Prepared
 	executor  Executor
 	available bool
-	// lease is the publication lease for this function's image: the admitted
-	// reference transferred from Prepared when the function is published into
+	// lease is the publication lease for this app's image: the admitted
+	// reference transferred from Prepared when the app is published into
 	// the registry. It is owned by the registry entry and released when the
 	// entry is superseded or removed (after the swap), so a published image
 	// stays admitted for as long as it is published and can never be removed
-	// while the registry still serves it. Nil for unavailable functions,
-	// hand-built test values, and no-runtime functions.
+	// while the registry still serves it. Nil for unavailable apps,
+	// hand-built test values, and no-runtime apps.
 	lease *runtime.ImageLease
 }
 
-func (p *PreparedFunction) Name() string {
+func (p *PreparedApp) Name() string {
 	return p.fn.Name
 }
 
-func (p *PreparedFunction) Function() function.Function {
+func (p *PreparedApp) App() app.App {
 	return p.fn
 }
 
-// Prepared returns the built image handle, or nil for an unavailable function.
-func (p *PreparedFunction) Prepared() *runtime.Prepared {
+// Prepared returns the built image handle, or nil for an unavailable app.
+func (p *PreparedApp) Prepared() *runtime.Prepared {
 	return p.prepared
 }
 
-// ReleasePublication drops this function's publication lease, if any. It is
+// ReleasePublication drops this app's publication lease, if any. It is
 // idempotent and nil-safe. The registry calls it when the entry is superseded;
-// a caller that builds a PreparedFunction but never publishes it must call it
+// a caller that builds a PreparedApp but never publishes it must call it
 // to avoid stranding the image.
-func (p *PreparedFunction) ReleasePublication() {
+func (p *PreparedApp) ReleasePublication() {
 	if p == nil || p.lease == nil {
 		return
 	}
@@ -545,7 +546,7 @@ func (p *PreparedFunction) ReleasePublication() {
 // a registry snapshot can pin the published image for the duration of its work
 // even if the entry is superseded concurrently. It is nil when the entry has no
 // publication lease (unavailable/no-runtime/test values).
-func (p *PreparedFunction) sharePublication() *runtime.ImageLease {
+func (p *PreparedApp) sharePublication() *runtime.ImageLease {
 	if p == nil || p.lease == nil {
 		return nil
 	}
@@ -553,22 +554,22 @@ func (p *PreparedFunction) sharePublication() *runtime.ImageLease {
 }
 
 // SharePublication is the exported form of sharePublication: it admits a
-// shared reference to this function's published image, held until the caller
+// shared reference to this app's published image, held until the caller
 // releases it. It is used by the worker's startup service enqueue, which
-// publishes a function's initial desired service state with the function's own
+// publishes an app's initial desired service state with the app's own
 // publication lease shared so a concurrent retirement cannot remove the image
 // while the service pass converges. A nil result means no Relay-owned image
-// (unavailable/no-runtime function, or a hand-built test value).
-func (p *PreparedFunction) SharePublication() *runtime.ImageLease {
+// (unavailable/no-runtime app, or a hand-built test value).
+func (p *PreparedApp) SharePublication() *runtime.ImageLease {
 	return p.sharePublication()
 }
 
 func NewPrepared(
-	fn function.Function,
+	fn app.App,
 	prepared *runtime.Prepared,
 	executor Executor,
-) *PreparedFunction {
-	pf := &PreparedFunction{
+) *PreparedApp {
+	pf := &PreparedApp{
 		fn:        fn,
 		prepared:  prepared,
 		executor:  executor,
@@ -585,21 +586,21 @@ func NewPrepared(
 	return pf
 }
 
-// NewUnavailable wraps a function whose image could not be built so the runner
-// can skip it without losing the function's identity.
-func NewUnavailable(fn function.Function) *PreparedFunction {
-	return &PreparedFunction{fn: fn, available: false}
+// NewUnavailable wraps an app whose image could not be built so the runner
+// can skip it without losing the app's identity.
+func NewUnavailable(fn app.App) *PreparedApp {
+	return &PreparedApp{fn: fn, available: false}
 }
 
-// New creates a Runner over the given prepared functions. Each invocation is
+// New creates a Runner over the given prepared apps. Each invocation is
 // bounded by the matching rule's own timeout. Metrics are nil (disabled).
-func New(prepared []*PreparedFunction, logger *slog.Logger) *Runner {
+func New(prepared []*PreparedApp, logger *slog.Logger) *Runner {
 	return NewWithMetrics(prepared, logger, nil)
 }
 
 // NewWithMetrics is like New but wires an optional metrics registry. A nil
 // registry is safe: every metric call is a no-op.
-func NewWithMetrics(prepared []*PreparedFunction, logger *slog.Logger, registry *metrics.Registry) *Runner {
+func NewWithMetrics(prepared []*PreparedApp, logger *slog.Logger, registry *metrics.Registry) *Runner {
 	r := &Runner{
 		reg:                     &Registry{},
 		log:                     logger,
@@ -629,7 +630,7 @@ func (r *Runner) imageRemovedIdle(image string) {
 }
 
 // Registry exposes the runner's mutable snapshot set so the reconciler can swap
-// functions live without round-tripping through New.
+// apps live without round-tripping through New.
 func (r *Runner) Registry() *Registry { return r.reg }
 
 // SetHostname sets this worker's container-ownership hostname, stamped as the
@@ -743,27 +744,27 @@ func (r *Runner) RetireImage(image string) {
 	}
 }
 
-// RemoveFunctionImages retires every local version of a function's images so
-// that, once idle, each is removed. It is the function-removal path: the
-// reconciler calls it when a function directory vanishes, and all of its version
+// RemoveAppImages retires every local version of an app's images so
+// that, once idle, each is removed. It is the app-removal path: the
+// reconciler calls it when an app directory vanishes, and all of its version
 // images become garbage. A nil cleaner makes this a no-op.
-func (r *Runner) RemoveFunctionImages(name string) {
+func (r *Runner) RemoveAppImages(name string) {
 	cleaner := r.resolver()
 	if cleaner == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	tags, err := cleaner.FunctionImageTags(ctx, name)
+	tags, err := cleaner.AppImageTags(ctx, name)
 	if err != nil {
 		// Manager shutdown is a terminal deferral for this worker: the images are
 		// left for the next boot's natural cleanup pass. It is not a genuine
 		// failure, so it is a debug deferral, not a Warn.
 		if errors.Is(err, runtime.ErrManagerShuttingDown) {
-			r.log.Debug("Image cleanup: manager shutting down; deferring function image listing", "function", name)
+			r.log.Debug("Image cleanup: manager shutting down; deferring app image listing", "app", name)
 			return
 		}
-		r.log.Warn("Image cleanup: list function versions failed", "function", name, "error", err)
+		r.log.Warn("Image cleanup: list app versions failed", "app", name, "error", err)
 		return
 	}
 	for _, tag := range tags {
@@ -870,14 +871,14 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 			return
 		}
 
-		// The function image was successfully removed. This is the lifecycle
-		// moment a dependency layer may become orphaned: the removed function
+		// The app image was successfully removed. This is the lifecycle
+		// moment a dependency layer may become orphaned: the removed app
 		// image was the only reference to its dependency, so run dependency GC
-		// now to prune any layer no managed function image references anymore.
+		// now to prune any layer no managed app image references anymore.
 		// It is best-effort: a failure here (a genuine daemon error) is worth a
-		// Warn — it retries on the next natural pass after the next function-image
+		// Warn — it retries on the next natural pass after the next app-image
 		// removal or at the next startup — and must NOT affect the outcome of the
-		// removal that already succeeded. The function image's own removal (and
+		// removal that already succeeded. The app image's own removal (and
 		// this GC) both proceed off the event path in this same goroutine, and the
 		// reconciler pump is serial with this retire hook, so this cannot race a
 		// build that FROM the dependency.
@@ -896,7 +897,7 @@ func (r *Runner) retryImageCleanupAttempt(image string, cleaner ImageCleaner, de
 // skipAndRetryImageCleanup logs a debug-level skip and schedules the next
 // removal attempt with bounded backoff (delays is the per-chain snapshot), or —
 // on the final attempt — logs a single Info deferring the image to a later natural
-// cleanup pass (boot sweep, the next rebuild's retire, or function-removal
+// cleanup pass (boot sweep, the next rebuild's retire, or app-removal
 // retirement). It is context-free and off the event path.
 func (r *Runner) skipAndRetryImageCleanup(image string, delays []time.Duration, reason string, attempt *int) {
 	r.log.Debug("Image cleanup: image still in use; skipping", "image", image, "reason", reason)
@@ -911,10 +912,10 @@ func (r *Runner) skipAndRetryImageCleanup(image string, delays []time.Duration, 
 	})
 }
 
-// toImage returns the image a prepared function executes, or "" when it is
+// toImage returns the image a prepared app executes, or "" when it is
 // unavailable/nil so refcount and retirement stay nil-safe for fake and
 // unavailable paths.
-func toImage(pf *PreparedFunction) string {
+func toImage(pf *PreparedApp) string {
 	if pf == nil || pf.prepared == nil {
 		return ""
 	}
@@ -922,7 +923,7 @@ func toImage(pf *PreparedFunction) string {
 }
 
 // executeWithRefs runs one rule's handler while holding a reference to the
-// function's image for the duration of the invocation, so a concurrent
+// app's image for the duration of the invocation, so a concurrent
 // RetireImage cannot remove the image an in-flight execution still needs
 // (at-least-once safety). The release is deferred so it runs even if the
 // executor panics; the helper is called per rule so the defer scope is
@@ -932,10 +933,10 @@ func toImage(pf *PreparedFunction) string {
 // lease is the snapshot's admitted publication lease pinning the image; it is
 // attached to the execution context so Manager.Execute executes under that
 // admitted authority rather than acquiring a fresh (possibly rejected) lease. A
-// nil lease (fake executors, no-runtime functions, test values) leaves the
+// nil lease (fake executors, no-runtime apps, test values) leaves the
 // context unchanged and lets Execute acquire its own.
 func (r *Runner) executeWithRefs(
-	pf *PreparedFunction,
+	pf *PreparedApp,
 	invokeCtx context.Context,
 	handler string,
 	eventJSON []byte,
@@ -952,20 +953,20 @@ func (r *Runner) executeWithRefs(
 }
 
 // semaphore is a channel-based counting semaphore that bounds how many
-// invocations may execute concurrently (globally or per function). acquireReserve
+// invocations may execute concurrently (globally or per app). acquireReserve
 // blocks up to slotWaitTimeout for a free slot, returning false on timeout (the
-// invocation is left pending and reclaimed later). A per-function semaphore is
-// REPLACED (not mutated) when the function's resolved concurrency changes, so an
+// invocation is left pending and reclaimed later). A per-app semaphore is
+// REPLACED (not mutated) when the app's resolved concurrency changes, so an
 // in-flight acquisition still releases to the semaphore pointer it captured
 // while new acquisitions use the resized one; the global semaphore is rebuilt by
 // SetMaxConcurrency.
 //
-// The per-function semaphore is the ONLY per-function invocation limiter: the
+// The per-app semaphore is the ONLY per-app invocation limiter: the
 // runtime's warm container pool is sized from the same effective concurrency
 // (template concurrency clipped to MAX_CONCURRENCY), so the semaphore always
 // admits no more concurrent Execute calls than the pool has containers, and the
 // pool never blocks in the runner path. The global semaphore is the broader cap
-// shared across functions.
+// shared across apps.
 type semaphore struct {
 	slots chan struct{}
 	// capacity is the limit the channel was created with. It is immutable and
@@ -1007,10 +1008,10 @@ func (s *semaphore) release() {
 	<-s.slots
 }
 
-// concurrencySems returns the global and per-function semaphores for the given
-// function. The function's semaphore is created on demand and RESIZED in place
+// concurrencySems returns the global and per-app semaphores for the given
+// app. The app's semaphore is created on demand and RESIZED in place
 // (by replacing the map entry with a freshly sized semaphore) whenever the
-// function's resolved concurrency differs from the installed one. Replacement
+// app's resolved concurrency differs from the installed one. Replacement
 // rather than channel mutation is deliberate: an in-flight acquisition holds
 // the OLD pointer and releases to it, so shrinking can never block a release on
 // a full new channel nor lose a slot, and no held slot is ever stranded. The
@@ -1021,7 +1022,7 @@ func (s *semaphore) release() {
 // holding an older snapshot cannot resize the semaphore backwards after a newer
 // snapshot already applied a larger bound. The resolved value is additionally
 // clipped to the worker-global MAX_CONCURRENCY (see effectiveConcurrency), so a
-// function asking for more than the global cap never gets a per-function
+// app asking for more than the global cap never gets a per-app
 // semaphore larger than the global one — and the runtime's warm-pool bound,
 // also clipped to the cap, agrees with it.
 func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *semaphore, fn *semaphore) {
@@ -1051,8 +1052,8 @@ func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *sema
 	return global, s
 }
 
-// currentConcurrency returns fnName's current resolved per-function concurrency
-// from the registry, falling back to fallback when the function is absent or has
+// currentConcurrency returns fnName's current resolved per-app concurrency
+// from the registry, falling back to fallback when the app is absent or has
 // no parsed template. It makes a semaphore resize authoritative to the latest
 // published template rather than a caller's possibly-stale registry snapshot.
 func (r *Runner) currentConcurrency(fnName string, fallback int) int {
@@ -1065,20 +1066,20 @@ func (r *Runner) currentConcurrency(fnName string, fallback int) int {
 	return fallback
 }
 
-// effectiveConcurrency returns the per-function semaphore capacity for fnName:
+// effectiveConcurrency returns the per-app semaphore capacity for fnName:
 // its current resolved template concurrency clipped to the worker-global
 // MAX_CONCURRENCY. Clipping matters when the template asks for more than the
-// global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8): the per-function
+// global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8): the per-app
 // semaphore is then sized to the cap, matching the runtime's effective warm-pool
 // bound, so the pool and the semaphore never disagree. A zero/negative template
-// value falls back to function.DefaultConcurrency; a zero maxConcurrency (a
+// value falls back to app.DefaultConcurrency; a zero maxConcurrency (a
 // zero-valued Runner in tests) falls back to DefaultMaxConcurrency, never
 // "uncapped". The global value is read fresh, so a SetMaxConcurrency call is
-// reflected on the next acquisition (which resizes the function's semaphore).
+// reflected on the next acquisition (which resizes the app's semaphore).
 func (r *Runner) effectiveConcurrency(fnName string, fallback int) int {
 	n := r.currentConcurrency(fnName, fallback)
 	if n < 1 {
-		n = function.DefaultConcurrency
+		n = app.DefaultConcurrency
 	}
 	limit := int(r.maxConcurrency.Load())
 	if limit < 1 {
@@ -1090,19 +1091,19 @@ func (r *Runner) effectiveConcurrency(fnName string, fallback int) int {
 	return n
 }
 
-// RemoveFunctionSemaphore drops a function's per-function semaphore. It is
-// called when the function is removed from the registry, so a later recreation
+// RemoveAppSemaphore drops an app's per-app semaphore. It is
+// called when the app is removed from the registry, so a later recreation
 // of the same name starts from a fresh semaphore rather than inheriting a stale
-// bound (and so a removed function's map entry does not linger). In-flight
+// bound (and so a removed app's map entry does not linger). In-flight
 // acquisitions still release to the pointer they captured. The constructor
 // guarantees a non-nil Runner.
-func (r *Runner) RemoveFunctionSemaphore(fnName string) {
+func (r *Runner) RemoveAppSemaphore(fnName string) {
 	r.fnSemsMu.Lock()
 	delete(r.fnSems, fnName)
 	r.fnSemsMu.Unlock()
 }
 
-// reserveSlots acquires both the global and per-function slots for one
+// reserveSlots acquires both the global and per-app slots for one
 // invocation, counting a concurrency_waits_total whenever either slot was not
 // immediately free (the acquisition had to block). It returns a release func on
 // success (call it after the invocation, releasing both slots and the in-flight
@@ -1124,9 +1125,9 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 		return nil, waited
 	}
 
-	// Then the per-function slot. A blocked acquire also counts a wait. If the
-	// per-function slot never frees, release the global slot so it does not
-	// leak to another function's wait.
+	// Then the per-app slot. A blocked acquire also counts a wait. If the
+	// per-app slot never frees, release the global slot so it does not
+	// leak to another app's wait.
 	got, w = fn.acquire(ctx, r.slotWait)
 	if w {
 		r.metrics.Inc(metrics.MetricConcurrencyWaits)
@@ -1158,7 +1159,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 }
 
 // runInvocation runs one rule's handler while holding a reference to the
-// function's image for the duration of the invocation, converting an
+// app's image for the duration of the invocation, converting an
 // executor/runtime panic into a failed-attempt error instead of letting it
 // escape Handle and kill the worker. This is the single panic boundary for
 // message processing: panics inside executor/runtime code are a misbehaving
@@ -1172,7 +1173,7 @@ func (r *Runner) reserveSlots(ctx context.Context, fnName string, fnConcurrency 
 // panic unwinding BEFORE the recover here, so the image reference is never
 // leaked; the returned panic value is logged by the caller.
 func (r *Runner) runInvocation(
-	pf *PreparedFunction,
+	pf *PreparedApp,
 	invokeCtx context.Context,
 	cancel context.CancelFunc,
 	handler string,
@@ -1224,7 +1225,7 @@ func (r *Runner) runInvocation(
 	return false, nil, r.executeWithRefs(pf, spanCtx, handler, eventJSON, extraEnv, lease)
 }
 
-// Handle evaluates the event against all loaded functions and executes every
+// Handle evaluates the event against all loaded apps and executes every
 // matching rule's handler. It returns nil only when every invocation succeeded
 // (or nothing matched); otherwise it returns an error so the stream layer does
 // not acknowledge the message.
@@ -1240,7 +1241,7 @@ func (r *Runner) runInvocation(
 // complete, and the handlers must stay idempotent.
 //
 // Aggregate, per-invocation semantics: a single Redis message can match multiple
-// "<function>/<handler>" invocations, and each is tracked independently in the
+// "<app>/<handler>" invocations, and each is tracked independently in the
 // per-message invocation-state hash. Every eligible matching invocation gets its
 // own attempt on each delivery regardless of the others' outcomes: a failure in one
 // handler does NOT prevent later matching handlers from running. The rule loop is
@@ -1250,13 +1251,13 @@ func (r *Runner) runInvocation(
 //
 // Invocation state: when the stream layer injects an InvocationState into ctx
 // (see stream.WithInvocationState), Handle skips any matching invocation whose
-// "<function>/<handler>" ID is already recorded as completed on a previous
+// "<app>/<handler>" ID is already recorded as completed on a previous
 // delivery, is protected by an active attempt deadline or a retry backoff (a
 // running or next_attempt_at marker whose persisted deadline has not yet passed
 // — this or another replica may be executing it, or it is waiting out its
 // backoff), or is exhausted (terminal). Skipped invocations are not executions:
-// they do not touch the handler_* or function_handler_* metrics.
-// function_events_matched_total still counts the function as engaged (it
+// they do not touch the handler_* or function_* metrics.
+// app_events_matched_total still counts the app as engaged (it
 // matched), which is attribution, not execution counting. When no invocation
 // state is present (direct Handle callers/tests, or invocation tracking
 // disabled) Handle behaves exactly as before: it runs every matching handler
@@ -1267,13 +1268,13 @@ func (r *Runner) runInvocation(
 //   - a plain (retryable) error when any matched invocation had a retryable
 //     failure this delivery — regardless of other invocations' outcomes — so
 //     the message stays pending and is retried. The first such error is returned.
-//   - a wrapped runner.ErrFunctionUnavailable when at least one MATCHED
-//     invocation belongs to a configured function whose image is not currently
+//   - a wrapped runner.ErrAppUnavailable when at least one MATCHED
+//     invocation belongs to a configured app whose image is not currently
 //     built and that invocation has not already completed. Such an event is
 //     MATCHED, never unmatched, but the invocation cannot run this delivery: the
 //     message stays pending (not ACKed, and not DLQ'd solely for
 //     unavailability). No handler attempt is claimed and no handler counter is
-//     touched, because no handler ran. A later delivery — once the function is
+//     touched, because no handler ran. A later delivery — once the app is
 //     rebuilt and available again — completes the outstanding invocation.
 //   - a wrapped stream.ErrInvocationExhausted when every invocation in the
 //     matched set is terminal (complete or exhausted), at least one of them is
@@ -1324,7 +1325,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// from a terminal-skip of an invocation already marked exhausted on a previous
 	// delivery (so a redelivery after a failed DLQ write re-routes instead of
 	// ACKing). The aggregate returns them all on a *stream.HandlerExhaustedError,
-	// so each exhausted function/handler gets its own DLQ entry with its own
+	// so each exhausted app/handler gets its own DLQ entry with its own
 	// attempt count. anyExhausted records whether any matched invocation is
 	// exhausted (this delivery or a previous one). These are only meaningful when
 	// hasState is true.
@@ -1346,12 +1347,12 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	executed := false
 
 	// Take one consistent snapshot for the whole call so a concurrent registry
-	// swap mid-execution cannot reorder or drop functions under us, and PIN each
-	// published function's image while the registry lock still protects its
+	// swap mid-execution cannot reorder or drop apps under us, and PIN each
+	// published app's image while the registry lock still protects its
 	// entry. The pins are held until Handle returns, so an image published at
 	// snapshot time cannot be removed out from under this delivery even if the
 	// entry is superseded concurrently; each matching execution carries its
-	// function's pin into Manager.Execute. The pins are shares of the published
+	// app's pin into Manager.Execute. The pins are shares of the published
 	// lease, so a retirement in progress never blocks an already-admitted
 	// delivery.
 	snap := r.reg.snapshotPinned()
@@ -1360,20 +1361,20 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 
 	// Pre-pass: collect every matched invocation ID so an exhausted attempt can
 	// decide whether the whole message is terminal (all matched invocations
-	// complete or exhausted), and collect the engaged function names. The
-	// registry snapshot holds one entry per function, so a function with several
+	// complete or exhausted), and collect the engaged app names. The
+	// registry snapshot holds one entry per app, so an app with several
 	// matching rules is appended once here (deduped by construction). This must
 	// be complete before any execution, because a rule that exhausts early must
 	// still see the full set of matched invocations (including ones that sort
 	// later). Matching is pure; a panic here is a programming error that escapes
 	// and no counter has been touched yet.
 	//
-	// Matching includes configured functions whose image is not currently built
-	// (available == false): an event matching ONLY such a function is MATCHED,
-	// not unmatched, so it is classified matched and the function is counted as
-	// engaged. Skipping unavailable functions here (the previous behavior) both
+	// Matching includes configured apps whose image is not currently built
+	// (available == false): an event matching ONLY such an app is MATCHED,
+	// not unmatched, so it is classified matched and the app is counted as
+	// engaged. Skipping unavailable apps here (the previous behavior) both
 	// mis-classified those events as unmatched and let a mixed message ACK
-	// without running the unavailable function's share. unavailableMatched
+	// without running the unavailable app's share. unavailableMatched
 	// records the invocations that matched but cannot run this delivery; an
 	// unresolved one keeps the message pending rather than ACKed or DLQ'd for
 	// unavailability alone (see the aggregate below). A nil Template (only
@@ -1402,7 +1403,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 
 	// An unavailable matched invocation is UNRESOLVED unless it already COMPLETED
 	// for this message: a complete marker means the invocation's work here is
-	// settled (it ran before this worker lost/never had the function), so it does
+	// settled (it ran before this worker lost/never had the app), so it does
 	// not hold the message pending. Anything else — never ran, or exhausted
 	// awaiting a DLQ re-route whose attempt count only the available path can read
 	// back — is unresolved, and the message must stay pending: it must neither be
@@ -1410,12 +1411,12 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 	// entry) nor be dead-lettered solely for unavailability. The exhausted case is
 	// deliberately included: this worker cannot attribute the exhausted attempt
 	// count from an unavailable entry, and ACKing would race another replica's
-	// DLQ write, so the safe choice is to hold pending until the function is
+	// DLQ write, so the safe choice is to hold pending until the app is
 	// available again and the normal path surfaces the exhaustion with correct
 	// metadata. With no invocation state there is no marker to consult, so any
 	// unavailable match is treated as unresolved (the fail-safe direction). This
 	// is read-only: no attempt is claimed and no counter is touched for an
-	// unavailable function.
+	// unavailable app.
 	var unresolvedUnavailable []string
 	if len(unavailableMatched) > 0 {
 		if hasState {
@@ -1455,13 +1456,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		r.metrics.Inc(metrics.MetricEventsReceived)
 		if len(matchedFns) > 0 {
 			r.metrics.Inc(metrics.MetricEventsMatched)
-			// A function is "engaged" by an event when at least one of its
+			// An app is "engaged" by an event when at least one of its
 			// rules matches, regardless of whether the execution later fails:
-			// an event matching two functions counts once per function here,
+			// an event matching two apps counts once per app here,
 			// while MetricEventsMatched counts it once globally.
 			for _, fnName := range matchedFns {
-				r.metrics.IncLabels(metrics.MetricFunctionEventsMatched,
-					[]metrics.Label{{Name: "function", Value: fnName}})
+				r.metrics.IncLabels(metrics.MetricAppEventsMatched,
+					[]metrics.Label{{Name: "app", Value: fnName}})
 			}
 		} else {
 			r.metrics.Inc(metrics.MetricEventsUnmatched)
@@ -1475,7 +1476,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		rules := snap.matchingRules(pf, event)
 		for _, rule := range rules {
 			// The invocation identity is stable across restarts and config
-			// reloads as long as the rule still exists: the function name and the
+			// reloads as long as the rule still exists: the app name and the
 			// rule handler string. Renaming either invalidates old invocation
 			// state — old entries simply never match, and the msg-level set of
 			// required invocations is recomputed each delivery from current
@@ -1483,8 +1484,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// ACK.
 			invocation := pf.fn.Name + "/" + rule.Handler
 			if hasState && invState.IsComplete(invocation) {
-				r.log.Debug("Function handler: already succeeded for event; skipping",
-					"function", pf.fn.Name,
+				r.log.Debug("App handler: already succeeded for event; skipping",
+					"app", pf.fn.Name,
 					"handler", rule.Handler,
 					"message_id", msgID,
 					"delivery_attempt", deliveryAttempt,
@@ -1502,7 +1503,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				timeout = cap
 			}
 			// executeRule runs this single rule's invocation while holding the
-			// worker-global and per-function concurrency slots (whose defer scope
+			// worker-global and per-app concurrency slots (whose defer scope
 			// is THIS call, so a multi-rule message never accumulates slots across
 			// rules). It classifies this invocation's outcome for this delivery and
 			// returns it plus the plain error (for a failed attempt) so the outer
@@ -1519,7 +1520,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// never calls recordFailure, so it never fabricates an
 				// exhaustion/DLQ attribution either.
 				var claim stream.InvocationClaim
-				// Reserve the worker-global and per-function concurrency slots
+				// Reserve the worker-global and per-app concurrency slots
 				// BEFORE TryStart, so a blocked invocation is never counted as an
 				// attempt and does not persist state. If no slot frees within
 				// slotWait (well below MinPendingIdle, so a locally buffered event
@@ -1533,8 +1534,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// it failed, leave the message pending (reclaim replays it
 					// later).
 					skippedPending = true
-					r.log.Debug("Function handler: concurrency slot wait timed out; leaving pending",
-						"function", pf.fn.Name,
+					r.log.Debug("App handler: concurrency slot wait timed out; leaving pending",
+						"app", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
 						"delivery_attempt", int(deliveryAttempt),
@@ -1542,8 +1543,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					return outcomePendingSkip, nil
 				}
 				if waited {
-					r.log.Debug("Function handler: waiting for concurrency slot",
-						"function", pf.fn.Name,
+					r.log.Debug("App handler: waiting for concurrency slot",
+						"app", pf.fn.Name,
 						"handler", rule.Handler,
 						"message_id", msgID,
 						"delivery_attempt", int(deliveryAttempt),
@@ -1576,8 +1577,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						// sentinel so the aggregate can surface a claim failure
 						// separately from an ordinary protected skip.
 						skippedPending = true
-						r.log.Warn("Function handler: claim failed (outcome unknown); leaving pending without executing",
-							"function", pf.fn.Name,
+						r.log.Warn("App handler: claim failed (outcome unknown); leaving pending without executing",
+							"app", pf.fn.Name,
 							"handler", rule.Handler,
 							"message_id", msgID,
 							"error", startErr,
@@ -1595,8 +1596,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							// invocation may still complete or fail on its own), so
 							// this is a "not eligible" skip, not a completion.
 							skippedPending = true
-							r.log.Debug("Function handler: not eligible for event (running or waiting for retry); leaving pending",
-								"function", pf.fn.Name,
+							r.log.Debug("App handler: not eligible for event (running or waiting for retry); leaving pending",
+								"app", pf.fn.Name,
 								"handler", rule.Handler,
 								"message_id", msgID,
 								"handler_attempt", startClaim.Attempt,
@@ -1611,13 +1612,13 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 						if startClaim.Attempt > 0 {
 							anyExhausted = true
 							exhaustedInvocations = append(exhaustedInvocations, stream.ExhaustedInvocation{
-								Function: pf.fn.Name,
+								App:      pf.fn.Name,
 								Handler:  rule.Handler,
 								Attempts: startClaim.Attempt,
 							})
 						}
-						r.log.Debug("Function handler: terminal for event; skipping",
-							"function", pf.fn.Name,
+						r.log.Debug("App handler: terminal for event; skipping",
+							"app", pf.fn.Name,
 							"handler", rule.Handler,
 							"message_id", msgID,
 							"handler_attempt", startClaim.Attempt,
@@ -1633,8 +1634,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				// last_execution_at attribution point — every claimed attempt
 				// counts, retries included (they are real executions), while
 				// the skip branches returned above never reach it.
-				r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampExecution, time.Now().Unix())
-				r.log.Debug("Function rule: matched event",
+				r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampExecution, time.Now().Unix())
+				r.log.Debug("App rule: matched event",
 					handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt)...,
 				)
 				eventJSON, err := json.Marshal(event)
@@ -1647,7 +1648,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					if hasState {
 						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
-					return outcomeRetryable, fmt.Errorf("function %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
+					return outcomeRetryable, fmt.Errorf("app %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
 				// Resolve the template's env values and secret references into the
 				// per-invocation extra env, immediately before container creation.
@@ -1664,7 +1665,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					if hasState {
 						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
-					return outcomeRetryable, fmt.Errorf("function %q handler %q: %w", pf.fn.Name, rule.Handler, err)
+					return outcomeRetryable, fmt.Errorf("app %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
 				invokeCtx, cancel := context.WithTimeout(ctx, timeout)
 				// Stamp the invocation's diagnostic metadata into the context so
@@ -1673,7 +1674,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				eventID, eventName := eventFields(event)
 				invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 					Type:      runtime.ContainerTypeEvent,
-					Function:  pf.fn.Name,
+					App:       pf.fn.Name,
 					Handler:   rule.Handler,
 					MessageID: msgID,
 					EventID:   eventID,
@@ -1690,7 +1691,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// the bug is visible and attributable, then funnel it through
 					// the SAME failure branch below (metrics + recordFailure) so
 					// retry and exhaustion accounting stay per-invocation.
-					r.log.Error("Function handler: PANICKED for event",
+					r.log.Error("App handler: PANICKED for event",
 						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 							"panic_value", fmt.Sprintf("%v", panicValue),
 							"stack", string(debug.Stack()),
@@ -1701,25 +1702,25 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 						[]metrics.Label{
 							{Name: "outcome", Value: "failure"},
-							{Name: "function", Value: pf.fn.Name},
+							{Name: "app", Value: pf.fn.Name},
 							{Name: "handler", Value: rule.Handler},
 						})
 					// Unlabeled total for the SQLite snapshot; the labeled counter
 					// above stays for Prometheus.
 					r.metrics.Inc(metrics.MetricHandlerFailure)
-					// Per-function failure attribution (per rule execution). A
+					// Per-app failure attribution (per rule execution). A
 					// failed attempt that will retry still counts as a failure
 					// (and as an execution above); only a DLQ-routed exhaustion
 					// additionally sets last_dlq_at (see recordFailure).
 					r.metrics.IncLabels(metrics.MetricFunctionHandlerFailure,
-						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
-					r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampFailure, time.Now().Unix())
+						[]metrics.Label{{Name: "app", Value: pf.fn.Name}})
+					r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampFailure, time.Now().Unix())
 					r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 						[]metrics.Label{
-							{Name: "function", Value: pf.fn.Name},
+							{Name: "app", Value: pf.fn.Name},
 							{Name: "handler", Value: rule.Handler},
 						}, elapsed)
-					r.log.Warn("Function handler: execution failed for event",
+					r.log.Warn("App handler: execution failed for event",
 						append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 							"duration", elapsed,
 							"reason", err,
@@ -1743,7 +1744,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// invocation state, where exhaustion is actually persisted
 					// and observable.
 					r.metrics.IncLabels(metrics.MetricFunctionRetries,
-						[]metrics.Label{{Name: "function", Value: pf.fn.Name}})
+						[]metrics.Label{{Name: "app", Value: pf.fn.Name}})
 					return outcomeRetryable, err
 				}
 				// Record the invocation as completed so a redelivery skips it.
@@ -1759,8 +1760,8 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				if hasState {
 					if !invState.MarkComplete(invocation, claim) {
 						skippedPending = true
-						r.log.Warn("Function handler: completion superseded; leaving pending",
-							"function", pf.fn.Name,
+						r.log.Warn("App handler: completion superseded; leaving pending",
+							"app", pf.fn.Name,
 							"handler", rule.Handler,
 							"message_id", msgID,
 							"handler_attempt", handlerAttempt,
@@ -1769,7 +1770,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					}
 				}
 				r.recordHandlerSuccess(pf.fn.Name, rule.Handler, elapsed)
-				r.log.Info("Function handler: executed for event",
+				r.log.Info("App handler: executed for event",
 					append(handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt),
 						"duration", elapsed,
 					)...,
@@ -1813,7 +1814,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				anyExhausted = true
 				// recordFailure returns a *stream.HandlerExhaustedError carrying
 				// exactly one exhausted invocation; collect it so the aggregate
-				// reports every exhausted function/handler with its own attempt
+				// reports every exhausted app/handler with its own attempt
 				// count. A non-typed error is ignored here (it cannot happen in
 				// production) and the terminal-skip metadata still drives the
 				// aggregate.
@@ -1845,10 +1846,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		//    has not already completed) → the message stays pending and is NOT
 		//    ACKed, and it is NOT dead-lettered solely for unavailability. No
 		//    handler attempt was claimed and no handler counter was touched for
-		//    it (no handler ran). Returning the retryable ErrFunctionUnavailable
+		//    it (no handler ran). Returning the retryable ErrAppUnavailable
 		//    makes the stream leave the message pending (an ordinary retryable
 		//    error), exactly like the schedule path's unavailable handling, so a
-		//    later delivery — after the function is rebuilt and available again —
+		//    later delivery — after the app is rebuilt and available again —
 		//    completes the outstanding work. This is checked BEFORE the DLQ
 		//    decision so an exhausted sibling can never dead-letter a message
 		//    whose unavailable invocation is still outstanding.
@@ -1859,7 +1860,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 		//    least one exhausted → the message is terminal; route it to the DLQ.
 		//    allMatchedTerminal fails open to false on a read error, keeping the
 		//    message pending rather than DLQ'ing it. The aggregate error carries
-		//    EVERY exhausted invocation's exact function/handler/attempt metadata
+		//    EVERY exhausted invocation's exact app/handler/attempt metadata
 		//    and wraps stream.ErrInvocationExhausted, so the stream layer writes
 		//    one correctly-attributed DLQ entry per exhausted invocation.
 		if anyExhausted && allMatchedTerminal(invState, matched) {
@@ -1897,22 +1898,22 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 }
 
 // unavailableMatchError reports the matched-but-unavailable invocations of a
-// message as a retryable error wrapping ErrFunctionUnavailable. An unavailable
-// function's event is MATCHED (not unmatched) and must keep the message pending
+// message as a retryable error wrapping ErrAppUnavailable. An unavailable
+// app's event is MATCHED (not unmatched) and must keep the message pending
 // without being dead-lettered for unavailability alone, so the stream layer
 // treats this exactly like any other retryable failure. The invocation IDs are
-// included so the log line names the outstanding function/handler.
+// included so the log line names the outstanding app/handler.
 func unavailableMatchError(invocations []string) error {
-	return fmt.Errorf("%w: matched but unavailable: %s", ErrFunctionUnavailable, strings.Join(invocations, ", "))
+	return fmt.Errorf("%w: matched but unavailable: %s", ErrAppUnavailable, strings.Join(invocations, ", "))
 }
 
 // obsoleteOccurrence is the terminal error returned when a schedule occurrence
-// names a function or schedule that is no longer in the configuration. The
+// names an app or schedule that is no longer in the configuration. The
 // stream layer recognizes ErrInvocationObsolete and ACKs the message: an
 // obsolete occurrence is never retried or dead-lettered.
 func obsoleteOccurrence(fnName, scheduleName string) error {
 	return fmt.Errorf(
-		"%w: schedule function %q schedule %q no longer in configuration",
+		"%w: schedule app %q schedule %q no longer in configuration",
 		stream.ErrInvocationObsolete, fnName, scheduleName,
 	)
 }
@@ -1954,13 +1955,13 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 // it stays stable across attempts.
 //
 // It reuses the exact event execution path: registry snapshot lookup, the global
-// + per-function concurrency slots, per-invocation secret resolution, the panic
+// + per-app concurrency slots, per-invocation secret resolution, the panic
 // boundary, and the same handler metrics. Invocation/DLQ attribution stays
-// handler-based ("<function>/<handler>"); the descriptor adds schedule provenance
+// handler-based ("<app>/<handler>"); the descriptor adds schedule provenance
 // only.
 //
 // When scheduleName is empty (the state-free DLQ-replay path, which knows only a
-// recorded function/handler), resolution falls back to the first schedule entry
+// recorded app/handler), resolution falls back to the first schedule entry
 // matching the handler, then to that exact event rule (never event matching), and
 // the no-state path executes a single attempt exactly as before.
 func (r *Runner) InvokeHandler(
@@ -1971,22 +1972,22 @@ func (r *Runner) InvokeHandler(
 	// apply on the production path. See the availability checks below.
 	invState, hasState := stream.InvocationStateFrom(ctx)
 
-	// Find the function in the current registry. GetByName returns nil only when
-	// the function is ABSENT (removed) — a present but unavailable function
+	// Find the app in the current registry. GetByName returns nil only when
+	// the app is ABSENT (removed) — a present but unavailable app
 	// returns a non-nil entry whose Prepared() is nil. These two cases must be
 	// handled differently:
 	//   - absent (removed): an intentional configuration change, so an occurrence
 	//     for it is OBSOLETE and terminal (ACKed, never retried/DLQ'd) — but only
 	//     on the production state-carrying path; direct callers/tests keep the
 	//     legacy plain error. This holds even for an already-admitted occurrence:
-	//     with no function there is no image or executor to run, so it cannot
-	//     complete. (The schedule NAME, not the function, is what admission pins;
-	//     a still-present function whose schedule was removed is NOT obsolete once
+	//     with no app there is no image or executor to run, so it cannot
+	//     complete. (The schedule NAME, not the app, is what admission pins;
+	//     a still-present app whose schedule was removed is NOT obsolete once
 	//     admitted — see the descriptor path below.)
 	//   - present but unavailable: temporary (build failed at startup/reconcile),
 	//     retryable exactly as today.
 	//
-	// The lookup PINS the function's published image (a share of its publication
+	// The lookup PINS the app's published image (a share of its publication
 	// lease, acquired under the registry lock), held until this invocation
 	// returns, so a concurrent retirement cannot remove the image between this
 	// lookup and the handler's execution. An UNADMITTED schedule occurrence
@@ -1997,34 +1998,34 @@ func (r *Runner) InvokeHandler(
 	defer func() { pin.Release() }()
 	if pf == nil {
 		if hasState {
-			r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
-				"function", fnName,
+			r.log.Warn("Schedule: occurrence obsolete; app removed; acknowledging",
+				"app", fnName,
 				"schedule", scheduleName,
 			)
 			return obsoleteOccurrence(fnName, scheduleName)
 		}
-		r.log.Warn("Schedule: function is not available", "function", fnName)
-		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+		r.log.Warn("Schedule: app is not available", "app", fnName)
+		return fmt.Errorf("schedule invocation: app %q is not available", fnName)
 	}
 	if pf.Prepared() == nil {
-		// The function exists but its image could not be built yet: temporarily
-		// unavailable, so the occurrence is retryable (not obsolete — the function
+		// The app exists but its image could not be built yet: temporarily
+		// unavailable, so the occurrence is retryable (not obsolete — the app
 		// is still configured).
-		r.log.Warn("Schedule: function is temporarily unavailable", "function", fnName)
-		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+		r.log.Warn("Schedule: app is temporarily unavailable", "app", fnName)
+		return fmt.Errorf("schedule invocation: app %q is not available", fnName)
 	}
 
-	// Reserve the worker-global and per-function concurrency slots BEFORE the
+	// Reserve the worker-global and per-app concurrency slots BEFORE the
 	// admission claim so a blocked invocation is never counted as an attempt and
 	// does not persist state (same ordering as Handle's event path). A slot
 	// timeout means the invocation is unresolved: with invocation state it
 	// returns a "not eligible" skip (the stream leaves the message pending with no
 	// retry accounting); without state it preserves the legacy plain error. The
 	// reservation is made for both the state-free and state-carrying paths, so a
-	// held function slot also bounds a direct/no-state caller.
+	// held app slot also bounds a direct/no-state caller.
 	releaseSlots, _ := r.reserveSlots(ctx, fnName, pf.fn.Template.Concurrency)
 	if releaseSlots == nil {
-		r.log.Warn("Schedule: concurrency slot wait timed out", "function", fnName, "handler", handler)
+		r.log.Warn("Schedule: concurrency slot wait timed out", "app", fnName, "handler", handler)
 		if hasState {
 			return stream.ErrInvocationNotEligible
 		}
@@ -2052,37 +2053,37 @@ func (r *Runner) InvokeHandler(
 	// An UNADMITTED schedule occurrence (scheduleName != "" and no pinned
 	// descriptor) resolves its template by the stable schedule NAME, and it may
 	// have waited arbitrarily long for a concurrency slot while a reload
-	// hot-swapped or removed the function. The lookup above is stale for that
+	// hot-swapped or removed the app. The lookup above is stale for that
 	// occurrence: refresh it from the registry under the lock and pin the NEWEST
 	// entry, dropping the stale pin, so the descriptor proposed for the atomic
 	// first admission comes from the CURRENT config. A reload racing AFTER this
 	// fresh snapshot is a concurrent proposal: the atomic descriptor write in
 	// TryStartScheduled remains the global first-winner boundary. A pinned
 	// descriptor is authoritative and is NEVER re-resolved (its admitted schedule
-	// may already be gone), but the function's availability is still rechecked.
+	// may already be gone), but the app's availability is still rechecked.
 	if scheduleName != "" && !known {
 		// getByNamePinned returns a FRESH share of the current entry's
 		// publication lease (always a distinct lease object, or nil when the
 		// entry has none), so release the stale lookup's pin and adopt the fresh
-		// one unconditionally — even when fresh is nil, so a function removed
+		// one unconditionally — even when fresh is nil, so an app removed
 		// while the occurrence waited drops the stale pin with it.
 		fresh, freshPin := r.reg.getByNamePinned(fnName)
 		pin.Release()
 		pf, pin = fresh, freshPin
 	}
 	if pf == nil {
-		r.log.Warn("Schedule: occurrence obsolete; function removed; acknowledging",
-			"function", fnName,
+		r.log.Warn("Schedule: occurrence obsolete; app removed; acknowledging",
+			"app", fnName,
 			"schedule", scheduleName,
 		)
 		return obsoleteOccurrence(fnName, scheduleName)
 	}
 	if pf.Prepared() == nil {
-		// The function exists but its image could not be built yet: temporarily
+		// The app exists but its image could not be built yet: temporarily
 		// unavailable, so the occurrence is retryable (not obsolete — the
-		// function is still configured).
-		r.log.Warn("Schedule: function is temporarily unavailable", "function", fnName)
-		return fmt.Errorf("schedule invocation: function %q is not available", fnName)
+		// app is still configured).
+		r.log.Warn("Schedule: app is temporarily unavailable", "app", fnName)
+		return fmt.Errorf("schedule invocation: app %q is not available", fnName)
 	}
 
 	// Resolve the descriptor that owns this message. A pinned descriptor (read
@@ -2091,7 +2092,7 @@ func (r *Runner) InvokeHandler(
 	// (the production path) or by handler (the state-carrying fallback).
 	if !known {
 		desc = resolveScheduleDescriptor(pf.fn.Template, scheduleName, handler)
-		// The production path carries a schedule NAME. When the function is
+		// The production path carries a schedule NAME. When the app is
 		// present but that NAME is gone, the occurrence may have been admitted by
 		// ANOTHER replica whose template still had it, so we must NOT pre-empt the
 		// atomic admission: pass no descriptor (known=false) and let the script
@@ -2127,7 +2128,7 @@ func (r *Runner) InvokeHandler(
 		// wraps ErrInvocationNotEligible (the stream's pending/no-ACK contract)
 		// plus ErrInvocationClaimUnconfirmed so the cause is distinguishable.
 		r.log.Warn("Schedule: claim failed (outcome unknown); leaving pending without executing",
-			"function", fnName,
+			"app", fnName,
 			"handler", desc.Handler,
 			"error", err,
 		)
@@ -2137,7 +2138,7 @@ func (r *Runner) InvokeHandler(
 	}
 	if admission.Obsolete {
 		r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
-			"function", fnName,
+			"app", fnName,
 			"schedule", scheduleName,
 		)
 		return obsoleteOccurrence(fnName, scheduleName)
@@ -2157,7 +2158,7 @@ func (r *Runner) InvokeHandler(
 			// complete or fail on its own, so this is a "not eligible" skip, never
 			// an ACK.
 			r.log.Debug("Schedule: invocation not eligible (running or waiting for retry); leaving pending",
-				"function", fnName,
+				"app", fnName,
 				"handler", handler,
 				"handler_attempt", admission.Claim.Attempt,
 				"next_attempt_in", admission.Wait,
@@ -2171,19 +2172,19 @@ func (r *Runner) InvokeHandler(
 		// typed error for DLQ attribution.
 		if admission.Claim.Attempt == 0 {
 			r.log.Debug("Schedule: invocation already succeeded; skipping (stream ACKs)",
-				"function", fnName,
+				"app", fnName,
 				"handler", handler,
 			)
 			return nil
 		}
 		r.log.Debug("Schedule: invocation terminal (exhausted); routing to DLQ",
-			"function", fnName,
+			"app", fnName,
 			"handler", handler,
 			"handler_attempt", admission.Claim.Attempt,
 		)
 		return &stream.HandlerExhaustedError{
 			Invocations: []stream.ExhaustedInvocation{{
-				Function: fnName,
+				App:      fnName,
 				Handler:  handler,
 				Attempts: admission.Claim.Attempt,
 			}},
@@ -2220,7 +2221,7 @@ func (r *Runner) InvokeHandler(
 }
 
 // resolveScheduleDescriptor resolves a schedule occurrence's descriptor from the
-// function's CURRENT template. When scheduleName is non-empty the schedule is
+// app's CURRENT template. When scheduleName is non-empty the schedule is
 // resolved by its STABLE NAME (the production identity); a handler change under
 // the same name is picked up, and a missing NAME leaves the envelope handler with
 // the defaults (the caller decides whether that is obsolete). When scheduleName
@@ -2229,11 +2230,11 @@ func (r *Runner) InvokeHandler(
 // matching — it selects by handler string alone, so no other rule can run. The
 // returned descriptor's Timeout is NOT capped here; the caller caps it (and the
 // capped value is what gets pinned).
-func resolveScheduleDescriptor(tmpl *function.Template, scheduleName, handler string) stream.ScheduleDescriptor {
+func resolveScheduleDescriptor(tmpl *app.Template, scheduleName, handler string) stream.ScheduleDescriptor {
 	desc := stream.ScheduleDescriptor{
 		Handler: handler,
-		Timeout: function.DefaultTimeout,
-		Retries: function.DefaultRetries,
+		Timeout: app.DefaultTimeout,
+		Retries: app.DefaultRetries,
 	}
 	found := false
 	if scheduleName != "" {
@@ -2277,7 +2278,7 @@ func resolveScheduleDescriptor(tmpl *function.Template, scheduleName, handler st
 // the given stable name. The production path uses it only to decide whether a
 // first-time (unpinned) occurrence can be admitted locally, never to cancel an
 // already-admitted one.
-func scheduleNameExists(tmpl *function.Template, scheduleName string) bool {
+func scheduleNameExists(tmpl *app.Template, scheduleName string) bool {
 	for _, sch := range tmpl.Schedules {
 		if sch.Name == scheduleName {
 			return true
@@ -2286,22 +2287,22 @@ func scheduleNameExists(tmpl *function.Template, scheduleName string) bool {
 	return false
 }
 
-// InvokeFunction executes every event rule of the named function whose pattern
+// InvokeApp executes every event rule of the named app whose pattern
 // matches event, in declaration order, and returns the number of handlers
 // invoked together with a concise error describing any failures. It is the
-// synchronous manual-invocation primitive behind `relay function invoke`,
+// synchronous manual-invocation primitive behind `relay app invoke`,
 // driven by the worker over its query socket against the LIVE runner/runtime
 // pool.
 //
 // It deliberately reuses the event execution path: the current registry
-// snapshot, the worker-global + per-function concurrency slots, the rule
+// snapshot, the worker-global + per-app concurrency slots, the rule
 // timeout (capped at the configured maximum exactly like Handle), per-invocation
 // env/secret resolution, the image in-flight reference, the panic boundary, the
 // normal runtime executor (Manager.Execute), and the handler success/failure
 // execution metrics. It deliberately does NOT reuse the broker lifecycle: it
 // never consults stream.InvocationState, never claims or counts the event
 // classification counters (events_received/matched/unmatched, and not
-// function_events_matched_total), never schedules a retry, and never
+// app_events_matched_total), never schedules a retry, and never
 // dead-letters. A manual invocation is an operator action, not a stream
 // delivery, so no broker state is written.
 //
@@ -2311,20 +2312,20 @@ func scheduleNameExists(tmpl *function.Template, scheduleName string) bool {
 // handler has been attempted. Matching zero rules is not an error: it returns
 // (0, nil) so the caller renders "no matching handlers".
 //
-// A function absent from the current registry returns ErrFunctionNotFound; a
-// registered but unrunnable function (its image could not be built) returns
-// ErrFunctionUnavailable. Both are wrapped with the function name so the socket
+// An app absent from the current registry returns ErrAppNotFound; a
+// registered but unrunnable app (its image could not be built) returns
+// ErrAppUnavailable. Both are wrapped with the app name so the socket
 // can map them onto stable wire codes.
 //
 // Tracing: the worker-side root operation span is opened BEFORE registry and
-// match validation, so an invalid function, an unavailable function, or a
+// match validation, so an invalid app, an unavailable app, or a
 // no-match invocation is still traced (with its error recorded) without changing
 // any return semantics.
-func (r *Runner) InvokeFunction(
+func (r *Runner) InvokeApp(
 	ctx context.Context, name string, event map[string]any,
 ) (count int, err error) {
 	// A worker-side root operation span around the whole manual invocation, so
-	// an operator `relay function invoke` is traced on the worker without the
+	// an operator `relay app invoke` is traced on the worker without the
 	// CLI carrying any trace context. It is a NEW root regardless of the
 	// caller's context; every matching rule's function.invoke runs as its child
 	// (the root span's context is the base for each rule's invokeCtx). It is
@@ -2339,15 +2340,15 @@ func (r *Runner) InvokeFunction(
 		defer pin.Release()
 	}
 	if pf == nil {
-		return 0, fmt.Errorf("%w: %q", ErrFunctionNotFound, name)
+		return 0, fmt.Errorf("%w: %q", ErrAppNotFound, name)
 	}
 	if pf.Prepared() == nil {
-		return 0, fmt.Errorf("%w: %q", ErrFunctionUnavailable, name)
+		return 0, fmt.Errorf("%w: %q", ErrAppUnavailable, name)
 	}
 
-	// Matching is pure and in declaration order. A function with no matching
+	// Matching is pure and in declaration order. An app with no matching
 	// rule is a successful no-op.
-	rules := pf.fn.Template.MatchingEventRules(event)
+	rules := eventmatch.MatchingEventRules(pf.fn.Template.Events, event)
 	if len(rules) == 0 {
 		return 0, nil
 	}
@@ -2357,7 +2358,7 @@ func (r *Runner) InvokeFunction(
 	// rather than executing a handler with a corrupt payload.
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
-		return 0, fmt.Errorf("function %q: marshal event: %w", name, err)
+		return 0, fmt.Errorf("app %q: marshal event: %w", name, err)
 	}
 	eventID, eventName := eventFields(event)
 
@@ -2370,18 +2371,18 @@ func (r *Runner) InvokeFunction(
 			timeout = cap
 		}
 
-		// Reserve the worker-global and per-function concurrency slots, exactly
+		// Reserve the worker-global and per-app concurrency slots, exactly
 		// like the event path. A slot timeout is not an execution: record the
 		// first such error and keep trying the later rules (which may themselves
 		// be blocked, in which case they are reported the same way).
 		releaseSlots, _ := r.reserveSlots(ctx, name, pf.fn.Template.Concurrency)
 		if releaseSlots == nil {
-			r.log.Warn("Function invoke: concurrency slot wait timed out",
-				"function", name,
+			r.log.Warn("App invoke: concurrency slot wait timed out",
+				"app", name,
 				"handler", rule.Handler,
 			)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("function %q handler %q: concurrency slot wait timed out", name, rule.Handler)
+				firstErr = fmt.Errorf("app %q handler %q: concurrency slot wait timed out", name, rule.Handler)
 			}
 			continue
 		}
@@ -2393,12 +2394,12 @@ func (r *Runner) InvokeFunction(
 			// last_execution_at attribution point, exactly as Handle's rule loop
 			// and InvokeHandler stamp it. A slot timeout above never reaches here
 			// (it is not an execution).
-			r.metrics.SetFunctionTimestamp(name, metrics.FunctionTimestampExecution, time.Now().Unix())
+			r.metrics.SetAppTimestamp(name, metrics.AppTimestampExecution, time.Now().Unix())
 
 			extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 			if err != nil {
 				r.recordHandlerFailure(name, rule.Handler, 0)
-				return fmt.Errorf("function %q handler %q: %w", name, rule.Handler, err)
+				return fmt.Errorf("app %q handler %q: %w", name, rule.Handler, err)
 			}
 
 			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -2410,7 +2411,7 @@ func (r *Runner) InvokeFunction(
 			// MessageID is empty: there is no stream message.
 			invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 				Type:      runtime.ContainerTypeEvent,
-				Function:  name,
+				App:       name,
 				Handler:   rule.Handler,
 				EventID:   eventID,
 				EventName: eventName,
@@ -2425,8 +2426,8 @@ func (r *Runner) InvokeFunction(
 			)
 			elapsed := time.Since(start)
 			if panicked {
-				r.log.Error("Function invoke: handler PANICKED",
-					"function", name,
+				r.log.Error("App invoke: handler PANICKED",
+					"app", name,
 					"handler", rule.Handler,
 					"panic_value", fmt.Sprintf("%v", panicValue),
 					"stack", string(debug.Stack()),
@@ -2434,17 +2435,17 @@ func (r *Runner) InvokeFunction(
 			}
 			if err != nil {
 				r.recordHandlerFailure(name, rule.Handler, elapsed)
-				r.log.Warn("Function invoke: handler execution failed",
-					"function", name,
+				r.log.Warn("App invoke: handler execution failed",
+					"app", name,
 					"handler", rule.Handler,
 					"duration", elapsed,
 					"reason", err,
 				)
-				return fmt.Errorf("function %q handler %q: %w", name, rule.Handler, err)
+				return fmt.Errorf("app %q handler %q: %w", name, rule.Handler, err)
 			}
 			r.recordHandlerSuccess(name, rule.Handler, elapsed)
-			r.log.Info("Function invoke: handler executed",
-				"function", name,
+			r.log.Info("App invoke: handler executed",
+				"app", name,
 				"handler", rule.Handler,
 				"duration", elapsed,
 			)
@@ -2465,17 +2466,17 @@ func (r *Runner) InvokeFunction(
 	return count, nil
 }
 
-// ReplayDLQ re-executes the exact function/handler recorded by one DLQ entry
+// ReplayDLQ re-executes the exact app/handler recorded by one DLQ entry
 // against the CURRENT registry, for the `relay dlq replay` command. It is the
-// DLQ counterpart of InvokeFunction: an operator action against the LIVE runner,
+// DLQ counterpart of InvokeApp: an operator action against the LIVE runner,
 // never a stream delivery.
 //
 // It validates the current configuration and then delegates to InvokeHandler:
 //
-//   - a function absent from the current registry returns ErrFunctionNotFound;
-//   - a registered but unrunnable function (image build failed) returns
-//     ErrFunctionUnavailable;
-//   - a handler no longer present in the function's current template (its event
+//   - an app absent from the current registry returns ErrAppNotFound;
+//   - a registered but unrunnable app (image build failed) returns
+//     ErrAppUnavailable;
+//   - a handler no longer present in the app's current template (its event
 //     rules or schedules) returns ErrHandlerNotFound — the entry is retained and
 //     the operator sees that the configuration changed.
 //
@@ -2483,7 +2484,7 @@ func (r *Runner) InvokeFunction(
 // explicit opt-out, so it holds even if the caller's context came from the stream
 // delivery path), so InvokeHandler takes its state-free single-attempt path:
 // exactly one synchronous execution of the named handler (never event matching,
-// so no other rule can run), against the function's current runtime, env/secrets
+// so no other rule can run), against the app's current runtime, env/secrets
 // resolution, concurrency slots, and timeout resolution. It writes NO broker
 // state — no invocation-state hash, no event classification counters, and no
 // retry/DLQ counters (recordFailure is only reached on the state-carrying path).
@@ -2493,7 +2494,7 @@ func (r *Runner) InvokeFunction(
 //
 // The handler timeout follows InvokeHandler's current resolution: the matching
 // schedule entry's timeout when the handler has one, otherwise the CURRENT event
-// rule's timeout for that exact handler, otherwise the function default — always
+// rule's timeout for that exact handler, otherwise the app default — always
 // capped by the configured maximum. Resolving the event rule is by exact handler
 // string, never event matching, so the replay still runs exactly one handler.
 // event is the entry's original payload, replayed verbatim.
@@ -2504,7 +2505,7 @@ func (r *Runner) InvokeFunction(
 // compact trace reference, forwarded by the control path — never embedded in the
 // event JSON). The replayed `function.invoke` runs as its child. An empty or
 // malformed lineage simply omits the link; the replay still runs. The operation
-// span is opened BEFORE registry/handler validation, so a removed function or
+// span is opened BEFORE registry/handler validation, so a removed app or
 // handler is still traced (with its error recorded) without changing any return
 // semantics.
 func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []byte, lineage string) (err error) {
@@ -2517,13 +2518,13 @@ func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []
 
 	pf := r.reg.GetByName(fnName)
 	if pf == nil {
-		return fmt.Errorf("%w: %q", ErrFunctionNotFound, fnName)
+		return fmt.Errorf("%w: %q", ErrAppNotFound, fnName)
 	}
 	if pf.Prepared() == nil {
-		return fmt.Errorf("%w: %q", ErrFunctionUnavailable, fnName)
+		return fmt.Errorf("%w: %q", ErrAppUnavailable, fnName)
 	}
 	if !templateHasHandler(pf.fn.Template, handler) {
-		return fmt.Errorf("%w: function %q handler %q", ErrHandlerNotFound, fnName, handler)
+		return fmt.Errorf("%w: app %q handler %q", ErrHandlerNotFound, fnName, handler)
 	}
 	// Strip any inherited invocation state and run the state-free path: no
 	// TryStart/complete/retry/exhaustion, and no DLQ accounting. The opt-out
@@ -2536,7 +2537,7 @@ func (r *Runner) ReplayDLQ(ctx context.Context, fnName, handler string, event []
 // current event rules or schedules. A DLQ entry attributes an exhausted
 // invocation that came from one of those, so either counts as "still
 // configured". A nil template has no handlers.
-func templateHasHandler(tmpl *function.Template, handler string) bool {
+func templateHasHandler(tmpl *app.Template, handler string) bool {
 	if tmpl == nil {
 		return false
 	}
@@ -2565,7 +2566,7 @@ func templateHasHandler(tmpl *function.Template, handler string) bool {
 // success) that the caller routes through the invocation-state lifecycle.
 func (r *Runner) invokeOnce(
 	ctx context.Context,
-	pf *PreparedFunction,
+	pf *PreparedApp,
 	handler string,
 	payload []byte,
 	timeout time.Duration,
@@ -2579,7 +2580,7 @@ func (r *Runner) invokeOnce(
 	// TryStart (or is a direct no-state caller) and holds the concurrency
 	// slots. This is the schedule path's last_execution_at attribution point —
 	// every claimed attempt counts, retries included.
-	r.metrics.SetFunctionTimestamp(pf.fn.Name, metrics.FunctionTimestampExecution, time.Now().Unix())
+	r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampExecution, time.Now().Unix())
 
 	// Resolve the template's env values and secret references immediately before
 	// container creation, mirroring Handle's rule path.
@@ -2588,11 +2589,11 @@ func (r *Runner) invokeOnce(
 		// Counted as a handler failure with a zero duration (no execution
 		// happened), mirroring how Handle attributes a resolution failure.
 		r.recordHandlerFailure(pf.fn.Name, handler, 0)
-		return fmt.Errorf("schedule invocation: function %q handler %q: %w", pf.fn.Name, handler, err)
+		return fmt.Errorf("schedule invocation: app %q handler %q: %w", pf.fn.Name, handler, err)
 	}
 
 	r.log.Debug("Schedule: invoking handler",
-		"function", pf.fn.Name,
+		"app", pf.fn.Name,
 		"handler", handler,
 	)
 
@@ -2603,7 +2604,7 @@ func (r *Runner) invokeOnce(
 	// relay.type marker that classifies this one-shot invocation container.
 	invokeCtx = runtime.WithRunMeta(invokeCtx, runtime.RunMeta{
 		Type:      runtime.ContainerTypeSchedule,
-		Function:  pf.fn.Name,
+		App:       pf.fn.Name,
 		Handler:   handler,
 		MessageID: msgID,
 		Hostname:  r.hostname,
@@ -2614,8 +2615,8 @@ func (r *Runner) invokeOnce(
 		invocationTrace{state: invState, invocation: invocation, attempt: claim.Attempt})
 	elapsed := time.Since(start)
 	if panicked {
-		r.log.Error("Function handler: PANICKED for schedule",
-			"function", pf.fn.Name,
+		r.log.Error("App handler: PANICKED for schedule",
+			"app", pf.fn.Name,
 			"handler", handler,
 			"panic_value", fmt.Sprintf("%v", panicValue),
 			"stack", string(debug.Stack()),
@@ -2625,8 +2626,8 @@ func (r *Runner) invokeOnce(
 	}
 	if err != nil {
 		r.recordHandlerFailure(pf.fn.Name, handler, elapsed)
-		r.log.Warn("Function handler: execution failed for schedule",
-			"function", pf.fn.Name,
+		r.log.Warn("App handler: execution failed for schedule",
+			"app", pf.fn.Name,
 			"handler", handler,
 			"duration", elapsed,
 			"reason", err,
@@ -2646,8 +2647,8 @@ func (r *Runner) invokeOnce(
 		}
 	}
 	r.recordHandlerSuccess(pf.fn.Name, handler, elapsed)
-	r.log.Info("Function handler: executed for schedule",
-		"function", pf.fn.Name,
+	r.log.Info("App handler: executed for schedule",
+		"app", pf.fn.Name,
 		"handler", handler,
 		"duration", elapsed,
 	)
@@ -2655,14 +2656,14 @@ func (r *Runner) invokeOnce(
 }
 
 // handlerLogFields builds the common structured-log fields for a handler
-// execution log line: function, handler, message_id, and the attempt
+// execution log line: app, handler, message_id, and the attempt
 // attribution. With invocation state the attempt attribution is the
 // Redis-backed handler attempt (the count that drives retry/exhaustion); without
 // it there is no handler attempt to attribute, so the message delivery attempt is
 // reported instead. It never presents a delivery count as a handler attempt.
 func handlerLogFields(hasState bool, fnName, handler, msgID string, handlerAttempt int, deliveryAttempt int64) []any {
 	fields := []any{
-		"function", fnName,
+		"app", fnName,
 		"handler", handler,
 		"message_id", msgID,
 	}
@@ -2674,55 +2675,55 @@ func handlerLogFields(hasState bool, fnName, handler, msgID string, handlerAttem
 
 // recordHandlerSuccess increments the success metrics shared by Handle's
 // success branch, InvokeHandler, and manual invocation: the labeled invocation
-// outcome counter, the unlabeled total, per-function success attribution, the
+// outcome counter, the unlabeled total, per-app success attribution, the
 // last_success_at timestamp, and the duration histogram. It deliberately does
-// NOT touch the event classification counters or function_events_matched_total —
+// NOT touch the event classification counters or app_events_matched_total —
 // Handle owns those and counts them once per logical event, so an execution
 // must not be double-attributed here.
 func (r *Runner) recordHandlerSuccess(fnName, handler string, duration time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "success"},
-			{Name: "function", Value: fnName},
+			{Name: "app", Value: fnName},
 			{Name: "handler", Value: handler},
 		})
 	// Unlabeled total for the SQLite snapshot; the labeled counter above stays
 	// for Prometheus.
 	r.metrics.Inc(metrics.MetricHandlerSuccess)
-	// Per-function success attribution.
+	// Per-app success attribution.
 	r.metrics.IncLabels(metrics.MetricFunctionHandlerSuccess,
-		[]metrics.Label{{Name: "function", Value: fnName}})
-	r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampSuccess, time.Now().Unix())
+		[]metrics.Label{{Name: "app", Value: fnName}})
+	r.metrics.SetAppTimestamp(fnName, metrics.AppTimestampSuccess, time.Now().Unix())
 	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{
-			{Name: "function", Value: fnName},
+			{Name: "app", Value: fnName},
 			{Name: "handler", Value: handler},
 		}, duration)
 }
 
 // recordHandlerFailure increments the failure metrics shared by Handle's
 // failure branch, InvokeHandler, and manual invocation: the labeled invocation
-// outcome counter, the unlabeled total, per-function failure attribution, and
+// outcome counter, the unlabeled total, per-app failure attribution, and
 // the duration histogram. A failed attempt that will retry still counts as a
 // failure here (it sets last_failure_at); only the DLQ-routed exhaustion
 // additionally sets last_dlq_at (see recordFailure). It deliberately does NOT
-// touch the event classification counters or function_events_matched_total —
+// touch the event classification counters or app_events_matched_total —
 // Handle owns those and counts them once per logical event, so a failure must
 // not be double-attributed here.
 func (r *Runner) recordHandlerFailure(fnName, handler string, duration time.Duration) {
 	r.metrics.IncLabels(metrics.MetricHandlerInvocations,
 		[]metrics.Label{
 			{Name: "outcome", Value: "failure"},
-			{Name: "function", Value: fnName},
+			{Name: "app", Value: fnName},
 			{Name: "handler", Value: handler},
 		})
 	r.metrics.Inc(metrics.MetricHandlerFailure)
 	r.metrics.IncLabels(metrics.MetricFunctionHandlerFailure,
-		[]metrics.Label{{Name: "function", Value: fnName}})
-	r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampFailure, time.Now().Unix())
+		[]metrics.Label{{Name: "app", Value: fnName}})
+	r.metrics.SetAppTimestamp(fnName, metrics.AppTimestampFailure, time.Now().Unix())
 	r.metrics.ObserveDurationLabels(metrics.MetricHandlerDuration,
 		[]metrics.Label{
-			{Name: "function", Value: fnName},
+			{Name: "app", Value: fnName},
 			{Name: "handler", Value: handler},
 		}, duration)
 }
@@ -2777,8 +2778,8 @@ func (r *Runner) recordFailure(
 		// in the stream layer, only after all exhausted siblings resolve, and
 		// only if the XADD succeeds).
 		if !invState.MarkExhausted(invocation, claim) {
-			r.log.Warn("Function handler: exhaustion superseded; leaving pending",
-				"function", fnName,
+			r.log.Warn("App handler: exhaustion superseded; leaving pending",
+				"app", fnName,
 				"handler", handler,
 				"message_id", msgID,
 				"handler_attempt", handlerAttempt,
@@ -2786,10 +2787,10 @@ func (r *Runner) recordFailure(
 			return outcomePendingSkip, nil
 		}
 		r.metrics.IncLabels(metrics.MetricFunctionDLQ,
-			[]metrics.Label{{Name: "function", Value: fnName}})
-		r.metrics.SetFunctionTimestamp(fnName, metrics.FunctionTimestampDLQ, time.Now().Unix())
-		r.log.Error("Function handler: exhausted; invocation terminal",
-			"function", fnName,
+			[]metrics.Label{{Name: "app", Value: fnName}})
+		r.metrics.SetAppTimestamp(fnName, metrics.AppTimestampDLQ, time.Now().Unix())
+		r.log.Error("App handler: exhausted; invocation terminal",
+			"app", fnName,
 			"handler", handler,
 			"message_id", msgID,
 			"handler_attempt", handlerAttempt,
@@ -2797,7 +2798,7 @@ func (r *Runner) recordFailure(
 		)
 		return outcomeExhausted, &stream.HandlerExhaustedError{
 			Invocations: []stream.ExhaustedInvocation{{
-				Function: fnName,
+				App:      fnName,
 				Handler:  handler,
 				Attempts: handlerAttempt,
 				Err:      origErr,
@@ -2813,8 +2814,8 @@ func (r *Runner) recordFailure(
 	// superseded claim's behalf.
 	backoff := retryBackoff(handlerAttempt)
 	if !invState.RecordFailure(invocation, claim, backoff) {
-		r.log.Warn("Function handler: retry superseded; leaving pending",
-			"function", fnName,
+		r.log.Warn("App handler: retry superseded; leaving pending",
+			"app", fnName,
 			"handler", handler,
 			"message_id", msgID,
 			"handler_attempt", handlerAttempt,
@@ -2822,9 +2823,9 @@ func (r *Runner) recordFailure(
 		return outcomePendingSkip, nil
 	}
 	r.metrics.IncLabels(metrics.MetricFunctionRetries,
-		[]metrics.Label{{Name: "function", Value: fnName}})
-	r.log.Warn("Function handler: failed attempt; retrying later",
-		"function", fnName,
+		[]metrics.Label{{Name: "app", Value: fnName}})
+	r.log.Warn("App handler: failed attempt; retrying later",
+		"app", fnName,
 		"handler", handler,
 		"message_id", msgID,
 		"handler_attempt", handlerAttempt,
@@ -2833,13 +2834,13 @@ func (r *Runner) recordFailure(
 		"reason", origErr,
 	)
 	return outcomeRetryable, fmt.Errorf(
-		"function %q handler %q: handler attempt %d failed: %w",
+		"app %q handler %q: handler attempt %d failed: %w",
 		fnName, handler, handlerAttempt, origErr,
 	)
 }
 
 // dedupeExhausted returns the exhausted invocations deduplicated by
-// "<function>/<handler>", preserving first-seen order. This is a defensive
+// "<app>/<handler>", preserving first-seen order. This is a defensive
 // backstop: a parsed template rejects duplicate event handlers, so the same
 // invocation should not appear twice in the aggregate, but hand-built
 // templates and legacy aggregates may still carry duplicate metadata; the DLQ
@@ -2922,14 +2923,14 @@ func stringify(v any) string {
 // before it is handed to the executor; the executor carries it in the request
 // frame's env map to the reused bootstrap process. It is never logged,
 // persisted, or written into an execution container's Docker Config.Env.
-func (r *Runner) resolveExtraEnv(ctx context.Context, tmpl *function.Template) ([]string, error) {
+func (r *Runner) resolveExtraEnv(ctx context.Context, tmpl *app.Template) ([]string, error) {
 	var extra []string
 	for _, ev := range tmpl.EnvList() {
 		extra = append(extra, ev.Name+"="+ev.Value)
 	}
 	for _, sb := range tmpl.SecretList() {
 		if r.secrets == nil {
-			return nil, fmt.Errorf("function references secret %q but no secret provider is configured", sb.Ref)
+			return nil, fmt.Errorf("app references secret %q but no secret provider is configured", sb.Ref)
 		}
 		val, err := r.secrets.Resolve(ctx, sb.Ref.String())
 		if err != nil {

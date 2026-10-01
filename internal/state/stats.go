@@ -74,43 +74,43 @@ func (st *State) RecordStatsContext(ctx context.Context, stats Stats) {
 }
 
 // RecordStatsSnapshot persists the whole stats snapshot in ONE short
-// transaction: it first prunes orphaned function_stats rows (rows whose
-// function no longer has a functions row — a function removed by RecordRemoved
+// transaction: it first prunes orphaned app_stats rows (rows whose
+// app no longer has a apps row — an app removed by RecordRemoved
 // must not keep a stats row), then upserts the global single-row stats, then
-// upserts each per-function row present in fns. The per-function upsert is
-// conditional on the function still existing in the functions table, so a
-// removed function's row is not re-created even if the caller's snapshot still
+// upserts each per-app row present in fns. The per-app upsert is
+// conditional on the app still existing in the apps table, so a
+// removed app's row is not re-created even if the caller's snapshot still
 // reports its (now-stale) counters. This is the worker's flush path; it keeps
 // the whole snapshot atomic and idempotent (absolute values, no deltas). It
 // returns the error so the caller can bound the write with a context; the
 // error is also logged here, matching the package's non-fatal style.
 //
-// Timestamp preservation: the four per-function Last*At fields are execution
+// Timestamp preservation: the four per-app Last*At fields are execution
 // history, so an empty incoming value PRESERVES the persisted one rather than
 // erasing it. Because each row's payload is JSON, the stored payloads are read
 // once inside the transaction and merged before writing (see
-// mergeFunctionStatsTimestamps); counters are never merged — they are absolute
+// mergeAppStatsTimestamps); counters are never merged — they are absolute
 // snapshots and always overwrite.
-func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []FunctionStats) error {
+func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []AppStats) error {
 	globalPayload, err := marshalStats(stats)
 	if err != nil {
 		st.log.Warn("State: flush stats snapshot failed", "error", err)
 		return err
 	}
 	err = st.rebuildTx(ctx, func(tx *sql.Tx) error {
-		// Prune orphaned function_stats rows first so a removed function's row
+		// Prune orphaned app_stats rows first so a removed app's row
 		// is gone before the upserts below could re-create it.
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM function_stats WHERE function_name NOT IN (SELECT name FROM functions)`); err != nil {
+			`DELETE FROM app_stats WHERE app_name NOT IN (SELECT name FROM apps)`); err != nil {
 			return err
 		}
 		// Read the surviving stored payloads once, for the timestamp merge.
-		stored, err := st.storedFunctionStatsPayloads(ctx, tx)
+		stored, err := st.storedAppStatsPayloads(ctx, tx)
 		if err != nil {
 			return err
 		}
 		// One timestamp for the whole snapshot, so the global row and every
-		// per-function row share the same updated_at (the previous explicit-
+		// per-app row share the same updated_at (the previous explicit-
 		// column flush computed ts once too).
 		ts := st.nowString()
 		if _, err := tx.ExecContext(ctx,
@@ -125,21 +125,21 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []Fun
 			// Counters are absolute and always replaced; an empty incoming
 			// timestamp is filled from the stored payload so a flush that
 			// observed nothing never erases history.
-			merged := mergeFunctionStatsTimestamps(stored[fs.Function], fs)
-			payload, err := marshalFunctionStats(merged)
+			merged := mergeAppStatsTimestamps(stored[fs.App], fs)
+			payload, err := marshalAppStats(merged)
 			if err != nil {
 				return err
 			}
-			// The EXISTS guard keeps a removed function's row from being
+			// The EXISTS guard keeps a removed app's row from being
 			// re-created even though the prune above already removed it.
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO function_stats (function_name, data, updated_at)
+				`INSERT INTO app_stats (app_name, data, updated_at)
 				 SELECT ?, jsonb(?), ?
-				 WHERE EXISTS (SELECT 1 FROM functions WHERE name = ?)
-				 ON CONFLICT(function_name) DO UPDATE SET
+				 WHERE EXISTS (SELECT 1 FROM apps WHERE name = ?)
+				 ON CONFLICT(app_name) DO UPDATE SET
 				   data       = excluded.data,
 				   updated_at = excluded.updated_at`,
-				fs.Function, payload, ts, fs.Function); err != nil {
+				fs.App, payload, ts, fs.App); err != nil {
 				return err
 			}
 		}
@@ -151,28 +151,28 @@ func (st *State) RecordStatsSnapshot(ctx context.Context, stats Stats, fns []Fun
 	return err
 }
 
-// storedFunctionStatsPayloads reads every function_stats row's decoded payload,
-// keyed by function name, inside tx. A row whose JSON is invalid is logged
-// (naming the function and the decode error) and treated as the zero value, so
+// storedAppStatsPayloads reads every app_stats row's decoded payload,
+// keyed by app name, inside tx. A row whose JSON is invalid is logged
+// (naming the app and the decode error) and treated as the zero value, so
 // one corrupt row cannot abort the whole flush; the flush below overwrites it
 // with the incoming absolute snapshot, self-healing the row.
-func (st *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]FunctionStats, error) {
+func (st *State) storedAppStatsPayloads(ctx context.Context, tx *sql.Tx) (map[string]AppStats, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT function_name, `+jsonPayloadExpr+` FROM function_stats`)
+		`SELECT app_name, `+jsonPayloadExpr+` FROM app_stats`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make(map[string]FunctionStats)
+	out := make(map[string]AppStats)
 	for rows.Next() {
 		var name string
 		var data sql.NullString
 		if err := rows.Scan(&name, &data); err != nil {
 			return nil, err
 		}
-		fs, err := unmarshalFunctionStats(data)
+		fs, err := unmarshalAppStats(data)
 		if err != nil {
-			st.log.Warn("State: read function stats failed", "function", name, "error", err)
+			st.log.Warn("State: read app stats failed", "app", name, "error", err)
 			continue
 		}
 		out[name] = fs
@@ -180,38 +180,38 @@ func (st *State) storedFunctionStatsPayloads(ctx context.Context, tx *sql.Tx) (m
 	return out, rows.Err()
 }
 
-// storedFunctionStatsTx reads and decodes one function_stats row's payload
+// storedAppStatsTx reads and decodes one app_stats row's payload
 // inside tx, returning the zero value when the row is absent. An invalid
-// payload is logged (naming the function and the decode error) and treated as
+// payload is logged (naming the app and the decode error) and treated as
 // the zero value, so the caller's incoming absolute snapshot still lands and
 // self-heals the row. It is the single-row companion of
-// storedFunctionStatsPayloads, shared by the standalone upsert.
-func (st *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name string) FunctionStats {
+// storedAppStatsPayloads, shared by the standalone upsert.
+func (st *State) storedAppStatsTx(ctx context.Context, tx *sql.Tx, name string) AppStats {
 	var data sql.NullString
 	err := tx.QueryRowContext(ctx,
-		`SELECT `+jsonPayloadExpr+` FROM function_stats WHERE function_name = ?`, name,
+		`SELECT `+jsonPayloadExpr+` FROM app_stats WHERE app_name = ?`, name,
 	).Scan(&data)
 	if err == sql.ErrNoRows {
-		return FunctionStats{}
+		return AppStats{}
 	}
 	if err != nil {
-		st.log.Warn("State: read function stats failed", "function", name, "error", err)
-		return FunctionStats{}
+		st.log.Warn("State: read app stats failed", "app", name, "error", err)
+		return AppStats{}
 	}
-	fs, err := unmarshalFunctionStats(data)
+	fs, err := unmarshalAppStats(data)
 	if err != nil {
-		st.log.Warn("State: read function stats failed", "function", name, "error", err)
-		return FunctionStats{}
+		st.log.Warn("State: read app stats failed", "app", name, "error", err)
+		return AppStats{}
 	}
 	return fs
 }
 
 // ResetStats returns the persisted cumulative statistics to their
 // fresh-install state in ONE transaction while PRESERVING the shape of the
-// stored rows: the global stats row and every per-function function_stats row
+// stored rows: the global stats row and every per-app app_stats row
 // survive, decoded from their typed JSON payloads. The global row's seven
 // cumulative counters (events received/matched/unmatched and
-// handler success/handler failure/retry/DLQ) are zeroed; each function row's
+// handler success/handler failure/retry/DLQ) are zeroed; each app row's
 // event-matched/handler counters plus the cumulative
 // warm-acquire/cold-start/discarded pool counters are zeroed, and its four
 // Last*At execution-history timestamps are cleared. The rows themselves are
@@ -225,7 +225,7 @@ func (st *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name str
 // does not know about are not round-tripped (the typed structs are the source
 // of truth); every KNOWN unrelated field survives. updated_at is refreshed to
 // now() on every rewritten row (generic last-write metadata, same semantics as
-// RecordStats). Everything else in the database (functions and their
+// RecordStats). Everything else in the database (apps and their
 // snapshots, git state, secrets, invocation state) is untouched; no Prometheus
 // counter, Redis state, worker, or container is involved.
 //
@@ -235,7 +235,7 @@ func (st *State) storedFunctionStatsTx(ctx context.Context, tx *sql.Tx, name str
 // snapshot cannot be written after this reset (see worker's stats resetter);
 // this method is the complete reset for a stopped worker.
 //
-// A corrupt payload — global or per-function — is fatal: it cannot be decoded
+// A corrupt payload — global or per-app — is fatal: it cannot be decoded
 // and rewritten to zero, so the decode error is returned and the transaction
 // rolls back, leaving every row exactly as it was. A partial reset is never
 // mistaken for a complete one.
@@ -246,12 +246,12 @@ func (st *State) ResetStats() error {
 	ctx := context.Background()
 	err := st.rebuildTx(ctx, func(tx *sql.Tx) error {
 		// One timestamp for every rewritten row, so the global row and all
-		// per-function rows share it (the flush snapshot does the same).
+		// per-app rows share it (the flush snapshot does the same).
 		ts := st.nowString()
 		if err := st.resetGlobalStatsTx(ctx, tx, ts); err != nil {
 			return err
 		}
-		return st.resetFunctionStatsTx(ctx, tx, ts)
+		return st.resetAppStatsTx(ctx, tx, ts)
 	})
 	if err != nil {
 		st.log.Warn("State: reset stats failed", "error", err)
@@ -303,7 +303,7 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) 
 	return err
 }
 
-// resetFunctionStatsTx zeroes every function_stats row's cumulative fields in
+// resetAppStatsTx zeroes every app_stats row's cumulative fields in
 // tx with an UPDATE per row (never a DELETE): the event-matched/handler
 // counters, the three warm-container pool counters, and the four Last*At
 // timestamps. The typed JSON payloads are read first into a slice (a
@@ -311,13 +311,13 @@ func (st *State) resetGlobalStatsTx(ctx context.Context, tx *sql.Tx, ts string) 
 // still open), then written back. A corrupt payload returns the decode error,
 // rolling the whole reset back. Timestamps are cleared (not merged) because a
 // reset is an explicit erasure of execution history.
-func (st *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
+func (st *State) resetAppStatsTx(ctx context.Context, tx *sql.Tx, ts string) error {
 	type row struct {
 		name string
 		data sql.NullString
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT function_name, `+jsonPayloadExpr+` FROM function_stats`)
+		`SELECT app_name, `+jsonPayloadExpr+` FROM app_stats`)
 	if err != nil {
 		return err
 	}
@@ -337,7 +337,7 @@ func (st *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string
 	rows.Close()
 
 	for _, r := range pending {
-		fs, err := unmarshalFunctionStats(r.data)
+		fs, err := unmarshalAppStats(r.data)
 		if err != nil {
 			return err
 		}
@@ -353,12 +353,12 @@ func (st *State) resetFunctionStatsTx(ctx context.Context, tx *sql.Tx, ts string
 		fs.LastSuccessAt = ""
 		fs.LastFailureAt = ""
 		fs.LastDLQAt = ""
-		payload, err := marshalFunctionStats(fs)
+		payload, err := marshalAppStats(fs)
 		if err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE function_stats SET data = jsonb(?), updated_at = ? WHERE function_name = ?`,
+			`UPDATE app_stats SET data = jsonb(?), updated_at = ? WHERE app_name = ?`,
 			payload, ts, r.name); err != nil {
 			return err
 		}

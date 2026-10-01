@@ -1,22 +1,22 @@
 // Package runner is the orchestration contract between the stream layer and
 // the runtime.
 //
-// This package evaluates events against a snapshot-consistent function registry:
-//   - Match: each event is evaluated against every loaded function's rules,
-//     INCLUDING functions that are configured but currently unavailable (their
-//     image could not be built). An event matching only an unavailable function
-//     is still MATCHED and engages that function; it is never misclassified as
+// This package evaluates events against a snapshot-consistent app registry:
+//   - Match: each event is evaluated against every loaded app's rules,
+//     INCLUDING apps that are configured but currently unavailable (their
+//     image could not be built). An event matching only an unavailable app
+//     is still MATCHED and engages that app; it is never misclassified as
 //     unmatched
 //   - Execute: matching handlers run sequentially, bounded by their rule's timeout
-//   - Unavailable: a matched invocation of an unavailable function cannot run
+//   - Unavailable: a matched invocation of an unavailable app cannot run
 //     this delivery. It claims no handler attempt and touches no handler counter
-//     (no handler ran); Handle reports the retryable runner.ErrFunctionUnavailable
+//     (no handler ran); Handle reports the retryable runner.ErrAppUnavailable
 //     so the stream leaves the message pending — never ACKed, never DLQ'd solely
 //     for unavailability. A mixed message runs its available invocations to
 //     completion and holds pending only for the unavailable one; once the
-//     function is rebuilt, a redelivery finishes the outstanding work
+//     app is rebuilt, a redelivery finishes the outstanding work
 //   - Skip: when the stream layer injects invocation state into the context,
-//     a matching handler whose "<function>/<rule-handler>" invocation already
+//     a matching handler whose "<app>/<rule-handler>" invocation already
 //     succeeded on a previous delivery, is protected by an active attempt
 //     deadline or a retry backoff, or is exhausted is skipped (not executed, not
 //     counted)
@@ -32,7 +32,7 @@
 //     every matched invocation is terminal (complete or exhausted) and at least
 //     one exhausted, the message is terminal and routed to the DLQ — the
 //     returned *stream.HandlerExhaustedError carries EVERY exhausted invocation
-//     (exact function/handler and handler attempt), so the stream writes one
+//     (exact app/handler and handler attempt), so the stream writes one
 //     correctly-attributed DLQ entry per invocation; a protected or slot-timeout
 //     skip returns stream.ErrInvocationNotEligible so the message stays pending
 //     (never acked while another replica may still be processing it, even if
@@ -58,8 +58,8 @@
 // Key Guarantees:
 //   - Handle holds one registry snapshot for the whole call, so in-flight
 //     executions never observe a half-replaced set during a live swap
-//   - Invocation identity is "function/rule-handler", stable across restarts and
-//     config reloads as long as the rule still exists; renaming a function or
+//   - Invocation identity is "app/rule-handler", stable across restarts and
+//     config reloads as long as the rule still exists; renaming an app or
 //     handler invalidates old invocation state (old entries simply never match)
 //
 // The package owns no Redis, Docker, or matching internals; execution is
@@ -74,7 +74,7 @@
 // invocation-state semantics apply exactly like any other stream message.
 //
 // Schedule admission boundary: BEFORE ADMISSION an occurrence resolves the
-// function's CURRENT template by its stable schedule NAME on every delivery, so
+// app's CURRENT template by its stable schedule NAME on every delivery, so
 // a handler/timeout/retries change under the same name applies and the name's
 // current handler runs; a removed NAME with nothing admitted yet is obsolete.
 // Because an occurrence may block for a long time waiting for a concurrency

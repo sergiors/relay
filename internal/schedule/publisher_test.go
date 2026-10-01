@@ -21,7 +21,7 @@ import (
 
 // ptestEnv provisions a unique stream name for one test and, on completion,
 // cleans up the owned keys (its stream plus the dedup keys under its own
-// function-name family). The dedup key scan is bounded to that family because
+// app-name family). The dedup key scan is bounded to that family because
 // the keys are keyed by occurrence identity, not by the stream prefix.
 type ptestEnv struct {
 	client *redis.Client
@@ -41,9 +41,9 @@ func newPTestEnv(t *testing.T, cli *redis.Client) *ptestEnv {
 	return &ptestEnv{client: cli, stream: stream, prefix: prefix}
 }
 
-// cleanupScheduleKeys scans for and deletes the dedup keys whose function-name
+// cleanupScheduleKeys scans for and deletes the dedup keys whose app-name
 // component is this env's unique prefix. Dedup keys are keyed by occurrence
-// identity ("relay:schedule:<function>:<handler>:<instant>"), never by the
+// identity ("relay:schedule:<app>:<handler>:<instant>"), never by the
 // stream prefix, so the scan is bounded to `relay:schedule:<prefix>:*` — this
 // test's own keys only. The prefix is generated from [0-9-] so it needs no
 // percent-encoding (unlike arbitrary user names in the stream package), and no
@@ -67,14 +67,14 @@ func cleanupScheduleKeys(ctx context.Context, cli *redis.Client, prefix string) 
 }
 
 // newUniqueOccurrence returns an Occurrence whose identity is unique to this test
-// invocation: its function-name component is the env's unixnano-based prefix, so
+// invocation: its app-name component is the env's unixnano-based prefix, so
 // the dedup key (`relay:schedule:<prefix>:...`) never collides with another
 // test's and cleanup can be scoped to that prefix. The ScheduledAt instant is a
 // fixed, second-aligned test instant; occurrences derived within a test differ by
 // instant or schedule name (see TestIntegrationDifferentOccurrencesPublishIndependently).
 func newUniqueOccurrence(prefix string) Occurrence {
 	return Occurrence{
-		Function:    prefix,
+		App:         prefix,
 		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
@@ -146,8 +146,8 @@ func TestIntegrationDifferentOccurrencesPublishIndependently(t *testing.T) {
 	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
 
 	o1 := newUniqueOccurrence(e.prefix)
-	o2 := Occurrence{Function: e.prefix, Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: o1.ScheduledAt.Add(time.Minute)}
-	o3 := Occurrence{Function: e.prefix, Schedule: "other", Handler: "jobs.other.handler", ScheduledAt: o1.ScheduledAt}
+	o2 := Occurrence{App: e.prefix, Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: o1.ScheduledAt.Add(time.Minute)}
+	o3 := Occurrence{App: e.prefix, Schedule: "other", Handler: "jobs.other.handler", ScheduledAt: o1.ScheduledAt}
 
 	ctx := context.Background()
 	for _, o := range []Occurrence{o1, o2, o3} {

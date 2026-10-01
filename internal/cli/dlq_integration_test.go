@@ -52,7 +52,7 @@ func TestIntegrationDLQCommandsAgainstRedis(t *testing.T) {
 			"consumer":         "worker-1",
 			"event":            `{"event_name":"INSERT","id":7}`,
 			"reason":           `invocation exhausted`,
-			"function":         "alpha",
+			"app":              "alpha",
 			"handler":          "events.a.handler",
 			"deliveries":       "9",
 			"handler_attempts": "5",
@@ -79,7 +79,7 @@ func TestIntegrationDLQCommandsAgainstRedis(t *testing.T) {
 		t.Fatalf("dlq inspect: %v", err)
 	}
 	flat := normWS(out)
-	for _, want := range []string{"Function: alpha", "Handler attempts: 5", "Handler: events.a.handler"} {
+	for _, want := range []string{"App: alpha", "Handler attempts: 5", "Handler: events.a.handler"} {
 		if !strings.Contains(flat, want) {
 			t.Fatalf("inspect missing %q:\n%s", want, out)
 		}

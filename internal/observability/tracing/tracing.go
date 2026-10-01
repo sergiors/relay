@@ -63,7 +63,7 @@ import (
 )
 
 // tracerName is the instrumentation scope every Relay span is created under. It
-// is a stable, low-cardinality identifier (never a function name).
+// is a stable, low-cardinality identifier (never an app name).
 const tracerName = "relay"
 
 // The W3C trace-context field names. They are the exact header names the

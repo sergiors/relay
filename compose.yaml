@@ -29,7 +29,7 @@ services:
       - LOG_LEVEL=DEBUG
 
     volumes:
-      - ./examples/functions:/functions:ro
+      - ./examples/apps:/apps:ro
       - relay-data:/var/lib/relay
 
     healthcheck:

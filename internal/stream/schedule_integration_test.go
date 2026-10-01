@@ -25,7 +25,7 @@ import (
 // schOcc returns a schedule occurrence used by the schedule integration tests.
 func schOcc() schedule.Occurrence {
 	return schedule.Occurrence{
-		Function:    "courses",
+		App:         "courses",
 		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),
@@ -88,7 +88,7 @@ func (r *scriptedRunner) last() scheduleOccCall {
 
 // TestIntegrationScheduleRoutedToRunnerAndAcked verifies a schedule message
 // routed through a ScheduleRunner is executed directly with the exact
-// function/handler and payload, then ACKed (gone from the PEL), while the
+// app/handler and payload, then ACKed (gone from the PEL), while the
 // normal-event handler is never invoked for it (bypass confirmed).
 func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 	testutil.RequireRedis(t)
@@ -107,14 +107,14 @@ func TestIntegrationScheduleRoutedToRunnerAndAcked(t *testing.T) {
 		return rr.count() >= 1
 	})
 	call := rr.last()
-	if call.fn != o.Function {
-		t.Fatalf("function = %q, want %q", call.fn, o.Function)
+	if call.fn != o.App {
+		t.Fatalf("function = %q, want %q", call.fn, o.App)
 	}
 	if call.handler != o.Handler {
 		t.Fatalf("handler = %q, want %q", call.handler, o.Handler)
 	}
 	// The payload is the handler payload (source + scheduled_at only), never the
-	// envelope (no function/handler/occurrence_id leaks).
+	// envelope (no app/handler/occurrence_id leaks).
 	var p map[string]any
 	if err := json.Unmarshal(call.payload, &p); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
@@ -268,7 +268,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 }
 
 // A schedule message whose ScheduleRunner reports ErrInvocationObsolete (the
-// function or its schedule entry/handler was removed while the message was
+// app or its schedule entry/handler was removed while the message was
 // pending) is terminal but must be ACKed — never left pending, never routed to
 // the DLQ. This is the intentional-removal case: retrying or dead-lettering an
 // obsolete occurrence would be wrong, so the stream acknowledges it instead.

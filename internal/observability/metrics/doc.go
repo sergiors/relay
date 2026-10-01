@@ -8,7 +8,7 @@
 // Structure:
 //
 //   - Registry (metrics.go) is the nil-safe in-memory store — the single source
-//     of truth for every recorded value, plus the Snapshot / FunctionStatsSnapshot
+//     of truth for every recorded value, plus the Snapshot / AppStatsSnapshot
 //     gather routines and the Prometheus exposition Handler (a pure promhttp
 //     wrap, with no routing). It contains no lifecycle or network code.
 //   - Server (server.go) owns the net/http /metrics lifecycle and routing: a
@@ -36,40 +36,42 @@
 //     relay_schedule_publish_failures_total, the bounded-retry counters
 //     relay_schedule_publish_retries_total / relay_schedule_publish_exhausted_total,
 //     and relay_schedule_catchup_total), plus CounterVecs
-//     relay_handler_invocations_total{outcome,function,handler},
-//     relay_build_failures_total{function}, the per-function operational
-//     counters relay_function_events_matched_total{function},
-//     relay_function_handler_success_total{function},
-//     relay_function_handler_failure_total{function},
-//     relay_function_retries_total{function}, relay_function_dlq_total{function},
+//     relay_handler_invocations_total{outcome,app,handler},
+//     relay_app_build_failures_total{app}, the per-app operational
+//     counters relay_app_events_matched_total{app},
+//     relay_function_handler_success_total{app},
+//     relay_function_handler_failure_total{app},
+//     relay_function_retries_total{app}, relay_function_dlq_total{app},
 //     and the warm-container pool acquire/discard/waits CounterVecs below.
-//   - Histograms: relay_handler_duration_seconds{function,handler},
-//     relay_function_build_seconds{function},
-//     relay_runtime_container_acquire_duration_seconds{function}, and
-//     relay_service_reconcile_duration_seconds{function}
+//     The four handler-execution counters carry the function_ namespace (they
+//     count handler work) but keep the app identity LABEL.
+//   - Histograms: relay_handler_duration_seconds{app,handler},
+//     relay_app_build_seconds{app},
+//     relay_runtime_container_acquire_duration_seconds{app}, and
+//     relay_service_reconcile_duration_seconds{app}
 //     (prometheus.DefBuckets; all observed in seconds).
 //   - Gauges: relay_pending_entries and relay_pending_oldest_age_seconds
 //     (Redis backlog depth and age sampled by the stream consumer),
 //     relay_buffered_events (the consumer's local in-flight buffer occupancy),
 //     relay_in_flight_invocations (the runner's current executing
-//     invocation count), and relay_function_status{function,status} (one-hot
+//     invocation count), and relay_app_status{app,status} (one-hot
 //     public lifecycle: exactly one of the closed status set is 1).
 //   - Selective operational counters: relay_redis_read_errors_total{operation}
 //     (failed Redis reads by the finite operation set; no raw error label) and
-//     relay_service_reconciles_total{function,outcome=changed|unchanged|error}
+//     relay_service_reconciles_total{app,outcome=changed|unchanged|error}
 //     (every ServiceReconciler pass, including periodic no-op verifications).
-//   - Warm-container pool (runtime, function-scoped):
-//     relay_runtime_pool_capacity{function} and
-//     relay_runtime_containers{function,state=idle|busy|starting} gauges,
-//     relay_runtime_container_acquires_total{function,outcome=warm|cold},
-//     relay_runtime_container_discards_total{function,reason}, and
-//     relay_runtime_container_waits_total{function} counters, and the
+//   - Warm-container pool (runtime, app-scoped):
+//     relay_runtime_pool_capacity{app} and
+//     relay_runtime_containers{app,state=idle|busy|starting} gauges,
+//     relay_runtime_container_acquires_total{app,outcome=warm|cold},
+//     relay_runtime_container_discards_total{app,reason}, and
+//     relay_runtime_container_waits_total{app} counters, and the
 //     successful-acquire histogram
-//     relay_runtime_container_acquire_duration_seconds{function}.
+//     relay_runtime_container_acquire_duration_seconds{app}.
 //
 // The schedule-coordination counters are Prometheus-only: they are deliberately
 // NOT wired into the SQLite stats snapshot. The selective metrics added later —
-// relay_function_status, relay_redis_read_errors_total, and the
+// relay_app_status, relay_redis_read_errors_total, and the
 // relay_service_reconcile_* family — are likewise Prometheus-only: a
 // current-state gauge and failure/histogram series are scrape-time observations,
 // not cumulative Relay totals worth persisting.
@@ -88,12 +90,14 @@
 // plus a placeholder per malformed message), while relay_function_dlq_total
 // counts invocations that exhausted their retry budget (the exhaustion commit,
 // which may precede the write). The two per-family counters answer different
-// questions and are deliberately not interchangeable.
+// questions and are deliberately not interchangeable. The function_* family
+// counts handler EXECUTION attributed to an app; app lifecycle families
+// (relay_app_events_matched_total, relay_app_status) keep the app_ namespace.
 //
-// Cardinality is bounded: labels are limited to function/handler/outcome plus
+// Cardinality is bounded: labels are limited to app/handler/outcome plus
 // the small closed runtime-pool value sets (state=idle|busy|starting,
 // outcome=warm|cold, and the finite discard reasons) plus the closed
-// function_status status set and the finite redis read/error operation set,
+// app_status status set and the finite redis read/error operation set,
 // which are validated
 // low-cardinality identifiers. High-cardinality values such as event IDs,
 // message IDs, container IDs, fingerprints, or raw error strings must never be
@@ -111,12 +115,12 @@
 //     be brittle; skipped.
 //
 // The discard reason label carries ONLY real, finite teardown causes. Persisted
-// per-function discards are one a-causal aggregate, so rather than expose a
+// per-app discards are one a-causal aggregate, so rather than expose a
 // synthetic reason series at startup, the restored total is held in an internal
-// per-function baseline (see Registry.restoredDiscards, seeded by
-// SeedFunctionStat) and folded into the cumulative total reported by
-// RuntimePoolCounters and FunctionStatsSnapshot. The baseline is never exposed
-// on /metrics and is cleared by every function retirement path.
+// per-app baseline (see Registry.restoredDiscards, seeded by
+// SeedAppStat) and folded into the cumulative total reported by
+// RuntimePoolCounters and AppStatsSnapshot. The baseline is never exposed
+// on /metrics and is cleared by every app retirement path.
 //
 // Single source of truth: stats are accumulated IN MEMORY in this registry —
 // the runner, stream consumer, and runtime manager record against it directly,
@@ -126,11 +130,11 @@
 // history. A hard crash loses at most the last unflushed interval of telemetry;
 // graceful shutdown performs a final bounded flush.
 //
-// Function lifecycle: function-scoped series (the CounterVecs and HistogramVecs
-// in functionMetrics) are created lazily on the first observation and deleted
-// when the function is removed. Removal happens at two points: RemoveFunction
-// is invoked from the reconciler's RemoveFunction hook at reconciliation time,
-// and SweepFunctionMetrics runs in the worker's stats flush to re-delete any
+// App lifecycle: app-scoped series (the CounterVecs and HistogramVecs
+// in appMetrics) are created lazily on the first observation and deleted
+// when the app is removed. Removal happens at two points: RemoveApp
+// is invoked from the reconciler's RemoveApp hook at reconciliation time,
+// and SweepAppMetrics runs in the worker's stats flush to re-delete any
 // series an in-flight invocation may have recreated after removal. Global
 // metrics are never deleted — they are process-lifetime totals.
 //

@@ -4,7 +4,7 @@
 //   - Group creation: XGROUP CREATE with MKSTREAM, tolerating BUSYGROUP, via the
 //     package-level EnsureGroup (Consumer.EnsureGroup delegates to it). The
 //     worker runs it as the FIRST step of its external-dependency preflight,
-//     before any function is loaded or fingerprinted and before the state DB and
+//     before any app is loaded or fingerprinted and before the state DB and
 //     runtime workload initialization (the Redis client and tracing already
 //     exist; the Docker manager is opened afterwards, see internal/worker), so a
 //     Redis stream/group problem short-circuits startup; the group is not
@@ -13,7 +13,7 @@
 //   - Schedule occurrences: messages whose decode is recognized as a schedule
 //     envelope (see internal/schedule) ride this same consumer-group / PEL /
 //     XAUTOCLAIM / retry / DLQ machinery but bypass event matching: when a
-//     ScheduleRunner is wired they invoke the named function/handler directly.
+//     ScheduleRunner is wired they invoke the named app/handler directly.
 //   - Recovery: XAUTOCLAIM reclaims idle pending messages, with retry counts
 //     sourced from XPENDING so delivery counts survive restarts. Reclaim is
 //     message-ownership recovery only; whether a reclaimed message's invocation
@@ -32,7 +32,7 @@
 //     every non-complete matched invocation is exhausted, the whole message is
 //     routed to the DLQ and one entry is written PER exhausted invocation (see
 //     ErrInvocationExhausted and HandlerExhaustedError), each carrying its exact
-//     function/handler and handler attempt count. A malformed message that never
+//     app/handler and handler attempt count. A malformed message that never
 //     reached a handler produces a single entry with the "-" placeholder and an
 //     explicit handler_attempts of 0.
 //   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
@@ -42,7 +42,7 @@
 //     missing ones. The original is ACKed only after all required entries are
 //     persisted, so a write failure leaves the message pending.
 //   - Invocation state: per-handler lifecycle is recorded in a Redis hash
-//     (relay:invocation:{stream}:{group}:{msgID}, field "<function>/<handler>" →
+//     (relay:invocation:{stream}:{group}:{msgID}, field "<app>/<handler>" →
 //     "ok" when complete, "running:<deadline_ms>:<attempt>:<token>" while an
 //     attempt is protected, "next_attempt_at:<deadline_ms>:<attempt>:<token>"
 //     while a failed attempt waits out its retry backoff, "exhausted:<attempt>:<token>"
@@ -166,9 +166,9 @@
 // The package knows nothing about matching or execution; it delegates each
 // decoded event to the caller's Handler. Schedule-occurrence messages are a
 // notable exception: they are routed to the ScheduleRunner seam (when wired),
-// which is the runner's InvokeHandler executing the named function's schedule by
+// which is the runner's InvokeHandler executing the named app's schedule by
 // its stable schedule name directly without event matching. A ScheduleRunner
-// that reports ErrInvocationObsolete (the function or schedule NAME was removed
+// that reports ErrInvocationObsolete (the app or schedule NAME was removed
 // while the occurrence was pending) causes the message to be acknowledged — an
 // obsolete occurrence is terminal and is never retried or dead-lettered.
 package stream

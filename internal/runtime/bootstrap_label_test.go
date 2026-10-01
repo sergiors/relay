@@ -73,7 +73,7 @@ func TestBootstrapHashChangesWithInjectedContent(t *testing.T) {
 	// Build-time Install commands (e.g. the pinned esbuild TypeScript
 	// transpilation) are image content too: a different compile step or esbuild
 	// version must change the hash so an older image is rebuilt under the same
-	// function fingerprint tag.
+	// app fingerprint tag.
 	installAdded := base
 	installAdded.Install = []string{"npm install --prefix /tmp/relay-esbuild --no-save --silent esbuild@0.28.2"}
 	if got := bootstrapHash(installAdded); got == orig {
@@ -102,7 +102,7 @@ func TestBootstrapHashPinsFileBoundaries(t *testing.T) {
 // and an inspect failure both report a mismatch (rebuild) so a stale-bootstrap
 // image is never reused. An empty want short-circuits to true.
 func TestBootstrapLabelMatches(t *testing.T) {
-	const image = "relay-fn-a:0123456789abcdef"
+	const image = "relay-app-a:0123456789abcdef"
 
 	newMgr := func(t *testing.T, body string, status int) *Manager {
 		t.Helper()
@@ -127,7 +127,7 @@ func TestBootstrapLabelMatches(t *testing.T) {
 	})
 
 	t.Run("missing label forces rebuild", func(t *testing.T) {
-		m := newMgr(t, `{"Config":{"Labels":{"relay.function":"a"}}}`, 0)
+		m := newMgr(t, `{"Config":{"Labels":{"relay.app":"a"}}}`, 0)
 		if m.bootstrapLabelMatches(context.Background(), image, "new") {
 			t.Error("bootstrapLabelMatches = true for a missing label, want false")
 		}

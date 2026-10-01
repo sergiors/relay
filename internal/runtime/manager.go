@@ -13,7 +13,7 @@ import (
 	"github.com/moby/moby/client"
 	"go.opentelemetry.io/otel/codes"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
@@ -94,12 +94,12 @@ func pingDocker(ctx context.Context, cli *client.Client) error {
 	return err
 }
 
-// Manager prepares function images and executes handler invocations. It owns a
+// Manager prepares app images and executes handler invocations. It owns a
 // single Docker Engine client, reused for every build and invocation, and a
-// per-function warm container pool: each function keeps up to its resolved
+// per-app warm container pool: each app keeps up to its resolved
 // concurrency reused containers per image version (see container_cache.go),
 // kept alive between invocations and leased one-per-invocation, and discarded
-// on timeout/process exit/protocol error/image change/function removal/shutdown
+// on timeout/process exit/protocol error/image change/app removal/shutdown
 // or evicted when it has been idle longer than the configured idle timeout.
 type Manager struct {
 	log *slog.Logger
@@ -115,10 +115,10 @@ type Manager struct {
 	hostname string
 	// maxConcurrency is the worker-global concurrency cap (MAX_CONCURRENCY): the
 	// SAME value the runner uses for its global semaphore. It clips every
-	// function's effective per-function concurrency to
+	// app's effective per-app concurrency to
 	// min(template concurrency, maxConcurrency) in Prepare/Execute, so the warm
 	// pool, its capacity gauge, PoolSnapshot/the CLI, and the runner's
-	// per-function semaphore all agree on one effective bound. It is set once at
+	// per-app semaphore all agree on one effective bound. It is set once at
 	// construction (WithMaxConcurrency; the worker wires config's resolved
 	// value) and read without the lock: MAX_CONCURRENCY is startup
 	// configuration and is NOT hot-reloadable, so a global change requires a
@@ -135,7 +135,7 @@ type Manager struct {
 	// infrastructure owned OUTSIDE Relay — the worker verifies they exist at
 	// startup and Relay never creates them.
 	networks []string
-	// containers caches the per-function reusable execution containers.
+	// containers caches the per-app reusable execution containers.
 	containers *containerCache
 	// leases is the single ownership authority for Relay-owned images: it
 	// admits references (builds, executions, services, registry publication)
@@ -210,7 +210,7 @@ type Manager struct {
 	// without a Docker daemon. It receives exactly the arguments Execute would
 	// pass to startContainer, including the resolved image identity so a test can
 	// assert the container is created from the exact content that was leased.
-	startContainerFn func(ctx context.Context, fnName string, img resolvedImage, env []string, limits function.ResourceLimits, meta RunMeta) (reusableContainer, error)
+	startContainerFn func(ctx context.Context, fnName string, img resolvedImage, env []string, limits app.ResourceLimits, meta RunMeta) (reusableContainer, error)
 	// resolveImageIdentityFn resolves a managed image reference to its immutable
 	// content identity. It is nil in production (resolveImageIdentity inspects
 	// the daemon) and set only by in-package tests so the Execute path's
@@ -220,13 +220,13 @@ type Manager struct {
 	// afterSourceSnapshot is the deterministic seam around the captured source
 	// snapshot: Prepare calls it (test-only) ONCE, immediately after
 	// CaptureSourceSnapshot and before the fingerprint is derived, passing the
-	// live *function.SourceSnapshot. It is nil in production and never called
+	// live *app.SourceSnapshot. It is nil in production and never called
 	// then. A test uses it either to mutate the on-disk tree at the exact
 	// capture/build boundary (proving the tag and staged bytes still come from
 	// the one capture) or to retain the snapshot and assert its bytes were
 	// released when Prepare returns — including on the cancellation path. It is
 	// read and never mutated after construction.
-	afterSourceSnapshot func(*function.SourceSnapshot)
+	afterSourceSnapshot func(*app.SourceSnapshot)
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -274,7 +274,7 @@ func WithWarmContainerIdleTimeout(idleTimeout time.Duration) ManagerOption {
 
 // WithMaxConcurrency sets the worker-global concurrency cap (MAX_CONCURRENCY).
 // It is the SAME value the worker passes to runner.SetMaxConcurrency, so the
-// warm pool's effective bound and the runner's per-function semaphore agree.
+// warm pool's effective bound and the runner's per-app semaphore agree.
 // A non-positive value is treated as DefaultMaxConcurrency (never "uncapped"),
 // matching the runner's normalization. It is startup configuration: changing it
 // requires a worker restart (there is no live setter; the runner's global
@@ -655,12 +655,12 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 	return m.closeErr
 }
 
-// startContainer builds one fresh execution container for a function version.
+// startContainer builds one fresh execution container for an app version.
 // It is the containerCache factory, called with the creating invocation's
 // parameters: img is the resolved immutable image identity (its createImage is
 // handed to Docker so the container is created from exactly the resolved bytes),
-// env is the function's plan env (per-function, applied at container create),
-// limits is the function's effective per-container resource configuration, and
+// env is the app's plan env (per-app, applied at container create),
+// limits is the app's effective per-container resource configuration, and
 // meta is the creation-time identity RunMeta stamped as labels (per-invocation
 // fields left empty — labels are immutable while the container outlives
 // invocations). Every container joins the worker-global network set
@@ -670,7 +670,7 @@ func (m *Manager) startContainer(
 	fnName string,
 	img resolvedImage,
 	env []string,
-	limits function.ResourceLimits,
+	limits app.ResourceLimits,
 	meta RunMeta,
 ) (reusableContainer, error) {
 	if m.startContainerFn != nil {
@@ -679,43 +679,43 @@ func (m *Manager) startContainer(
 	return startExecutionContainer(ctx, m.cli, m.log, fnName, img.createImage(), env, m.networks, limits, meta)
 }
 
-// Prepared is a function whose image has been built.
+// Prepared is an app whose image has been built.
 type Prepared struct {
 	Name        string
 	Image       string
 	Fingerprint string
-	// Env are the runtime environment variables the function's engine requires
+	// Env are the runtime environment variables the app's engine requires
 	// (e.g. PYTHONDONTWRITEBYTECODE for Python). They are applied to every
-	// execution container for this function, after the base RELAY_HANDLER var.
+	// execution container for this app, after the base RELAY_HANDLER var.
 	Env []string
-	// Concurrency is the function's EFFECTIVE per-function concurrency: the
+	// Concurrency is the app's EFFECTIVE per-app concurrency: the
 	// template's resolved `concurrency` clipped to the worker-global
 	// MAX_CONCURRENCY (see Manager.effectiveConcurrency). It is the bound on the
-	// function's warm container pool: at most this many containers are kept and
-	// leased concurrently. It intentionally matches the runner's per-function
+	// app's warm container pool: at most this many containers are kept and
+	// leased concurrently. It intentionally matches the runner's per-app
 	// semaphore (also clipped to the global cap) so the pool is not a second
 	// limiter in the runner path; direct Execute callers that bypass the runner
 	// are bounded by it. Because MAX_CONCURRENCY is startup configuration, a
 	// global change requires a worker restart; a hot-swapped template
 	// `concurrency` is re-clipped live on each successful Prepare.
 	Concurrency int
-	// Dependency is the full "relay-dep-*" reference this function image was
-	// built FROM, or "" when the function declares no dependency layer. It is
-	// the function image's parent, so a caller (the runner) knows which
-	// dependency image this function version pulls its payload from — the input
+	// Dependency is the full "relay-dep-*" reference this app image was
+	// built FROM, or "" when the app declares no dependency layer. It is
+	// the app image's parent, so a caller (the runner) knows which
+	// dependency image this app version pulls its payload from — the input
 	// to dependency garbage collection. It is populated on BOTH the build and
 	// reuse paths.
 	Dependency string
-	// lease is the admitted reference to the function image (or dependency
+	// lease is the admitted reference to the app image (or dependency
 	// image for a dependency-only handle) that Prepare acquired. It is the
 	// ownership authority for the image: the caller must transfer it to the
 	// registry publication (runner.NewPrepared → Registry) or release it. It is
-	// nil for a no-runtime function and for hand-built Prepared values.
+	// nil for a no-runtime app and for hand-built Prepared values.
 	lease *ImageLease
 }
 
 // Lease returns the admitted image lease Prepare acquired for this handle, or
-// nil for a no-runtime function and hand-built handles. Ownership transfers to
+// nil for a no-runtime app and hand-built handles. Ownership transfers to
 // whoever publishes the handle (the runner registry); an unpublished handle
 // must be released by calling ReleaseLease.
 func (p *Prepared) Lease() *ImageLease {
@@ -739,7 +739,7 @@ func (p *Prepared) ReleaseLease() {
 // clears the handle's own reference, so the handle can no longer release it.
 // It is the seam runner.NewPrepared uses to move the build's admitted reference
 // into the registry publication without a double release. It returns nil for a
-// no-runtime function or an already-transferred handle.
+// no-runtime app or an already-transferred handle.
 func (p *Prepared) TakeLease() *ImageLease {
 	if p == nil || p.lease == nil {
 		return nil
@@ -749,9 +749,9 @@ func (p *Prepared) TakeLease() *ImageLease {
 	return lease
 }
 
-// Prepare builds exactly ONE image for the function's current content (never per
+// Prepare builds exactly ONE image for the app's current content (never per
 // handler or event), then returns a handle for executing invocations against it.
-// It captures the function's selected source into one immutable snapshot and
+// It captures the app's selected source into one immutable snapshot and
 // derives the content fingerprint, the image tag, and the staged build context
 // from that single capture, so the tag can never describe one set of bytes while
 // the image bakes another.
@@ -762,20 +762,20 @@ func (p *Prepared) TakeLease() *ImageLease {
 // skipped and the existing image reused — restart-without-changes is cheap. A
 // fingerprint error fails Prepare: the reconciler already computes the
 // fingerprint before calling Prepare and retains the previous version on error,
-// and for startup a fingerprint failure marks the function unavailable, which is
+// and for startup a fingerprint failure marks the app unavailable, which is
 // consistent with the existing build-failure handling.
 //
-// A successful Prepare (re)activates the function in the warm-container cache,
+// A successful Prepare (re)activates the app in the warm-container cache,
 // clearing any prior removal mark and un-retiring THIS exact image so a
-// removed-then-recreated function warms again. Activation is deliberately NOT
+// removed-then-recreated app warms again. Activation is deliberately NOT
 // done up front: a failed prepare must not lift a removal, or a stale acquire
-// could warm a function the reconciler has not actually reconciled.
-func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared, error) {
+// could warm an app the reconciler has not actually reconciled.
+func (m *Manager) Prepare(ctx context.Context, fn app.App) (*Prepared, error) {
 	return m.prepare(ctx, fn, "", nil)
 }
 
 // PrepareWithFingerprint is Prepare with a caller-supplied content fingerprint.
-// The worker's startup path computes each loaded function's fingerprint exactly
+// The worker's startup path computes each loaded app's fingerprint exactly
 // once (before the state phase) and passes it here so Prepare does not rescan the
 // tree it already hashed. The supplied value is the identity the CALLER compared
 // to decide a rebuild was needed; Prepare still captures the selected source once
@@ -786,10 +786,10 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 //
 // An empty fingerprint means "not supplied" and falls back to computing one
 // internally, so direct and test callers that have no ready fingerprint keep the
-// exact Prepare behavior. For a runtime-backed function the source selection must
-// still be resolved (the build context is staged from it). A no-runtime function
+// exact Prepare behavior. For a runtime-backed app the source selection must
+// still be resolved (the build context is staged from it). A no-runtime app
 // takes no filesystem walk at all: its fingerprint is template-only by
-// construction (see FingerprintFunction).
+// construction (see FingerprintApp).
 //
 // Correctness of the supplied value at startup is preserved by the caller's
 // ordering: the reconciler's watcher is established BEFORE the supplied
@@ -798,7 +798,7 @@ func (m *Manager) Prepare(ctx context.Context, fn function.Function) (*Prepared,
 // reconcile's own rescan, because the supplied seed is the older value.
 func (m *Manager) PrepareWithFingerprint(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	fingerprint string,
 ) (*Prepared, error) {
 	return m.prepare(ctx, fn, fingerprint, nil)
@@ -807,18 +807,18 @@ func (m *Manager) PrepareWithFingerprint(
 // PrepareWithFingerprintAndSelection is Prepare with BOTH a caller-supplied
 // content fingerprint and the already-resolved source selection that fingerprint
 // was computed from. The reconciler computes the fingerprint to decide whether a
-// rebuild is needed, resolving the selection once (function.SelectAndFingerprintFunction),
+// rebuild is needed, resolving the selection once (app.SelectAndFingerprintApp),
 // and passes BOTH here so the build re-derives neither the policy nor the hash.
 // Prepare then captures one immutable snapshot of that selection and derives the
 // tag, the staged context, and the returned identity from that single capture, so
 // a concurrent edit can no longer make the tag and the baked bytes disagree.
 //
 // A nil selection falls back to resolving one here (matching PrepareWithFingerprint).
-// A no-runtime function ignores both: it builds no image and its template-only
+// A no-runtime app ignores both: it builds no image and its template-only
 // fingerprint is used verbatim when supplied.
 func (m *Manager) PrepareWithFingerprintAndSelection(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	fingerprint string,
 	selection *source.Selection,
 ) (*Prepared, error) {
@@ -829,21 +829,21 @@ func (m *Manager) PrepareWithFingerprintAndSelection(
 // PrepareWithFingerprint, and PrepareWithFingerprintAndSelection. fingerprint is
 // the caller-supplied content fingerprint, or "" to compute one here.
 // suppliedSelection is the caller's already-resolved source selection for a
-// runtime-backed function, or nil to resolve one here.
+// runtime-backed app, or nil to resolve one here.
 func (m *Manager) prepare(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	fingerprint string,
 	suppliedSelection *source.Selection,
 ) (*Prepared, error) {
 	// A template that needs no runtime (its services all use the external
-	// `image` source, and it has no events or schedules) has no function image
+	// `image` source, and it has no events or schedules) has no app image
 	// to build: the services bring their own images. Prepare still succeeds so
-	// the function is available for service convergence, returning a handle with
+	// the app is available for service convergence, returning a handle with
 	// no image — no entrypoint service exists to consume it. The fingerprint is
 	// still recorded so template changes gate reconciliation exactly as for a
-	// runtime-backed function, but it is computed over template.yaml ALONE
-	// (FingerprintFunction): no function source is ever baked into an image, so
+	// runtime-backed app, but it is computed over template.yaml ALONE
+	// (FingerprintApp): no app source is ever baked into an image, so
 	// scanning the tree would read files nothing depends on. A caller-supplied
 	// fingerprint (the worker's startup path) is used verbatim, so even the
 	// template read is skipped.
@@ -851,25 +851,25 @@ func (m *Manager) prepare(
 		fp := fingerprint
 		if fp == "" {
 			var err error
-			fp, err = function.FingerprintFunction(fn.Dir, fn.Template)
+			fp, err = app.FingerprintApp(fn.Dir, fn.Template)
 			if err != nil {
-				return nil, fmt.Errorf("function %q: fingerprint: %w", fn.Name, err)
+				return nil, fmt.Errorf("app %q: fingerprint: %w", fn.Name, err)
 			}
 		}
-		m.log.Debug("Function: no runtime required; services bring their own images",
-			"function", fn.Name)
+		m.log.Debug("App: no runtime required; services bring their own images",
+			"app", fn.Name)
 		prepared := &Prepared{
 			Name:        fn.Name,
 			Fingerprint: fp,
 			Concurrency: m.effectiveConcurrency(fn),
 		}
-		m.containers.activateFunction(fn.Name, "")
-		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
-		m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
+		m.containers.activateApp(fn.Name, "")
+		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
+		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
 		return prepared, nil
 	}
 
-	// Resolve the source-selection policy ONCE. The policy (the function's
+	// Resolve the source-selection policy ONCE. The policy (the app's
 	// .gitignore rules) decides which files are source, and a single resolved
 	// Selection keeps the capture below from disagreeing with the caller about
 	// it. A caller that already resolved it for the fingerprint it supplies (the
@@ -880,7 +880,7 @@ func (m *Manager) prepare(
 		var err error
 		selection, err = source.ForDir(fn.Dir)
 		if err != nil {
-			return nil, fmt.Errorf("function %q: select sources: %w", fn.Name, err)
+			return nil, fmt.Errorf("app %q: select sources: %w", fn.Name, err)
 		}
 	}
 
@@ -892,9 +892,9 @@ func (m *Manager) prepare(
 	// success, error, and cancellation. A read failure is fatal to the prepare —
 	// there is deliberately no fallback that would stage live files under an
 	// identity that was never verified against them.
-	sourceSnapshot, err := function.CaptureSourceSnapshot(selection)
+	sourceSnapshot, err := app.CaptureSourceSnapshot(selection)
 	if err != nil {
-		return nil, fmt.Errorf("function %q: snapshot source: %w", fn.Name, err)
+		return nil, fmt.Errorf("app %q: snapshot source: %w", fn.Name, err)
 	}
 	defer sourceSnapshot.Discard()
 	if m.afterSourceSnapshot != nil {
@@ -908,7 +908,7 @@ func (m *Manager) prepare(
 	if fp == "" {
 		// CaptureSourceSnapshot always yields a 64-hex digest, so an empty value
 		// would mean the identity is unavailable; never build under it.
-		return nil, fmt.Errorf("function %q: empty source fingerprint", fn.Name)
+		return nil, fmt.Errorf("app %q: empty source fingerprint", fn.Name)
 	}
 	if fingerprint != "" && fingerprint != fp {
 		// The caller's pre-computed fingerprint (the value it compared to decide a
@@ -918,8 +918,8 @@ func (m *Manager) prepare(
 		// bytes — and the caller persists the RETURNED fingerprint, so the built
 		// generation is never mislabeled. The next reconcile/audit observes the
 		// caller's now-stale value and rebuilds.
-		m.log.Debug("Function: source changed before snapshot; using snapshot identity",
-			"function", fn.Name,
+		m.log.Debug("App: source changed before snapshot; using snapshot identity",
+			"app", fn.Name,
 			"supplied_fingerprint", fingerprint,
 			"snapshot_fingerprint", fp,
 		)
@@ -927,24 +927,24 @@ func (m *Manager) prepare(
 
 	spec, err := lookup(fn.Template.Runtime)
 	if err != nil {
-		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 
 	eng, err := engineFor(spec)
 	if err != nil {
-		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 
 	planResult, err := eng.Plan(spec, fn.Dir, templateHandlers(fn))
 	if err != nil {
-		return nil, fmt.Errorf("function %q: plan: %w", fn.Name, err)
+		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
 	}
 
 	image := ImageRef(fn.Name, fp)
 
 	// bootstrapHash pins the runtime-injected bootstrap content (the engine's
 	// embedded plan files) plus the entrypoint onto the image as a label. The
-	// fingerprint above covers ONLY the function dir, so the label is what
+	// fingerprint above covers ONLY the app dir, so the label is what
 	// lets the reuse path below detect an image built with a stale bootstrap
 	// (e.g. by an older Relay version) under the exact same tag.
 	bootstrapLabelHash := bootstrapHash(planResult)
@@ -952,9 +952,9 @@ func (m *Manager) prepare(
 	// Prepare the dependency label reference for the return value on both paths.
 	// On the build path it is the dependency image built FROM; on the reuse path
 	// it is computed WITHOUT building (the dependency image obviously exists, or
-	// the existing function image — which inherits its layers — would never have
+	// the existing app image — which inherits its layers — would never have
 	// built). Computing the dependency fingerprint needs the same fnDir reads the
-	// function fingerprint above already performed, so it stays cheap.
+	// app fingerprint above already performed, so it stays cheap.
 	prepared := &Prepared{
 		Name:        fn.Name,
 		Image:       image,
@@ -963,16 +963,16 @@ func (m *Manager) prepare(
 		Concurrency: m.effectiveConcurrency(fn),
 	}
 
-	// Admit the function image reference BEFORE any probe or build. Holding this
+	// Admit the app image reference BEFORE any probe or build. Holding this
 	// lease from here until the handle is published (or discarded) closes the
 	// TOCTOU window where an image could be committed to removal between the
 	// existence probe and its use. A retirement in progress rejects the new
 	// lease with ErrImageRetiring, which the caller retries.
 	funcLease, err := m.AcquireImageLease(image)
 	if err != nil {
-		return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
-	// The function lease is transferred to the returned Prepared on success;
+	// The app lease is transferred to the returned Prepared on success;
 	// until then every failure path releases it so a failed Prepare never pins
 	// the image.
 	leaseTransferred := false
@@ -983,7 +983,7 @@ func (m *Manager) prepare(
 	}()
 	prepared.lease = funcLease
 
-	// The dependency manifest snapshot is captured ONCE when the function
+	// The dependency manifest snapshot is captured ONCE when the app
 	// declares deps, so the dependency fingerprint (and thus the tag) and the
 	// bytes staged into the dependency image come from the same read. It is also
 	// used on the reuse path merely to name the dependency without touching the
@@ -1003,28 +1003,28 @@ func (m *Manager) prepare(
 	}
 	// The dependency lease is held from its admission below through the ACTUAL
 	// dependency build (ensureDependencyImage, when the layer is absent) and the
-	// function image build that consumes the layer via FROM, so dependency GC
+	// app image build that consumes the layer via FROM, so dependency GC
 	// cannot remove the layer between its existence probe and its consumption.
 	// The lease therefore spans the whole dependency use in Prepare, not merely
 	// the probe. See TestPrepareDependencyLeaseSpansBuildVsGC.
 	defer releaseDep()
 	if !planResult.Deps.IsZero() {
 		// Split out the pure fingerprint computation so the reuse path below can
-		// name the function image's dependency without touching the daemon; the
+		// name the app image's dependency without touching the daemon; the
 		// snapshot is the single read shared with the build path.
 		depSnap, err = snapshotDependency(fn.Dir, planResult.Deps)
 		if err != nil {
-			return nil, fmt.Errorf("function %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
+			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
 		depFingerprint = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
 		prepared.Dependency = depImageRef(depFingerprint)
 		// Admit the dependency layer BEFORE its own reuse/existence probe, the
-		// dependency image build, and the function image build below, so
+		// dependency image build, and the app image build below, so
 		// dependency GC's retirement gate cannot remove the layer between the
 		// probe and the FROM consumption.
 		depLease, err = m.AcquireImageLease(prepared.Dependency)
 		if err != nil {
-			return nil, fmt.Errorf("function %q: dependency %s: %w", fn.Name, prepared.Dependency, err)
+			return nil, fmt.Errorf("app %q: dependency %s: %w", fn.Name, prepared.Dependency, err)
 		}
 	}
 
@@ -1033,28 +1033,28 @@ func (m *Manager) prepare(
 	// identical source (the tag embeds the fingerprint prefix), so no content
 	// comparison is needed. The inspect duration is logged at Debug on BOTH
 	// outcomes below, so the reuse-probe cost (up to two daemon round trips) is
-	// visible during startup triage whether the function reuses or builds,
+	// visible during startup triage whether the app reuses or builds,
 	// without a benchmark and without a line per content file.
 	reuseStart := time.Now()
 	if m.imageExists(ctx, image) && m.bootstrapLabelMatches(ctx, image, bootstrapLabelHash) {
 		m.log.Debug(
-			"Function: image exists; reusing",
-			"function", fn.Name,
+			"App: image exists; reusing",
+			"app", fn.Name,
 			"image", image,
 			"inspect_duration", time.Since(reuseStart),
 		)
 		// The prepare succeeded (the image is present and current), so activate
-		// the exact image: a previously removed function warms again, and a
+		// the exact image: a previously removed app warms again, and a
 		// reverted same-source image is no longer treated as retired.
-		m.containers.activateFunction(fn.Name, image)
+		m.containers.activateApp(fn.Name, image)
 		// Propagate the reconciled concurrency to the live pool: the effective
 		// bound must follow a successful Prepare even when the image was reused
 		// (a concurrency-only change rebuilds the same fingerprinted image).
-		m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
+		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
 		// Propagate the reconciled resource limits too: they never affect the
 		// image fingerprint, so a resource-only change reaches the live pool
-		// here (or via SetFunctionResources on the reconciler's skip path).
-		m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
+		// here (or via SetAppResources on the reconciler's skip path).
+		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
 		leaseTransferred = true
 		return prepared, nil
 	}
@@ -1064,30 +1064,30 @@ func (m *Manager) prepare(
 	// observable during startup triage; the following build has its own
 	// duration/result logging.
 	m.log.Debug(
-		"Function: image absent or stale; building",
-		"function", fn.Name,
+		"App: image absent or stale; building",
+		"app", fn.Name,
 		"image", image,
 		"inspect_duration", time.Since(reuseStart),
 	)
 
-	// When the function declares a dependency layer, ensure the dependency image
-	// exists first and build the function image FROM it. The dependency image is
-	// content-addressed (no function name): it is shared across every function
+	// When the app declares a dependency layer, ensure the dependency image
+	// exists first and build the app image FROM it. The dependency image is
+	// content-addressed (no app name): it is shared across every app
 	// and every version with identical (runtime + arch + manifest + install), so
 	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
-	// existing layer with no rebuild (even when the function's source changed).
+	// existing layer with no rebuild (even when the app's source changed).
 	depRef := prepared.Dependency
 	if !planResult.Deps.IsZero() {
 		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef)
 		if err != nil {
-			return nil, fmt.Errorf("function %q: %w", fn.Name, err)
+			return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 		}
-		// The function image inherits every layer of the dependency image, so
+		// The app image inherits every layer of the dependency image, so
 		// its Dockerfile's FROM is the dependency reference rather than the raw
-		// base image. The engine moved the install into Deps, so the function
+		// base image. The engine moved the install into Deps, so the app
 		// image carries no install RUN of its own — only UserSetup/User/Env/
 		// Entrypoint on top of the dependency layer. The dependency image was
-		// built with the runtime's external tools (e.g. uv), so the function
+		// built with the runtime's external tools (e.g. uv), so the app
 		// image inherits them via FROM and does not need to copy them again.
 		planResult.BaseImage = depRef
 		planResult.ToolCopies = nil
@@ -1103,33 +1103,33 @@ func (m *Manager) prepare(
 	// keep using the caller's ctx — they are quick and must honor its
 	// cancellation.
 	//
-	// notifyFunctionBuild fires at this exact boundary — after every reuse probe,
+	// notifyAppBuild fires at this exact boundary — after every reuse probe,
 	// immediately before buildImage — so the caller publishes the persisted
 	// building status only when an image build is actually issued; a reused image
 	// never flashes building.
-	notifyFunctionBuild(ctx)
+	notifyAppBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
 	// The actual managed image build boundary (after every reuse probe). The span
 	// is rooted in the caller's context so it nests under the preparing
-	// function's span; the build itself still runs on the lifecycle-bounded
+	// app's span; the build itself still runs on the lifecycle-bounded
 	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, functionImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot); err != nil {
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot); err != nil {
 		buildSpan.RecordError(err)
 		buildSpan.SetStatus(codes.Error, err.Error())
 		buildSpan.End()
 		elapsed := time.Since(start)
-		m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild, []metrics.Label{
-			{Name: "function", Value: fn.Name},
+		m.metrics.ObserveDurationLabels(metrics.MetricAppBuild, []metrics.Label{
+			{Name: "app", Value: fn.Name},
 		}, elapsed)
-		m.metrics.IncLabels(metrics.MetricBuildFailures, []metrics.Label{
-			{Name: "function", Value: fn.Name},
+		m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
+			{Name: "app", Value: fn.Name},
 		})
-		// Function names are validated to [a-z0-9][a-z0-9._-]* (bounded by
-		// function count), so using them as labels is low-cardinality.
-		m.log.Error("Function: build failed",
-			"function", fn.Name,
+		// App names are validated to [a-z0-9][a-z0-9._-]* (bounded by
+		// app count), so using them as labels is low-cardinality.
+		m.log.Error("App: build failed",
+			"app", fn.Name,
 			"duration", elapsed,
 			"result", "failed",
 		)
@@ -1137,26 +1137,26 @@ func (m *Manager) prepare(
 	}
 	buildSpan.End()
 	elapsed := time.Since(start)
-	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
-		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
-	m.log.Info("Function: built",
-		"function", fn.Name,
+	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
+		[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
+	m.log.Info("App: built",
+		"app", fn.Name,
 		"duration", elapsed,
 		"result", "success",
 	)
 	// The build succeeded: activate the exact image so a removed-then-recreated
-	// function warms again and a same-content rebuild is not left retired, then
+	// app warms again and a same-content rebuild is not left retired, then
 	// propagate the reconciled concurrency to the live pool (a hot-swapped
 	// concurrency takes effect without a worker restart).
-	m.containers.activateFunction(fn.Name, image)
-	m.containers.setFunctionConcurrency(fn.Name, prepared.Concurrency)
-	m.containers.setFunctionResources(fn.Name, fn.Template.ResourceLimits())
+	m.containers.activateApp(fn.Name, image)
+	m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
+	m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
 	leaseTransferred = true
 	prepared.Dependency = depRef
 	return prepared, nil
 }
 
-// templateHandlers returns the function's handler MODULE parts (the portion of
+// templateHandlers returns the app's handler MODULE parts (the portion of
 // each `module.function` handler before the LAST dot), collected from the
 // template's event rules and cron schedules, sorted and deduped. Only the module
 // part is needed: it identifies the source file the engine must resolve (and, for
@@ -1164,7 +1164,7 @@ func (m *Manager) prepare(
 // handler without a dot, and an empty module are skipped: template validation
 // already rejects them on the parse path, and this keeps Prepare total for
 // hand-built templates used by tests and direct callers.
-func templateHandlers(fn function.Function) []string {
+func templateHandlers(fn app.App) []string {
 	if fn.Template == nil {
 		return nil
 	}
@@ -1192,39 +1192,39 @@ func templateHandlers(fn function.Function) []string {
 	return out
 }
 
-// resolveConcurrency returns the function's resolved per-function concurrency
+// resolveConcurrency returns the app's resolved per-app concurrency
 // for the warm container pool. It reads the template's parsed value, defaulting
-// a zero value (a function built without parsing, or a nil template) to
-// function.DefaultConcurrency — the same fallback the runner applies to its
-// per-function semaphore, so the pool's bound and the runner's bound agree.
-func resolveConcurrency(fn function.Function) int {
+// a zero value (an app built without parsing, or a nil template) to
+// app.DefaultConcurrency — the same fallback the runner applies to its
+// per-app semaphore, so the pool's bound and the runner's bound agree.
+func resolveConcurrency(fn app.App) int {
 	if fn.Template == nil || fn.Template.Concurrency < 1 {
-		return function.DefaultConcurrency
+		return app.DefaultConcurrency
 	}
 	return fn.Template.Concurrency
 }
 
-// effectiveConcurrency returns the function's EFFECTIVE per-function
+// effectiveConcurrency returns the app's EFFECTIVE per-app
 // concurrency for the warm container pool: the template's resolved concurrency
 // clipped to the worker-global MAX_CONCURRENCY. When the template asks for more
 // than the global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8), the pool
 // warms, reports, and admits only the cap's worth — the effective intersection
 // of the two limits the README documents, matching the runner's clipped
-// per-function semaphore.
-func (m *Manager) effectiveConcurrency(fn function.Function) int {
+// per-app semaphore.
+func (m *Manager) effectiveConcurrency(fn app.App) int {
 	return m.clipConcurrency(resolveConcurrency(fn))
 }
 
-// clipConcurrency clips an already-resolved per-function concurrency to the
+// clipConcurrency clips an already-resolved per-app concurrency to the
 // worker-global MAX_CONCURRENCY. A value below 1 is treated as
-// function.DefaultConcurrency first, and a zero Manager.maxConcurrency (a
+// app.DefaultConcurrency first, and a zero Manager.maxConcurrency (a
 // Manager constructed directly by tests) is treated as DefaultMaxConcurrency,
 // never "uncapped". It is the single clipping rule applied by Prepare and
 // Execute, so a hand-built Prepared (direct/integration callers) can never
 // warm a pool larger than the worker-global cap.
 func (m *Manager) clipConcurrency(n int) int {
 	if n < 1 {
-		n = function.DefaultConcurrency
+		n = app.DefaultConcurrency
 	}
 	limit := m.maxConcurrency
 	if limit < 1 {
@@ -1247,13 +1247,13 @@ func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, d
 	return dependencyFingerprintFrom(arch, platform, spec, deps, snap)
 }
 
-// ensureDependencyImage builds the dependency image for the function's
+// ensureDependencyImage builds the dependency image for the app's
 // dependency manifest set, returning the dependency image reference. It is a
 // no-op (returns the existing reference) when the dependency image is already
 // present locally — the content address makes existence the correctness test,
 // since the tag embeds the fingerprint over every relevant input. If the
 // dependency build fails, Prepare fails: there is no fallback to the old
-// single-stage build, because the function image's Dockerfile inherits its
+// single-stage build, because the app image's Dockerfile inherits its
 // dependency layers via FROM and cannot be built without them.
 //
 // depFingerprint is the content address the caller already computed from snap;
@@ -1264,7 +1264,7 @@ func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, d
 // the ONE immutable read.
 func (m *Manager) ensureDependencyImage(
 	ctx context.Context,
-	fn function.Function,
+	fn app.App,
 	spec plan.Spec,
 	deps plan.Deps,
 	snap dependencySnapshot,
@@ -1275,7 +1275,7 @@ func (m *Manager) ensureDependencyImage(
 		depRef = depImageRef(depFingerprint)
 	}
 	// The inspect duration is logged at Debug on BOTH outcomes below, mirroring
-	// Prepare's function-image reuse probe, so the dependency probe's daemon
+	// Prepare's app-image reuse probe, so the dependency probe's daemon
 	// round trip is visible during startup triage whether the layer is reused
 	// or built — without a line per staged manifest.
 	depReuseStart := time.Now()
@@ -1294,31 +1294,31 @@ func (m *Manager) ensureDependencyImage(
 	)
 
 	start := time.Now()
-	// As in Prepare's function-image build, the dependency build uses an
+	// As in Prepare's app-image build, the dependency build uses an
 	// independent lifecycle-rooted buildTimeout context rather than the caller's
 	// ctx, so a slow install step is never cut off by a short reconcile budget
 	// while still being cancelled at Relay shutdown. The imageExists probe above
-	// keeps the caller's ctx. notifyFunctionBuild fires at this exact boundary so
+	// keeps the caller's ctx. notifyAppBuild fires at this exact boundary so
 	// a dependency build also reports the building status.
-	notifyFunctionBuild(ctx)
+	notifyAppBuild(ctx)
 	buildCtx, buildCancel := m.buildContext()
 	defer buildCancel()
-	// The dependency layer is a real build, so it is spanned like the function
-	// image build. The span nests under the preparing function's span.
+	// The dependency layer is a real build, so it is spanned like the app
+	// image build. The span nests under the preparing app's span.
 	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
 	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint); err != nil {
 		depBuildSpan.RecordError(err)
 		depBuildSpan.SetStatus(codes.Error, err.Error())
 		depBuildSpan.End()
 		elapsed := time.Since(start)
-		// Dependency-image build failures count as function build failures so the
+		// Dependency-image build failures count as app build failures so the
 		// existing failure metric/label surface stays the single observability
-		// contract for "this function could not be prepared".
-		m.metrics.IncLabels(metrics.MetricBuildFailures, []metrics.Label{
-			{Name: "function", Value: fn.Name},
+		// contract for "this app could not be prepared".
+		m.metrics.IncLabels(metrics.MetricAppBuildFailures, []metrics.Label{
+			{Name: "app", Value: fn.Name},
 		})
-		m.log.Error("Function: dependency build failed",
-			"function", fn.Name,
+		m.log.Error("App: dependency build failed",
+			"app", fn.Name,
 			"duration", elapsed,
 			"dep_image", depRef,
 			"result", "failed",
@@ -1327,10 +1327,10 @@ func (m *Manager) ensureDependencyImage(
 	}
 	depBuildSpan.End()
 	elapsed := time.Since(start)
-	m.metrics.ObserveDurationLabels(metrics.MetricFunctionBuild,
-		[]metrics.Label{{Name: "function", Value: fn.Name}}, elapsed)
-	m.log.Info("Function: dependency layer built",
-		"function", fn.Name,
+	m.metrics.ObserveDurationLabels(metrics.MetricAppBuild,
+		[]metrics.Label{{Name: "app", Value: fn.Name}}, elapsed)
+	m.log.Info("App: dependency layer built",
+		"app", fn.Name,
 		"duration", elapsed,
 		"dep_image", depRef,
 		"result", "success",
@@ -1339,18 +1339,18 @@ func (m *Manager) ensureDependencyImage(
 }
 
 // Execute runs the given handler invocation against a REUSED execution
-// container leased from the function's warm pool (up to Prepared.Concurrency
-// containers per function per image version; see container_cache.go and
-// execution_container.go). The first invocation for a function starts a
+// container leased from the app's warm pool (up to Prepared.Concurrency
+// containers per app per image version; see container_cache.go and
+// execution_container.go). The first invocation for an app starts a
 // container (stamping its creation-time identity labels from the RunMeta in
-// ctx); concurrent invocations of the same function lease distinct containers,
+// ctx); concurrent invocations of the same app lease distinct containers,
 // and each container serves one invocation at a time over the line-JSON
 // invocation protocol until it is discarded (timeout, process exit, protocol
 // error, image change). A handler failure (ok:false) does NOT discard it.
 //
 // The pool's bound is Prepared.Concurrency (the effective value, already
 // clipped to MAX_CONCURRENCY by Prepare and re-clipped here), the same value
-// the runner's per-function semaphore uses, so in the runner path the pool
+// the runner's per-app semaphore uses, so in the runner path the pool
 // never blocks (the semaphore already admits at most that many concurrent
 // calls). Direct callers that bypass the runner are bounded by the pool itself;
 // when the pool is at capacity, Execute blocks until a lease is released, ctx
@@ -1392,13 +1392,13 @@ func (m *Manager) Execute(
 		meta.Hostname = m.hostname
 	}
 	if meta.Image == "" {
-		// Same safety net for the image identity: the owning function image is
+		// Same safety net for the image identity: the owning app image is
 		// known here, so the label (and RemoveImage's in-use guard) stays
 		// accurate for direct callers that never set it.
 		meta.Image = prepared.Image
 	}
-	if meta.Function == "" {
-		meta.Function = prepared.Name
+	if meta.App == "" {
+		meta.App = prepared.Name
 	}
 
 	// Pin the image for the whole execution. An execution admitted before the
@@ -1430,13 +1430,13 @@ func (m *Manager) Execute(
 	idMeta.MessageID = ""
 	idMeta.EventID = ""
 	idMeta.EventName = ""
-	// Resolve the function's effective per-container resource limits ONCE for
+	// Resolve the app's effective per-container resource limits ONCE for
 	// this execution, from the cache's last published configuration, and derive
 	// the config fingerprint from exactly those limits. Passing the same pair to
 	// the create and to the pool means the HostConfig a container is created
 	// with and the generation it is pooled under always agree, so a resource-only
 	// hot change rotates containers without a rebuild.
-	limits := m.containers.functionResources(prepared.Name)
+	limits := m.containers.appResources(prepared.Name)
 	config := limits.Fingerprint()
 	// Resolve the managed image's IMMUTABLE content identity ONCE for this
 	// execution, after the image lease above and BEFORE the pool lease and the
@@ -1461,9 +1461,9 @@ func (m *Manager) Execute(
 	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
 	// (direct/integration callers) may carry the raw template value or leave it
 	// zero, so clip it here too: the pool bound can never exceed the
-	// worker-global cap, and the same bound the runner's clipped per-function
+	// worker-global cap, and the same bound the runner's clipped per-app
 	// semaphore uses is what the pool enforces, keeping the pool from ever being
-	// a stricter limiter than the runner's per-function semaphore.
+	// a stricter limiter than the runner's per-app semaphore.
 	max := m.clipConcurrency(prepared.Concurrency)
 	return m.containers.executeVersion(
 		ctx, prepared.Name, img.identity(), config, max, start, handler, eventJSON, envMap(extraEnv),
@@ -1480,32 +1480,32 @@ func (m *Manager) InvalidateImage(image string) {
 	m.containers.invalidateImage(image)
 }
 
-// SetFunctionResources publishes a function's effective per-container resource
+// SetAppResources publishes an app's effective per-container resource
 // limits to the live warm pool WITHOUT a rebuild. It is the resource half of a
 // hot template change: resource limits intentionally do not participate in the
 // image fingerprint, so the reconciler's unchanged-fingerprint skip path calls
 // this (through the Builder's optional resourceSetter capability) when only the
-// function's `resources` changed. A changed value supersedes the current
+// app's `resources` changed. A changed value supersedes the current
 // container generation so old-config idle containers are discarded and busy ones
 // drain, exactly like an image change but without touching the image reference
 // or its ownership lease. It is idempotent for an unchanged value.
-func (m *Manager) SetFunctionResources(name string, limits function.ResourceLimits) {
+func (m *Manager) SetAppResources(name string, limits app.ResourceLimits) {
 	if name == "" {
 		return
 	}
-	m.containers.setFunctionResources(name, limits)
+	m.containers.setAppResources(name, limits)
 }
 
 // PoolSnapshot returns a point-in-time view of name's live warm-container pool:
 // capacity, container counts by lease state, and the cumulative acquire/discard
 // counters. The gauges are read from the pool's authoritative in-memory state
 // (no Docker round trip); the counters are read from the same metrics registry
-// the worker exposes on /metrics. ok is false when the function has never warmed
+// the worker exposes on /metrics. ok is false when the app has never warmed
 // a pool (or its pool was already removed), so a caller can omit the section
 // rather than render stale zeros. It is safe for concurrent use.
 //
 // This is a LIVE, worker-local view. It exists for in-process callers (an
-// embedded CLI/provider, tests); the standalone `relay function inspect` process
+// embedded CLI/provider, tests); the standalone `relay app inspect` process
 // has no access to the worker's memory and therefore renders only the persisted
 // cumulative counters with the live gauges marked unavailable (see
 // internal/cli). The live gauges are deliberately NOT persisted to SQLite: a
@@ -1517,29 +1517,29 @@ func (m *Manager) PoolSnapshot(name string) (PoolSnapshot, bool) {
 	return m.containers.snapshot(name, m.metrics)
 }
 
-// RemoveFunction discards a removed function's warm container state: new
-// acquires for the function fail immediately, idle containers are discarded now,
+// RemoveApp discards a removed app's warm container state: new
+// acquires for the app fail immediately, idle containers are discarded now,
 // busy ones are retired and discarded when their invocation releases, and the
 // pool's state is deleted once it is empty. A later release of a busy container
-// can never recreate the state (the function name is remembered as removed until
+// can never recreate the state (the app name is remembered as removed until
 // Prepared reactivates it). It is non-blocking, so the reconciler's removal hook
 // is never stalled by an in-flight invocation, and it is the runtime half of
-// function removal; the runner separately retires the function's images.
+// app removal; the runner separately retires the app's images.
 //
-// The function's runtime-pool metric series are deleted by the cache inside the
+// The app's runtime-pool metric series are deleted by the cache inside the
 // SAME critical section that installs the removal tombstone, so no concurrent
-// acquire/discard can recreate them (see containerCache.removeFunction). A
-// genuinely reactivated function gets a fresh pool (and fresh series) after that
-// section. The worker's own metricsInstance.RemoveFunction and the flush-time
-// SweepFunctionMetrics still cover the runner's series; the runtime no longer
+// acquire/discard can recreate them (see containerCache.removeApp). A
+// genuinely reactivated app gets a fresh pool (and fresh series) after that
+// section. The worker's own metricsInstance.RemoveApp and the flush-time
+// SweepAppMetrics still cover the runner's series; the runtime no longer
 // performs a second, racy delete here.
-func (m *Manager) RemoveFunction(name string) {
+func (m *Manager) RemoveApp(name string) {
 	if name == "" {
 		return
 	}
-	m.containers.removeFunction(name)
-	// Drop the function's external-service pull-check records so a later
-	// re-added function starts with an immediate remote check and the in-memory
+	m.containers.removeApp(name)
+	// Drop the app's external-service pull-check records so a later
+	// re-added app starts with an immediate remote check and the in-memory
 	// map does not grow without bound across removals.
 	m.forgetServicePullChecks(name)
 }

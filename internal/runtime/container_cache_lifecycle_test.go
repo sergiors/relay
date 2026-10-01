@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // fakeClock is the injectable clock seam used by eviction tests. It is safe for
@@ -291,7 +291,7 @@ func TestResolveManagerOptions(t *testing.T) {
 }
 
 // TestBackwardCompatibleNilOption pins that a nil option in the variadic list is
-// ignored (a nil option function must not panic NewManager's resolution).
+// ignored (a nil option app must not panic NewManager's resolution).
 func TestBackwardCompatibleNilOption(t *testing.T) {
 	resolved := resolveManagerOptions([]ManagerOption{nil, WithWarmContainerIdleTimeout(time.Minute), nil})
 	if resolved.idleTimeout != time.Minute {
@@ -379,10 +379,10 @@ func TestGenerationNoNewOldGeneration(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalDiscardsIdleAndBusy proves RemoveFunction discards idle
+// TestAppRemovalDiscardsIdleAndBusy proves RemoveApp discards idle
 // containers immediately, retires busy ones until release, refuses new
 // acquires, and removes the pool state once empty.
-func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
+func TestAppRemovalDiscardsIdleAndBusy(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
@@ -409,15 +409,15 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 		t.Fatalf("fn-b seed: %v", err)
 	}
 
-	cc.removeFunction("fn-a")
-	if got := idle.reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
-		t.Fatalf("idle removal discards = %v, want [%s]", got, reasonFunctionRemove)
+	cc.removeApp("fn-a")
+	if got := idle.reasons(); len(got) != 1 || got[0] != reasonAppRemove {
+		t.Fatalf("idle removal discards = %v, want [%s]", got, reasonAppRemove)
 	}
 	if got := busy.reasons(); len(got) != 0 {
 		t.Fatalf("busy container discarded mid-invocation: %v", got)
 	}
 
-	// A new acquire for the removed function fails immediately.
+	// A new acquire for the removed app fails immediately.
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
@@ -426,8 +426,8 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("busy execute: %v", err)
 	}
-	if got := busy.reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
-		t.Fatalf("busy removal discards = %v, want [%s]", got, reasonFunctionRemove)
+	if got := busy.reasons(); len(got) != 1 || got[0] != reasonAppRemove {
+		t.Fatalf("busy removal discards = %v, want [%s]", got, reasonAppRemove)
 	}
 
 	// fn-a's state is gone; fn-b's is intact and reusable.
@@ -442,9 +442,9 @@ func TestFunctionRemovalDiscardsIdleAndBusy(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalLateReleaseCannotRecreate proves a late release after
+// TestAppRemovalLateReleaseCannotRecreate proves a late release after
 // removal cannot recreate pool state, and a subsequent acquire still fails.
-func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
+func TestAppRemovalLateReleaseCannotRecreate(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 	busy := newBlockingContainer(1)
@@ -455,7 +455,7 @@ func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 	}()
 	<-busy.entered
 
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	close(busy.release)
 	if err := <-done; err != nil {
 		t.Fatalf("busy execute: %v", err)
@@ -463,7 +463,7 @@ func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 
 	cc.mu.Lock()
 	_, exists := cc.pools["fn-a"]
-	removed := cc.removedFunctions["fn-a"]
+	removed := cc.removedApps["fn-a"]
 	cc.mu.Unlock()
 	if exists {
 		t.Fatal("removed function's empty pool must be deleted from the cache")
@@ -476,45 +476,45 @@ func TestFunctionRemovalLateReleaseCannotRecreate(t *testing.T) {
 	}
 }
 
-// TestFunctionReactivateAfterRemoval proves Prepare's activation clears the
-// removal mark so a removed-then-recreated function warms again.
-func TestFunctionReactivateAfterRemoval(t *testing.T) {
+// TestAppReactivateAfterRemoval proves Prepare's activation clears the
+// removal mark so a removed-then-recreated app warms again.
+func TestAppReactivateAfterRemoval(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal = %v, want errPoolClosed", err)
 	}
 
-	cc.activateFunction("fn-a", "img-1")
+	cc.activateApp("fn-a", "img-1")
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after reactivation: %v", err)
 	}
 }
 
-// TestFunctionSameImageRecreationWarms is the deterministic regression for the
-// reported bug: a function removed and then recreated with the SAME image must
+// TestAppSameImageRecreationWarms is the deterministic regression for the
+// reported bug: an app removed and then recreated with the SAME image must
 // WARM, not be permanently treated as retired. It models the real sequence:
-// RemoveFunction discards the pool, the runner retires every function image
+// RemoveApp discards the pool, the runner retires every app image
 // (InvalidateImage), and a later Prepare/activate for the exact same image must
-// un-retire it so the recreated function reuses a warm container instead of
+// un-retire it so the recreated app reuses a warm container instead of
 // starting a throwaway per invocation.
-func TestFunctionSameImageRecreationWarms(t *testing.T) {
+func TestAppSameImageRecreationWarms(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
 	// Use a real Relay image reference: activation's scoping guard only accepts
-	// the function's own relay-fn-<name>:<tag> reference.
-	const image = "relay-fn-fn-a:abc123"
-	// Seed a warm container for fn-a, then remove the function and retire its
+	// the app's own relay-app-<name>:<tag> reference.
+	const image = "relay-app-fn-a:abc123"
+	// Seed a warm container for fn-a, then remove the app and retire its
 	// image exactly as the worker's removal hook does (manager then runner).
 	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	cc.invalidateImage(image)
 
 	// A stale acquire during removal must fail, never warm.
@@ -522,9 +522,9 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 		t.Fatalf("acquire while removed = %v, want errPoolClosed", err)
 	}
 
-	// Function is recreated with the same content/image. Activation must clear
-	// both the removal mark and the image retirement for this function's image.
-	cc.activateFunction("fn-a", image)
+	// App is recreated with the same content/image. Activation must clear
+	// both the removal mark and the image retirement for this app's image.
+	cc.activateApp("fn-a", image)
 
 	before := ff.count()
 	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
@@ -535,7 +535,7 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 		t.Fatalf("recreated same-image container discarded as retired: %v", got)
 	}
 
-	// The recreated function must be WARM: a second invocation reuses the
+	// The recreated app must be WARM: a second invocation reuses the
 	// container rather than starting a fresh throwaway.
 	if err := runInvoke(t, cc, ff, "fn-a", image, 1, "h"); err != nil {
 		t.Fatalf("second acquire after recreation: %v", err)
@@ -548,15 +548,15 @@ func TestFunctionSameImageRecreationWarms(t *testing.T) {
 	}
 }
 
-// TestFunctionRecreationOnlyUnretiresOwnImage proves activation is scoped: a
+// TestAppRecreationOnlyUnretiresOwnImage proves activation is scoped: a
 // foreign (or untagged) image reference can never be un-retired, so a stale
-// request cannot use reactivation to tear down another function's current
+// request cannot use reactivation to tear down another app's current
 // version.
-func TestFunctionRecreationOnlyUnretiresOwnImage(t *testing.T) {
+func TestAppRecreationOnlyUnretiresOwnImage(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
-	const foreignImage = "relay-fn-fn-b:abc123"
+	const foreignImage = "relay-app-fn-b:abc123"
 	// fn-b is warm on its image, which is then invalidated (retired).
 	if err := runInvoke(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
 		t.Fatalf("fn-b seed: %v", err)
@@ -565,7 +565,7 @@ func TestFunctionRecreationOnlyUnretiresOwnImage(t *testing.T) {
 
 	// Activating fn-a with fn-b's image must NOT clear fn-b's retirement: the
 	// name encoded in the reference is fn-b, not fn-a.
-	cc.activateFunction("fn-a", foreignImage)
+	cc.activateApp("fn-a", foreignImage)
 
 	if err := runInvoke(t, cc, ff, "fn-b", foreignImage, 1, "h"); err != nil {
 		t.Fatalf("fn-b acquire: %v", err)
@@ -575,12 +575,12 @@ func TestFunctionRecreationOnlyUnretiresOwnImage(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalDuringInFlightStart proves the removal linearization at
+// TestAppRemovalDuringInFlightStart proves the removal linearization at
 // the create boundary: a removal that lands while an acquire is blocked in the
 // start factory must prevent that container from being leased or pooled. The
 // in-flight start completes into the removal path (discarded, errPoolClosed),
 // and the pool is then deleted once the reservation is gone.
-func TestFunctionRemovalDuringInFlightStart(t *testing.T) {
+func TestAppRemovalDuringInFlightStart(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
@@ -607,7 +607,7 @@ func TestFunctionRemovalDuringInFlightStart(t *testing.T) {
 	<-started
 
 	// Removal runs while the lazy start is in flight.
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	close(unblock)
 
 	res := <-resCh
@@ -618,8 +618,8 @@ func TestFunctionRemovalDuringInFlightStart(t *testing.T) {
 	if !errors.Is(res.err, errPoolClosed) {
 		t.Fatalf("in-flight acquire after removal = %v, want errPoolClosed", res.err)
 	}
-	if got := ff.lastContainer().reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
-		t.Fatalf("in-flight-start container discards = %v, want [%s]", got, reasonFunctionRemove)
+	if got := ff.lastContainer().reasons(); len(got) != 1 || got[0] != reasonAppRemove {
+		t.Fatalf("in-flight-start container discards = %v, want [%s]", got, reasonAppRemove)
 	}
 
 	cc.mu.Lock()
@@ -643,14 +643,14 @@ func poolExists(cc *containerCache, fnName string) bool {
 	return ok
 }
 
-// TestFunctionRemovalDuringInFlightStartFailureDeletesPool is the regression
+// TestAppRemovalDuringInFlightStartFailureDeletesPool is the regression
 // for the review finding: a removal that races a REGULAR lazy start which then
 // FAILS must still delete the now-empty removing pool. The reservation is the
-// only thing that kept the pool non-empty when removeFunction ran, so rolling
+// only thing that kept the pool non-empty when removeApp ran, so rolling
 // it back is exactly the point at which the pool becomes empty and must leave
 // the cache. Before the fix this path decremented `creating` and signalled but
 // never called maybeDeletePool, leaving a stale removing pool in the map.
-func TestFunctionRemovalDuringInFlightStartFailureDeletesPool(t *testing.T) {
+func TestAppRemovalDuringInFlightStartFailureDeletesPool(t *testing.T) {
 	clk := newFakeClock()
 	cc, _ := newManagedCache(clk, time.Minute)
 
@@ -670,7 +670,7 @@ func TestFunctionRemovalDuringInFlightStartFailureDeletesPool(t *testing.T) {
 	<-started
 
 	// Removal runs while the lazy start is in flight, holding the reservation.
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if !poolExists(cc, "fn-a") {
 		t.Fatal("pool must still exist while the in-flight start holds a reservation")
 	}
@@ -689,11 +689,11 @@ func TestFunctionRemovalDuringInFlightStartFailureDeletesPool(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalDuringInFlightStartPanicDeletesPool proves the panic-unwind
+// TestAppRemovalDuringInFlightStartPanicDeletesPool proves the panic-unwind
 // variant of the finding for a REGULAR lazy start: a start factory that panics
 // after a removal raced it must roll back the reservation AND delete the empty
 // removing pool, while still propagating the panic.
-func TestFunctionRemovalDuringInFlightStartPanicDeletesPool(t *testing.T) {
+func TestAppRemovalDuringInFlightStartPanicDeletesPool(t *testing.T) {
 	clk := newFakeClock()
 	cc, _ := newManagedCache(clk, time.Minute)
 
@@ -712,7 +712,7 @@ func TestFunctionRemovalDuringInFlightStartPanicDeletesPool(t *testing.T) {
 	}()
 	<-started
 
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	close(unblock)
 
 	if r := <-resCh; r == nil {
@@ -727,12 +727,12 @@ func TestFunctionRemovalDuringInFlightStartPanicDeletesPool(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalDuringInFlightTransientStartFailureDeletesPool is the
+// TestAppRemovalDuringInFlightTransientStartFailureDeletesPool is the
 // TRANSIENT variant of the finding: a stale request for a retired image starts a
 // throwaway container; a removal races that start and the start then fails. The
 // transientCreating reservation is rolled back and the empty removing pool must
 // be deleted from the cache.
-func TestFunctionRemovalDuringInFlightTransientStartFailureDeletesPool(t *testing.T) {
+func TestAppRemovalDuringInFlightTransientStartFailureDeletesPool(t *testing.T) {
 	clk := newFakeClock()
 	cc, _ := newManagedCache(clk, time.Minute)
 
@@ -754,7 +754,7 @@ func TestFunctionRemovalDuringInFlightTransientStartFailureDeletesPool(t *testin
 	}()
 	<-started
 
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if !poolExists(cc, "fn-a") {
 		t.Fatal("pool must still exist while the in-flight transient holds a reservation")
 	}
@@ -772,11 +772,11 @@ func TestFunctionRemovalDuringInFlightTransientStartFailureDeletesPool(t *testin
 	}
 }
 
-// TestFunctionRemovalDuringInFlightTransientStartPanicDeletesPool proves the
+// TestAppRemovalDuringInFlightTransientStartPanicDeletesPool proves the
 // panic-unwind variant for the TRANSIENT path: the transientCreating
 // reservation is rolled back, the empty removing pool is deleted, and the panic
 // still propagates.
-func TestFunctionRemovalDuringInFlightTransientStartPanicDeletesPool(t *testing.T) {
+func TestAppRemovalDuringInFlightTransientStartPanicDeletesPool(t *testing.T) {
 	clk := newFakeClock()
 	cc, _ := newManagedCache(clk, time.Minute)
 
@@ -797,7 +797,7 @@ func TestFunctionRemovalDuringInFlightTransientStartPanicDeletesPool(t *testing.
 	}()
 	<-started
 
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	close(unblock)
 
 	if r := <-resCh; r == nil {
@@ -812,34 +812,34 @@ func TestFunctionRemovalDuringInFlightTransientStartPanicDeletesPool(t *testing.
 	}
 }
 
-// TestFunctionRemovalRequestAfterReactivationWins proves ordering: a removal
+// TestAppRemovalRequestAfterReactivationWins proves ordering: a removal
 // that runs AFTER a reactivation is a later event and must take effect, while a
 // removal that ran before it is undone by reactivation. This pins the
 // linearization at the cache lock.
-func TestFunctionRemovalRequestAfterReactivationWins(t *testing.T) {
+func TestAppRemovalRequestAfterReactivationWins(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 
-	cc.removeFunction("fn-a")
-	cc.activateFunction("fn-a", "")
+	cc.removeApp("fn-a")
+	cc.activateApp("fn-a", "")
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after remove-then-activate: %v", err)
 	}
 
 	// A subsequent removal is later and must win.
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after later removal = %v, want errPoolClosed", err)
 	}
 }
 
-// TestFunctionLateReleaseCannotUndoReactivation proves the removal/reactivation
+// TestAppLateReleaseCannotUndoReactivation proves the removal/reactivation
 // linearization: a removal that began before reactivation must not undo it. The
 // busy container is retired by the removal, then activation detaches the
 // draining pool; the later release can only discard the container and must not
-// re-remove or otherwise disable the reactivated function, whose next acquire
+// re-remove or otherwise disable the reactivated app, whose next acquire
 // warms normally.
-func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
+func TestAppLateReleaseCannotUndoReactivation(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 	busy := newBlockingContainer(1)
@@ -851,8 +851,8 @@ func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
 	<-busy.entered
 
 	// Removal begins while busy is in flight; activation follows immediately.
-	cc.removeFunction("fn-a")
-	cc.activateFunction("fn-a", "img-1")
+	cc.removeApp("fn-a")
+	cc.activateApp("fn-a", "img-1")
 
 	// The late release of the removal-retired container must not undo the
 	// activation: fn-a must warm again.
@@ -861,8 +861,8 @@ func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("busy execute: %v", err)
 	}
-	if got := busy.reasons(); len(got) != 1 || got[0] != reasonFunctionRemove {
-		t.Fatalf("removal-retired busy discards = %v, want [%s]", got, reasonFunctionRemove)
+	if got := busy.reasons(); len(got) != 1 || got[0] != reasonAppRemove {
+		t.Fatalf("removal-retired busy discards = %v, want [%s]", got, reasonAppRemove)
 	}
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("acquire after late release: %v", err)
@@ -877,20 +877,20 @@ func TestFunctionLateReleaseCannotUndoReactivation(t *testing.T) {
 	}
 }
 
-// TestPrepareFailureDoesNotReactivateRemovedFunction is the finding (3)
-// regression: Manager.Prepare must only lift a function's removal after a
-// SUCCESSFUL prepare. A fingerprint failure (here, a missing function dir) must
-// leave the removal in place so a stale acquire cannot warm a function the
+// TestPrepareFailureDoesNotReactivateRemovedApp is the finding (3)
+// regression: Manager.Prepare must only lift an app's removal after a
+// SUCCESSFUL prepare. A fingerprint failure (here, a missing app dir) must
+// leave the removal in place so a stale acquire cannot warm an app the
 // reconciler has not actually reconciled. Prepare fails before touching Docker,
 // so this runs without a daemon.
-func TestPrepareFailureDoesNotReactivateRemovedFunction(t *testing.T) {
+func TestPrepareFailureDoesNotReactivateRemovedApp(t *testing.T) {
 	m := &Manager{
 		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		containers: newContainerCache(),
 	}
-	m.containers.removeFunction("fn-a")
+	m.containers.removeApp("fn-a")
 
-	fn := function.Function{
+	fn := app.App{
 		Name: "fn-a",
 		Dir:  filepath.Join(t.TempDir(), "does-not-exist"),
 	}
@@ -899,7 +899,7 @@ func TestPrepareFailureDoesNotReactivateRemovedFunction(t *testing.T) {
 	}
 
 	m.containers.mu.Lock()
-	_, removed := m.containers.removedFunctions["fn-a"]
+	_, removed := m.containers.removedApps["fn-a"]
 	if p := m.containers.pools["fn-a"]; p != nil {
 		p.mu.Lock()
 		removing := p.removing
@@ -920,9 +920,9 @@ func TestPrepareFailureDoesNotReactivateRemovedFunction(t *testing.T) {
 	}
 }
 
-// TestFunctionRemovalWakesWaiter proves a blocked acquire is woken by removal
+// TestAppRemovalWakesWaiter proves a blocked acquire is woken by removal
 // and fails with errPoolClosed (rather than hanging).
-func TestFunctionRemovalWakesWaiter(t *testing.T) {
+func TestAppRemovalWakesWaiter(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
 	busy := newBlockingContainer(1)
@@ -938,7 +938,7 @@ func TestFunctionRemovalWakesWaiter(t *testing.T) {
 		waiter <- cc.execute(context.Background(), "fn-a", "img-1", 1, ff.start(), "h", []byte(`{}`), nil)
 	}()
 
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	select {
 	case err := <-waiter:
 		if !errors.Is(err, errPoolClosed) {
@@ -952,7 +952,7 @@ func TestFunctionRemovalWakesWaiter(t *testing.T) {
 }
 
 // TestIndependentPoolsEvictionAndRemoval proves pools are isolated: eviction
-// and removal in one function never touches another function's containers.
+// and removal in one app never touches another app's containers.
 func TestIndependentPoolsEvictionAndRemoval(t *testing.T) {
 	clk := newFakeClock()
 	cc, ff := newManagedCache(clk, time.Minute)
@@ -983,7 +983,7 @@ func TestIndependentPoolsEvictionAndRemoval(t *testing.T) {
 		t.Fatalf("reseed fn-b: %v", err)
 	}
 	last := ff.lastContainer()
-	cc.removeFunction("fn-a")
+	cc.removeApp("fn-a")
 	if last.dead() {
 		t.Fatal("removing fn-a must not discard fn-b's container")
 	}
@@ -1015,7 +1015,7 @@ func TestEvictionRaceSafety(t *testing.T) {
 		}
 	}()
 
-	// Concurrent acquires/releases against two functions. Containers never
+	// Concurrent acquires/releases against two apps. Containers never
 	// block, so each acquire/release completes immediately.
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
@@ -1036,14 +1036,14 @@ func TestEvictionRaceSafety(t *testing.T) {
 		}(i)
 	}
 
-	// Concurrent remove/reactivate on an unrelated function exercises the
+	// Concurrent remove/reactivate on an unrelated app exercises the
 	// cache's removal path under contention too.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 20; i++ {
-			cc.removeFunction("fn-race-removed")
-			cc.activateFunction("fn-race-removed", "")
+			cc.removeApp("fn-race-removed")
+			cc.activateApp("fn-race-removed", "")
 		}
 	}()
 

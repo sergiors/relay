@@ -54,12 +54,12 @@ configuration: changing it requires a worker restart.
 
 `MAX_CONCURRENCY` and `MAX_BUFFERED_EVENTS` are **per worker**. With `N`
 replicas the effective global totals multiply. `MAX_CONCURRENCY` is startup
-configuration (restart to change); a template's per-function `concurrency` is
-clipped to it live and is documented in [functions.md](functions.md).
+configuration (restart to change); a template's per-app `concurrency` is
+clipped to it live and is documented in [apps.md](apps.md).
 
 ```
 Redis stream → bounded local buffer → matcher/dispatcher →
-worker concurrency → per-function concurrency → runner/container → ACK
+worker concurrency → per-app concurrency → runner/container → ACK
 ```
 
 When the local buffer is full the consumer stops reading, so the backlog stays

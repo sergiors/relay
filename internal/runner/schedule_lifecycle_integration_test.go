@@ -21,8 +21,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/app"
 	"relay/internal/config"
-	"relay/internal/function"
 	"relay/internal/runtime"
 	"relay/internal/schedule"
 	"relay/internal/stream"
@@ -74,11 +74,11 @@ func markerAttempt(v string) int {
 	return n
 }
 
-// scheduleOcc builds a schedule occurrence under the fixed function/handler the
-// runner test functions register.
+// scheduleOcc builds a schedule occurrence under the fixed app/handler the
+// runner test apps register.
 func scheduleOcc(scheduledAt time.Time) schedule.Occurrence {
 	return schedule.Occurrence{
-		Function:    scheduleFnName,
+		App:         scheduleFnName,
 		Schedule:    scheduleHandler,
 		Handler:     scheduleHandler,
 		ScheduledAt: scheduledAt,
@@ -331,27 +331,27 @@ func (e *scheduleEnv) notLeaked(msgID string) bool {
 	return !e.hasStateKey(msgID) || e.isRetained(msgID)
 }
 
-// registerScheduleFn builds a runner with a single schedule function whose
+// registerScheduleFn builds a runner with a single schedule app whose
 // handler is scheduleHandler carrying the given retry count.
 func registerScheduleFn(t *testing.T, exec Executor, retries int) *Runner {
 	t.Helper()
 	return NewWithMetrics(
-		[]*PreparedFunction{scheduleFnForHandler(t, scheduleHandler, exec, time.Second, retries)},
+		[]*PreparedApp{scheduleFnForHandler(t, scheduleHandler, exec, time.Second, retries)},
 		testutil.DiscardLogger(), nil)
 }
 
-// scheduleFnForHandler builds a prepared function with a single schedule entry
+// scheduleFnForHandler builds a prepared app with a single schedule entry
 // routed to handler (the handler the stream's schedule messages target), so
 // InvokeHandler resolves the schedule entry's timeout AND retry count.
-func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleTimeout time.Duration, retries int) *PreparedFunction {
+func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleTimeout time.Duration, retries int) *PreparedApp {
 	t.Helper()
 	return NewPrepared(
-		function.Function{
+		app.App{
 			Name: scheduleFnName,
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}, Timeout: scheduleTimeout, Retries: function.DefaultRetries}},
-				Schedules: []function.Schedule{{
+				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}, Timeout: scheduleTimeout, Retries: app.DefaultRetries}},
+				Schedules: []app.Schedule{{
 					Name:     handler,
 					Handler:  handler,
 					Cron:     "0 3 * * *",
@@ -458,7 +458,7 @@ func TestIntegrationScheduleInvocationStateLifecycle(t *testing.T) {
 }
 
 // TestIntegrationScheduleOccurrencesDoNotShareState publishes TWO schedule
-// occurrences of the same function/handler at different seconds (→ distinct
+// occurrences of the same app/handler at different seconds (→ distinct
 // msgIDs → distinct invocation-state keys) and verifies each occurrence keeps
 // its own lifecycle state: each failing occurrence records an independent
 // next_attempt_at marker under its own key, and neither's marker (or lifecycle)
@@ -541,10 +541,10 @@ func TestIntegrationScheduleExhaustionRoutesToDLQ(t *testing.T) {
 	if m.Values["handler_attempts"] != "1" {
 		t.Errorf("handler_attempts = %v, want 1 (from the invocation retry state)", m.Values["handler_attempts"])
 	}
-	// The schedule entry names the exact function/handler that exhausted.
-	if m.Values["function"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
+	// The schedule entry names the exact app/handler that exhausted.
+	if m.Values["app"] != scheduleFnName || m.Values["handler"] != scheduleHandler {
 		t.Errorf("function/handler = %v/%v, want %s/%s",
-			m.Values["function"], m.Values["handler"], scheduleFnName, scheduleHandler)
+			m.Values["app"], m.Values["handler"], scheduleFnName, scheduleHandler)
 	}
 	if m.Values["deliveries"] != "1" {
 		t.Errorf("deliveries = %v, want 1 (first delivery)", m.Values["deliveries"])
@@ -646,12 +646,12 @@ func TestIntegrationScheduleRetryFailureLeavesPending(t *testing.T) {
 	}
 }
 
-// TestIntegrationScheduleObsoleteFunctionRemoved publishes an occurrence for a
-// function, then REMOVES that function from the runner's registry before the
+// TestIntegrationScheduleObsoleteAppRemoved publishes an occurrence for a
+// app, then REMOVES that app from the runner's registry before the
 // consumer starts. The occurrence must be treated as obsolete: ACKed (gone from
 // the PEL), never DLQ'd, and the invocation-state key terminal-retained — never
 // retried forever.
-func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
+func TestIntegrationScheduleObsoleteAppRemoved(t *testing.T) {
 	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{fail: 1000} // would never succeed if it ran
 	r := registerScheduleFn(t, exec, 100)
@@ -659,7 +659,7 @@ func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
 	o := scheduleOcc(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
 	id := e.xadd(o)
 
-	// Remove the function from the runner's registry BEFORE the consumer starts,
+	// Remove the app from the runner's registry BEFORE the consumer starts,
 	// so the reclaim delivery sees it absent.
 	r.Registry().Replace(scheduleFnName, nil)
 
@@ -686,7 +686,7 @@ func TestIntegrationScheduleObsoleteFunctionRemoved(t *testing.T) {
 }
 
 // TestIntegrationScheduleObsoleteScheduleHandlerRemoved publishes an occurrence,
-// then SWAPS the function's template to one whose Schedules no longer include
+// then SWAPS the app's template to one whose Schedules no longer include
 // the handler. The occurrence must be treated as obsolete: ACKed, not DLQ'd,
 // never retried forever, and the executor never runs.
 func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
@@ -697,14 +697,14 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 	o := scheduleOcc(time.Date(2026, 8, 3, 13, 0, 0, 0, time.UTC))
 	id := e.xadd(o)
 
-	// Swap the function to a template whose Schedules no longer include the
+	// Swap the app to a template whose Schedules no longer include the
 	// occurrence's handler, BEFORE the consumer starts.
 	r.Registry().Replace(scheduleFnName, NewPrepared(
-		function.Function{
+		app.App{
 			Name: scheduleFnName,
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}}},
+				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}}},
 				// No Schedules: the handler is removed.
 			},
 		},
@@ -731,14 +731,14 @@ func TestIntegrationScheduleObsoleteScheduleHandlerRemoved(t *testing.T) {
 	}
 }
 
-// TestIntegrationScheduleUnavailableStaysPending is regression #3: a function
+// TestIntegrationScheduleUnavailableStaysPending is regression #3: an app
 // still REGISTERED but temporarily unavailable (NewUnavailable) must leave the
 // occurrence PENDING across reclaim cycles — never ACKed, never DLQ'd. It is a
 // temporary condition, not an obsolete removal.
 func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
 	_ = redisAvailable(t)
 	r := NewWithMetrics(
-		[]*PreparedFunction{NewUnavailable(function.Function{Name: scheduleFnName, Template: &function.Template{Runtime: "node24"}})},
+		[]*PreparedApp{NewUnavailable(app.App{Name: scheduleFnName, Template: &app.Template{Runtime: "node24"}})},
 		testutil.DiscardLogger(), nil)
 	e := newScheduleEnv(t, r)
 	o := scheduleOcc(time.Date(2026, 8, 3, 14, 0, 0, 0, time.UTC))
@@ -769,17 +769,17 @@ func TestIntegrationScheduleUnavailableStaysPending(t *testing.T) {
 	}
 }
 
-// scheduleFnNamed builds a prepared function with ONE schedule whose stable NAME
+// scheduleFnNamed builds a prepared app with ONE schedule whose stable NAME
 // is `name` and whose handler is `handler`, so a handler change under the SAME
 // name can be exercised end to end.
-func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, scheduleTimeout time.Duration, retries int) *PreparedFunction {
+func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, scheduleTimeout time.Duration, retries int) *PreparedApp {
 	t.Helper()
 	return NewPrepared(
-		function.Function{
+		app.App{
 			Name: scheduleFnName,
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Schedules: []function.Schedule{{
+				Schedules: []app.Schedule{{
 					Name:     name,
 					Handler:  handler,
 					Cron:     "0 3 * * *",
@@ -796,7 +796,7 @@ func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, schedule
 
 // namedOcc builds an occurrence for a schedule NAME and envelope handler.
 func namedOcc(name, handler string, at time.Time) schedule.Occurrence {
-	return schedule.Occurrence{Function: scheduleFnName, Schedule: name, Handler: handler, ScheduledAt: at}
+	return schedule.Occurrence{App: scheduleFnName, Schedule: name, Handler: handler, ScheduledAt: at}
 }
 
 // stateFieldFor reads an arbitrary invocation field from a message's state hash.
@@ -818,7 +818,7 @@ func TestIntegrationScheduleAdmissionPinsCurrentHandlerBeforeStart(t *testing.T)
 	_ = redisAvailable(t)
 	exec := &stateAwareExecutor{}
 	r := NewWithMetrics(
-		[]*PreparedFunction{scheduleFnNamed(t, "sched", "jobs.new", exec, time.Second, 0)},
+		[]*PreparedApp{scheduleFnNamed(t, "sched", "jobs.new", exec, time.Second, 0)},
 		testutil.DiscardLogger(), nil)
 	e := newScheduleEnv(t, r)
 	// Envelope carries the OLD handler under the SAME schedule name.
@@ -866,7 +866,7 @@ func TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes(t *testing
 	failing := &firstFailExecutor{failFirst: 1}
 	// retries: 4 so the first failure is retryable (does not exhaust).
 	r := NewWithMetrics(
-		[]*PreparedFunction{scheduleFnNamed(t, "sched", scheduleHandler, failing, time.Second, 4)},
+		[]*PreparedApp{scheduleFnNamed(t, "sched", scheduleHandler, failing, time.Second, 4)},
 		testutil.DiscardLogger(), nil)
 	e := newScheduleEnv(t, r)
 	id := e.xadd(namedOcc("sched", scheduleHandler, time.Date(2026, 9, 2, 9, 0, 0, 0, time.UTC)))
@@ -886,9 +886,9 @@ func TestIntegrationScheduleAdmittedThenScheduleRemovedStillCompletes(t *testing
 	// Remove the schedule NAME from the template, and force the pending retry to
 	// be eligible NOW (delete the backoff marker) so a reclaim runs immediately.
 	r.Registry().Replace(scheduleFnName, NewPrepared(
-		function.Function{
+		app.App{
 			Name: scheduleFnName,
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
 				// No Schedules: the admitted name is gone.
 			},

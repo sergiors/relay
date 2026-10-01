@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/plan"
 	"relay/internal/source"
 )
@@ -19,7 +19,7 @@ import (
 // rm=1. It also asserts ForceRemove is NOT set: failed builds must keep their
 // intermediates for debugging.
 func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
-	opts := buildImageOptions("relay-fn-test:abc123", nil)
+	opts := buildImageOptions("relay-app-test:abc123", nil)
 
 	if !opts.Remove {
 		t.Error("expected Remove=true so the daemon removes intermediate containers after a " +
@@ -28,8 +28,8 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 	if opts.ForceRemove {
 		t.Error("expected ForceRemove=false: failed builds must keep their intermediates for debugging")
 	}
-	if len(opts.Tags) != 1 || opts.Tags[0] != "relay-fn-test:abc123" {
-		t.Errorf("Tags = %v, want [relay-fn-test:abc123]", opts.Tags)
+	if len(opts.Tags) != 1 || opts.Tags[0] != "relay-app-test:abc123" {
+		t.Errorf("Tags = %v, want [relay-app-test:abc123]", opts.Tags)
 	}
 	if opts.Dockerfile != "Dockerfile" {
 		t.Errorf("Dockerfile = %q, want %q", opts.Dockerfile, "Dockerfile")
@@ -44,21 +44,21 @@ func TestBuildImageOptionsRemoveIntermediateContainers(t *testing.T) {
 // resulting image config carries them (the build backend applies them as LABEL
 // equivalents, the same mechanism Relay relies on for its label model).
 func TestBuildImageOptionsCarriesManagedLabels(t *testing.T) {
-	labels := map[string]string{labelType: ImageTypeFunction, labelFunction: "a", labelDependency: "relay-dep-abc"}
-	opts := buildImageOptions("relay-fn-a:abc123", labels)
+	labels := map[string]string{labelType: ImageTypeApp, labelApp: "a", labelDependency: "relay-dep-abc"}
+	opts := buildImageOptions("relay-app-a:abc123", labels)
 
-	if got := opts.Labels[labelType]; got != ImageTypeFunction {
-		t.Errorf("opts.Labels[relay.type] = %q, want %q", got, ImageTypeFunction)
+	if got := opts.Labels[labelType]; got != ImageTypeApp {
+		t.Errorf("opts.Labels[relay.type] = %q, want %q", got, ImageTypeApp)
 	}
-	if got := opts.Labels[labelFunction]; got != "a" {
-		t.Errorf("opts.Labels[relay.function] = %q, want a", got)
+	if got := opts.Labels[labelApp]; got != "a" {
+		t.Errorf("opts.Labels[relay.app] = %q, want a", got)
 	}
 	if got := opts.Labels[labelDependency]; got != "relay-dep-abc" {
 		t.Errorf("opts.Labels[relay.dependency] = %q, want relay-dep-abc", got)
 	}
 }
 
-func TestDockerfileTemplateEmbedsFunctionSource(t *testing.T) {
+func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "node:24-alpine",
 		WorkDir:   "/app",
@@ -209,14 +209,14 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 // TestRenderDockerfileDependencyBase verifies the synthetic plan the builder
 // renders for a dependency image: FROM the runtime base -> WORKDIR the install
 // dir -> COPY the staged manifests -> RUN install. It must carry NO user setup,
-// USER, Env, or ENTRYPOINT — a dependency image is a base for the function
-// image, not a runnable function.
+// USER, Env, or ENTRYPOINT — a dependency image is a base for the app
+// image, not a runnable app.
 func TestRenderDockerfileDependencyBase(t *testing.T) {
 	// buildDependencyImage builds this plan (note Deps is intentionally zero so
 	// the renderer emits the plain COPY . path, not a nested dep base). The
 	// dependency base image is built FROM the raw runtime base, so it must copy
 	// the runtime's tool (uv) itself — this is how the dependency install gets
-	// uv even though it does not inherit it from a function image.
+	// uv even though it does not inherit it from an app image.
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
@@ -252,11 +252,11 @@ func TestRenderDockerfileDependencyBase(t *testing.T) {
 	}
 }
 
-// TestRenderDockerfileFunctionFromDependency verified the MANAGER rewrites the
-// function image's FROM to the dependency reference when Deps are present; this
+// TestRenderDockerfileAppFromDependency verified the MANAGER rewrites the
+// app image's FROM to the dependency reference when Deps are present; this
 // test asserts the plan the manager hands to renderDockerfile produces the right
 // FROM and no install RUN (engine moved install into Deps).
-func TestRenderDockerfileFunctionFromDependency(t *testing.T) {
+func TestRenderDockerfileAppFromDependency(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage:  "relay-dep-abcdef1234567890",
 		WorkDir:    "/app",
@@ -270,14 +270,14 @@ func TestRenderDockerfileFunctionFromDependency(t *testing.T) {
 	if !strings.Contains(df, "FROM relay-dep-abcdef1234567890") {
 		t.Errorf("function image must build FROM the dependency image, got:\n%s", df)
 	}
-	// The install is in the dependency layer; the function image has no install
+	// The install is in the dependency layer; the app image has no install
 	// RUN of its own.
 	if strings.Contains(df, "RUN uv pip install") {
 		t.Errorf("function image built FROM the dep layer must not re-run install, got:\n%s", df)
 	}
 	// The user setup is still needed (the dep layer's /app contents are owned by
 	// root; chown hands them to the runtime user), and the user switch + entry
-	// point stay in the function layer.
+	// point stay in the app layer.
 	if !strings.Contains(df, "RUN groupadd") {
 		t.Errorf("expected user-setup RUN kept in the function image, got:\n%s", df)
 	}
@@ -303,7 +303,7 @@ func TestQuoteEntrypointJSON(t *testing.T) {
 }
 
 // TestStageSourceSnapshotSkipsTemplateYaml verifies the build-context staging
-// excludes template.yaml (Relay configuration, not function source) while
+// excludes template.yaml (Relay configuration, not app source) while
 // staging every other captured file. This is what keeps env values and secret
 // references out of the image layers. It stages from the SAME immutable snapshot
 // the fingerprint is derived from, so the assertion also covers the capture
@@ -333,7 +333,7 @@ func TestStageSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	snapshot, err := function.CaptureSourceSnapshot(selection)
+	snapshot, err := app.CaptureSourceSnapshot(selection)
 	if err != nil {
 		t.Fatalf("capture source snapshot: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestStageSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 }
 
 // TestStageSourceSnapshotHonorsSelection verifies the build context stages
-// exactly the selected source: files excluded by the function's .gitignore never
+// exactly the selected source: files excluded by the app's .gitignore never
 // reach the image, the applicable .gitignore itself does, and template.yaml is
 // still excluded (Relay configuration must not leak into a layer).
 func TestStageSourceSnapshotHonorsSelection(t *testing.T) {
@@ -377,7 +377,7 @@ func TestStageSourceSnapshotHonorsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	snapshot, err := function.CaptureSourceSnapshot(selection)
+	snapshot, err := app.CaptureSourceSnapshot(selection)
 	if err != nil {
 		t.Fatalf("capture source snapshot: %v", err)
 	}

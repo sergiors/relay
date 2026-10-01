@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // statusEvent is one observer notification.
@@ -38,8 +38,8 @@ func TestStatusObserverTransitions(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	tmpl := &function.Template{Runtime: "python3.14"}
-	fn := function.Function{Name: "demo", Dir: t.TempDir(), Template: tmpl}
+	tmpl := &app.Template{Runtime: "python3.14"}
+	fn := app.App{Name: "demo", Dir: t.TempDir(), Template: tmpl}
 
 	// Discovery -> preparing.
 	st.RecordDiscoveredWithFingerprint(fn, "fp-1")
@@ -75,7 +75,7 @@ func TestStatusObserverTransitions(t *testing.T) {
 }
 
 // TestStatusObserverFailureWithoutGenerationUnavailable pins the unavailable
-// branch: a failure on a function that never had a usable generation notifies
+// branch: a failure on an app that never had a usable generation notifies
 // with unavailable.
 func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "db.sqlite3"))
@@ -87,8 +87,8 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	tmpl := &function.Template{Runtime: "python3.14"}
-	fn := function.Function{Name: "fresh", Dir: t.TempDir(), Template: tmpl}
+	tmpl := &app.Template{Runtime: "python3.14"}
+	fn := app.App{Name: "fresh", Dir: t.TempDir(), Template: tmpl}
 	st.RecordDiscoveredWithFingerprint(fn, "fp")
 	st.RecordReconcileFailure("fresh", errors.New("first build failed"))
 
@@ -96,7 +96,7 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 	if last.status != StatusUnavailable {
 		t.Fatalf("last event = %+v, want unavailable", last)
 	}
-	// No notification claims ready for a function that never converged.
+	// No notification claims ready for an app that never converged.
 	for _, e := range *events {
 		if e.status == StatusReady {
 			t.Fatalf("unexpected ready notification: %+v", *events)
@@ -105,7 +105,7 @@ func TestStatusObserverFailureWithoutGenerationUnavailable(t *testing.T) {
 }
 
 // TestStatusObserverNotNotifiedForMissingRow pins that a transient status write
-// against an absent row (building/reconciling on a function with no persisted
+// against an absent row (building/reconciling on an app with no persisted
 // row) does not notify the observer: the gauge must not claim a transition the
 // database did not record.
 func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
@@ -126,7 +126,7 @@ func TestStatusObserverNotNotifiedForMissingRow(t *testing.T) {
 }
 
 // TestStatusObserverNotNotifiedForRemovalOfMissingRow pins that removal of an
-// absent function is idempotent and still notifies the empty-status signal (a
+// absent app is idempotent and still notifies the empty-status signal (a
 // delete of already-absent series is harmless), while a fresh discovery after
 // removal emits preparing again.
 func TestStatusObserverPruneNotifiesRemoval(t *testing.T) {
@@ -140,14 +140,14 @@ func TestStatusObserverPruneNotifiesRemoval(t *testing.T) {
 	observer, events := recordingObserver()
 	st.SetStatusObserver(observer)
 
-	tmpl := &function.Template{Runtime: "python3.14"}
-	fn := function.Function{Name: "gone", Dir: filepath.Join(root, "gone"), Template: tmpl}
+	tmpl := &app.Template{Runtime: "python3.14"}
+	fn := app.App{Name: "gone", Dir: filepath.Join(root, "gone"), Template: tmpl}
 	if err := os.MkdirAll(fn.Dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	st.RecordDiscoveredWithFingerprint(fn, "fp")
 
-	// Prune removes the row for a function whose directory no longer exists.
+	// Prune removes the row for an app whose directory no longer exists.
 	if err := os.RemoveAll(fn.Dir); err != nil {
 		t.Fatalf("remove dir: %v", err)
 	}
@@ -172,8 +172,8 @@ func TestStatusObserverNilSafe(t *testing.T) {
 	st.SetStatusObserver(observer)
 	st.SetStatusObserver(nil)
 
-	tmpl := &function.Template{Runtime: "python3.14"}
-	fn := function.Function{Name: "quiet", Dir: t.TempDir(), Template: tmpl}
+	tmpl := &app.Template{Runtime: "python3.14"}
+	fn := app.App{Name: "quiet", Dir: t.TempDir(), Template: tmpl}
 	st.RecordDiscoveredWithFingerprint(fn, "fp")
 	st.RecordReconcileSuccess("quiet", "img", "fp", time.Now(), fn)
 	if len(*events) != 0 {

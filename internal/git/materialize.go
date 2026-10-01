@@ -9,33 +9,33 @@ import (
 	"sort"
 	"strings"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/source"
 )
 
-// discoverFunctions returns the sorted set of valid function names under the
+// discoverApps returns the sorted set of valid app names under the
 // selected source: each DIRECT subdirectory that has a template.yaml and is not
 // excluded by the source-selection policy. Subdirectories without a
-// template.yaml, files, and directories failing function.ValidName are ignored —
-// the same discovery rules as internal/function/loader.go, so the set we
+// template.yaml, files, and directories failing app.ValidName are ignored —
+// the same discovery rules as internal/app/loader.go, so the set we
 // materialize is exactly what the reconciler would load. An ignored directory is
-// skipped just as the loader would (git never descends into it), so a function
+// skipped just as the loader would (git never descends into it), so an app
 // directory excluded by .gitignore is not materialized.
-func discoverFunctions(selection *source.Selection) ([]string, error) {
+func discoverApps(selection *source.Selection) ([]string, error) {
 	entries, err := os.ReadDir(selection.Dir())
 	if err != nil {
 		// A missing source dir means the validated monorepo path (or the whole
 		// checkout) is absent from the checked-out ref. That is a hard sync
-		// failure: silently producing an empty /functions would look like a
-		// successful "there are no functions yet" sync and could erase valid
-		// materialized functions through the deterministic-removal rule.
+		// failure: silently producing an empty /apps would look like a
+		// successful "there are no apps yet" sync and could erase valid
+		// materialized apps through the deterministic-removal rule.
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("git: source dir %q does not exist in the checkout", selection.Dir())
 		}
 		return nil, fmt.Errorf("git: read source dir %q: %w", selection.Dir(), err)
 	}
 	// A successfully read but empty directory is a valid, deliberate "no
-	// functions here" source, NOT an error: materialize still runs the
+	// apps here" source, NOT an error: materialize still runs the
 	// deterministic-removal pass so stale dirs are cleared. We return the empty
 	// slice (non-nil not required) and the caller distinguishes it from an error
 	// purely by the nil err.
@@ -45,14 +45,14 @@ func discoverFunctions(selection *source.Selection) ([]string, error) {
 			continue
 		}
 		name := e.Name()
-		if function.ValidName(name) != nil {
+		if app.ValidName(name) != nil {
 			continue
 		}
 		if !selection.IncludesPath(filepath.Join(selection.Dir(), name, "template.yaml"), false) {
 			continue // excluded by the source-selection policy
 		}
 		if _, err := os.Stat(filepath.Join(selection.Dir(), name, "template.yaml")); err != nil {
-			continue // no template.yaml, or unreadable: not a function
+			continue // no template.yaml, or unreadable: not an app
 		}
 		names = append(names, name)
 	}
@@ -60,42 +60,42 @@ func discoverFunctions(selection *source.Selection) ([]string, error) {
 	return names, nil
 }
 
-// materialize rewrites dstDir (the /functions root) so that it contains exactly
-// the function directories discovered under selection, recursively and
+// materialize rewrites dstDir (the /apps root) so that it contains exactly
+// the app directories discovered under selection, recursively and
 // deterministically:
 //
-//   - Each function in the discovered set is copied/refreshed from selection into
-//     dstDir. The copy is made "atomic-ish" per function: the tree is copied
+//   - Each app in the discovered set is copied/refreshed from selection into
+//     dstDir. The copy is made "atomic-ish" per app: the tree is copied
 //     into a temp directory beside dstDir, then the existing target is removed
 //     and the temp renamed over it. A reader (the reconciler's watcher) sees at
 //     worst the target absent for an instant — which the reconciler tolerates —
-//     and never a half-copied function.
+//     and never a half-copied app.
 //   - Files excluded by the source-selection policy (the .gitignore rules
 //     anchored at the checkout root) are NOT copied. The applicable .gitignore
 //     files themselves ARE copied: they are the selection policy, so they must
-//     travel with the function for the build context and fingerprint to keep
-//     applying the same rules against /functions.
+//     travel with the app for the build context and fingerprint to keep
+//     applying the same rules against /apps.
 //   - Any pre-existing DIRECTORY in dstDir whose name is not in the new set is
-//     removed, so /functions reflects exactly the configured source (the
+//     removed, so /apps reflects exactly the configured source (the
 //     deterministic-replace rule). Only directories are removed, never files,
 //     and nothing outside dstDir is ever touched. A Relay-owned transient
-//     staging directory (function.IsReservedDir) is not governed by this rule:
+//     staging directory (app.IsReservedDir) is not governed by this rule:
 //     the creator owns its lifecycle, so it is never reported as removed nor
 //     deleted here.
 //
 // REMOVED are treated by removal of the directory. The returned values are the
 // names materialized (sorted) and removed (sorted) for the sync summary.
 //
-// Ownership note: once a git source is configured and synced, /functions is
-// managed by git. Operator-placed function directories are subject to the same
+// Ownership note: once a git source is configured and synced, /apps is
+// managed by git. Operator-placed app directories are subject to the same
 // deterministic rule: a sync removes any directory not in the source. This is
 // documented in README.md "Git" and in Sync's doc comment.
 func materialize(selection *source.Selection, dstDir string) (materialized, removed []string, err error) {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return nil, nil, fmt.Errorf("git: create functions dir %q: %w", dstDir, err)
+		return nil, nil, fmt.Errorf("git: create apps dir %q: %w", dstDir, err)
 	}
 
-	newSet, err := discoverFunctions(selection)
+	newSet, err := discoverApps(selection)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,14 +104,14 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 		want[n] = true
 	}
 
-	// Copy/refresh each wanted function atomically-ish: temp dir beside dst,
+	// Copy/refresh each wanted app atomically-ish: temp dir beside dst,
 	// remove old target, rename temp into place.
 	for _, name := range newSet {
 		fnSelection, err := selection.Sub(filepath.Join(selection.Dir(), name))
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := copyFunctionDir(fnSelection, dstDir, name); err != nil {
+		if err := copyAppDir(fnSelection, dstDir, name); err != nil {
 			return nil, nil, err
 		}
 		materialized = append(materialized, name)
@@ -124,21 +124,21 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	// newSet/entries naming above. Both reads must succeed independently and a
 	// ReadDir error here must NOT be conflated with the discovery result that
 	// drives the copy loop — an empty dstDir (nil dstEntries) is normal (first
-	// sync, or /functions already empty) and is NOT the same as a read failure.
+	// sync, or /apps already empty) and is NOT the same as a read failure.
 	dstEntries, err := os.ReadDir(dstDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("git: list functions dir %q: %w", dstDir, err)
+		return nil, nil, fmt.Errorf("git: list apps dir %q: %w", dstDir, err)
 	}
 	for _, e := range dstEntries {
 		if !e.IsDir() {
 			continue
 		}
-		if function.IsReservedDir(e.Name()) {
+		if app.IsReservedDir(e.Name()) {
 			// A Relay-owned transient staging directory (git's ".sync-*") is
-			// not a materialized function and is not governed by the
+			// not a materialized app and is not governed by the
 			// deterministic-removal rule: the creator owns its lifecycle (it is
 			// renamed away on success and cleaned up on failure). Skipping it
-			// here avoids reporting a transient stage as a removed function and
+			// here avoids reporting a transient stage as a removed app and
 			// avoids deleting a stage a concurrent sync is still filling.
 			continue
 		}
@@ -146,7 +146,7 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(dstDir, e.Name())); err != nil {
-			return nil, nil, fmt.Errorf("git: remove stale function dir %q: %w", e.Name(), err)
+			return nil, nil, fmt.Errorf("git: remove stale app dir %q: %w", e.Name(), err)
 		}
 		removed = append(removed, e.Name())
 	}
@@ -154,17 +154,17 @@ func materialize(selection *source.Selection, dstDir string) (materialized, remo
 	return materialized, removed, nil
 }
 
-// copyFunctionDir copies the whole tree at selection into dst/name
+// copyAppDir copies the whole tree at selection into dst/name
 // atomically-ish: the tree is first copied to a temp directory (named with
-// function.StagingPrefix, Relay's reserved staging prefix that discovery
+// app.StagingPrefix, Relay's reserved staging prefix that discovery
 // ignores) created beside dst, then the existing dst/name is removed and the
 // temp renamed into place, so the reconciler never observes a partially-written
-// function directory. Files the
+// app directory. Files the
 // source-selection policy excludes are not copied; the applicable .gitignore
-// files are (they are the policy and must travel with the function). File modes
+// files are (they are the policy and must travel with the app). File modes
 // are preserved.
-func copyFunctionDir(selection *source.Selection, dst, name string) error {
-	tmp, err := os.MkdirTemp(dst, function.StagingPrefix+"*")
+func copyAppDir(selection *source.Selection, dst, name string) error {
+	tmp, err := os.MkdirTemp(dst, app.StagingPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("git: create temp dir: %w", err)
 	}
@@ -188,18 +188,18 @@ func copyFunctionDir(selection *source.Selection, dst, name string) error {
 	// template (ErrNotReady) and retried loads.
 	if _, err := os.Stat(target); err == nil {
 		if err := os.RemoveAll(target); err != nil {
-			return fmt.Errorf("git: remove existing function dir %q: %w", name, err)
+			return fmt.Errorf("git: remove existing app dir %q: %w", name, err)
 		}
 	}
 	if err := os.Rename(tmpPath, target); err != nil {
-		return fmt.Errorf("git: rename function dir %q: %w", name, err)
+		return fmt.Errorf("git: rename app dir %q: %w", name, err)
 	}
 	tmpPath = "" // renamed away; skip deferred cleanup
 	return nil
 }
 
 // preserveAncestorIgnoreFiles carries checkout-level policy into the
-// materialized function. Without this, a subsequent runtime fingerprint would
+// materialized app. Without this, a subsequent runtime fingerprint would
 // forget an ancestor .gitignore when the ancestor rule happened not to change
 // the selected files.
 func preserveAncestorIgnoreFiles(selection *source.Selection, dst string) error {

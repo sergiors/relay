@@ -10,8 +10,8 @@ import (
 )
 
 // The persistent invocation protocol. Execution containers are
-// REUSED across invocations for the same function: each pooled container (up to
-// the function's concurrency, per image version) stays alive as a long-running
+// REUSED across invocations for the same app: each pooled container (up to
+// the app's concurrency, per image version) stays alive as a long-running
 // bootstrap process and is leased to one invocation at a time, and each
 // invocation is one request/response frame exchange over that container's stdin
 // and stdout. The bootstrap is a line-JSON server side:
@@ -21,7 +21,7 @@ import (
 //	                 @@RELAY@@{"id":"<id>","ok":false,"error":"…"}
 //
 // stdout lines that do NOT start with the sentinel are user output and are
-// forwarded to the function-output sink exactly as before (a raw transport);
+// forwarded to the app-output sink exactly as before (a raw transport);
 // sentinel lines that do not parse as a response frame are likewise treated as
 // user output (a program that happens to print the sentinel is not a framing
 // failure, but a PARSEABLE response carrying an unexpected id is a protocol
@@ -153,7 +153,7 @@ func clampResponseError(s string) string {
 // line longer than the cap is flushed as user output, bounding memory; a
 // trailing partial line at EOF is flushed too.
 type protocolDemuxer struct {
-	fn string // function name for the idle fallback prefix
+	fn string // app name for the idle fallback prefix
 
 	// mu guards everything below. The reader goroutine (Write/processLine) and
 	// the Invoke goroutine (setPending/clearPending/begin/end) both take it;
@@ -171,7 +171,7 @@ type protocolDemuxer struct {
 	// per-invocation prefixed instances (begin) while an Invoke is in flight
 	// and back to the idle fallback (end) after. One forwarder pair exists per
 	// stream; swapping whole instances is how the per-invocation prefix
-	// (function/handler[@id]) is applied without mutating shared state.
+	// (app/handler[@id]) is applied without mutating shared state.
 	stdoutFwd *streamForwarder
 	stderrFwd *streamForwarder
 
@@ -193,7 +193,7 @@ type protocolDemuxer struct {
 // newProtocolDemuxer returns a demuxer whose idle forwarding falls back to
 // stable "[<fn>/] stdout/stderr: " prefixed forwarders.
 func newProtocolDemuxer(fn string) *protocolDemuxer {
-	idle := RunMeta{Function: fn}
+	idle := RunMeta{App: fn}
 	return &protocolDemuxer{
 		fn:         fn,
 		idleStdout: newStreamForwarder("stdout", fn, "", idle),
@@ -202,7 +202,7 @@ func newProtocolDemuxer(fn string) *protocolDemuxer {
 }
 
 // begin swaps in per-invocation forwarders so forwarded lines carry the
-// [function/handler[@id]] prefix for this invocation.
+// [app/handler[@id]] prefix for this invocation.
 func (d *protocolDemuxer) begin(meta RunMeta) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -211,7 +211,7 @@ func (d *protocolDemuxer) begin(meta RunMeta) {
 }
 
 // end removes the per-invocation forwarders, falling back to the stable idle
-// "[function/] stream:" prefixes for asynchronous output between invocations.
+// "[app/] stream:" prefixes for asynchronous output between invocations.
 // The outgoing forwarders are flushed first so any buffered partial line they
 // hold (a line split across stdcopy chunks) is delivered under their own
 // prefix rather than leaking into the next prefix.

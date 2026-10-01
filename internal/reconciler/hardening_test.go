@@ -70,7 +70,7 @@ func TestWatchCleanupOnRenameRemovesDescendants(t *testing.T) {
 	// Wait until the full subtree is watched.
 	waitAllWatched(t, r, oldSub())
 
-	// Rename the top-level function directory -> its watch + all descendants
+	// Rename the top-level app directory -> its watch + all descendants
 	// become stale.
 	newName := filepath.Join(root, "renamed")
 	if err := os.Rename(filepath.Join(root, "a"), newName); err != nil {
@@ -127,7 +127,7 @@ func TestWatchRecleanupOnRecreate(t *testing.T) {
 	}
 }
 
-// A symlink loop inside the functions tree cannot hang addWatchRecursive:
+// A symlink loop inside the apps tree cannot hang addWatchRecursive:
 // WalkDir does not follow links, so the walk terminates and, per policy, the
 // symlinked dir is simply not watched.
 func TestAddWatchRecursiveSymlinkLoopBounded(t *testing.T) {

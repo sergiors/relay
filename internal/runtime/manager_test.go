@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // TestEnvMapParsesKeyValueAndLaterWins verifies the per-invocation env parsing:
@@ -54,14 +54,14 @@ func TestEnvMapParsesKeyValueAndLaterWins(t *testing.T) {
 func TestTemplateHandlersExtraction(t *testing.T) {
 	cases := []struct {
 		name string
-		fn   function.Function
+		fn   app.App
 		want []string
 	}{
-		{name: "nil template", fn: function.Function{}},
+		{name: "nil template", fn: app.App{}},
 		{
 			name: "event modules",
-			fn: function.Function{Template: &function.Template{
-				Events: []function.EventRule{
+			fn: app.App{Template: &app.Template{
+				Events: []app.EventRule{
 					{Handler: "handler.handler"},
 					{Handler: "src.order.handler"},
 				},
@@ -70,12 +70,12 @@ func TestTemplateHandlersExtraction(t *testing.T) {
 		},
 		{
 			name: "schedules deduped and sorted with events",
-			fn: function.Function{Template: &function.Template{
-				Events: []function.EventRule{
+			fn: app.App{Template: &app.Template{
+				Events: []app.EventRule{
 					{Handler: "src.order.handler"},
 					{Handler: "handler.handler"},
 				},
-				Schedules: []function.Schedule{
+				Schedules: []app.Schedule{
 					{Handler: "src.order.cleanup"},
 					{Handler: "jobs.report.handler"},
 				},
@@ -84,8 +84,8 @@ func TestTemplateHandlersExtraction(t *testing.T) {
 		},
 		{
 			name: "malformed handlers skipped",
-			fn: function.Function{Template: &function.Template{
-				Events: []function.EventRule{
+			fn: app.App{Template: &app.Template{
+				Events: []app.EventRule{
 					{Handler: "nodot"},
 					{Handler: ".fn"},
 					{Handler: "ok.handler"},

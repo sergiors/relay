@@ -14,7 +14,7 @@ import (
 
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -40,7 +40,7 @@ func TestIntegrationFingerprintedImageLifecycle(t *testing.T) {
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-fn-ver:") {
+				if strings.HasPrefix(tag, "relay-app-fn-ver:") {
 					cleanupImage(cli, cleanupCtx, tag)
 					break
 				}
@@ -58,8 +58,8 @@ events:
 `)
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v1'); }\n")
 
-	fn := function.Function{Name: "fn-ver", Dir: dir, Template: &function.Template{Runtime: "node24"}}
-	fp1, err := function.Fingerprint(dir)
+	fn := app.App{Name: "fn-ver", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	fp1, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v1: %v", err)
 	}
@@ -81,7 +81,7 @@ events:
 
 	// Change source -> distinct fingerprint -> distinct image.
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('v2'); }\n")
-	fp2, err := function.Fingerprint(dir)
+	fp2, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v2: %v", err)
 	}
@@ -118,7 +118,7 @@ CMD []
 	// Note: we deliberately do NOT call (*Manager).RemoveImagesExcept here. That
 	// sweep is a worker-startup operation over ALL Relay-owned images on the
 	// daemon; a unit-scoped lifecycle test must not assert on whole-daemon state
-	// it does not own, since it races anything else creating relay-fn-* images on
+	// it does not own, since it races anything else creating relay-app-* images on
 	// a shared daemon (e.g. another Go test package running concurrently).
 	m1, err := NewManager(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "test-host")
 	if err != nil {
@@ -147,7 +147,7 @@ CMD []
 // TestIntegrationDependencyLayerReuse verifies the shared dependency layer is
 // reused across source changes: build v1 (with requirements.txt), then change
 // ONLY the handler source and build v2. The dependency image must exist
-// unchanged BEFORE and AFTER (same reference and image ID), while the function
+// unchanged BEFORE and AFTER (same reference and image ID), while the app
 // image gets a NEW tag for the changed source.
 //
 // The dependency reference is computed deterministically with the production
@@ -160,20 +160,20 @@ CMD []
 // layer is detected by re-deriving the reference across the source change (a
 // correct dependency fingerprint must not depend on handler source), by Prepare
 // reporting the same dependency reference for both versions, and by the v2
-// function image's relay.dependency label naming that exact layer.
+// app image's relay.dependency label naming that exact layer.
 func TestIntegrationDependencyLayerReuse(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
-	// leak the dep-layer and function images this test creates into the sibling
+	// leak the dep-layer and app images this test creates into the sibling
 	// tests that follow on the shared daemon. We remove only the dep images this
 	// test built (delta vs the snapshot below), not every relay-dep-* layer on
-	// the daemon, and force-remove this test's own function image.
+	// the daemon, and force-remove this test's own app image.
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-reuse:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-reuse:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -185,7 +185,7 @@ events:
 `)
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
 
-	fn := function.Function{Name: "dep-reuse", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-reuse", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	// The dependency reference is content-addressed from the manifest set +
 	// runtime + arch + install command — NOT from the handler source. Derive it
@@ -205,7 +205,7 @@ events:
 
 	// v1 source.
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('v1')\n")
-	fp1, err := function.Fingerprint(dir)
+	fp1, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v1: %v", err)
 	}
@@ -241,7 +241,7 @@ events:
 	if depRef2 := expectedDependencyRef(t, fn); depRef2 != depRef {
 		t.Fatalf("dependency reference changed across a pure source change: %s -> %s", depRef, depRef2)
 	}
-	fp2, err := function.Fingerprint(dir)
+	fp2, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("fingerprint v2: %v", err)
 	}
@@ -273,9 +273,9 @@ events:
 			"it should be reused", inspV1.ID, inspV2.ID)
 	}
 
-	// Wrong/new dependency layer guard: the v2 function image must actually be
+	// Wrong/new dependency layer guard: the v2 app image must actually be
 	// wired to the expected dependency layer via its relay.dependency label. The
-	// label is the strict wiring the dependency GC reads, so a function image
+	// label is the strict wiring the dependency GC reads, so an app image
 	// built FROM the wrong dependency layer fails here even if its own image
 	// reference happened to be correct. This is a deterministic, per-image check
 	// against the reference derived with the production helpers; it deliberately
@@ -314,11 +314,11 @@ func TestIntegrationDependencyChangeProducesNewDepLayer(t *testing.T) {
 	defer cancel()
 
 	// Register cleanup FIRST (before any Fatalf) so a mid-test failure can never
-	// leak the dep-layer and function images this test creates into the sibling
+	// leak the dep-layer and app images this test creates into the sibling
 	// tests that follow on the shared daemon.
 	depBefore := depTagSet(ctx, cli)
 	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
-	t.Cleanup(cleanupImagePrefixes(cli, "relay-fn-dep-change:"))
+	t.Cleanup(cleanupImagePrefixes(cli, "relay-app-dep-change:"))
 
 	dir := t.TempDir()
 	writeFile(t, dir, "template.yaml", `
@@ -329,7 +329,7 @@ events:
       status: [COMPLETED]
 `)
 	writeFile(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
-	fn := function.Function{Name: "dep-change", Dir: dir, Template: &function.Template{Runtime: "python3.14"}}
+	fn := app.App{Name: "dep-change", Dir: dir, Template: &app.Template{Runtime: "python3.14"}}
 
 	// v1 manifest.
 	writeFile(t, dir, "requirements.txt", "six==1.16.0\n")
@@ -345,7 +345,7 @@ events:
 		t.Fatalf("dependency image %s must exist after v1 build", dep1)
 	}
 
-	// v2 manifest: add a package. The function source and template are unchanged,
+	// v2 manifest: add a package. The app source and template are unchanged,
 	// so only the dependencies differ. idna is a single tiny wheel with no
 	// transitive dependencies, so the added package proves the invalidation
 	// without pulling the multi-wheel `requests` tree.

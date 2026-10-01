@@ -48,12 +48,12 @@ var (
 //
 // The flag is the worker's own lifecycle state and starts false: it is set true
 // only at the actual ready-to-consume boundary (immediately before Consume,
-// once dependency preflight, function loading/preparation, the socket, the
+// once dependency preflight, app loading/preparation, the socket, the
 // required listeners and loops, and the consumer/schedule/reconciler/scheduler
 // wiring are all complete) and is cleared as the FIRST instruction of the
 // shutdown defer, before the lifecycle is cancelled and any teardown runs. It
 // deliberately does not wait on asynchronous service convergence/housekeeping,
-// optional tracing, SQLite, or per-function success: none of those gate the
+// optional tracing, SQLite, or per-app success: none of those gate the
 // worker's readiness to consume.
 //
 // The flag alone is not sufficient: the worker lifecycle context is bound in as
@@ -169,7 +169,7 @@ func (r *readiness) Ready(ctx context.Context) (bool, string) {
 // consumer or manager is a hard dependency failure, not a pass. The returned
 // reason is a fixed, low-cardinality string that never carries a dependency's
 // raw error, so a readiness response cannot leak operator detail. It is a pure
-// function of its injected seams, so it is unit-testable with deterministic
+// app of its injected seams, so it is unit-testable with deterministic
 // fakes and no sleeps.
 func probeReadiness(
 	ctx context.Context,

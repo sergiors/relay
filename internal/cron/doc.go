@@ -1,4 +1,4 @@
-// Package cron owns when function schedules fire. It maps each template schedule
+// Package cron owns when app schedules fire. It maps each template schedule
 // to a gocron job and hands due occurrences to internal/schedule for
 // cluster-wide publication. It does not depend on Docker or Redis directly.
 //
@@ -12,8 +12,8 @@
 // Scheduled invocations therefore reuse the same runner/runtime path as normal
 // event-driven execution.
 //
-// New constructs the scheduler without starting it. ReplaceFunction converges a
-// function's jobs, RemoveFunction removes them, Start begins firing, and Stop
+// New constructs the scheduler without starting it. ReplaceApp converges a
+// app's jobs, RemoveApp removes them, Start begins firing, and Stop
 // stops firing and strictly joins every in-flight publisher callback (including
 // callbacks gocron's own bounded shutdown may have abandoned), so no callback
 // can still be touching Redis once Stop returns.

@@ -3,7 +3,7 @@ package runtime
 import "context"
 
 // RunMeta carries the diagnostic metadata attached as Docker labels to every
-// function execution container. It is diagnostic-only: Relay's correctness never
+// app execution container. It is diagnostic-only: Relay's correctness never
 // depends on these labels beyond the relay.type + relay.hostname ownership
 // predicate used by the sweep.
 //
@@ -14,7 +14,7 @@ import "context"
 //
 // The values are all low-cardinality or bounded identifiers that Relay already
 // uses as log fields or identities elsewhere — never raw payload content:
-//   - Function/Handler are configuration (function name, rule handler).
+//   - App/Handler are configuration (app name, rule handler).
 //   - MessageID is the stream message ID (bounded by upstream event data).
 //   - EventID/EventName are low-cardinality event fields carried for the
 //     diagnostic container labels and the invocation output prefix.
@@ -27,7 +27,7 @@ import "context"
 // key is ever omitted.
 type RunMeta struct {
 	Type      string
-	Function  string
+	App       string
 	Handler   string
 	MessageID string
 	EventID   string
@@ -43,7 +43,7 @@ type RunMeta struct {
 func runLabels(meta RunMeta) map[string]string {
 	return map[string]string{
 		labelType:      meta.Type,
-		labelFunction:  meta.Function,
+		labelApp:       meta.App,
 		labelHandler:   meta.Handler,
 		labelMessageID: meta.MessageID,
 		labelEventID:   meta.EventID,

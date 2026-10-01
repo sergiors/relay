@@ -243,7 +243,7 @@ func requireInstall(t *testing.T, p plan.BuildPlan) string {
 }
 
 // TestPlanJSHandlersNoBuild asserts the JavaScript path is untouched: a .js
-// handler, a nil handler list, and an all-JS multi-handler function all produce
+// handler, a nil handler list, and an all-JS multi-handler app all produce
 // no Install step and an unchanged dependency layer. JavaScript must never be
 // forced through TypeScript tooling.
 func TestPlanJSHandlersNoBuild(t *testing.T) {
@@ -300,7 +300,7 @@ func TestPlanTSHandlerBuilds(t *testing.T) {
 			t.Errorf("Install command missing %q:\n%s", want, cmd)
 		}
 	}
-	// No tsconfig.json in the function dir: the flag must be absent.
+	// No tsconfig.json in the app dir: the flag must be absent.
 	if strings.Contains(cmd, "--tsconfig") {
 		t.Errorf("Install command must not pass --tsconfig when no tsconfig.json exists:\n%s", cmd)
 	}
@@ -432,7 +432,7 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 	}
 }
 
-// TestPlanTSWithTsconfig pins that a tsconfig.json present in the function dir
+// TestPlanTSWithTsconfig pins that a tsconfig.json present in the app dir
 // is passed to esbuild; Relay never type-checks, esbuild only reads
 // compilerOptions from it.
 func TestPlanTSWithTsconfig(t *testing.T) {

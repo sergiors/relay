@@ -34,31 +34,31 @@ func seedAllMetrics(r *Registry) {
 	} {
 		r.Inc(name)
 	}
-	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"function", "a"}, {"handler", "x"}})
-	r.IncLabels(MetricBuildFailures, []Label{{"function", "a"}})
+	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
+	r.IncLabels(MetricAppBuildFailures, []Label{{"app", "a"}})
 	for _, name := range []string{
-		MetricFunctionEventsMatched,
+		MetricAppEventsMatched,
 		MetricFunctionHandlerSuccess,
 		MetricFunctionHandlerFailure,
 		MetricFunctionRetries,
 		MetricFunctionDLQ,
 		MetricRuntimeContainerWaits,
 	} {
-		r.IncLabels(name, []Label{{"function", "a"}})
+		r.IncLabels(name, []Label{{"app", "a"}})
 	}
 	// Duration histograms are observed with a known 2s value so the test can
 	// assert the exposed sample sums are in seconds, not milliseconds.
-	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"function", "a"}, {"handler", "x"}}, 2*time.Second)
-	r.ObserveDurationLabels(MetricFunctionBuild, []Label{{"function", "a"}}, 2*time.Second)
-	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"function", "a"}}, 2*time.Second)
-	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"function", "a"}, {"outcome", RuntimeOutcomeWarm}})
-	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"function", "a"}, {"reason", "shutdown"}})
-	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"function", "a"}, {"state", RuntimeStateIdle}}, 1)
-	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"function", "a"}}, 1)
-	r.SetGaugeLabels(MetricFunctionStatus, []Label{{"function", "a"}, {"status", "ready"}}, 1)
+	r.ObserveDurationLabels(MetricHandlerDuration, []Label{{"app", "a"}, {"handler", "x"}}, 2*time.Second)
+	r.ObserveDurationLabels(MetricAppBuild, []Label{{"app", "a"}}, 2*time.Second)
+	r.ObserveDurationLabels(MetricRuntimeContainerAcquireDuration, []Label{{"app", "a"}}, 2*time.Second)
+	r.IncLabels(MetricRuntimeContainerAcquires, []Label{{"app", "a"}, {"outcome", RuntimeOutcomeWarm}})
+	r.IncLabels(MetricRuntimeContainerDiscards, []Label{{"app", "a"}, {"reason", "shutdown"}})
+	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"app", "a"}, {"state", RuntimeStateIdle}}, 1)
+	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"app", "a"}}, 1)
+	r.SetGaugeLabels(MetricAppStatus, []Label{{"app", "a"}, {"status", "ready"}}, 1)
 	r.IncLabels(MetricRedisReadErrors, []Label{{"operation", RedisOpReadGroup}})
-	r.IncLabels(MetricServiceReconciles, []Label{{"function", "a"}, {"outcome", ServiceOutcomeChanged}})
-	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"function", "a"}}, 2*time.Second)
+	r.IncLabels(MetricServiceReconciles, []Label{{"app", "a"}, {"outcome", ServiceOutcomeChanged}})
+	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"app", "a"}}, 2*time.Second)
 	for _, name := range []string{
 		MetricPendingEntries,
 		MetricPendingOldestAge,

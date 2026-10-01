@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 )
 
@@ -17,10 +17,10 @@ import (
 type resourceRecordingBuilder struct {
 	mu        sync.Mutex
 	prepares  int
-	published map[string][]function.ResourceLimits
+	published map[string][]app.ResourceLimits
 }
 
-func (b *resourceRecordingBuilder) Prepare(_ context.Context, fn function.Function) (*runtime.Prepared, error) {
+func (b *resourceRecordingBuilder) Prepare(_ context.Context, fn app.App) (*runtime.Prepared, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prepares++
@@ -31,11 +31,11 @@ func (b *resourceRecordingBuilder) Execute(context.Context, *runtime.Prepared, s
 	return nil
 }
 
-func (b *resourceRecordingBuilder) SetFunctionResources(name string, limits function.ResourceLimits) {
+func (b *resourceRecordingBuilder) SetAppResources(name string, limits app.ResourceLimits) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.published == nil {
-		b.published = map[string][]function.ResourceLimits{}
+		b.published = map[string][]app.ResourceLimits{}
 	}
 	b.published[name] = append(b.published[name], limits)
 }
@@ -46,10 +46,10 @@ func (b *resourceRecordingBuilder) prepareCount() int {
 	return b.prepares
 }
 
-func (b *resourceRecordingBuilder) publishedFor(name string) []function.ResourceLimits {
+func (b *resourceRecordingBuilder) publishedFor(name string) []app.ResourceLimits {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]function.ResourceLimits(nil), b.published[name]...)
+	return append([]app.ResourceLimits(nil), b.published[name]...)
 }
 
 // TestReconcileResourceOnlyChangeSkipsPrepareAndPublishesResources pins the core
@@ -81,7 +81,7 @@ events:
 
 	b := &resourceRecordingBuilder{}
 	r, reg := newTestReconciler(t, root, b, nil, nil)
-	r.reconcileFunction("res")
+	r.reconcileApp("res")
 	if b.prepareCount() != 1 {
 		t.Fatalf("prepare count = %d, want 1", b.prepareCount())
 	}
@@ -101,7 +101,7 @@ events:
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(changed), 0o644); err != nil {
 		t.Fatalf("rewrite template: %v", err)
 	}
-	r.reconcileFunction("res")
+	r.reconcileApp("res")
 	if b.prepareCount() != 1 {
 		t.Fatalf("a resource-only change triggered a rebuild: prepares = %d, want 1", b.prepareCount())
 	}
@@ -114,14 +114,14 @@ events:
 	if len(published) == 0 {
 		t.Fatal("resource-only change did not publish any resource configuration")
 	}
-	want := function.ResourceLimits{MemoryBytes: 1 << 30, NanoCPUs: 500_000_000, PidsLimit: 64}
+	want := app.ResourceLimits{MemoryBytes: 1 << 30, NanoCPUs: 500_000_000, PidsLimit: 64}
 	if got := published[len(published)-1]; got != want {
 		t.Fatalf("last published resources = %+v, want %+v", got, want)
 	}
 }
 
 // TestReconcileResourceOnlyChangeDoesNotChurnBuilder pins that a periodic
-// reconcile of an UNCHANGED function publishes the same limits repeatedly (the
+// reconcile of an UNCHANGED app publishes the same limits repeatedly (the
 // runtime no-ops them) and never rebuilds: the reconciler's skip path is a cheap
 // no-op for the image and idempotent for resources.
 func TestReconcileResourceOnlyChangeDoesNotChurnBuilder(t *testing.T) {
@@ -147,14 +147,14 @@ events:
 
 	b := &resourceRecordingBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
-	r.reconcileFunction("stable")
-	r.reconcileFunction("stable")
-	r.reconcileFunction("stable")
+	r.reconcileApp("stable")
+	r.reconcileApp("stable")
+	r.reconcileApp("stable")
 	if b.prepareCount() != 1 {
 		t.Fatalf("prepare count = %d, want 1 (unchanged content never rebuilds)", b.prepareCount())
 	}
 	for _, got := range b.publishedFor("stable") {
-		if got != (function.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: function.DefaultResourceNanoCPUs, PidsLimit: function.DefaultResourcePidsLimit}) {
+		if got != (app.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: app.DefaultResourceNanoCPUs, PidsLimit: app.DefaultResourcePidsLimit}) {
 			t.Fatalf("published resources = %+v, want the configured limits", got)
 		}
 	}
@@ -186,7 +186,7 @@ events:
 
 	b := &resourceRecordingBuilder{}
 	r, _ := newTestReconciler(t, root, b, nil, nil)
-	r.reconcileFunction("edit")
+	r.reconcileApp("edit")
 	if b.prepareCount() != 1 {
 		t.Fatalf("prepare count = %d, want 1", b.prepareCount())
 	}
@@ -201,7 +201,7 @@ events:
 `), 0o644); err != nil {
 		t.Fatalf("rewrite template: %v", err)
 	}
-	r.reconcileFunction("edit")
+	r.reconcileApp("edit")
 	if b.prepareCount() != 2 {
 		t.Fatalf("a non-resource edit must rebuild: prepares = %d, want 2", b.prepareCount())
 	}

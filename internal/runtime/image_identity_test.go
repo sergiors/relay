@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -19,7 +19,7 @@ import (
 // is preferred but never required: an image without labels (an external service
 // image) still gets a content-addressed identity from its ID alone.
 func TestImageIdentityKeyDistinguishesContent(t *testing.T) {
-	const ref = "relay-fn-fn:tag"
+	const ref = "relay-app-fn:tag"
 
 	same := imageIdentityKey(ref, "sha256:v1", "fp1")
 	if again := imageIdentityKey(ref, "sha256:v1", "fp1"); same != again {
@@ -63,10 +63,10 @@ func TestImageIdentityKeyDistinguishesContent(t *testing.T) {
 // a create can never run bytes other than those leased), and falls back to the
 // mutable reference only when resolution was unavailable.
 func TestResolvedImageCreatePrefersContentID(t *testing.T) {
-	if got := (resolvedImage{ref: "relay-fn-a:t", id: "sha256:v1"}).createImage(); got != "sha256:v1" {
+	if got := (resolvedImage{ref: "relay-app-a:t", id: "sha256:v1"}).createImage(); got != "sha256:v1" {
 		t.Fatalf("createImage with content id = %q, want the content id", got)
 	}
-	if got := (resolvedImage{ref: "relay-fn-a:t"}).createImage(); got != "relay-fn-a:t" {
+	if got := (resolvedImage{ref: "relay-app-a:t"}).createImage(); got != "relay-app-a:t" {
 		t.Fatalf("createImage without content id = %q, want the reference", got)
 	}
 }
@@ -78,7 +78,7 @@ func TestResolvedImageCreatePrefersContentID(t *testing.T) {
 func TestImageInspectContentLabelsOptional(t *testing.T) {
 	cli := newScriptedDockerClient(t,
 		dockerRoute{method: http.MethodGet, path: "/images/ghcr.io/acme/api:1/json", body: `{"Id":"sha256:ext"}`},
-		dockerRoute{method: http.MethodGet, path: "/images/relay-fn-a:t/json", body: `{"Id":"sha256:fn","Config":{"Labels":{"relay.fingerprint":"abc123"}}}`},
+		dockerRoute{method: http.MethodGet, path: "/images/relay-app-a:t/json", body: `{"Id":"sha256:fn","Config":{"Labels":{"relay.fingerprint":"abc123"}}}`},
 		dockerRoute{method: http.MethodGet, path: "/images/missing:t/json", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
@@ -87,7 +87,7 @@ func TestImageInspectContentLabelsOptional(t *testing.T) {
 	if err != nil || !present || id != "sha256:ext" || fp != "" {
 		t.Fatalf("external inspect = (%q, %q, %v, %v), want the content id and an empty fingerprint with no labels", id, fp, present, err)
 	}
-	id, fp, present, err = m.imageInspectContent(context.Background(), "relay-fn-a:t")
+	id, fp, present, err = m.imageInspectContent(context.Background(), "relay-app-a:t")
 	if err != nil || !present || id != "sha256:fn" || fp != "abc123" {
 		t.Fatalf("managed inspect = (%q, %q, %v, %v), want the content id and relay.fingerprint", id, fp, present, err)
 	}
@@ -104,36 +104,36 @@ func TestImageInspectContentLabelsOptional(t *testing.T) {
 // fingerprint as the metadata fallback when the image carries no Relay label.
 func TestResolveImageIdentityDegradesWithoutDaemon(t *testing.T) {
 	noDaemon := &Manager{log: testutil.DiscardLogger()}
-	img := noDaemon.resolveImageIdentity(context.Background(), "relay-fn-a:t", "prepared-fp")
-	if img.id != "" || img.createImage() != "relay-fn-a:t" {
+	img := noDaemon.resolveImageIdentity(context.Background(), "relay-app-a:t", "prepared-fp")
+	if img.id != "" || img.createImage() != "relay-app-a:t" {
 		t.Fatalf("no-daemon resolution = %+v, want no content id and the reference create", img)
 	}
 	// The prepared fingerprint is retained as identity metadata even without a
 	// content id, so a Docker-less caller is still content-aware; the mutable
 	// reference remains recoverable for retirement.
-	if img.fingerprint != "prepared-fp" || identityRef(img.identity()) != "relay-fn-a:t" {
+	if img.fingerprint != "prepared-fp" || identityRef(img.identity()) != "relay-app-a:t" {
 		t.Fatalf("no-daemon identity = %q (fingerprint %q), want the reference with the prepared fingerprint", img.identity(), img.fingerprint)
 	}
-	if img.identity() == "relay-fn-a:t" {
+	if img.identity() == "relay-app-a:t" {
 		t.Fatal("a supplied fingerprint must still be part of the identity")
 	}
 
 	broken := &Manager{cli: newScriptedDockerClient(t,
-		dockerRoute{method: http.MethodGet, path: "/images/relay-fn-a:t/json", status: http.StatusInternalServerError, body: `{"message":"daemon down"}`},
+		dockerRoute{method: http.MethodGet, path: "/images/relay-app-a:t/json", status: http.StatusInternalServerError, body: `{"message":"daemon down"}`},
 	), log: testutil.DiscardLogger()}
-	img = broken.resolveImageIdentity(context.Background(), "relay-fn-a:t", "prepared-fp")
-	if img.id != "" || img.createImage() != "relay-fn-a:t" || identityRef(img.identity()) != "relay-fn-a:t" {
+	img = broken.resolveImageIdentity(context.Background(), "relay-app-a:t", "prepared-fp")
+	if img.id != "" || img.createImage() != "relay-app-a:t" || identityRef(img.identity()) != "relay-app-a:t" {
 		t.Fatalf("failed-inspect resolution = %+v, want the reference (with the prepared fingerprint) and no content id", img)
 	}
 
 	ok := &Manager{cli: newScriptedDockerClient(t,
-		dockerRoute{method: http.MethodGet, path: "/images/relay-fn-a:t/json", body: `{"Id":"sha256:v1"}`},
+		dockerRoute{method: http.MethodGet, path: "/images/relay-app-a:t/json", body: `{"Id":"sha256:v1"}`},
 	), log: testutil.DiscardLogger()}
-	img = ok.resolveImageIdentity(context.Background(), "relay-fn-a:t", "prepared-fp")
+	img = ok.resolveImageIdentity(context.Background(), "relay-app-a:t", "prepared-fp")
 	if img.id != "sha256:v1" || img.fingerprint != "prepared-fp" || img.createImage() != "sha256:v1" {
 		t.Fatalf("resolved = %+v, want content id with the prepared fingerprint fallback", img)
 	}
-	if img.identity() == "relay-fn-a:t" {
+	if img.identity() == "relay-app-a:t" {
 		t.Fatal("a resolved image must not degrade to the reference identity")
 	}
 }
@@ -208,7 +208,7 @@ type startRecorder struct {
 	created chan *fakeContainer
 }
 
-func (s *startRecorder) start(_ context.Context, _ string, img resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+func (s *startRecorder) start(_ context.Context, _ string, img resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 	s.mu.Lock()
 	if s.buildErr != nil {
 		err := s.buildErr
@@ -265,7 +265,7 @@ func (s *startRecorder) starts() int {
 func TestExecuteRotatesGenerationOnMovedTag(t *testing.T) {
 	m, res, start := newIdentityManager(t)
 	res.set("sha256:v1")
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 1}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 1}
 
 	exec := func() {
 		t.Helper()
@@ -317,7 +317,7 @@ func TestExecuteMovedTagBusyDrainsAndStaleCannotReacquire(t *testing.T) {
 	m, res, start := newIdentityManager(t)
 	start.block = make(chan struct{})
 	res.set("sha256:v1")
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 2}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 2}
 
 	busyDone := make(chan error, 1)
 	go func() { busyDone <- m.Execute(context.Background(), prepared, "h", []byte(`{}`), nil) }()
@@ -383,7 +383,7 @@ func TestExecuteResolutionPrecedesConcurrentCreates(t *testing.T) {
 	m, res, start := newIdentityManager(t)
 	res.unique = true
 	start.block = make(chan struct{})
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 2}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 2}
 
 	const n = 2
 	done := make(chan error, n)
@@ -427,7 +427,7 @@ func TestExecuteResolutionPrecedesConcurrentCreates(t *testing.T) {
 
 // TestExecuteIdentityHelperReusedWithServices is the alignment guard: the same
 // resolvedImage helper an external service image uses never requires Relay labels,
-// so a function execution against an image whose inspect carries none still gets a
+// so an app execution against an image whose inspect carries none still gets a
 // content-addressed identity and a content-ID create.
 func TestExecuteIdentityHelperReusedWithServices(t *testing.T) {
 	cli := newScriptedDockerClient(t,
@@ -435,7 +435,7 @@ func TestExecuteIdentityHelperReusedWithServices(t *testing.T) {
 	)
 	m := &Manager{log: testutil.DiscardLogger(), cli: cli, containers: newContainerCache()}
 	var created []string
-	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		created = append(created, img.createImage())
 		return &fakeContainer{}, nil
 	}
@@ -457,9 +457,9 @@ func TestExecuteIdentityHelperReusedWithServices(t *testing.T) {
 func TestExecuteSameContentResourceChangeStillPooled(t *testing.T) {
 	m, res, start := newIdentityManager(t)
 	res.set("sha256:v1")
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 1}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 1}
 
-	m.SetFunctionResources("fn", function.DefaultResourceLimits())
+	m.SetAppResources("fn", app.DefaultResourceLimits())
 	if err := m.Execute(context.Background(), prepared, "h", []byte(`{}`), nil); err != nil {
 		t.Fatalf("execute defaults: %v", err)
 	}
@@ -478,7 +478,7 @@ func TestExecuteSameContentResourceChangeStillPooled(t *testing.T) {
 	// A resource-only change rotates the generation with the resource reason and
 	// does not retire the image identity, so the same content warms afterwards.
 	old := start.lastContainer()
-	m.SetFunctionResources("fn", function.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 64})
+	m.SetAppResources("fn", app.ResourceLimits{MemoryBytes: 256 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 64})
 	if got := old.reasons(); len(got) != 1 || got[0] != reasonResourcesChanged {
 		t.Fatalf("resource change discards = %v, want [%s]", got, reasonResourcesChanged)
 	}
@@ -506,15 +506,15 @@ func TestExecuteIdentityResolutionFailureStillServes(t *testing.T) {
 		return resolvedImage{}, errors.New("resolution boom")
 	}
 	var created []string
-	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ function.ResourceLimits, _ RunMeta) (reusableContainer, error) {
+	m.startContainerFn = func(_ context.Context, _ string, img resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
 		created = append(created, img.createImage())
 		return &fakeContainer{}, nil
 	}
-	prepared := &Prepared{Name: "fn", Image: "relay-fn-fn:tag", Fingerprint: "fp", Concurrency: 1}
+	prepared := &Prepared{Name: "fn", Image: "relay-app-fn:tag", Fingerprint: "fp", Concurrency: 1}
 	if err := m.Execute(context.Background(), prepared, "h", []byte(`{}`), nil); err != nil {
 		t.Fatalf("execute with resolution failure: %v", err)
 	}
-	if len(created) != 1 || created[0] != "relay-fn-fn:tag" {
+	if len(created) != 1 || created[0] != "relay-app-fn:tag" {
 		t.Fatalf("create image = %v, want the reference fallback", created)
 	}
 }
@@ -526,7 +526,7 @@ func TestExecuteIdentityResolutionFailureStillServes(t *testing.T) {
 // state.
 func TestCacheInvalidateImageRetiresEveryContentOfReference(t *testing.T) {
 	cc, ff := newTestCache()
-	const ref = "relay-fn-fn-a:v1"
+	const ref = "relay-app-fn-a:v1"
 	idV1 := imageIdentityKey(ref, "sha256:v1", "fp")
 	idV2 := imageIdentityKey(ref, "sha256:v2", "fp")
 
@@ -567,7 +567,7 @@ func TestCacheInvalidateImageRetiresEveryContentOfReference(t *testing.T) {
 // reference clears that retirement so the reverted content warms again.
 func TestCacheRetagThenActivateRevertWarms(t *testing.T) {
 	cc, ff := newTestCache()
-	const ref = "relay-fn-fn-a:v1"
+	const ref = "relay-app-fn-a:v1"
 	idV1 := imageIdentityKey(ref, "sha256:v1", "fp")
 	idV2 := imageIdentityKey(ref, "sha256:v2", "fp")
 
@@ -594,7 +594,7 @@ func TestCacheRetagThenActivateRevertWarms(t *testing.T) {
 
 	// Reverting the content and activating the reference must un-retire v1 so it
 	// warms again.
-	cc.activateFunction("fn-a", ref)
+	cc.activateApp("fn-a", ref)
 	before := ff.count()
 	if err := cc.execute(context.Background(), "fn-a", idV1, 1, ff.start(), "h", []byte(`{}`), nil); err != nil {
 		t.Fatalf("reverted v1: %v", err)

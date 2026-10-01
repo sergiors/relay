@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/source"
 )
 
 // TestPrepareWithFingerprintRuntimeUsesSnapshotIdentity pins the snapshot
-// contract: for a runtime-backed function the image identity is derived from the
+// contract: for a runtime-backed app the image identity is derived from the
 // source snapshot captured within Prepare, NOT taken verbatim from the supplied
 // value. The supplied fingerprint is the caller's pre-build scan; the returned
 // Prepared.Fingerprint and the image tag are the digest over exactly the bytes
@@ -27,9 +27,9 @@ func TestPrepareWithFingerprintRuntimeUsesSnapshotIdentity(t *testing.T) {
 		t.Fatalf("write source: %v", err)
 	}
 	const supplied = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	fn := function.Function{Name: "supplied-fp", Dir: dir, Template: &function.Template{Runtime: "node24"}}
+	fn := app.App{Name: "supplied-fp", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 
-	snapshot, err := function.CaptureSourceSnapshot(mustSelect(t, dir))
+	snapshot, err := app.CaptureSourceSnapshot(mustSelect(t, dir))
 	if err != nil {
 		t.Fatalf("capture reference snapshot: %v", err)
 	}
@@ -70,14 +70,14 @@ func mustSelect(t *testing.T, dir string) *source.Selection {
 
 // TestPrepareWithFingerprintNoRuntimeNeverWalksTree pins the no-runtime half:
 // with a supplied fingerprint Prepare touches no filesystem at all, so it
-// succeeds even when the function directory does not exist. An empty
+// succeeds even when the app directory does not exist. An empty
 // fingerprint still falls back to computing one.
 func TestPrepareWithFingerprintNoRuntimeNeverWalksTree(t *testing.T) {
 	const supplied = "template-only-supplied"
-	fn := function.Function{
+	fn := app.App{
 		Name:     "externals",
 		Dir:      filepath.Join(t.TempDir(), "does-not-exist"),
-		Template: &function.Template{Services: []function.Service{{Image: "nginx:alpine"}}},
+		Template: &app.Template{Services: []app.Service{{Image: "nginx:alpine"}}},
 	}
 	if fn.Template.NeedsRuntime() {
 		t.Fatal("fixture precondition: template must not need a runtime")

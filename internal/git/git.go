@@ -68,7 +68,7 @@ func ErrConfigNotFound() error { return errNoSource }
 // production; Ref defaults to DefaultRef; Path is an optional monorepo subdir
 // (empty = repo root). LastSyncedCommit/LastSyncedAt/Synced are the bookkeeping
 // written by a successful Sync so Status can report when the source last
-// produced /functions.
+// produced /apps.
 type Config struct {
 	Repository       string `json:"repository"`
 	Ref              string `json:"ref"`
@@ -203,7 +203,7 @@ func SetSource(path, repository, ref, monorepoPath, webhookSecretRef string) err
 }
 
 // SyncOptions carries the injectable directories and transport inputs for a
-// Sync. Tests redirect every path away from /var/lib/relay and /functions and
+// Sync. Tests redirect every path away from /var/lib/relay and /apps and
 // drive the transport against a local filesystem path (CloneURL set, Auth nil).
 type SyncOptions struct {
 	// RepositoryURL overrides the configured repository as the remote source.
@@ -228,10 +228,10 @@ type SyncOptions struct {
 	// ConfigPath and CheckoutDir locate the config and checkout. Defaulted by
 	// the CLI to /var/lib/relay/git/... .
 	ConfigPath, CheckoutDir string
-	// FunctionsDir is the root /functions must reflect. The CLI defaults it to
-	// function.Dir; tests always inject a temp dir. Sync never hardcodes
-	// "/functions" internally.
-	FunctionsDir string
+	// AppsDir is the root /apps must reflect. The CLI defaults it to
+	// app.Dir; tests always inject a temp dir. Sync never hardcodes
+	// "/apps" internally.
+	AppsDir string
 	// Log is the caller-injected logger (DI). nil means the package is silent —
 	// it never constructs a fallback logger of its own (that helper was
 	// deliberately removed). It is populated by the background sync path (the

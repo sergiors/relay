@@ -72,15 +72,15 @@ func TestRemoveImageCancelledByManagerLifecycle(t *testing.T) {
 	)
 	m.lifecycle = lifecycle
 
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer lease.Release()
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	rmDone := make(chan error, 1)
-	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 	signal.wait(t)
 
 	// Cancelling the lifecycle (not CloseContext) must abort the blocked removal.
@@ -125,14 +125,14 @@ func TestCloseContextAbortsBlockedRetirementBeforeClientClose(t *testing.T) {
 			onMatch: func() { deleteCalls.Add(1) }},
 	)
 
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	rmDone := make(chan error, 1)
-	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 
 	// The removal owns the retirement gate and is blocked on the held lease.
 	signal.wait(t)
@@ -204,11 +204,11 @@ func TestRemoveImageAfterShutdownRefused(t *testing.T) {
 		t.Fatal("the Docker client was never closed")
 	}
 
-	err := m.RemoveImage(context.Background(), "relay-fn-a:v1")
+	err := m.RemoveImage(context.Background(), "relay-app-a:v1")
 	if !errors.Is(err, ErrManagerShuttingDown) {
 		t.Fatalf("RemoveImage after shutdown = %v, want ErrManagerShuttingDown", err)
 	}
-	if err := m.RemoveImageNow(context.Background(), "relay-fn-a:v1"); !errors.Is(err, ErrManagerShuttingDown) {
+	if err := m.RemoveImageNow(context.Background(), "relay-app-a:v1"); !errors.Is(err, ErrManagerShuttingDown) {
 		t.Fatalf("RemoveImageNow after shutdown = %v, want ErrManagerShuttingDown", err)
 	}
 
@@ -236,14 +236,14 @@ func TestRemoveImageBlockedRetirementJoinedOnShutdown(t *testing.T) {
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]"},
 	)
 
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	rmDone := make(chan error, 1)
-	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { rmDone <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 	signal.wait(t)
 
 	// Close must return even though the lease is STILL held, because shutdown
@@ -290,14 +290,14 @@ func TestCloseContextIdempotentWithInFlightRemoval(t *testing.T) {
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]"},
 	)
 
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer lease.Release()
 
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
-	go func() { _ = m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	signal := signalOnRetirement(m, "relay-app-a:v1")
+	go func() { _ = m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 	signal.wait(t)
 
 	if err := m.CloseContext(context.Background()); err != nil {

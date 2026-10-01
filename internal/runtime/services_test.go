@@ -13,25 +13,25 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
 func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 	got := serviceLabels(ServiceSpec{
-		Function:  "user-events",
+		App:       "user-events",
 		Name:      "api",
 		SourceRef: "service.js",
 		Port:      3000,
-		Image:     "relay-fn-user-events:632aca75fa306911",
+		Image:     "relay-app-user-events:632aca75fa306911",
 	}, "worker-1", 2)
 
 	want := map[string]string{
 		labelType:     ContainerTypeService,
-		labelFunction: "user-events",
+		labelApp:      "user-events",
 		labelService:  "api",
 		labelIdentity: "service.js",
-		labelImage:    "relay-fn-user-events:632aca75fa306911",
+		labelImage:    "relay-app-user-events:632aca75fa306911",
 		labelHostname: "worker-1",
 		labelPort:     "3000",
 		labelReplica:  "2",
@@ -42,7 +42,7 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 		// No spec.Resources -> the default limits' fingerprint (a container
 		// created without explicit resources still carries the effective
 		// default config's hash so discovery can compare it).
-		labelResources: function.DefaultResourceLimits().Fingerprint(),
+		labelResources: app.DefaultResourceLimits().Fingerprint(),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("label count = %d, want %d (%v)", len(got), len(want), got)
@@ -74,7 +74,7 @@ func TestServiceLabelsCarriesServiceIdentityAndOwnership(t *testing.T) {
 // the same entries in a different order are a different effective env.
 func TestServiceLabelsEnvHashPinsEffectiveEnv(t *testing.T) {
 	spec := func(env []string) ServiceSpec {
-		return ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc.js", Port: 80, Image: "img", Env: env}
+		return ServiceSpec{App: "fn", Name: "svc", SourceRef: "svc.js", Port: 80, Image: "img", Env: env}
 	}
 	base := serviceLabels(spec([]string{"A=1", "B=2"}), "h", 0)
 	if base[labelEnvHash] != EnvHash([]string{"A=1", "B=2"}) {
@@ -109,7 +109,7 @@ func TestEnvHashEmptyIsStableAndValueFree(t *testing.T) {
 
 // TestEnvHashDeterministicAcrossProcesses pins the cross-restart determinism the
 // service reconciler depends on: the same effective env must hash to the SAME
-// value every time and every build. The digest is a pure, UNSALTED function of
+// value every time and every build. The digest is a pure, UNSALTED app of
 // the env alone (nothing per-boot is mixed in), so a container labeled before a
 // worker restart still compares equal after it. A salted digest with no
 // persisted key would break that and spuriously replace every service container
@@ -135,7 +135,7 @@ func TestEnvHashDeterministicAcrossProcesses(t *testing.T) {
 func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
-		function    string
+		appName     string
 		serviceName string
 		replica     int
 		wantPrefix  string
@@ -145,7 +145,7 @@ func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 		{"sanitize name", "fn", "my service@v1", 1, "relay-svc-fn-my-service-v1-"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := serviceContainerName(tc.function, tc.serviceName, tc.replica)
+			got := serviceContainerName(tc.appName, tc.serviceName, tc.replica)
 			if len(got) > serviceContainerNameLenCap {
 				t.Fatalf("name length %d exceeds cap %d", len(got), serviceContainerNameLenCap)
 			}
@@ -155,8 +155,8 @@ func TestServiceContainerNameSanitizesAndCaps(t *testing.T) {
 			if !strings.HasSuffix(got, "-"+strconv.Itoa(tc.replica)) {
 				t.Errorf("name = %q, want the -%d replica suffix", got, tc.replica)
 			}
-			if !strings.Contains(got, serviceNameHash(tc.function, tc.serviceName)) {
-				t.Errorf("name = %q, want the name hash %q", got, serviceNameHash(tc.function, tc.serviceName))
+			if !strings.Contains(got, serviceNameHash(tc.appName, tc.serviceName)) {
+				t.Errorf("name = %q, want the name hash %q", got, serviceNameHash(tc.appName, tc.serviceName))
 			}
 		})
 	}
@@ -251,7 +251,7 @@ func TestStartServiceConfirmsRunningBeforeReturn(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0)
@@ -282,7 +282,7 @@ func TestStartServiceNonRunningInspectDiscardsAndFails(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	id, err := m.StartService(context.Background(), ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0)
@@ -315,7 +315,7 @@ func TestStartServiceInspectErrorDiscardsAndFails(t *testing.T) {
 	)
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	if _, err := m.StartService(context.Background(), ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 	}, 0); err == nil {
@@ -344,7 +344,7 @@ func TestStartServiceCreateSendsUniquePhysicalName(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "h"}
 	for i := 0; i < 2; i++ {
 		if _, err := m.StartService(context.Background(), ServiceSpec{
-			Function:  "fn",
+			App:       "fn",
 			Name:      "svc",
 			SourceRef: "service.js", Port: 80, Image: "img", Env: []string{"PORT=80"},
 		}, 0); err != nil {
@@ -456,27 +456,27 @@ func TestServiceEntryTranslatesPerRuntime(t *testing.T) {
 
 // TestSweepSkipsServiceContainers verifies sweepSkips (the decision helper
 // SweepOrphanContainers uses for every container) excludes service containers
-// even though they carry relay.function + relay.hostname and would otherwise be
+// even though they carry relay.app + relay.hostname and would otherwise be
 // Relay-owned — a service must never be swept as an orphan.
 func TestSweepSkipsServiceContainers(t *testing.T) {
-	svc := serviceLabels(ServiceSpec{Function: "f", Name: "svc", SourceRef: "svc", Image: "img"}, "test-host", 0)
+	svc := serviceLabels(ServiceSpec{App: "f", Name: "svc", SourceRef: "svc", Image: "img"}, "test-host", 0)
 	if !sweepSkips(svc) {
 		t.Error("sweepSkips(service labels) = false, want true (services are persistent, reconciler-owned)")
 	}
 	// A typed invocation container (relay.type=event) must NOT be skipped.
-	exec := runLabels(RunMeta{Type: ContainerTypeEvent, Function: "f", Hostname: "test-host"})
+	exec := runLabels(RunMeta{Type: ContainerTypeEvent, App: "f", Hostname: "test-host"})
 	if sweepSkips(exec) {
 		t.Error("sweepSkips(event invocation labels) = true, want false")
 	}
-	// A non-Relay container (no known relay.type, no relay.function) is skipped.
+	// A non-Relay container (no known relay.type, no relay.app) is skipped.
 	if !sweepSkips(map[string]string{"app": "x"}) {
 		t.Error("sweepSkips(non-relay) = false, want true")
 	}
-	// A container carrying relay.function but NO relay.type is strictly NOT
+	// A container carrying relay.app but NO relay.type is strictly NOT
 	// Relay-owned under the new model and must be skipped (backward compat is
 	// not required).
-	if !sweepSkips(map[string]string{labelFunction: "f", labelHostname: "h"}) {
-		t.Error("sweepSkips(relay.function but no relay.type) = false, want true")
+	if !sweepSkips(map[string]string{labelApp: "f", labelHostname: "h"}) {
+		t.Error("sweepSkips(relay.app but no relay.type) = false, want true")
 	}
 }
 
@@ -486,14 +486,14 @@ func TestSweepSkipsServiceContainers(t *testing.T) {
 // non-service container (including one with no labels at all) is excluded safely.
 // The client-call path is exercised without a real Docker daemon.
 func TestServiceContainerListParsing(t *testing.T) {
-	c1Labels := `{"relay.type":"service","relay.function":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
+	c1Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"3000","relay.replica":"2",` +
 		`"relay.env_hash":"0123456789abcdef"}`
-	c2Labels := `{"relay.type":"service","relay.function":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
+	c2Labels := `{"relay.type":"service","relay.app":"fn-a","relay.service":"svcname","relay.identity":"svc.js",` +
 		`"relay.image":"img-a","relay.hostname":"h1","relay.port":"notaport"}`
 	body := `[{"Id":"c1","Labels":` + c1Labels + `},` +
 		`{"Id":"c2","Labels":` + c2Labels + `},` +
-		`{"Id":"c3","Labels":{"relay.type":"event","relay.function":"fn-a"}},` +
+		`{"Id":"c3","Labels":{"relay.type":"event","relay.app":"fn-a"}},` +
 		`{"Id":"c4"}]`
 	cli := newScriptedDockerClient(t, dockerRoute{method: http.MethodGet, path: "/containers/json", body: body})
 	m := &Manager{cli: cli, log: testutil.DiscardLogger()}
@@ -511,7 +511,7 @@ func TestServiceContainerListParsing(t *testing.T) {
 	}
 
 	c1 := byID["c1"]
-	if c1.Function != "fn-a" || c1.Name != "svcname" || c1.SourceRef != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
+	if c1.App != "fn-a" || c1.Name != "svcname" || c1.SourceRef != "svc.js" || c1.Image != "img-a" || c1.Hostname != "h1" {
 		t.Errorf("c1 identity = %+v, want the label-derived name + source", c1)
 	}
 	if c1.Replica != 2 {
@@ -551,18 +551,18 @@ func TestServiceContainerListParsing(t *testing.T) {
 // authoritative relay value.
 func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	spec := ServiceSpec{
-		Function: "user-events",
-		Name:     "svc", SourceRef: "service.js",
+		App:  "user-events",
+		Name: "svc", SourceRef: "service.js",
 		Port:  3000,
-		Image: "relay-fn-user-events:deadbeef",
+		Image: "relay-app-user-events:deadbeef",
 		Labels: map[string]string{
 			"traefik.enable": "true",
 			// Attempted spoof of Relay ownership keys.
-			labelType:     ContainerTypeEvent,
-			labelFunction: "spoofed",
-			labelPort:     "9999",
-			labelEnvHash:  "spoofedhash",
-			"custom.key":  "custom-value",
+			labelType:    ContainerTypeEvent,
+			labelApp:     "spoofed",
+			labelPort:    "9999",
+			labelEnvHash: "spoofedhash",
+			"custom.key": "custom-value",
 		},
 	}
 	got := serviceLabels(spec, "worker-1", 0)
@@ -570,8 +570,8 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 	if got[labelType] != ContainerTypeService {
 		t.Fatalf("relay.type = %q, want %q (ownership must win)", got[labelType], ContainerTypeService)
 	}
-	if got[labelFunction] != "user-events" {
-		t.Fatalf("relay.function = %q, want user-events (ownership must win)", got[labelFunction])
+	if got[labelApp] != "user-events" {
+		t.Fatalf("relay.app = %q, want user-events (ownership must win)", got[labelApp])
 	}
 	if got[labelPort] != "3000" {
 		t.Fatalf("relay.port = %q, want 3000 (ownership must win)", got[labelPort])
@@ -596,7 +596,7 @@ func TestServiceLabelsSpecMergedOwnershipWins(t *testing.T) {
 // relay.resources so the reconciler can detect a resource-only change. It drives
 // the real StartService client path against the scripted daemon.
 func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
-	limits := function.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 250_000_000, PidsLimit: 48}
+	limits := app.ResourceLimits{MemoryBytes: 512 << 20, NanoCPUs: 250_000_000, PidsLimit: 48}
 	for _, tc := range []struct {
 		name string
 		spec ServiceSpec
@@ -604,16 +604,16 @@ func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
 		{
 			name: "entrypoint",
 			spec: ServiceSpec{
-				Function:  "fn",
+				App:       "fn",
 				Name:      "svc",
-				SourceRef: "service.js", Port: 3000, Image: "relay-fn-fn:tag",
+				SourceRef: "service.js", Port: 3000, Image: "relay-app-fn:tag",
 				Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"}, Resources: limits,
 			},
 		},
 		{
 			name: "image",
 			spec: ServiceSpec{
-				Function:  "fn",
+				App:       "fn",
 				Name:      "svc",
 				SourceRef: "ghcr.io/acme/api:1.2", Port: 3000,
 				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: []string{"PORT=3000"}, Resources: limits,
@@ -650,18 +650,18 @@ func TestStartServiceAppliesResourceLimitsForAllSources(t *testing.T) {
 // changes when any resource field changes, and a zero value fingerprints as the
 // defaults so a legacy/unlabeled container is replaced once.
 func TestServiceLabelsResourcesFingerprint(t *testing.T) {
-	spec := func(r function.ResourceLimits) ServiceSpec {
-		return ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc", Image: "img", Port: 80, Resources: r}
+	spec := func(r app.ResourceLimits) ServiceSpec {
+		return ServiceSpec{App: "fn", Name: "svc", SourceRef: "svc", Image: "img", Port: 80, Resources: r}
 	}
-	a := serviceLabels(spec(function.DefaultResourceLimits()), "h", 0)[labelResources]
-	b := serviceLabels(spec(function.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}), "h", 0)[labelResources]
+	a := serviceLabels(spec(app.DefaultResourceLimits()), "h", 0)[labelResources]
+	b := serviceLabels(spec(app.ResourceLimits{MemoryBytes: 64 << 20, NanoCPUs: 1_000_000_000, PidsLimit: 128}), "h", 0)[labelResources]
 	if a == "" || len(a) != serviceIdentityHashLen {
 		t.Fatalf("relay.resources = %q, want %d hex chars", a, serviceIdentityHashLen)
 	}
 	if a == b {
 		t.Fatal("a changed memory limit must change relay.resources")
 	}
-	if serviceLabels(spec(function.ResourceLimits{}), "h", 0)[labelResources] != a {
+	if serviceLabels(spec(app.ResourceLimits{}), "h", 0)[labelResources] != a {
 		t.Fatal("a zero value must fingerprint as the defaults")
 	}
 }
@@ -731,16 +731,16 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 		{
 			name: "entrypoint",
 			spec: ServiceSpec{
-				Function:  "fn",
+				App:       "fn",
 				Name:      "svc",
 				SourceRef: "service.js", Port: 3000,
-				Image: "relay-fn-fn:tag", Entry: []string{"node", "/app/service.js"}, Env: env,
+				Image: "relay-app-fn:tag", Entry: []string{"node", "/app/service.js"}, Env: env,
 			},
 		},
 		{
 			name: "image",
 			spec: ServiceSpec{
-				Function:  "fn",
+				App:       "fn",
 				Name:      "svc",
 				SourceRef: "ghcr.io/acme/api:1.2", Port: 3000,
 				Image: "ghcr.io/acme/api:1.2", ImageID: "sha256:cafe", Env: env,
@@ -775,7 +775,7 @@ func TestStartServiceWritesEffectiveEnvToConfigEnvForAllSources(t *testing.T) {
 // leaves it empty so the image's own ENTRYPOINT/CMD is preserved.
 func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	entry := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 3000,
 		Image: "img", Entry: []string{"node", "/app/service.js"}, Env: []string{"PORT=3000"},
@@ -785,7 +785,7 @@ func TestStartServiceEntryOnlyForEntrypointSource(t *testing.T) {
 	}
 
 	image := decodeCreateConfig(t, captureServiceCreate(t, ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "ghcr.io/acme/api:1.2", Port: 3000, Image: "ghcr.io/acme/api:1.2", Env: []string{"PORT=3000"},
 	}))
@@ -859,7 +859,7 @@ func TestStartServiceNetworkingConfig(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := decodeCreateRequest(t, captureServiceCreate(t, ServiceSpec{
-				Function:  "fn",
+				App:       "fn",
 				Name:      "svc",
 				SourceRef: "service.js", Port: 3000, Image: "img",
 				Env: []string{"PORT=3000"}, Networks: tc.spec,
@@ -936,7 +936,7 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 	m := &Manager{cli: cli, log: testutil.DiscardLogger(), hostname: "test-host"}
 
 	_, err := m.StartService(context.Background(), ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "service.js", Port: 3000, Image: "img",
 		Env: []string{"PORT=3000"}, Networks: []string{"backend"},
@@ -953,13 +953,13 @@ func TestStartServiceDeletedNetworkCreateFailure(t *testing.T) {
 // deduped, and omitted when empty. It also pins that a caller-supplied label can
 // never spoof it.
 func TestServiceLabelsNetworks(t *testing.T) {
-	base := serviceLabels(ServiceSpec{Function: "fn", Name: "svc", SourceRef: "svc", Image: "img"}, "h", 0)
+	base := serviceLabels(ServiceSpec{App: "fn", Name: "svc", SourceRef: "svc", Image: "img"}, "h", 0)
 	if _, ok := base[labelNetworks]; ok {
 		t.Fatalf("no networks must omit relay.networks, got %q", base[labelNetworks])
 	}
 
 	got := serviceLabels(ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "svc", Image: "img", Networks: []string{"proxy"},
 	}, "h", 0)
@@ -968,7 +968,7 @@ func TestServiceLabelsNetworks(t *testing.T) {
 	}
 
 	spoof := serviceLabels(ServiceSpec{
-		Function:  "fn",
+		App:       "fn",
 		Name:      "svc",
 		SourceRef: "svc", Image: "img", Networks: []string{"real"},
 		Labels: map[string]string{labelNetworks: "spoofed"},

@@ -6,16 +6,16 @@ import (
 	"path/filepath"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/state"
 )
 
 // TestFingerprintDiscoveredReusedAcrossStatePhase is the state-phase regression
-// for the worker's startup wiring: each loaded function is hashed exactly once
-// (selectAndFingerprintFunctions), and that single value is persisted by both the
-// fresh-database rebuild and the per-function discovery upsert as the DESIRED
+// for the worker's startup wiring: each loaded app is hashed exactly once
+// (selectAndFingerprintApps), and that single value is persisted by both the
+// fresh-database rebuild and the per-app discovery upsert as the DESIRED
 // fingerprint (no usable active generation exists yet, so the active Fingerprint
 // stays empty). The source is changed after the fingerprint is computed, so a
 // state write that recomputed it would persist the changed digest; the
@@ -23,31 +23,31 @@ import (
 // on the record so Prepare can stage the exact policy the hash came from.
 func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerFunction(t, root, "demo", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "demo", "def handler(e): return 1\n")
 
-	loader := function.NewLoader(root, discardLogger())
+	loader := app.NewLoader(root, discardLogger())
 	fns, err := loader.Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if len(fns) != 1 {
-		t.Fatalf("loaded %d functions, want 1", len(fns))
+		t.Fatalf("loaded %d apps, want 1", len(fns))
 	}
 
-	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	startup := selectAndFingerprintApps(fns, discardLogger())
 	if len(startup) != 1 {
 		t.Fatalf("startup records = %d, want 1", len(startup))
 	}
 	computed := startup[0].Fingerprint
 	if computed == "" {
-		t.Fatal("selectAndFingerprintFunctions returned an empty fingerprint")
+		t.Fatal("selectAndFingerprintApps returned an empty fingerprint")
 	}
 	if startup[0].Selection == nil {
 		t.Fatal("a runtime-backed function must carry its resolved selection")
 	}
 	discovered := discoveredFromStartup(startup)
 	if len(discovered) != 1 {
-		t.Fatalf("discovered %d functions, want 1", len(discovered))
+		t.Fatalf("discovered %d apps, want 1", len(discovered))
 	}
 
 	// Mutate the source after the fingerprint was computed: any recompute now
@@ -55,7 +55,7 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "demo", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
-	changed, err := function.Fingerprint(filepath.Join(root, "demo"))
+	changed, err := app.Fingerprint(filepath.Join(root, "demo"))
 	if err != nil {
 		t.Fatalf("recompute fingerprint: %v", err)
 	}
@@ -71,14 +71,14 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if err := st.RebuildFromFunctions(discovered); err != nil {
-		t.Fatalf("rebuild from functions: %v", err)
+	if err := st.RebuildFromApps(discovered); err != nil {
+		t.Fatalf("rebuild from apps: %v", err)
 	}
 	for _, d := range discovered {
-		st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
+		st.RecordDiscoveredWithFingerprint(d.App, d.Fingerprint)
 	}
 
-	detail, ok := st.GetFunction("demo")
+	detail, ok := st.GetApp("demo")
 	if !ok {
 		t.Fatal("expected demo row")
 	}
@@ -91,26 +91,26 @@ func TestFingerprintDiscoveredReusedAcrossStatePhase(t *testing.T) {
 	}
 }
 
-// TestFingerprintDiscoveredNamespacedByFunction pins that the startup
-// fingerprints can be keyed by function name for the Prepare/reconciler seed
-// without a further scan: each loaded function contributes exactly one entry,
+// TestFingerprintDiscoveredNamespacedByApp pins that the startup
+// fingerprints can be keyed by app name for the Prepare/reconciler seed
+// without a further scan: each loaded app contributes exactly one entry,
 // and the value is the same one the state phase persists.
-func TestFingerprintDiscoveredNamespacedByFunction(t *testing.T) {
+func TestFingerprintDiscoveredNamespacedByApp(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerFunction(t, root, "alpha", "def handler(e): return 1\n")
-	writeWorkerFunction(t, root, "beta", "def handler(e): return 2\n")
+	writeWorkerApp(t, root, "alpha", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "beta", "def handler(e): return 2\n")
 
-	fns, err := function.NewLoader(root, discardLogger()).Load()
+	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	startup := selectAndFingerprintApps(fns, discardLogger())
 	if len(startup) != 2 {
 		t.Fatalf("startup records = %d, want 2", len(startup))
 	}
 	byName := make(map[string]string, len(startup))
 	for _, s := range startup {
-		byName[s.Function.Name] = s.Fingerprint
+		byName[s.App.Name] = s.Fingerprint
 	}
 	for _, name := range []string{"alpha", "beta"} {
 		fp, ok := byName[name]
@@ -124,34 +124,34 @@ func TestFingerprintDiscoveredNamespacedByFunction(t *testing.T) {
 }
 
 // TestDiscoveredFromStartupDropsSelection pins the package boundary: the state
-// phase receives the narrow (function, fingerprint) pair and never sees the
+// phase receives the narrow (app, fingerprint) pair and never sees the
 // filesystem selection, which stays worker-local. The fingerprint is carried
 // verbatim.
 func TestDiscoveredFromStartupDropsSelection(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerFunction(t, root, "demo", "def handler(e): return 1\n")
-	fns, err := function.NewLoader(root, discardLogger()).Load()
+	writeWorkerApp(t, root, "demo", "def handler(e): return 1\n")
+	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	startup := selectAndFingerprintApps(fns, discardLogger())
 	discovered := discoveredFromStartup(startup)
 	if len(discovered) != 1 {
 		t.Fatalf("discovered = %d, want 1", len(discovered))
 	}
-	if discovered[0].Function.Name != "demo" || discovered[0].Fingerprint != startup[0].Fingerprint {
+	if discovered[0].App.Name != "demo" || discovered[0].Fingerprint != startup[0].Fingerprint {
 		t.Fatalf("conversion lost identity: %+v vs %+v", discovered[0], startup[0])
 	}
 }
 
-// TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection pins that a
-// no-runtime function carries a nil selection (it builds no image) while a
+// TestSelectAndFingerprintAppsNoRuntimeYieldsNoSelection pins that a
+// no-runtime app carries a nil selection (it builds no image) while a
 // runtime-backed one carries the selection it hashed.
-func TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection(t *testing.T) {
+func TestSelectAndFingerprintAppsNoRuntimeYieldsNoSelection(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerFunction(t, root, "runtime-fn", "def handler(e): return 1\n")
-	writeWorkerFunction(t, root, "external-fn", "def handler(e): return 1\n")
-	fns, err := function.NewLoader(root, discardLogger()).Load()
+	writeWorkerApp(t, root, "runtime-fn", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "external-fn", "def handler(e): return 1\n")
+	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -161,10 +161,10 @@ func TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection(t *testing.T) {
 			fns[i].Template.Events = nil
 		}
 	}
-	startup := selectAndFingerprintFunctions(fns, discardLogger())
-	byName := make(map[string]startupFunction, len(startup))
+	startup := selectAndFingerprintApps(fns, discardLogger())
+	byName := make(map[string]startupApp, len(startup))
 	for _, s := range startup {
-		byName[s.Function.Name] = s
+		byName[s.App.Name] = s
 	}
 	if ext := byName["external-fn"]; ext.Selection != nil {
 		t.Fatalf("no-runtime function must carry no selection, got %v", ext.Selection)
@@ -182,13 +182,13 @@ func TestSelectAndFingerprintFunctionsNoRuntimeYieldsNoSelection(t *testing.T) {
 // reconciler's audit detects the drift instead.
 func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	root := t.TempDir()
-	writeWorkerFunction(t, root, "runtime-fn", "def handler(e): return 1\n")
+	writeWorkerApp(t, root, "runtime-fn", "def handler(e): return 1\n")
 
-	fns, err := function.NewLoader(root, discardLogger()).Load()
+	fns, err := app.NewLoader(root, discardLogger()).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	startup := selectAndFingerprintFunctions(fns, discardLogger())
+	startup := selectAndFingerprintApps(fns, discardLogger())
 	if len(startup) != 1 {
 		t.Fatalf("startup records = %d, want 1", len(startup))
 	}
@@ -201,7 +201,7 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "runtime-fn", "main.py"), []byte("def handler(e): return 2\n"), 0o644); err != nil {
 		t.Fatalf("rewrite source: %v", err)
 	}
-	onDisk, err := function.FingerprintFunction(filepath.Join(root, "runtime-fn"), startup[0].Function.Template)
+	onDisk, err := app.FingerprintApp(filepath.Join(root, "runtime-fn"), startup[0].App.Template)
 	if err != nil {
 		t.Fatalf("on-disk fingerprint: %v", err)
 	}
@@ -214,11 +214,11 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 		t.Fatalf("state open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	st.RecordDiscovered(startup[0].Function)
+	st.RecordDiscovered(startup[0].App)
 
-	prepareFunctions(context.Background(), spy, startup, st, discardLogger())
+	prepareApps(context.Background(), spy, startup, st, discardLogger())
 
-	detail, ok := st.GetFunction("runtime-fn")
+	detail, ok := st.GetApp("runtime-fn")
 	if !ok {
 		t.Fatal("expected a runtime-fn row")
 	}
@@ -235,19 +235,19 @@ func TestStartupBuiltFingerprintIsReturnedIdentity(t *testing.T) {
 // the reconciler, factored out so it is asserted directly rather than inferred
 // from Run's inline wiring.
 func TestStartupSeedFingerprintsPrefersBuiltIdentity(t *testing.T) {
-	builtFn := function.Function{Name: "built"}
-	unavailFn := function.Function{Name: "unavailable"}
-	noRuntimeFn := function.Function{Name: "no-runtime"}
+	builtFn := app.App{Name: "built"}
+	unavailFn := app.App{Name: "unavailable"}
+	noRuntimeFn := app.App{Name: "no-runtime"}
 
-	prepared := []*runner.PreparedFunction{
-		// A successfully built function: its built identity is authoritative.
+	prepared := []*runner.PreparedApp{
+		// A successfully built app: its built identity is authoritative.
 		runner.NewPrepared(builtFn, &runtime.Prepared{Name: "built", Image: "img-built", Fingerprint: "built-identity"}, nil),
 		// An unavailable build: no prepared handle, so the scan stands.
 		runner.NewUnavailable(unavailFn),
-		// A no-runtime/external-image function: no image identity, scan stands.
+		// A no-runtime/external-image app: no image identity, scan stands.
 		runner.NewPrepared(noRuntimeFn, &runtime.Prepared{Name: "no-runtime", Image: ""}, nil),
 	}
-	functions := []function.Function{builtFn, unavailFn, noRuntimeFn}
+	functions := []app.App{builtFn, unavailFn, noRuntimeFn}
 	fingerprints := map[string]string{
 		"built":       "pre-prepare-scan",
 		"unavailable": "scan-unavail",
@@ -270,9 +270,9 @@ func TestStartupSeedFingerprintsPrefersBuiltIdentity(t *testing.T) {
 	}
 }
 
-// writeWorkerFunction creates root/name/template.yaml and a source file so the
+// writeWorkerApp creates root/name/template.yaml and a source file so the
 // loader and fingerprint have real inputs.
-func writeWorkerFunction(t *testing.T, root, name, source string) {
+func writeWorkerApp(t *testing.T, root, name, source string) {
 	t.Helper()
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

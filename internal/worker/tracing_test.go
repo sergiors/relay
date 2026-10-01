@@ -43,7 +43,7 @@ func TestRunDisabledTracingNoNetworkNoCollector(t *testing.T) {
 
 // TestStartupRootSpanParenting proves the worker's root+child startup span
 // shape through the same Setup + tracing.Start seam Run uses: a relay.startup
-// root with functions.load as its child, and the root's trace id shared with the
+// root with apps.load as its child, and the root's trace id shared with the
 // child. Run's full path is not exercised (it needs Redis/Docker), but the span
 // construction and naming are exactly Run's.
 func TestStartupRootSpanParenting(t *testing.T) {
@@ -62,7 +62,7 @@ func TestStartupRootSpanParenting(t *testing.T) {
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
 
 	startupCtx, root := tracing.Start(context.Background(), "relay.startup")
-	_, child := tracing.Start(startupCtx, "functions.load")
+	_, child := tracing.Start(startupCtx, "apps.load")
 	child.End()
 	root.End()
 	if err := provider.ForceFlush(context.Background()); err != nil {
@@ -78,7 +78,7 @@ func TestStartupRootSpanParenting(t *testing.T) {
 		switch s.Name {
 		case "relay.startup":
 			rootStub = s
-		case "functions.load":
+		case "apps.load":
 			childStub = s
 		}
 	}
@@ -86,7 +86,7 @@ func TestStartupRootSpanParenting(t *testing.T) {
 		t.Fatalf("missing expected spans: %+v", spans)
 	}
 	if childStub.Parent.SpanID() != rootStub.SpanContext.SpanID() {
-		t.Errorf("functions.load parent = %s, want relay.startup %s",
+		t.Errorf("apps.load parent = %s, want relay.startup %s",
 			childStub.Parent.SpanID(), rootStub.SpanContext.SpanID())
 	}
 	if childStub.SpanContext.TraceID() != rootStub.SpanContext.TraceID() {

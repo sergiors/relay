@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/reconciler"
 	"relay/internal/routing"
 	"relay/internal/runtime"
@@ -31,7 +31,7 @@ func newDeadlineBlockingDocker() *deadlineBlockingDocker {
 }
 
 func (d *deadlineBlockingDocker) ResolveServiceImage(
-	context.Context, string, *function.Template, function.Service, string,
+	context.Context, string, *app.Template, app.Service, string,
 ) (runtime.ServiceImage, error) {
 	return runtime.ServiceImage{Ref: "img"}, nil
 }
@@ -57,7 +57,7 @@ func (d *deadlineBlockingDocker) StopServiceContainers(context.Context, []runtim
 	return nil
 }
 
-func (d *deadlineBlockingDocker) RemoveFunctionServiceContainers(context.Context, string) (int, error) {
+func (d *deadlineBlockingDocker) RemoveAppServiceContainers(context.Context, string) (int, error) {
 	return 0, nil
 }
 

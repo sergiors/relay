@@ -9,7 +9,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
@@ -18,7 +18,7 @@ import (
 )
 
 // TestReconcileWithStatusCallbackOrdering pins the focused status-callback
-// contract the reconciler wires for a function that declares services:
+// contract the reconciler wires for an app that declares services:
 //
 //	onReconcileStart -> reconciling (source resolved / convergence beginning)
 //	onComplete(nil)  -> ready (only after the full generation converged)
@@ -29,7 +29,7 @@ import (
 func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 	t.Run("entrypoint service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		entryTmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+		entryTmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -45,7 +45,7 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 
 	t.Run("image service fires reconciling on corrective work", func(t *testing.T) {
 		f := newFakeDocker()
-		imgTmpl := serviceTemplate("", function.Service{Name: "nginx:1.27", Image: "nginx:1.27", Port: 80, Replicas: 1})
+		imgTmpl := serviceTemplate("", app.Service{Name: "nginx:1.27", Image: "nginx:1.27", Port: 80, Replicas: 1})
 
 		var order []string
 		c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -64,15 +64,15 @@ func TestReconcileWithStatusCallbackOrdering(t *testing.T) {
 // focused correction: a fully-converged service pass is a VERIFICATION, not
 // convergence work. It must not fire the reconciling callback, so a periodic
 // no-op tick can never publish a spurious reconciling status for an already-ready
-// function.
+// app.
 func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["id-1"] = &fakeContainer{
-		id: "id-1", function: "fn", entrypoint: "service.js",
+		id: "id-1", appName: "fn", entrypoint: "service.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -91,7 +91,7 @@ func TestReconcileWithStatusNoOpVerificationDoesNotNotifyReconciling(t *testing.
 // fires reconciling exactly once before converging the container.
 func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 	f := newFakeDocker()
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	var reconciling int
 	c := NewServiceReconciler(f, nil, routing.TraefikConfig{}, testutil.DiscardLogger(), testReconcileTimeout)
@@ -114,7 +114,7 @@ func TestReconcileWithStatusCorrectiveStartNotifiesReconciling(t *testing.T) {
 func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 	f := newFakeDocker()
 	f.ctrs["old-1"] = &fakeContainer{
-		id: "old-1", function: "fn", entrypoint: "old.js",
+		id: "old-1", appName: "fn", entrypoint: "old.js",
 		image: "img-1", port: 80, replica: 0, state: container.StateRunning,
 	}
 	tmpl := serviceTemplate("node24") // old.js is no longer desired
@@ -135,7 +135,7 @@ func TestReconcileWithStatusRemovedServiceNotifiesReconciling(t *testing.T) {
 }
 
 // TestReconcileServiceStatusPersistedPreparingReconcilingReady drives the real
-// reconciler over a function with services and pins the persisted lifecycle the
+// reconciler over an app with services and pins the persisted lifecycle the
 // worker exposes: preparing (written before the current generation's work),
 // reconciling (at the convergence seam), and ready (after onComplete). It wires
 // status callbacks the production worker wires and asserts the persisted status
@@ -144,7 +144,7 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-persist")
 	tmpl := mustParse(servicesTemplate)
-	baseFn := function.Function{Name: "svc-persist", Dir: dir, Template: tmpl}
+	baseFn := app.App{Name: "svc-persist", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -157,20 +157,20 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	// bypassed by changing content below).
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-svc-persist"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	var seen []string
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			// The reconciler wrote preparing before dispatching. Record the
 			// persisted state at the convergence seam and at completion.
 			onReconcileStart()
-			if d, ok := st.GetFunction(name); ok {
+			if d, ok := st.GetApp(name); ok {
 				seen = append(seen, d.Status)
 			}
 			onComplete(nil)
-			if d, ok := st.GetFunction(name); ok {
+			if d, ok := st.GetApp(name); ok {
 				seen = append(seen, d.Status)
 			}
 		},
@@ -181,12 +181,12 @@ func TestReconcileServiceStatusPersistedPreparingReconcilingReady(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction("svc-persist")
+	r.reconcileApp("svc-persist")
 
 	if len(seen) != 2 || seen[0] != state.StatusReconciling || seen[1] != state.StatusReady {
 		t.Fatalf("persisted status at seams = %v, want [reconciling ready]", seen)
 	}
-	final, _ := st.GetFunction("svc-persist")
+	final, _ := st.GetApp("svc-persist")
 	if final.Status != state.StatusReady {
 		t.Fatalf("final status = %q, want ready", final.Status)
 	}
@@ -200,7 +200,7 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-fail")
 	tmpl := mustParse(servicesTemplate)
-	baseFn := function.Function{Name: "svc-fail", Dir: dir, Template: tmpl}
+	baseFn := app.App{Name: "svc-fail", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -211,11 +211,11 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-svc-fail"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			onReconcileStart()
 			onComplete(errServiceConverge)
 		},
@@ -225,9 +225,9 @@ func TestReconcileServiceFailureStatusRetainsGeneration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction("svc-fail")
+	r.reconcileApp("svc-fail")
 
-	final, ok := st.GetFunction("svc-fail")
+	final, ok := st.GetApp("svc-fail")
 	if !ok {
 		t.Fatal("expected svc-fail row")
 	}
@@ -247,7 +247,7 @@ type boomError struct{ msg string }
 func (e *boomError) Error() string { return e.msg }
 
 // TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus pins the
-// generation guard: when a newer reconcile of the same function has begun, a
+// generation guard: when a newer reconcile of the same app has begun, a
 // stale in-flight generation's completion callback (success or failure) must be
 // a no-op, so a slow service convergence from an older desired state can never
 // resurrect an outdated ready/degraded status over the newer generation's
@@ -257,7 +257,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	root := t.TempDir()
 	dir := writeServicesDir(t, root, "svc-gen")
 	tmpl := mustParse(servicesTemplate)
-	baseFn := function.Function{Name: "svc-gen", Dir: dir, Template: tmpl}
+	baseFn := app.App{Name: "svc-gen", Dir: dir, Template: tmpl}
 
 	st, err := state.Open(filepath.Join(t.TempDir(), "db.sqlite3"))
 	if err != nil {
@@ -268,7 +268,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 
 	pf := runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})
 	reg := &runner.Registry{}
-	reg.Set([]*runner.PreparedFunction{pf})
+	reg.Set([]*runner.PreparedApp{pf})
 
 	type completion struct {
 		onBegin  func()
@@ -277,7 +277,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	var completions []completion
 	r := New(Config{
 		Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st,
-		UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+		UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 			completions = append(completions, completion{onBegin: onReconcileStart, onFinish: onComplete})
 		},
 	}, reg, &fakeBuilder{}, testutil.DiscardLogger())
@@ -287,13 +287,13 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v2'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v2: %v", err)
 	}
-	r.reconcileFunction("svc-gen")
+	r.reconcileApp("svc-gen")
 
 	// Generation 2: another content change begins before generation 1 completes.
 	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v3'); }\n"), 0o644); err != nil {
 		t.Fatalf("write v3: %v", err)
 	}
-	r.reconcileFunction("svc-gen")
+	r.reconcileApp("svc-gen")
 
 	if len(completions) != 2 {
 		t.Fatalf("captured %d completions, want 2", len(completions))
@@ -308,7 +308,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 	completions[1].onBegin()
 	completions[1].onFinish(errServiceConverge)
 
-	final, _ := st.GetFunction("svc-gen")
+	final, _ := st.GetApp("svc-gen")
 	if final.Status != state.StatusDegraded {
 		t.Fatalf("status = %q, want degraded (stale success must not overwrite the newer failure)", final.Status)
 	}
@@ -325,10 +325,10 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 
 		var cs []completion
 		reg2 := &runner.Registry{}
-		reg2.Set([]*runner.PreparedFunction{runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})})
+		reg2.Set([]*runner.PreparedApp{runner.NewPrepared(baseFn, &runtime.Prepared{Name: baseFn.Name, Image: "img-gen"}, &fakeBuilder{})})
 		r2 := New(Config{
 			Root: root, Debounce: 10 * time.Millisecond, Interval: time.Hour, State: st2,
-			UpdateServicesWithStatus: func(name string, _ *function.Template, image string, onReconcileStart func(), onComplete func(error)) {
+			UpdateServicesWithStatus: func(name string, _ *app.Template, image string, onReconcileStart func(), onComplete func(error)) {
 				cs = append(cs, completion{onBegin: onReconcileStart, onFinish: onComplete})
 			},
 		}, reg2, &fakeBuilder{}, testutil.DiscardLogger())
@@ -337,11 +337,11 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v4'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v4: %v", err)
 		}
-		r2.reconcileFunction("svc-gen")
+		r2.reconcileApp("svc-gen")
 		if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("export function hi(e){ console.log('v5'); }\n"), 0o644); err != nil {
 			t.Fatalf("write v5: %v", err)
 		}
-		r2.reconcileFunction("svc-gen")
+		r2.reconcileApp("svc-gen")
 		if len(cs) != 2 {
 			t.Fatalf("captured %d completions, want 2", len(cs))
 		}
@@ -350,7 +350,7 @@ func TestReconcileStaleGenerationCompletionCannotOverwriteNewerStatus(t *testing
 		cs[0].onBegin()     // stale generation begins...
 		cs[0].onFinish(errServiceConverge)
 
-		got, _ := st2.GetFunction("svc-gen")
+		got, _ := st2.GetApp("svc-gen")
 		if got.Status != state.StatusReady {
 			t.Fatalf("status = %q, want ready (stale failure must not overwrite the newer success)", got.Status)
 		}

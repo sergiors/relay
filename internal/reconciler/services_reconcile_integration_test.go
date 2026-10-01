@@ -1,8 +1,8 @@
 //go:build integration
 
 // This file drives the service reconciler end to end through the reconciler's
-// unexported reconcileFunction against a real Docker daemon: it creates a temp
-// function dir with a services template, builds/reconciles 2 replicas, scales to
+// unexported reconcileApp against a real Docker daemon: it creates a temp
+// app dir with a services template, builds/reconciles 2 replicas, scales to
 // 1, then removes the dir and asserts 0 containers + the image is removed. It
 // mirrors reconciler_integration_test.go's dockerManagerAdapter pattern.
 package reconciler
@@ -22,14 +22,14 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runner"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
 )
 
-// TestServicesReconcileIntegration reconciles a function's services end to end.
+// TestServicesReconcileIntegration reconciles an app's services end to end.
 func TestServicesReconcileIntegration(t *testing.T) {
 	testutil.RequireDocker(t)
 
@@ -45,10 +45,10 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	// Manager is both the reconcile Builder and the services Docker seam.
 	adapter := dockerManagerAdapter{m}
 
-	// Write a node function dir that declares one service (port 3000). The name
+	// Write a node app dir that declares one service (port 3000). The name
 	// is derived from the test name + a nanosecond stamp so concurrent runs on
-	// one daemon do not collide on function, container, or image names;
-	// testutil.UniqueName keeps it within function.ValidName's 63-char cap even
+	// one daemon do not collide on app, container, or image names;
+	// testutil.UniqueName keeps it within app.ValidName's 63-char cap even
 	// for a long test name.
 	name := testutil.UniqueName(t, "svc-rec")
 	dir := filepath.Join(root, name)
@@ -68,8 +68,8 @@ func TestServicesReconcileIntegration(t *testing.T) {
 		t.Fatalf("write service: %v", err)
 	}
 
-	// Cleanup: stop every service container belonging to this function and remove
-	// every relay-fn-<name>:* image this test builds.
+	// Cleanup: stop every service container belonging to this app and remove
+	// every relay-app-<name>:* image this test builds.
 	cleanupCli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		t.Fatalf("cleanup client: %v", err)
@@ -87,7 +87,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-"+name+":") {
+				if strings.HasPrefix(tag, "relay-app-"+name+":") {
 					_, _ = cleanupCli.ImageRemove(cc, tag, client.ImageRemoveOptions{Force: true})
 					break
 				}
@@ -108,7 +108,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 			Root:     root,
 			Debounce: 20 * time.Millisecond,
 			Interval: time.Hour,
-			UpdateServices: func(fnName string, tmpl *function.Template, image string) {
+			UpdateServices: func(fnName string, tmpl *app.Template, image string) {
 				ctx := context.Background()
 				svcCtrl.Apply(ctx, fnName, tmpl, image, nil)
 			},
@@ -122,7 +122,7 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	)
 
 	// a) Discover + prepare; reconcile starts 2 running service replicas.
-	rec.reconcileFunction(name)
+	rec.reconcileApp(name)
 	if pf := reg.GetByName(name); pf == nil || pf.Prepared() == nil {
 		t.Fatal("function should be discovered and prepared")
 	}
@@ -132,17 +132,17 @@ func TestServicesReconcileIntegration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "template.yaml"), []byte(serviceReconcileTemplate(3000, 1)), 0o644); err != nil {
 		t.Fatalf("write scaled template: %v", err)
 	}
-	rec.reconcileFunction(name)
+	rec.reconcileApp(name)
 	assertServiceCounts(t, m, name, 1)
 
-	// c) Remove the dir; reconcile drops the function and the RemoveServices
+	// c) Remove the dir; reconcile drops the app and the RemoveServices
 	// hook stops+removes its service containers. The images would then be
-	// retired by the worker's RemoveFunction hook (not wired here), so this test
+	// retired by the worker's RemoveApp hook (not wired here), so this test
 	// asserts the container side converges to zero.
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove dir: %v", err)
 	}
-	rec.reconcileFunction(name)
+	rec.reconcileApp(name)
 	if reg.GetByName(name) != nil {
 		t.Fatal("function should be removed from the registry")
 	}
@@ -197,7 +197,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 		if c, err := m.ServiceContainerList(cc); err == nil {
 			var own []runtime.ServiceContainer
 			for _, ct := range c {
-				if ct.Function == name {
+				if ct.App == name {
 					own = append(own, ct)
 				}
 			}
@@ -209,7 +209,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 		}
 		for _, img := range imgs.Items {
 			for _, tag := range img.RepoTags {
-				if strings.HasPrefix(tag, "relay-fn-"+name+":") {
+				if strings.HasPrefix(tag, "relay-app-"+name+":") {
 					_, _ = cli.ImageRemove(cc, tag, client.ImageRemoveOptions{Force: true})
 					break
 				}
@@ -221,12 +221,12 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 	reg.Set(nil)
 	svcCtrl := NewServiceReconciler(m, nil, routing.TraefikConfig{}, logger, testReconcileTimeout)
 
-	// apply builds/prepares the function (through the adapter) and converges its
+	// apply builds/prepares the app (through the adapter) and converges its
 	// service containers, so each pass observes the current template's env.
 	rec := New(
 		Config{
 			Root: root, Debounce: 20 * time.Millisecond, Interval: time.Hour,
-			UpdateServices: func(fnName string, tmpl *function.Template, image string) {
+			UpdateServices: func(fnName string, tmpl *app.Template, image string) {
 				ctx := context.Background()
 				svcCtrl.Apply(ctx, fnName, tmpl, image, nil)
 			},
@@ -237,7 +237,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 		reg, dockerManagerAdapter{m}, logger,
 	)
 
-	rec.reconcileFunction(name)
+	rec.reconcileApp(name)
 	assertServiceCounts(t, m, name, 1)
 
 	// Find the running container and capture its id + env.
@@ -248,7 +248,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 			t.Fatalf("list: %v", err)
 		}
 		for _, c := range list {
-			if c.Function != name || c.State != container.StateRunning {
+			if c.App != name || c.State != container.StateRunning {
 				continue
 			}
 			insp, err := cli.ContainerInspect(context.Background(), c.ID, client.ContainerInspectOptions{})
@@ -271,7 +271,7 @@ func TestServicesReconcileEnvChangeReplacesContainer(t *testing.T) {
 
 	// Change only the template env value; re-reconcile.
 	writeTemplate("v2")
-	rec.reconcileFunction(name)
+	rec.reconcileApp(name)
 	assertServiceCounts(t, m, name, 1)
 
 	secondID, secondEnv, secondHash := findContainer()
@@ -311,7 +311,7 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 		n := 0
 		allRunning := true
 		for _, c := range list {
-			if c.Function == name {
+			if c.App == name {
 				if c.State != container.StateRunning {
 					allRunning = false
 				}
@@ -326,7 +326,7 @@ func assertServiceCounts(t *testing.T, m *runtime.Manager, name string, want int
 	list, _ := m.ServiceContainerList(context.Background())
 	got := 0
 	for _, c := range list {
-		if c.Function == name {
+		if c.App == name {
 			got++
 		}
 	}
@@ -344,7 +344,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 
 	var buf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	// Derive per-run worker identities and function names so concurrent runs on
+	// Derive per-run worker identities and app names so concurrent runs on
 	// one daemon cannot collide on the hostname-scoped container set.
 	stamp := time.Now().UnixNano()
 	w1host, w2host := fmt.Sprintf("relay-it-w1-%d", stamp), fmt.Sprintf("relay-it-w2-%d", stamp)
@@ -359,7 +359,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	}
 	defer m2.Close()
 
-	// Start one persistent service container per worker (distinct functions, a
+	// Start one persistent service container per worker (distinct apps, a
 	// long-lived sleep under the shared node:24-alpine image). Unrelated
 	// non-Relay containers cannot appear in ServiceContainerList structurally
 	// (the strict relay.type=service filter), so hostname preservation is the
@@ -373,8 +373,8 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	// unchanged.
 	stopResponsive := []string{"node", "-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);"}
 	id1, err := m1.StartService(context.Background(), runtime.ServiceSpec{
-		Function: fn1,
-		Name:     "svc.js", SourceRef: "svc.js",
+		App:  fn1,
+		Name: "svc.js", SourceRef: "svc.js",
 		Port:  80,
 		Image: "node:24-alpine",
 		Entry: stopResponsive,
@@ -383,8 +383,8 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 		t.Fatalf("start w1 service: %v", err)
 	}
 	id2, err := m2.StartService(context.Background(), runtime.ServiceSpec{
-		Function: fn2,
-		Name:     "svc.js", SourceRef: "svc.js",
+		App:  fn2,
+		Name: "svc.js", SourceRef: "svc.js",
 		Port:  80,
 		Image: "node:24-alpine",
 		Entry: stopResponsive,
@@ -394,7 +394,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 	}
 
 	// Cleanup: stop whatever this test left running on either manager, scoped to
-	// this run's derived function names.
+	// this run's derived app names.
 	t.Cleanup(func() {
 		cc, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -402,7 +402,7 @@ func TestIntegrationShutdownCleanupHostnameScoped(t *testing.T) {
 			if list, err := m.ServiceContainerList(cc); err == nil {
 				keep := list[:0]
 				for _, c := range list {
-					if c.Function == fn1 || c.Function == fn2 {
+					if c.App == fn1 || c.App == fn2 {
 						keep = append(keep, c)
 					}
 				}

@@ -9,15 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
-// dependencyRefForTest computes the dependency image reference a function's
+// dependencyRefForTest computes the dependency image reference an app's
 // current manifest set resolves to, using the exact production helpers Prepare
 // uses (lookup -> engine Plan -> DependencyFingerprint -> depImageRef). It is the
 // non-integration twin of integration_helpers_test.go's expectedDependencyRef, so
 // this race test can name the shared dependency image deterministically.
-func dependencyRefForTest(t *testing.T, fn function.Function) string {
+func dependencyRefForTest(t *testing.T, fn app.App) string {
 	t.Helper()
 	spec, err := lookup(fn.Template.Runtime)
 	if err != nil {
@@ -84,9 +84,9 @@ func (g *raceGate) parked(req *http.Request) {
 // TestPrepareDependencyLeaseSpansBuildVsGC is the deterministic proof of the
 // "dependency GC vs active build" race. Manager.Prepare admits the dependency
 // image lease BEFORE the dependency's existence probe and holds it through the
-// ACTUAL dependency image build (and the function image build that consumes the
+// ACTUAL dependency image build (and the app image build that consumes the
 // layer via FROM). The test parks Prepare at each real daemon boundary — the
-// dependency ImageInspect, the dependency /build, and the function /build — and
+// dependency ImageInspect, the dependency /build, and the app /build — and
 // at each boundary runs CleanupUnusedDependencies with an inventory that names the
 // dependency as an unreferenced candidate. The GC must never issue the dependency
 // DELETE while the lease is held; once Prepare returns and releases the lease, the
@@ -100,13 +100,13 @@ func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 	writeRaceSource(t, dir, "handler.py", "def run(event):\n    print('ok')\n")
 	writeRaceSource(t, dir, "requirements.txt", "six==1.16.0\n")
 
-	fn := function.Function{
+	fn := app.App{
 		Name:     "dep-race",
 		Dir:      dir,
-		Template: &function.Template{Runtime: "python3.14"},
+		Template: &app.Template{Runtime: "python3.14"},
 	}
 
-	fp, err := function.Fingerprint(dir)
+	fp, err := app.Fingerprint(dir)
 	if err != nil {
 		t.Fatalf("function fingerprint: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 	//   depInspect — the dependency's existence probe (after the dep lease is
 	//                admitted, before any dependency use);
 	//   depBuild   — the actual dependency image build (POST /build t=<depRef>);
-	//   fnBuild    — the function image build that consumes the layer via FROM.
+	//   fnBuild    — the app image build that consumes the layer via FROM.
 	depInspect := newRaceGate()
 	depBuild := newRaceGate()
 	fnBuild := newRaceGate()
@@ -143,10 +143,10 @@ func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 				depInspect.parked(req)
 			},
 		},
-		// The function image is absent, forcing the build path.
+		// The app image is absent, forcing the build path.
 		dockerRoute{method: http.MethodGet, path: "/images/", status: http.StatusNotFound, body: `{"message":"no such image"}`},
 		// A single build route dispatching on the tag query: the dependency build
-		// parks on depBuild, the function build on fnBuild.
+		// parks on depBuild, the app build on fnBuild.
 		dockerRoute{
 			method: http.MethodPost, path: "/build",
 			body: `{"stream":"ok"}`,
@@ -208,11 +208,11 @@ func TestPrepareDependencyLeaseSpansBuildVsGC(t *testing.T) {
 	depBuild.wait(t, "dependency image build")
 	assertGCKeepsLeasedDependency("during dependency build")
 
-	// Let the dependency build finish; the function image build (FROM depRef)
+	// Let the dependency build finish; the app image build (FROM depRef)
 	// starts next.
 	depBuild.releaseAll()
 
-	// Boundary 3: the function image build consuming the dependency via FROM.
+	// Boundary 3: the app image build consuming the dependency via FROM.
 	fnBuild.wait(t, "function image build")
 	assertGCKeepsLeasedDependency("during function image build consuming the dependency")
 

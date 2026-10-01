@@ -1,5 +1,5 @@
 // Package python is the Python runtime engine. It holds the language-specific
-// preparation knowledge for Python functions: the embedded bootstrap, the
+// preparation knowledge for Python apps: the embedded bootstrap, the
 // dependency handling (requirements.txt and native uv projects), and the
 // container entrypoint. It does NOT run docker build or generate Dockerfiles; it
 // produces a generic runtime.BuildPlan that the Docker builder renders.
@@ -71,11 +71,11 @@ const (
 	// interface. --no-cache keeps the layer small.
 	requirementsInstall = "uv pip install --system --no-cache -r " + requirementsFile
 
-	// otelInstall installs the managed OpenTelemetry API into the function
+	// otelInstall installs the managed OpenTelemetry API into the app
 	// image's system site-packages (the same environment the bootstrap and any
 	// user-installed SDK resolve from). The spec is single-quoted because the
 	// version range's < and > are shell redirection operators. It runs in the
-	// function image (not the shared dependency layer) so it never enters the
+	// app image (not the shared dependency layer) so it never enters the
 	// content-addressed dependency fingerprint; being a build Install command,
 	// it is covered by the relay.bootstrap label, so images pick it up on the
 	// next reconcile.
@@ -86,7 +86,7 @@ const (
 	// uv.lock is up to date and fails the build if it is not, `--no-dev` drops
 	// development groups, and `--no-emit-project` excludes the project itself
 	// (Relay only installs the project's dependencies into the base layer; the
-	// function's own source is copied by the function image). The export goes to
+	// app's own source is copied by the app image). The export goes to
 	// a file (not a pipe) and is chained with && so an export failure aborts the
 	// build instead of silently installing an empty set.
 	nativeInstall = "uv export --locked --no-dev --no-emit-project -o " + exportedRequirements +
@@ -95,7 +95,7 @@ const (
 )
 
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
-// Relay function so the container never runs as root and the identity is stable
+// Relay app so the container never runs as root and the identity is stable
 // across images and rebuilds; the numeric id is what the kernel enforces, so the
 // user/group name is cosmetic. python:3.14-slim (Debian) has no pre-created user,
 // so the Dockerfile creates one at build time via UserSetup.
@@ -109,7 +109,7 @@ const (
 	noBytecodeEnv = "PYTHONDONTWRITEBYTECODE=1"
 )
 
-// Plan returns the generic build plan for a Python function. It only inspects
+// Plan returns the generic build plan for a Python app. It only inspects
 // fnDir (for the dependency manifests) and never writes into it.
 //
 // Dependency detection is deterministic:
@@ -127,7 +127,7 @@ const (
 //     deterministically. Commit the lock (or use requirements.txt).
 //   - none: no dependency layer.
 //
-// handlers is the function's handler MODULE parts, an input only the Node engine
+// handlers is the app's handler MODULE parts, an input only the Node engine
 // needs (to transpile TypeScript at build time). Python handlers are resolved by
 // the runtime bootstrap exactly as before, so the list is intentionally unused
 // here; the parameter exists so both engines share one Plan signature.
@@ -143,14 +143,14 @@ func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, er
 		return plan.BuildPlan{}, err
 	}
 
-	// The managed OpenTelemetry API is installed in the FUNCTION image (not the
+	// The managed OpenTelemetry API is installed in the APP image (not the
 	// shared dependency layer): it must be present in every runtime even when
-	// the function declares no dependencies, and keeping it out of Deps leaves
+	// the app declares no dependencies, and keeping it out of Deps leaves
 	// the content-addressed dependency fingerprint untouched. It runs after the
 	// dependency image's FROM has already provided the user's packages, so a
 	// user SDK that pinned its own matching API is not disturbed (see
-	// otelAPIFloor). uv is available: the no-deps function image copies it as a
-	// tool, and a deps function image inherits it from the dependency base.
+	// otelAPIFloor). uv is available: the no-deps app image copies it as a
+	// tool, and a deps app image inherits it from the dependency base.
 	return plan.BuildPlan{
 		BaseImage:  spec.BaseImage,
 		WorkDir:    workDir,
@@ -166,7 +166,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, er
 }
 
 // dependencyPlan resolves fnDir's dependency manifests into a Deps value (zero
-// when the function declares none) or a detection error. It is split out so the
+// when the app declares none) or a detection error. It is split out so the
 // detection rules above are readable in one place and unit-testable without a
 // plan.Spec.
 func dependencyPlan(fnDir string) (plan.Deps, error) {
@@ -200,7 +200,7 @@ func dependencyPlan(fnDir string) (plan.Deps, error) {
 	case hasRequirements:
 		// Requirements-only remains valid, including alongside an unrelated
 		// pyproject.toml (e.g. tool configuration), which is left to the
-		// function's source.
+		// app's source.
 		return plan.Deps{
 			Files:   []string{requirementsFile},
 			Install: requirementsInstall,

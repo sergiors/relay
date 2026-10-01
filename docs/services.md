@@ -7,7 +7,7 @@ event/schedule invocations that exit after one request.
 ## Source model
 
 Every service declares a **mandatory `name`** — its stable identity within the
-function — and **exactly one source**:
+app — and **exactly one source**:
 
 ```yaml
 runtime: node24
@@ -26,8 +26,8 @@ services:
 
 `name` is the service's identity: it keys the container grouping, the Traefik
 router/service id, and the persisted snapshot. It follows the same conservative
-rule as a function name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no trailing `.`) and
-must be unique among the function's services. Two services **may** share the
+rule as an app name (`[a-z0-9][a-z0-9._-]*`, ≤ 63 chars, no trailing `.`) and
+must be unique among the app's services. Two services **may** share the
 same source — they are distinct services running the same implementation. A
 changed source under the same name is the same logical service: it replaces the
 same replica slots (start-before-stop), so it is **not** a removal plus an
@@ -45,7 +45,7 @@ Convergence below).
   registry when the image is missing locally or the hourly freshness window has
   elapsed; the image's own `ENTRYPOINT`/`CMD` are preserved. An `image` service
   does not need a `runtime`. **Relay never removes external images** — cleanup
-  only ever touches its own `relay-fn-*` / `relay-dep-*` namespaces.
+  only ever touches its own `relay-app-*` / `relay-dep-*` namespaces.
 
 ## Port, host, path, replicas
 
@@ -102,12 +102,12 @@ container is left untouched.
 Both source kinds share **one cohesive reconciler and lifecycle**; the only
 difference is how the desired image is resolved:
 
-- an `entrypoint` service runs the function image prepared exactly as for
+- an `entrypoint` service runs the app image prepared exactly as for
   invocations, with its entrypoint overridden per container;
 - an `image` service runs the external reference (inspected locally, pulled when
   due).
 
-At startup and on every reconcile of the owning function (including the periodic
+At startup and on every reconcile of the owning app (including the periodic
 pass, default every 30s), Relay lists its service containers and converges them
 to the template.
 
@@ -148,15 +148,15 @@ to the template.
 - A replica whose process exits (a crash) is recreated on the next reconcile, so
   a service self-heals within the periodic cadence — no event-style
   retry/DLQ semantics.
-- Removing a service, or its whole function, stops and removes its containers.
-  Relay then retires obsolete `relay-fn-<name>` images, but only after no active
+- Removing a service, or its whole app, stops and removes its containers.
+  Relay then retires obsolete `relay-app-<name>` images, but only after no active
   container references them, and ordered after service convergence. Image
   removal is never forced.
 - On graceful shutdown, Relay stops and removes the service containers owned by
   that worker (scoped by `relay.hostname`); containers left by a crashed process
   are swept at the next startup.
 
-Changes to a function's services are serialized per function and only the latest
+Changes to an app's services are serialized per app and only the latest
 desired state is applied. A pass that a newer desired state superseded (a live
 reload, or a periodic self-heal arriving mid-pass) does not stop the old
 generation it was about to replace: it removes only the replacement containers it
@@ -165,19 +165,19 @@ always finds a usable generation to replace. The coalesced newer request then
 converges and commits the replacement.
 
 **External image freshness:** for an `image` service Relay checks the registry
-**at most once per hour per independent source** (per function + image
+**at most once per hour per independent source** (per app + image
 reference). A successful remote check is recorded in memory; the window is not
 persisted, and changing the configured source reference is checked immediately.
 A failed check does not advance the window, so it retries at the next reconcile.
 
 Containers are identified by deterministic Relay-owned labels
-(`relay.type=service`, `relay.function`, `relay.service`, `relay.identity`, plus
+(`relay.type=service`, `relay.app`, `relay.service`, `relay.identity`, plus
 image content id, port, replica slot, `relay.env_hash`, `relay.resources`,
 `relay.networks`), never by name alone. `relay.service` is the service's stable
 name (the grouping key); `relay.identity` is its configured source descriptor,
 used only to resolve the image/entry command and to detect a changed
 implementation. Service containers carry no `relay.handler` label. The Docker
-container name is greppable and derived from the function/name/replica, but
+container name is greppable and derived from the app/name/replica, but
 carries a per-start uniqueness token so a replacement can be created while the
 container it replaces is still running; ownership, grouping, and the replica slot
 always come from the labels.
@@ -223,10 +223,10 @@ Requirements:
   per-service.
 
 `<id>` is a deterministic Traefik-safe router/service id derived from the
-function name + **service name** (never the host, path, or source):
-`relay-<function>-<name>-<hash>`, sanitized to `[a-z0-9-]`, capped at 100
+app name + **service name** (never the host, path, or source):
+`relay-<app>-<name>-<hash>`, sanitized to `[a-z0-9-]`, capped at 100
 characters, where `<hash>` is a 64-bit suffix hashed from the full untruncated
-function and service name. Stable ids mean reconciliation produces stable labels
+app and service name. Stable ids mean reconciliation produces stable labels
 and a source change under the same name keeps the same route.
 
 Changing `host`, `path`, `port`, or any routing value makes the running container

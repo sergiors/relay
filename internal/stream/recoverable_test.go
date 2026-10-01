@@ -53,7 +53,7 @@ func TestProcessMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T) {
 	rec := withSpanRecorder(t)
 	occ := schedule.Occurrence{
-		Function:    "courses",
+		App:         "courses",
 		Schedule:    "cleanup",
 		Handler:     "jobs.cleanup.handler",
 		ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC),

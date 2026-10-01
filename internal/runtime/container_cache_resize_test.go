@@ -78,7 +78,7 @@ func TestPoolResizeIncreaseUpdatesAdmissionLazily(t *testing.T) {
 		t.Fatalf("seed creations = %d, want 1", before)
 	}
 
-	cc.setFunctionConcurrency("fn-a", 3)
+	cc.setAppConcurrency("fn-a", 3)
 
 	// Lazy: no container is created by the resize itself.
 	if got := ff.count(); got != before {
@@ -138,7 +138,7 @@ func TestPoolResizeIncreaseWakesWaiter(t *testing.T) {
 	case <-time.After(80 * time.Millisecond):
 	}
 
-	cc.setFunctionConcurrency("fn-a", 2)
+	cc.setAppConcurrency("fn-a", 2)
 
 	select {
 	case l := <-waiter:
@@ -167,7 +167,7 @@ func TestPoolResizeDecreaseRetiresExcessIdle(t *testing.T) {
 		t.Fatalf("idle before shrink = %d, want 3", got)
 	}
 
-	cc.setFunctionConcurrency("fn-a", 1)
+	cc.setAppConcurrency("fn-a", 1)
 
 	counts := discardReasons(ff)
 	if counts[reasonConcurrencyShrink] != 2 {
@@ -192,7 +192,7 @@ func TestPoolResizeDecreaseNeverKillsBusyAndConvergesOnRelease(t *testing.T) {
 	cc, ff, reg := newMetricsCache()
 	leases := acquireN(t, cc, ff, "fn-a", "img-1", 3, 3)
 
-	cc.setFunctionConcurrency("fn-a", 1)
+	cc.setAppConcurrency("fn-a", 1)
 
 	if got := discardReasons(ff)[reasonConcurrencyShrink]; got != 0 {
 		t.Fatalf("busy containers were discarded on shrink: %d", got)
@@ -230,7 +230,7 @@ func TestPoolResizeDecreaseBoundsAcquisition(t *testing.T) {
 	cc, ff := newTestCache()
 	lease := acquireN(t, cc, ff, "fn-a", "img-1", 1, 1)
 	lease[0].release() // one idle
-	cc.setFunctionConcurrency("fn-a", 1)
+	cc.setAppConcurrency("fn-a", 1)
 
 	busy := acquireN(t, cc, ff, "fn-a", "img-1", 1, 1)
 	_ = busy
@@ -251,7 +251,7 @@ func TestPoolResizeNoOpKeepsPoolUnchanged(t *testing.T) {
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 2, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	cc.setFunctionConcurrency("fn-a", 2)
+	cc.setAppConcurrency("fn-a", 2)
 	if got := discardReasons(ff)[reasonConcurrencyShrink]; got != 0 {
 		t.Fatalf("no-op resize discarded %d containers", got)
 	}
@@ -299,7 +299,7 @@ func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
 
 	// Concurrency shrinks 3 -> 2: used is busy(1)+idle(2)=3, so exactly one excess
 	// idle container is retired now (the busy one is never killed).
-	cc.setFunctionConcurrency("fn-a", 2)
+	cc.setAppConcurrency("fn-a", 2)
 	if got := poolMax(cc, "fn-a"); got != 2 {
 		t.Fatalf("pool max = %d, want 2", got)
 	}
@@ -345,8 +345,8 @@ func TestPoolResizeImageAndConcurrencyTogether(t *testing.T) {
 // holding an old Prepared.Concurrency) creates the pool after Prepare ran.
 func TestPoolResizeFreshPoolUsesEffectiveCapacity(t *testing.T) {
 	cc, _ := newTestCache()
-	// Prepare reconciled the function to 5; no pool exists yet.
-	cc.setFunctionConcurrency("fn-a", 5)
+	// Prepare reconciled the app to 5; no pool exists yet.
+	cc.setAppConcurrency("fn-a", 5)
 
 	// A stale acquire passes the old max 2; the fresh pool must use 5.
 	p := cc.poolFor("fn-a", 2)
@@ -358,7 +358,7 @@ func TestPoolResizeFreshPoolUsesEffectiveCapacity(t *testing.T) {
 	}
 
 	// A direct caller (integration test) with no recorded capacity still uses its
-	// own max for a function never prepared.
+	// own max for an app never prepared.
 	p2 := cc.poolFor("fn-raw", 3)
 	p2.mu.Lock()
 	got2 := p2.max
@@ -381,7 +381,7 @@ func TestPoolResizeManagerSnapshotReflectsNewBound(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	m.containers.setFunctionConcurrency("fn-a", 4)
+	m.containers.setAppConcurrency("fn-a", 4)
 	s, ok := m.PoolSnapshot("fn-a")
 	if !ok {
 		t.Fatal("PoolSnapshot(fn-a) not found")
@@ -394,15 +394,15 @@ func TestPoolResizeManagerSnapshotReflectsNewBound(t *testing.T) {
 	}
 }
 
-// TestPoolResizeRemovedFunctionIgnores proves a resize of a removed/detached
+// TestPoolResizeRemovedAppIgnores proves a resize of a removed/detached
 // pool is a safe no-op and does not resurrect it.
-func TestPoolResizeRemovedFunctionIgnores(t *testing.T) {
+func TestPoolResizeRemovedAppIgnores(t *testing.T) {
 	cc, ff := newTestCache()
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	cc.removeFunction("fn-a")
-	cc.setFunctionConcurrency("fn-a", 5)
+	cc.removeApp("fn-a")
+	cc.setAppConcurrency("fn-a", 5)
 	if err := runInvoke(t, cc, ff, "fn-a", "img-1", 1, "h"); !errors.Is(err, errPoolClosed) {
 		t.Fatalf("acquire after removal+resize = %v, want errPoolClosed", err)
 	}
@@ -428,7 +428,7 @@ func TestPoolResizeRaceSafety(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < resizeIters; i++ {
-			cc.setFunctionConcurrency("fn-race", 1+(i%4))
+			cc.setAppConcurrency("fn-race", 1+(i%4))
 		}
 	}()
 

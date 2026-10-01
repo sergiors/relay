@@ -8,7 +8,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 )
 
 // serviceImagePullInterval bounds how often Relay performs a REMOTE pull check
@@ -44,7 +44,7 @@ type ServiceImage struct {
 // becomes a runnable image, so the service reconciler stays source-agnostic and
 // the two sources share one container lifecycle.
 //
-//	functionImage is the function's own prepared runtime image, used only by an
+//	appImage is the app's own prepared runtime image, used only by an
 //	`entrypoint` service (which overrides that image's invocation bootstrap).
 //
 // Resolution is read-only except for the one lifecycle action a source may
@@ -53,19 +53,19 @@ type ServiceImage struct {
 func (m *Manager) ResolveServiceImage(
 	ctx context.Context,
 	fnName string,
-	tmpl *function.Template,
-	svc function.Service,
-	functionImage string,
+	tmpl *app.Template,
+	svc app.Service,
+	appImage string,
 ) (ServiceImage, error) {
 	switch svc.Source() {
-	case function.ServiceSourceImage:
+	case app.ServiceSourceImage:
 		return m.resolveExternalServiceImage(ctx, fnName, svc.SourceRef())
 	default:
 		entry, err := ServiceEntry(tmpl.Runtime, svc.Entrypoint)
 		if err != nil {
 			return ServiceImage{}, err
 		}
-		return ServiceImage{Ref: functionImage, Entry: entry}, nil
+		return ServiceImage{Ref: appImage, Entry: entry}, nil
 	}
 }
 
@@ -73,7 +73,7 @@ func (m *Manager) ResolveServiceImage(
 // image and, when the freshness policy allows, pull it from its registry.
 //
 // The remote check runs at most once per serviceImagePullInterval per
-// independent source (function + image reference), measured from the last
+// independent source (app + image reference), measured from the last
 // SUCCESSFUL check; a failed check does not advance that instant (it is retried
 // at the next reconcile). A source with no recorded check — a first sighting, a
 // changed reference, or a worker restart (the map is in-memory only) — is
@@ -141,8 +141,8 @@ func (m *Manager) recordPullCheck(fnName, sourceRef string, t time.Time) {
 	m.pullChecks[pullCheckKey(fnName, sourceRef)] = t
 }
 
-// forgetServicePullChecks drops every pull-check record for a function. It is
-// called when a function is removed so a later re-added function starts fresh
+// forgetServicePullChecks drops every pull-check record for an app. It is
+// called when an app is removed so a later re-added app starts fresh
 // (immediate remote check) and the map does not grow without bound across
 // removals. It is idempotent and safe with no records.
 func (m *Manager) forgetServicePullChecks(fnName string) {
@@ -156,10 +156,10 @@ func (m *Manager) forgetServicePullChecks(fnName string) {
 	}
 }
 
-// pullCheckKey is the per-independent-source pull-check key: the function and
-// the service's source reference, so two functions never share a freshness
+// pullCheckKey is the per-independent-source pull-check key: the app and
+// the service's source reference, so two apps never share a freshness
 // window, a changed source reference is a new independent source, and the two
-// parts cannot collide (the NUL separator is not valid in either a function name
+// parts cannot collide (the NUL separator is not valid in either an app name
 // or an image reference). The key is deliberately the SOURCE reference, not the
 // service name: freshness is a property of the image bytes, shared by two
 // distinct services that reference the same image.

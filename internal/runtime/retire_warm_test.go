@@ -27,7 +27,7 @@ func TestWarmBusyContainerRetiredDuringImageRemoval(t *testing.T) {
 
 	// An execution holds the image lease (as Manager.Execute does) and is
 	// running on a leased warm container.
-	execLease, err := m.AcquireImageLease("relay-fn-a:v1")
+	execLease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire image lease: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestWarmBusyContainerRetiredDuringImageRemoval(t *testing.T) {
 	releaseContainer := make(chan struct{})
 	entered := make(chan struct{})
 	fake := &fakeContainer{entered: entered, release: releaseContainer}
-	lease, err := m.containers.acquire(context.Background(), "a", "relay-fn-a:v1", 1, func() (reusableContainer, error) {
+	lease, err := m.containers.acquire(context.Background(), "a", "relay-app-a:v1", 1, func() (reusableContainer, error) {
 		return fake, nil
 	})
 	if err != nil {
@@ -45,9 +45,9 @@ func TestWarmBusyContainerRetiredDuringImageRemoval(t *testing.T) {
 	// Commit removal: it must block on the execution's image lease. Wait for the
 	// gate deterministically, then prove it is blocked (the held execution lease
 	// keeps the drain open) without a delay-based assertion.
-	signal := signalOnRetirement(m, "relay-fn-a:v1")
+	signal := signalOnRetirement(m, "relay-app-a:v1")
 	done := make(chan error, 1)
-	go func() { done <- m.RemoveImage(context.Background(), "relay-fn-a:v1") }()
+	go func() { done <- m.RemoveImage(context.Background(), "relay-app-a:v1") }()
 	signal.wait(t)
 	select {
 	case err := <-done:
@@ -57,7 +57,7 @@ func TestWarmBusyContainerRetiredDuringImageRemoval(t *testing.T) {
 
 	// Retirement invalidates the image's warm containers without blocking; the
 	// busy container is marked retired and discarded on release.
-	m.InvalidateImage("relay-fn-a:v1")
+	m.InvalidateImage("relay-app-a:v1")
 
 	// The execution ends: release the container lease (discards the retired
 	// busy container) and the image lease (lets the removal drain).
@@ -84,17 +84,17 @@ func TestWarmBusyContainerRetiredDuringImageRemoval(t *testing.T) {
 // startup sweep and service retirement: it never blocks on a held lease.
 func TestRemoveImageNowSkipsWhileLeaseHeld(t *testing.T) {
 	m := &Manager{log: testutil.DiscardLogger()}
-	lease, err := m.AcquireImageLease("relay-fn-a:v1")
+	lease, err := m.AcquireImageLease("relay-app-a:v1")
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	defer lease.Release()
 
-	err = m.RemoveImageNow(context.Background(), "relay-fn-a:v1")
+	err = m.RemoveImageNow(context.Background(), "relay-app-a:v1")
 	if !errors.Is(err, ErrImageRetiring) {
 		t.Fatalf("RemoveImageNow while leased = %v, want ErrImageRetiring", err)
 	}
-	if m.IsImageRetiring("relay-fn-a:v1") {
+	if m.IsImageRetiring("relay-app-a:v1") {
 		t.Fatal("a skipped non-blocking removal must clear the retirement gate")
 	}
 }

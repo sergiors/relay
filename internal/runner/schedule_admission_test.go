@@ -8,21 +8,21 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
-// schedTmplFn builds a prepared function with the given named schedules, all
+// schedTmplFn builds a prepared app with the given named schedules, all
 // routed to their own handler/timeout/retries, so the admission descriptor can
 // be exercised per schedule name.
-func schedTmplFn(t *testing.T, exec Executor, schedules ...function.Schedule) *PreparedFunction {
+func schedTmplFn(t *testing.T, exec Executor, schedules ...app.Schedule) *PreparedApp {
 	t.Helper()
 	return NewPrepared(
-		function.Function{
+		app.App{
 			Name: "fn",
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime:   "node24",
 				Schedules: schedules,
 			},
@@ -33,8 +33,8 @@ func schedTmplFn(t *testing.T, exec Executor, schedules ...function.Schedule) *P
 }
 
 // sched builds one schedule entry.
-func sched(name, handler string, timeout time.Duration, retries int) function.Schedule {
-	return function.Schedule{
+func sched(name, handler string, timeout time.Duration, retries int) app.Schedule {
+	return app.Schedule{
 		Name:     name,
 		Handler:  handler,
 		Cron:     "0 3 * * *",
@@ -52,7 +52,7 @@ func sched(name, handler string, timeout time.Duration, retries int) function.Sc
 func TestInvokeHandlerAdmissionPinsCurrentHandler(t *testing.T) {
 	exec := &captureExecutor{}
 	pf := schedTmplFn(t, exec, sched("cleanup", "jobs.new", 42*time.Second, 3))
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -86,7 +86,7 @@ func TestInvokeHandlerAdmittedHandlerChangeIgnoredOnRetry(t *testing.T) {
 
 	// First admission: handler jobs.old, retries 4.
 	r1 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, exec, sched("cleanup", "jobs.old", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, exec, sched("cleanup", "jobs.old", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 	if err := r1.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err == nil {
 		t.Fatal("expected the first (failing) attempt to return an error")
@@ -98,7 +98,7 @@ func TestInvokeHandlerAdmittedHandlerChangeIgnoredOnRetry(t *testing.T) {
 	// Swap the template (a NEW worker/ruleset) to a DIFFERENT handler with a
 	// smaller retry budget, then let the retry fire.
 	r2 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, exec, sched("cleanup", "jobs.new", 30*time.Second, 0))},
+		[]*PreparedApp{schedTmplFn(t, exec, sched("cleanup", "jobs.new", 30*time.Second, 0))},
 		testutil.DiscardLogger(), nil)
 	prog.advance(2 * time.Minute) // past the 1m backoff
 
@@ -127,9 +127,9 @@ func TestInvokeHandlerAdmittedHandlerChangeIgnoredOnRetry(t *testing.T) {
 // admitted is obsolete — no descriptor, no execution, no state.
 func TestInvokeHandlerScheduleRemovedBeforeAdmissionObsolete(t *testing.T) {
 	exec := &countingExecutor{}
-	// The function is present but has no schedules at all.
+	// The app is present but has no schedules at all.
 	pf := schedTmplFn(t, exec)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -161,7 +161,7 @@ func TestInvokeHandlerScheduleRemovedAfterAdmissionStillCompletes(t *testing.T) 
 
 	failing := &countingExecutor{fail: true}
 	r1 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, failing, sched("cleanup", "jobs.old", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, failing, sched("cleanup", "jobs.old", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 	if err := r1.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err == nil {
 		t.Fatal("expected the first attempt to fail")
@@ -170,7 +170,7 @@ func TestInvokeHandlerScheduleRemovedAfterAdmissionStillCompletes(t *testing.T) 
 	// Remove the schedule entirely and use a fresh, succeeding runner (simulating
 	// a restarted/reconciled worker).
 	succeeding := &countingExecutor{}
-	r2 := NewWithMetrics([]*PreparedFunction{schedTmplFn(t, succeeding)}, testutil.DiscardLogger(), nil)
+	r2 := NewWithMetrics([]*PreparedApp{schedTmplFn(t, succeeding)}, testutil.DiscardLogger(), nil)
 	prog.advance(2 * time.Minute)
 
 	if err := r2.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err != nil {
@@ -194,7 +194,7 @@ func TestInvokeHandlerPinnedTimeoutSurvivesTemplateChange(t *testing.T) {
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	r1 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, &countingExecutor{fail: true}, sched("cleanup", "jobs.old", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, &countingExecutor{fail: true}, sched("cleanup", "jobs.old", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 	if err := r1.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err == nil {
 		t.Fatal("expected the first attempt to fail")
@@ -205,7 +205,7 @@ func TestInvokeHandlerPinnedTimeoutSurvivesTemplateChange(t *testing.T) {
 	// the deadline persisted for the retry.
 	probe := &deadlineProbeExecutor{prog: prog, invocation: "fn/jobs.old"}
 	r2 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, probe, sched("cleanup", "jobs.old", time.Millisecond, 4))},
+		[]*PreparedApp{schedTmplFn(t, probe, sched("cleanup", "jobs.old", time.Millisecond, 4))},
 		testutil.DiscardLogger(), nil)
 	if err := r2.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err != nil {
 		t.Fatalf("retry with a pinned timeout must not expire: %v", err)
@@ -253,11 +253,11 @@ func TestInvokeHandlerSharedHandlerScheduleNamesAreDistinct(t *testing.T) {
 		sched("a", "jobs.shared", 10*time.Second, 1),
 		sched("b", "jobs.shared", 20*time.Second, 2),
 	)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 
 	for _, tc := range []struct {
 		name string
-		want function.Schedule
+		want app.Schedule
 	}{{"a", sched("a", "jobs.shared", 10*time.Second, 1)}, {"b", sched("b", "jobs.shared", 20*time.Second, 2)}} {
 		t.Run(tc.name, func(t *testing.T) {
 			prog := newFakeInvocationState()
@@ -292,10 +292,10 @@ func TestInvokeHandlerDescriptorRaceExactlyOneHandler(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
 	rOld := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, holding, sched("cleanup", "jobs.old", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, holding, sched("cleanup", "jobs.old", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 	rNew := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, holding, sched("cleanup", "jobs.new", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, holding, sched("cleanup", "jobs.new", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -358,7 +358,7 @@ func TestInvokeHandlerRestartPreservesDescriptor(t *testing.T) {
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	r1 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, &countingExecutor{fail: true}, sched("cleanup", "jobs.old", 30*time.Second, 4))},
+		[]*PreparedApp{schedTmplFn(t, &countingExecutor{fail: true}, sched("cleanup", "jobs.old", 30*time.Second, 4))},
 		testutil.DiscardLogger(), nil)
 	if err := r1.InvokeHandler(ctx, "m-0", "fn", "cleanup", "jobs.old", []byte(`{}`)); err == nil {
 		t.Fatal("expected the first attempt to fail")
@@ -367,7 +367,7 @@ func TestInvokeHandlerRestartPreservesDescriptor(t *testing.T) {
 	// "Restart": a new runner with a changed current template, the same persisted
 	// invocation state, and a reclaim after the backoff.
 	r2 := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, &countingExecutor{}, sched("cleanup", "jobs.renamed", 5*time.Second, 0))},
+		[]*PreparedApp{schedTmplFn(t, &countingExecutor{}, sched("cleanup", "jobs.renamed", 5*time.Second, 0))},
 		testutil.DiscardLogger(), nil)
 	prog.advance(2 * time.Minute)
 
@@ -388,7 +388,7 @@ func TestInvokeHandlerRestartPreservesDescriptor(t *testing.T) {
 func TestInvokeHandlerNoStateStillUsesCurrentTemplate(t *testing.T) {
 	exec := &captureExecutor{}
 	r := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, exec, sched("cleanup", "jobs.current", 30*time.Second, 0))},
+		[]*PreparedApp{schedTmplFn(t, exec, sched("cleanup", "jobs.current", 30*time.Second, 0))},
 		testutil.DiscardLogger(), nil)
 
 	if err := r.InvokeHandler(context.Background(), "m-0", "fn", "cleanup", "jobs.stale", []byte(`{}`)); err != nil {
@@ -413,7 +413,7 @@ func TestInvokeHandlerScheduleDescriptorEncodingRoundTrip(t *testing.T) {
 
 	want := stream.ScheduleDescriptor{Schedule: "a.b-c_1", Handler: "jobs.run", Timeout: 7 * time.Second, Retries: 2}
 	r := NewWithMetrics(
-		[]*PreparedFunction{schedTmplFn(t, &countingExecutor{}, sched(want.Schedule, want.Handler, want.Timeout, want.Retries))},
+		[]*PreparedApp{schedTmplFn(t, &countingExecutor{}, sched(want.Schedule, want.Handler, want.Timeout, want.Retries))},
 		testutil.DiscardLogger(), nil)
 	if err := r.InvokeHandler(ctx, "m-0", "fn", want.Schedule, want.Handler, []byte(`{}`)); err != nil {
 		t.Fatalf("InvokeHandler: %v", err)

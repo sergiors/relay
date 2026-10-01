@@ -1,6 +1,6 @@
 // Command relay is the single Relay executable. `relay start` runs the
 // long-running Relay runtime in the foreground; every other subcommand is an
-// administrative interface around the same process (functions, secrets,
+// administrative interface around the same process (apps, secrets,
 // stats, health). It stays minimal on purpose: command construction and
 // parsing live in internal/cli and the runtime lifecycle in internal/worker.
 // main owns the process logger, a signal-aware context, error printing

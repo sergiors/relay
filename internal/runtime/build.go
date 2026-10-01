@@ -17,7 +17,7 @@ import (
 	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime/plan"
 )
 
@@ -58,7 +58,7 @@ func renderDockerfile(p plan.BuildPlan) string {
 		b.WriteString("WORKDIR " + p.WorkDir + "\n")
 	}
 
-	// Function sources are copied into WorkDir.
+	// App sources are copied into WorkDir.
 	dest := p.WorkDir
 	if dest == "" {
 		dest = "/"
@@ -125,34 +125,34 @@ func buildImage(
 	ctx context.Context,
 	cli *client.Client,
 	name string,
-	fn function.Function,
+	fn app.App,
 	p plan.BuildPlan,
 	image string,
 	labels map[string]string,
-	snapshot *function.SourceSnapshot,
+	snapshot *app.SourceSnapshot,
 ) error {
 	ctxDir, err := os.MkdirTemp("", "relay-build-*")
 	if err != nil {
-		return fmt.Errorf("function %q: create build context: %w", name, err)
+		return fmt.Errorf("app %q: create build context: %w", name, err)
 	}
 	defer os.RemoveAll(ctxDir)
 
 	// snapshot is the SINGLE immutable read the caller already fingerprinted: the
 	// image is staged from exactly the bytes its tag was derived from, so a
 	// concurrent edit between the fingerprint and the build can no longer make the
-	// tag and the baked content disagree. The function's .gitignore policy was
+	// tag and the baked content disagree. The app's .gitignore policy was
 	// applied at capture time (ignored files and .git were never captured), so the
 	// staged context contains exactly the selected source. Staging is read-only;
-	// the user's function directory is never modified.
+	// the user's app directory is never modified.
 	//
 	// template.yaml is excluded from the context even though it participates in
 	// the fingerprint: the template is Relay configuration (runtime, rules, env
-	// values, secret references), not function source, so baking it into the image
+	// values, secret references), not app source, so baking it into the image
 	// would embed env values and secret references in the image layers. Generated
-	// plan files are written separately below, so the user's function directory is
+	// plan files are written separately below, so the user's app directory is
 	// never modified.
 	if err := stageSourceSnapshot(snapshot, ctxDir); err != nil {
-		return fmt.Errorf("function %q: copy sources: %w", name, err)
+		return fmt.Errorf("app %q: copy sources: %w", name, err)
 	}
 
 	if err := writePlanFiles(ctxDir, name, p.Files); err != nil {
@@ -161,14 +161,14 @@ func buildImage(
 
 	dockerfile := renderDockerfile(p)
 	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
-		return fmt.Errorf("function %q: write dockerfile: %w", name, err)
+		return fmt.Errorf("app %q: write dockerfile: %w", name, err)
 	}
 
 	return runImageBuild(ctx, cli, name, ctxDir, image, labels)
 }
 
 // writePlanFiles writes the generated plan files (bootstrap, injected
-// package.json) into the staged build context. The caller's function directory
+// package.json) into the staged build context. The caller's app directory
 // is never modified: generated files live only in the transient context.
 func writePlanFiles(ctxDir, name string, files []plan.File) error {
 	for _, f := range files {
@@ -176,7 +176,7 @@ func writePlanFiles(ctxDir, name string, files []plan.File) error {
 		target := filepath.Join(ctxDir, rel)
 		if dir := filepath.Dir(target); dir != ctxDir {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("function %q: mkdir for %s: %w", name, f.Path, err)
+				return fmt.Errorf("app %q: mkdir for %s: %w", name, f.Path, err)
 			}
 		}
 		mode := f.Mode
@@ -184,7 +184,7 @@ func writePlanFiles(ctxDir, name string, files []plan.File) error {
 			mode = 0o644
 		}
 		if err := os.WriteFile(target, f.Content, mode); err != nil {
-			return fmt.Errorf("function %q: write %s: %w", name, f.Path, err)
+			return fmt.Errorf("app %q: write %s: %w", name, f.Path, err)
 		}
 	}
 	return nil
@@ -199,12 +199,12 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 	// from the staged directory rather than shelling out to tar.
 	contextTar, err := tarContext(ctxDir)
 	if err != nil {
-		return fmt.Errorf("function %q: tar build context: %w", name, err)
+		return fmt.Errorf("app %q: tar build context: %w", name, err)
 	}
 
 	resp, err := cli.ImageBuild(ctx, contextTar, buildImageOptions(image, labels))
 	if err != nil {
-		return fmt.Errorf("function %q: docker build: %w", name, err)
+		return fmt.Errorf("app %q: docker build: %w", name, err)
 	}
 	defer resp.Body.Close()
 
@@ -213,16 +213,16 @@ func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image 
 	// any such message as a failed build.
 	out, err := drainBuildResponse(resp.Body)
 	if err != nil {
-		return fmt.Errorf("function %q: docker build: %w\n%s", name, err, strings.TrimSpace(out))
+		return fmt.Errorf("app %q: docker build: %w\n%s", name, err, strings.TrimSpace(out))
 	}
 	return nil
 }
 
-// buildDependencyImage builds the reusable dependency layer for a function. The
+// buildDependencyImage builds the reusable dependency layer for an app. The
 // image installs the dependencies into Deps.Dir (e.g. /app) as ROOT and carries
-// NO user setup, entrypoint, or env — it is a BASE for the function image, not a
+// NO user setup, entrypoint, or env — it is a BASE for the app image, not a
 // runnable image, so run-time concerns (the runtime user, the entrypoint) stay in
-// the function image's own layer.
+// the app image's own layer.
 //
 // snap is the immutable manifest snapshot captured by the caller (see
 // snapshotDependency): the SAME bytes whose fingerprint names the tag are the
@@ -248,7 +248,7 @@ func buildDependencyImage(
 	}
 	defer os.RemoveAll(ctxDir)
 
-	// Stage ONLY the manifest files, not the function's source tree. The
+	// Stage ONLY the manifest files, not the app's source tree. The
 	// dependency image exists to cache the install; baking the whole source
 	// would couple the layer to every source change and defeat the reuse.
 	for _, f := range snap.files {
@@ -273,8 +273,8 @@ func buildDependencyImage(
 		BaseImage: spec.BaseImage,
 		WorkDir:   deps.Dir,
 		// The dependency base image is built FROM the raw runtime base (not the
-		// function image), so it must copy the runtime's external tools itself:
-		// the function image inherits them through FROM, but the dependency
+		// app image), so it must copy the runtime's external tools itself:
+		// the app image inherits them through FROM, but the dependency
 		// build cannot.
 		ToolCopies: spec.ToolCopies,
 		// Note: plan.Deps is intentionally left zero here so the renderer emits
@@ -292,7 +292,7 @@ func buildDependencyImage(
 	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, dependencyImageLabels(spec.Name, depFingerprint))
 }
 
-// buildImageOptions returns the ImageBuildOptions Relay uses for every function
+// buildImageOptions returns the ImageBuildOptions Relay uses for every app
 // and dependency build. Remove is set to true deliberately: the moby client
 // v0.6.0 emits
 // rm=0 when Remove is false (it only sends the value when opting out of the
@@ -404,7 +404,7 @@ func tarContext(ctxDir string) (io.Reader, error) {
 //
 // template.yaml is deliberately excluded by BASE NAME anywhere in the tree: the
 // template is Relay configuration (runtime, rules, env values, secret
-// references), not function source, so it must never enter an image — including
+// references), not app source, so it must never enter an image — including
 // a nested template.yaml the loader never reads. It still participates in the
 // fingerprint (the selected directory's own template.yaml is hashed with its
 // resources stripped; a nested one is hashed verbatim), so template edits still
@@ -414,7 +414,7 @@ func tarContext(ctxDir string) (io.Reader, error) {
 // Directories are created so an empty selected directory still appears in the
 // context (and so plan-file writes find their parents), and the original mode is
 // preserved. The snapshot is read-only here; the user's tree is never touched.
-func stageSourceSnapshot(snapshot *function.SourceSnapshot, dst string) error {
+func stageSourceSnapshot(snapshot *app.SourceSnapshot, dst string) error {
 	if snapshot == nil {
 		return fmt.Errorf("stage source: nil snapshot")
 	}

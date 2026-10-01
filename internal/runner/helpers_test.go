@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -122,7 +122,7 @@ func (e *captureExecutor) Execute(ctx context.Context, prepared *runtime.Prepare
 }
 
 // gotPrepared returns the Prepared handle the executor was invoked with. The
-// runner forwards the function's published handle unchanged, so the runtime's
+// runner forwards the app's published handle unchanged, so the runtime's
 // Execute (the single resource-resolution point) receives the same handle from
 // every entry path.
 func (e *captureExecutor) gotPrepared() *runtime.Prepared {
@@ -203,7 +203,7 @@ type blockingExecutor struct {
 	gcCalls int
 	// gcErr makes CleanupUnusedDependencies fail.
 	gcErr bool
-	// tags is the FunctionImageTags table, keyed by function name.
+	// tags is the AppImageTags table, keyed by app name.
 	tags map[string][]string
 }
 
@@ -283,7 +283,7 @@ func (f *blockingExecutor) setReferenced(image string, v bool) {
 	f.referenced[image] = v
 }
 
-func (f *blockingExecutor) FunctionImageTags(_ context.Context, name string) ([]string, error) {
+func (f *blockingExecutor) AppImageTags(_ context.Context, name string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.tags == nil {
@@ -323,24 +323,24 @@ func (ctxAwareExecutor) Execute(ctx context.Context, _ *runtime.Prepared, _ stri
 	return ctx.Err()
 }
 
-// --- prepared-function builders ---
+// --- prepared-app builders ---
 
-// fnSpec captures the configurable parts of a prepared function so the builders
+// fnSpec captures the configurable parts of a prepared app so the builders
 // below can share one construction path.
 type fnSpec struct {
 	name        string
 	image       string
 	runtime     string
-	rules       []function.EventRule
-	schedules   []function.Schedule
+	rules       []app.EventRule
+	schedules   []app.Schedule
 	concurrency int
 	env         map[string]string
-	secrets     map[string]function.SecretRef
+	secrets     map[string]app.SecretRef
 }
 
-// buildFn assembles a prepared function from spec. The runtime defaults to
+// buildFn assembles a prepared app from spec. The runtime defaults to
 // node24 so ServiceEntry and rule resolution behave like production.
-func buildFn(spec fnSpec, exec Executor) *PreparedFunction {
+func buildFn(spec fnSpec, exec Executor) *PreparedApp {
 	if spec.runtime == "" {
 		spec.runtime = "node24"
 	}
@@ -348,9 +348,9 @@ func buildFn(spec fnSpec, exec Executor) *PreparedFunction {
 		spec.image = "x"
 	}
 	return NewPrepared(
-		function.Function{
+		app.App{
 			Name: spec.name,
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime:     spec.runtime,
 				Concurrency: spec.concurrency,
 				Events:      spec.rules,
@@ -365,97 +365,97 @@ func buildFn(spec fnSpec, exec Executor) *PreparedFunction {
 }
 
 // alwaysMatchRule is a single any-event rule with the default retry count.
-func alwaysMatchRule(timeout time.Duration) function.EventRule {
-	return function.EventRule{Handler: "index.run", Pattern: function.Pattern{}, Timeout: timeout, Retries: function.DefaultRetries}
+func alwaysMatchRule(timeout time.Duration) app.EventRule {
+	return app.EventRule{Handler: "index.run", Pattern: app.Pattern{}, Timeout: timeout, Retries: app.DefaultRetries}
 }
 
-// newFn builds a prepared function with no rules, used by registry-only tests.
-func newFn(t *testing.T, name string) *PreparedFunction {
+// newFn builds a prepared app with no rules, used by registry-only tests.
+func newFn(t *testing.T, name string) *PreparedApp {
 	t.Helper()
 	return buildFn(fnSpec{name: name}, &countingExecutor{hold: time.Millisecond})
 }
 
-// alwaysMatchFn builds a function whose single rule matches any event and
+// alwaysMatchFn builds an app whose single rule matches any event and
 // carries the default retry count.
-func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedFunction {
+func alwaysMatchFn(t *testing.T, name string, executor Executor) *PreparedApp {
 	t.Helper()
-	return buildFn(fnSpec{name: name, rules: []function.EventRule{alwaysMatchRule(time.Second)}}, executor)
+	return buildFn(fnSpec{name: name, rules: []app.EventRule{alwaysMatchRule(time.Second)}}, executor)
 }
 
-// unavailableMatchFn builds an UNAVAILABLE prepared function whose single rule
-// matches any event. Unlike a removed function (absent from the registry), it is
+// unavailableMatchFn builds an UNAVAILABLE prepared app whose single rule
+// matches any event. Unlike a removed app (absent from the registry), it is
 // configured and matching but cannot run because its image is not built, so the
 // matched-but-unavailable event path is exercisable. The template is present so
 // matching (not a nil-template guard) drives the outcome.
-func unavailableMatchFn(t *testing.T, name string) *PreparedFunction {
+func unavailableMatchFn(t *testing.T, name string) *PreparedApp {
 	t.Helper()
-	return NewUnavailable(function.Function{
+	return NewUnavailable(app.App{
 		Name: name,
-		Template: &function.Template{
+		Template: &app.Template{
 			Runtime: "node24",
-			Events:  []function.EventRule{alwaysMatchRule(time.Second)},
+			Events:  []app.EventRule{alwaysMatchRule(time.Second)},
 		},
 	})
 }
 
-// fp is a valid, always-matching prepared function whose executor doubles as an
+// fp is a valid, always-matching prepared app whose executor doubles as an
 // ImageCleaner so the runner's resolver finds it.
-func fpClean(t *testing.T, name, image string, exec Executor) *PreparedFunction {
+func fpClean(t *testing.T, name, image string, exec Executor) *PreparedApp {
 	t.Helper()
-	return buildFn(fnSpec{name: name, image: image, rules: []function.EventRule{alwaysMatchRule(time.Second)}}, exec)
+	return buildFn(fnSpec{name: name, image: image, rules: []app.EventRule{alwaysMatchRule(time.Second)}}, exec)
 }
 
-// fnWithTimeout builds a prepared function whose single rule matches any event
+// fnWithTimeout builds a prepared app whose single rule matches any event
 // and carries the given handler timeout and the default retry count.
-func fnWithTimeout(t *testing.T, name string, timeout time.Duration, executor Executor) *PreparedFunction {
+func fnWithTimeout(t *testing.T, name string, timeout time.Duration, executor Executor) *PreparedApp {
 	t.Helper()
-	return buildFn(fnSpec{name: name, rules: []function.EventRule{alwaysMatchRule(timeout)}}, executor)
+	return buildFn(fnSpec{name: name, rules: []app.EventRule{alwaysMatchRule(timeout)}}, executor)
 }
 
-// fnWithRetries builds a prepared function whose single rule matches any event
+// fnWithRetries builds a prepared app whose single rule matches any event
 // and carries the given retry count (additional attempts after the first).
-func fnWithRetries(t *testing.T, name string, retries int, executor Executor) *PreparedFunction {
+func fnWithRetries(t *testing.T, name string, retries int, executor Executor) *PreparedApp {
 	t.Helper()
 	rule := alwaysMatchRule(time.Second)
 	rule.Retries = retries
-	return buildFn(fnSpec{name: name, rules: []function.EventRule{rule}}, executor)
+	return buildFn(fnSpec{name: name, rules: []app.EventRule{rule}}, executor)
 }
 
-// fnWithConcurrency builds an always-matching function with the given template
+// fnWithConcurrency builds an always-matching app with the given template
 // concurrency (0 = unparsed/default in the runner).
-func fnWithConcurrency(t *testing.T, name string, concurrency int, executor Executor) *PreparedFunction {
+func fnWithConcurrency(t *testing.T, name string, concurrency int, executor Executor) *PreparedApp {
 	t.Helper()
 	rule := alwaysMatchRule(time.Second)
 	rule.Retries = 0
-	return buildFn(fnSpec{name: name, concurrency: concurrency, rules: []function.EventRule{rule}}, executor)
+	return buildFn(fnSpec{name: name, concurrency: concurrency, rules: []app.EventRule{rule}}, executor)
 }
 
-// fnWithEnv builds a prepared function whose template carries env and secrets.
-func fnWithEnv(t *testing.T, name string, executor Executor, env map[string]string, secrets map[string]function.SecretRef) *PreparedFunction {
+// fnWithEnv builds a prepared app whose template carries env and secrets.
+func fnWithEnv(t *testing.T, name string, executor Executor, env map[string]string, secrets map[string]app.SecretRef) *PreparedApp {
 	t.Helper()
 	rule := alwaysMatchRule(0)
-	return buildFn(fnSpec{name: name, rules: []function.EventRule{rule}, env: env, secrets: secrets}, executor)
+	return buildFn(fnSpec{name: name, rules: []app.EventRule{rule}, env: env, secrets: secrets}, executor)
 }
 
-// schedFn returns a prepared function with an empty schedule-entry rule set but
+// schedFn returns a prepared app with an empty schedule-entry rule set but
 // that still carries the runtime/template the InvokeHandler path reads. Its
 // schedule entry carries the given timeout and a zero retry count (a schedule
 // whose retries are unset, so the first failure exhausts).
-func schedFn(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration) *PreparedFunction {
+func schedFn(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration) *PreparedApp {
 	t.Helper()
 	return schedFnRetries(t, name, executor, scheduleTimeout, 0)
 }
 
-// schedFnRetries returns a prepared function with a single schedule entry for
+// schedFnRetries returns a prepared app with a single schedule entry for
 // handler "index.run" (schedule name "sched") carrying the given timeout and
 // retry count.
-func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration, retries int) *PreparedFunction {
+func schedFnRetries(t *testing.T, name string, executor Executor, scheduleTimeout time.Duration, retries int) *PreparedApp {
 	t.Helper()
 	rule := alwaysMatchRule(scheduleTimeout)
 	return buildFn(fnSpec{
 		name:  name,
-		rules: []function.EventRule{rule},
-		schedules: []function.Schedule{{
+		rules: []app.EventRule{rule},
+		schedules: []app.Schedule{{
 			Name:     "sched",
 			Handler:  "index.run",
 			Cron:     "0 3 * * *",

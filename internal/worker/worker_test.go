@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/state"
@@ -43,15 +43,15 @@ func TestStatsLoopNilStateExitsOnCancel(t *testing.T) {
 func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testing.T) {
 	st := openTempState(t)
 
-	runtimeFn := function.Function{
+	runtimeFn := app.App{
 		Name:     "runtime-fn",
 		Dir:      t.TempDir(),
-		Template: &function.Template{Runtime: "node24"},
+		Template: &app.Template{Runtime: "node24"},
 	}
-	noRuntimeFn := function.Function{
+	noRuntimeFn := app.App{
 		Name:     "no-runtime-fn",
 		Dir:      t.TempDir(),
-		Template: &function.Template{Services: []function.Service{{Name: "web", Image: "nginx:alpine"}}},
+		Template: &app.Template{Services: []app.Service{{Name: "web", Image: "nginx:alpine"}}},
 	}
 	if err := os.WriteFile(
 		filepath.Join(noRuntimeFn.Dir, "template.yaml"),
@@ -66,44 +66,44 @@ func TestManagedRuntimeBuildObserverPublishesBuildingOnlyOnActualBuild(t *testin
 
 	st.RecordDiscovered(runtimeFn)
 	st.RecordDiscovered(noRuntimeFn)
-	if got, _ := st.GetFunction(runtimeFn.Name); got.Status != state.StatusPreparing {
+	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusPreparing {
 		t.Fatalf("discovered runtime function status = %q, want preparing", got.Status)
 	}
 
 	// A real build fires the observer, moving preparing -> building.
-	runtime.FunctionBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), st, runtimeFn))()
-	if got, _ := st.GetFunction(runtimeFn.Name); got.Status != state.StatusBuilding {
+	runtime.AppBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), st, runtimeFn))()
+	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusBuilding {
 		t.Fatalf("runtime function status = %q, want building", got.Status)
 	}
 
 	// A no-runtime preparation never fires the observer (there is no image to
 	// build), so it stays preparing.
 	noRuntimeCtx := managedRuntimeBuildContext(context.Background(), st, noRuntimeFn)
-	if runtime.FunctionBuildObserverFromContext(noRuntimeCtx) == nil {
+	if runtime.AppBuildObserverFromContext(noRuntimeCtx) == nil {
 		t.Fatal("expected an observer to be installed for the no-runtime function too")
 	}
-	if got, _ := st.GetFunction(noRuntimeFn.Name); got.Status != state.StatusPreparing {
+	if got, _ := st.GetApp(noRuntimeFn.Name); got.Status != state.StatusPreparing {
 		t.Fatalf("no-runtime function status = %q, want preparing (observer never fires)", got.Status)
 	}
 
 	// A successful no-service preparation reaches ready, clearing building.
 	st.RecordReconcileSuccess(runtimeFn.Name, "img", "fp", time.Now(), runtimeFn)
-	if got, _ := st.GetFunction(runtimeFn.Name); got.Status != state.StatusReady {
+	if got, _ := st.GetApp(runtimeFn.Name); got.Status != state.StatusReady {
 		t.Fatalf("after success status = %q, want ready", got.Status)
 	}
 
 	// A preparation failure without an active image is unavailable, again
 	// clearing building.
-	failFn := function.Function{Name: "fail-fn", Dir: t.TempDir(), Template: &function.Template{Runtime: "node24"}}
+	failFn := app.App{Name: "fail-fn", Dir: t.TempDir(), Template: &app.Template{Runtime: "node24"}}
 	st.RecordDiscovered(failFn)
-	runtime.FunctionBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), st, failFn))()
+	runtime.AppBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), st, failFn))()
 	st.RecordReconcileFailure(failFn.Name, errors.New("build failed"))
-	if got, _ := st.GetFunction(failFn.Name); got.Status != state.StatusUnavailable {
+	if got, _ := st.GetApp(failFn.Name); got.Status != state.StatusUnavailable {
 		t.Fatalf("after failure status = %q, want unavailable", got.Status)
 	}
 
 	// Nil state yields a context without an observer, not a panic.
-	if runtime.FunctionBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), nil, runtimeFn)) != nil {
+	if runtime.AppBuildObserverFromContext(managedRuntimeBuildContext(context.Background(), nil, runtimeFn)) != nil {
 		t.Fatal("nil state must not install a build observer")
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/testutil"
 )
@@ -16,7 +16,7 @@ import (
 func TestInvokeHandlerSuccess(t *testing.T) {
 	exec := &captureExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", exec, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{schedFn(t, "fn", exec, app.DefaultTimeout)}, testutil.DiscardLogger(), m)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{"source":"relay.schedule"}`))
 	if err != nil {
@@ -35,10 +35,10 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 	if !strings.Contains(got, "handler_success_total count=1") {
 		t.Fatalf("expected handler_success_total; got:\n%s", got)
 	}
-	if !strings.Contains(got, "handler_invocations_total{function=fn,handler=index.run,outcome=success} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=fn,handler=index.run,outcome=success} count=1") {
 		t.Fatalf("expected success invocation counter; got:\n%s", got)
 	}
-	if !strings.Contains(got, "function_handler_success_total{function=fn} count=1") {
+	if !strings.Contains(got, "function_handler_success_total{app=fn} count=1") {
 		t.Fatalf("expected per-function success; got:\n%s", got)
 	}
 	// InvokeHandler (called directly here, without the stream layer) must not
@@ -49,15 +49,15 @@ func TestInvokeHandlerSuccess(t *testing.T) {
 		strings.Contains(got, metrics.MetricEventsUnmatched) {
 		t.Fatalf("schedule must not inflate event counters:\n%s", got)
 	}
-	if strings.Contains(got, metrics.MetricFunctionEventsMatched) {
-		t.Fatalf("schedule must not inflate function_events_matched_total:\n%s", got)
+	if strings.Contains(got, metrics.MetricAppEventsMatched) {
+		t.Fatalf("schedule must not inflate app_events_matched_total:\n%s", got)
 	}
 }
 
 // A failing invocation records failure metrics and returns the error.
 func TestInvokeHandlerFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{schedFn(t, "fn", &countingExecutor{fail: true}, function.DefaultTimeout)}, testutil.DiscardLogger(), m)
+	r := NewWithMetrics([]*PreparedApp{schedFn(t, "fn", &countingExecutor{fail: true}, app.DefaultTimeout)}, testutil.DiscardLogger(), m)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{}`))
 	if err == nil {
@@ -68,10 +68,10 @@ func TestInvokeHandlerFailure(t *testing.T) {
 	if !strings.Contains(got, "handler_failure_total count=1") {
 		t.Fatalf("expected handler_failure_total; got:\n%s", got)
 	}
-	if !strings.Contains(got, "handler_invocations_total{function=fn,handler=index.run,outcome=failure} count=1") {
+	if !strings.Contains(got, "handler_invocations_total{app=fn,handler=index.run,outcome=failure} count=1") {
 		t.Fatalf("expected failure invocation counter; got:\n%s", got)
 	}
-	if !strings.Contains(got, "function_handler_failure_total{function=fn} count=1") {
+	if !strings.Contains(got, "function_handler_failure_total{app=fn} count=1") {
 		t.Fatalf("expected per-function failure; got:\n%s", got)
 	}
 	if strings.Contains(got, "outcome=success") {
@@ -79,23 +79,23 @@ func TestInvokeHandlerFailure(t *testing.T) {
 	}
 }
 
-// Missing or unavailable functions return an error without executing.
-func TestInvokeHandlerMissingFunction(t *testing.T) {
+// Missing or unavailable apps return an error without executing.
+func TestInvokeHandlerMissingApp(t *testing.T) {
 	exec := &captureExecutor{}
-	r := New([]*PreparedFunction{schedFn(t, "present", exec, function.DefaultTimeout)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{schedFn(t, "present", exec, app.DefaultTimeout)}, testutil.DiscardLogger())
 
 	err := r.InvokeHandler(context.Background(), "1-0", "ghost", "sched", "index.run", []byte(`{}`))
-	if err == nil || !strings.Contains(err.Error(), `function "ghost" is not available`) {
+	if err == nil || !strings.Contains(err.Error(), `app "ghost" is not available`) {
 		t.Fatalf("err = %v, want not-available error", err)
 	}
 	if _, payload := exec.got(); len(payload) != 0 {
 		t.Fatalf("executor should not run for a missing function")
 	}
 
-	// Unavailable (nil prepared) function.
-	r = New([]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})}, testutil.DiscardLogger())
+	// Unavailable (nil prepared) app.
+	r = New([]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}})}, testutil.DiscardLogger())
 	err = r.InvokeHandler(context.Background(), "1-0", "broken", "sched", "index.run", []byte(`{}`))
-	if err == nil || !strings.Contains(err.Error(), `function "broken" is not available`) {
+	if err == nil || !strings.Contains(err.Error(), `app "broken" is not available`) {
 		t.Fatalf("err = %v, want not-available error for unavailable function", err)
 	}
 }
@@ -103,7 +103,7 @@ func TestInvokeHandlerMissingFunction(t *testing.T) {
 // SetMaxHandlerTimeout caps the schedule timeout exactly like a rule timeout:
 // the executor observes a deadline at the cap, not the larger schedule timeout.
 func TestInvokeHandlerTimeoutCap(t *testing.T) {
-	r := New([]*PreparedFunction{schedFn(t, "fn", ctxAwareExecutor{}, time.Hour)}, testutil.DiscardLogger())
+	r := New([]*PreparedApp{schedFn(t, "fn", ctxAwareExecutor{}, time.Hour)}, testutil.DiscardLogger())
 	r.SetMaxHandlerTimeout(50 * time.Millisecond)
 
 	start := time.Now()
@@ -127,8 +127,8 @@ func TestInvokeHandlerSecretResolution(t *testing.T) {
 	prov := &fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}}
 	pf := fnWithEnv(t, "fn", exec,
 		map[string]string{"API_URL": "https://api.example.com"},
-		map[string]function.SecretRef{"DATABASE_URL": "db-url"})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+		map[string]app.SecretRef{"DATABASE_URL": "db-url"})
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.SetSecretProvider(prov)
 
 	err := r.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{}`))

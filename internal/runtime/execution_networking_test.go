@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
@@ -32,7 +32,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), m.cli, m.log,
-			"fn", "img", nil, []string{"backend", "frontend", "backend"}, function.ResourceLimits{}, RunMeta{})
+			"fn", "img", nil, []string{"backend", "frontend", "backend"}, app.ResourceLimits{}, RunMeta{})
 		if err == nil {
 			t.Fatal("expected the scripted create failure")
 		}
@@ -65,7 +65,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), m.cli, m.log,
-			"fn", "img", nil, nil, function.ResourceLimits{}, RunMeta{})
+			"fn", "img", nil, nil, app.ResourceLimits{}, RunMeta{})
 		if err == nil {
 			t.Fatal("expected the scripted create failure")
 		}
@@ -99,7 +99,7 @@ func TestStartExecutionContainerNetworkingConfig(t *testing.T) {
 		m := &Manager{cli: cli, log: testutil.DiscardLogger()}
 
 		_, err := startExecutionContainer(context.Background(), m.cli, m.log,
-			"fn", "img", nil, []string{"backend"}, function.ResourceLimits{}, RunMeta{})
+			"fn", "img", nil, []string{"backend"}, app.ResourceLimits{}, RunMeta{})
 		if err == nil {
 			t.Fatal("a missing network must surface as a container create error")
 		}

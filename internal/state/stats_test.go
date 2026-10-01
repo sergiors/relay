@@ -86,10 +86,10 @@ func TestStatsOnEmptyDB(t *testing.T) {
 }
 
 // RebuildFromFS does not erase the stats row: discovery only touches the
-// functions table.
+// apps table.
 func TestRebuildFromFSKeepsStats(t *testing.T) {
 	root := t.TempDir()
-	writeFunctionsDir(t, root)
+	writeAppsDir(t, root)
 
 	c := openTestState(t)
 	c.RecordStats(Stats{EventsMatchedTotal: 55, PendingEntries: 3})
@@ -107,26 +107,26 @@ func TestRebuildFromFSKeepsStats(t *testing.T) {
 	}
 }
 
-// RecordFunctionStats then FunctionStats round-trips exact values, including a
+// RecordAppStats then AppStats round-trips exact values, including a
 // non-empty updated_at set by the write.
-func TestFunctionStatsRoundTrip(t *testing.T) {
+func TestAppStatsRoundTrip(t *testing.T) {
 	c := openTestState(t)
-	in := FunctionStats{
-		Function:            "alpha",
+	in := AppStats{
+		App:                 "alpha",
 		EventsMatchedTotal:  5,
 		HandlerSuccessTotal: 4,
 		HandlerFailureTotal: 1,
 		RetryTotal:          1,
 		DLQTotal:            0,
 	}
-	c.RecordFunctionStats(in)
+	c.RecordAppStats(in)
 
-	s, ok := c.FunctionStats("alpha")
+	s, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected function stats row after record")
 	}
-	if s.Function != "alpha" {
-		t.Fatalf("function = %q, want alpha", s.Function)
+	if s.App != "alpha" {
+		t.Fatalf("function = %q, want alpha", s.App)
 	}
 	if s.UpdatedAt == "" {
 		t.Fatal("expected non-empty updated_at")
@@ -134,37 +134,37 @@ func TestFunctionStatsRoundTrip(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, s.UpdatedAt); err != nil {
 		t.Fatalf("updated_at not RFC3339: %q: %v", s.UpdatedAt, err)
 	}
-	// Compare all fields except updated_at, which is written by RecordFunctionStats.
+	// Compare all fields except updated_at, which is written by RecordAppStats.
 	in.UpdatedAt = s.UpdatedAt
 	if s != in {
 		t.Fatalf("function stats = %+v, want %+v", s, in)
 	}
 }
 
-// Two functions keep independent rows: recording one does not affect the other.
-func TestFunctionStatsIndependentRows(t *testing.T) {
+// Two apps keep independent rows: recording one does not affect the other.
+func TestAppStatsIndependentRows(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3})
-	c.RecordFunctionStats(FunctionStats{Function: "beta", EventsMatchedTotal: 7})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3})
+	c.RecordAppStats(AppStats{App: "beta", EventsMatchedTotal: 7})
 
-	a, ok := c.FunctionStats("alpha")
+	a, ok := c.AppStats("alpha")
 	if !ok || a.EventsMatchedTotal != 3 {
 		t.Fatalf("alpha = %+v, ok=%v; want events 3", a, ok)
 	}
-	b, ok := c.FunctionStats("beta")
+	b, ok := c.AppStats("beta")
 	if !ok || b.EventsMatchedTotal != 7 {
 		t.Fatalf("beta = %+v, ok=%v; want events 7", b, ok)
 	}
 }
 
-// A second RecordFunctionStats REPLACES every counter column (gauge semantics),
+// A second RecordAppStats REPLACES every counter column (gauge semantics),
 // not accumulates.
-func TestFunctionStatsUpdateReplaces(t *testing.T) {
+func TestAppStatsUpdateReplaces(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3, HandlerSuccessTotal: 2})
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 9, HandlerSuccessTotal: 8})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3, HandlerSuccessTotal: 2})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 9, HandlerSuccessTotal: 8})
 
-	s, ok := c.FunctionStats("alpha")
+	s, ok := c.AppStats("alpha")
 	if !ok {
 		t.Fatal("expected function stats row")
 	}
@@ -176,32 +176,32 @@ func TestFunctionStatsUpdateReplaces(t *testing.T) {
 	}
 }
 
-// FunctionStats on an absent function yields (zero, false).
-func TestFunctionStatsAbsent(t *testing.T) {
+// AppStats on an absent app yields (zero, false).
+func TestAppStatsAbsent(t *testing.T) {
 	c := openTestState(t)
-	s, ok := c.FunctionStats("ghost")
+	s, ok := c.AppStats("ghost")
 	if ok {
 		t.Fatalf("expected absent, got %+v", s)
 	}
-	if s != (FunctionStats{}) {
+	if s != (AppStats{}) {
 		t.Fatalf("expected zero function stats, got %+v", s)
 	}
 }
 
-// RecordRemoved deletes the function_stats row alongside the functions row.
-func TestRemovalDeletesFunctionStats(t *testing.T) {
+// RecordRemoved deletes the app_stats row alongside the apps row.
+func TestRemovalDeletesAppStats(t *testing.T) {
 	c := openTestState(t)
-	c.RecordFunctionStats(FunctionStats{Function: "alpha", EventsMatchedTotal: 3})
+	c.RecordAppStats(AppStats{App: "alpha", EventsMatchedTotal: 3})
 
 	c.RecordRemoved("alpha")
 
-	if _, ok := c.FunctionStats("alpha"); ok {
+	if _, ok := c.AppStats("alpha"); ok {
 		t.Fatal("expected function stats row to be removed")
 	}
 }
 
 // Schema init is idempotent: re-opening the same path succeeds and the stats
-// table is present alongside the functions table.
+// table is present alongside the apps table.
 func TestOpenWithStatsSchemaIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db.sqlite3")
 	c1, err := Open(path)

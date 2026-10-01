@@ -1,10 +1,10 @@
 // Package worker is the long-running Relay runtime, started via `relay start`.
-// It loads functions, builds their images, reconciles them live, and consumes
+// It loads apps, builds their images, reconciles them live, and consumes
 // the Redis stream, blocking until signalled. Configuration comes entirely
 // from the environment.
 //
 // Startup begins with an explicit external-dependency preflight (see
-// runExternalPreflight) that runs BEFORE any function is loaded or fingerprinted,
+// runExternalPreflight) that runs BEFORE any app is loaded or fingerprinted,
 // before the state database is opened, and before the runtime socket, services,
 // sweeps, preparation, listener starts, background loops, scheduler, and
 // reconciler. The fixed order is: Redis stream/consumer-group readiness, then
@@ -45,9 +45,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/codes"
 
+	"relay/internal/app"
 	"relay/internal/config"
 	"relay/internal/cron"
-	"relay/internal/function"
 	gitwh "relay/internal/git/webhook"
 	"relay/internal/observability/metrics"
 	"relay/internal/observability/tracing"
@@ -73,7 +73,7 @@ const statsFlushInterval = 5 * time.Second
 // the startup orphan container sweep, the startup image keep-set list, the
 // coordinator's per-removal operation context (RemoveAndWait/EnqueueRemove), and
 // — injected into the ServiceReconciler — each normal pre-resolution and
-// post-resolution Docker operation inside a per-function Apply. Each such
+// post-resolution Docker operation inside a per-app Apply. Each such
 // operation gets its own fresh bound so one slow Docker call cannot consume the
 // budget of the calls
 // that follow. It deliberately does NOT bound Dockerfile builds: a build is
@@ -219,7 +219,7 @@ type preflightDeps struct {
 // runExternalPreflight runs the worker's external-dependency preflight in the
 // fixed order Redis stream/group readiness -> Docker runtime-manager readiness
 // -> configured NETWORKS verification -> manager maintenance start, BEFORE any
-// function is loaded or fingerprinted, before state.Open, and before the runtime
+// app is loaded or fingerprinted, before state.Open, and before the runtime
 // socket, services, sweeps, preparation, listener starts, background loops,
 // scheduler, and reconciler are touched. A failure at any step short-circuits
 // every later step and is returned so Run unwinds through its deferred shutdown;
@@ -417,7 +417,7 @@ func Run(logger *slog.Logger) error {
 
 	// External-dependency preflight, in one explicit fixed order: Redis
 	// stream/consumer-group readiness -> Docker runtime-manager readiness ->
-	// configured NETWORKS verification. It runs BEFORE any function is loaded or
+	// configured NETWORKS verification. It runs BEFORE any app is loaded or
 	// fingerprinted, before state.Open, and before the runtime socket, services,
 	// sweeps, preparation, listener starts, background loops, scheduler, and
 	// reconciler. A failure at any step short-circuits every later step: Redis
@@ -445,7 +445,7 @@ func Run(logger *slog.Logger) error {
 				cfg.ConsumerName,
 				runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
 				// The SAME MAX_CONCURRENCY the runner's global semaphore uses:
-				// the runtime clips each function's effective per-function
+				// the runtime clips each app's effective per-app
 				// concurrency to it, so a template asking for more than the
 				// worker-global cap (e.g. 15 with MAX_CONCURRENCY=8) warms,
 				// reports, and admits only the cap's worth. It is startup
@@ -453,7 +453,7 @@ func Run(logger *slog.Logger) error {
 				runtime.WithMaxConcurrency(cfg.MaxConcurrency),
 				// The worker-global Docker networks (NETWORKS) every execution
 				// container joins at create time. They are verified by the next
-				// preflight step before any function is prepared or any container
+				// preflight step before any app is prepared or any container
 				// created.
 				runtime.WithNetworks(cfg.Networks),
 				// Root Dockerfile builds in the WORKER LIFECYCLE (ctx), not the
@@ -490,7 +490,7 @@ func Run(logger *slog.Logger) error {
 		},
 		VerifyNetworks: func(ctx context.Context, m *runtime.Manager) error {
 			// Verify every configured NETWORKS network exists BEFORE any
-			// function is prepared or any container created. The networks are
+			// app is prepared or any container created. The networks are
 			// infrastructure owned OUTSIDE Relay — Relay never creates them —
 			// so a missing one is an operator condition that must fail startup
 			// rather than silently produce containers on the wrong (or no)
@@ -540,29 +540,29 @@ func Run(logger *slog.Logger) error {
 		gitWebhookServer = gitwh.NewServer(cfg.GitWebhookAddr, logger, gitwh.Config{Secrets: secretProvider})
 	}
 
-	_, loaderSpan := tracing.Start(startupCtx, "functions.load")
-	loader := function.NewLoader(function.Dir, logger)
-	functions, loadIssues, err := loader.LoadWithDiagnostics()
+	_, loaderSpan := tracing.Start(startupCtx, "apps.load")
+	loader := app.NewLoader(app.Dir, logger)
+	apps, loadIssues, err := loader.LoadWithDiagnostics()
 	if err != nil {
 		loaderSpan.RecordError(err)
 		loaderSpan.SetStatus(codes.Error, err.Error())
 		loaderSpan.End()
-		// The worker cannot run without its function set. The deferred cleanup
+		// The worker cannot run without its app set. The deferred cleanup
 		// releases the Redis client and stops the servers; the error is returned
 		// for the CLI boundary to print and exit on.
-		return fmt.Errorf("load functions failed: %w", err)
+		return fmt.Errorf("load apps failed: %w", err)
 	}
 	loaderSpan.End()
-	logger.Info("Loaded functions", "count", len(functions), "invalid", len(loadIssues), "root", function.Dir)
+	logger.Info("Loaded apps", "count", len(apps), "invalid", len(loadIssues), "root", app.Dir)
 
-	// Compute every loaded function's content fingerprint — and, for a
-	// runtime-backed function, the source selection it was computed from — ONCE
+	// Compute every loaded app's content fingerprint — and, for a
+	// runtime-backed app, the source selection it was computed from — ONCE
 	// for the whole startup, carrying both forward as the immutable startup
 	// records. The fingerprint feeds the state phase (rebuild + discovery
 	// upserts); the selection feeds Manager.Prepare, which captures it into one
 	// immutable snapshot and derives the built image's tag, staged context, and
 	// returned identity from that single read — no startup stage re-reads
-	// /functions to build. The identity actually built is what the state phase
+	// /apps to build. The identity actually built is what the state phase
 	// records and the reconciler is seeded with, not this pre-prepare scan. The
 	// state DB is a persisted, read-mostly local state view (see internal/state),
 	// NOT the source of truth and NOT a snapshot the worker only reads: the worker
@@ -570,14 +570,14 @@ func Run(logger *slog.Logger) error {
 	// flush). It never drives matching or building; it is opened after the
 	// fingerprints so even a broken DB still yields fingerprints for Prepare and
 	// the reconciler.
-	_, fingerprintSpan := tracing.Start(startupCtx, "functions.fingerprint")
+	_, fingerprintSpan := tracing.Start(startupCtx, "apps.fingerprint")
 	fingerprintStart := time.Now()
-	startup := selectAndFingerprintFunctions(functions, logger)
+	startup := selectAndFingerprintApps(apps, logger)
 	fingerprints := make(map[string]string, len(startup))
 	for _, s := range startup {
-		fingerprints[s.Function.Name] = s.Fingerprint
+		fingerprints[s.App.Name] = s.Fingerprint
 	}
-	// The state package consumes the narrow (function, fingerprint) pair; the
+	// The state package consumes the narrow (app, fingerprint) pair; the
 	// selection stays worker-local because it is a filesystem concern the state
 	// layer must not own.
 	discovered := discoveredFromStartup(startup)
@@ -597,7 +597,7 @@ func Run(logger *slog.Logger) error {
 		st = nil
 	}
 	if st != nil {
-		// Keep the one-hot function_status gauge in sync with every persisted
+		// Keep the one-hot app_status gauge in sync with every persisted
 		// status transition, centrally, so startup discovery, the reconciler, and
 		// the service callbacks all flow through one seam. Installed immediately
 		// after open, before any discovery/status write, so no transition is
@@ -611,12 +611,12 @@ func Run(logger *slog.Logger) error {
 			run:     func(context.Context) error { return st.Close() },
 		})
 		// The already-computed fingerprint pairs feed both the fresh-database
-		// rebuild and the per-function discovery upserts; /functions is never
-		// re-read for state and each function's source is hashed exactly once.
+		// rebuild and the per-app discovery upserts; /apps is never
+		// re-read for state and each app's source is hashed exactly once.
 		// Present-but-invalid desired definitions are persisted alongside the
 		// valid discovery; they stay out of the loaded set, so they never reach
 		// the runtime registry, matching, the scheduler, or preparation.
-		if rerr := persistStartupDiscovery(st, function.Dir, discovered, loadIssues, logger); rerr != nil {
+		if rerr := persistStartupDiscovery(st, app.Dir, discovered, loadIssues, logger); rerr != nil {
 			stateSpan.RecordError(rerr)
 		}
 	}
@@ -646,7 +646,7 @@ func Run(logger *slog.Logger) error {
 	})
 
 	// The live runtime-pool query socket (see internal/worker/socket.go). It is
-	// started now that the manager exists: the CLI's `function inspect` dials it
+	// started now that the manager exists: the CLI's `app inspect` dials it
 	// for the LIVE gauges, which are worker-local and never persisted; the
 	// cumulative counters stay in /var/lib/relay. The
 	// process lock acquired by `relay start` is already held, so removing a stale
@@ -676,11 +676,11 @@ func Run(logger *slog.Logger) error {
 	})
 	logger.Info("Runtime state socket listening", "path", SocketPath)
 
-	// The service controller converges each function's persistent service
+	// The service controller converges each app's persistent service
 	// containers to its template (manager is the Docker seam; secretProvider is
 	// the shared secrets resolver). Service containers now stop on graceful
 	// shutdown: the shutdown tail runs ShutdownCleanup for this worker's
-	// hostname (cfg.ConsumerName). The coordinator runs the per-function Applys
+	// hostname (cfg.ConsumerName). The coordinator runs the per-app Applys
 	// asynchronously (bounded workers, latest-desired-state coalescing), so
 	// startup never blocks on service convergence (e.g. an external image pull);
 	// the startup orphan
@@ -721,7 +721,7 @@ func Run(logger *slog.Logger) error {
 		},
 	})
 
-	// Conservative startup orphan sweep: before any function is prepared or any
+	// Conservative startup orphan sweep: before any app is prepared or any
 	// container created, remove execution containers a previous Relay process on
 	// THIS hostname left behind (a crash mid-invocation). It is label- and
 	// hostname-scoped, so other workers' and non-Relay containers are untouched.
@@ -740,21 +740,21 @@ func Run(logger *slog.Logger) error {
 	}
 	orphanSpan.End()
 
-	// Build every function's image. A function whose image cannot be built is
+	// Build every app's image. An app whose image cannot be built is
 	// marked unavailable so the runner skips it; the rest continue. The startup
 	// selections are supplied to Prepare (which captures each into one immutable
-	// snapshot) so no startup build re-reads a function's source to derive an
+	// snapshot) so no startup build re-reads an app's source to derive an
 	// identity it already has, nor re-derives the selection policy. The state
 	// record and the reconciler seed use the identity each image was ACTUALLY
 	// built from, so a source edit during the build is detected by the next audit
 	// rather than recorded as current.
-	prepareCtx, prepareSpan := tracing.Start(startupCtx, "functions.prepare")
+	prepareCtx, prepareSpan := tracing.Start(startupCtx, "apps.prepare")
 	prepareStart := time.Now()
-	prepared := prepareFunctions(prepareCtx, manager, startup, st, logger)
-	logger.Debug("Startup: prepared functions", "count", len(prepared), "duration", time.Since(prepareStart))
+	prepared := prepareApps(prepareCtx, manager, startup, st, logger)
+	logger.Debug("Startup: prepared apps", "count", len(prepared), "duration", time.Since(prepareStart))
 	prepareSpan.End()
 
-	// Publish each function's initial desired service state and return
+	// Publish each app's initial desired service state and return
 	// immediately. The coordinator's bounded workers converge the states in the
 	// background, so startup never blocks on service convergence (e.g. an
 	// external image pull) — nor on the unavailable/no-services removals, which
@@ -772,8 +772,8 @@ func Run(logger *slog.Logger) error {
 	// Run does NOT call image GC synchronously; housekeepingDone is joined in the
 	// shutdown tail so no sweep overlaps shutdown cleanup or the closing state DB
 	// and Docker client.
-	liveNames := make(map[string]bool, len(functions))
-	for _, fn := range functions {
+	liveNames := make(map[string]bool, len(apps))
+	for _, fn := range apps {
 		liveNames[fn.Name] = true
 	}
 	housekeepingDone := startStartupHousekeeping(ctx, logger, startupHousekeeper{
@@ -798,7 +798,7 @@ func Run(logger *slog.Logger) error {
 	// never at startup.
 	runWorker.SetSecretProvider(secretProvider)
 	// Cap every rule's handler timeout at the value template validation enforces
-	// (function.MaxTimeout). Defense in depth: a misconfigured or hot-swapped
+	// (app.MaxTimeout). Defense in depth: a misconfigured or hot-swapped
 	// template can never run a handler past the cap.
 	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
 	// Bound the number of invocations executing concurrently (MAX_CONCURRENCY);
@@ -807,12 +807,12 @@ func Run(logger *slog.Logger) error {
 
 	// Expose the live runner to the manual-invocation socket command. It was
 	// wired after the socket was created (the runner is built later, once images
-	// and services are prepared), so a `relay function invoke` that races the
+	// and services are prepared), so a `relay app invoke` that races the
 	// wiring answers invoke_unavailable rather than a torn value. This is what
 	// lets the CLI run handlers against the live runtime pool without ever
 	// instantiating Docker/runtime in the CLI process. The same runner also
 	// serves the `relay dlq replay` semantic command, which re-executes one DLQ
-	// entry's exact recorded function/handler once against the current registry.
+	// entry's exact recorded app/handler once against the current registry.
 	rtSocket.SetInvoker(runWorker)
 	rtSocket.SetReplayer(runWorker)
 
@@ -934,13 +934,13 @@ func Run(logger *slog.Logger) error {
 	// consumer reads, and wires into the scheduler below.
 	publisher := schedule.NewPublisher(client, cfg.RedisStream, logger, metricsInstance)
 
-	// The cron scheduler maps each function template's schedules into jobs that
+	// The cron scheduler maps each app template's schedules into jobs that
 	// publish schedule occurrences through the publisher, seeded from the loaded
-	// function set before Start, then converges live via the reconciler's
-	// UpdateSchedules/RemoveFunction hooks.
+	// app set before Start, then converges live via the reconciler's
+	// UpdateSchedules/RemoveApp hooks.
 	sched := cron.NewWithMetrics(publisher, logger, metricsInstance)
-	for _, fn := range functions {
-		sched.ReplaceFunction(fn.Name, fn.Template)
+	for _, fn := range apps {
+		sched.ReplaceApp(fn.Name, fn.Template)
 	}
 	logger.Info("Scheduler: schedule jobs registered", "count", sched.JobCount())
 
@@ -963,39 +963,39 @@ func Run(logger *slog.Logger) error {
 		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
 	)
 
-	// Watch /functions and reconcile functions live: rebuild changed images,
+	// Watch /apps and reconcile apps live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped
 	// atomically behind the snapshots the consumer already uses. The retire hook
 	// hands superseded images back to the runner so it can remove them once no
-	// in-flight execution uses them. On removal, RemoveFunction first deletes the
-	// function's Prometheus series (after the registry entry is swapped to nil)
+	// in-flight execution uses them. On removal, RemoveApp first deletes the
+	// app's Prometheus series (after the registry entry is swapped to nil)
 	// and retires its images; the flush sweep in recordSnapshots re-deletes any
-	// series an in-flight invocation may have recreated, so the "removed function
+	// series an in-flight invocation may have recreated, so the "removed app
 	// => no exposed series" invariant holds even mid-invocation.
 	rec := reconciler.New(
 		reconciler.Config{
-			Root:   function.Dir,
+			Root:   app.Dir,
 			State:  st,
 			Retire: func(_ string, oldImage string) { runWorker.RetireImage(oldImage) },
-			RemoveFunction: func(name string) {
-				metricsInstance.RemoveFunction(name)
-				// Drop the function's reset baseline too, so a re-added function
+			RemoveApp: func(name string) {
+				metricsInstance.RemoveApp(name)
+				// Drop the app's reset baseline too, so a re-added app
 				// is not offset by a stale pre-removal total.
-				statsFlusher.dropFunctionBaseline(name)
-				// Drop the function's warm container state first: no new acquire
-				// may warm a removed function, idle containers are discarded now,
+				statsFlusher.dropAppBaseline(name)
+				// Drop the app's warm container state first: no new acquire
+				// may warm a removed app, idle containers are discarded now,
 				// and busy ones are discarded on release. Then retire every image
 				// version once idle (the runner's reference guard keeps an image
 				// an in-flight execution still needs).
-				manager.RemoveFunction(name)
-				runWorker.RemoveFunctionSemaphore(name)
-				runWorker.RemoveFunctionImages(name)
-				sched.RemoveFunction(name) // a removed function never keeps firing
+				manager.RemoveApp(name)
+				runWorker.RemoveAppSemaphore(name)
+				runWorker.RemoveAppImages(name)
+				sched.RemoveApp(name) // a removed app never keeps firing
 			},
-			UpdateSchedules: func(name string, tmpl *function.Template) {
-				sched.ReplaceFunction(name, tmpl)
+			UpdateSchedules: func(name string, tmpl *app.Template) {
+				sched.ReplaceApp(name, tmpl)
 			},
-			// Converge the function's persistent service containers whenever its
+			// Converge the app's persistent service containers whenever its
 			// new version is swapped in (and on the skip path when it declares
 			// services, so crashed replicas self-heal on the periodic tick). The
 			// hook runs synchronously in the reconciler pump goroutine.
@@ -1009,7 +1009,7 @@ func Run(logger *slog.Logger) error {
 			// The prepared env comes from the current registry entry (the runtime
 			// plan env); a nil Prepared (unavailable) falls back to no plan env,
 			// mirroring the runner's nil-safe behavior.
-			UpdateServices: func(name string, tmpl *function.Template, image string) {
+			UpdateServices: func(name string, tmpl *app.Template, image string) {
 				enqueueLiveServices(
 					services,
 					manager,
@@ -1021,7 +1021,7 @@ func Run(logger *slog.Logger) error {
 			},
 			UpdateServicesWithStatus: func(
 				name string,
-				tmpl *function.Template,
+				tmpl *app.Template,
 				image string,
 				onReconcileStart func(),
 				onComplete func(error),
@@ -1039,7 +1039,7 @@ func Run(logger *slog.Logger) error {
 			},
 			UpdateServicesObservationWithStatus: func(
 				name string,
-				tmpl *function.Template,
+				tmpl *app.Template,
 				image string,
 				onReconcileStart func(),
 				onComplete func(error),
@@ -1055,15 +1055,15 @@ func Run(logger *slog.Logger) error {
 					onComplete,
 				)
 			},
-			// On removal, stop the function's service containers BEFORE the images
-			// are retired (reconciler calls RemoveServices before RemoveFunction):
+			// On removal, stop the app's service containers BEFORE the images
+			// are retired (reconciler calls RemoveServices before RemoveApp):
 			// running service containers reference those images. RemoveAndWait
 			// waits DETERMINISTICALLY for the queued removal to complete; the
 			// coordinator derives the operation's own fresh 30s bound rooted in
 			// the lifecycle context, and shutdown releases the wait via the
 			// lifecycle, so the hook can never let image retirement race the
 			// removal. The hook runs in the single pump goroutine, so it never
-			// blocks a reconcile of another function.
+			// blocks a reconcile of another app.
 			RemoveServices: func(name string) {
 				services.RemoveAndWait(name)
 			},
@@ -1087,23 +1087,23 @@ func Run(logger *slog.Logger) error {
 		reconcilerSpan.RecordError(err)
 	} else {
 		seedStart := time.Now()
-		// Seed the identity each function's image was ACTUALLY built from
+		// Seed the identity each app's image was ACTUALLY built from
 		// (Prepared.Fingerprint), not the pre-prepare scan. A source edit between
 		// the scan and the build's snapshot changes the built identity, and seeding
 		// the built value makes the first reconcile compare against what is really
 		// baked: it observes the edit as a rebuild instead of treating the mutated
 		// tree as already prepared. The rule lives in the pure startupSeedFingerprints
 		// helper so it is pinned by a deterministic unit test.
-		seeds := startupSeedFingerprints(functions, fingerprints, prepared)
-		for _, fn := range functions {
+		seeds := startupSeedFingerprints(apps, fingerprints, prepared)
+		for _, fn := range apps {
 			rec.Seed(fn, seeds[fn.Name])
 		}
 		logger.Debug("Startup: seeded startup fingerprints",
-			"count", len(functions),
+			"count", len(apps),
 			"duration", time.Since(seedStart),
 		)
 	}
-	logger.Info("Watching functions for changes", "root", function.Dir)
+	logger.Info("Watching apps for changes", "root", app.Dir)
 
 	// Runs in its own goroutine and stops when ctx is cancelled. Start reuses the
 	// watcher PrepareWatch already established, and now JOINS its pump/ticker/
@@ -1138,11 +1138,11 @@ func Run(logger *slog.Logger) error {
 	// Ready-to-consume boundary: install the live dependency probe (Redis
 	// consumer health + a bounded Docker ping + NETWORKS verification) and mark
 	// the worker ready. This is the LAST step before Consume, and it is reached
-	// only after the external preflight, function load/prepare, the socket,
+	// only after the external preflight, app load/prepare, the socket,
 	// required listeners and loops, and the consumer/schedule/reconciler/
 	// scheduler wiring are all complete. It deliberately does not wait on
 	// asynchronous service convergence/housekeeping, optional tracing, SQLite,
-	// or per-function success.
+	// or per-app success.
 	workerReady.startReady(consumer, manager, cfg.Networks)
 	logger.Info("Worker ready to consume")
 
@@ -1592,8 +1592,8 @@ func setupMetrics(cfg config.Config, logger *slog.Logger) (*metrics.Registry, *m
 }
 
 // wireStatusObserver installs the state status observer that projects every
-// persisted lifecycle transition onto the one-hot function_status gauge. An
-// EMPTY status is the removal/prune signal and deletes the function's status
+// persisted lifecycle transition onto the one-hot app_status gauge. An
+// EMPTY status is the removal/prune signal and deletes the app's status
 // series; every other status is written one-hot. It is nil-safe on both the
 // state handle and the registry, so a failed state open (or a nil registry in a
 // test) is a silent no-op. It centralizes the state→metrics bridge in one
@@ -1611,38 +1611,38 @@ func wireStatusObserver(st *state.State, metricsInstance *metrics.Registry) {
 	}
 	st.SetStatusObserver(func(name, status string) {
 		if status == "" {
-			metricsInstance.RemoveFunctionStatus(name)
+			metricsInstance.RemoveAppStatus(name)
 			return
 		}
-		metricsInstance.SetFunctionStatus(name, status)
+		metricsInstance.SetAppStatus(name, status)
 	})
 }
 
-// managedRuntimeBuildContext installs the function-image build observer that
+// managedRuntimeBuildContext installs the app-image build observer that
 // publishes the building status at the ACTUAL managed runtime image-build
 // boundary. It is passed to Manager.Prepare, whose runtime fires the observer
 // only when a build is really issued — after the reuse probes — so a reused
 // image never flashes building, and a template that needs no runtime (Prepare is
 // then a fast no-op) never fires it at all. It is nil-state-safe. Installed
 // unconditionally: for a no-runtime template the observer simply never runs.
-func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn function.Function) context.Context {
+func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn app.App) context.Context {
 	if st == nil {
 		return ctx
 	}
-	return runtime.WithFunctionBuildObserver(ctx, func() {
+	return runtime.WithAppBuildObserver(ctx, func() {
 		st.RecordReconcileBuilding(fn.Name)
 	})
 }
 
-// startupFunction is one loaded function's immutable startup identity: the
-// function, the content fingerprint computed for it exactly once, and — for a
-// runtime-backed function — the source selection that fingerprint was computed
+// startupApp is one loaded app's immutable startup identity: the
+// app, the content fingerprint computed for it exactly once, and — for a
+// runtime-backed app — the source selection that fingerprint was computed
 // from. Carrying the selection alongside the digest lets every later startup
 // stage (state writes, Manager.Prepare, the reconciler seed, and the image
-// keep-set) reuse one traversal instead of re-reading /functions. It is
+// keep-set) reuse one traversal instead of re-reading /apps. It is
 // worker-local on purpose: the selection is a filesystem concern the state
 // package must not own, so state only ever sees the narrow
-// (function, fingerprint) conversion below.
+// (app, fingerprint) conversion below.
 //
 // Fingerprint here is the PRE-PREPARE scan: it seeds the desired state. The
 // identity an image is ACTUALLY built from comes back as
@@ -1650,66 +1650,66 @@ func managedRuntimeBuildContext(ctx context.Context, st *state.State, fn functio
 // and that returned value is what the state phase records and the reconciler is
 // seeded with.
 //
-// Selection is nil for a no-runtime (external-image-only) function, which builds
-// no function image; its Fingerprint is then template-only by construction.
-type startupFunction struct {
-	Function    function.Function
+// Selection is nil for a no-runtime (external-image-only) app, which builds
+// no app image; its Fingerprint is then template-only by construction.
+type startupApp struct {
+	App         app.App
 	Fingerprint string
 	Selection   *source.Selection
 }
 
-// selectAndFingerprintFunctions computes each loaded function's fingerprint —
-// and, for a runtime-backed function, resolves its source selection in the SAME
+// selectAndFingerprintApps computes each loaded app's fingerprint —
+// and, for a runtime-backed app, resolves its source selection in the SAME
 // traversal — exactly once for the whole startup. The returned records are the
 // immutable startup identity reused by the state phase, Manager.Prepare, the
 // reconciler seed, and the startup image keep-set. A fingerprint error is logged
 // and yielded as "" with a nil selection — the same fallback the state package
 // uses — so a transient read failure never blocks discovery (the empty seed then
 // forces a reconcile rebuild).
-func selectAndFingerprintFunctions(functions []function.Function, logger *slog.Logger) []startupFunction {
-	return selectAndFingerprintFunctionsWith(functions, logger, function.SelectAndFingerprintFunction)
+func selectAndFingerprintApps(apps []app.App, logger *slog.Logger) []startupApp {
+	return selectAndFingerprintAppsWith(apps, logger, app.SelectAndFingerprintApp)
 }
 
-// selectAndFingerprintFunctionsWith is selectAndFingerprintFunctions with the
+// selectAndFingerprintAppsWith is selectAndFingerprintApps with the
 // identity resolver injected. Production passes
-// function.SelectAndFingerprintFunction (the wrapper above); a test passes a
+// app.SelectAndFingerprintApp (the wrapper above); a test passes a
 // counting/spying resolver so it can prove the helper resolves each loaded
-// function's selection+fingerprint EXACTLY once and carries the SAME values into
+// app's selection+fingerprint EXACTLY once and carries the SAME values into
 // the returned records (which feed the state phase, Prepare, and the reconciler
 // seed) without rehashing.
-func selectAndFingerprintFunctionsWith(
-	functions []function.Function,
+func selectAndFingerprintAppsWith(
+	apps []app.App,
 	logger *slog.Logger,
-	resolve func(dir string, tmpl *function.Template) (*source.Selection, string, error),
-) []startupFunction {
-	startup := make([]startupFunction, 0, len(functions))
-	for _, fn := range functions {
+	resolve func(dir string, tmpl *app.Template) (*source.Selection, string, error),
+) []startupApp {
+	startup := make([]startupApp, 0, len(apps))
+	for _, fn := range apps {
 		selection, fp, err := resolve(fn.Dir, fn.Template)
 		if err != nil {
-			logger.Warn("Function: fingerprint failed", "function", fn.Name, "error", err)
+			logger.Warn("App: fingerprint failed", "app", fn.Name, "error", err)
 			selection, fp = nil, ""
 		}
-		startup = append(startup, startupFunction{Function: fn, Fingerprint: fp, Selection: selection})
+		startup = append(startup, startupApp{App: fn, Fingerprint: fp, Selection: selection})
 	}
 	return startup
 }
 
 // discoveredFromStartup converts the worker-local startup records to the narrow
-// (function, fingerprint) pairs the state package consumes, so state never sees
+// (app, fingerprint) pairs the state package consumes, so state never sees
 // — or owns — the filesystem selection.
-func discoveredFromStartup(startup []startupFunction) []state.DiscoveredFunction {
-	discovered := make([]state.DiscoveredFunction, 0, len(startup))
+func discoveredFromStartup(startup []startupApp) []state.DiscoveredApp {
+	discovered := make([]state.DiscoveredApp, 0, len(startup))
 	for _, s := range startup {
-		discovered = append(discovered, state.DiscoveredFunction{Function: s.Function, Fingerprint: s.Fingerprint})
+		discovered = append(discovered, state.DiscoveredApp{App: s.App, Fingerprint: s.Fingerprint})
 	}
 	return discovered
 }
 
-// startupSeedFingerprints returns the seed value for each loaded function, keyed
-// by name. The preferred seed is the identity the function's image was ACTUALLY
+// startupSeedFingerprints returns the seed value for each loaded app, keyed
+// by name. The preferred seed is the identity the app's image was ACTUALLY
 // built from (Prepared.Fingerprint); the pre-prepare scan (fingerprints) is only
-// the fallback for a function that produced no built identity (an unavailable
-// build, a no-runtime function that builds no image, or a hand-built test value).
+// the fallback for an app that produced no built identity (an unavailable
+// build, a no-runtime app that builds no image, or a hand-built test value).
 //
 // Seeding the BUILT identity is what makes the first reconcile compare the live
 // tree against what is really baked: a source edit between the pre-prepare scan
@@ -1718,9 +1718,9 @@ func discoveredFromStartup(startup []startupFunction) []state.DiscoveredFunction
 // pure helper so it is pinned by a deterministic unit test rather than inferred
 // from Run's inline wiring.
 func startupSeedFingerprints(
-	functions []function.Function,
+	apps []app.App,
 	fingerprints map[string]string,
-	prepared []*runner.PreparedFunction,
+	prepared []*runner.PreparedApp,
 ) map[string]string {
 	builtByFn := make(map[string]string, len(prepared))
 	for _, pf := range prepared {
@@ -1728,8 +1728,8 @@ func startupSeedFingerprints(
 			builtByFn[pf.Name()] = p.Fingerprint
 		}
 	}
-	seeds := make(map[string]string, len(functions))
-	for _, fn := range functions {
+	seeds := make(map[string]string, len(apps))
+	for _, fn := range apps {
 		seed := fingerprints[fn.Name]
 		if built := builtByFn[fn.Name]; built != "" {
 			seed = built
@@ -1740,23 +1740,23 @@ func startupSeedFingerprints(
 }
 
 // persistStartupDiscovery writes the startup state phase: it seeds a fresh
-// database from the already-loaded (function, fingerprint) pairs, records each
+// database from the already-loaded (app, fingerprint) pairs, records each
 // PRESENT-but-invalid desired definition from the loader diagnostics as invalid
 // (preserving any active generation while clearing the untrustworthy desired
-// snapshot), prunes rows for functions genuinely absent from dir, and records
-// each valid function as discovered (preserving its active generation).
+// snapshot), prunes rows for apps genuinely absent from dir, and records
+// each valid app as discovered (preserving its active generation).
 //
 // Ordering matters. The invalid writes happen BEFORE the prune so a directory
 // the loader observed as present but which vanished before the sweep is still
 // removed by the filesystem-authoritative prune rather than resurrected as an
 // invalid row — a disappearance is a removal, never an invalid desired state.
-// The prune still runs BEFORE the valid discovery so a function removed while
+// The prune still runs BEFORE the valid discovery so an app removed while
 // down is never resurrected, and the whole phase runs before
-// restorePersistedStats (the caller) so a pruned function's stats row is gone
-// before the fresh registry is seeded from it. Invalid functions stay out of the
+// restorePersistedStats (the caller) so a pruned app's stats row is gone
+// before the fresh registry is seeded from it. Invalid apps stay out of the
 // loaded set and are never passed to discovery, matching, the scheduler, or
 // startup preparation — only their state view is updated. Relay-owned transient
-// staging directories (function.IsReservedDir) are ignored entirely: a reserved
+// staging directories (app.IsReservedDir) are ignored entirely: a reserved
 // issue is never recorded as an invalid desired definition, and PruneRemoved
 // removes any stale reserved row a buggy prior discovery may have left, so a
 // live sync's ".sync-*" directory can never create, update, or retain state.
@@ -1767,53 +1767,53 @@ func startupSeedFingerprints(
 func persistStartupDiscovery(
 	st *state.State,
 	dir string,
-	discovered []state.DiscoveredFunction,
-	issues []function.LoadIssue,
+	discovered []state.DiscoveredApp,
+	issues []app.LoadIssue,
 	logger *slog.Logger,
 ) error {
 	var rebuildErr error
-	if err := st.RebuildFromFunctions(discovered); err != nil {
+	if err := st.RebuildFromApps(discovered); err != nil {
 		rebuildErr = err
-		logger.Warn("State: rebuild from functions failed; continuing", "error", err)
+		logger.Warn("State: rebuild from apps failed; continuing", "error", err)
 	}
 	for _, issue := range issues {
-		if function.IsReservedDir(issue.Name) {
+		if app.IsReservedDir(issue.Name) {
 			// Defense in depth: the loader already filters Relay-owned staging
 			// directories, so a reserved issue should never reach here. If one
 			// does (a future caller), it must not create or update state for a
-			// directory that is not a function.
+			// directory that is not an app.
 			continue
 		}
 		st.RecordInvalidDesired(issue.Name, issue.Err)
 	}
 	st.PruneRemoved(dir)
 	for _, d := range discovered {
-		st.RecordDiscoveredWithFingerprint(d.Function, d.Fingerprint)
+		st.RecordDiscoveredWithFingerprint(d.App, d.Fingerprint)
 	}
 	return rebuildErr
 }
 
-// functionPreparer is the narrow view of the runtime Manager that startup
+// appPreparer is the narrow view of the runtime Manager that startup
 // preparation needs: the selection-aware Prepare, plus (via runner.Executor) the
 // Execute used to pair each returned handle with its executor for the runner.
 // *runtime.Manager satisfies it; a test spy can implement it, so the startup
 // handoff (the resolved fingerprint+selection must reach Prepare, not be
 // recomputed) is unit-testable without Docker.
-type functionPreparer interface {
+type appPreparer interface {
 	PrepareWithFingerprintAndSelection(
 		ctx context.Context,
-		fn function.Function,
+		fn app.App,
 		fingerprint string,
 		selection *source.Selection,
 	) (*runtime.Prepared, error)
 	runner.Executor
 }
 
-// prepareFunctions builds each function's image and returns the prepared set. A
-// function whose image cannot be built is marked unavailable (the runner skips
+// prepareApps builds each app's image and returns the prepared set. A
+// app whose image cannot be built is marked unavailable (the runner skips
 // it) rather than failing startup; the rest carry their fresh image. It receives
-// the startup records — each function with the fingerprint resolved exactly once
-// and (for a runtime-backed function) the source selection that fingerprint was
+// the startup records — each app with the fingerprint resolved exactly once
+// and (for a runtime-backed app) the source selection that fingerprint was
 // derived from — and supplies BOTH to the selection-aware Prepare. Prepare
 // itself captures one immutable snapshot of the selected source and derives the
 // build tag, the staged context, and the returned identity from it, so the built
@@ -1828,7 +1828,7 @@ type functionPreparer interface {
 // The building status is published at the ACTUAL managed runtime image-build
 // boundary via the observer installed by managedRuntimeBuildContext: a reused
 // image and a no-runtime template never flash building, while a real build does.
-// A successful no-service preparation reaches ready below; a function whose
+// A successful no-service preparation reaches ready below; an app whose
 // template declares services records its terminal outcome after service
 // convergence (services have no separate image build, so building is
 // published only for the managed-runtime image build itself), and a preparation
@@ -1840,29 +1840,29 @@ type functionPreparer interface {
 // Dockerfile build in the manager lifecycle with its own 10m buildTimeout, so
 // this context's lack of a short deadline is intentional and the build is never
 // bounded by the 30s reconcileTimeout.
-func prepareFunctions(
+func prepareApps(
 	ctx context.Context,
-	manager functionPreparer,
-	startup []startupFunction,
+	manager appPreparer,
+	startup []startupApp,
 	st *state.State,
 	logger *slog.Logger,
-) []*runner.PreparedFunction {
+) []*runner.PreparedApp {
 	preparedCount := 0
-	prepared := make([]*runner.PreparedFunction, 0, len(startup))
+	prepared := make([]*runner.PreparedApp, 0, len(startup))
 	for _, s := range startup {
-		fn := s.Function
+		fn := s.App
 		prep, err := manager.PrepareWithFingerprintAndSelection(
 			managedRuntimeBuildContext(ctx, st, fn), fn, s.Fingerprint, s.Selection,
 		)
 		if err != nil {
 			// A build cancelled by the lifecycle is a shutdown, not a build
 			// failure: it must not record a spurious reconcile failure in the
-			// state DB. The function is still marked unavailable, but Run is
+			// state DB. The app is still marked unavailable, but Run is
 			// already converging on shutdown.
 			if startupInterrupted(ctx, err) {
-				logger.Debug("Function: prepare interrupted by shutdown", "function", fn.Name, "error", err)
+				logger.Debug("App: prepare interrupted by shutdown", "app", fn.Name, "error", err)
 			} else {
-				logger.Warn("Function: prepare failed", "function", fn.Name, "error", err)
+				logger.Warn("App: prepare failed", "app", fn.Name, "error", err)
 				if st != nil {
 					st.RecordReconcileFailure(fn.Name, err)
 				}
@@ -1883,18 +1883,18 @@ func prepareFunctions(
 		prepared = append(prepared, runner.NewPrepared(fn, prep, manager))
 		preparedCount++
 	}
-	logger.Info("Prepared functions", "count", preparedCount)
+	logger.Info("Prepared apps", "count", preparedCount)
 	return prepared
 }
 
 // enqueueLiveServices snapshots the current prepared environment and publishes
-// the desired service state without blocking the function reconciler pump. The
-// coordinator coalesces updates to the latest desired state per function and its
+// the desired service state without blocking the app reconciler pump. The
+// coordinator coalesces updates to the latest desired state per app and its
 // bounded workers converge it with the worker LIFECYCLE context. A nil Prepared
 // (unavailable) entry falls back to no plan env, mirroring the runner's
 // nil-safe behavior.
 //
-// The managed function image lease is acquired BEFORE the enqueue and handed to
+// The managed app image lease is acquired BEFORE the enqueue and handed to
 // the coordinator, which holds it across pending/coalesced/running service
 // reconciliation through StartService completion, so a concurrent retirement
 // cannot remove the image a service pass is still converging. When the image is
@@ -1905,7 +1905,7 @@ func enqueueLiveServices(
 	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 ) {
 	var preparedEnv []string
@@ -1921,7 +1921,7 @@ func enqueueLiveServicesWithStatus(
 	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 	onReconcileStart func(),
 	onComplete func(error),
@@ -1947,7 +1947,7 @@ func enqueueLiveServiceObservationWithStatus(
 	manager *runtime.Manager,
 	reg *runner.Registry,
 	name string,
-	tmpl *function.Template,
+	tmpl *app.Template,
 	image string,
 	onReconcileStart func(),
 	onComplete func(error),
@@ -1981,13 +1981,13 @@ func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.
 	lease, err := manager.AcquireImageLease(image)
 	if err != nil {
 		manager.Logger().Debug("Service: image retiring; enqueue unleased",
-			"function", name, "image", image)
+			"app", name, "image", image)
 		return nil
 	}
 	return lease
 }
 
-// enqueueStartupServices publishes each prepared function's initial desired
+// enqueueStartupServices publishes each prepared app's initial desired
 // service state and returns immediately; the coordinator converges them in the
 // background, so startup never blocks on service convergence (e.g. an external
 // image pull). The
@@ -1996,37 +1996,37 @@ func acquireServiceLease(manager *runtime.Manager, name, image string) *runtime.
 // background housekeeping pass' barrier waits for every published operation to
 // settle before touching containers or images.
 //
-// Prepared (available) functions are enqueued UNCONDITIONALLY — including
+// Prepared (available) apps are enqueued UNCONDITIONALLY — including
 // templates that now declare no services: Reconcile with an empty desired set
 // stops any containers a previous boot left behind when services were removed
 // while Relay was down (the fingerprint was re-seeded from changed content, so
 // the reconciler would take the skip path and never converge them otherwise).
 //
-// An unavailable function (no image this boot) is left alone when its template
+// An unavailable app (no image this boot) is left alone when its template
 // still declares services (its stale containers may still be serving the old
 // image, until a later successful reconcile or Remove replaces them); when its
 // template no longer declares services, lingering containers are stale by
 // definition and are removed via the nonblocking EnqueueRemove. The coordinator
 // derives the removal's own fresh reconcileTimeout bound; the housekeeping
 // barrier serializes the image sweep behind it exactly as it does for Applys.
-func enqueueStartupServices(prepared []*runner.PreparedFunction, services *reconciler.ServiceCoordinator, logger *slog.Logger) {
+func enqueueStartupServices(prepared []*runner.PreparedApp, services *reconciler.ServiceCoordinator, logger *slog.Logger) {
 	enqueueStartupServicesWithState(prepared, services, nil, logger)
 }
 
 func enqueueStartupServicesWithState(
-	prepared []*runner.PreparedFunction,
+	prepared []*runner.PreparedApp,
 	services *reconciler.ServiceCoordinator,
 	st *state.State,
 	logger *slog.Logger,
 ) {
 	for _, pf := range prepared {
-		fn := pf.Function()
+		fn := pf.App()
 		if prep := pf.Prepared(); prep != nil {
-			// Share the function's publication lease into the startup service
+			// Share the app's publication lease into the startup service
 			// request, so a concurrent retirement cannot remove the image while
 			// the initial service convergence still needs it. The share is
 			// admitted from the SAME lease the registry will publish, and is
-			// released when the request concludes. A no-runtime function has no
+			// released when the request concludes. A no-runtime app has no
 			// lease and enqueues unleased.
 			lease := pf.SharePublication()
 			if st != nil && len(fn.Template.Services) > 0 {
@@ -2052,7 +2052,7 @@ func enqueueStartupServicesWithState(
 		if len(fn.Template.Services) == 0 {
 			services.EnqueueRemove(fn.Name)
 		} else {
-			logger.Warn("Service: function unavailable; skipping service reconcile", "function", fn.Name)
+			logger.Warn("Service: app unavailable; skipping service reconcile", "app", fn.Name)
 		}
 	}
 }
@@ -2114,44 +2114,44 @@ func startStartupHousekeeping(
 }
 
 // sweepStartupImages removes Relay-owned images that no longer correspond to a
-// live function version, after every current image is built (reused if
+// live app version, after every current image is built (reused if
 // unchanged) and services are converged. The keep-set holds (a) the exact image
-// each function was actually prepared with this boot (Prepared.Image, not a
+// each app was actually prepared with this boot (Prepared.Image, not a
 // re-derived expected tag), (b) images the running service containers
 // reference. It also keeps (c) every last-active image recorded in state — the
 // crash guard for a swap that started but whose RecordReconcileSuccess never
 // landed, where the recorded image may still be the one serving.
 //
 // The recorded-image gather is the full state listing rather than only the
-// loaded set: a function whose desired definition is PRESENT but INVALID is not
+// loaded set: an app whose desired definition is PRESENT but INVALID is not
 // part of the loaded set (it is never prepared or registered), yet it may still
 // have a previously-serving active image that must not be swept. PruneRemoved
-// has already dropped rows for genuinely absent functions, so every remaining
-// row corresponds to a function present on disk (or one whose stat transiently
+// has already dropped rows for genuinely absent apps, so every remaining
+// row corresponds to an app present on disk (or one whose stat transiently
 // failed, which is conservatively kept); keeping its recorded image is the safe
 // choice. This affects GC only — never execution, which uses the runtime
-// registry of valid functions.
+// registry of valid apps.
 //
-// Keeping Prepared.Image is deliberate: the image each function is actually
+// Keeping Prepared.Image is deliberate: the image each app is actually
 // serving this boot is the authoritative answer, and it needs no tree scan — a
-// function whose build failed (unavailable) contributes no prepared image, and
+// app whose build failed (unavailable) contributes no prepared image, and
 // its previous serving image is covered by the recorded state image. This
-// replaces a re-hash of every function tree purely to reconstruct an expected
-// tag, so a build that reused an image or a no-runtime function costs nothing
+// replaces a re-hash of every app tree purely to reconstruct an expected
+// tag, so a build that reused an image or a no-runtime app costs nothing
 // here.
 //
 // When state is nil (DB failed to open) the recorded images are unavailable, so
-// the sweep below is skipped entirely: we cannot distinguish a removed function
+// the sweep below is skipped entirely: we cannot distinguish a removed app
 // from a live one, and orphan removal must never run against an unknown world.
 // Conservative: nothing that might still serve is ever removed.
 func sweepStartupImages(
 	lifecycle context.Context,
 	manager *runtime.Manager,
-	prepared []*runner.PreparedFunction,
+	prepared []*runner.PreparedApp,
 	st *state.State,
 	logger *slog.Logger,
 ) {
-	// The exact image each prepared function is serving this boot. This is the
+	// The exact image each prepared app is serving this boot. This is the
 	// authoritative keep input: no fingerprint re-scan, no expected-tag
 	// reconstruction.
 	preparedImages := make([]string, 0, len(prepared))
@@ -2165,7 +2165,7 @@ func sweepStartupImages(
 	// container kept by the Applys above (unchanged image) or left over from a
 	// previous boot that this boot has not yet replaced references its image by
 	// label, and the sweep must not remove an image a running container depends
-	// on. Removal is deferred to the owning function's reconcile, which replaces
+	// on. Removal is deferred to the owning app's reconcile, which replaces
 	// the container first and only then retires the image.
 	svcCtx, cancel := context.WithTimeout(lifecycle, reconcileTimeout)
 	svcContainers, err := manager.ServiceContainerList(svcCtx)
@@ -2211,7 +2211,7 @@ func sweepStartupImages(
 // daemon cannot make the exclusive housekeeping window (and every service update
 // coalesced behind it) wait unbounded. It preserves the ServiceReconciler's
 // existing behavior (list then stop stale containers); the only change is the
-// bound, matching the per-function Applys.
+// bound, matching the per-app Applys.
 func sweepStartupServiceOrphans(
 	hctx context.Context, svcCtrl *reconciler.ServiceReconciler, liveNames map[string]bool,
 ) {
@@ -2229,7 +2229,7 @@ type networkVerifier interface {
 }
 
 // verifyConfiguredNetworks verifies every network in the worker-global NETWORKS
-// set exists on the Docker daemon before any function is prepared or any
+// set exists on the Docker daemon before any app is prepared or any
 // container created. A missing network, or a verify error (a broken daemon), is
 // a fatal startup failure: Relay never creates networks, and an execution
 // container silently created on the wrong network would be a latent runtime
@@ -2253,18 +2253,18 @@ func verifyConfiguredNetworks(ctx context.Context, manager networkVerifier, netw
 }
 
 // startupImageKeepSet computes the set of image references the startup sweep
-// must keep: (a) the exact image each function was actually prepared with this
+// must keep: (a) the exact image each app was actually prepared with this
 // boot (Prepared.Image), (b) every image a running service container
-// references, and (c) every last-active image recorded for a function still on
+// references, and (c) every last-active image recorded for an app still on
 // disk — the crash guard for a swap that started but whose
 // RecordReconcileSuccess never landed, where the recorded image may still be the
 // one serving.
 //
 // It takes the ALREADY-RESOLVED prepared image references rather than
-// re-hashing each function tree to reconstruct an expected tag: the prepared
+// re-hashing each app tree to reconstruct an expected tag: the prepared
 // refs are the authoritative "what is live right now" and cost no filesystem
 // work, whereas a fingerprint re-scan would duplicate the startup hash and could
-// even disagree with what was actually built. A no-runtime function has no
+// even disagree with what was actually built. A no-runtime app has no
 // prepared image and is naturally absent; any image a previous (runtime) version
 // built is covered by its recorded last-active image. It is a pure function so
 // the keep-set policy is unit testable without Docker or a state DB; blank image
@@ -2293,8 +2293,8 @@ func startupImageKeepSet(preparedImages, serviceImages, recordedImages []string)
 }
 
 // cleanupStartupDependencies runs dependency GC at startup. The startup image
-// sweep may remove superseded function images; dependency cleanup can then
-// remove dependency images that no managed function image references anymore.
+// sweep may remove superseded app images; dependency cleanup can then
+// remove dependency images that no managed app image references anymore.
 // It runs OUTSIDE the st != nil gate: unlike RemoveImagesExcept, it needs no
 // state keep-set — ownership is derived from the managed-image labels the builds
 // just stamped. Best-effort and single-shot: an error is logged and left for the
@@ -2332,9 +2332,9 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 		metricsInstance.SeedCounter(metrics.MetricRetries, gs.RetryTotal)
 		metricsInstance.SeedCounter(metrics.MetricDLQEntries, gs.DLQTotal)
 	}
-	for _, fs := range st.AllFunctionStats() {
-		metricsInstance.SeedFunctionStat(metrics.FunctionStat{
-			Function:            fs.Function,
+	for _, fs := range st.AllAppStats() {
+		metricsInstance.SeedAppStat(metrics.AppStat{
+			App:                 fs.App,
 			EventsMatchedTotal:  fs.EventsMatchedTotal,
 			HandlerSuccessTotal: fs.HandlerSuccessTotal,
 			HandlerFailureTotal: fs.HandlerFailureTotal,
@@ -2348,7 +2348,7 @@ func restorePersistedStats(metricsInstance *metrics.Registry, st *state.State) {
 			DiscardedTotal:    fs.DiscardedTotal,
 			// Parse the RFC3339 timestamp strings back to unix seconds for the
 			// registry (an unparseable/empty value parses to a zero time, which
-			// SeedFunctionStat skips as "never observed").
+			// SeedAppStat skips as "never observed").
 			LastExecution: rfc3339ToUnix(fs.LastExecutionAt),
 			LastSuccess:   rfc3339ToUnix(fs.LastSuccessAt),
 			LastFailure:   rfc3339ToUnix(fs.LastFailureAt),
@@ -2385,8 +2385,8 @@ func unixSecToRFC3339(ts int64) string {
 }
 
 // relayGlobalCounters are the unlabeled cumulative counters the worker persists.
-// They are the global counterpart of the per-function counters read by
-// FunctionStatsSnapshot, and the set the relay baseline captures/subtracts.
+// They are the global counterpart of the per-app counters read by
+// AppStatsSnapshot, and the set the relay baseline captures/subtracts.
 var relayGlobalCounters = []string{
 	metrics.MetricEventsReceived,
 	metrics.MetricEventsMatched,
@@ -2403,7 +2403,7 @@ var relayGlobalCounters = []string{
 // accumulator, and the worker subtracts the reset point when it snapshots, so
 // the persisted Relay totals continue from zero while /metrics never moves
 // backwards. globals maps a counter name to its raw value at the reset; funcs
-// maps a function to its raw per-function snapshot at the reset (counters are
+// maps an app to its raw per-app snapshot at the reset (counters are
 // subtracted, and a timestamp not advanced since the reset is suppressed to
 // "never observed" — timestamps are last-observed, not cumulative, so
 // subtraction alone cannot represent their reset). It is guarded by the owning
@@ -2411,7 +2411,7 @@ var relayGlobalCounters = []string{
 // "no reset yet" baseline and a nil *relayBaseline is treated the same.
 type relayBaseline struct {
 	globals map[string]int64
-	funcs   map[string]metrics.FunctionStat
+	funcs   map[string]metrics.AppStat
 }
 
 // counter returns v (the raw counter value) minus the reset baseline for name.
@@ -2423,16 +2423,16 @@ func (b *relayBaseline) counter(name string, v int64) int64 {
 	return v - b.globals[name]
 }
 
-// applyFunctionStat returns fs with every cumulative per-function counter
+// applyAppStat returns fs with every cumulative per-app counter
 // reduced by the reset baseline and any timestamp not advanced since the reset
-// suppressed to zero ("never observed"). A nil baseline, or a function absent
+// suppressed to zero ("never observed"). A nil baseline, or an app absent
 // from the baseline, leaves fs unchanged. It is read-only: the registry is
 // never mutated.
-func (b *relayBaseline) applyFunctionStat(fs metrics.FunctionStat) metrics.FunctionStat {
+func (b *relayBaseline) applyAppStat(fs metrics.AppStat) metrics.AppStat {
 	if b == nil {
 		return fs
 	}
-	base, ok := b.funcs[fs.Function]
+	base, ok := b.funcs[fs.App]
 	if !ok {
 		return fs
 	}
@@ -2463,7 +2463,7 @@ func (b *relayBaseline) applyFunctionStat(fs metrics.FunctionStat) metrics.Funct
 }
 
 // captureRelayBaseline reads the registry's current raw counters and
-// per-function snapshot and installs them as the reset baseline. A nil registry
+// per-app snapshot and installs them as the reset baseline. A nil registry
 // yields the zero baseline (there is no in-memory source to reset). The caller
 // holds the flusher mutex, so the captured values are a consistent reset point
 // with respect to any concurrent flush.
@@ -2476,9 +2476,9 @@ func captureRelayBaseline(metricsInstance *metrics.Registry) relayBaseline {
 	for _, name := range relayGlobalCounters {
 		b.globals[name] = metricsInstance.Counter(name)
 	}
-	b.funcs = make(map[string]metrics.FunctionStat)
-	for _, fs := range metricsInstance.FunctionStatsSnapshot() {
-		b.funcs[fs.Function] = fs
+	b.funcs = make(map[string]metrics.AppStat)
+	for _, fs := range metricsInstance.AppStatsSnapshot() {
+		b.funcs[fs.App] = fs
 	}
 	return b
 }
@@ -2518,25 +2518,25 @@ func snapshotStats(metricsInstance *metrics.Registry, base *relayBaseline) state
 	}
 }
 
-// snapshotFunctionStats maps the registry's per-function counters AND latest
-// execution-history timestamps into the state layer's FunctionStats rows. Like
+// snapshotAppStats maps the registry's per-app counters AND latest
+// execution-history timestamps into the state layer's AppStats rows. Like
 // snapshotStats it applies the worker-owned relay baseline (base), so
-// per-function totals continue from zero after an operator reset and pre-reset
+// per-app totals continue from zero after an operator reset and pre-reset
 // timestamps are reported as "never observed", while the Prometheus series stay
 // monotonic. The registry stores unix seconds; the state layer stores RFC3339
 // strings in the updated_at convention (empty = never observed), so zero
 // timestamps map to "". It is nil-safe: a nil registry yields an empty slice so
 // the snapshot path can never panic or block processing.
-func snapshotFunctionStats(metricsInstance *metrics.Registry, base *relayBaseline) []state.FunctionStats {
+func snapshotAppStats(metricsInstance *metrics.Registry, base *relayBaseline) []state.AppStats {
 	if metricsInstance == nil {
 		return nil
 	}
-	stats := metricsInstance.FunctionStatsSnapshot()
-	out := make([]state.FunctionStats, 0, len(stats))
+	stats := metricsInstance.AppStatsSnapshot()
+	out := make([]state.AppStats, 0, len(stats))
 	for _, fs := range stats {
-		fs = base.applyFunctionStat(fs)
-		out = append(out, state.FunctionStats{
-			Function:            fs.Function,
+		fs = base.applyAppStat(fs)
+		out = append(out, state.AppStats{
+			App:                 fs.App,
 			EventsMatchedTotal:  fs.EventsMatchedTotal,
 			HandlerSuccessTotal: fs.HandlerSuccessTotal,
 			HandlerFailureTotal: fs.HandlerFailureTotal,
@@ -2592,13 +2592,13 @@ func (flusher *statsFlusher) flush(ctx context.Context) {
 	recordSnapshots(ctx, flusher.st, flusher.metrics, &flusher.baseline)
 }
 
-// dropFunctionBaseline drops a function's entry from the worker-owned reset
-// baseline. It is called from the reconciler's RemoveFunction hook alongside the
-// registry's series deletion, so a function removed and later re-added starts
+// dropAppBaseline drops an app's entry from the worker-owned reset
+// baseline. It is called from the reconciler's RemoveApp hook alongside the
+// registry's series deletion, so an app removed and later re-added starts
 // from its fresh zero-valued series instead of subtracting a stale pre-removal
 // total (which would persist a negative value). It is idempotent, nil-safe, and
 // safe to call before any reset (a zero baseline has no entry to drop).
-func (flusher *statsFlusher) dropFunctionBaseline(name string) {
+func (flusher *statsFlusher) dropAppBaseline(name string) {
 	if flusher == nil {
 		return
 	}
@@ -2675,20 +2675,20 @@ func finalStatsFlush(ctx context.Context, flusher *statsFlusher) {
 }
 
 // recordSnapshots writes the whole stats snapshot — the global stats row and
-// one function_stats row per function with any attributed activity — in a
+// one app_stats row per app with any attributed activity — in a
 // single short transaction (see state.RecordStatsSnapshot). base is the
 // worker-owned reset baseline subtracted from every cumulative counter (nil =
 // no reset yet), so an operator reset starts the persisted totals from zero
 // while Prometheus stays monotonic. Before the write it enforces the
 // metrics/SQLite consistency invariant: it sweeps the registry with
-// SweepFunctionMetrics against state.FunctionNames, deleting any function-scoped
-// series whose function no longer has a functions row. This complements the
-// reconciler's RemoveFunction hook (which deletes series at removal time) by
+// SweepAppMetrics against state.AppNames, deleting any app-scoped
+// series whose app no longer has a apps row. This complements the
+// reconciler's RemoveApp hook (which deletes series at removal time) by
 // re-deleting series an in-flight invocation may have recreated after removal —
-// a removed function exposes NO series on /metrics, and globals are untouched.
-// The transaction first prunes orphaned function_stats rows (a removed
-// function's row is not re-created even though its registry counters are swept
-// just above). Per-function writes are bounded by the function count, so the 5s
+// a removed app exposes NO series on /metrics, and globals are untouched.
+// The transaction first prunes orphaned app_stats rows (a removed
+// app's row is not re-created even though its registry counters are swept
+// just above). Per-app writes are bounded by the app count, so the 5s
 // cadence keeps them small. A failed flush is logged and retried next tick with
 // the current absolute values; no path resets counters on failure.
 func recordSnapshots(
@@ -2697,23 +2697,23 @@ func recordSnapshots(
 	metricsInstance *metrics.Registry,
 	base *relayBaseline,
 ) {
-	// Sweep the registry against the live function set before snapshotting, so
-	// a function removed (or swept) this interval cannot persist a stale
-	// function_stats row that the orphan-prune would have to reject anyway, and
+	// Sweep the registry against the live app set before snapshotting, so
+	// an app removed (or swept) this interval cannot persist a stale
+	// app_stats row that the orphan-prune would have to reject anyway, and
 	// cannot linger on /metrics.
 	//
-	// Fail-open: if the live set cannot be read (st.FunctionNames returns
+	// Fail-open: if the live set cannot be read (st.AppNames returns
 	// ok=false), the sweep is skipped entirely rather than run against an empty
-	// map — an empty live set would delete every function-scoped series,
-	// including live functions'. Sweeping is best-effort and re-applied on the
+	// map — an empty live set would delete every app-scoped series,
+	// including live apps'. Sweeping is best-effort and re-applied on the
 	// next successful flush; RecordStatsSnapshot below already logs the DB
 	// issue, so no new logging is added here.
-	if names, ok := st.FunctionNames(); ok {
+	if names, ok := st.AppNames(); ok {
 		active := make(map[string]bool, len(names))
 		for _, name := range names {
 			active[name] = true
 		}
-		metricsInstance.SweepFunctionMetrics(active)
+		metricsInstance.SweepAppMetrics(active)
 	}
 	// RecordStatsSnapshot logs internally on error (matching the state package's
 	// non-fatal style); the returned error is only for the caller to bound the
@@ -2721,6 +2721,6 @@ func recordSnapshots(
 	_ = st.RecordStatsSnapshot(
 		ctx,
 		snapshotStats(metricsInstance, base),
-		snapshotFunctionStats(metricsInstance, base),
+		snapshotAppStats(metricsInstance, base),
 	)
 }

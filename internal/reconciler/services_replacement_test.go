@@ -9,7 +9,7 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/routing"
 	"relay/internal/runtime"
 	"relay/internal/testutil"
@@ -22,7 +22,7 @@ import (
 // service's stable identity (relay.service).
 func seedOldService(f *fakeDocker, id, fn, name, image string, port, replica int) {
 	f.ctrs[id] = &fakeContainer{
-		id: id, function: fn, entrypoint: name, image: image, port: port,
+		id: id, appName: fn, entrypoint: name, image: image, port: port,
 		replica: replica, state: container.StateRunning,
 	}
 }
@@ -34,7 +34,7 @@ func seedOldService(f *fakeDocker, id, fn, name, image string, port, replica int
 func TestReconcileReplaceStartsBeforeStoppingOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -65,7 +65,7 @@ func TestReconcileReplaceMultiReplicaPerSlotOrdering(t *testing.T) {
 	seedOldService(f, "old-0", "fn", "service.js", "img-old", 80, 0)
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 1)
 	seedOldService(f, "old-2", "fn", "service.js", "img-old", 80, 2)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 2})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -100,7 +100,7 @@ func TestReconcileReplaceStartFailurePreservesOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
 	f.failStart[0] = fmt.Errorf("start failed for replica 0")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "replica 0") {
@@ -124,7 +124,7 @@ func TestReconcileReplaceStartFailurePreservesOld(t *testing.T) {
 func TestReconcileReplaceStartFailureNoFallbackIsUnavailable(t *testing.T) {
 	f := newFakeDocker()
 	f.failStart[0] = fmt.Errorf("start failed for replica 0")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "replica 0") {
@@ -140,7 +140,7 @@ func TestReconcileReplaceStartFailureNoFallbackIsUnavailable(t *testing.T) {
 // the replacement is confirmed running before the env-stale container stops.
 func TestReconcileReplaceEnvChangeStartsBeforeStop(t *testing.T) {
 	f := newFakeDocker()
-	start := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	start := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	start.Env = map[string]string{"MODE": "a"}
 	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=a: %v", err)
@@ -153,7 +153,7 @@ func TestReconcileReplaceEnvChangeStartsBeforeStop(t *testing.T) {
 	f.events = nil
 	f.mu.Unlock()
 
-	changed := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	changed := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile env=b: %v", err)
@@ -179,7 +179,7 @@ func TestReconcileReplaceNetworkFailureDoesNotMutateOld(t *testing.T) {
 	// create fails. The fake's StartService does not model create-time network
 	// errors, so inject the failure directly.
 	f.failStart[0] = fmt.Errorf("service: create container: network backend not found")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcileNetworks(t, f, "fn", tmpl, "img-1", []string{"backend"}, routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "network backend not found") {
@@ -199,7 +199,7 @@ func TestReconcileReplaceNetworkFailureDoesNotMutateOld(t *testing.T) {
 func TestReconcileReplaceRoutingValidationFailureDoesNotMutateOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-1", 80, 0)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "svc.test"})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1, Host: "svc.test"})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}) // empty config -> validation error
 	if err == nil {
@@ -220,7 +220,7 @@ func TestReconcileReplaceResolveFailureDoesNotMutateOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
 	f.resolveErr["service.js"] = fmt.Errorf("pull failed: registry down")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "registry down") {
@@ -240,8 +240,8 @@ func TestReconcileReplaceResolveFailureDoesNotMutateOld(t *testing.T) {
 func TestReconcileReplaceMissingEnvSecretDoesNotMutateOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-1", 80, 0)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
-	tmpl.Secrets = map[string]function.SecretRef{"TOKEN": "api-token"}
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl.Secrets = map[string]app.SecretRef{"TOKEN": "api-token"}
 
 	_, err := reconcileEnv(t, f, "fn", tmpl, "img-1", nil, nil) // nil provider
 	if err == nil || !strings.Contains(err.Error(), "no secret provider") {
@@ -264,7 +264,7 @@ func TestReconcileReplaceInspectNonRunningDoesNotStopOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
 	f.failStart[0] = fmt.Errorf("service: started container is not running")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "not running") {
@@ -289,14 +289,14 @@ func TestReconcileDuplicateCandidatesDeterministicByID(t *testing.T) {
 	// replica 0). "a-dup" sorts before "z-dup".
 	converged := func(id string, port int) *fakeContainer {
 		return &fakeContainer{
-			id: id, function: "fn", entrypoint: "service.js", image: "img-1",
+			id: id, appName: "fn", entrypoint: "service.js", image: "img-1",
 			port: port, replica: 0, state: container.StateRunning,
 			envHash: serviceEnvHash(port), resources: serviceResources(),
 		}
 	}
 	f.ctrs["a-dup"] = converged("a-dup", 80)
 	f.ctrs["z-dup"] = converged("z-dup", 80)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	changed, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
 	if err != nil {
@@ -332,13 +332,13 @@ func TestReconcileRestartWithOldAndNewConverges(t *testing.T) {
 	f := newFakeDocker()
 	// B: converged for the desired img-new.
 	f.ctrs["b-new"] = &fakeContainer{
-		id: "b-new", function: "fn", entrypoint: "service.js", image: "img-new",
+		id: "b-new", appName: "fn", entrypoint: "service.js", image: "img-new",
 		port: 80, replica: 0, state: container.StateRunning,
 		envHash: serviceEnvHash(80), resources: serviceResources(),
 	}
 	// A: old generation, still running.
 	seedOldService(f, "a-old", "fn", "service.js", "img-old", 80, 0)
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -369,7 +369,7 @@ func TestReconcileRestartOldOnlyRetriesReplacement(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "a-old", "fn", "service.js", "img-old", 80, 0)
 	f.failStart[0] = fmt.Errorf("start failed for replica 0")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil {
@@ -400,7 +400,7 @@ func TestReconcileScaleUpAndDownWithReplacement(t *testing.T) {
 	t.Run("scale up", func(t *testing.T) {
 		f := newFakeDocker()
 		seedOldService(f, "old-0", "fn", "service.js", "img-old", 80, 0)
-		tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 3})
+		tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 3})
 		if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
@@ -418,7 +418,7 @@ func TestReconcileScaleUpAndDownWithReplacement(t *testing.T) {
 		seedOldService(f, "old-0", "fn", "service.js", "img-old", 80, 0)
 		seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 1)
 		seedOldService(f, "old-2", "fn", "service.js", "img-old", 80, 2)
-		tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+		tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 		if _, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
@@ -443,7 +443,7 @@ func TestReconcileRemovedServiceAllGenerationsStopped(t *testing.T) {
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if got := f.countForFunction("fn"); got != 0 {
+	if got := f.countForApp("fn"); got != 0 {
 		t.Fatalf("removed service generations left = %d, want 0", got)
 	}
 }
@@ -456,7 +456,7 @@ func TestReconcileRemovedServiceStoppedAfterDesiredStarts(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-src", "fn", "ghcr.io/acme/api:1", "ghcr.io/acme/api:1", 80, 0)
 	// New desired service plus the removed old one.
-	tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:2", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:2", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -469,14 +469,14 @@ func TestReconcileRemovedServiceStoppedAfterDesiredStarts(t *testing.T) {
 	}
 }
 
-// TestReconcileRemoveAllAndRemoveFunctionCleanAllGenerations pins that function
+// TestReconcileRemoveAllAndRemoveAppCleanAllGenerations pins that app
 // removal cleans every generation.
-func TestReconcileRemoveAllAndRemoveFunctionCleanAllGenerations(t *testing.T) {
+func TestReconcileRemoveAllAndRemoveAppCleanAllGenerations(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "a", "fn", "service.js", "img-1", 80, 0)
 	seedOldService(f, "b", "fn", "service.js", "img-2", 80, 0)
 	RemoveAll(context.Background(), f, "fn", testutil.DiscardLogger())
-	if got := f.countForFunction("fn"); got != 0 {
+	if got := f.countForApp("fn"); got != 0 {
 		t.Fatalf("containers after RemoveAll = %d, want 0", got)
 	}
 }
@@ -489,7 +489,7 @@ func TestReconcileReplaceCreateFailurePreservesOld(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 0)
 	f.failStart[0] = fmt.Errorf("service: create container: no such image")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "no such image") {
@@ -512,7 +512,7 @@ func TestReconcileStaleStopFailureIsSurfacedAndRecoverable(t *testing.T) {
 	// stop. Make the stop of the stale one fail.
 	converged := func(id string) *fakeContainer {
 		return &fakeContainer{
-			id: id, function: "fn", entrypoint: "service.js", image: "img-1",
+			id: id, appName: "fn", entrypoint: "service.js", image: "img-1",
 			port: 80, replica: 0, state: container.StateRunning,
 			envHash: serviceEnvHash(80), resources: serviceResources(),
 		}
@@ -520,7 +520,7 @@ func TestReconcileStaleStopFailureIsSurfacedAndRecoverable(t *testing.T) {
 	f.ctrs["a-keep"] = converged("a-keep")
 	f.ctrs["z-stale"] = converged("z-stale")
 	f.failStopFor = "z-stale"
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{})
 	if err == nil || !strings.Contains(err.Error(), "stop failed") {
@@ -557,7 +557,7 @@ func TestReconcileNeverRemovesLastRunningReplica(t *testing.T) {
 	seedOldService(f, "old-1", "fn", "service.js", "img-old", 80, 1)
 	seedOldService(f, "old-2", "fn", "service.js", "img-old", 80, 2)
 	f.failStart[0] = fmt.Errorf("start failed for replica 0")
-	tmpl := serviceTemplate("node24", function.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("node24", app.Service{Name: "service.js", Entrypoint: "service.js", Port: 80, Replicas: 1})
 
 	_, err := reconcile(t, f, "fn", tmpl, "img-new", routing.TraefikConfig{})
 	if err == nil {
@@ -578,7 +578,7 @@ func TestReconcileNeverRemovesLastRunningReplica(t *testing.T) {
 // TestReconcileImageRefProtectionAndExternalSemantics pins that the replacement
 // path preserves the existing image-reference semantics: the replacement spec
 // carries the resolved external reference and its content ID, and an
-// entrypoint-source replacement carries the function image; external images are
+// entrypoint-source replacement carries the app image; external images are
 // never mistaken for Relay-owned ones.
 func TestReconcileImageRefProtectionAndExternalSemantics(t *testing.T) {
 	t.Run("external image ref and content id preserved", func(t *testing.T) {
@@ -589,7 +589,7 @@ func TestReconcileImageRefProtectionAndExternalSemantics(t *testing.T) {
 		f.mu.Lock()
 		f.resolvedImages["ghcr.io/acme/api:1.2"] = "sha256:moved"
 		f.mu.Unlock()
-		tmpl := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+		tmpl := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 		if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
@@ -619,7 +619,7 @@ func TestServiceCoordinatorReplacementOrderingAndSupersede(t *testing.T) {
 	defer cancel()
 	coordinator.Start(lifecycle)
 
-	start := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	start := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	start.Env = map[string]string{"MODE": "a"}
 	coordinator.Enqueue("fn", start, "", nil)
 	if err := coordinator.Wait(context.Background()); err != nil {
@@ -634,7 +634,7 @@ func TestServiceCoordinatorReplacementOrderingAndSupersede(t *testing.T) {
 	f.mu.Lock()
 	f.events = nil
 	f.mu.Unlock()
-	changed := serviceTemplate("", function.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
+	changed := serviceTemplate("", app.Service{Name: "ghcr.io/acme/api:1.2", Image: "ghcr.io/acme/api:1.2", Port: 8080, Replicas: 1})
 	changed.Env = map[string]string{"MODE": "b"}
 	coordinator.Enqueue("fn", changed, "", nil)
 	if err := coordinator.Wait(context.Background()); err != nil {
@@ -670,8 +670,8 @@ func TestServiceCoordinatorReplacementOrderingAndSupersede(t *testing.T) {
 // removing it would take the service to zero. Each subtest seeds A running at
 // replica 0 and asserts A survives.
 func TestReconcileRenameRemovalFailurePreservesOld(t *testing.T) {
-	newTmpl := func() *function.Template {
-		return serviceTemplate("", function.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
+	newTmpl := func() *app.Template {
+		return serviceTemplate("", app.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
 	}
 
 	t.Run("resolve failure", func(t *testing.T) {
@@ -694,7 +694,7 @@ func TestReconcileRenameRemovalFailurePreservesOld(t *testing.T) {
 		f := newFakeDocker()
 		seedOldService(f, "old-a", "fn", "a", "ghcr.io/acme/api:1", 80, 0)
 		f.missingNetworks["proxy"] = true
-		tmpl := serviceTemplate("", function.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1, Host: "svc.test"})
+		tmpl := serviceTemplate("", app.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1, Host: "svc.test"})
 
 		if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{Network: "proxy"}); err == nil {
 			t.Fatal("expected the missing routing network surfaced")
@@ -762,7 +762,7 @@ func TestReconcileRenameRemovalFailurePreservesOld(t *testing.T) {
 func TestReconcileRenameSuccessRemovesOldAfterB(t *testing.T) {
 	f := newFakeDocker()
 	seedOldService(f, "old-a", "fn", "a", "ghcr.io/acme/api:1", 80, 0)
-	tmpl := serviceTemplate("", function.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
+	tmpl := serviceTemplate("", app.Service{Name: "b", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 1})
 
 	if _, err := reconcile(t, f, "fn", tmpl, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -786,7 +786,7 @@ func TestReconcileRenameSuccessRemovesOldAfterB(t *testing.T) {
 // service never drops to zero and the identity label (relay.service) is stable.
 func TestReconcileSameNameSourceChangeReplacesInPlace(t *testing.T) {
 	f := newFakeDocker()
-	start := serviceTemplate("", function.Service{Name: "api", Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 2})
+	start := serviceTemplate("", app.Service{Name: "api", Image: "ghcr.io/acme/api:1", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", start, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile v1: %v", err)
 	}
@@ -799,7 +799,7 @@ func TestReconcileSameNameSourceChangeReplacesInPlace(t *testing.T) {
 	f.mu.Unlock()
 
 	// Same name "api", new source. Both replica slots replace in place.
-	changed := serviceTemplate("", function.Service{Name: "api", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 2})
+	changed := serviceTemplate("", app.Service{Name: "api", Image: "ghcr.io/acme/api:2", Port: 80, Replicas: 2})
 	if _, err := reconcile(t, f, "fn", changed, "", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile v2: %v", err)
 	}
@@ -816,7 +816,7 @@ func TestReconcileSameNameSourceChangeReplacesInPlace(t *testing.T) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, c := range f.ctrs {
-		if c.function != "fn" || c.state != container.StateRunning {
+		if c.appName != "fn" || c.state != container.StateRunning {
 			continue
 		}
 		if c.entrypoint != "api" {
@@ -834,8 +834,8 @@ func TestReconcileSameNameSourceChangeReplacesInPlace(t *testing.T) {
 func TestReconcileSameSourceDistinctNamesAreDistinctServices(t *testing.T) {
 	f := newFakeDocker()
 	tmpl := serviceTemplate("node24",
-		function.Service{Name: "api", Entrypoint: "service.js", Port: 80, Replicas: 1},
-		function.Service{Name: "worker", Entrypoint: "service.js", Port: 81, Replicas: 1},
+		app.Service{Name: "api", Entrypoint: "service.js", Port: 80, Replicas: 1},
+		app.Service{Name: "worker", Entrypoint: "service.js", Port: 81, Replicas: 1},
 	)
 	if _, err := reconcile(t, f, "fn", tmpl, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -848,7 +848,7 @@ func TestReconcileSameSourceDistinctNamesAreDistinctServices(t *testing.T) {
 	}
 
 	// Remove the api name only; worker (same source) is untouched.
-	reduced := serviceTemplate("node24", function.Service{Name: "worker", Entrypoint: "service.js", Port: 81, Replicas: 1})
+	reduced := serviceTemplate("node24", app.Service{Name: "worker", Entrypoint: "service.js", Port: 81, Replicas: 1})
 	if _, err := reconcile(t, f, "fn", reduced, "img-1", routing.TraefikConfig{}); err != nil {
 		t.Fatalf("reconcile reduced: %v", err)
 	}

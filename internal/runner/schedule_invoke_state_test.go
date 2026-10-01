@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -44,14 +44,14 @@ func (e *stateProbeExecutor) got() (int, bool) {
 
 // TestInvokeHandlerTryStartWritesRunningBeforeExecution verifies that with
 // invocation state present, TryStart persists a running marker (attempt 1) for
-// the "<function>/<handler>" invocation BEFORE the executor runs.
+// the "<app>/<handler>" invocation BEFORE the executor runs.
 func TestInvokeHandlerTryStartWritesRunningBeforeExecution(t *testing.T) {
 	prog := newFakeInvocationState()
 	exec := &stateProbeExecutor{probe: func() (bool, bool) {
 		_, ok := prog.runningDeadline("fn/index.run")
 		return ok, ok
 	}}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
 	if err := r.InvokeHandler(ctx, "1-0", "fn", "sched", "index.run", []byte(`{}`)); err != nil {
@@ -77,7 +77,7 @@ func TestInvokeHandlerTryStartWritesRunningBeforeExecution(t *testing.T) {
 // the invocation complete and returns nil.
 func TestInvokeHandlerSuccessMarksComplete(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -100,7 +100,7 @@ func TestInvokeHandlerSuccessMarksComplete(t *testing.T) {
 // retryable error, not an exhausted or not-eligible one.
 func TestInvokeHandlerFailureRecordsRetryBackoff(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -134,7 +134,7 @@ func TestInvokeHandlerFailureRecordsRetryBackoff(t *testing.T) {
 // DLQ).
 func TestInvokeHandlerExhaustedAfterRetries(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -158,7 +158,7 @@ func TestInvokeHandlerExhaustedAfterRetries(t *testing.T) {
 // clears state).
 func TestInvokeHandlerSkipsCompletedOnRedelivery(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	prog.done["fn/index.run"] = true
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -177,7 +177,7 @@ func TestInvokeHandlerSkipsCompletedOnRedelivery(t *testing.T) {
 // message pending).
 func TestInvokeHandlerProtectedRunningNotEligible(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	now := time.Now()
 	prog.setClock(func() time.Time { return now })
@@ -195,7 +195,7 @@ func TestInvokeHandlerProtectedRunningNotEligible(t *testing.T) {
 	}
 }
 
-// TestInvokeHandlerSlotTimeoutLeavesPending verifies that when the per-function
+// TestInvokeHandlerSlotTimeoutLeavesPending verifies that when the per-app
 // concurrency slot is held and no slot frees within the (test-overridden)
 // slotWait, InvokeHandler returns ErrInvocationNotEligible and writes NO state
 // (no TryStart, no RecordFailure, no MarkComplete) — a slot timeout is never an
@@ -203,11 +203,11 @@ func TestInvokeHandlerProtectedRunningNotEligible(t *testing.T) {
 func TestInvokeHandlerSlotTimeoutLeavesPending(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", holding, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", holding, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	r.SetMaxConcurrency(1)
 	r.slotWait = 50 * time.Millisecond
 
-	// First invocation acquires the single per-function slot and blocks.
+	// First invocation acquires the single per-app slot and blocks.
 	firstDone := make(chan struct{})
 	go func() {
 		_ = r.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{}`))
@@ -233,15 +233,15 @@ func TestInvokeHandlerSlotTimeoutLeavesPending(t *testing.T) {
 	<-firstDone
 }
 
-// TestInvokeHandlerObsoleteFunctionRemoved verifies that on the production
-// (state-carrying) path, an occurrence for a function NO LONGER in the registry
+// TestInvokeHandlerObsoleteAppRemoved verifies that on the production
+// (state-carrying) path, an occurrence for an app NO LONGER in the registry
 // returns a wrapped stream.ErrInvocationObsolete — the stream ACKs the message
 // instead of retrying it forever or dead-lettering it. No invocation-state
 // method may be called (the occurrence is obsolete before TryStart).
-func TestInvokeHandlerObsoleteFunctionRemoved(t *testing.T) {
+func TestInvokeHandlerObsoleteAppRemoved(t *testing.T) {
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
-	// Registry WITHOUT the function: NewWithMetrics with an empty set.
+	// Registry WITHOUT the app: NewWithMetrics with an empty set.
 	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
 
 	err := r.InvokeHandler(ctx, "1-0", "ghost", "sched", "index.run", []byte(`{}`))
@@ -255,24 +255,24 @@ func TestInvokeHandlerObsoleteFunctionRemoved(t *testing.T) {
 }
 
 // TestInvokeHandlerObsoleteScheduleRemoved verifies that on the production path,
-// an occurrence whose function is present and available but whose SCHEDULE NAME
+// an occurrence whose app is present and available but whose SCHEDULE NAME
 // is no longer in the current template's Schedules is obsolete: returns wrapped
 // stream.ErrInvocationObsolete, no TryStart, and the executor is never called.
 func TestInvokeHandlerObsoleteScheduleRemoved(t *testing.T) {
 	exec := &countingExecutor{}
-	// Build a prepared function whose template has NO schedule entries at all.
+	// Build a prepared app whose template has NO schedule entries at all.
 	pf := NewPrepared(
-		function.Function{
+		app.App{
 			Name: "fn",
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Events:  []function.EventRule{{Handler: "index.run", Pattern: function.Pattern{}}},
+				Events:  []app.EventRule{{Handler: "index.run", Pattern: app.Pattern{}}},
 			},
 		},
 		&runtime.Prepared{Name: "fn", Image: "x"},
 		exec,
 	)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -296,19 +296,19 @@ func TestInvokeHandlerObsoleteScheduleRemoved(t *testing.T) {
 func TestInvokeHandlerHandlerChangeRunsCurrentHandler(t *testing.T) {
 	exec := &captureExecutor{}
 	pf := NewPrepared(
-		function.Function{
+		app.App{
 			Name: "fn",
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Schedules: []function.Schedule{
-					{Name: "cleanup", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout, Retries: 0},
+				Schedules: []app.Schedule{
+					{Name: "cleanup", Handler: "jobs.new", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout, Retries: 0},
 				},
 			},
 		},
 		&runtime.Prepared{Name: "fn", Image: "x"},
 		exec,
 	)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -332,19 +332,19 @@ func TestInvokeHandlerHandlerChangeRunsCurrentHandler(t *testing.T) {
 func TestInvokeHandlerRemovingOneSharedHandlerScheduleDoesNotObsoleteAnother(t *testing.T) {
 	exec := &captureExecutor{}
 	pf := NewPrepared(
-		function.Function{
+		app.App{
 			Name: "fn",
-			Template: &function.Template{
+			Template: &app.Template{
 				Runtime: "node24",
-				Schedules: []function.Schedule{
-					{Name: "a", Handler: "jobs.shared", Cron: "0 3 * * *", Location: time.UTC, Timeout: function.DefaultTimeout},
+				Schedules: []app.Schedule{
+					{Name: "a", Handler: "jobs.shared", Cron: "0 3 * * *", Location: time.UTC, Timeout: app.DefaultTimeout},
 				},
 			},
 		},
 		&runtime.Prepared{Name: "fn", Image: "x"},
 		exec,
 	)
-	r := NewWithMetrics([]*PreparedFunction{pf}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -365,15 +365,15 @@ func TestInvokeHandlerRemovingOneSharedHandlerScheduleDoesNotObsoleteAnother(t *
 	}
 }
 
-// TestInvokeHandlerUnavailableFunctionStillRetryable is the regression for the
-// conflation bug: a function that IS still in the registry but is temporarily
+// TestInvokeHandlerUnavailableAppStillRetryable is the regression for the
+// conflation bug: an app that IS still in the registry but is temporarily
 // unavailable (image build failed at startup/reconcile) must NOT be treated as
 // obsolete — it returns a plain retryable error, NOT ErrInvocationObsolete (and
 // not NotEligible/Exhausted), so the stream leaves the message pending. No
 // TryStart (the unavailable branch returns before claiming).
-func TestInvokeHandlerUnavailableFunctionStillRetryable(t *testing.T) {
+func TestInvokeHandlerUnavailableAppStillRetryable(t *testing.T) {
 	r := NewWithMetrics(
-		[]*PreparedFunction{NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}})},
+		[]*PreparedApp{NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}})},
 		testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -400,7 +400,7 @@ func TestInvokeHandlerUnavailableFunctionStillRetryable(t *testing.T) {
 // executes the handler, with no retry/exhaustion accounting.
 func TestInvokeHandlerClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	prog.startErr = errors.New("redis down")
 	ctx := stream.WithInvocationState(context.Background(), prog)
@@ -426,7 +426,7 @@ func TestInvokeHandlerClaimErrorLeavesPendingAndSkipsHandler(t *testing.T) {
 // returns nil, and no state methods are touched.
 func TestInvokeHandlerWithoutStateStillExecutes(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 
 	if err := r.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{}`)); err != nil {
 		t.Fatalf("InvokeHandler: %v", err)
@@ -436,7 +436,7 @@ func TestInvokeHandlerWithoutStateStillExecutes(t *testing.T) {
 	}
 
 	// A failing no-state invocation returns a plain error.
-	rfail := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", &countingExecutor{fail: true}, function.DefaultTimeout, function.DefaultRetries)}, testutil.DiscardLogger(), nil)
+	rfail := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", &countingExecutor{fail: true}, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
 	err := rfail.InvokeHandler(context.Background(), "1-0", "fn", "sched", "index.run", []byte(`{}`))
 	if err == nil {
 		t.Fatal("expected no-state failure to return an error")
@@ -454,7 +454,7 @@ func TestInvokeHandlerRespectsScheduleRetries(t *testing.T) {
 	// retries: 0 → a single failure exhausts immediately.
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
-	r0 := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", &countingExecutor{fail: true}, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	r0 := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", &countingExecutor{fail: true}, app.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
 	if err := r0.InvokeHandler(ctx, "1-0", "fn", "sched", "index.run", []byte(`{}`)); !errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("retries:0 err = %v, want ErrInvocationExhausted", err)
 	}
@@ -465,7 +465,7 @@ func TestInvokeHandlerRespectsScheduleRetries(t *testing.T) {
 	// retries: 4 → a single failure is retryable (recorded backoff), not terminal.
 	prog2 := newFakeInvocationState()
 	ctx2 := stream.WithInvocationState(context.Background(), prog2)
-	r4 := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", &countingExecutor{fail: true}, function.DefaultTimeout, 4)}, testutil.DiscardLogger(), nil)
+	r4 := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", &countingExecutor{fail: true}, app.DefaultTimeout, 4)}, testutil.DiscardLogger(), nil)
 	if err := r4.InvokeHandler(ctx2, "1-0", "fn", "sched", "index.run", []byte(`{}`)); err == nil || errors.Is(err, stream.ErrInvocationExhausted) {
 		t.Fatalf("retries:4 first-failure err = %v, want plain retryable", err)
 	}
@@ -481,7 +481,7 @@ func TestInvokeHandlerRespectsScheduleRetries(t *testing.T) {
 // attempt exhausts and the typed error reports attempt 1.
 func TestInvokeHandlerExhaustionCarriesHandlerAttempts(t *testing.T) {
 	exec := &countingExecutor{fail: true}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
@@ -493,7 +493,7 @@ func TestInvokeHandlerExhaustionCarriesHandlerAttempts(t *testing.T) {
 	if len(exhausted.Invocations) != 1 || exhausted.Invocations[0].Attempts != 1 {
 		t.Fatalf("Invocations = %+v, want one with attempts 1 (retries:0 → exhaustion on attempt 1)", exhausted.Invocations)
 	}
-	if exhausted.Invocations[0].Function != "fn" || exhausted.Invocations[0].Handler != "index.run" {
+	if exhausted.Invocations[0].App != "fn" || exhausted.Invocations[0].Handler != "index.run" {
 		t.Fatalf("exhausted invocation = %+v, want fn/index.run", exhausted.Invocations[0])
 	}
 	if !errors.Is(err, stream.ErrInvocationExhausted) {
@@ -508,7 +508,7 @@ func TestInvokeHandlerExhaustionCarriesHandlerAttempts(t *testing.T) {
 // (5), read back from TryStart.
 func TestInvokeHandlerTerminalSkipCarriesExhaustedAttempts(t *testing.T) {
 	exec := &countingExecutor{}
-	r := NewWithMetrics([]*PreparedFunction{schedFnRetries(t, "fn", exec, function.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
+	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", exec, app.DefaultTimeout, 0)}, testutil.DiscardLogger(), nil)
 	prog := newFakeInvocationState()
 	prog.exhausted["fn/index.run"] = 5
 	ctx := stream.WithInvocationState(context.Background(), prog)

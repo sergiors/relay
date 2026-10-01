@@ -2,7 +2,7 @@
 
 Relay consumes events from the configured Redis Stream with a consumer group.
 Each entry carries an `event` field whose value is a JSON **object**; Relay
-matches that object against every loaded function's event rules and runs the
+matches that object against every loaded app's event rules and runs the
 matching handlers.
 
 ```
@@ -26,7 +26,7 @@ redis-cli XADD events '*' event '{"event_name":"INSERT","table_name":"users"}'
 
 Relay never assumes where events originate; it only reads the stream.
 
-Events may also be created by `relay function invoke` (manual, synchronous, not
+Events may also be created by `relay app invoke` (manual, synchronous, not
 part of the stream lifecycle — see [cli.md](cli.md)) and by Relay's own schedule
 publication (see [schedules.md](schedules.md)).
 
@@ -136,7 +136,7 @@ map itself is missing.
 - Extra event fields are ignored.
 - Each rule's pattern is evaluated independently: multiple rules may match the
   same event and there is no deduplication, so every matching rule runs. Event
-  handler names are unique within a function, so each matching rule is a
+  handler names are unique within an app, so each matching rule is a
   distinct handler invocation.
 
 Example: `status: [COMPLETED, FAILED]` matches either value; an `id` field
@@ -144,15 +144,15 @@ with `- prefix: "user_"` matches `user_123` but not `123`.
 
 ## Dispatch and concurrency
 
-For each delivered message, Relay evaluates every loaded function (in sorted
-name order) and each function's rules in declaration order:
+For each delivered message, Relay evaluates every loaded app (in sorted
+name order) and each app's rules in declaration order:
 
 - **Per message, matching invocations run one at a time.** The runner iterates
-  functions and rules in a single loop and executes each matching handler in
+  apps and rules in a single loop and executes each matching handler in
   turn.
 - **Across messages, invocations run concurrently.** Distinct events (and
   distinct workers) execute simultaneously, bounded by the worker-global
-  `MAX_CONCURRENCY` and the per-function effective concurrency
+  `MAX_CONCURRENCY` and the per-app effective concurrency
   (`min(concurrency, MAX_CONCURRENCY)`).
 - A failure in one matching handler does **not** prevent the remaining matched
   handlers of that message from running. Each matching invocation gets its own
@@ -175,7 +175,7 @@ once, so handlers must be idempotent.
   that deadline skips the invocation without executing it.
 - The attempt count is the **real handler execution count**. The Redis PEL
   delivery count is diagnostic only and is not the retry driver.
-- If a matched invocation cannot run because its function is unavailable, the
+- If a matched invocation cannot run because its app is unavailable, the
   message stays pending (no handler attempt counted) and is never DLQ'd for
   unavailability alone.
 - If no concurrency slot frees within a bounded wait, the message stays pending
@@ -192,7 +192,7 @@ once, so handlers must be idempotent.
 ### Invocation state persistence
 
 Per-message invocation state is a Redis hash keyed by message and
-`<function>/<handler>`. While the message is still pending (recoverable — it can
+`<app>/<handler>`. While the message is still pending (recoverable — it can
 be redelivered from the PEL) that hash is **persistent with no TTL**, so however
 long a message sits pending its `running`/`next_attempt_at`/terminal markers are
 still there when a reclaim reads them. Only after the message has left the PEL —
@@ -207,7 +207,7 @@ in the ACK→retain window) is simply leaked, never prematurely expired.
 
 When **all** non-complete matched invocations are exhausted, the message is
 dead-lettered and then acknowledged. One entry is written **per exhausted
-invocation**, so a message matching several functions or handlers that all
+invocation**, so a message matching several apps or handlers that all
 exhaust produces one correctly-attributed entry each.
 
 - The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key).
@@ -218,17 +218,17 @@ exhaust produces one correctly-attributed entry each.
   marker becomes `exhausted:<attempt>:<token>:dlq`, so a redelivery skips the
   entries already written and writes only the missing ones.
 - Entry fields: `original_stream`, `original_id`, `group`, `consumer`, `event`,
-  `reason`, `function`, `handler`, `deliveries` (diagnostic PEL count),
+  `reason`, `app`, `handler`, `deliveries` (diagnostic PEL count),
   `handler_attempts` (real execution count), `timestamp` (RFC 3339), and an
   optional `trace` lineage. A malformed-message entry uses `-` for
-  `function`/`handler` and `handler_attempts` `0`.
+  `app`/`handler` and `handler_attempts` `0`.
 
 Manage the DLQ with `relay dlq ls` / `inspect` / `replay` / `rm` — see
 [cli.md](cli.md).
 
 ## Guarantees summary
 
-- Events are matched including functions that are currently unavailable.
+- Events are matched including apps that are currently unavailable.
 - Unmatched and malformed messages are acknowledged (malformed ones only after a
   DLQ entry is persisted).
 - No message is acknowledged while any invocation is protected, running, or

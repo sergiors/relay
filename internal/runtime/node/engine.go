@@ -1,5 +1,5 @@
 // Package node is the Node.js runtime engine. It holds the language-specific
-// preparation knowledge for Node.js (ESM) functions: the embedded bootstrap,
+// preparation knowledge for Node.js (ESM) apps: the embedded bootstrap,
 // the dependency handling (package-lock.json / package.json), the TypeScript
 // handler transpilation, and the container entrypoint. It does NOT run docker
 // build or generate Dockerfiles; it produces a generic runtime.BuildPlan that
@@ -34,7 +34,7 @@ const pkgFile = "package.json"
 const lockFile = "package-lock.json"
 
 // tsconfigFile is the optional TypeScript compiler configuration esbuild reads
-// when it is present in the function directory. Relay never type-checks; the
+// when it is present in the app directory. Relay never type-checks; the
 // file only supplies compilerOptions (strict, experimentalDecorators, paths,
 // ...) that shape the transpilation.
 const tsconfigFile = "tsconfig.json"
@@ -62,7 +62,7 @@ const (
 )
 
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
-// Relay function so the container never runs as root and the identity is stable
+// Relay app so the container never runs as root and the identity is stable
 // across images and rebuilds; the numeric id is what the kernel enforces, so the
 // user/group name is cosmetic. node:24-alpine (BusyBox) has no pre-created user,
 // so the Dockerfile creates one at build time via UserSetup. Node needs only read
@@ -78,7 +78,7 @@ const (
 	userSetup = "addgroup -g 10001 app && adduser -D -u 10001 -G app -h /home/app -s /sbin/nologin app && chown -R 10001:10001 /app /relay"
 )
 
-// esmPackageJSON is a minimal package.json injected when the function has none,
+// esmPackageJSON is a minimal package.json injected when the app has none,
 // so that .js files are interpreted as ESM.
 var esmPackageJSON = func() []byte {
 	b, err := json.Marshal(map[string]string{"type": "module"})
@@ -111,16 +111,16 @@ func (s handlerSource) outPath() string {
 	return path.Join(workDir, strings.TrimSuffix(s.rel, ext)+".mjs")
 }
 
-// Plan returns the generic build plan for a Node.js function. It only inspects
+// Plan returns the generic build plan for a Node.js app. It only inspects
 // fnDir (for package-lock.json, package.json, tsconfig.json, and the handler
 // sources) and never writes into it; any injected file is returned for the
 // builder to write.
 //
-// handlers are the handler MODULE parts declared by the function's template
+// handlers are the handler MODULE parts declared by the app's template
 // (sorted and deduped by the caller). Each is resolved to a source file under
 // fnDir; a TypeScript source is transpiled to a generated .mjs at BUILD time
 // with a pinned esbuild, and the existing bootstrap then executes the generated
-// file unchanged. A JavaScript source needs no build work, so a function with no
+// file unchanged. A JavaScript source needs no build work, so an app with no
 // TypeScript handlers produces no Install step at all. A module that resolves to
 // neither a JS nor a TS source — or to both — fails Plan, turning what would be a
 // per-invocation "module not found" into a deterministic build-time error.
@@ -131,8 +131,8 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		Mode:    fs.FileMode(0o644),
 	}}
 
-	// A package.json / package-lock.json declares the function's dependencies:
-	// a reusable layer that installs them into /app (the function WORKDIR).
+	// A package.json / package-lock.json declares the app's dependencies:
+	// a reusable layer that installs them into /app (the app WORKDIR).
 	var deps plan.Deps
 
 	lockErr := stat(fnDir, lockFile)
@@ -255,7 +255,7 @@ func resolveHandlerSource(fnDir, module string) (handlerSource, error) {
 	}
 }
 
-// validateHandlerModule rejects a module part that could escape the function
+// validateHandlerModule rejects a module part that could escape the app
 // directory when its dots are turned into path separators. Every dot-separated
 // segment must be non-empty and must not be "." or "..". (A literal ".." always
 // yields an empty segment under this split, so the rule covers traversal forms
@@ -322,7 +322,7 @@ func firstExisting(fnDir string, candidates []string) string {
 // from the dependency layer; --format=esm and the .mjs output make the result
 // unconditionally ESM, which the bootstrap imports dynamically; --target is the
 // runtime spec name (e.g. node24) so the emitted syntax matches the managed Node.
-// --tsconfig is added only when the function ships a tsconfig.json.
+// --tsconfig is added only when the app ships a tsconfig.json.
 //
 // Shell safety: every value interpolated into the RUN is passed through
 // shellQuoteArg, so a handler-derived path (a user may name a source file with

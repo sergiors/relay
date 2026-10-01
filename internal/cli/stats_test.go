@@ -183,13 +183,13 @@ func TestStatsCommand(t *testing.T) {
 
 // `relay stats reset` with no running worker falls back to the state database:
 // it prints the exact confirmation line, zeroes the global cumulative counters
-// and every function_stats row IN PLACE, but PRESERVES the live backlog gauges.
+// and every app_stats row IN PLACE, but PRESERVES the live backlog gauges.
 // A following bare `relay stats` renders zeros for the counters and the
 // preserved gauge value.
 func TestStatsResetCommand(t *testing.T) {
 	st, deps := seedStatsState(t)
-	st.RecordFunctionStats(state.FunctionStats{
-		Function:           "alpha",
+	st.RecordAppStats(state.AppStats{
+		App:                "alpha",
 		EventsMatchedTotal: 9,
 		WarmAcquiresTotal:  3,
 		LastExecutionAt:    time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
@@ -203,7 +203,7 @@ func TestStatsResetCommand(t *testing.T) {
 		t.Fatalf("stats reset stdout = %q, want %q", out, "Stats reset\n")
 	}
 
-	// Persisted state: global counters zeroed, gauges preserved, function rows
+	// Persisted state: global counters zeroed, gauges preserved, app rows
 	// reset in place (not deleted).
 	s, ok := st.Stats()
 	if !ok {
@@ -217,12 +217,12 @@ func TestStatsResetCommand(t *testing.T) {
 	if s.PendingEntries != 17 || s.OldestPendingAgeSeconds != 134 {
 		t.Fatalf("backlog gauges must be preserved: %+v", s)
 	}
-	all := st.AllFunctionStats()
-	if len(all) != 1 || all[0].Function != "alpha" {
-		t.Fatalf("function_stats rows must be preserved: %+v", all)
+	all := st.AllAppStats()
+	if len(all) != 1 || all[0].App != "alpha" {
+		t.Fatalf("app_stats rows must be preserved: %+v", all)
 	}
 	if all[0].EventsMatchedTotal != 0 || all[0].WarmAcquiresTotal != 0 || all[0].LastExecutionAt != "" {
-		t.Fatalf("function_stats must be zeroed in place: %+v", all[0])
+		t.Fatalf("app_stats must be zeroed in place: %+v", all[0])
 	}
 
 	// A follow-up bare `relay stats` still renders the table (the parent Action

@@ -20,8 +20,8 @@ type Spec struct {
 	BaseImage string
 	// ToolCopies are external-image COPY --from directives every image for this
 	// runtime needs (e.g. a pinned tool binary). They are applied to BOTH the
-	// function image and its dependency base image, because the dependency image
-	// is built FROM BaseImage (not from the function image) and still needs the
+	// app image and its dependency base image, because the dependency image
+	// is built FROM BaseImage (not from the app image) and still needs the
 	// tool to run its install. Empty when the runtime needs no external tool.
 	ToolCopies []ImageCopy
 }
@@ -51,21 +51,21 @@ type ImageCopy struct {
 	Dest string
 }
 
-// BuildPlan is how a function directory becomes an image. Engines answer "what
+// BuildPlan is how an app directory becomes an image. Engines answer "what
 // does this runtime need?" by producing a plan; the Docker builder answers "how
 // do I build the image?" by rendering it into a single generic Dockerfile.
-// Deps describes the function's dependencies as a reusable layer: the manifest
-// files the engine reads (paths relative to the function dir), the install
+// Deps describes the app's dependencies as a reusable layer: the manifest
+// files the engine reads (paths relative to the app dir), the install
 // command, and the directory the dependencies land in. Zero value = no deps.
 type Deps struct {
-	// Files are the dependency manifest files, RELATIVE to the function dir
+	// Files are the dependency manifest files, RELATIVE to the app dir
 	// (e.g. "requirements.txt"; node: "package.json", "package-lock.json").
 	Files []string
 	// Install is the shell command that installs the dependencies from the
 	// manifest files into InstallDir, run inside the dependency-image build.
 	Install string
 	// Dir is the absolute path the dependencies are installed into (the layer's
-	// payload; e.g. /app). It must equal the function image's WorkDir so a
+	// payload; e.g. /app). It must equal the app image's WorkDir so a
 	// FROM of the dependency image inherits everything in place.
 	Dir string
 }
@@ -98,10 +98,10 @@ type BuildPlan struct {
 	// Files are additional files for the builder to write (the bootstrap, an
 	// injected package.json, etc.).
 	Files []File
-	// Deps is the function's reusable dependency layer (manifest files +
+	// Deps is the app's reusable dependency layer (manifest files +
 	// install command + install directory). When non-zero, the builder renders
 	// a separate dependency image whose contents are installed into Deps.Dir,
-	// and the function image's Dockerfile builds FROM that dependency image
+	// and the app image's Dockerfile builds FROM that dependency image
 	// instead of BaseImage. Zero value = no dependency layer.
 	Deps Deps
 	// Install are shell commands run inside the image at build time. With the

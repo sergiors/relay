@@ -11,7 +11,7 @@ import (
 
 // dlqPayload builds the flat field map for ONE DLQ entry, corresponding to one
 // exhausted invocation (or, for a malformed message that never reached a
-// handler, a single entry with placeholder function/handler and an explicit 0
+// handler, a single entry with placeholder app/handler and an explicit 0
 // handler_attempts). Keeping it flat (no nested JSON) keeps the entry easy to
 // inspect with redis-cli and re-drive by hand.
 //
@@ -29,8 +29,8 @@ import (
 //     pre-handler) it is explicitly 0, never fabricated from the delivery
 //     count.
 //
-// "function" and "handler" identify the exact exhausted invocation so a message
-// matching several functions/handlers produces one precisely-attributed entry
+// "app" and "handler" identify the exact exhausted invocation so a message
+// matching several apps/handlers produces one precisely-attributed entry
 // each. The malformed-message path has no invocation, so it carries the "-"
 // placeholder for both.
 //
@@ -40,7 +40,7 @@ import (
 // path, or tracing disabled), so every existing entry's field shape is
 // unchanged; baggage is never recorded.
 func dlqPayload(
-	stream, id, group, consumer, event, reason, function, handler string,
+	stream, id, group, consumer, event, reason, app, handler string,
 	deliveries int64, handlerAttempts int, trace string,
 ) map[string]any {
 	fields := map[string]any{
@@ -50,7 +50,7 @@ func dlqPayload(
 		"consumer":         consumer,
 		"event":            event,
 		"reason":           reason,
-		"function":         function,
+		"app":              app,
 		"handler":          handler,
 		"deliveries":       deliveries,
 		"handler_attempts": handlerAttempts,
@@ -62,7 +62,7 @@ func dlqPayload(
 	return fields
 }
 
-// dlqNoHandler is the function/handler placeholder for a DLQ entry that has no
+// dlqNoHandler is the app/handler placeholder for a DLQ entry that has no
 // handler invocation to attribute (a malformed message routed pre-handler). It
 // mirrors eventString's "-" fallback so every DLQ entry keeps the same flat,
 // always-present field shape.
@@ -82,7 +82,7 @@ func exhaustedInvocationsFromError(err error) []ExhaustedInvocation {
 	}
 	out := make([]ExhaustedInvocation, 0, len(exhausted.Invocations))
 	for _, iv := range exhausted.Invocations {
-		if iv.Attempts > 0 && iv.Function != "" && iv.Handler != "" {
+		if iv.Attempts > 0 && iv.App != "" && iv.Handler != "" {
 			out = append(out, iv)
 		}
 	}
@@ -95,11 +95,11 @@ func exhaustedInvocationsFromError(err error) []ExhaustedInvocation {
 // (the malformed-message path), so routeToDLQ neither checks nor marks
 // persistence for it.
 type dlqEntrySpec struct {
-	function string
+	app      string
 	handler  string
 	attempts int
 	reason   string
-	// invocation is the "<function>/<handler>" ID used to record this entry's
+	// invocation is the "<app>/<handler>" ID used to record this entry's
 	// persistence in the invocation-state hash. It is empty when there is no
 	// invocation (malformed message routed pre-handler).
 	invocation string
@@ -117,25 +117,25 @@ type dlqEntrySpec struct {
 }
 
 // dlqEntrySpecs expands the runner's terminal exhaustion error into one DLQ
-// entry per exhausted invocation. A message matching several functions or
+// entry per exhausted invocation. A message matching several apps or
 // handlers is therefore dead-lettered as one precisely-attributed entry each,
 // with its own attempt count and reason. When the error carries no typed
 // invocation metadata (a malformed message routed pre-handler), a single
-// placeholder entry is produced with "-" function/handler and an explicit 0
+// placeholder entry is produced with "-" app/handler and an explicit 0
 // handler_attempts, never a fabricated count.
 func dlqEntrySpecs(reason error) []dlqEntrySpec {
 	invocations := exhaustedInvocationsFromError(reason)
 	if len(invocations) == 0 {
 		return []dlqEntrySpec{{
-			function: dlqNoHandler,
-			handler:  dlqNoHandler,
-			reason:   reason.Error(),
+			app:     dlqNoHandler,
+			handler: dlqNoHandler,
+			reason:  reason.Error(),
 		}}
 	}
 	specs := make([]dlqEntrySpec, 0, len(invocations))
 	seen := make(map[string]bool, len(invocations))
 	for _, iv := range invocations {
-		// Duplicate "<function>/<handler>" metadata in the aggregate collapses
+		// Duplicate "<app>/<handler>" metadata in the aggregate collapses
 		// to one entry: a parsed template rejects duplicate event handlers, but
 		// this defensive dedup keeps the contract ("one entry per exhausted
 		// invocation") explicit. The persistence-marker skip would also cover
@@ -145,7 +145,7 @@ func dlqEntrySpecs(reason error) []dlqEntrySpec {
 		}
 		seen[iv.Invocation()] = true
 		specs = append(specs, dlqEntrySpec{
-			function:   iv.Function,
+			app:        iv.App,
 			handler:    iv.Handler,
 			attempts:   iv.Attempts,
 			reason:     ErrInvocationExhausted.Error() + ": " + iv.Reason(),

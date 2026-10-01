@@ -55,7 +55,7 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 		Usage: "Inspect and replay dead-lettered events",
 		Description: "List, inspect, replay, and remove entries from the Relay DLQ " +
 			"stream (relay:<stream>:dlq). Replay re-executes one entry's exact " +
-			"function and handler once on the running worker's live runtime pool.",
+			"app and handler once on the running worker's live runtime pool.",
 		Action: namespaceAction(),
 		Commands: []*cli.Command{
 			dlqLsCommand(logger, deps),
@@ -68,13 +68,13 @@ func dlqCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 
 // dlqLsCommand builds `relay dlq ls`: a concise table of the DLQ entries in
 // Redis stream order (ascending entry ID), one row per entry. The row shows the
-// entry ID, the original message identity, the exact failed function/handler and
+// entry ID, the original message identity, the exact failed app/handler and
 // its handler attempt count, and the entry's age.
 func dlqLsCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:        "ls",
 		Usage:       "List DLQ entries",
-		Description: "List every DLQ entry in stream order: entry ID, source message, failed function/handler, handler attempts, and age.",
+		Description: "List every DLQ entry in stream order: entry ID, source message, failed app/handler, handler attempts, and age.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.Args().Present() {
 				return cli.Exit("dlq ls: too many arguments", 2)
@@ -111,17 +111,17 @@ func dlqInspectCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 }
 
 // dlqReplayCommand builds `relay dlq replay ID`: it reads the entry's exact
-// stored function, handler, and event, asks the running worker over its query
+// stored app, handler, and event, asks the running worker over its query
 // socket to execute exactly that one handler once against the live runtime, and
 // deletes only that DLQ entry after the execution succeeds. On any failure — a
-// removed function/handler, a failed handler, or an unavailable worker — the
+// removed app/handler, a failed handler, or an unavailable worker — the
 // entry is retained and a concise error is returned.
 func dlqReplayCommand(logger *slog.Logger, deps Dependencies) *cli.Command {
 	return &cli.Command{
 		Name:      "replay",
 		Usage:     "Replay one DLQ entry",
 		UsageText: "relay dlq replay ID",
-		Description: "Re-execute one DLQ entry's exact function and handler once on the " +
+		Description: "Re-execute one DLQ entry's exact app and handler once on the " +
 			"running worker, then delete the entry on success. The entry is kept on failure.",
 		Arguments: []cli.Argument{
 			&cli.StringArgs{Name: "id", Min: 1, Max: 1},
@@ -193,12 +193,12 @@ func dlqList(ctx context.Context, w io.Writer, store DLQStore) error {
 	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tORIGINAL\tFUNCTION\tHANDLER\tATTEMPTS\tAGE")
+	fmt.Fprintln(tw, "ID\tORIGINAL\tAPP\tHANDLER\tATTEMPTS\tAGE")
 	for _, e := range entries {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
 			e.ID,
 			originalRef(e),
-			e.Function,
+			e.App,
 			e.Handler,
 			e.HandlerAttempts,
 			state.RelativeAgo(e.Timestamp),
@@ -228,7 +228,7 @@ func dlqInspect(ctx context.Context, w io.Writer, store DLQStore, id string) err
 	fmt.Fprintf(tw, "Original ID:\t%s\n", entry.OriginalID)
 	fmt.Fprintf(tw, "Group:\t%s\n", entry.Group)
 	fmt.Fprintf(tw, "Consumer:\t%s\n", entry.Consumer)
-	fmt.Fprintf(tw, "Function:\t%s\n", entry.Function)
+	fmt.Fprintf(tw, "App:\t%s\n", entry.App)
 	fmt.Fprintf(tw, "Handler:\t%s\n", entry.Handler)
 	fmt.Fprintf(tw, "Handler attempts:\t%d\n", entry.HandlerAttempts)
 	fmt.Fprintf(tw, "Deliveries:\t%d\n", entry.Deliveries)
@@ -245,16 +245,16 @@ func dlqInspect(ctx context.Context, w io.Writer, store DLQStore, id string) err
 	return nil
 }
 
-// dlqReplay reads one entry, replays its exact stored function/handler/event
+// dlqReplay reads one entry, replays its exact stored app/handler/event
 // through the running worker socket, and — only when the execution succeeds —
 // deletes exactly that entry. Any failure (unknown ID, a non-replayable entry,
-// an unavailable worker, a removed function/handler, or a failed handler)
+// an unavailable worker, a removed app/handler, or a failed handler)
 // returns a concise error and leaves the entry in place. It never consults event
 // matching or writes broker state: the worker's ReplayDLQ executes exactly the
 // recorded handler once.
 //
 // A non-replayable entry is rejected before dialing: a malformed-message
-// placeholder has no function/handler to re-execute and an event that is not
+// placeholder has no app/handler to re-execute and an event that is not
 // JSON, so replay would otherwise attempt to encode invalid JSON and report a
 // misleading socket-unavailability error. The entry is kept for inspection or
 // removal.
@@ -267,10 +267,10 @@ func dlqReplay(ctx context.Context, w io.Writer, store DLQStore, socketPath, id 
 		return fmt.Errorf("unknown DLQ entry %q", id)
 	}
 	if !entry.Replayable() {
-		return fmt.Errorf("DLQ entry %q is not replayable: no function/handler to re-execute (malformed-message placeholder)", id)
+		return fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder)", id)
 	}
 
-	if err := worker.ReplayDLQ(ctx, socketPath, entry.Function, entry.Handler, []byte(entry.Event), entry.Trace); err != nil {
+	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, []byte(entry.Event), entry.Trace); err != nil {
 		return fmt.Errorf("replay %s: %w", id, err)
 	}
 

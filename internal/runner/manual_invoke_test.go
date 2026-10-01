@@ -7,37 +7,37 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
 	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
-// invokeFn builds a prepared function from a parsed YAML template, so the
+// invokeFn builds a prepared app from a parsed YAML template, so the
 // manual-invocation tests exercise the real matcher (parsed patterns), not a
 // hand-built any-event rule. It fails the test on a parse error.
-func invokeFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedFunction {
+func invokeFn(t *testing.T, name, tmplYAML string, exec Executor) *PreparedApp {
 	t.Helper()
-	tmpl, err := function.ParseTemplate([]byte(tmplYAML))
+	tmpl, err := app.ParseTemplate([]byte(tmplYAML))
 	if err != nil {
 		t.Fatalf("parse template: %v", err)
 	}
 	return NewPrepared(
-		function.Function{Name: name, Template: tmpl},
+		app.App{Name: name, Template: tmpl},
 		&runtime.Prepared{Name: name, Image: "x"},
 		exec,
 	)
 }
 
-// TestInvokeFunctionExecutesMatchingHandler verifies the successful single-rule
+// TestInvokeAppExecutesMatchingHandler verifies the successful single-rule
 // case: the matching handler runs on the executor with the marshalled event and
 // a RunMeta classified as an event invocation, and the handler-execution metrics
 // are recorded.
-func TestInvokeFunctionExecutesMatchingHandler(t *testing.T) {
+func TestInvokeAppExecutesMatchingHandler(t *testing.T) {
 	exec := &captureExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: events.created.handler
     pattern:
@@ -45,9 +45,9 @@ events:
 `, exec)}, testutil.DiscardLogger(), m)
 
 	event := map[string]any{"event_name": "INSERT", "id": 7}
-	invoked, err := r.InvokeFunction(context.Background(), "fn", event)
+	invoked, err := r.InvokeApp(context.Background(), "fn", event)
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 1 {
 		t.Fatalf("invoked = %d, want 1", invoked)
@@ -64,8 +64,8 @@ events:
 	if meta.Type != runtime.ContainerTypeEvent {
 		t.Fatalf("RunMeta.Type = %q, want %q", meta.Type, runtime.ContainerTypeEvent)
 	}
-	if meta.Function != "fn" || meta.Handler != "events.created.handler" {
-		t.Fatalf("RunMeta function/handler = %q/%q", meta.Function, meta.Handler)
+	if meta.App != "fn" || meta.Handler != "events.created.handler" {
+		t.Fatalf("RunMeta function/handler = %q/%q", meta.App, meta.Handler)
 	}
 	if meta.MessageID != "" {
 		t.Fatalf("RunMeta.MessageID = %q, want empty (no stream message)", meta.MessageID)
@@ -75,16 +75,16 @@ events:
 	if !strings.Contains(got, "handler_success_total count=1") {
 		t.Fatalf("expected handler_success_total; got:\n%s", got)
 	}
-	if !strings.Contains(got, "function_handler_success_total{function=fn} count=1") {
+	if !strings.Contains(got, "function_handler_success_total{app=fn} count=1") {
 		t.Fatalf("expected per-function success; got:\n%s", got)
 	}
 }
 
-// TestInvokeFunctionMultipleMatchingRules verifies every matching rule runs, in
+// TestInvokeAppMultipleMatchingRules verifies every matching rule runs, in
 // declaration order, and the returned count reflects all of them.
-func TestInvokeFunctionMultipleMatchingRules(t *testing.T) {
+func TestInvokeAppMultipleMatchingRules(t *testing.T) {
 	exec := &captureExecutor{}
-	r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: first.run
     pattern:
@@ -97,9 +97,9 @@ events:
       event_name: [MODIFY]
 `, exec)}, testutil.DiscardLogger())
 
-	invoked, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
+	invoked, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 2 {
 		t.Fatalf("invoked = %d, want 2 (only matching rules)", invoked)
@@ -112,21 +112,21 @@ events:
 	}
 }
 
-// TestInvokeFunctionNoMatchingRules verifies a non-matching event is a
+// TestInvokeAppNoMatchingRules verifies a non-matching event is a
 // successful no-op: zero handlers, no error, no execution, and no metrics.
-func TestInvokeFunctionNoMatchingRules(t *testing.T) {
+func TestInvokeAppNoMatchingRules(t *testing.T) {
 	exec := &countingExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: events.created.handler
     pattern:
       event_name: [INSERT]
 `, exec)}, testutil.DiscardLogger(), m)
 
-	invoked, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "DELETE"})
+	invoked, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "DELETE"})
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 0 {
 		t.Fatalf("invoked = %d, want 0", invoked)
@@ -134,19 +134,19 @@ events:
 	if exec.count() != 0 {
 		t.Fatalf("executor calls = %d, want 0", exec.count())
 	}
-	if fs := m.FunctionStatsSnapshot(); len(fs) != 0 {
+	if fs := m.AppStatsSnapshot(); len(fs) != 0 {
 		t.Fatalf("function stats = %+v, want none for a no-match invocation", fs)
 	}
 }
 
-// TestInvokeFunctionFailureRunsLaterHandlers verifies a failure in one matching
+// TestInvokeAppFailureRunsLaterHandlers verifies a failure in one matching
 // handler does not prevent later matching handlers from running, and the first
 // failure is returned after all handlers were attempted.
-func TestInvokeFunctionFailureRunsLaterHandlers(t *testing.T) {
+func TestInvokeAppFailureRunsLaterHandlers(t *testing.T) {
 	failing := &countingExecutor{fail: true}
 	// Two rules sharing one executor: the executor fails for the first rule, but
 	// the second rule must still be attempted.
-	r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: first.run
     pattern:
@@ -156,7 +156,7 @@ events:
       event_name: [INSERT]
 `, failing)}, testutil.DiscardLogger())
 
-	invoked, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
+	invoked, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
 	if err == nil {
 		t.Fatal("expected a failure error")
 	}
@@ -171,19 +171,19 @@ events:
 	}
 }
 
-// TestInvokeFunctionUnknownFunction verifies an absent function is reported with
+// TestInvokeAppUnknownApp verifies an absent app is reported with
 // the stable not-found sentinel and nothing executes.
-func TestInvokeFunctionUnknownFunction(t *testing.T) {
+func TestInvokeAppUnknownApp(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{invokeFn(t, "present", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "present", `runtime: node24
 events:
   - handler: index.run
     pattern: {}
 `, exec)}, testutil.DiscardLogger())
 
-	invoked, err := r.InvokeFunction(context.Background(), "ghost", map[string]any{"x": 1})
-	if !errors.Is(err, ErrFunctionNotFound) {
-		t.Fatalf("err = %v, want ErrFunctionNotFound", err)
+	invoked, err := r.InvokeApp(context.Background(), "ghost", map[string]any{"x": 1})
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Fatalf("err = %v, want ErrAppNotFound", err)
 	}
 	if invoked != 0 {
 		t.Fatalf("invoked = %d, want 0", invoked)
@@ -193,29 +193,29 @@ events:
 	}
 }
 
-// TestInvokeFunctionUnavailableFunction verifies a registered but unrunnable
-// function is reported with the stable unavailable sentinel.
-func TestInvokeFunctionUnavailableFunction(t *testing.T) {
-	r := New([]*PreparedFunction{
-		NewUnavailable(function.Function{Name: "broken", Template: &function.Template{Runtime: "node24"}}),
+// TestInvokeAppUnavailableApp verifies a registered but unrunnable
+// app is reported with the stable unavailable sentinel.
+func TestInvokeAppUnavailableApp(t *testing.T) {
+	r := New([]*PreparedApp{
+		NewUnavailable(app.App{Name: "broken", Template: &app.Template{Runtime: "node24"}}),
 	}, testutil.DiscardLogger())
 
-	invoked, err := r.InvokeFunction(context.Background(), "broken", map[string]any{"x": 1})
-	if !errors.Is(err, ErrFunctionUnavailable) {
-		t.Fatalf("err = %v, want ErrFunctionUnavailable", err)
+	invoked, err := r.InvokeApp(context.Background(), "broken", map[string]any{"x": 1})
+	if !errors.Is(err, ErrAppUnavailable) {
+		t.Fatalf("err = %v, want ErrAppUnavailable", err)
 	}
 	if invoked != 0 {
 		t.Fatalf("invoked = %d, want 0", invoked)
 	}
 }
 
-// TestInvokeFunctionWritesNoBrokerState verifies manual invocation never touches
+// TestInvokeAppWritesNoBrokerState verifies manual invocation never touches
 // stream invocation state, even when one is present in the context: no
 // classification claim, no per-invocation marks, no retry backoffs, no
 // exhaustion.
-func TestInvokeFunctionWritesNoBrokerState(t *testing.T) {
+func TestInvokeAppWritesNoBrokerState(t *testing.T) {
 	exec := &countingExecutor{}
-	r := New([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := New([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: index.run
     pattern: {}
@@ -224,9 +224,9 @@ events:
 	prog := newFakeInvocationState()
 	ctx := stream.WithInvocationState(context.Background(), prog)
 
-	invoked, err := r.InvokeFunction(ctx, "fn", map[string]any{"event_name": "INSERT"})
+	invoked, err := r.InvokeApp(ctx, "fn", map[string]any{"event_name": "INSERT"})
 	if err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	if invoked != 1 {
 		t.Fatalf("invoked = %d, want 1", invoked)
@@ -245,20 +245,20 @@ events:
 	}
 }
 
-// TestInvokeFunctionNoEventClassificationCounters verifies manual invocation
+// TestInvokeAppNoEventClassificationCounters verifies manual invocation
 // never increments the events_received/matched/unmatched partition or the
-// per-function events-matched counter, even though handler execution metrics
+// per-app events-matched counter, even though handler execution metrics
 // (which reflect a real execution) are recorded.
-func TestInvokeFunctionNoEventClassificationCounters(t *testing.T) {
+func TestInvokeAppNoEventClassificationCounters(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: index.run
     pattern: {}
 `, &countingExecutor{})}, testutil.DiscardLogger(), m)
 
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err != nil {
+		t.Fatalf("InvokeApp: %v", err)
 	}
 
 	got := m.Snapshot()
@@ -266,7 +266,7 @@ events:
 		"events_received_total",
 		"events_matched_total",
 		"events_unmatched_total",
-		"function_events_matched_total",
+		"app_events_matched_total",
 		"retries_total",
 		"dlq_entries_total",
 	} {
@@ -280,18 +280,18 @@ events:
 	}
 }
 
-// TestInvokeFunctionNoRetryOrDLQOnFailure verifies a manual-invocation failure
+// TestInvokeAppNoRetryOrDLQOnFailure verifies a manual-invocation failure
 // records the handler-failure execution metrics (it is a real failed execution)
 // but never a retry or DLQ counter: there is no broker retry lifecycle.
-func TestInvokeFunctionNoRetryOrDLQOnFailure(t *testing.T) {
+func TestInvokeAppNoRetryOrDLQOnFailure(t *testing.T) {
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: index.run
     pattern: {}
 `, &countingExecutor{fail: true})}, testutil.DiscardLogger(), m)
 
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err == nil {
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"}); err == nil {
 		t.Fatal("expected failure")
 	}
 	got := m.Snapshot()
@@ -303,19 +303,19 @@ events:
 	}
 }
 
-// TestInvokeFunctionResolvesEnvAndSecrets verifies manual invocation reuses the
+// TestInvokeAppResolvesEnvAndSecrets verifies manual invocation reuses the
 // per-invocation env/secret resolution, exactly like the event and schedule
 // paths.
-func TestInvokeFunctionResolvesEnvAndSecrets(t *testing.T) {
+func TestInvokeAppResolvesEnvAndSecrets(t *testing.T) {
 	exec := &captureExecutor{}
 	pf := fnWithEnv(t, "fn", exec,
 		map[string]string{"API_URL": "https://api.example.com"},
-		map[string]function.SecretRef{"DATABASE_URL": "db-url"})
-	r := New([]*PreparedFunction{pf}, testutil.DiscardLogger())
+		map[string]app.SecretRef{"DATABASE_URL": "db-url"})
+	r := New([]*PreparedApp{pf}, testutil.DiscardLogger())
 	r.SetSecretProvider(&fakeProvider{vals: map[string]string{"db-url": "postgres://secret"}})
 
-	if _, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"x": 1}); err != nil {
-		t.Fatalf("InvokeFunction: %v", err)
+	if _, err := r.InvokeApp(context.Background(), "fn", map[string]any{"x": 1}); err != nil {
+		t.Fatalf("InvokeApp: %v", err)
 	}
 	joined := strings.Join(exec.gotEnv(), " ")
 	for _, want := range []string{"API_URL=https://api.example.com", "DATABASE_URL=postgres://secret"} {
@@ -325,17 +325,17 @@ func TestInvokeFunctionResolvesEnvAndSecrets(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionTimeoutCap verifies the per-rule timeout is capped at the
+// TestInvokeAppTimeoutCap verifies the per-rule timeout is capped at the
 // configured maximum exactly like Handle: the executor observes the cap, not the
-// larger rule timeout. The function is built directly (not parsed) so the rule
+// larger rule timeout. The app is built directly (not parsed) so the rule
 // can carry a timeout above the template-validation cap, isolating the runner's
 // runtime cap as the thing under test.
-func TestInvokeFunctionTimeoutCap(t *testing.T) {
-	r := New([]*PreparedFunction{fnWithTimeout(t, "fn", time.Hour, ctxAwareExecutor{})}, testutil.DiscardLogger())
+func TestInvokeAppTimeoutCap(t *testing.T) {
+	r := New([]*PreparedApp{fnWithTimeout(t, "fn", time.Hour, ctxAwareExecutor{})}, testutil.DiscardLogger())
 	r.SetMaxHandlerTimeout(50 * time.Millisecond)
 
 	start := time.Now()
-	_, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"x": 1})
+	_, err := r.InvokeApp(context.Background(), "fn", map[string]any{"x": 1})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected a deadline error from the capped handler")
@@ -345,16 +345,16 @@ func TestInvokeFunctionTimeoutCap(t *testing.T) {
 	}
 }
 
-// TestInvokeFunctionMixedOutcomesAttributeMetrics verifies a mixed multi-rule
-// run records one per-function success and one per-handler failure for the same
-// function, with the last_success/last_failure timestamps advanced and no event
+// TestInvokeAppMixedOutcomesAttributeMetrics verifies a mixed multi-rule
+// run records one per-app success and one per-handler failure for the same
+// app, with the last_success/last_failure timestamps advanced and no event
 // classification.
-func TestInvokeFunctionMixedOutcomesAttributeMetrics(t *testing.T) {
+func TestInvokeAppMixedOutcomesAttributeMetrics(t *testing.T) {
 	// The first rule fails, the second succeeds. Both share one executor that
 	// fails only its first call.
 	exec := &flipExecutor{}
 	m := metrics.New()
-	r := NewWithMetrics([]*PreparedFunction{invokeFn(t, "fn", `runtime: node24
+	r := NewWithMetrics([]*PreparedApp{invokeFn(t, "fn", `runtime: node24
 events:
   - handler: first.run
     pattern:
@@ -364,7 +364,7 @@ events:
       event_name: [INSERT]
 `, exec)}, testutil.DiscardLogger(), m)
 
-	invoked, err := r.InvokeFunction(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
+	invoked, err := r.InvokeApp(context.Background(), "fn", map[string]any{"event_name": "INSERT"})
 	if err == nil {
 		t.Fatal("expected the first handler to fail")
 	}
@@ -372,12 +372,12 @@ events:
 		t.Fatalf("invoked = %d, want 2", invoked)
 	}
 
-	success := m.CounterLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "function", Value: "fn"}})
-	failure := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "function", Value: "fn"}})
+	success := m.CounterLabels(metrics.MetricFunctionHandlerSuccess, []metrics.Label{{Name: "app", Value: "fn"}})
+	failure := m.CounterLabels(metrics.MetricFunctionHandlerFailure, []metrics.Label{{Name: "app", Value: "fn"}})
 	if success != 1 || failure != 1 {
 		t.Fatalf("per-function success/failure = %d/%d, want 1/1", success, failure)
 	}
-	fs := m.FunctionStatsSnapshot()
+	fs := m.AppStatsSnapshot()
 	if len(fs) != 1 {
 		t.Fatalf("function stats = %+v, want one entry", fs)
 	}

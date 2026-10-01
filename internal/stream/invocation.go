@@ -92,7 +92,7 @@ func newClaimToken() (string, error) {
 // invocation that is mid-retry/DLQ: it completes under the contract it started
 // with. The schedule NAME remains the occurrence/dedup identity; the descriptor
 // is execution provenance only, and invocation/DLQ attribution stays
-// handler-based ("<function>/<handler>").
+// handler-based ("<app>/<handler>").
 type ScheduleDescriptor struct {
 	// Schedule is the schedule's stable name (the template schedules[].name).
 	Schedule string
@@ -241,7 +241,7 @@ func ttlMillis(d time.Duration) int64 {
 // neither mutate the retained state nor remove the retention TTL (which would
 // resurrect an unrecoverable hash). Like classificationField and traceFieldPrefix
 // it cannot collide with a real invocation ID (a leading "__" is not a legal
-// function name).
+// app name).
 const terminalField = "__terminal"
 
 // retentionTTLMillis returns the terminal retention TTL in integer milliseconds
@@ -848,15 +848,15 @@ type invocationStateStore interface {
 // classificationField is the reserved invocation-state hash field that records
 // whether this message's logical-event classification (received/matched/
 // unmatched) has already been claimed. It cannot collide with a real invocation
-// ID, which is always "<function>/<handler>": function names are validated to
-// start with [a-z0-9], so a leading "__" is not a legal function name.
+// ID, which is always "<app>/<handler>": app names are validated to
+// start with [a-z0-9], so a leading "__" is not a legal app name.
 const classificationField = "__classification"
 
 // traceFieldPrefix is the reserved invocation-state hash field prefix under
 // which each invocation's most recent attempt trace lineage is persisted, as
 // "<prefix><invocation>" (e.g. "__trace:fn/index.run"). Like classificationField
 // it cannot collide with a real invocation ID (a leading "__" is not a legal
-// function name), and it is a SIBLING of the lifecycle value rather than part of
+// app name), and it is a SIBLING of the lifecycle value rather than part of
 // it, so recording a lineage never disturbs eligibility parsing. The value is the
 // compact traceparent[|tracestate] form (see tracing.SpanContextToString) and
 // never contains baggage.
@@ -865,7 +865,7 @@ const traceFieldPrefix = "__trace:"
 // scheduleField is the reserved invocation-state hash field that pins a schedule
 // occurrence's admission contract (see ScheduleDescriptor). Like
 // classificationField and traceFieldPrefix it cannot collide with a real
-// invocation ID (a leading "__" is not a legal function name), and it is a
+// invocation ID (a leading "__" is not a legal app name), and it is a
 // sibling of the lifecycle values rather than part of them, so pinning a
 // descriptor never disturbs eligibility parsing.
 //
@@ -884,7 +884,7 @@ func traceField(invocation string) string {
 }
 
 // invocationStore is a thin Redis-backed store for per-message invocation
-// state. Each key is a HASH mapping an invocation ID ("<function>/<handler>")
+// state. Each key is a HASH mapping an invocation ID ("<app>/<handler>")
 // to a short value describing that invocation's lifecycle for this message.
 //
 // The value grammar (a single string, so the same field convention stays
@@ -1623,7 +1623,7 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 // InvocationState is the read/write view of a single message's invocation
 // state, carried in the delivery context so the runner can decide whether to
 // execute an invocation. The invocation argument is the full
-// "<function>/<handler>" ID; the stream layer never parses it.
+// "<app>/<handler>" ID; the stream layer never parses it.
 //
 // The lifecycle of a single invocation's field value (deadlines are integer
 // Unix milliseconds; tokens are opaque claim identities):
@@ -1692,7 +1692,7 @@ type InvocationState interface {
 	// proposed is the descriptor resolved from the CURRENT template by schedule
 	// NAME (handler, capped timeout, retries); propose=false means the schedule
 	// NAME is gone, so nothing can be proposed. invocationFor maps a descriptor to
-	// its "<function>/<handler>" invocation ID: on a lost race the winning
+	// its "<app>/<handler>" invocation ID: on a lost race the winning
 	// descriptor owns the message and its handler (not the caller's) is invoked,
 	// so the callback is re-evaluated for the adopted descriptor. The loop is
 	// bounded and terminates because a pinned descriptor is immutable while the
@@ -1786,16 +1786,16 @@ var ErrInvocationClaimUnconfirmed = errors.New("invocation claim unconfirmed")
 var ErrInvocationExhausted = errors.New("invocation exhausted")
 
 // ExhaustedInvocation identifies one terminal exhausted invocation: the exact
-// function and handler, the handler attempt that exhausted (the 1+retries bound
+// app and handler, the handler attempt that exhausted (the 1+retries bound
 // reached, sourced from the invocation retry state, never the Redis delivery
 // count), and the underlying failure cause when it is known.
 //
 // It is the unit of per-invocation DLQ attribution: the stream writes one DLQ
-// entry per ExhaustedInvocation, so a message matching several functions or
+// entry per ExhaustedInvocation, so a message matching several apps or
 // handlers that all exhaust produces one entry each, with exact metadata.
 type ExhaustedInvocation struct {
-	// Function is the exact function name.
-	Function string
+	// App is the exact app name.
+	App string
 	// Handler is the exact handler string ("module.function").
 	Handler string
 	// Attempts is the 1-based handler attempt that exhausted. It is always >= 1
@@ -1808,18 +1808,18 @@ type ExhaustedInvocation struct {
 	Err error
 }
 
-// Invocation returns the "<function>/<handler>" invocation ID used by the
+// Invocation returns the "<app>/<handler>" invocation ID used by the
 // per-message invocation-state hash.
 func (e ExhaustedInvocation) Invocation() string {
-	return e.Function + "/" + e.Handler
+	return e.App + "/" + e.Handler
 }
 
 // Reason returns the human-readable exhaustion reason for this invocation,
-// naming the exact function/handler and attempt count so the DLQ `reason`
+// naming the exact app/handler and attempt count so the DLQ `reason`
 // field stays consistent with the entry's `handler_attempts` and metadata.
 func (e ExhaustedInvocation) Reason() string {
-	reason := fmt.Sprintf("function %q handler %q exhausted after %d handler attempts",
-		e.Function, e.Handler, e.Attempts)
+	reason := fmt.Sprintf("app %q handler %q exhausted after %d handler attempts",
+		e.App, e.Handler, e.Attempts)
 	if e.Err != nil {
 		reason += ": " + e.Err.Error()
 	}
@@ -1828,10 +1828,10 @@ func (e ExhaustedInvocation) Reason() string {
 
 // HandlerExhaustedError is the runner's terminal exhaustion signal. It wraps
 // ErrInvocationExhausted (so errors.Is keeps matching) and carries the full set
-// of exhausted invocations for the message, each with its exact function,
+// of exhausted invocations for the message, each with its exact app,
 // handler, and exhausted handler attempt. Handle aggregates EVERY exhausted
 // matched invocation (both those that exhausted on this delivery and those
-// already marked exhausted on a previous delivery), so a multi-function or
+// already marked exhausted on a previous delivery), so a multi-app or
 // multi-handler message dead-letters each invocation individually with correct
 // metadata.
 //
@@ -1849,7 +1849,7 @@ type HandlerExhaustedError struct {
 // Error reports the exhaustion reason in the stable, human-readable form the
 // DLQ `reason` field uses: the ErrInvocationExhausted sentinel followed by the
 // per-invocation exhaustion message(s). A single invocation reads
-// `invocation exhausted: function "fn" handler "h" exhausted after 5 handler
+// `invocation exhausted: app "fn" handler "h" exhausted after 5 handler
 // attempts: ...`; multiple invocations are joined. The sentinel is emitted
 // exactly once.
 func (e *HandlerExhaustedError) Error() string {
@@ -1882,8 +1882,8 @@ func (e *HandlerExhaustedError) Unwrap() []error {
 }
 
 // ErrInvocationObsolete is returned (wrapped) by the runner when an invocation
-// no longer exists in the current function/template configuration — the
-// function or its schedule entry/handler was removed while the message was
+// no longer exists in the current app/template configuration — the
+// app or its schedule entry/handler was removed while the message was
 // pending. Obsolete invocations are terminal and MUST NOT be retried or
 // routed to the DLQ: their removal was an intentional configuration change,
 // so the stream layer acknowledges the message instead.

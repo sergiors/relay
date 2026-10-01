@@ -47,7 +47,7 @@ type gitRepo interface {
 }
 
 // Sync orchestrates a manual synchronization of the configured git source into
-// the /functions target. It:
+// the /apps target. It:
 //
 //  1. Loads the persisted config; errors clearly if none is configured.
 //  2. Builds (or receives) the SSH auth and enforces host-key verification via
@@ -60,10 +60,10 @@ type gitRepo interface {
 //     fetches origin with Force+Prune+AllTags so removed branches/tags drop.
 //  4. Resolves the configured ref to a commit and hard-checks-out it (detached
 //     HEAD, Force). NEVER pulls — a pull could produce merge state.
-//  5. Locates the functions source (repo root or validated monorepo Path) and
+//  5. Locates the apps source (repo root or validated monorepo Path) and
 //     resolves the shared source-selection policy (.gitignore rules anchored at
 //     the checkout root; see internal/source).
-//  6. Materializes /functions deterministically: copy/refresh each function
+//  6. Materializes /apps deterministically: copy/refresh each app
 //     directory, skipping files excluded by the selection policy, and remove any
 //     directory not in the source (see materialize).
 //  7. Records LastSyncedCommit/LastSyncedAt/Synced in the persisted config,
@@ -73,9 +73,9 @@ type gitRepo interface {
 // network operation with a fixed syncTimeout context. Progress output is a tidy
 // per-step line, never raw go-git sideband.
 //
-// Determinism contract: with a git source configured AND synced, /functions is
+// Determinism contract: with a git source configured AND synced, /apps is
 // owned by git. Sync rewrites it to reflect exactly the repository/path — a
-// directory present in /functions but absent from the source is removed,
+// directory present in /apps but absent from the source is removed,
 // including operator-placed ones. This is the documented behavior.
 func Sync(ctx context.Context, opts SyncOptions) error {
 	cfg, err := LoadConfig(opts.ConfigPath)
@@ -286,23 +286,23 @@ func syncWithGit(ctx context.Context, opts SyncOptions, cfg Config, ops gitOps, 
 		return err
 	}
 
-	// Materialize /functions deterministically.
-	materialized, removed, err := materialize(selection, opts.FunctionsDir)
+	// Materialize /apps deterministically.
+	materialized, removed, err := materialize(selection, opts.AppsDir)
 	if err != nil {
 		return err
 	}
 	if len(materialized) == 0 {
 		// materialize already hard-errors on a missing source dir, so an empty
-		// result here means the source existed but held no function dirs. The
+		// result here means the source existed but held no app dirs. The
 		// deterministic-removal pass still ran and cleared stale dirs.
-		writeLine("Source contained no function directories; /functions is now empty")
+		writeLine("Source contained no app directories; /apps is now empty")
 	} else {
-		writeLine("Materialized %d function(s): %s", len(materialized), joinNames(materialized))
+		writeLine("Materialized %d app(s): %s", len(materialized), joinNames(materialized))
 	}
 	if len(removed) > 0 {
-		writeLine("Removed %d function(s): %s", len(removed), joinNames(removed))
+		writeLine("Removed %d app(s): %s", len(removed), joinNames(removed))
 	}
-	debug("Materialized functions", "source", srcDir, "materialized", len(materialized), "removed", len(removed))
+	debug("Materialized apps", "source", srcDir, "materialized", len(materialized), "removed", len(removed))
 
 	// Record the sync bookkeeping atomically, only after materialization.
 	cfg.LastSyncedCommit = headHash.String()

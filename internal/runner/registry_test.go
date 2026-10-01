@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"relay/internal/function"
+	"relay/internal/app"
 	"relay/internal/testutil"
 )
 
-// Set and Replace keep the function set sorted by name, so Names() and iteration
-// order never depend on the order functions were discovered or swapped in.
+// Set and Replace keep the app set sorted by name, so Names() and iteration
+// order never depend on the order apps were discovered or swapped in.
 func TestRegistryNamesDeterministic(t *testing.T) {
 	r := New(nil, testutil.DiscardLogger())
 	reg := r.Registry()
 
 	// Inserting "zeta" before "alpha": the slice must come out sorted anyway.
-	reg.Set([]*PreparedFunction{newFn(t, "zeta"), newFn(t, "alpha")})
+	reg.Set([]*PreparedApp{newFn(t, "zeta"), newFn(t, "alpha")})
 	reg.Replace("mid", newFn(t, "mid"))
 	reg.Replace("beta", newFn(t, "beta"))
 
@@ -56,7 +56,7 @@ func TestHandleVsSwapSnapshotConsistency(t *testing.T) {
 	r := New(nil, testutil.DiscardLogger())
 
 	names := []string{"a", "b", "c"}
-	var fns []*PreparedFunction
+	var fns []*PreparedApp
 	for _, n := range names {
 		fns = append(fns, alwaysMatchFn(t, n, &countingExecutor{hold: time.Millisecond}))
 	}
@@ -80,7 +80,7 @@ func TestHandleVsSwapSnapshotConsistency(t *testing.T) {
 				// exercise the skip path.
 				i := int(swaps.Add(1)) % len(names)
 				if i%2 == 0 {
-					r.Registry().Replace(names[i], NewUnavailable(function.Function{Name: names[i]}))
+					r.Registry().Replace(names[i], NewUnavailable(app.App{Name: names[i]}))
 				} else {
 					r.Registry().Replace(names[i], alwaysMatchFn(t, names[i], &countingExecutor{hold: time.Millisecond}))
 				}

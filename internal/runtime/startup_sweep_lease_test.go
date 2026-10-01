@@ -12,17 +12,17 @@ import (
 // respect: a stale Relay-owned image that an admitted lease still holds (a
 // registry publication or an in-flight build) is NOT removed by the sweep — the
 // non-blocking removal reports the retryable ErrImageRetiring, the sweep leaves
-// it for the owning function's reconcile, and once the lease drains the same
+// it for the owning app's reconcile, and once the lease drains the same
 // sweep removes it. This is the startup keep-set's runtime half: the keep-set
 // names what must survive, and the lease gate is the second line of defense for
 // anything the keep-set did not know about.
 func TestRemoveImagesExceptSkipsLeasedImage(t *testing.T) {
-	const held = "relay-fn-a:1111111111111111"
+	const held = "relay-app-a:1111111111111111"
 	deletes := 0
 	cli := newScriptedDockerClient(t,
 		dockerRoute{method: http.MethodGet, path: "/containers/json", body: `[]`},
 		dockerRoute{method: http.MethodGet, path: "/images/json", body: labeledImageListJSON(
-			scriptedImage{tags: []string{held}, labels: functionLabels("a")},
+			scriptedImage{tags: []string{held}, labels: appImageLabelsForTest("a")},
 		)},
 		dockerRoute{method: http.MethodDelete, path: "/images/", body: "[]", onMatch: func() { deletes++ }},
 	)
