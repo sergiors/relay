@@ -353,6 +353,29 @@ func (st *State) initSchema(ctx context.Context) error {
 			data BLOB NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		// schedule_pending is the durable schedule-publication retry outbox: one
+		// row per logical occurrence whose immediate Redis publish failed. The row
+		// key is the derived occurrence ID and the COMPLETE immutable occurrence
+		// intent (app/schedule/handler/scheduled_at) is the JSON object in data,
+		// written through jsonb(?) and read back with json(data), so the schema
+		// stays stable while the intent grows. It is NOT a history table and NOT an
+		// execution source: /apps stays authoritative, and the row exists only
+		// until a later publication resolves (published or a clean duplicate) and
+		// is deleted. The scheduling fields (attempts, next_attempt_ms,
+		// lease_until_ms) are integer Unix milliseconds used to coordinate retry
+		// observations: a row is claimable only while next_attempt_ms and
+		// lease_until_ms are both in the past, and a claim sets lease_until_ms
+		// atomically so concurrent retriers cannot both claim it. The occurrence
+		// intent (id/data) is never updated after insert.
+		`CREATE TABLE IF NOT EXISTS schedule_pending (
+			id TEXT PRIMARY KEY,
+			data BLOB NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+			lease_until_ms INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS schedule_pending_due
+			ON schedule_pending (next_attempt_ms, lease_until_ms)`,
 	}
 
 	for _, s := range stmts {

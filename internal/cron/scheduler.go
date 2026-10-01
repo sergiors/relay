@@ -139,6 +139,54 @@ type Scheduler struct {
 	// timer; tests substitute a fake so the retry backoff is deterministic and
 	// sleep-free.
 	wait func(ctx context.Context, d time.Duration) bool
+
+	// outbox is the optional durable publication-retry store. It is nil when the
+	// worker has not wired state (standalone/test schedulers), in which case the
+	// scheduler behaves exactly as before: bounded in-memory retry only. It is
+	// installed by SetOutbox BEFORE StartPendingRetry/Start and then only read,
+	// so no lock is needed on the publication path.
+	outbox Outbox
+	// pendingWake signals the durable retry worker that a record was persisted.
+	// It is a buffered (capacity 1) channel created by the constructor.
+	pendingWake chan struct{}
+	// pendingCancel cancels the durable retry worker; pendingDone is closed when
+	// it returns. Both are set once by StartPendingRetry and read by Stop under
+	// mu.
+	pendingCancel context.CancelFunc
+	pendingDone   chan struct{}
+	// pendingWait is the durable worker's sleep seam. It waits for up to d (or
+	// indefinitely when d < 0) for a wake token or ctx cancellation, reporting
+	// whether the worker should keep going. Tests substitute a fake to drive the
+	// loop deterministically without timers.
+	pendingWait pendingWaitFunc
+}
+
+// pendingWaitFunc is the durable retry worker's sleep. See Scheduler.pendingWait.
+type pendingWaitFunc func(ctx context.Context, d time.Duration, wake <-chan struct{}) bool
+
+// waitPendingContext is the production pendingWaitFunc: it waits for up to d,
+// indefinitely when d < 0, for a wake token or ctx cancellation. It uses a single
+// timer (no polling) and returns false once ctx is cancelled so the worker exits
+// promptly.
+func waitPendingContext(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
+	if d < 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-wake:
+			return true
+		}
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
+	case <-t.C:
+		return true
+	}
 }
 
 // New constructs a Scheduler over the given publisher with a nil metrics
@@ -164,12 +212,14 @@ func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics
 		panic(fmt.Sprintf("cron: construct gocron scheduler: %v", err))
 	}
 	return &Scheduler{
-		log:     logger,
-		pub:     pub,
-		g:       g,
-		metrics: metricsRegistry,
-		now:     time.Now,
-		wait:    waitContext,
+		log:         logger,
+		pub:         pub,
+		g:           g,
+		metrics:     metricsRegistry,
+		now:         time.Now,
+		wait:        waitContext,
+		pendingWake: make(chan struct{}, 1),
+		pendingWait: waitPendingContext,
 	}
 }
 
@@ -397,27 +447,40 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		// callback may begin (and touch Redis) once Stop has started, and the
 		// watcher below joins those already admitted.
 		s.callbacks.close()
+		// Cancel the durable retry worker too: it touches Redis and the state
+		// DB, so it must be joined before either is torn down. Its in-flight
+		// attempt observes cancellation and leaves its record leased/recoverable.
+		if s.pendingCancel != nil {
+			s.pendingCancel()
+		}
 		done := make(chan struct{})
 		s.shutdownDone = done
 		if g == nil {
 			close(done)
-			s.mu.Unlock()
-			return nil
+		} else {
+			go func() {
+				err := g.Shutdown()
+				s.mu.Lock()
+				s.shutdownErr = err
+				s.mu.Unlock()
+				close(done)
+			}()
 		}
-		go func() {
-			err := g.Shutdown()
-			s.mu.Lock()
-			s.shutdownErr = err
-			s.mu.Unlock()
-			close(done)
-		}()
 	}
 	done := s.shutdownDone
 	callbacksDone := s.callbacks.doneCh()
+	pendingDone := s.pendingDone
 	s.mu.Unlock()
 
 	if err := waitShutdown(ctx, done, callbacksDone); err != nil {
 		return err
+	}
+	if pendingDone != nil {
+		select {
+		case <-pendingDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

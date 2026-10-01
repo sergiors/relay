@@ -24,7 +24,7 @@ Functions, schedules, and persistent services are declared within an app and sha
 
 - **Event-driven execution** — Redis Streams, declarative matching, retries, reclaim, dead-lettering, and at-least-once delivery.
 - **Managed runtimes** — Python 3.14 and Node 24, including TypeScript support, with reusable warm containers and bounded concurrency.
-- **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries, and startup catch-up.
+- **Cron schedules** — minute-precision cron with IANA timezones, deterministic occurrence identity, cluster-wide publication deduplication, bounded retries with a durable local outbox, and startup catch-up.
 - **Persistent services** — run APIs, workers, gateways, consumers, and other long-running processes from managed-runtime entrypoints or external container images, with replicas, Docker networks, resource limits, environment configuration, secrets, and optional Traefik routing.
 - **Resource controls** — per-container memory, CPU, and PID limits.
 - **Configuration and secrets** — environment values and secret references shared across apps, schedules, and services.
@@ -303,7 +303,9 @@ worker C ─┘
 
 This avoids leader election while preserving a single published stream entry per occurrence cluster-wide.
 
-Publication retries and startup catch-up reuse the same occurrence identity, so duplicates remain harmless.
+Publication retries — including a durable local retry of a tick whose immediate
+publish did not resolve — and startup catch-up reuse the same occurrence
+identity, so duplicates remain harmless.
 
 Handler execution after publication is still at-least-once.
 

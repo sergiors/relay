@@ -166,6 +166,12 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   `relay_schedule_publish_failures_total`,
   `relay_schedule_publish_retries_total`,
   `relay_schedule_publish_exhausted_total`, `relay_schedule_catchup_total`.
+- **Durable schedule recovery:** `relay_schedule_pending_persisted_total`
+  (occurrences newly written to the local retry outbox after an immediate
+  publication did not resolve) and `relay_schedule_pending_retries_total`
+  (publication attempts made by the durable retry worker). A resolved attempt
+  removes the outbox row; the publish outcome itself is still counted by the
+  `relay_schedule_occurrences_*` families above.
 - **Services:** `relay_service_reconciles_total{app,outcome}`,
   `relay_service_reconcile_duration_seconds{app}`.
 - **Anomaly:** `relay_missing_payload_total` (reclaimed PEL entries whose stream

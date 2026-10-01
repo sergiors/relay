@@ -739,6 +739,97 @@ func TestBarrierStepConstructorsMarkBarriers(t *testing.T) {
 	}
 }
 
+// TestSchedulerBarrierGatesRedisTeardownOnEarlyStartupFailure pins the
+// early-startup-failure guarantee for the durable retry worker: the scheduler
+// barrier is registered when the Scheduler is constructed (before
+// StartPendingRetry), so even if startup fails before the scheduler is ever
+// Started, the shutdown registry still runs the scheduler barrier BEFORE the
+// Redis close and strictly joins an in-flight durable retry. The retry worker is
+// wedged in a Redis-facing call that ignores the step bound; Redis must not close
+// until it is released.
+func TestSchedulerBarrierGatesRedisTeardownOnEarlyStartupFailure(t *testing.T) {
+	retryEntered := make(chan struct{})
+	retryRelease := make(chan struct{})
+	stepCancelled := make(chan struct{})
+	redisClosed := make(chan struct{})
+	stateClosed := make(chan struct{})
+	var once sync.Once
+
+	// stop models Scheduler.Stop joining an in-flight durable retry (the
+	// Redis/SQLite-facing work) on a scheduler that was never Started: it
+	// observes its bound (so the registry logs a timeout) but keeps waiting.
+	stop := func(stepCtx context.Context) error {
+		once.Do(func() { close(retryEntered) })
+		<-stepCtx.Done()
+		close(stepCancelled)
+		<-retryRelease
+		return nil
+	}
+	redisStep := shutdownStep{
+		name:    shutdownStepRedis,
+		timeout: time.Second,
+		run:     func(context.Context) error { close(redisClosed); return nil },
+	}
+	stateStep := shutdownStep{
+		name:    shutdownStepState,
+		timeout: time.Second,
+		run:     func(context.Context) error { close(stateClosed); return nil },
+	}
+	schedulerStep := shutdownStep{
+		name:    shutdownStepScheduler,
+		timeout: 40 * time.Millisecond,
+		barrier: true,
+		run: func(stepCtx context.Context) error {
+			return barrierJoin(stepCtx, stop)
+		},
+	}
+
+	reg := &shutdownRegistry{}
+	reg.register(redisStep)
+	reg.register(stateStep)
+	reg.register(schedulerStep)
+
+	done := make(chan struct{})
+	go func() { defer close(done); reg.run(slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+
+	select {
+	case <-retryEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler barrier never entered its retry join")
+	}
+	select {
+	case <-stepCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler barrier never observed its expired bound")
+	}
+	// Redis and the state DB must not close while the retry is in flight.
+	select {
+	case <-redisClosed:
+		t.Fatal("Redis closed before the early-startup retry join completed")
+	case <-stateClosed:
+		t.Fatal("state closed before the early-startup retry join completed")
+	case <-done:
+		t.Fatal("shutdown advanced past the scheduler barrier before the retry joined")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(retryRelease)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not complete after the retry was released")
+	}
+	select {
+	case <-redisClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Redis did not close after the scheduler barrier was joined")
+	}
+	select {
+	case <-stateClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("state did not close after the scheduler barrier was joined")
+	}
+}
+
 // TestSchedulerBarrierStepHoldsRedisTeardownUntilCallbackJoins proves the
 // scheduler barrier gates the Redis close: the scheduler's stop is wedged in a
 // Relay publisher callback (the controllable Redis-facing seam) that ignores the

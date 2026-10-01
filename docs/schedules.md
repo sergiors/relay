@@ -93,10 +93,17 @@ worker's simultaneous evaluation of the same tick is a clean no-op.
 - Dedup keys live under `relay:schedule:<occurrence_id>` with a **7-day TTL**.
   They are history only and are never deleted on completion, so a worker whose
   callback runs later cannot re-publish an occurrence the fleet already
-  completed. Dedup applies to **publication**, not to handler execution.- Once the stream entry exists it is an ordinary Relay message: the consumer
+  completed. Dedup applies to **publication**, not to handler execution.
+- Once the stream entry exists it is an ordinary Relay message: the consumer
   group delivers it to one worker, and PEL / `XAUTOCLAIM` recovery, retries,
   exhaustion, and DLQ apply exactly as for an event.
 - A duplicate publication is a successful no-op.
+
+Because a failed publish is persisted durably (see
+[Publication recovery](#publication-recovery)) and retried with the same
+occurrence identity, an ambiguous `XADD` (the call errored but the entry may have
+been admitted) is eventually resolved as a clean duplicate rather than
+republished or lost.
 
 The scheduled handler receives a deterministic payload on stdin (same contract
 as events):
@@ -105,7 +112,7 @@ as events):
 { "source": "relay.schedule", "scheduled_at": "2026-09-29T03:00:00Z" }
 ```
 
-## Publication recovery (bounded)
+## Publication recovery
 
 A tick is not a single best-effort publish:
 
@@ -114,13 +121,43 @@ A tick is not a single best-effort publish:
   2s, 5s (five attempts total) — that observes the worker lifecycle, so shutdown
   aborts promptly. A success or a clean duplicate ends the loop; a duplicate is
   never retried.
-- On startup, before jobs begin, each worker performs a bounded **catch-up**:
-  for each schedule it republishes the latest missed occurrence within a
-  **24-hour horizon**, using the same bounded retry routine. Only the latest
-  occurrence per schedule is recovered — older misses are intentionally dropped
-  (bounded recovery, not unbounded backlog replay) — and future occurrences are
-  never synthesized. A catch-up another worker already published is a harmless
-  duplicate.
+- **The failure is durable.** On the FIRST failed attempt the complete immutable
+  occurrence intent (its derived id plus app/schedule/handler/scheduled_at) is
+  written to the local state database. If the bounded in-memory retries then
+  recover it, the row is deleted only once a publication call resolves with a
+  nil error. A healthy first-attempt success — or a clean duplicate — never
+  touches the database.
+- A background **durable retry worker** reclaims persisted occurrences and keeps
+  republishing each one **indefinitely** (a capped backoff of 5s, 15s, 30s, 2m,
+  5m, 10m) until it resolves. A record is claimed with a per-row database lease,
+  so concurrent retriers in the same process cannot both work it; a record
+  whose lease expires while unresolved is reclaimed automatically. Because the
+  occurrence identity is unchanged, a durable retry that finds the occurrence
+  already published is a clean duplicate and resolves the row. This survives
+  restarts: on startup the worker scans the outbox and retries immediately.
+- A row is deleted only after a publication call resolved (published or a clean
+  duplicate). If the delete itself fails the row is retained and retried
+  idempotently. An ambiguous `XADD` (the call errored but the entry may exist)
+  is handled by retrying: the retry is a clean duplicate that deletes the row.
+- A persisted record is republished only after its decoded fields are verified
+  to reconstruct exactly the occurrence ID stored in the row key (the same
+  derivation the publisher and consumer use). A row whose payload cannot be
+  decoded, or whose decoded intent would name a different occurrence, is never
+  published and never deleted: it is logged and rescheduled under the same
+  bounded backoff so the durable row is retained and repairable.
+- On startup, before jobs begin, each worker also performs a bounded
+  **catch-up**: for each schedule it republishes the latest missed occurrence
+  within a **24-hour horizon**, using the same bounded retry routine. Only the
+  latest occurrence per schedule is recovered — older misses are intentionally
+  dropped (bounded recovery, not unbounded backlog replay) — and future
+  occurrences are never synthesized. A catch-up another worker already published
+  is a harmless duplicate. The durable outbox is a separate, unbounded retry of
+  occurrences that were **actually attempted**; catch-up remains latest-only.
+
+The local state database therefore records a small, bounded outbox of
+unresolved publications — not execution history and never an execution source.
+`/apps` stays authoritative, and the row disappears as soon as publication
+resolves.
 
 ## Live changes
 
@@ -171,11 +208,14 @@ per-invocation state and DLQ attribution remain keyed by that
 > claimed. A crash between a handler's side effect and its completion re-runs the
 > handler, so scheduled handlers must stay idempotent.
 
-Publication recovery is bounded per worker (retry budget, then the 24h catch-up
-for the latest miss per schedule). Beyond that, older misses are dropped, and the
-fleet-level single-publication guarantee always rests on the atomic
-publish-if-new: a retry or catch-up that finds the key already present is a clean
-duplicate.
+Publication recovery has two layers: the bounded in-memory retry (per tick), and
+a durable outbox that keeps retrying an occurrence that was actually attempted
+but unresolved, indefinitely and across restarts, until publication resolves. The
+24h catch-up remains the bounded, latest-only recovery for occurrences the
+worker never got to attempt (a miss while it was down); older misses are dropped.
+The fleet-level single-publication guarantee always rests on the atomic
+publish-if-new: any retry, durable retry, or catch-up that finds the key already
+present is a clean duplicate.
 
 Schedule occurrences bypass event matching, so they do **not** advance the
 event-classification counters (`events_received_total`, `events_matched_total`,

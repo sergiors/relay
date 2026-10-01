@@ -73,6 +73,25 @@
 //     parser's opaque matcher patterns: matching is rebuilt from template.yaml,
 //     never from this state view, and those matcher interfaces cannot be JSON
 //     round-tripped.
+//   - schedule_pending(id PRIMARY KEY, data BLOB NOT NULL, attempts,
+//     next_attempt_ms, lease_until_ms) is the durable schedule-PUBLICATION retry
+//     outbox, not history and not an execution source. The row key is the derived
+//     occurrence ID, and the COMPLETE immutable occurrence intent
+//     (app/schedule/handler/scheduled_at) is the JSON object in data, written
+//     through jsonb(?) and read back with json(data) — the same BLOB-payload
+//     convention as apps.data, so the schema stays stable while the intent
+//     grows. It is written once (INSERT ... ON CONFLICT DO NOTHING, so it is
+//     unique and idempotent), leased per-row so concurrent retriers cannot both
+//     claim it, and deleted only after a publication call resolves with a nil
+//     error (published or a clean duplicate). The intent (id/data) is never
+//     updated after insert; only attempts/next_attempt_ms advance. The scheduling
+//     columns are integer Unix milliseconds. A stored payload that cannot be
+//     decoded, or whose decoded intent does not reconstruct the row's occurrence
+//     ID, is surfaced to the caller and RETAINED (logged and rescheduled, never
+//     published, never deleted) so a repair can still recover it. This table
+//     never drives matching, building, scheduling, or execution: /apps is
+//     authoritative, and the occurrence identity it stores is derived exactly as
+//     on the wire.
 //
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the

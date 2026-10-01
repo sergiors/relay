@@ -1,0 +1,382 @@
+package cron
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"relay/internal/observability/metrics"
+	"relay/internal/schedule"
+	"relay/internal/state"
+)
+
+// Outbox is the durable schedule-publication retry store. It persists the
+// COMPLETE immutable occurrence intent of a tick whose immediate publication
+// did not resolve, leases due records so concurrent retriers cannot both claim
+// one, and deletes a record only once a publication call has resolved with a nil
+// error (published or a clean duplicate). *state.State satisfies it; the narrow
+// interface keeps cron decoupled from the SQLite implementation and lets tests
+// substitute a deterministic fake.
+//
+// Every method takes a context. The scheduler calls the write methods with a
+// cancellation-independent context (see pendingWriteCtx) so an in-flight tick
+// cancelled by shutdown still leaves a recoverable row.
+type Outbox interface {
+	// SavePendingOccurrence inserts p's immutable intent unless a row for the
+	// same id already exists, reporting whether a new row was inserted.
+	SavePendingOccurrence(ctx context.Context, p state.PendingOccurrence) (inserted bool, err error)
+	// ClaimPendingOccurrences leases up to limit due records atomically and
+	// returns them.
+	ClaimPendingOccurrences(ctx context.Context, now, leaseUntil time.Time, limit int) ([]state.PendingOccurrence, error)
+	// ReschedulePendingOccurrence increments a record's attempt count and sets
+	// its next due instant after a failed retry.
+	ReschedulePendingOccurrence(ctx context.Context, id string, nextAttempt time.Time) error
+	// DeletePendingOccurrence removes a resolved record. It is idempotent.
+	DeletePendingOccurrence(ctx context.Context, id string) error
+	// NextPendingDue returns the earliest instant a record becomes claimable.
+	NextPendingDue(ctx context.Context) (due time.Time, ok bool, err error)
+}
+
+// The local SQLite state store is the production durable retry outbox; this
+// assertion keeps the two in lockstep without state importing cron.
+var _ Outbox = (*state.State)(nil)
+
+// Durable retry policy constants. They are fixed internal values, not
+// configurable: the durable outbox is a recovery mechanism, not a tuning knob.
+const (
+	// pendingClaimBatch bounds how many records one scan claims, so a large
+	// backlog is drained in bounded batches rather than one unbounded query.
+	pendingClaimBatch = 64
+	// pendingLease is how long a claimed record is protected from another
+	// claim. It is short enough that a crashed/wedged retrier's work is
+	// reclaimed promptly (the "claim expiry" rescan) and long enough to cover a
+	// normal publication attempt.
+	pendingLease = time.Minute
+	// pendingWriteTimeout bounds one SQLite outbox write/delete. The outbox is
+	// written off the publish path and must never hang on a wedged write.
+	pendingWriteTimeout = 5 * time.Second
+	// pendingErrorDelay is the pause after a failed scan/due query, so a
+	// persistent database error cannot become a busy loop.
+	pendingErrorDelay = time.Second
+)
+
+// pendingRetryDelays is the durable retry backoff: an unbounded, capped
+// progression indexed by the persisted attempt count. Unlike the bounded
+// in-memory publishRetryDelays (which recovers a brief Redis blip within
+// seconds), this keeps retrying indefinitely across temporary and long outages
+// at a capped cadence. It is a package value so tests can substitute a shorter
+// budget.
+var pendingRetryDelays = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	2 * time.Minute,
+	5 * time.Minute,
+	10 * time.Minute,
+}
+
+// pendingBackoff returns the retry delay for a record that has already
+// accumulated attempts failed durable retries, capped at the final delay so it
+// retries forever.
+func pendingBackoff(attempts int) time.Duration {
+	if attempts < 0 {
+		attempts = 0
+	}
+	if attempts >= len(pendingRetryDelays) {
+		return pendingRetryDelays[len(pendingRetryDelays)-1]
+	}
+	return pendingRetryDelays[attempts]
+}
+
+// SetOutbox installs the durable publication-retry store. It must be called
+// before StartPendingRetry and before any publication that might need to persist
+// (i.e. before CatchUp and Start). A nil outbox disables durability: the
+// scheduler then behaves exactly as before, with the bounded in-memory retry
+// only. A nil receiver is a no-op.
+func (s *Scheduler) SetOutbox(o Outbox) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.outbox = o
+}
+
+// pendingWriteCtx returns a bounded context for one outbox write that is NOT
+// cancelled when the calling publish context is. Shutdown cancels a gocron job's
+// context out from under an in-flight tick; that tick must still record its
+// occurrence so the retry worker can recover it, so the write deliberately
+// ignores the caller's cancellation.
+func pendingWriteCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), pendingWriteTimeout)
+}
+
+// wakePending signals the durable retry worker that a record was just persisted,
+// so it does not sleep out its backoff before discovering new work. The send is
+// non-blocking: a buffered token is enough, and a full buffer means the worker is
+// already awake.
+func (s *Scheduler) wakePending() {
+	select {
+	case s.pendingWake <- struct{}{}:
+	default:
+	}
+}
+
+// persistPending records o in the durable outbox for retry, returning whether
+// the occurrence is now durably queued. It is a no-op (false) when no outbox is
+// configured. A pre-existing row for the same ID counts as queued: the intent is
+// immutable and identical, so persistence is idempotent under concurrent
+// immediate and durable observations.
+func (s *Scheduler) persistPending(o schedule.Occurrence, log *slog.Logger) bool {
+	if s.outbox == nil {
+		return false
+	}
+	wctx, cancel := pendingWriteCtx()
+	defer cancel()
+	inserted, err := s.outbox.SavePendingOccurrence(wctx, state.PendingOccurrence{
+		ID:          o.ID(),
+		App:         o.App,
+		Schedule:    o.Schedule,
+		Handler:     o.Handler,
+		ScheduledAt: o.ScheduledAt,
+		// Due immediately: the durable worker should observe this occurrence as
+		// soon as it wakes.
+		NextAttempt: s.now(),
+	})
+	if err != nil {
+		log.Warn("Schedule: persist pending occurrence failed", "reason", err)
+		return false
+	}
+	if inserted {
+		s.metrics.Inc(metrics.MetricSchedulePendingPersisted)
+	}
+	s.wakePending()
+	return true
+}
+
+// resolvePending removes o's durable record after a publication call resolved
+// with a nil error. A delete failure is logged and the row is left in place: it
+// is idempotent to retry, so the durable worker will publish the occurrence again
+// (a clean duplicate) and attempt the delete again.
+func (s *Scheduler) resolvePending(o schedule.Occurrence, log *slog.Logger) {
+	if s.outbox == nil {
+		return
+	}
+	wctx, cancel := pendingWriteCtx()
+	defer cancel()
+	if err := s.outbox.DeletePendingOccurrence(wctx, o.ID()); err != nil {
+		log.Warn("Schedule: delete pending occurrence failed; will retry", "reason", err)
+	}
+}
+
+// StartPendingRetry starts the durable publication-retry worker, which reclaims
+// persisted occurrences and republishes them until each resolves. It is a no-op
+// when no outbox is configured, when it was already started, or after Stop. The
+// worker observes ctx (the worker lifecycle), and Stop additionally cancels and
+// joins it, so no retry can touch Redis or the state DB after the scheduler
+// barrier returns. The worker scans immediately on start, so records persisted
+// before a restart are retried as soon as the process is up.
+func (s *Scheduler) StartPendingRetry(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.outbox == nil || s.stopped || s.pendingDone != nil {
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.pendingCancel = cancel
+	done := make(chan struct{})
+	s.pendingDone = done
+	go func() {
+		defer close(done)
+		s.pendingRetryLoop(runCtx)
+	}()
+}
+
+// pendingRetryLoop is the durable retry worker: it drains due records in bounded
+// batches, then sleeps until the earliest next due instant, a wake signal, or
+// lifecycle cancellation. It never busy-polls: an empty outbox waits only for a
+// wake or cancellation, and a non-empty one waits on a timer for the next due
+// record. A failed scan/due query pauses briefly rather than spinning.
+func (s *Scheduler) pendingRetryLoop(ctx context.Context) {
+	log := s.log.With("component", "schedule_retry")
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		n, err := s.RunPendingOnce(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Warn("Schedule: durable retry scan failed", "reason", err)
+			if !s.pendingSleep(ctx, pendingErrorDelay, s.pendingWake) {
+				return
+			}
+			continue
+		}
+		if n > 0 {
+			// More due records may remain: scan again immediately rather than
+			// sleeping.
+			continue
+		}
+		due, ok, derr := s.outbox.NextPendingDue(ctx)
+		if derr != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Warn("Schedule: durable retry due query failed", "reason", derr)
+			if !s.pendingSleep(ctx, pendingErrorDelay, s.pendingWake) {
+				return
+			}
+			continue
+		}
+		d := time.Duration(-1)
+		if ok {
+			if d = due.Sub(s.now()); d < 0 {
+				d = 0
+			}
+		}
+		if !s.pendingSleep(ctx, d, s.pendingWake) {
+			return
+		}
+	}
+}
+
+// RunPendingOnce performs one durable-retry cycle: it atomically claims up to
+// pendingClaimBatch due records and attempts each, returning the number claimed.
+// It is exported so shutdown and retry behavior can be driven deterministically
+// in tests without timers.
+//
+// A claim that a later lifecycle cancellation interrupts leaves the claimed
+// records leased; they are reclaimed after pendingLease expires, so no
+// occurrence is lost when a publication is cut short at shutdown.
+func (s *Scheduler) RunPendingOnce(ctx context.Context) (int, error) {
+	if s.outbox == nil {
+		return 0, nil
+	}
+	now := s.now()
+	claimed, err := s.outbox.ClaimPendingOccurrences(ctx, now, now.Add(pendingLease), pendingClaimBatch)
+	if err != nil {
+		return 0, err
+	}
+	log := s.log.With("component", "schedule_retry")
+	processed := 0
+	for _, p := range claimed {
+		if ctx.Err() != nil {
+			// Leave the remaining leases to expire; they are recoverable.
+			break
+		}
+		s.retryPending(ctx, p, log)
+		processed++
+	}
+	return processed, nil
+}
+
+// retryPending attempts one claimed record. A nil-error publication (newly
+// published or a clean duplicate) deletes the record; a failure reschedules it
+// with the durable backoff; a cancellation leaves the record leased for
+// reclaim.
+//
+// Before any publisher call it validates the record: a row whose stored intent
+// could not be decoded (p.DecodeErr), or whose decoded fields reconstruct an
+// occurrence ID different from the row's key (p.ID), is NEVER published (that
+// would target the wrong occurrence) and NEVER deleted (that would lose the
+// pending work). It is logged for an operator and rescheduled under the same
+// bounded backoff, so the durable row is retained and repairable while it does
+// not spin.
+func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence, log *slog.Logger) {
+	s.metrics.Inc(metrics.MetricSchedulePendingRetries)
+
+	// Identity guard: the stored key is the derived occurrence ID, so the
+	// decoded intent MUST reconstruct exactly that ID. A decode failure or a
+	// mismatch is corrupt coordination state, not an occurrence: retain and
+	// reschedule it (never publish, never delete).
+	if err := s.pendingIdentityError(p); err != nil {
+		log.Warn("Schedule: pending occurrence corrupt; retaining for repair",
+			"occurrence_id", p.ID, "durable_attempts", p.Attempts+1, "reason", err)
+		s.reschedulePending(p, log)
+		return
+	}
+
+	o := schedule.Occurrence{App: p.App, Schedule: p.Schedule, Handler: p.Handler, ScheduledAt: p.ScheduledAt}
+
+	published, err := s.pub.PublishOccurrence(ctx, o)
+	if err == nil {
+		if published {
+			log.Info("Schedule: pending occurrence published",
+				"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "occurrence_id", o.ID(), "durable_attempts", p.Attempts+1)
+		} else {
+			log.Debug("Schedule: pending occurrence resolved as duplicate",
+				"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "occurrence_id", o.ID(), "durable_attempts", p.Attempts+1)
+		}
+		// Resolve with a cancellation-independent context: the publication
+		// succeeded, so the row must be removable even if the lifecycle is
+		// shutting down.
+		if s.outbox != nil {
+			wctx, cancel := pendingWriteCtx()
+			if derr := s.outbox.DeletePendingOccurrence(wctx, p.ID); derr != nil {
+				log.Warn("Schedule: delete pending occurrence failed; will retry",
+					"app", o.App, "schedule", o.Schedule, "occurrence_id", p.ID, "reason", derr)
+			}
+			cancel()
+		}
+		return
+	}
+	if ctx.Err() != nil {
+		// The attempt was cut short by lifecycle cancellation. Leave the record
+		// leased; it is reclaimed after the lease expires on the next process.
+		log.Debug("Schedule: pending retry cancelled",
+			"app", o.App, "schedule", o.Schedule, "occurrence_id", p.ID, "durable_attempts", p.Attempts+1)
+		return
+	}
+	s.reschedulePending(p, log)
+	log.Warn("Schedule: pending retry failed; rescheduled",
+		"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
+		"occurrence_id", p.ID, "durable_attempts", p.Attempts+1,
+		"next_retry_in", pendingBackoff(p.Attempts), "reason", err,
+	)
+}
+
+// pendingIdentityError validates a claimed record before publication. It reports
+// a non-nil error when the record cannot be trusted as the occurrence its key
+// names: a decode failure (no intent), or decoded fields that reconstruct an
+// occurrence ID different from the stored key. The reconstructed identity is
+// schedule.Occurrence.ID — the SAME derivation the publisher and consumer use —
+// so the check is exact rather than a re-implementation.
+func (s *Scheduler) pendingIdentityError(p state.PendingOccurrence) error {
+	if p.DecodeErr != nil {
+		return fmt.Errorf("stored payload undecodable: %w", p.DecodeErr)
+	}
+	reconstructed := schedule.Occurrence{
+		App: p.App, Schedule: p.Schedule, Handler: p.Handler, ScheduledAt: p.ScheduledAt,
+	}
+	if got := reconstructed.ID(); got != p.ID {
+		return fmt.Errorf("row identity %q does not match reconstructed occurrence %q", p.ID, got)
+	}
+	return nil
+}
+
+// reschedulePending records one failed durable observation for p, advancing its
+// attempt count and next due instant under the bounded backoff. It is the shared
+// failure path for a publisher error and for a corrupt/mismatched record, and it
+// NEVER deletes the row.
+func (s *Scheduler) reschedulePending(p state.PendingOccurrence, log *slog.Logger) {
+	next := s.now().Add(pendingBackoff(p.Attempts))
+	wctx, cancel := pendingWriteCtx()
+	defer cancel()
+	if rerr := s.outbox.ReschedulePendingOccurrence(wctx, p.ID, next); rerr != nil {
+		log.Warn("Schedule: reschedule pending occurrence failed",
+			"occurrence_id", p.ID, "reason", rerr)
+	}
+}
+
+// pendingSleep pauses the durable retry worker for up to d (indefinitely when
+// d < 0) via the pendingWait seam, reporting whether the worker should continue
+// (true) or exit because the lifecycle was cancelled (false).
+func (s *Scheduler) pendingSleep(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
+	return s.pendingWait(ctx, d, wake)
+}

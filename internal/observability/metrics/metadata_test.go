@@ -30,6 +30,8 @@ func seedAllMetrics(r *Registry) {
 		MetricSchedulePublishRetries,
 		MetricSchedulePublishExhausted,
 		MetricScheduleCatchUp,
+		MetricSchedulePendingPersisted,
+		MetricSchedulePendingRetries,
 		MetricMissingPayload,
 	} {
 		r.Inc(name)

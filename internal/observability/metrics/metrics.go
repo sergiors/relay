@@ -82,6 +82,20 @@ const (
 	MetricSchedulePublishRetries   = metricNamespacePrefix + "schedule_publish_retries_total"
 	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
 	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
+	// Durable schedule-publication recovery. A live tick whose immediate
+	// publication does not resolve (Redis error, or lifecycle cancellation) is
+	// persisted as an immutable occurrence intent in the local state DB and
+	// retried by a background worker until it publishes or is confirmed a clean
+	// duplicate. These two counters describe the durable path specifically;
+	// the publish outcomes themselves are still counted by
+	// schedule_occurrences_published_total, schedule_occurrences_duplicate_total,
+	// and schedule_publish_failures_total, which the same publisher increments.
+	// MetricSchedulePendingPersisted counts occurrences newly written to the
+	// outbox (a re-persist of an already-present occurrence is not counted);
+	// MetricSchedulePendingRetries counts publication attempts made by the
+	// durable retry worker.
+	MetricSchedulePendingPersisted = metricNamespacePrefix + "schedule_pending_persisted_total"
+	MetricSchedulePendingRetries   = metricNamespacePrefix + "schedule_pending_retries_total"
 	MetricHandlerInvocations       = metricNamespacePrefix + "handler_invocations_total"
 	// MetricAppBuildFailures counts failed app image and dependency-image
 	// builds. It is APP lifecycle (whether an app could be prepared), not handler
@@ -212,6 +226,8 @@ var metricHelp = map[string]string{
 	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
 	MetricSchedulePublishExhausted:     "Schedule occurrences whose bounded publication retry budget was exhausted without a success or duplicate; the occurrence is lost on this worker (other workers may still publish it).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
+	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox after their immediate Redis publication did not resolve; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
+	MetricSchedulePendingRetries:       "Publication attempts made by the durable schedule-publication retry worker for occurrences persisted in the local outbox; a resolved attempt removes the outbox row, a failed one reschedules it.",
 
 	MetricHandlerInvocations:              "Handler invocation outcomes by app and handler, counted once per handler attempt; outcome is success or failure.",
 	MetricAppBuildFailures:                "App image and dependency-image build failures by app.",
@@ -501,6 +517,10 @@ func New() *Registry {
 		MetricSchedulePublishRetries,
 		MetricSchedulePublishExhausted,
 		MetricScheduleCatchUp,
+		// Durable schedule-publication recovery counters (see internal/cron's
+		// durable retry worker). Prometheus-only, like the other schedule counters.
+		MetricSchedulePendingPersisted,
+		MetricSchedulePendingRetries,
 		// MetricMissingPayload is a stream-layer anomaly counter fed by the
 		// consumer when it clears a dangling PEL entry (see the constant's doc).
 		MetricMissingPayload,

@@ -33,6 +33,8 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.Inc(MetricSchedulePublishRetries)
 	r.Inc(MetricSchedulePublishExhausted)
 	r.Inc(MetricScheduleCatchUp)
+	r.Inc(MetricSchedulePendingPersisted)
+	r.Inc(MetricSchedulePendingRetries)
 	r.Inc(MetricMissingPayload)
 	r.IncLabels(MetricHandlerInvocations, []Label{{"outcome", "success"}, {"app", "a"}, {"handler", "x"}})
 	r.IncLabels(MetricAppBuildFailures, []Label{{"app", "a"}})

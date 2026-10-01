@@ -939,6 +939,29 @@ func Run(logger *slog.Logger) error {
 	// app set before Start, then converges live via the reconciler's
 	// UpdateSchedules/RemoveApp hooks.
 	sched := cron.NewWithMetrics(publisher, logger, metricsInstance)
+	// Register the scheduler shutdown barrier IMMEDIATELY after constructing the
+	// scheduler and BEFORE starting anything that can touch Redis or the state
+	// DB (the durable retry worker, catch-up, jobs). gocron's Shutdown is bounded
+	// by WithStopTimeout (and its executor can return ErrStopJobsTimedOut while a
+	// task goroutine is still running), so a Relay publisher callback — or the
+	// durable retry worker — can outlive g.Shutdown and still touch Redis. This
+	// barrier strictly joins both the gocron shutdown, every admitted publisher
+	// callback, AND the durable retry worker. Registering it here means an early
+	// startup failure after this point still joins them before the later state/
+	// Redis teardown runs, rather than leaving the retry worker mid-operation.
+	// Stop is idempotent and also guards against a scheduler that was never
+	// Started, so an early-return shutdown is safe.
+	shutdown.register(schedulerBarrierStep(sched.Stop))
+	// Wire the durable publication-retry outbox and worker. When the local
+	// state DB is unavailable (st==nil) there is no durable store, so the
+	// scheduler keeps its bounded in-memory retry only — state failures are
+	// never fatal. The retry worker is started BEFORE catch-up so a record
+	// persisted by a failed catch-up is retried promptly; the barrier above
+	// already covers it.
+	if st != nil {
+		sched.SetOutbox(st)
+		sched.StartPendingRetry(ctx)
+	}
 	for _, fn := range apps {
 		sched.ReplaceApp(fn.Name, fn.Template)
 	}
@@ -1121,13 +1144,9 @@ func Run(logger *slog.Logger) error {
 	// (seeded before Start) fire from their first cron tick and jobs the
 	// reconciler later converges schedule immediately.
 	sched.Start()
-	// barrier: gocron's Shutdown is bounded by WithStopTimeout (and its
-	// executor can return ErrStopJobsTimedOut while a task goroutine is still
-	// running), so a Relay publisher callback can outlive g.Shutdown and still
-	// touch Redis. The scheduler step strictly joins both the shutdown and
-	// every admitted callback before any later step (ultimately the Redis
-	// close) can run.
-	shutdown.register(schedulerBarrierStep(sched.Stop))
+	// The scheduler shutdown barrier was registered when the scheduler was
+	// constructed (before its durable retry worker and any publish could start),
+	// so an early startup failure already joins it; nothing is registered here.
 	reconcilerSpan.End()
 
 	// The startup root ends here, at the ready-to-consume boundary immediately

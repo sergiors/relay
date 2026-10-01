@@ -20,10 +20,14 @@
 //
 // Publication retries always reuse the same logical occurrence and therefore the
 // same deduplication identity. Retries are bounded and stop on success, a clean
-// duplicate, or lifecycle cancellation. On startup, CatchUp may republish the
-// latest missed occurrence for each schedule within a bounded recovery horizon;
-// older occurrences are not replayed and future occurrences are never
-// synthesized.
+// duplicate, or lifecycle cancellation. A publication that does not resolve is
+// also persisted to a durable outbox (when one is wired via SetOutbox) and
+// retried indefinitely by StartPendingRetry's background worker, across
+// restarts, until it resolves; the row is deleted only after a publication call
+// returns a nil error (published or a clean duplicate). On startup, CatchUp may
+// republish the latest missed occurrence for each schedule within a bounded
+// recovery horizon; older occurrences are not replayed and future occurrences
+// are never synthesized.
 //
 // gocron callbacks do not expose the scheduled due instant, so Relay derives the
 // latest occurrence at or before the callback time using the same cron parsing

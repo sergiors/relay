@@ -34,9 +34,10 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   engines (`runtime/python`, `runtime/node`).
 - `runner` match -> attempt/retry/exhaustion -> outcome aggregate; `stream`
   consumption, recovery, per-invocation state, DLQ.
-- `schedule` identity/publish; `cron` timing/catch-up; `reconciler` live reload
-  and services; `routing` Traefik; `secrets`, `state`, `processlock`,
-  `git`/`git/webhook`, `observability/*`, `testutil`.
+- `schedule` identity/publish; `cron` timing/catch-up and the durable
+  publication-retry worker; `reconciler` live reload and services; `routing`
+  Traefik; `secrets`, `state`, `processlock`, `git`/`git/webhook`,
+  `observability/*`, `testutil`.
 
 ## Ownership and invariants
 
@@ -132,8 +133,20 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   handler.
 - Only minute-granularity schedules are accepted; sub-minute and relative forms
   are rejected because their identity is not deterministic across workers.
-- Publication failures retry the same occurrence with a bounded backoff; startup
-  catch-up republishes only the latest missed occurrence within a bounded horizon.
+- Publication failures retry the same occurrence with a bounded backoff; if that
+  in-memory budget is spent (or the tick is cancelled), the complete immutable
+  occurrence intent is persisted to the local `state` SQLite outbox
+  (`schedule_pending`) and a `cron`-owned durable retry worker republishes it
+  indefinitely, across restarts, until a publication call resolves nil
+  (published or clean duplicate), when the row is deleted. The outbox is
+  coordination state only — never history, never an execution source — and is
+  untouched on a healthy first-attempt success/duplicate. Rows are claimed with a
+  per-row DB lease, not a global mutex, and never deleted until a call resolves.
+  A record is republished only after its decoded intent is verified to
+  reconstruct the occurrence ID stored in its row key; an undecodable or
+  identity-mismatched row is logged, retained, and rescheduled under the bounded
+  backoff, never published or deleted. Startup catch-up stays the bounded,
+  latest-only 24h recovery for never-attempted misses and is unchanged.
 - Once published it reuses the stream retry/claim/DLQ machinery, so handler
   execution stays at-least-once. The execution contract is frozen at the
   occurrence's FIRST successful admission: before admission a delivery resolves
@@ -267,9 +280,12 @@ integration suite with Redis and Node.
   after service convergence and reference guards.
 - Never close the runtime manager or state DB while a reconcile, service pass,
   or startup sweep may still use it, and never close Redis while a scheduler
-  publisher callback may still be running: their shutdown steps are strict-join
-  barriers, so a bound expiry cancels the step and then waits for its real
-  operation before teardown advances.
+  publisher callback or the durable publication-retry worker may still be
+  running: their shutdown steps are strict-join barriers, so a bound expiry
+  cancels the step and then waits for its real operation before teardown
+  advances. A durable-retry attempt cut short by that cancellation leaves its
+  outbox row recoverable; an outbox row is never deleted until a publication
+  call resolves nil.
 
 ## References
 
