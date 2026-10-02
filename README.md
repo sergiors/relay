@@ -2,13 +2,23 @@
 
 Relay is an event-driven runtime for declarative apps — with serverless functions, schedules, and persistent services. Run it on infrastructure you control.
 
-It executes short-lived functions in isolated runtimes, publishes scheduled work through the same event pipeline, and continuously reconciles long-running services from the same declarative model.
+It executes short-lived functions in isolated runtimes, publishes scheduled
+occurrences to the same Redis Stream and consumer group as external events, and
+continuously reconciles long-running services from the same declarative model.
 
-For event-driven workloads, Relay consumes events from a broker, matches them against declarative rules, executes matched functions, retries failures, and dead-letters exhausted invocations.
+For external events, Relay consumes stream messages, classifies each event
+against declarative patterns, executes the matching functions, retries failures,
+and dead-letters exhausted invocations. Scheduled occurrences use a separate
+dispatch path that resolves the schedule's handler directly, without ordinary
+event classification or pattern matching.
 
 Persistent services use the same runtime, configuration, secrets, networking, resource controls, and container infrastructure without requiring them to participate in the event pipeline.
 
-**An app is the unit of source, configuration, and deployment.** Within an app, event-driven **functions**, schedules, and optional persistent services share one declarative model. Each function targets a handler, while schedules publish work into the same event pipeline and services run as long-lived containers outside it.
+**An app is the unit of source, configuration, and deployment.** Within an
+app, event-driven **functions**, schedules, and optional persistent services
+share one declarative model. A handler is the execution target for a one-shot
+function; an event pattern or schedule trigger determines when that function
+runs. Services are separate persistent workloads.
 
 Functions remain a first-class Relay workload. Start with a function. Add a service when you need one.
 
@@ -34,46 +44,63 @@ Functions, schedules, and persistent services are declared within an app and sha
 
 ## How it works
 
-Relay has two workloads: **functions** (triggered by events or schedules) and **services** (always long-lived):
+Relay has two workload types: **functions** (ephemeral, one-shot executions)
+and **services** (persistent, long-lived workloads). External events and
+schedules are distinct function triggers:
 
 ```text
-Functions    Events       → matched invocation
-             Schedules    → published occurrence → matched invocation
+Functions    External event → classify and pattern-match → handler → one-shot function
+             Schedule       → uniquely identified occurrence → Redis Stream / consumer group
+                              → schedule dispatch (resolve/adopt handler; bypass pattern matching)
+                              → handler → one-shot function
 Services     → continuously reconciled containers
 ```
 
-Both triggers land in the same event pipeline; services never do. An app may declare any mix of these.
+External events and schedule occurrences share the Redis Stream, consumer
+group, invocation-state, retry/recovery, and DLQ infrastructure. Only external
+events go through ordinary event classification and pattern matching. Persistent
+services do not use this message-dispatch or one-shot function lifecycle. An app
+may declare any mix of these.
 
 ### Events
 
 For event-driven workloads, Relay follows this path:
 
 ```text
-Redis Stream
+External event
     ↓
-event matcher
+Redis Stream / consumer group
     ↓
-invocation state / retries
+event classification and pattern matching
     ↓
-runner
+matching handler(s) → one-shot function(s)
     ↓
-isolated container
+shared invocation state / retries / recovery / DLQ
 ```
 
-A stream message may match one or more handlers across one or more apps. Relay only acknowledges the message after every matched invocation reaches a terminal state.
+A stream message carrying an external event may match one or more handlers
+across one or more apps. Relay only acknowledges it after every matched
+invocation reaches a terminal state.
 
 ### Schedules
 
-Schedules follow the same execution path after publication:
+Each schedule is a trigger. A firing creates a uniquely identified occurrence
+and publishes it to the same Redis Stream and consumer group as external events.
+The consumer uses schedule-specific dispatch: it resolves the configured handler
+by schedule name (or adopts the handler contract already pinned at admission),
+bypassing ordinary event classification and pattern matching. The handler then
+runs as a one-shot function through the common runtime machinery.
 
 ```text
 cron
   ↓
-deduplicated occurrence publication
+uniquely identified occurrence + deduplicated publication
   ↓
-Redis Stream
+Redis Stream / consumer group
   ↓
-normal Relay execution
+schedule dispatch → configured handler
+  ↓
+one-shot function → shared invocation state / retries / recovery / DLQ
 ```
 
 ### Services
@@ -101,12 +128,17 @@ Relay watches `/apps` for changes. When an app changes, Relay reconciles only th
 Relay is designed around explicit delivery, recovery, and convergence semantics.
 
 - **Handler execution is at-least-once, not exactly-once.** A crash after a handler performs a side effect but before completion is recorded may cause the handler to run again. Handlers should be idempotent where side effects require it.
-- **Matched work is not acknowledged while unresolved.** Running invocations, retry backoff, and other non-terminal states keep the Redis message pending.
-- **Unavailable apps do not turn matched work into unmatched work.** Their invocations remain recoverable rather than being acknowledged as if nothing matched.
+- **Dispatched work is not acknowledged while unresolved.** Running functions, retry backoff, and other non-terminal states keep the Redis message pending.
+- **Unavailable apps do not turn matching external events into unmatched
+  events.** Their event invocations remain recoverable rather than being
+  acknowledged as if nothing matched.
 - **Retries preserve invocation coordination.** Stale claim owners cannot overwrite newer invocation state.
 - **Exhausted invocations enter the DLQ.** DLQ state is tracked per invocation rather than per whole stream message.
 - **Schedule publication is deduplicated cluster-wide.** Multiple workers may evaluate the same cron occurrence, but only one stream entry is admitted for that logical occurrence.
-- **Schedule deduplication does not imply exactly-once execution.** Once published, scheduled handlers follow the same at-least-once execution model as any other event.
+- **Schedule deduplication does not imply exactly-once execution.** Once
+  published, schedule-triggered function invocations use the shared at-least-once
+  delivery and recovery machinery, but not ordinary event classification or
+  pattern matching.
 - **Redis pending work is recoverable.** Unacknowledged messages remain subject to normal PEL/reclaim handling.
 - **Persistent services converge toward declared state.** Relay continuously reconciles service containers against their configured replicas and runtime configuration.
 - **Warm container generations converge safely.** Idle stale containers are retired while busy old-generation containers are allowed to drain.
@@ -244,8 +276,7 @@ This is useful when the same app contains both event-driven functions and long-r
 
 ```text
 app
-├── event functions
-├── scheduled functions
+├── functions triggered by events or schedules
 └── persistent API / worker
 ```
 

@@ -3,6 +3,15 @@
 An app is one direct subdirectory of `/apps` containing a
 `template.yaml`. The directory name is the app name.
 
+Relay distinguishes the trigger, execution target, and workload: an external
+event is classified and pattern-matched; a **schedule** is a trigger whose each
+firing creates a uniquely identified **occurrence**; a **handler** is the target
+selected for execution; and a **function** is the ephemeral, one-shot workload
+that runs that handler. A **service** is a separate persistent, long-lived
+workload. Event and schedule functions share runtime and delivery/recovery
+machinery, but schedule occurrences bypass ordinary event classification and
+pattern matching. Services do not use that one-shot message lifecycle.
+
 ```
 /apps
   user-events-python/
@@ -39,7 +48,7 @@ events: # rules that consume stream events
     timeout: 6s # optional, default 6s, max 5m
     retries: 4 # optional, additional attempts, default 4
 
-schedules: # cron-triggered handlers
+schedules: # triggers that publish uniquely identified occurrences
   - name: nightly-cleanup # mandatory stable identity, unique per app
     handler: jobs.cleanup.handler
     cron: "0 3 * * *"
@@ -92,10 +101,15 @@ Handlers may live in nested modules (for example the `events/` package), not
 only top-level files. On `node24` a module may be `.js`/`.mjs` or
 `.ts`/`.mts`; the handler string never carries an extension.
 
-The handler contract is the same for events and schedules: the container gets
-`RELAY_HANDLER` set to the rule's handler and the event JSON on stdin; the exit
-code decides success (`0`) or failure (non-zero). See [events.md](events.md) and
-[schedules.md](schedules.md).
+Both event and schedule handlers run as one-shot functions through the managed
+runtime. For an event function, Relay sets `RELAY_HANDLER` to the matched rule's
+handler and sends the external event JSON on stdin. For a schedule-triggered
+function invocation, it sets `RELAY_HANDLER` to the configured (or
+already-admitted) schedule handler and sends the occurrence payload on stdin;
+schedule dispatch selects this handler directly rather than pattern-matching the
+occurrence. In either case, exit code
+`0` is success and any non-zero code is failure. See
+[events.md](events.md) and [schedules.md](schedules.md).
 
 Event handler names must be **unique across an app's event rules**,
 regardless of pattern, timeout, or retries: the invocation identity is
@@ -109,7 +123,7 @@ no trailing `.`).
 
 ### Timeouts and retries
 
-- `timeout` bounds one invocation of that rule (default `6s`). It must be
+- `timeout` bounds one function invocation (default `6s`). It must be
   positive and at most `5m`; a larger, zero, negative, or unparseable value
   fails template validation.
 - `retries` is the number of **additional** executions after the initial one
@@ -148,7 +162,7 @@ agree.
 
 Injection and confidentiality — be precise about the boundaries:
 
-- For **event/schedule invocations**, template env values and resolved secrets
+- For **ephemeral event/schedule functions**, template env values and resolved secrets
   travel in the per-invocation request frame applied by the reused bootstrap
   process. They are never written to the execution container's Docker
   `Config.Env`, a Docker label, a metric, a log, a trace, or the state database.
@@ -168,7 +182,7 @@ secret **reference** names only.
 ### Resource limits
 
 `resources` declares per-container memory/CPU/PID limits for every container the
-app runs (event, schedule, manual invocation, and both service source
+app runs (event/schedule/manual function, and both persistent service source
 kinds). All three keys are optional and resolved **independently**; omitted or
 empty `resources` yields the defaults `128MiB`, `1` CPU, `128` PIDs.
 
@@ -251,9 +265,10 @@ a worker restart.
 ### Hot reload
 
 Relay watches `/apps` and reconciles changes live: a new directory is
-built and starts matching; edits to template/source/dependencies rebuild only
-that app; a failed rebuild keeps the previous working version and retries on
-the next change or the 30s periodic pass. An app whose image cannot be built
+built and becomes available to event matching and schedule dispatch; edits to
+template/source/dependencies rebuild only that app; a failed rebuild keeps the
+previous working version and retries on the next change or the 30s periodic pass.
+An app whose image cannot be built
 is marked unavailable but is still **matched**: an event matching only an
 unavailable app counts as matched and stays pending (never DLQ'd for
 unavailability alone) until the app is rebuilt. `/apps` is read-only

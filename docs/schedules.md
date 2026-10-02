@@ -1,13 +1,20 @@
 # Schedules
 
-A `schedules` list in `template.yaml` makes an app's handler run on a cron
-schedule. Scheduled invocations reuse the entire event execution path: the same
-runtime image lifecycle, secrets, timeout cap, concurrency slots, retry/DLQ
-machinery, and handler metrics.
+A schedule is a **trigger**, not a workload: each firing creates a uniquely
+identified **occurrence** and publishes it to the same Redis Stream and consumer
+group used for external events. A schedule-specific dispatch path resolves the
+configured **handler** by schedule name (or adopts the handler contract pinned at
+admission) and bypasses ordinary event classification and pattern matching. The
+handler is the execution target for a one-shot **function** invocation. That
+function uses the common runtime, secrets, timeout cap, concurrency slots,
+invocation-state, retry/recovery, and DLQ machinery. A persistent **service** is a
+separate long-lived workload and does not run as an occurrence invocation.
 
 ```
-gocron (every worker) → atomic publish-if-new → Redis Stream
-→ existing consumer group → one worker → runner → container
+gocron (every worker) → uniquely identified occurrence → atomic publish-if-new
+→ Redis Stream → existing consumer group → schedule dispatch
+→ resolve/adopt handler (bypass event pattern matching) → one-shot function
+→ common runtime and invocation lifecycle
 ```
 
 A template must still declare at least one event or service; `schedules` alone
@@ -94,9 +101,10 @@ worker's simultaneous evaluation of the same tick is a clean no-op.
   They are history only and are never deleted on completion, so a worker whose
   callback runs later cannot re-publish an occurrence the fleet already
   completed. Dedup applies to **publication**, not to handler execution.
-- Once the stream entry exists it is an ordinary Relay message: the consumer
-  group delivers it to one worker, and PEL / `XAUTOCLAIM` recovery, retries,
-  exhaustion, and DLQ apply exactly as for an event.
+- Once the occurrence entry exists, the consumer group delivers it to one worker.
+  It takes the schedule-specific dispatch path, not ordinary event
+  classification/pattern matching; PEL / `XAUTOCLAIM` recovery, invocation state,
+  retries, exhaustion, and DLQ are shared with external event work.
 - A duplicate publication is a successful no-op.
 
 Because a failed publish is persisted durably (see
@@ -105,8 +113,9 @@ occurrence identity, an ambiguous `XADD` (the call errored but the entry may hav
 been admitted) is eventually resolved as a clean duplicate rather than
 republished or lost.
 
-The scheduled handler receives a deterministic payload on stdin (same contract
-as events):
+The scheduled handler receives the occurrence's deterministic payload on stdin.
+It is still a one-shot function invocation, but the occurrence is dispatched
+directly to its configured handler rather than matched against event patterns:
 
 ```json
 { "source": "relay.schedule", "scheduled_at": "2026-09-29T03:00:00Z" }
@@ -169,10 +178,10 @@ when another schedule shares its handler; removing one name never obsoletes
 another. Already published occurrences are not purged from Redis; they expire via
 the dedup TTL and stream retention.
 
-An occurrence still pending when its app or schedule is removed is
-treated as **obsolete** if it has not yet been admitted: it is acknowledged
-as terminal rather than retried forever or dead-lettered, because the
-referenced configuration was intentionally removed.
+An occurrence still pending when its app or schedule is removed is treated as
+**obsolete** if it has not yet been admitted: it is acknowledged as terminal
+rather than retried forever or dead-lettered, because the referenced schedule
+configuration was intentionally removed.
 
 A schedule is resolved by its stable **name**, and its execution contract is
 frozen at the occurrence's **first successful admission**:
@@ -195,11 +204,10 @@ frozen at the occurrence's **first successful admission**:
   DLQ lifecycle under the contract with which it was admitted.
 
 The handler is not part of the schedule occurrence identity. Occurrences are
-identified by the schedule resource, while execution remains tied to the
-`app/handler` invocation that was actually admitted and run. The pinned
-descriptor preserves the admitted schedule context and execution contract;
-per-invocation state and DLQ attribution remain keyed by that
-`app/handler`.
+identified by the schedule resource, while the one-shot function executes the
+`app/handler` target that was actually admitted. The pinned descriptor preserves
+the admitted schedule context and execution contract; shared per-invocation state
+and DLQ attribution remain keyed by that `app/handler`.
 
 ## The guarantee
 

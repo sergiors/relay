@@ -1,19 +1,24 @@
 # Events
 
-Relay consumes events from the configured Redis Stream with a consumer group.
-Each entry carries an `event` field whose value is a JSON **object**; Relay
-matches that object against every loaded app's event rules and runs the
-matching handlers.
+Relay consumes external events from the configured Redis Stream with a consumer
+group. Each external-event entry carries an `event` field whose value is a JSON
+**object**; Relay classifies it against every loaded app's event rules, matches
+that object against their patterns, and runs the matching handlers. Schedule
+occurrences use the same stream and consumer group but a separate schedule
+dispatch path: they resolve/adopt the configured handler directly and bypass
+ordinary event classification and pattern matching (see
+[schedules.md](schedules.md)).
 
 ```
-Producer → Redis Stream → Relay (match) → runner → container → XACK
+Producer → Redis Stream → Relay (classify + pattern-match external event)
+→ matching handler → one-shot function → shared invocation lifecycle → XACK
 ```
 
-A message that decodes successfully is classified `matched` or `unmatched`
-**before any execution**; an unmatched message is acknowledged and never
-retried. A malformed message (missing `event`, not a string, not a JSON object)
-can never succeed and is routed straight to the DLQ on first encounter without
-running a handler, then acknowledged.
+An external-event message that decodes successfully is classified `matched` or
+`unmatched` **before any execution**; an unmatched event is acknowledged and
+never retried. A malformed external-event message (missing `event`, not a string,
+not a JSON object) can never succeed and is routed straight to the DLQ on first
+encounter without running a handler, then acknowledged.
 
 ## Publishing an event
 
@@ -27,8 +32,10 @@ redis-cli XADD events '*' event '{"event_name":"INSERT","table_name":"users"}'
 Relay never assumes where events originate; it only reads the stream.
 
 Events may also be created by `relay app invoke` (manual, synchronous, not
-part of the stream lifecycle — see [cli.md](cli.md)) and by Relay's own schedule
-publication (see [schedules.md](schedules.md)).
+part of the stream lifecycle — see [cli.md](cli.md)). Relay also publishes its
+own schedule occurrences to this stream; those are not external events and do
+not pass through the classification and pattern-matching flow described here
+(see [schedules.md](schedules.md)).
 
 ## Pattern syntax
 
@@ -144,8 +151,8 @@ with `- prefix: "user_"` matches `user_123` but not `123`.
 
 ## Dispatch and concurrency
 
-For each delivered message, Relay evaluates every loaded app (in sorted
-name order) and each app's rules in declaration order:
+For each delivered external-event message, Relay evaluates every loaded app (in
+sorted name order) and each app's rules in declaration order:
 
 - **Per message, matching invocations run one at a time.** The runner iterates
   apps and rules in a single loop and executes each matching handler in
@@ -158,9 +165,13 @@ name order) and each app's rules in declaration order:
   handlers of that message from running. Each matching invocation gets its own
   independent attempt and outcome.
 
-A handler runs in an isolated container with `RELAY_HANDLER` set and the event
-JSON on stdin; exit code `0` is success, anything else is failure. Container
-stdout/stderr is forwarded verbatim (prefixed per handler) at every log level.
+A matched event handler runs as a one-shot function in an isolated container,
+with `RELAY_HANDLER` set and the external event JSON on stdin; exit code `0` is
+success, anything else is failure. Container stdout/stderr is forwarded verbatim
+(prefixed per handler) at every log level. A schedule-triggered function
+invocation uses the same one-shot runtime and outcome machinery but receives an
+occurrence payload and is selected by schedule dispatch, not event pattern
+matching.
 
 ## Delivery, retry, and ACK
 
@@ -205,10 +216,11 @@ in the ACK→retain window) is simply leaked, never prematurely expired.
 
 ## Dead-letter queue
 
-When **all** non-complete matched invocations are exhausted, the message is
-dead-lettered and then acknowledged. One entry is written **per exhausted
-invocation**, so a message matching several apps or handlers that all
-exhaust produces one correctly-attributed entry each.
+When **all** non-complete invocations dispatched for a message are exhausted,
+the message is dead-lettered and then acknowledged. One entry is written **per
+exhausted invocation**, so an external event matching several apps or handlers
+that all exhaust produces one correctly-attributed entry each. Scheduled
+occurrence functions use this shared invocation/DLQ infrastructure.
 
 - The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key).
 - Entries are written **before** the XACK. If a write fails, the original stays
@@ -228,9 +240,11 @@ Manage the DLQ with `relay dlq ls` / `inspect` / `replay` / `rm` — see
 
 ## Guarantees summary
 
-- Events are matched including apps that are currently unavailable.
-- Unmatched and malformed messages are acknowledged (malformed ones only after a
-  DLQ entry is persisted).
+- External events are classified and matched including apps that are currently
+  unavailable; schedule occurrences bypass that matching and dispatch by
+  schedule name to the configured/admitted handler.
+- Unmatched external events and malformed external-event messages are
+  acknowledged (malformed ones only after a DLQ entry is persisted).
 - No message is acknowledged while any invocation is protected, running, or
   unresolved.
 - A reclaimed PEL entry whose stream body no longer exists is data loss, not

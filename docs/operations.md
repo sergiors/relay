@@ -137,7 +137,12 @@ Canonical names carry the `relay_` prefix. Highlights:
 
 - **Event classification** (closed partition): `relay_events_received_total ==
 relay_events_matched_total + relay_events_unmatched_total`, classified exactly
-  once per logical event across redeliveries. Schedule occurrences are excluded.
+  once per external event across redeliveries. Schedule occurrences are excluded
+  because schedule dispatch resolves/adopts the configured handler directly and
+  bypasses ordinary event classification and pattern matching. Both dispatch
+  types use the same Redis Stream/consumer group and invocation-state,
+  retry/recovery, and DLQ infrastructure; schedule occurrences run their handler
+  as a one-shot function. Persistent services are separate long-lived workloads.
 - **Handlers/retries/DLQ:** `relay_handler_success_total`,
   `relay_handler_failure_total`, `relay_retries_total`, `relay_dlq_entries_total`,
   `relay_handler_invocations_total{outcome,app,handler}`,
@@ -188,11 +193,13 @@ isolated from the event path.
 OpenTelemetry tracing is opt-in via the standard OTLP environment (see
 [configuration.md](configuration.md)) and propagates W3C TraceContext + Baggage.
 Relay installs exactly those two propagators; `OTEL_PROPAGATORS` is not
-honored. The primary propagation path is the Redis event stream: schedule
-publication writes `traceparent`/`tracestate`/`baggage` as flat stream metadata,
-consumption extracts them, and invocation frames carry them to the Python/Node
-bootstraps. Each handler attempt is its own span; retries link to the prior
-attempt via persisted compact lineage; DLQ replay links to the original failed
+honored. The primary propagation path is the Redis stream: external events and
+schedule occurrence publication carry `traceparent`/`tracestate`/`baggage` as
+flat stream metadata, consumption extracts them, and invocation frames carry
+them to the Python/Node bootstraps. Schedule occurrences use schedule-specific
+dispatch, not ordinary event matching. Each handler attempt is its own span;
+retries link to the prior attempt via persisted compact lineage; DLQ replay links
+to the original failed
 invocation. Manual invocations create a new-root span. Persistent services are
 not propagation boundaries. A setup error is non-fatal — the worker runs
 untraced.

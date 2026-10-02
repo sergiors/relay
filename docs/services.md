@@ -1,8 +1,13 @@
 # Services
 
 A `services` list declares **persistent long-running containers** kept running
-and reconciled continuously — an HTTP server, for example — as opposed to
-event/schedule invocations that exit after one request.
+and reconciled continuously — an HTTP server, for example. A service is distinct
+from an ephemeral **function**: event functions are selected by classification
+and pattern matching, while a schedule-triggered function invocation is selected
+by schedule-specific dispatch for a particular occurrence. Each function
+attempt executes its handler and then finishes; retry/recovery may launch another
+attempt. Services remain running independently of individual events or
+occurrences.
 
 ## Source model
 
@@ -72,9 +77,9 @@ The environment each replica gets, in order: the runtime's plan environment
 (e.g. `PYTHONDONTWRITEBYTECODE=1` for Python; empty for image sources), the
 template's `env` values, resolved `secrets` values, then `PORT`.
 
-Unlike event/schedule invocations, a persistent service needs its environment at
-process **start**, so the effective environment is written to the service
-container's Docker `Config.Env`. Anyone with Docker daemon access can read it via
+Unlike ephemeral event/schedule functions, a persistent service needs its
+environment at process **start**, so the effective environment is written to the
+service container's Docker `Config.Env`. Anyone with Docker daemon access can read it via
 `docker inspect`; Relay never writes a value into a label, log, metric, or span,
 only the one-way `relay.env_hash` digest.
 
