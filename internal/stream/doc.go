@@ -13,7 +13,13 @@
 //   - Schedule occurrences: messages whose decode is recognized as a schedule
 //     envelope (see internal/schedule) ride this same consumer-group / PEL /
 //     XAUTOCLAIM / retry / DLQ machinery but bypass event matching: when a
-//     ScheduleRunner is wired they invoke the named app/handler directly.
+//     ScheduleRunner is wired they validate the occurrence against the current
+//     template and invoke the named app/schedule directly. A message that claims
+//     schedule identity (source=="relay.schedule") but is structurally
+//     incomplete, malformed, or carries a mismatched occurrence_id is NEVER
+//     treated as an ordinary event: it is dead-lettered as a non-retryable
+//     failure, so a malformed claim can neither fall through to pattern matching
+//     nor be ACKed as unmatched.
 //   - Recovery: XAUTOCLAIM reclaims idle pending messages, with retry counts
 //     sourced from XPENDING so delivery counts survive restarts. Reclaim is
 //     message-ownership recovery only; whether a reclaimed message's invocation
@@ -166,9 +172,13 @@
 // The package knows nothing about matching or execution; it delegates each
 // decoded event to the caller's Handler. Schedule-occurrence messages are a
 // notable exception: they are routed to the ScheduleRunner seam (when wired),
-// which is the runner's InvokeHandler executing the named app's schedule by
-// its stable schedule name directly without event matching. A ScheduleRunner
-// that reports ErrInvocationObsolete (the app or schedule NAME was removed
-// while the occurrence was pending) causes the message to be acknowledged — an
-// obsolete occurrence is terminal and is never retried or dead-lettered.
+// which validates the occurrence against the current template and executes the
+// named app's schedule by its stable schedule name directly without event
+// matching. A ScheduleRunner that reports ErrInvocationObsolete (the app or
+// schedule NAME was removed while the occurrence was pending) causes the message
+// to be acknowledged — an obsolete occurrence is terminal and is never retried
+// or dead-lettered. A ScheduleRunner that reports ErrScheduleInvalid (the
+// occurrence is well-formed but is not a real firing of the current schedule
+// definition) causes the message to be dead-lettered — an invalid claim is
+// terminal and is never retried or ACKed as success.
 package stream

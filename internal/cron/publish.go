@@ -54,8 +54,12 @@ var publishRetryDelays = []time.Duration{
 // drift. Only the accepted schedule grammar reaches here: the 6-field (seconds)
 // form and `@every` are rejected before registration (see ReplaceApp and
 // internal/app.validateCron).
+//
+// It delegates to schedule.ParseCron, the shared primitive the consumer side
+// (runner claim validation) also uses, so firing semantics have exactly one
+// implementation.
 func parseSchedule(expr string, loc *time.Location) (robfigcron.Schedule, error) {
-	return robfigcron.ParseStandard("CRON_TZ=" + loc.String() + " " + expr)
+	return schedule.ParseCron(expr, loc)
 }
 
 // latestOccurrence returns the latest occurrence of sch at or before now,

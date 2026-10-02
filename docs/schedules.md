@@ -209,6 +209,51 @@ identified by the schedule resource, while the one-shot function executes the
 the admitted schedule context and execution contract; shared per-invocation state
 and DLQ attribution remain keyed by that `app/handler`.
 
+### Occurrence validation
+
+A schedule message is a **claim of schedule identity**: the envelope names the
+app, the schedule, the handler, the scheduled instant, and the derived
+occurrence id. Relay validates that claim structurally and semantically before
+anything executes. This is integrity, not provenance — there is no signature or
+key; the validation only establishes that a claim is well-formed and
+consistent, never who sent it.
+
+- **Structural.** A message whose `source` is `relay.schedule` must carry a
+  non-empty app, schedule, handler, and occurrence id, and an RFC3339
+  `scheduled_at` that is whole-second. Cron evaluation is whole-second
+  granularity, so a timestamp carrying a fractional second (e.g.
+  `12:34:00.500Z`) is malformed even though its derived id truncates to
+  `12:34:00Z`: it is rejected rather than accepted as the second it falls in. A
+  nonzero whole second is **not** structurally malformed: historical IANA
+  offsets can themselves carry a seconds component, so a legitimate local-minute
+  firing may have a nonzero UTC second; whether it actually fires is decided
+  semantically (see Firing). A message that carries the marker but fails the
+  structural check is **invalid**: it is deliberately **not** treated as an
+  ordinary event (so it can never be pattern-matched and ACKed as unmatched) and
+  it is **dead-lettered** as a non-retryable failure. A message without the
+  marker is an ordinary external event and is untouched.
+- **Identity.** `occurrence_id` must equal the id derived from
+  `app`/schedule/`scheduled_at`; identity is derived and cross-checked, never
+  trusted from the wire. A mismatch is invalid and dead-lettered.
+- **Firing.** For a schedule whose name still exists, `scheduled_at` must be a
+  real firing of the schedule's **current** cron in its effective timezone
+  (including DST), computed with the same parser gocron uses. A timestamp that
+  is not a firing is invalid and dead-lettered. A schedule whose own cron no
+  longer parses is surfaced the same way.
+- **Target.** The envelope handler never selects the execution target: only the
+  app and the stable schedule **name** do, and the current template's handler is
+  what runs (or the handler pinned at admission). This is why a handler change
+  under the same name is a valid live change, not an invalid claim.
+
+Dispositions stay distinct:
+
+- **Obsolete** (app or schedule NAME removed, never admitted): acknowledged as
+  terminal, never retried and never dead-lettered.
+- **Unavailable** (app configured but not runnable): retryable, left pending.
+- **Invalid** (the name exists but the claim is not a real firing, or its cron
+  is unparseable): non-retryable, dead-lettered.
+- **Handler failure**: the ordinary per-invocation retry/exhaustion lifecycle.
+
 ## The guarantee
 
 > One schedule occurrence is **published once cluster-wide**, while handler

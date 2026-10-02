@@ -1889,6 +1889,17 @@ func (e *HandlerExhaustedError) Unwrap() []error {
 // so the stream layer acknowledges the message instead.
 var ErrInvocationObsolete = errors.New("invocation obsolete")
 
+// ErrScheduleInvalid is returned (wrapped) by the runner when a schedule
+// occurrence is well-formed as an envelope but is semantically invalid against
+// the CURRENT template: the named app and schedule exist and are available, but
+// scheduled_at is not a real firing of the schedule's current cron definition
+// (including timezone/DST), or the schedule's cron could not be parsed. Such a
+// claim can never succeed, so it is terminal and non-retryable: the stream
+// routes the message to the DLQ (never a retry, never a silent ACK-as-success).
+// It is deliberately distinct from ErrInvocationObsolete (removed configuration,
+// ACKed) and from a temporary/unavailable failure (retried).
+var ErrScheduleInvalid = errors.New("schedule occurrence invalid")
+
 // WithInvocationState returns a child of ctx carrying the per-message
 // InvocationState. The stream layer sets this before invoking the Handler so
 // the runner can skip already-completed or in-flight invocations without

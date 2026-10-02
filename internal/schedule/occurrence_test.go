@@ -131,8 +131,11 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
-// IsScheduleEvent recognizes schedule messages and ignores normal events,
-// source-with-missing-fields events, tampered occurrence_id, and invalid dates.
+// IsScheduleEvent recognizes structurally VALID schedule messages and ignores
+// normal events and malformed claims. A marker with a missing/invalid field, or
+// a mismatched occurrence_id, is NOT a valid schedule event: it is classified
+// as an invalid claim (see TestClassifyClaim) so the stream dead-letters it
+// instead of executing it as an ordinary event.
 func TestIsScheduleEvent(t *testing.T) {
 	o := Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
 	raw, err := o.Envelope()
@@ -157,7 +160,7 @@ func TestIsScheduleEvent(t *testing.T) {
 		t.Fatal("normal event recognized as schedule")
 	}
 
-	// source==relay.schedule but missing required fields -> not a schedule.
+	// source==relay.schedule but missing required fields -> not a valid schedule.
 	for _, missing := range []map[string]any{
 		{"source": "relay.schedule", "app": "f", "schedule": "s", "handler": "h"},
 		{"source": "relay.schedule", "app": "f", "schedule": "s", "scheduled_at": "2026-07-01T08:00:00Z"},
@@ -172,19 +175,19 @@ func TestIsScheduleEvent(t *testing.T) {
 		}
 	}
 
-	// A tampered occurrence_id in the envelope does not change the recomputed ID
-	// (identity is derived from the fields, never trusted from the wire).
+	// A tampered occurrence_id does not match the derived identity, so the claim
+	// is invalid: identity is derived and cross-checked, never trusted.
 	tampered := make(map[string]any, len(event))
 	for k, v := range event {
 		tampered[k] = v
 	}
 	tampered["occurrence_id"] = "schedule:evil:evil:2030-01-01T00:00:00Z"
-	got2, ok := IsScheduleEvent(tampered)
-	if !ok {
-		t.Fatal("tampered envelope not recognized as schedule")
+	if _, ok := IsScheduleEvent(tampered); ok {
+		t.Fatal("a mismatched occurrence_id must not be recognized as a valid schedule event")
 	}
-	if got2.ID() != o.ID() {
-		t.Fatalf("tampered occurrence_id changed derived identity: got %q, want %q", got2.ID(), o.ID())
+	occ, kind, err := ClassifyClaim(tampered)
+	if kind != InvalidScheduleClaim || err == nil {
+		t.Fatalf("ClassifyClaim(mismatched id) = (%+v, %v, %v), want InvalidScheduleClaim with an error", occ, kind, err)
 	}
 }
 

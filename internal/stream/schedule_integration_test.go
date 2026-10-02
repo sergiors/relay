@@ -59,9 +59,9 @@ type scheduleOccCall struct {
 	payload  []byte
 }
 
-func (r *scriptedRunner) Run(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
+func (r *scriptedRunner) Run(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error {
 	r.mu.Lock()
-	r.calls = append(r.calls, scheduleOccCall{fn: fn, schedule: scheduleName, handler: handler, payload: append([]byte(nil), payload...)})
+	r.calls = append(r.calls, scheduleOccCall{fn: occ.App, schedule: occ.Schedule, handler: occ.Handler, payload: append([]byte(nil), payload...)})
 	failErr := r.failErr
 	exhaust := r.exhaust
 	r.mu.Unlock()
@@ -167,10 +167,10 @@ func TestIntegrationScheduleReclaimRetriesThenAcks(t *testing.T) {
 	rr := &scriptedRunner{failErr: fmt.Errorf("boom")}
 	// The runner fails only its first invocation.
 	var attempts atomic.Int64
-	runner := func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
+	runner := func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error {
 		n := attempts.Add(1)
 		_ = n
-		return rr.Run(ctx, msgID, fn, scheduleName, handler, payload)
+		return rr.Run(ctx, msgID, occ, payload)
 	}
 	e := newEnv(t, ConsumerConfig{
 		ScheduleRunner:  runner,
@@ -244,7 +244,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 	testutil.RequireRedis(t)
 	neo := schOcc()
 	env := newEnv(t, ConsumerConfig{
-		ScheduleRunner: func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
+		ScheduleRunner: func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error {
 			return ErrInvocationNotEligible
 		},
 		MinPendingIdle:  300 * time.Millisecond,
@@ -275,7 +275,7 @@ func TestIntegrationScheduleNotEligibleLeavesPending(t *testing.T) {
 func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 	testutil.RequireRedis(t)
 	env := newEnv(t, ConsumerConfig{
-		ScheduleRunner: func(ctx context.Context, msgID, fn, scheduleName, handler string, payload []byte) error {
+		ScheduleRunner: func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error {
 			return fmt.Errorf("%w: removed", ErrInvocationObsolete)
 		},
 		MinPendingIdle:  300 * time.Millisecond,
@@ -299,4 +299,41 @@ func TestIntegrationScheduleObsoleteIsAckedNotDLQed(t *testing.T) {
 		return !dlqed
 	})
 	env.stop(t)
+}
+
+// A structurally INVALID schedule claim (source==relay.schedule but a missing
+// required field) must never fall through to event matching and be ACKed as
+// unmatched: it is dead-lettered as a non-retryable failure, even though a
+// normal-event handler is wired. The handler is never invoked.
+func TestIntegrationInvalidScheduleClaimDLQedNotMatched(t *testing.T) {
+	testutil.RequireRedis(t)
+	rr := &scriptedRunner{}
+	env := newEnv(t, ConsumerConfig{ScheduleRunner: rr.Run})
+	// Marker present, but occurrence_id missing: an invalid claim.
+	id := env.xadd(t, `{"source":"relay.schedule","app":"courses","schedule":"cleanup","handler":"jobs.cleanup.handler","scheduled_at":"2026-07-01T08:00:00Z"}`)
+
+	var matched atomic.Int64
+	env.start(func(ctx context.Context, msgID string, ev map[string]any) error {
+		matched.Add(1)
+		return nil
+	})
+
+	// The invalid claim is routed to the DLQ...
+	testutil.WaitFor(t, 8*time.Second, "invalid schedule claim DLQ'd", func() bool {
+		_, ok := env.dlq()[id]
+		return ok
+	})
+	// ...and ACKed (gone from the PEL).
+	testutil.WaitFor(t, 8*time.Second, "invalid schedule claim acked (gone from PEL)", func() bool {
+		_, ok := env.pending()[id]
+		return !ok
+	})
+	env.stop(t)
+
+	if got := matched.Load(); got != 0 {
+		t.Fatalf("normal handler invoked %d times for an invalid schedule claim; want 0 (no fall-through)", got)
+	}
+	if rr.count() != 0 {
+		t.Fatalf("schedule runner invoked %d times for an invalid schedule claim; want 0", rr.count())
+	}
 }

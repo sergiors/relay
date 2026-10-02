@@ -825,9 +825,10 @@ func Run(logger *slog.Logger) error {
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
 		// Schedule occurrences route directly to the runner, bypassing event
-		// matching; the runner resolves the handler timeout from the current
-		// template and stamps the message's real Redis stream ID.
-		ScheduleRunner: runWorker.InvokeHandler,
+		// matching; the runner validates the occurrence against the current
+		// template and resolves the handler timeout from it, and stamps the
+		// message's real Redis stream ID.
+		ScheduleRunner: runWorker.InvokeOccurrence,
 	})
 
 	// Start the metrics components created earlier. The snapshot logger and the

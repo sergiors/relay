@@ -324,7 +324,7 @@ func TestScheduleRedeliveryDistinctSpansSameUpstreamTrace(t *testing.T) {
 	}
 	calls := 0
 	c := processMessageConsumer(newFakeInvocationStore(nil))
-	c.scheduleRunner = func(context.Context, string, string, string, string, []byte) error {
+	c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
 		calls++
 		return errors.New("retryable schedule failure")
 	}

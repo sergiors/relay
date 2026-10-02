@@ -37,10 +37,11 @@ func (o Occurrence) ID() string {
 	// timezone the cron was evaluated in is deliberately dropped here. Dropping
 	// sub-second components means worker-side evaluation jitter (whether two
 	// workers read the due instant a few milliseconds apart) never splits an
-	// occurrence into two IDs. Seconds themselves are NOT truncated: schedules
-	// are minute-granularity by construction (the scheduler stamps a
-	// minute-truncated due instant — seconds schedules are rejected at template
-	// validation), so two distinct whole seconds would still be distinct.
+	// occurrence into two IDs. Seconds themselves are NOT truncated: the
+	// scheduler stamps the schedule's own due instant, which is whole-second.
+	// That whole second can legitimately be nonzero (a historical IANA offset
+	// carrying a seconds component), so truncating it would merge distinct
+	// firings; two distinct whole seconds stay distinct.
 	t := o.ScheduledAt.UTC().Truncate(time.Second)
 	return "schedule:" + o.App + ":" + o.Schedule + ":" + t.Format(time.RFC3339)
 }
@@ -75,12 +76,99 @@ func (o Occurrence) Envelope() ([]byte, error) {
 	})
 }
 
-// ParseEnvelope decodes a stream envelope into its Occurrence. It validates
-// non-empty app/schedule/handler and a parseable scheduled_at (normalized
-// to UTC), and RECOMPUTES the ID from those fields rather than trusting the
-// stored occurrence_id. Identity is derived, never trusted from the wire: a
-// malformed or forged occurrence_id cannot redirect an invocation — the
-// recomputed ID is what the consumer and the invocation-state keying use.
+// ClaimKind classifies a decoded event against the schedule envelope:
+//
+//   - NotScheduleClaim: the event does not carry the reserved
+//     source=="relay.schedule" marker, so it is an ordinary external event and
+//     must be left untouched by the schedule path.
+//   - ValidScheduleClaim: the event is a structurally valid schedule claim
+//     (app/schedule/handler non-empty, a parseable scheduled_at, and an
+//     occurrence_id that matches the derived identity). It is routed to the
+//     schedule runner.
+//   - InvalidScheduleClaim: the event carries the reserved schedule marker but
+//     is structurally incomplete or inconsistent (a missing/empty/non-string
+//     field, an unparseable or sub-second scheduled_at, or an occurrence_id
+//     that does not match the derived identity). It is a malformed claim that
+//     must NEVER fall through to ordinary event matching and be executed/ACKed
+//     as unmatched; the stream routes it to the DLQ as a non-retryable failure.
+type ClaimKind int
+
+const (
+	// NotScheduleClaim is an ordinary event that does not claim schedule identity.
+	NotScheduleClaim ClaimKind = iota
+	// ValidScheduleClaim is a well-formed schedule occurrence envelope.
+	ValidScheduleClaim
+	// InvalidScheduleClaim carries the schedule marker but is malformed.
+	InvalidScheduleClaim
+)
+
+// claimFields is the decoded envelope shape shared by ParseEnvelope (raw JSON)
+// and ClassifyClaim (an already-decoded event map).
+type claimFields struct {
+	App          string
+	Schedule     string
+	Handler      string
+	ScheduledAt  string
+	OccurrenceID string
+}
+
+// validateClaim validates the envelope fields and returns the Occurrence. The
+// error is descriptive and non-nil for every structural failure:
+//
+//   - app, schedule, handler, and occurrence_id must be present and non-empty;
+//   - scheduled_at must parse as RFC3339 (normalized to UTC);
+//   - scheduled_at must be whole-second. Cron evaluation is whole-second
+//     granularity, so a fractional-second timestamp (e.g. "12:34:00.500Z") is a
+//     malformed claim, not a real occurrence, even though Occurrence.ID would
+//     truncate it to 12:34:00. Rejecting it here stops a sub-second instant from
+//     masquerading as the second it falls in. A whole second is NOT required to
+//     have UTC Second()==0: historical IANA offsets can carry a seconds
+//     component, so a legitimate local-minute firing can have a nonzero UTC
+//     second. Whether a whole-second instant is a real firing of a given
+//     cron/timezone is decided semantically by Contains/IsFiring (the runner's
+//     validateOccurrence), never structurally here;
+//   - occurrence_id must equal the ID derived from app + schedule +
+//     scheduled_at. The identity is DERIVED and cross-checked, never trusted:
+//     a forged/mismatched id is rejected rather than silently recomputed.
+//
+// Occurrence.ID's canonical identity rules are deliberately unchanged: for a
+// valid occurrence the identity is still the second-truncated RFC3339 form, and
+// the sub-second truncation remains the normalization that keeps worker-side
+// jitter from splitting an occurrence while whole seconds (which a historical
+// timezone may legitimately produce) stay distinct.
+func validateClaim(f claimFields) (Occurrence, error) {
+	if f.App == "" {
+		return Occurrence{}, fmt.Errorf("schedule claim: app is empty")
+	}
+	if f.Schedule == "" {
+		return Occurrence{}, fmt.Errorf("schedule claim: schedule is empty")
+	}
+	if f.Handler == "" {
+		return Occurrence{}, fmt.Errorf("schedule claim: handler is empty")
+	}
+	if f.OccurrenceID == "" {
+		return Occurrence{}, fmt.Errorf("schedule claim: occurrence_id is empty")
+	}
+	t, err := time.Parse(time.RFC3339, f.ScheduledAt)
+	if err != nil {
+		return Occurrence{}, fmt.Errorf("schedule claim: scheduled_at: %w", err)
+	}
+	if !wholeSecondAligned(t) {
+		return Occurrence{}, fmt.Errorf(
+			"schedule claim: scheduled_at %s has a sub-second component; must be whole-second", f.ScheduledAt)
+	}
+	occ := Occurrence{App: f.App, Schedule: f.Schedule, Handler: f.Handler, ScheduledAt: t.UTC()}
+	if got := occ.ID(); got != f.OccurrenceID {
+		return Occurrence{}, fmt.Errorf("schedule claim: occurrence_id %q does not match derived identity %q", f.OccurrenceID, got)
+	}
+	return occ, nil
+}
+
+// ParseEnvelope decodes a stream envelope into its Occurrence, enforcing the
+// full structural contract (see validateClaim), including that occurrence_id
+// matches the derived identity. Identity is derived and cross-checked, never
+// trusted from the wire, so a malformed or forged occurrence_id is rejected
+// rather than redirecting an invocation.
 func ParseEnvelope(raw string) (Occurrence, error) {
 	var e struct {
 		App          string `json:"app"`
@@ -92,56 +180,83 @@ func ParseEnvelope(raw string) (Occurrence, error) {
 	if err := json.Unmarshal([]byte(raw), &e); err != nil {
 		return Occurrence{}, fmt.Errorf("parse schedule envelope: %w", err)
 	}
-	if e.App == "" {
-		return Occurrence{}, fmt.Errorf("parse schedule envelope: app is empty")
-	}
-	if e.Schedule == "" {
-		return Occurrence{}, fmt.Errorf("parse schedule envelope: schedule is empty")
-	}
-	if e.Handler == "" {
-		return Occurrence{}, fmt.Errorf("parse schedule envelope: handler is empty")
-	}
-	t, err := time.Parse(time.RFC3339, e.ScheduledAt)
-	if err != nil {
-		return Occurrence{}, fmt.Errorf("parse schedule envelope: scheduled_at: %w", err)
-	}
-	return Occurrence{App: e.App, Schedule: e.Schedule, Handler: e.Handler, ScheduledAt: t.UTC()}, nil
+	return validateClaim(claimFields{
+		App:          e.App,
+		Schedule:     e.Schedule,
+		Handler:      e.Handler,
+		ScheduledAt:  e.ScheduledAt,
+		OccurrenceID: e.OccurrenceID,
+	})
 }
 
-// IsScheduleEvent reports whether a decoded event map is a schedule message and,
-// when it is, returns the parsed Occurrence. Schedule messages are recognized by
-// the envelope's "source" == "relay.schedule" plus string app/schedule/
-// handler/scheduled_at fields present in the DECODED event map. Absence of the
-// source marker (or any missing field) returns (zero, false), so normal events
-// are untouched. An ordinary user event carrying source==relay.schedule AND the
-// schedule fields is a deliberate claim of schedule identity, which is
-// acceptable and documented: the occurrence id is re-derived from the fields, so
-// a forged value cannot redirect the invocation (identity is derived, never
-// trusted).
-func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
+// ClassifyClaim classifies a decoded event map against the schedule envelope.
+// Schedule messages are recognized by the reserved "source" == "relay.schedule".
+// A missing/empty source marker is NotScheduleClaim, so ordinary external events
+// are untouched. Once the marker is present the event is a deliberate claim of
+// schedule identity: a well-formed envelope is ValidScheduleClaim, and any
+// structural failure (missing/empty/non-string app, schedule, handler, or
+// occurrence_id; an unparseable or sub-second scheduled_at; or a
+// mismatched occurrence_id) is InvalidScheduleClaim. The returned Occurrence is
+// populated only for a valid claim; the error is populated only for an invalid
+// one.
+func ClassifyClaim(event map[string]any) (Occurrence, ClaimKind, error) {
 	src, ok := event["source"].(string)
 	if !ok || src != "relay.schedule" {
-		return Occurrence{}, false
+		return Occurrence{}, NotScheduleClaim, nil
 	}
-	fn, ok := event["app"].(string)
-	if !ok || fn == "" {
-		return Occurrence{}, false
-	}
-	scheduleName, ok := event["schedule"].(string)
-	if !ok || scheduleName == "" {
-		return Occurrence{}, false
-	}
-	handler, ok := event["handler"].(string)
-	if !ok || handler == "" {
-		return Occurrence{}, false
-	}
-	schedAt, ok := event["scheduled_at"].(string)
-	if !ok {
-		return Occurrence{}, false
-	}
-	t, err := time.Parse(time.RFC3339, schedAt)
+	f, err := claimFieldsFromEvent(event)
 	if err != nil {
-		return Occurrence{}, false
+		return Occurrence{}, InvalidScheduleClaim, err
 	}
-	return Occurrence{App: fn, Schedule: scheduleName, Handler: handler, ScheduledAt: t.UTC()}, true
+	occ, err := validateClaim(f)
+	if err != nil {
+		return Occurrence{}, InvalidScheduleClaim, err
+	}
+	return occ, ValidScheduleClaim, nil
+}
+
+// claimFieldsFromEvent extracts the string envelope fields from a decoded event
+// map. A missing or non-string field is a structural failure (the source marker
+// is already known to be present), so an incomplete schedule claim is classified
+// invalid rather than falling through to ordinary event matching.
+func claimFieldsFromEvent(event map[string]any) (claimFields, error) {
+	str := func(key string) (string, error) {
+		v, ok := event[key].(string)
+		if !ok {
+			return "", fmt.Errorf("schedule claim: %s is missing or not a string", key)
+		}
+		return v, nil
+	}
+	var f claimFields
+	var err error
+	if f.App, err = str("app"); err != nil {
+		return claimFields{}, err
+	}
+	if f.Schedule, err = str("schedule"); err != nil {
+		return claimFields{}, err
+	}
+	if f.Handler, err = str("handler"); err != nil {
+		return claimFields{}, err
+	}
+	if f.ScheduledAt, err = str("scheduled_at"); err != nil {
+		return claimFields{}, err
+	}
+	if f.OccurrenceID, err = str("occurrence_id"); err != nil {
+		return claimFields{}, err
+	}
+	return f, nil
+}
+
+// IsScheduleEvent reports whether a decoded event map is a STRUCTURALLY VALID
+// schedule message and, when it is, returns the parsed Occurrence. It is the
+// boolean convenience over ClassifyClaim: a marker-with-missing-fields event or
+// a mismatched occurrence_id is NOT reported as a schedule event here (those are
+// handled by the stream's ClassifyClaim-based non-retryable path). An ordinary
+// user event carrying source==relay.schedule AND a complete, self-consistent
+// envelope is a deliberate, acceptable claim of schedule identity; the
+// occurrence id is re-derived and cross-checked, so a forged value cannot
+// redirect the invocation.
+func IsScheduleEvent(event map[string]any) (Occurrence, bool) {
+	occ, kind, _ := ClassifyClaim(event)
+	return occ, kind == ValidScheduleClaim
 }

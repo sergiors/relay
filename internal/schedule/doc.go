@@ -18,6 +18,23 @@
 // workers evaluating the same logical tick produce the same identity regardless
 // of timezone representation or callback timing.
 //
+// The package also owns the shared structural and semantic validation of a
+// decoded occurrence: ClassifyClaim separates an ordinary event from a
+// well-formed schedule claim and from a malformed claim (which must never fall
+// through to ordinary event matching). A malformed claim includes a
+// scheduled_at that is unparseable or has a sub-second component, because cron
+// evaluation is whole-second granularity. Whether a whole-second instant is
+// actually a firing is semantic and timezone-dependent, so it is decided by
+// Contains/IsFiring (the runner's validateOccurrence), never structurally here:
+// historical IANA offsets can carry a seconds component, so a legitimate
+// local-minute firing can have a nonzero UTC second. IsFiring/ParseCron
+// expose the single cron-firing primitive that both the publisher
+// (internal/cron) and the consumer (internal/runner) use, so a claim's
+// scheduled_at can be checked against a
+// schedule's current definition without divergent cron semantics. None of this
+// is cryptographic: it establishes structural and semantic integrity, not
+// provenance.
+//
 // Deduplication and stream publication happen in one Redis Lua script. The
 // dedup key and XADD therefore succeed or fail as one atomic operation: Relay
 // never records an occurrence as published without also admitting its stream

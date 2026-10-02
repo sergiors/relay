@@ -92,14 +92,18 @@ type ConsumerConfig struct {
 	// occurrences directly against the named app/schedule/handler,
 	// bypassing event matching. msgID is the message's real Redis stream ID, so
 	// the runner can stamp it on the execution container's relay.message_id
-	// label (the same identity the invocation-state machinery uses). The runner
-	// resolves the schedule by its stable name, so a handler change under the
-	// same schedule is picked up on delivery. The stream layer stays the same
+	// label (the same identity the invocation-state machinery uses). The whole
+	// validated Occurrence (including the scheduled instant and derived identity)
+	// is passed so the runner can semantically validate it against the current
+	// template before admission — the envelope handler is never the target; the
+	// runner resolves the schedule by its stable name, so a handler change under
+	// the same schedule is picked up on delivery. The stream layer stays the same
 	// consumer-group/PEL/recovery machinery for both message kinds. It is wired
-	// by the worker to runner.InvokeHandler. A nil value means schedule messages
-	// are treated as normal events (the safe fallback for tests that do not wire
-	// it).
-	ScheduleRunner func(ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte) error
+	// by the worker to runner.InvokeOccurrence. A nil value means a WELL-FORMED
+	// schedule message is treated as a normal event (the safe fallback for tests
+	// that do not wire it); a structurally INVALID schedule claim is dead-lettered
+	// regardless, never executed as an ordinary event.
+	ScheduleRunner func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error
 	// backoffTable and backoffJitter override the retry backoff for tests. They
 	// are unexported so production always uses the fixed defaults.
 	backoffTable  []time.Duration
@@ -131,8 +135,8 @@ type Consumer struct {
 	buffer   *bufferSemaphore
 	capacity int
 	// scheduleRunner is the ScheduleRunner seam (see ConsumerConfig). When nil,
-	// schedule-occurrence messages are treated as normal events.
-	scheduleRunner func(ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte) error
+	// well-formed schedule-occurrence messages are treated as normal events.
+	scheduleRunner func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -942,6 +946,37 @@ func (c *Consumer) processMessage(
 		return
 	}
 
+	// Classify the decoded event against the schedule envelope. Three outcomes:
+	//
+	//   - NotScheduleClaim: an ordinary external event, handled below exactly as
+	//     before.
+	//   - ValidScheduleClaim: a well-formed schedule occurrence; when a
+	//     ScheduleRunner is wired it is routed to it, bypassing event matching
+	//     entirely. A nil ScheduleRunner falls back to treating it as a normal
+	//     event (the safe fallback for tests/unwired consumers).
+	//   - InvalidScheduleClaim: the event deliberately claims schedule identity
+	//     (source==relay.schedule) but is structurally incomplete, malformed, or
+	//     carries a mismatched occurrence_id. It must NEVER fall through to event
+	//     matching and be executed/ACKed as unmatched: it can never succeed, so
+	//     it is dead-lettered as a non-retryable failure, exactly like a
+	//     malformed event body. This holds whether or not a ScheduleRunner is
+	//     wired: a malformed claim is malformed either way.
+	//
+	// Classification happens BEFORE the invocation-state migration below, like
+	// the malformed-message path: an invalid claim is non-retryable and needs no
+	// recoverable state, so it is dead-lettered directly.
+	occ, claimKind, claimErr := schedule.ClassifyClaim(event)
+	if claimKind == schedule.InvalidScheduleClaim {
+		c.log.Error("Message: invalid schedule claim; routing to DLQ",
+			"message_id", msg.ID,
+			"delivery_attempt", deliveryNum,
+			"error", claimErr,
+		)
+		outcome, spanErr = "dlq", claimErr
+		c.routeToDLQ(ctx, msg, claimErr, deliveryNum)
+		return
+	}
+
 	// The message decoded successfully and is about to be handed to the handler.
 	// Event classification (received/matched/unmatched) is NOT counted here: it
 	// is a property of the logical event, owned by the runner, which claims it
@@ -978,11 +1013,7 @@ func (c *Consumer) processMessage(
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msg.ID, c.log))
 
-	// A schedule-occurrence message is recognized by its relay.schedule envelope
-	// and, when a ScheduleRunner is wired, routed directly to it, bypassing event
-	// matching entirely. A nil ScheduleRunner falls back to treating schedule
-	// messages as normal events (the safe fallback for tests/unwired consumers).
-	if occ, ok := schedule.IsScheduleEvent(event); ok && c.scheduleRunner != nil {
+	if claimKind == schedule.ValidScheduleClaim && c.scheduleRunner != nil {
 		outcome, spanErr = c.processScheduleMessage(ctx, msg.ID, deliveryNum, occ)
 		return
 	}
@@ -1063,12 +1094,13 @@ func (c *Consumer) processMessage(
 }
 
 // processScheduleMessage routes a schedule-occurrence message directly to the
-// ScheduleRunner (which resolves the app's current timeout from the
-// registry), bypassing event matching entirely. It shares the exact delivery
-// contract of processMessage: invocation state protects redeliveries
+// ScheduleRunner (which validates the occurrence against the current template,
+// resolves the app's current timeout from the registry, and executes it),
+// bypassing event matching entirely. It shares the exact delivery contract of
+// processMessage: invocation state protects redeliveries
 // (complete/running/backoff/exhausted), and the message is ACKed on success,
 // left pending on a retryable failure or protected skip, and routed to the DLQ
-// on exhaustion.
+// on exhaustion OR on a semantic validation failure (ErrScheduleInvalid).
 //
 // It returns the terminal outcome label and an error for the caller's message
 // span, so the schedule path is traced identically to the event path.
@@ -1117,7 +1149,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	handlerCtx = WithInvocationState(handlerCtx,
 		NewInvocationState(ctx, c.invStateStore, c.stream, c.group, msgID, c.log))
 
-	err := c.scheduleRunner(handlerCtx, msgID, occ.App, occ.Schedule, occ.Handler, occ.Payload())
+	err := c.scheduleRunner(handlerCtx, msgID, occ, occ.Payload())
 	if err != nil {
 		// Shutting down: not a real attempt; leave pending for a live consumer.
 		if ctx.Err() != nil {
@@ -1162,6 +1194,26 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 				c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", cerr)
 			}
 			return "acked", nil
+		}
+		// A semantically invalid occurrence: the app and schedule exist and are
+		// available, but scheduled_at is not a real firing of the schedule's
+		// CURRENT cron definition (a forged/non-firing instant), or the schedule's
+		// own cron could not be parsed. The claim can never succeed, so it is
+		// terminal and MUST be dead-lettered rather than retried or ACKed as
+		// success. This is a distinct disposition from obsolete (removed
+		// configuration, ACKed) and from a temporary failure (retried).
+		if errors.Is(err, ErrScheduleInvalid) {
+			c.log.Error("Schedule: invalid occurrence claim; routing to DLQ",
+				"message_id", msgID,
+				"delivery_attempt", deliveryNum,
+				"reason", err,
+			)
+			if envelope, eerr := occ.Envelope(); eerr == nil {
+				c.routeToDLQ(ctx, redis.XMessage{ID: msgID, Values: map[string]any{"event": string(envelope)}}, err, deliveryNum)
+			} else {
+				c.routeToDLQ(ctx, redis.XMessage{ID: msgID}, err, deliveryNum)
+			}
+			return "dlq", err
 		}
 		// A terminal message: the schedule invocation is exhausted, so the message
 		// routes to the DLQ.

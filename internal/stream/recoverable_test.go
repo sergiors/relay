@@ -68,7 +68,7 @@ func TestProcessScheduleMessageMakeRecoverableFailureLeavesPending(t *testing.T)
 	c := processMessageConsumer(store)
 
 	calls := 0
-	c.scheduleRunner = func(context.Context, string, string, string, string, []byte) error {
+	c.scheduleRunner = func(context.Context, string, schedule.Occurrence, []byte) error {
 		calls++
 		return nil
 	}

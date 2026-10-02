@@ -247,6 +247,29 @@ func TestLatestOccurrence(t *testing.T) {
 			t.Fatalf("occurrence = %v, want %v", got, want)
 		}
 	})
+	t.Run("historical offset yields nonzero UTC second", func(t *testing.T) {
+		rome, err := time.LoadLocation("Europe/Rome")
+		if err != nil {
+			t.Fatalf("load Europe/Rome: %v", err)
+		}
+		// Rome local mean time is UTC+00:49:56, so 12:00 local in 1866 is
+		// 11:10:04Z: a whole-second instant with a nonzero UTC second. The
+		// binary search must still find it (its search is whole-second based and
+		// its predicate uses the schedule's own Next, not an absolute-second
+		// alignment test).
+		sch := mustParse(t, "0 12 * * *", rome)
+		want := time.Date(1866, 6, 1, 11, 10, 4, 0, time.UTC)
+		if want.Second() == 0 {
+			t.Fatalf("test fixture %v has a zero UTC second; need a nonzero one", want)
+		}
+		got, ok := latestOccurrence(sch, want.Add(30*time.Second), occurrenceHorizon)
+		if !ok {
+			t.Fatal("no occurrence found")
+		}
+		if !got.Equal(want) {
+			t.Fatalf("occurrence = %v, want %v", got, want)
+		}
+	})
 	t.Run("beyond horizon", func(t *testing.T) {
 		// A yearly schedule whose only occurrence is >24h before now.
 		sch := mustParse(t, "0 0 1 1 *", time.UTC)

@@ -17,6 +17,7 @@ import (
 	eventmatch "relay/internal/event"
 	"relay/internal/observability/metrics"
 	"relay/internal/runtime"
+	"relay/internal/schedule"
 	"relay/internal/secrets"
 	"relay/internal/stream"
 )
@@ -1964,8 +1965,53 @@ func obsoleteOccurrence(fnName, scheduleName string) error {
 // recorded app/handler), resolution falls back to the first schedule entry
 // matching the handler, then to that exact event rule (never event matching), and
 // the no-state path executes a single attempt exactly as before.
+//
+// InvokeHandler takes only the app/schedule/handler strings; it does not carry
+// the occurrence's scheduled instant, so it performs no semantic validation.
+// The production stream entry point is InvokeOccurrence, which additionally
+// validates the occurrence's scheduled_at against the current schedule before
+// admission.
 func (r *Runner) InvokeHandler(
 	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
+) error {
+	return r.invokeHandler(ctx, msgID, fnName, scheduleName, handler, payload, nil)
+}
+
+// InvokeOccurrence executes one schedule occurrence routed through the stream.
+// It is InvokeHandler's production entry point: the decoded Occurrence (app,
+// stable schedule name, envelope handler, scheduled instant, and derived
+// identity) is passed so that, BEFORE admission, the occurrence is semantically
+// validated against the CURRENT template — the named app must be configured and
+// available, the stable schedule name must exist, and scheduled_at must be a
+// real firing of that schedule's current cron/timezone (see validateOccurrence).
+//
+// The envelope handler is NEVER the execution target: only the app/schedule
+// name select the invocation, and the current template's handler is what runs.
+// The envelope handler is carried for provenance/logging only, so a handler
+// change under the same name remains a valid live change.
+//
+// Validation applies only to a not-yet-admitted occurrence. Once a descriptor
+// is pinned (first successful admission), it is authoritative and the
+// occurrence completes its lifecycle even if the schedule was since changed or
+// removed (see InvokeHandler). The state-free path (no invocation state) keeps
+// its legacy single-attempt behavior and does not validate.
+func (r *Runner) InvokeOccurrence(
+	ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte,
+) error {
+	return r.invokeHandler(ctx, msgID, occ.App, occ.Schedule, occ.Handler, payload,
+		func(tmpl *app.Template) error { return validateOccurrence(tmpl, occ) })
+}
+
+// invokeHandler is the shared implementation of InvokeHandler and
+// InvokeOccurrence. validate, when non-nil, is the occurrence's pre-admission
+// semantic validation, called with the CURRENT template once the app and
+// schedule name have resolved and the app is available. It runs only for an
+// unadmitted occurrence (no pinned descriptor) whose schedule name still exists;
+// a missing name is left to the existing obsolete path, and an admitted
+// occurrence is authoritative and never re-validated.
+func (r *Runner) invokeHandler(
+	ctx context.Context, msgID, fnName, scheduleName, handler string, payload []byte,
+	validate func(tmpl *app.Template) error,
 ) error {
 	// Invocation state (when present) distinguishes the production stream path
 	// from direct callers/tests: obsolete-removal and descriptor pinning only
@@ -2049,6 +2095,11 @@ func (r *Runner) InvokeHandler(
 	// pinned by an earlier first admission is immutable while the message is
 	// recoverable, so this read is stable for the rest of the delivery.
 	desc, known := invState.ScheduleDescriptor()
+	// admitted records whether a descriptor was already pinned at the START of
+	// this delivery. `known` is later reassigned when the current template can
+	// propose a descriptor, so this is the stable "is this occurrence
+	// already-admitted?" signal the pre-admission validation keys on.
+	admitted := known
 
 	// An UNADMITTED schedule occurrence (scheduleName != "" and no pinned
 	// descriptor) resolves its template by the stable schedule NAME, and it may
@@ -2105,6 +2156,35 @@ func (r *Runner) InvokeHandler(
 			known = true
 		}
 	}
+	// Pre-admission semantic validation (schedule-occurrence entry point only):
+	// the app is present and available, so validate the occurrence against the
+	// CURRENT template — the stable name must resolve to a schedule and
+	// scheduled_at must be a real firing of that schedule's current
+	// cron/timezone. A MISSING name is deliberately a no-op here: the atomic
+	// admission below already decides between adopting a descriptor pinned by
+	// another replica and reporting the never-admitted occurrence obsolete. A
+	// pinned (already-admitted) occurrence is authoritative and never
+	// re-validated, so a schedule edited or removed after admission still
+	// completes under its pinned contract.
+	//
+	// On failure the disposition is deliberately NOT decided here: the caller
+	// proposes no descriptor (known=false) and the atomic admission below still
+	// observes any descriptor a concurrent replica has pinned, so an admitted
+	// occurrence is adopted rather than raced into an ACK (no ACK hazard). Only
+	// an admission that finds nothing pinned AND no proposal is then reported as
+	// invalid, exactly where a never-admitted occurrence is reported obsolete.
+	var invalidErr error
+	if validate != nil && !admitted {
+		if invalidErr = validate(pf.fn.Template); invalidErr != nil {
+			r.log.Warn("Schedule: invalid occurrence claim; deferring to admission",
+				"app", fnName,
+				"schedule", scheduleName,
+				"reason", invalidErr,
+			)
+			known = false
+		}
+	}
+
 	// Cap the timeout exactly like Handle caps each rule's timeout (defense in
 	// depth; template validation enforces the cap at load). When the descriptor is
 	// pinned, its timeout was already capped at admission, so re-capping is a
@@ -2137,6 +2217,24 @@ func (r *Runner) InvokeHandler(
 			stream.ErrInvocationClaimUnconfirmed, err)
 	}
 	if admission.Obsolete {
+		// Nothing was ever pinned and the caller proposed nothing. For the
+		// schedule-occurrence entry point that can mean two distinct things:
+		//
+		//   - the schedule NAME is gone from the current template: an intentional
+		//     removal, so the occurrence is OBSOLETE and the stream ACKs it; or
+		//   - the name exists but the occurrence is semantically invalid (a
+		//     non-firing scheduled_at, or an unparseable current cron): the claim
+		//     can never succeed, so it is INVALID and the stream dead-letters it.
+		//
+		// invalidErr distinguishes them. Removal semantics are preserved exactly.
+		if invalidErr != nil {
+			r.log.Warn("Schedule: occurrence invalid; routing to DLQ",
+				"app", fnName,
+				"schedule", scheduleName,
+				"reason", invalidErr,
+			)
+			return invalidErr
+		}
 		r.log.Warn("Schedule: occurrence obsolete; schedule no longer in template; acknowledging",
 			"app", fnName,
 			"schedule", scheduleName,
@@ -2285,6 +2383,63 @@ func scheduleNameExists(tmpl *app.Template, scheduleName string) bool {
 		}
 	}
 	return false
+}
+
+// scheduleByName returns the template's schedule with the given stable NAME, and
+// whether it exists.
+func scheduleByName(tmpl *app.Template, scheduleName string) (app.Schedule, bool) {
+	for _, sch := range tmpl.Schedules {
+		if sch.Name == scheduleName {
+			return sch, true
+		}
+	}
+	return app.Schedule{}, false
+}
+
+// validateOccurrence is the schedule occurrence's pre-admission semantic
+// validation against the CURRENT template. It is called only once the app is
+// present and available and no descriptor has been pinned (an admitted
+// occurrence is authoritative and never re-validated).
+//
+// It enforces two invariants, using the schedule's stable NAME and the shared
+// firing primitive:
+//
+//   - The name must resolve to a currently-configured schedule. A name that is
+//     gone is NOT rejected here: returning nil lets the existing admission path
+//     decide between adopting a descriptor pinned by another replica and
+//     reporting the never-admitted occurrence OBSOLETE (ACKed, never retried or
+//     dead-lettered). This keeps removal semantics exactly as they were.
+//   - scheduled_at must be a real firing of that schedule's current cron in its
+//     effective timezone (see schedule.IsFiring), so timezone/DST handling is
+//     the parser's, not a re-implementation. A schedule whose own cron cannot be
+//     parsed is a corrupt configuration: it is surfaced as invalid (a bounded,
+//     non-retryable DLQ) rather than silently accepted, because no instant can
+//     be a firing of an unparseable schedule.
+//
+// The envelope handler plays no part: the schedule is selected by name and its
+// current handler is the execution target, so a handler change under the same
+// name stays valid.
+func validateOccurrence(tmpl *app.Template, occ schedule.Occurrence) error {
+	sch, ok := scheduleByName(tmpl, occ.Schedule)
+	if !ok {
+		// Missing name: left to the admission path's obsolete decision.
+		return nil
+	}
+	if sch.Location == nil {
+		return fmt.Errorf("%w: app %q schedule %q has no timezone",
+			stream.ErrScheduleInvalid, occ.App, occ.Schedule)
+	}
+	firing, err := schedule.IsFiring(sch.Cron, sch.Location, occ.ScheduledAt)
+	if err != nil {
+		return fmt.Errorf("%w: app %q schedule %q has an unparseable cron %q: %v",
+			stream.ErrScheduleInvalid, occ.App, occ.Schedule, sch.Cron, err)
+	}
+	if !firing {
+		return fmt.Errorf("%w: app %q schedule %q scheduled_at %s is not a firing of cron %q in %s",
+			stream.ErrScheduleInvalid, occ.App, occ.Schedule,
+			occ.ScheduledAt.UTC().Format(time.RFC3339), sch.Cron, sch.Location)
+	}
+	return nil
 }
 
 // InvokeApp executes every event rule of the named app whose pattern

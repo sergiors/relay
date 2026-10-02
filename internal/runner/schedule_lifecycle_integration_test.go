@@ -158,7 +158,7 @@ func newScheduleEnv(t *testing.T, r *Runner) *scheduleEnv {
 		MinPendingIdle:  300 * time.Millisecond,
 		ReclaimInterval: 200 * time.Millisecond,
 		Block:           300 * time.Millisecond,
-		ScheduleRunner:  r.InvokeHandler,
+		ScheduleRunner:  r.InvokeOccurrence,
 	}
 	c := stream.NewConsumer(cfg)
 	if err := c.EnsureGroup(cctx); err != nil {
@@ -354,7 +354,7 @@ func scheduleFnForHandler(t *testing.T, handler string, exec Executor, scheduleT
 				Schedules: []app.Schedule{{
 					Name:     handler,
 					Handler:  handler,
-					Cron:     "0 3 * * *",
+					Cron:     "* * * * *",
 					Location: time.UTC,
 					Timeout:  scheduleTimeout,
 					Retries:  retries,
@@ -468,9 +468,9 @@ func TestIntegrationScheduleOccurrencesDoNotShareState(t *testing.T) {
 	exec := &stateAwareExecutor{fail: 1000} // always fails → never ACKs, backoff markers persist
 	r := registerScheduleFn(t, exec, 100)
 	e := newScheduleEnv(t, r)
-	// Two occurrences, one second apart → different msgIDs and different keys.
+	// Two occurrences, one minute apart → different msgIDs and different keys.
 	o1 := scheduleOcc(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC))
-	o2 := scheduleOcc(time.Date(2026, 8, 1, 10, 0, 1, 0, time.UTC))
+	o2 := scheduleOcc(time.Date(2026, 8, 1, 10, 1, 0, 0, time.UTC))
 	id1 := e.xadd(o1)
 	id2 := e.xadd(o2)
 	e.start()
@@ -782,7 +782,7 @@ func scheduleFnNamed(t *testing.T, name, handler string, exec Executor, schedule
 				Schedules: []app.Schedule{{
 					Name:     name,
 					Handler:  handler,
-					Cron:     "0 3 * * *",
+					Cron:     "* * * * *",
 					Location: time.UTC,
 					Timeout:  scheduleTimeout,
 					Retries:  retries,
@@ -976,4 +976,62 @@ type streamScheduleDescriptor struct {
 	Handler  string
 	Timeout  time.Duration
 	Retries  int
+}
+
+// TestIntegrationScheduleForgedTimestampNeverExecutesAndDLQs pins the end-to-end
+// semantic-integrity contract: an occurrence whose scheduled_at is not a real
+// firing of the schedule's current cron (the schedule is every minute, but the
+// timestamp carries a non-zero second — impossible for the definition) is
+// rejected before execution and dead-lettered, never run and never ACKed as
+// success.
+func TestIntegrationScheduleForgedTimestampNeverExecutesAndDLQs(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	// The schedule is "* * * * *" (every whole minute); :30s cannot be a firing.
+	o := scheduleOcc(time.Date(2026, 8, 4, 10, 0, 30, 0, time.UTC))
+	id := e.xadd(o)
+	e.start()
+
+	e.eventually("forged-timestamp occurrence DLQ'd", func() bool { return e.inDlq(id) })
+	e.eventually("forged-timestamp occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if got := exec.count(); got != 0 {
+		t.Fatalf("executor calls = %d, want 0 (a forged timestamp must never execute)", got)
+	}
+	m := e.dlqGet()[id]
+	reason, _ := m.Values["reason"].(string)
+	// The forged :30s instant parses structurally (only a sub-second component
+	// is structurally malformed), so it reaches the runner's semantic validation
+	// and is rejected there as ErrScheduleInvalid because it is not a firing of
+	// the every-minute cron. Both the semantic rejection and a generic invalid
+	// claim are the terminal, non-retryable DLQ path.
+	if !strings.Contains(reason, stream.ErrScheduleInvalid.Error()) &&
+		!strings.Contains(reason, "schedule claim") {
+		t.Fatalf("DLQ reason = %q, want it to name the invalid schedule claim", m.Values["reason"])
+	}
+}
+
+// TestIntegrationScheduleValidTimestampExecutes pins the complement: a real
+// whole-minute firing of the same schedule executes and is ACKed.
+func TestIntegrationScheduleValidTimestampExecutes(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{}
+	r := registerScheduleFn(t, exec, 4)
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 8, 4, 11, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+	e.start()
+
+	e.eventually("valid occurrence executed", func() bool { return exec.count() >= 1 })
+	e.eventually("valid occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	if e.inDlq(id) {
+		t.Fatal("a valid firing must not be dead-lettered")
+	}
 }
