@@ -195,7 +195,10 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   routed non-retryably to the DLQ; unlabeled — event IDs and sizes are never
   labels).
 - **Builds:** `relay_app_build_failures_total{app}`,
-  `relay_app_build_seconds{app}`.
+  `relay_app_build_seconds{app}`, and the unlabeled
+  `relay_app_build_output_truncated_total` (build responses whose retained
+  diagnostic reached the internal 1 MiB bound; the stream is still fully drained,
+  only the retained diagnostic is bounded).
 
 Labels are bounded to app/handler/outcome and small closed sets; IDs and
 raw errors are never labels. The metrics server is fail-fast on a taken port and

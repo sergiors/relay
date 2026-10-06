@@ -262,21 +262,28 @@ func writeFingerprintEntry(h hash.Hash, rel, templateRel string, raw []byte) {
 	h.Write([]byte{0})
 }
 
-// SnapshotEntry is one captured entry of an app's selected source.
+// snapshotRootPattern is the os.MkdirTemp pattern for a captured source
+// snapshot's private root. The root IS the app image build context: the runtime
+// writes its generated Dockerfile and plan files into it and tars it, so the
+// source is never copied a second time. The "relay-build-" prefix matches the
+// transient build directory the runtime used to create (and that its cleanup
+// tests observe); Discard removes it on every path.
+const snapshotRootPattern = "relay-build-*"
+
+// SnapshotEntry is one captured entry of an app's selected source. It carries
+// only metadata: the captured bytes live on disk under the owning
+// SourceSnapshot's private root (see Root), so a whole selected tree is never
+// held in memory.
 type SnapshotEntry struct {
 	// Rel is the entry's ROOT-relative slash path: the canonical path the
 	// fingerprint frames entries with (so the serialization is independent of how
 	// the walk produced absolute paths and independent of the selected subtree).
 	Rel string
-	// StageRel is the entry's SELECTED-DIRECTORY-relative slash path: the path the
-	// build context stages it at. It is empty when the entry is a policy file
+	// StageRel is the entry's SELECTED-DIRECTORY-relative slash path: the path
+	// the build context stages it at. It is empty when the entry is a policy file
 	// above the selected directory (an ancestor .gitignore), which participates in
 	// the fingerprint but is not part of the image.
 	StageRel string
-	// Content is the exact captured bytes. It is nil for a directory. A
-	// non-regular entry (e.g. a symlink) captures the bytes its path resolves to,
-	// matching the historical fingerprint, but is never staged (see Regular).
-	Content []byte
 	// Mode is the entry's file mode at capture time.
 	Mode fs.FileMode
 	// IsDir reports whether the entry is a directory.
@@ -289,74 +296,185 @@ type SnapshotEntry struct {
 
 // SourceSnapshot is an immutable, single-read capture of an app's selected
 // source. The content fingerprint and the runtime image build context BOTH derive
-// from exactly these bytes, so the tag can never describe one set of files while
-// the image bakes another (the fingerprint-then-stage TOCTOU the previous
+// from exactly this one read, so the tag can never describe one set of files
+// while the image bakes another (the fingerprint-then-stage TOCTOU the previous
 // selection-only handoff left open).
+//
+// The capture is DISK-BACKED: CaptureSourceSnapshot copies each selected regular
+// file into the snapshot's private root (minus template.yaml, which is Relay
+// configuration and never staged) while streaming it through the fingerprint
+// hash, so a captured tree does not have to be held in memory. The root is the
+// app image build context; the runtime writes its generated files there and tars
+// it directly.
 //
 // A snapshot is owned by ONE preparation. CaptureSourceSnapshot reads every
 // selected file once; the caller threads the same value through the fingerprint
 // and the build-context staging and then releases it with Discard (a deferred
 // call covers success, error, and cancellation).
 type SourceSnapshot struct {
-	// templateRel is the root-relative path of the selected directory's own
-	// template.yaml. Only that file has its top-level `resources` mapping stripped
-	// before hashing (a nested template.yaml is ordinary source, hashed verbatim).
-	templateRel string
-	entries     []SnapshotEntry
+	// root is the private directory holding the staged selected source. It is the
+	// build context and is removed by Discard (never by a caller).
+	root    string
+	entries []SnapshotEntry
+	// fingerprint is the digest computed while capturing, so Fingerprint is a
+	// pure accessor and is stable even after Discard.
+	fingerprint string
 }
 
 // CaptureSourceSnapshot walks the resolved selection once and captures every
-// selected entry's exact bytes and mode. It applies exactly the same selection
-// and ordering as FingerprintSelection (both use collectSelectionEntries), and it
-// captures the bytes that fingerprint hashes, so the two can never disagree.
+// selected entry's exact bytes and mode into a private on-disk root. It applies
+// exactly the same selection and ordering as FingerprintSelection (both use
+// collectSelectionEntries), and it hashes the bytes it stages, so the two can
+// never disagree.
 //
-// Any read error is surfaced: a caller must never build an image from a tree it
-// could not fully capture, because that would bake a partial (and so
-// misidentified) source set.
+// Selection policy is preserved exactly: ignored files and .git are never
+// captured; an applicable ancestor .gitignore is fingerprinted but not staged;
+// template.yaml is fingerprinted but excluded from the build context by base name
+// anywhere in the tree (with its subtree when it is a directory); a non-regular
+// entry is fingerprinted but never staged.
+//
+// Any read error is surfaced and the private root is removed: a caller must never
+// build an image from a tree it could not fully capture, because that would bake
+// a partial (and so misidentified) source set.
 func CaptureSourceSnapshot(selection *source.Selection) (*SourceSnapshot, error) {
 	entries, err := collectSelectionEntries(selection)
 	if err != nil {
 		return nil, err
 	}
+	root, err := os.MkdirTemp("", snapshotRootPattern)
+	if err != nil {
+		return nil, fmt.Errorf("create source snapshot: %w", err)
+	}
+	snapshot, err := captureSnapshot(selection, entries, root)
+	if err != nil {
+		_ = os.RemoveAll(root)
+		return nil, err
+	}
+	return snapshot, nil
+}
 
+// captureSnapshot fills root with the selected, staged source while streaming
+// every entry through the fingerprint hash. It is the single place the staging
+// policy and the hashing policy meet, so the digest and the staged context can
+// never select or exclude differently.
+func captureSnapshot(selection *source.Selection, entries []snapshotEntry, root string) (*SourceSnapshot, error) {
+	templateRel := templateRelFor(selection)
+	h := sha256.New()
 	captured := make([]SnapshotEntry, 0, len(entries))
+	// excludedDirs holds the stage-prefixes of directories literally named
+	// template.yaml whose whole subtree is excluded from the context. Sorted entry
+	// order guarantees a directory is seen before its children.
+	var excludedDirs []string
+
 	for _, e := range entries {
 		entry := SnapshotEntry{Rel: e.rel, StageRel: e.stageRel, Mode: e.mode, IsDir: e.isDir, Regular: !e.isDir}
 		if !e.isDir {
-			content, rerr := os.ReadFile(e.path)
-			if rerr != nil {
-				return nil, fmt.Errorf("read %q: %w", e.rel, rerr)
-			}
-			entry.Content = content
 			entry.Regular = e.mode.IsRegular()
 		}
 		captured = append(captured, entry)
+
+		if e.isDir {
+			if e.stageRel != "" && filepath.Base(e.stageRel) == "template.yaml" {
+				excludedDirs = append(excludedDirs, e.stageRel+"/")
+				continue
+			}
+			if e.stageRel == "" || underStageDir(e.stageRel, excludedDirs) {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(e.stageRel)), e.mode.Perm()); err != nil {
+				return nil, fmt.Errorf("stage %q: %w", e.rel, err)
+			}
+			continue
+		}
+
+		stageRel := ""
+		if e.stageRel != "" && e.mode.IsRegular() &&
+			filepath.Base(e.stageRel) != "template.yaml" &&
+			!underStageDir(e.stageRel, excludedDirs) {
+			stageRel = e.stageRel
+		}
+		if err := captureEntryBytes(h, e.path, e.rel, templateRel, root, stageRel, e.mode); err != nil {
+			return nil, err
+		}
 	}
-	return &SourceSnapshot{templateRel: templateRelFor(selection), entries: captured}, nil
+
+	return &SourceSnapshot{
+		root:        root,
+		entries:     captured,
+		fingerprint: hex.EncodeToString(h.Sum(nil)),
+	}, nil
+}
+
+// captureEntryBytes frames one entry into the fingerprint exactly as
+// writeFingerprintEntry does while staging its bytes into root when stageRel is
+// non-empty. The template's own top-level `resources` stripping requires the
+// whole document, so that one file (never staged) is read into memory; every
+// other entry streams straight from source to hash and destination.
+func captureEntryBytes(h hash.Hash, path, rel, templateRel, root, stageRel string, mode fs.FileMode) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", rel, err)
+	}
+	defer f.Close()
+
+	io.WriteString(h, rel)
+	h.Write([]byte{0})
+
+	switch {
+	case rel != "" && rel == templateRel:
+		raw, rerr := io.ReadAll(f)
+		if rerr != nil {
+			return fmt.Errorf("read %q: %w", rel, rerr)
+		}
+		h.Write(stripTemplateResources(raw))
+	case stageRel == "":
+		if _, err := io.Copy(h, f); err != nil {
+			return fmt.Errorf("read %q: %w", rel, err)
+		}
+	default:
+		target := filepath.Join(root, filepath.FromSlash(stageRel))
+		if dir := filepath.Dir(target); dir != root {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("stage %q: %w", rel, err)
+			}
+		}
+		dst, cerr := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
+		if cerr != nil {
+			return fmt.Errorf("stage %q: %w", rel, cerr)
+		}
+		if _, err := io.Copy(io.MultiWriter(h, dst), f); err != nil {
+			_ = dst.Close()
+			return fmt.Errorf("read %q: %w", rel, err)
+		}
+		if err := dst.Close(); err != nil {
+			return fmt.Errorf("stage %q: %w", rel, err)
+		}
+	}
+
+	h.Write([]byte{0})
+	return nil
 }
 
 // Fingerprint returns the content digest over the snapshot's captured files,
 // using the same per-entry framing, canonical ordering, and template-resource
-// stripping as FingerprintSelection. Directories are not hashed.
+// stripping as FingerprintSelection. It was computed while capturing, so it is
+// stable across on-disk mutation and even after Discard.
 //
 // The digest is always a non-empty 64-hex SHA-256 for a successfully captured
 // snapshot (even an empty selected tree hashes the empty input), so a caller can
 // treat "" as "no identity" without ambiguity.
 func (s *SourceSnapshot) Fingerprint() string {
-	h := sha256.New()
-	for _, e := range s.entries {
-		if e.IsDir {
-			continue
-		}
-		writeFingerprintEntry(h, e.Rel, s.templateRel, e.Content)
+	if s == nil {
+		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return s.fingerprint
 }
 
-// Entries returns the captured entries in canonical root-relative order for the
-// build-context stager. The returned slice must not be mutated; entries with an
-// empty StageRel are policy files outside the selected tree and must be skipped
-// by a stager.
+// Entries returns the captured entry metadata in canonical root-relative order.
+// The returned slice must not be mutated; entries with an empty StageRel are
+// policy files outside the selected tree and are not part of the build context.
+// A directory literally named template.yaml is present as metadata but its
+// subtree is not staged.
 func (s *SourceSnapshot) Entries() []SnapshotEntry {
 	if s == nil {
 		return nil
@@ -364,18 +482,43 @@ func (s *SourceSnapshot) Entries() []SnapshotEntry {
 	return s.entries
 }
 
-// Discard releases the snapshot's captured bytes. It is the explicit cleanup for
-// one preparation and is owned by the capturing caller, so capturing code must
-// defer it: a preparation that succeeds, fails, or is cancelled must not retain
-// the captured source. It is nil-safe and idempotent.
+// Root returns the private directory holding the snapshot's staged selected
+// source: the exact regular files (minus template.yaml) the fingerprint was
+// derived from. The runtime uses it directly as the app image build context, so
+// the source is never copied a second time. It is "" after Discard, and the
+// caller must never remove it: Discard owns its lifetime.
+func (s *SourceSnapshot) Root() string {
+	if s == nil {
+		return ""
+	}
+	return s.root
+}
+
+// Discard releases the snapshot's staged source by removing its private root and
+// dropping the entry metadata. It is the explicit cleanup for one preparation
+// and is owned by the capturing caller, so capturing code must defer it: a
+// preparation that succeeds, fails, or is cancelled must not retain (or leak) the
+// captured source. It is nil-safe and idempotent.
 func (s *SourceSnapshot) Discard() {
 	if s == nil {
 		return
 	}
-	for i := range s.entries {
-		s.entries[i].Content = nil
+	if s.root != "" {
+		_ = os.RemoveAll(s.root)
+		s.root = ""
 	}
 	s.entries = nil
+}
+
+// underStageDir reports whether the slash path rel lies inside one of the
+// excluded directory prefixes.
+func underStageDir(rel string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(rel, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // stagedRel returns path's path relative to the selected directory dir as a slash

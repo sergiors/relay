@@ -165,6 +165,15 @@ const (
 	// entry counts again.
 	MetricEventsOversized = metricNamespacePrefix + "events_oversized_total"
 
+	// MetricBuildOutputTruncated counts Docker build responses whose retained
+	// diagnostic reached the internal buildOutputRetention bound (1 MiB) — the
+	// stream output and the Docker error message together — and had further bytes
+	// discarded. The stream is still fully drained; only the retained diagnostic
+	// is bounded. It is an unlabeled anomaly counter: the app
+	// name and byte size are deliberately never labels (the app dimension is
+	// already carried by the build duration/failure families).
+	MetricBuildOutputTruncated = metricNamespacePrefix + "app_build_output_truncated_total"
+
 	// MetricAppStatus is the one-hot lifecycle status gauge. Exactly one
 	// status series per app holds 1 (the app's current public status)
 	// and every other allowed status holds 0, so a dashboard can read the
@@ -276,14 +285,15 @@ var metricHelp = map[string]string{
 	MetricAppBuild:                        "App image and dependency-image build duration in seconds by app.",
 	MetricRuntimeContainerAcquireDuration: "Warm-container pool acquire duration in seconds by app, observed for successful acquires only and including any capacity wait.",
 
-	MetricPendingEntries:      "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
-	MetricPendingOldestAge:    "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
-	MetricBufferedEvents:      "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
-	MetricInFlightInvocations: "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
-	MetricMissingPayload:      "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
-	MetricEventsOversized:     "Delivered messages whose raw event value exceeded MAX_EVENT_BYTES, counted once per processing delivery that rejects the message before decode, schedule classification, event matching, invocation-state migration, or handler execution and routes it non-retryably to the DLQ. A redelivery of the same oversized entry counts again. Unlabeled: the event ID and byte size are never labels.",
-	MetricRuntimeContainers:   "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
-	MetricRuntimePoolCapacity: "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
+	MetricPendingEntries:       "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
+	MetricPendingOldestAge:     "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
+	MetricBufferedEvents:       "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
+	MetricInFlightInvocations:  "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
+	MetricMissingPayload:       "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
+	MetricEventsOversized:      "Delivered messages whose raw event value exceeded MAX_EVENT_BYTES, counted once per processing delivery that rejects the message before decode, schedule classification, event matching, invocation-state migration, or handler execution and routes it non-retryably to the DLQ. A redelivery of the same oversized entry counts again. Unlabeled: the event ID and byte size are never labels.",
+	MetricBuildOutputTruncated: "Docker build responses whose retained diagnostic reached the internal 1 MiB build-output retention bound and had further output discarded; the response stream is still fully drained, only the retained diagnostic is bounded. Unlabeled: the app name and byte size are never labels.",
+	MetricRuntimeContainers:    "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
+	MetricRuntimePoolCapacity:  "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
 
 	MetricAppStatus:                "Current public lifecycle status of the app as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
 	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",
@@ -589,6 +599,10 @@ func New() *Registry {
 		// consumer when it rejects a message whose raw event value exceeds
 		// MAX_EVENT_BYTES (see the constant's doc).
 		MetricEventsOversized,
+		// MetricBuildOutputTruncated counts build responses whose retained
+		// diagnostic was cut at the internal retention bound (see the constant's
+		// doc).
+		MetricBuildOutputTruncated,
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(c)

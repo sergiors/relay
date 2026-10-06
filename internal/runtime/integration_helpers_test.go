@@ -198,16 +198,16 @@ func buildTestImage(ctx context.Context, t *testing.T, ref, dockerfile string) s
 	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		t.Fatalf("write dockerfile: %v", err)
 	}
-	reader, err := tarContext(ctxDir)
-	if err != nil {
-		t.Fatalf("tar context: %v", err)
-	}
+	reader, writer := io.Pipe()
+	go func() {
+		_ = writer.CloseWithError(writeContextTar(ctx, ctxDir, writer))
+	}()
 	resp, err := cli.ImageBuild(ctx, reader, client.ImageBuildOptions{Tags: []string{ref}, Dockerfile: "Dockerfile"})
 	if err != nil {
 		t.Fatalf("build unrelated image: %v", err)
 	}
 	defer resp.Body.Close()
-	if _, err := drainBuildResponse(resp.Body); err != nil {
+	if _, _, err := drainBuildResponse(resp.Body); err != nil {
 		t.Fatalf("build unrelated image output: %v", err)
 	}
 	return ref

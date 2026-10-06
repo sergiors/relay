@@ -113,7 +113,7 @@ func TestEnsureDependencyImageLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		m, logs := newLogCapturingManager(t, cli)
 
 		fn := app.App{Name: "dep-reuse-timing", Dir: t.TempDir(), Template: &app.Template{Runtime: "python3.14"}}
-		snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
+		snap := testDependencySnapshot(t, map[string]string{"requirements.txt": "six==1.16.0\n"})
 
 		if _, err := m.ensureDependencyImage(context.Background(), fn, spec, deps, snap, sentinel, depRef); err != nil {
 			t.Fatalf("ensure dependency image (reuse): %v", err)
@@ -130,7 +130,7 @@ func TestEnsureDependencyImageLogsInspectionTimingOnReuseAndMiss(t *testing.T) {
 		m, logs := newLogCapturingManager(t, cli)
 
 		fn := app.App{Name: "dep-miss-timing", Dir: t.TempDir(), Template: &app.Template{Runtime: "python3.14"}}
-		snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
+		snap := testDependencySnapshot(t, map[string]string{"requirements.txt": "six==1.16.0\n"})
 
 		if _, err := m.ensureDependencyImage(context.Background(), fn, spec, deps, snap, sentinel, depRef); err != nil {
 			t.Fatalf("ensure dependency image (miss): %v", err)

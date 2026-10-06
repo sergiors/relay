@@ -282,7 +282,11 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 			m := newLifecycleManager(t, cli, context.Background())
 
 			var captured *app.SourceSnapshot
-			m.afterSourceSnapshot = func(s *app.SourceSnapshot) { captured = s }
+			var capturedRoot string
+			m.afterSourceSnapshot = func(s *app.SourceSnapshot) {
+				captured = s
+				capturedRoot = s.Root()
+			}
 
 			fn := app.App{Name: "release-" + tc.name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 			_, err := m.Prepare(context.Background(), fn)
@@ -299,6 +303,12 @@ func TestPrepareReleasesSnapshotOnSuccessAndFailure(t *testing.T) {
 			// no entries remaining is the observable release on this pointer.
 			if n := len(captured.Entries()); n != 0 {
 				t.Fatalf("%d snapshot entries retained after Prepare returned; the deferred Discard must release them", n)
+			}
+			if capturedRoot == "" {
+				t.Fatal("test setup: the captured snapshot had no root")
+			}
+			if _, err := os.Stat(capturedRoot); !os.IsNotExist(err) {
+				t.Fatalf("snapshot root %q retained after Prepare returned; the deferred Discard must remove it", capturedRoot)
 			}
 		})
 	}
@@ -333,7 +343,11 @@ func TestPrepareReleasesSnapshotOnCancellation(t *testing.T) {
 	m := newLifecycleManager(t, cli, lifecycle)
 
 	var captured *app.SourceSnapshot
-	m.afterSourceSnapshot = func(s *app.SourceSnapshot) { captured = s }
+	var capturedRoot string
+	m.afterSourceSnapshot = func(s *app.SourceSnapshot) {
+		captured = s
+		capturedRoot = s.Root()
+	}
 
 	fn := app.App{Name: "release-cancel", Dir: dir, Template: &app.Template{Runtime: "node24"}}
 	done := make(chan error, 1)
@@ -363,5 +377,11 @@ func TestPrepareReleasesSnapshotOnCancellation(t *testing.T) {
 	// entries remaining is the observable release on this pointer.
 	if n := len(captured.Entries()); n != 0 {
 		t.Fatalf("%d snapshot entries retained after a cancelled Prepare; the deferred Discard must release them", n)
+	}
+	if capturedRoot == "" {
+		t.Fatal("test setup: the captured snapshot had no root")
+	}
+	if _, err := os.Stat(capturedRoot); !os.IsNotExist(err) {
+		t.Fatalf("snapshot root %q retained after a cancelled Prepare; the deferred Discard must remove it", capturedRoot)
 	}
 }

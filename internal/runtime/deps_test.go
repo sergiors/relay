@@ -3,6 +3,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,35 @@ func pythonRequirementsDeps() plan.Deps {
 		Install: "uv pip install --system --no-cache -r requirements.txt",
 		Dir:     "/app",
 	}
+}
+
+// testDependencySnapshot stages the given name->content manifests into a fresh
+// private root (exactly as snapshotDependency does) and returns the disk-backed
+// snapshot, with release registered as cleanup. It is the seam tests use to
+// build a dependencySnapshot without a real manifest tree on disk.
+func testDependencySnapshot(t *testing.T, manifests map[string]string) dependencySnapshot {
+	t.Helper()
+	root := t.TempDir()
+	names := make([]string, 0, len(manifests))
+	for name := range manifests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	snap := dependencySnapshot{root: root, files: make([]dependencyManifest, 0, len(names))}
+	for _, name := range names {
+		target := filepath.Join(root, filepath.FromSlash(name))
+		if dir := filepath.Dir(target); dir != root {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("mkdir for %s: %v", name, err)
+			}
+		}
+		if err := os.WriteFile(target, []byte(manifests[name]), 0o644); err != nil {
+			t.Fatalf("write manifest %s: %v", name, err)
+		}
+		snap.files = append(snap.files, dependencyManifest{name: name})
+	}
+	t.Cleanup(snap.release)
+	return snap
 }
 
 // TestDependencyFingerprintDeterminism verifies the fingerprint is stable: the

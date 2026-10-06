@@ -134,7 +134,7 @@ func TestEnsureDependencyImageUsesSuppliedFingerprint(t *testing.T) {
 		t.Fatalf("lookup: %v", err)
 	}
 	deps := plan.Deps{Install: "pip install -r requirements.txt", Dir: "/app", Files: []string{"requirements.txt"}}
-	snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
+	snap := testDependencySnapshot(t, map[string]string{"requirements.txt": "six==1.16.0\n"})
 
 	ref, err := m.ensureDependencyImage(context.Background(), fn, spec, deps, snap, sentinel, "")
 	if err != nil {
@@ -148,7 +148,11 @@ func TestEnsureDependencyImageUsesSuppliedFingerprint(t *testing.T) {
 		t.Fatalf("built tag = %q, want %q", builtTag, want)
 	}
 	// A rehash would have produced the real content address, not the sentinel.
-	if realFP := dependencyFingerprintFrom(arch, platform, spec, deps, snap); depImageRef(realFP) == want {
+	realFP, err := dependencyFingerprintFrom(arch, platform, spec, deps, snap)
+	if err != nil {
+		t.Fatalf("real dependency fingerprint: %v", err)
+	}
+	if depImageRef(realFP) == want {
 		t.Fatal("test sentinel collides with the real dependency fingerprint; pick a different sentinel")
 	}
 }
@@ -179,7 +183,7 @@ func TestPrepareComputesDependencyFingerprintOnce(t *testing.T) {
 	m := newLifecycleManager(t, cli, context.Background())
 
 	depFingerprintCalls := 0
-	m.depFingerprint = func(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) string {
+	m.depFingerprint = func(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) (string, error) {
 		depFingerprintCalls++
 		return dependencyFingerprintFrom(arch, platform, spec, deps, snap)
 	}

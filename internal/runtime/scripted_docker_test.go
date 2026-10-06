@@ -67,12 +67,17 @@ func (s *scriptedDocker) RoundTrip(r *http.Request) (*http.Response, error) {
 				return nil, err
 			}
 		}
+		// Always consume the request body, exactly as a real HTTP transport does
+		// before returning the response: the production build path streams the
+		// context tar through the request body, so a transport that never reads it
+		// would leave the producer blocked (and mask a leak). onBody observes the
+		// fully-read bytes when the test asked for them.
+		var reqBody []byte
+		if r.Body != nil {
+			reqBody, _ = io.ReadAll(r.Body)
+		}
 		if rt.onBody != nil {
-			// The client has already serialized the request; read it here (the
-			// response below does not depend on the body). A read error leaves
-			// body nil, which the test's assertions will surface.
-			b, _ := io.ReadAll(r.Body)
-			rt.onBody(b)
+			rt.onBody(reqBody)
 		}
 		status := rt.status
 		if status == 0 {

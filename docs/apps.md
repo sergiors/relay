@@ -228,6 +228,37 @@ and shared across apps; the fingerprint keys on the base image **tag**, not
 its digest, so a newer pull of the same tag reuses the cached layer (operators
 wanting a refresh must remove those images).
 
+#### Build resource use
+
+Build input and output do not scale with the source tree's total size, but they
+are not a host-wide memory bound:
+
+- **Build input is streamed, not buffered.** The selected source is staged to a
+  private on-disk directory (the snapshot above) and the fingerprint is computed
+  in the same single pass; ordinary source bodies and dependency manifests (e.g. a
+  large `package-lock.json`) are copied/hashed with bounded buffers and file
+  metadata, not held in the worker heap. That directory is the build context, and
+  the context tar is streamed directly to the Docker daemon through a pipe; the
+  whole tar is never materialized in the worker heap. The one exception is the
+  app's top-level `template.yaml`: Relay parses and rewrites that document to drop
+  `resources` from the fingerprint, so that single YAML file is read into memory,
+  proportional to the document size. There is **no `MAX_BUILD_CONTEXT_BYTES`** and
+  none is planned: the worker's memory stays bounded independently of the total
+  context size, while **disk use still scales with the context** (the staged
+  snapshot plus the daemon's own build storage). This is not a host-wide resource
+  limit.
+- **Build output is retained up to 1 MiB.** A failed build's diagnostic is
+  capped at 1 MiB as a whole — the retained stream output plus the Docker error
+  message together; the remainder is still fully drained from the daemon (never
+  abandoned mid-stream) and discarded, and the retained text is marked
+  `[build output truncated]`. Reading the daemon's JSON message stream
+  transiently materializes one decoded Docker JSON message value (a `stream` or
+  an error message string) before the cap is applied, so peak memory for that one
+  message tracks the size of that message, not the whole response; the retained
+  diagnostic stays at 1 MiB plus the fixed marker. The truncation is counted by
+  the unlabeled `relay_app_build_output_truncated_total` metric. A successful
+  build returns no diagnostic output.
+
 ### Warm execution containers
 
 Each app keeps a bounded warm pool of reused containers, up to its

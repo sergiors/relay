@@ -14,30 +14,47 @@ import (
 	"relay/internal/runtime/plan"
 )
 
-// dependencySnapshot is an immutable, in-memory snapshot of a dependency
-// layer's manifest inputs: every declared manifest file's relative name and its
-// exact bytes, read exactly once. It is the single source for BOTH the
+// dependencySnapshot is an immutable snapshot of a dependency layer's manifest
+// inputs: every declared manifest file's relative name and its exact staged copy
+// under a private root, read exactly once. It is the single source for BOTH the
 // dependency fingerprint and the staged dependency build context, so the
 // resulting hash/tag always corresponds to the bytes actually baked into the
 // dependency image even if a manifest is edited concurrently.
+//
+// The manifests live on disk under root (which IS the dependency build context),
+// not in memory, so a large manifest such as a package-lock.json is never held
+// in the worker heap. The fingerprint is recomputed deterministically from the
+// staged bytes (see dependencyFingerprintFrom), so it remains valid even after
+// the root is removed.
 type dependencySnapshot struct {
+	root  string
 	files []dependencyManifest
 }
 
 // dependencyManifest is one staged manifest: its relative name (as declared by
-// the engine) and its content bytes.
+// the engine). Its content bytes live at root/<name>.
 type dependencyManifest struct {
-	name    string
-	content []byte
+	name string
 }
 
+// depBuildRootPattern is the os.MkdirTemp pattern for a dependency snapshot's
+// private root (the shared relay-dep-* build context). The "relay-dep-build-"
+// prefix matches the transient dependency build directory the runtime used to
+// create (and that its cleanup tests observe); release removes it.
+const depBuildRootPattern = "relay-dep-build-*"
+
 // snapshotDependency reads the manifest files declared by deps from fnDir into
-// an immutable snapshot sorted by name, so the serialization is canonical and a
-// later edit to the on-disk manifest cannot make the fingerprint and the staged
-// bytes disagree. A missing/unreadable manifest is an error: the engine only
-// declares Deps when the manifests exist, so an absent one means a race /
-// mid-reconcile state and must not be silently hashed as empty (that would
-// poison the shared layer cache).
+// an immutable disk-backed snapshot sorted by name, so the serialization is
+// canonical and a later edit to the on-disk manifest cannot make the fingerprint
+// and the staged bytes disagree. The snapshot's private root is the dependency
+// build context; the caller must release it with snap.release() once the
+// fingerprint and the dependency image build are done.
+//
+// A missing/unreadable manifest is an error: the engine only declares Deps when
+// the manifests exist, so an absent one means a race / mid-reconcile state and
+// must not be silently hashed as empty (that would poison the shared layer
+// cache). On any error the private root is removed, so a failed capture leaks
+// nothing.
 func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error) {
 	if len(deps.Files) == 0 {
 		return dependencySnapshot{}, fmt.Errorf("fingerprint deps: no manifest files")
@@ -45,16 +62,63 @@ func snapshotDependency(fnDir string, deps plan.Deps) (dependencySnapshot, error
 
 	files := append([]string(nil), deps.Files...)
 	sort.Strings(files)
-	snap := dependencySnapshot{files: make([]dependencyManifest, 0, len(files))}
+
+	root, err := os.MkdirTemp("", depBuildRootPattern)
+	if err != nil {
+		return dependencySnapshot{}, fmt.Errorf("dependency snapshot: create root: %w", err)
+	}
+
+	snap := dependencySnapshot{root: root, files: make([]dependencyManifest, 0, len(files))}
 	for _, name := range files {
-		content, err := os.ReadFile(filepath.Join(fnDir, filepath.FromSlash(name)))
-		if err != nil {
-			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: read manifest %q: %w", name, err)
+		src, oerr := os.Open(filepath.Join(fnDir, filepath.FromSlash(name)))
+		if oerr != nil {
+			snap.release()
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: read manifest %q: %w", name, oerr)
+		}
+		target := filepath.Join(root, filepath.FromSlash(name))
+		if dir := filepath.Dir(target); dir != root {
+			if merr := os.MkdirAll(dir, 0o755); merr != nil {
+				_ = src.Close()
+				snap.release()
+				return dependencySnapshot{}, fmt.Errorf("fingerprint deps: stage manifest %q: %w", name, merr)
+			}
+		}
+		dst, cerr := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		if cerr != nil {
+			_ = src.Close()
+			snap.release()
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: stage manifest %q: %w", name, cerr)
+		}
+		_, copyErr := io.Copy(dst, src)
+		closeDstErr := dst.Close()
+		closeSrcErr := src.Close()
+		if copyErr != nil {
+			snap.release()
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: read manifest %q: %w", name, copyErr)
+		}
+		if closeDstErr != nil {
+			snap.release()
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: stage manifest %q: %w", name, closeDstErr)
+		}
+		if closeSrcErr != nil {
+			snap.release()
+			return dependencySnapshot{}, fmt.Errorf("fingerprint deps: read manifest %q: %w", name, closeSrcErr)
 		}
 
-		snap.files = append(snap.files, dependencyManifest{name: name, content: content})
+		snap.files = append(snap.files, dependencyManifest{name: name})
 	}
 	return snap, nil
+}
+
+// release removes the snapshot's private root if it owns one. It is nil-safe and
+// idempotent. A snapshot constructed directly by tests (no root) releases
+// nothing.
+func (s *dependencySnapshot) release() {
+	if s == nil || s.root == "" {
+		return
+	}
+	_ = os.RemoveAll(s.root)
+	s.root = ""
 }
 
 // DependencyFingerprint computes the content address for a dependency layer:
@@ -99,20 +163,24 @@ func DependencyFingerprint(
 	if err != nil {
 		return "", err
 	}
-	return dependencyFingerprintFrom(arch, platform, spec, deps, snap), nil
+	defer snap.release()
+	return dependencyFingerprintFrom(arch, platform, spec, deps, snap)
 }
 
 // dependencyFingerprintFrom hashes an already-captured manifest snapshot. It is
 // the single fingerprint implementation, shared by DependencyFingerprint and
 // the Manager's prepare path, so the fingerprint and the bytes staged into the
-// dependency image come from the exact same read.
+// dependency image come from the exact same read. Because the snapshot is
+// disk-backed, each manifest's bytes are STREAMED into the hash (with the same
+// 8-byte length prefix as hashFieldBytes would write), so an arbitrarily large
+// manifest is never materialized in memory.
 func dependencyFingerprintFrom(
 	arch,
 	platform string,
 	spec plan.Spec,
 	deps plan.Deps,
 	snap dependencySnapshot,
-) string {
+) (string, error) {
 	h := sha256.New()
 
 	// Runtime identity.
@@ -141,10 +209,38 @@ func dependencyFingerprintFrom(
 	// already name-sorted by snapshotDependency.
 	for _, f := range snap.files {
 		hashField(h, f.name)
-		hashFieldBytes(h, f.content)
+		if err := hashManifestBytes(h, snap.root, f.name); err != nil {
+			return "", err
+		}
 	}
 
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashManifestBytes streams the staged manifest's bytes into the digest, framed
+// exactly as hashFieldBytes frames a byte slice (8-byte big-endian length then
+// content), so the disk-backed fingerprint is byte-for-byte identical to the
+// historical in-memory one. A read failure is surfaced: a manifest that vanished
+// from the snapshot root is an anomaly, never hashed as empty.
+func hashManifestBytes(h io.Writer, root, name string) error {
+	f, err := os.Open(filepath.Join(root, filepath.FromSlash(name)))
+	if err != nil {
+		return fmt.Errorf("dependency snapshot: read manifest %q: %w", name, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("dependency snapshot: stat manifest %q: %w", name, err)
+	}
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(info.Size()))
+	if _, err := h.Write(lenBuf[:]); err != nil {
+		return fmt.Errorf("dependency snapshot: hash manifest %q: %w", name, err)
+	}
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("dependency snapshot: hash manifest %q: %w", name, err)
+	}
+	return nil
 }
 
 // hashField writes a length-prefixed string field into the digest.

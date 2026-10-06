@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +17,7 @@ import (
 	"github.com/moby/moby/client"
 
 	"relay/internal/app"
+	"relay/internal/observability/metrics"
 	"relay/internal/runtime/plan"
 )
 
@@ -130,20 +130,16 @@ func buildImage(
 	image string,
 	labels map[string]string,
 	snapshot *app.SourceSnapshot,
+	reg *metrics.Registry,
 ) error {
-	ctxDir, err := os.MkdirTemp("", "relay-build-*")
-	if err != nil {
-		return fmt.Errorf("app %q: create build context: %w", name, err)
-	}
-	defer os.RemoveAll(ctxDir)
-
 	// snapshot is the SINGLE immutable read the caller already fingerprinted: the
 	// image is staged from exactly the bytes its tag was derived from, so a
 	// concurrent edit between the fingerprint and the build can no longer make the
-	// tag and the baked content disagree. The app's .gitignore policy was
-	// applied at capture time (ignored files and .git were never captured), so the
-	// staged context contains exactly the selected source. Staging is read-only;
-	// the user's app directory is never modified.
+	// tag and the baked content disagree. The app's .gitignore policy was applied
+	// at capture time (ignored files and .git were never captured), so the staged
+	// context contains exactly the selected source. The snapshot's private root IS
+	// the build context: the source is not copied a second time, and Discard (the
+	// capturing caller's deferred release) owns removing it on every path.
 	//
 	// template.yaml is excluded from the context even though it participates in
 	// the fingerprint: the template is Relay configuration (runtime, rules, env
@@ -151,8 +147,9 @@ func buildImage(
 	// would embed env values and secret references in the image layers. Generated
 	// plan files are written separately below, so the user's app directory is
 	// never modified.
-	if err := stageSourceSnapshot(snapshot, ctxDir); err != nil {
-		return fmt.Errorf("app %q: copy sources: %w", name, err)
+	ctxDir := snapshot.Root()
+	if ctxDir == "" {
+		return fmt.Errorf("app %q: build source snapshot is unavailable", name)
 	}
 
 	if err := writePlanFiles(ctxDir, name, p.Files); err != nil {
@@ -164,7 +161,7 @@ func buildImage(
 		return fmt.Errorf("app %q: write dockerfile: %w", name, err)
 	}
 
-	return runImageBuild(ctx, cli, name, ctxDir, image, labels)
+	return runImageBuild(ctx, cli, name, ctxDir, image, labels, reg)
 }
 
 // writePlanFiles writes the generated plan files (bootstrap, injected
@@ -190,30 +187,95 @@ func writePlanFiles(ctxDir, name string, files []plan.File) error {
 	return nil
 }
 
-// runImageBuild is the shared ImageBuild tail: write the Dockerfile is already
-// done by the caller; this tars the context, builds, and drains the response.
+// buildOutputRetention bounds the whole retained Docker build diagnostic: the
+// Docker error message and the retained stream text together. A build can stream
+// an unbounded amount of output (an install step's progress) and the daemon's
+// error message can itself be arbitrarily large, so both are capped rather than
+// accumulated without limit; the remainder is drained and discarded. There is
+// deliberately no user-facing configuration for this: it is a diagnostic bound,
+// not a behavior knob.
+const buildOutputRetention = 1 << 20 // 1 MiB
+
+// buildOutputTruncatedMarker is appended to a retained build diagnostic when
+// bytes were discarded, so an operator can tell a genuinely short failure output
+// from one that was cut at the retention bound.
+const buildOutputTruncatedMarker = "[build output truncated]"
+
+// runImageBuild is the shared ImageBuild tail: the Dockerfile is already written
+// by the caller; this streams the context tar, builds, and drains the response.
 // labels are the managed-image labels stamped onto the resulting image (see
 // buildImageOptions / managed image labeling in labels.go); nil means no labels.
-func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string, labels map[string]string) error {
-	// The daemon expects the build context as a tar stream; build it in memory
-	// from the staged directory rather than shelling out to tar.
-	contextTar, err := tarContext(ctxDir)
-	if err != nil {
-		return fmt.Errorf("app %q: tar build context: %w", name, err)
+//
+// The context tar is STREAMED into the daemon through an io.Pipe rather than
+// buffered in memory first, so an arbitrarily large build context never has to
+// be materialized in the worker heap. The producer goroutine is joined on every
+// path (success, daemon error, cancellation, and early consumer close), so a
+// failed or cancelled build cannot leak it or block on a full pipe.
+func runImageBuild(ctx context.Context, cli *client.Client, name, ctxDir, image string, labels map[string]string, reg *metrics.Registry) error {
+	pr, pw := io.Pipe()
+	producerDone := make(chan error, 1)
+	go func() {
+		err := writeContextTar(ctx, ctxDir, pw)
+		// CloseWithError closes the write end: nil yields io.EOF so the consumer
+		// sees a clean end, otherwise the reader observes the producer's error.
+		_ = pw.CloseWithError(err)
+		producerDone <- err
+	}()
+
+	resp, buildErr := cli.ImageBuild(ctx, pr, buildImageOptions(image, labels))
+	if buildErr != nil {
+		// The client did not produce a response (a transport failure or a
+		// cancelled context). It may have abandoned the context body, so unblock
+		// the producer before joining it; Close is idempotent and a no-op if the
+		// producer already finished, so the join below cannot hang.
+		_ = pr.Close()
+		producerErr := <-producerDone
+		// The transport failure is the build failure. A producer error is already
+		// reflected through it when the daemon read the failing stream; on a
+		// non-read failure the producer was abandoned, which is not itself a
+		// second fault to report.
+		if producerErr != nil && !errors.Is(producerErr, io.ErrClosedPipe) && !errors.Is(producerErr, context.Canceled) {
+			return fmt.Errorf("app %q: docker build: %w", name, errors.Join(buildErr, producerErr))
+		}
+		return fmt.Errorf("app %q: docker build: %w", name, buildErr)
 	}
 
-	resp, err := cli.ImageBuild(ctx, contextTar, buildImageOptions(image, labels))
-	if err != nil {
-		return fmt.Errorf("app %q: docker build: %w", name, err)
-	}
-	defer resp.Body.Close()
+	// Drain the response BEFORE joining the producer. The HTTP transport writes
+	// the request body on its own goroutine while this goroutine reads the
+	// response, so the daemon can always flush its output and finish reading the
+	// context; waiting for the producer first could deadlock against a server
+	// blocked writing a response nobody is reading. Draining also consumes the
+	// full stream after a build failure.
+	out, truncated, drainErr := drainBuildResponse(resp.Body)
+	_ = resp.Body.Close()
+	// If the response ended without the transport having consumed the whole
+	// context (an early abort or a daemon that stopped reading), unblock the
+	// producer so the join below cannot hang. Closing an already-closed pipe is a
+	// no-op.
+	_ = pr.Close()
+	producerErr := <-producerDone
 
+	// A producer error that is only the pipe closing under it (the consumer
+	// returned early, or we closed the read end after the response) or the build
+	// context being cancelled is not itself a tar fault: the real outcome is the
+	// drained response below. Any OTHER producer error (a filesystem failure)
+	// means the tar Relay sent was incomplete, which must never pass as a
+	// successful build.
+	if producerErr != nil && !errors.Is(producerErr, io.ErrClosedPipe) && !errors.Is(producerErr, context.Canceled) && !errors.Is(producerErr, context.DeadlineExceeded) {
+		return fmt.Errorf("app %q: tar build context: %w", name, producerErr)
+	}
+	if truncated {
+		reg.Inc(metrics.MetricBuildOutputTruncated)
+	}
 	// The build API returns 200 even when the build fails; failure is signalled
-	// by an "error" JSON message in the response stream, so drain it and treat
-	// any such message as a failed build.
-	out, err := drainBuildResponse(resp.Body)
-	if err != nil {
-		return fmt.Errorf("app %q: docker build: %w\n%s", name, err, strings.TrimSpace(out))
+	// by an "error" JSON message in the response stream (drainErr), or by the
+	// build context being cancelled. The returned output is a bounded diagnostic;
+	// on success it is discarded by the caller.
+	if drainErr != nil {
+		return fmt.Errorf("app %q: docker build: %w\n%s", name, drainErr, strings.TrimSpace(out))
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("app %q: docker build: %w", name, ctxErr)
 	}
 	return nil
 }
@@ -241,26 +303,21 @@ func buildDependencyImage(
 	deps plan.Deps,
 	snap dependencySnapshot,
 	depRef, depFingerprint string,
+	reg *metrics.Registry,
 ) error {
-	ctxDir, err := os.MkdirTemp("", "relay-dep-build-*")
-	if err != nil {
-		return fmt.Errorf("dependency %s: create build context: %w", depRef, err)
-	}
-	defer os.RemoveAll(ctxDir)
-
-	// Stage ONLY the manifest files, not the app's source tree. The
-	// dependency image exists to cache the install; baking the whole source
-	// would couple the layer to every source change and defeat the reuse.
-	for _, f := range snap.files {
-		target := filepath.Join(ctxDir, filepath.FromSlash(f.name))
-		if dir := filepath.Dir(target); dir != ctxDir {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("dependency %s: mkdir for %s: %w", depRef, f.name, err)
-			}
-		}
-		if err := os.WriteFile(target, f.content, 0o644); err != nil {
-			return fmt.Errorf("dependency %s: write manifest %s: %w", depRef, f.name, err)
-		}
+	// snap is the immutable manifest snapshot the caller captured (see
+	// snapshotDependency): the SAME bytes whose fingerprint names the tag are the
+	// bytes staged here, so the image can never be tagged for one manifest content
+	// while baking another. The snapshot's private root IS the dependency build
+	// context: the manifests are not copied a second time, and the caller's
+	// deferred release removes it on every path.
+	//
+	// Stage ONLY the manifest files, not the app's source tree. The dependency
+	// image exists to cache the install; baking the whole source would couple the
+	// layer to every source change and defeat the reuse.
+	ctxDir := snap.root
+	if ctxDir == "" {
+		return fmt.Errorf("dependency %s: build context is unavailable", depRef)
 	}
 
 	// Render via the single generic renderer with a synthetic plan: the runtime
@@ -289,7 +346,7 @@ func buildDependencyImage(
 		return fmt.Errorf("dependency %s: write dockerfile: %w", depRef, err)
 	}
 
-	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, dependencyImageLabels(spec.Name, depFingerprint))
+	return runImageBuild(ctx, cli, "dependency "+depRef, ctxDir, depRef, dependencyImageLabels(spec.Name, depFingerprint), reg)
 }
 
 // buildImageOptions returns the ImageBuildOptions Relay uses for every app
@@ -323,10 +380,42 @@ func buildImageOptions(image string, labels map[string]string) client.ImageBuild
 }
 
 // drainBuildResponse reads the JSON message stream returned by ImageBuild,
-// collecting the build output and failing on the first message that carries an
-// error.
-func drainBuildResponse(r io.Reader) (string, error) {
+// retaining a BOUNDED diagnostic and failing on the first message that carries
+// an error.
+//
+// The whole response is always consumed, even after the retention cap is reached
+// and even after the first Docker error, so the daemon's response body is
+// drained rather than abandoned mid-stream (which can stall the connection).
+// The first error is remembered; draining continues so the stream is not left
+// half-read. The retained diagnostic as a whole (the first Docker error message
+// plus the retained stream text) is bounded by buildOutputRetention: an
+// oversized Docker error message is itself capped (copied, never left backed by
+// the original decoded string), and the stream budget is reduced by the error
+// message it must accompany. Whatever was cut is marked with
+// buildOutputTruncatedMarker, so an operator can tell a short failure from a
+// truncated one. On a successful stream the (possibly bounded) output is
+// returned with a nil error; the caller discards it.
+//
+// A malformed message ends parsing: JSON cannot be resynchronized, so the
+// remaining messages are not interpreted. After the first error the malformed
+// message is ignored (the first error already explains the failure); before any
+// error the decode error is returned. Either way the decoder's buffered
+// remainder and the underlying reader are drained to io.Discard first, so the
+// daemon's response body is still fully consumed rather than abandoned (which
+// can stall the connection).
+//
+// It also reports whether bytes were discarded (truncation), so the caller can
+// record the bounded-diagnostic anomaly.
+func drainBuildResponse(r io.Reader) (string, bool, error) {
 	var out strings.Builder
+	truncated := false
+	var firstErr error
+	var decodeErr error
+	// errMsg is the bounded first Docker error message. It reserves part of the
+	// retention budget so the combined diagnostic (error message plus retained
+	// stream text) stays bounded.
+	errMsg := ""
+
 	dec := json.NewDecoder(r)
 	for {
 		var msg jsonstream.Message
@@ -334,23 +423,130 @@ func drainBuildResponse(r io.Reader) (string, error) {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return out.String(), err
+			// Parsing stops here, but the body must still be drained: consume
+			// whatever the decoder buffered and then the rest of the underlying
+			// reader before reporting the preserved error.
+			drainDecoderRemainder(dec, r)
+			// The build already failed with a Docker error; a malformed trailing
+			// message adds no signal and must not replace the real cause.
+			if firstErr == nil {
+				decodeErr = err
+			}
+			break
 		}
 		if msg.Error != nil {
-			return out.String(), msg.Error
+			if firstErr == nil {
+				capped, cut := capBuildError(msg.Error)
+				firstErr = capped
+				errMsg = capped.Message
+				if cut {
+					truncated = true
+				}
+			}
+			// Keep draining: the remainder of the response must still be read.
+			continue
 		}
-		if msg.Stream != "" {
+		if msg.Stream == "" {
+			continue
+		}
+		if truncated {
+			continue
+		}
+		remaining := buildStreamBudget(errMsg) - out.Len()
+		if remaining <= 0 {
+			truncated = true
+			continue
+		}
+		if len(msg.Stream) <= remaining {
 			out.WriteString(msg.Stream)
+			continue
 		}
+		out.WriteString(msg.Stream[:remaining])
+		truncated = true
 	}
-	return out.String(), nil
+	// Finalize once: an error message decoded late may have shrunk the stream
+	// budget after text was already retained, so the combined diagnostic is
+	// trimmed here too and the truncation flag is refreshed.
+	text, cut := finishBuildOutput(out, truncated, errMsg)
+	if firstErr != nil {
+		return text, cut, firstErr
+	}
+	return text, cut, decodeErr
 }
 
-func tarContext(ctxDir string) (io.Reader, error) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
+// capBuildError bounds the first Docker error message to buildOutputRetention and
+// reports whether the message was cut. An oversized message is copied, so the
+// retained diagnostic never keeps the original, arbitrarily large decoded string
+// alive. The error's code and an in-budget message are preserved verbatim.
+func capBuildError(e *jsonstream.Error) (*jsonstream.Error, bool) {
+	if len(e.Message) <= buildOutputRetention {
+		return e, false
+	}
+	capped := *e
+	capped.Message = strings.Clone(e.Message[:buildOutputRetention])
+	return &capped, true
+}
+
+// buildStreamBudget returns how many bytes of stream output may be retained
+// alongside a first Docker error message of errMsg bytes, so the combined
+// retained diagnostic never exceeds buildOutputRetention.
+func buildStreamBudget(errMsg string) int {
+	remaining := buildOutputRetention - len(errMsg)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// drainDecoderRemainder consumes everything a json.Decoder has already buffered
+// but not yet consumed, then the rest of the underlying reader, so a caller that
+// stops parsing mid-stream still reads the body to EOF. It must be called only
+// after a decode error, when the decoder's position no longer matters. Errors
+// from the underlying reader are intentionally ignored: the caller already has
+// the parse failure (or the first Docker error) to report, and draining is
+// best-effort cleanup of a response that will be closed anyway.
+func drainDecoderRemainder(dec *json.Decoder, r io.Reader) {
+	_, _ = io.Copy(io.Discard, dec.Buffered())
+	_, _ = io.Copy(io.Discard, r)
+}
+
+// finishBuildOutput renders the retained build text, appending the truncation
+// marker when bytes were discarded and a separating newline when the retained
+// text does not already end with one. errMsg is the retained first Docker error
+// message, whose bytes reserve part of the retention budget: the returned stream
+// text is itself trimmed to the remaining budget, so the combined diagnostic
+// (error message plus stream text) never exceeds buildOutputRetention before the
+// fixed marker. It returns the rendered text and whether it truncated, which
+// covers the case where the budget only shrank when a later error message was
+// decoded. It never returns more than the stream budget bytes of build output
+// before the marker.
+func finishBuildOutput(out strings.Builder, truncated bool, errMsg string) (string, bool) {
+	s := out.String()
+	if budget := buildStreamBudget(errMsg); len(s) > budget {
+		s = s[:budget]
+		truncated = true
+	}
+	if !truncated {
+		return s, false
+	}
+	if s != "" && !strings.HasSuffix(s, "\n") {
+		s += "\n"
+	}
+	return s + buildOutputTruncatedMarker, true
+}
+
+// writeContextTar streams a tar of ctxDir into w. It is the producer half of the
+// streamed build context (see runImageBuild): it never buffers the whole tar, so
+// an arbitrarily large context is bounded by the pipe, not by heap. It honors
+// ctx: a cancelled build stops the walk at the next entry and returns the
+// context error, so the producer cannot outlive its build.
+func writeContextTar(ctx context.Context, ctxDir string, w io.Writer) error {
+	tw := tar.NewWriter(w)
 	err := filepath.Walk(ctxDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(ctxDir, path)
@@ -389,87 +585,13 @@ func tarContext(ctxDir string) (io.Reader, error) {
 		return f.Close()
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
+	// Flush the tar trailer, but only when the consumer is still reading: if the
+	// daemon already closed the pipe, the tar writer's final write fails and that
+	// is the consumer's early return, not a build fault of ours.
 	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	return &buf, nil
-}
-
-// stageSourceSnapshot writes the immutable snapshot's selected files (and the
-// directories that contain them) into the build context. It stages exactly the
-// bytes the fingerprint was derived from, so the tag and the image can never
-// disagree about a concurrent edit.
-//
-// template.yaml is deliberately excluded by BASE NAME anywhere in the tree: the
-// template is Relay configuration (runtime, rules, env values, secret
-// references), not app source, so it must never enter an image — including
-// a nested template.yaml the loader never reads. It still participates in the
-// fingerprint (the selected directory's own template.yaml is hashed with its
-// resources stripped; a nested one is hashed verbatim), so template edits still
-// gate rebuilds while the bytes stay out of the image. Entries with an empty
-// StageRel are ancestor policy files that are fingerprinted but never staged.
-//
-// Directories are created so an empty selected directory still appears in the
-// context (and so plan-file writes find their parents), and the original mode is
-// preserved. The snapshot is read-only here; the user's tree is never touched.
-func stageSourceSnapshot(snapshot *app.SourceSnapshot, dst string) error {
-	if snapshot == nil {
-		return fmt.Errorf("stage source: nil snapshot")
-	}
-	// A directory literally named template.yaml is excluded with its whole
-	// subtree, mirroring the historical base-name SkipDir behavior; its contents
-	// still participate in the fingerprint.
-	var excludedDirs []string
-	for _, e := range snapshot.Entries() {
-		if e.StageRel == "" {
-			continue
-		}
-		if filepath.Base(e.StageRel) == "template.yaml" {
-			if e.IsDir {
-				excludedDirs = append(excludedDirs, e.StageRel+"/")
-			}
-			continue
-		}
-		if underStageDir(e.StageRel, excludedDirs) {
-			continue
-		}
-		target := filepath.Join(dst, filepath.FromSlash(e.StageRel))
-		if e.IsDir {
-			if err := os.MkdirAll(target, e.Mode.Perm()); err != nil {
-				return err
-			}
-			continue
-		}
-		if !e.Regular {
-			// A non-regular entry (a symlink, socket, ...) participates in the
-			// fingerprint but is never staged, matching the historical stager; the
-			// build only ever bakes regular files.
-			continue
-		}
-		if dir := filepath.Dir(target); dir != dst {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return err
-			}
-		}
-		// Content is already in memory (the snapshot captured it), so write it
-		// without reopening the on-disk file: reopening would reintroduce the
-		// fingerprint-then-stage race the snapshot exists to remove.
-		if err := os.WriteFile(target, e.Content, e.Mode.Perm()); err != nil {
-			return err
-		}
+		return err
 	}
 	return nil
-}
-
-// underStageDir reports whether the slash path rel lies inside one of the
-// excluded directory prefixes.
-func underStageDir(rel string, prefixes []string) bool {
-	for _, p := range prefixes {
-		if strings.HasPrefix(rel, p) {
-			return true
-		}
-	}
-	return false
 }

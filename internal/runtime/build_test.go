@@ -302,13 +302,13 @@ func TestQuoteEntrypointJSON(t *testing.T) {
 	}
 }
 
-// TestStageSourceSnapshotSkipsTemplateYaml verifies the build-context staging
-// excludes template.yaml (Relay configuration, not app source) while
-// staging every other captured file. This is what keeps env values and secret
-// references out of the image layers. It stages from the SAME immutable snapshot
-// the fingerprint is derived from, so the assertion also covers the capture
-// boundary.
-func TestStageSourceSnapshotSkipsTemplateYaml(t *testing.T) {
+// TestCaptureSourceSnapshotSkipsTemplateYaml verifies the build-context staging
+// excludes template.yaml (Relay configuration, not app source) while staging
+// every other captured file into the snapshot's private root (the build context).
+// This is what keeps env values and secret references out of the image layers.
+// The capture derives the staged bytes and the fingerprint from one read, so the
+// assertion also covers the capture boundary.
+func TestCaptureSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 	src := t.TempDir()
 	if err := os.WriteFile(filepath.Join(src, "template.yaml"), []byte("runtime: node24\n"), 0o644); err != nil {
 		t.Fatalf("write template: %v", err)
@@ -338,10 +338,7 @@ func TestStageSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 		t.Fatalf("capture source snapshot: %v", err)
 	}
 	t.Cleanup(snapshot.Discard)
-	dst := t.TempDir()
-	if err := stageSourceSnapshot(snapshot, dst); err != nil {
-		t.Fatalf("stageSourceSnapshot: %v", err)
-	}
+	dst := snapshot.Root()
 
 	if _, err := os.Stat(filepath.Join(dst, "template.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("template.yaml should be excluded from the build context, stat err = %v", err)
@@ -356,11 +353,11 @@ func TestStageSourceSnapshotSkipsTemplateYaml(t *testing.T) {
 	}
 }
 
-// TestStageSourceSnapshotHonorsSelection verifies the build context stages
+// TestCaptureSourceSnapshotHonorsSelection verifies the build context stages
 // exactly the selected source: files excluded by the app's .gitignore never
 // reach the image, the applicable .gitignore itself does, and template.yaml is
 // still excluded (Relay configuration must not leak into a layer).
-func TestStageSourceSnapshotHonorsSelection(t *testing.T) {
+func TestCaptureSourceSnapshotHonorsSelection(t *testing.T) {
 	src := t.TempDir()
 	write := func(name, content string) {
 		t.Helper()
@@ -382,10 +379,7 @@ func TestStageSourceSnapshotHonorsSelection(t *testing.T) {
 		t.Fatalf("capture source snapshot: %v", err)
 	}
 	t.Cleanup(snapshot.Discard)
-	dst := t.TempDir()
-	if err := stageSourceSnapshot(snapshot, dst); err != nil {
-		t.Fatalf("stageSourceSnapshot: %v", err)
-	}
+	dst := snapshot.Root()
 
 	if _, err := os.Stat(filepath.Join(dst, "template.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("template.yaml must be excluded from the build context, stat err = %v", err)

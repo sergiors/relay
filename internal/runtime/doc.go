@@ -49,6 +49,25 @@
 // internal/source policy (the app's .gitignore rules), the same selection
 // the fingerprint uses: an ignored file is neither hashed nor baked into a layer.
 //
+// Build resource use does not scale with the source tree's total size, but it is
+// not a host-wide memory bound. The selected source is captured to a private
+// on-disk snapshot (which IS the build context) and fingerprinted in one pass;
+// ordinary source bodies and dependency manifests are staged and hashed with
+// bounded buffers and file metadata rather than held in memory, and the context
+// tar is streamed to the daemon through a pipe, so the whole tar is never
+// buffered. The one exception is the app's top-level template.yaml, which is read
+// into memory because stripping its resources section for the fingerprint
+// requires the whole YAML document; one template document may use memory
+// proportional to that document. There is deliberately NO MAX_BUILD_CONTEXT_BYTES:
+// the worker's heap stays bounded independently of the total context size (disk
+// still scales with the context), but that is not a host-wide limit. A failed
+// build's output diagnostic is retained up to 1 MiB (the remainder is drained and
+// discarded, and marked [build output truncated]); while reading the daemon's
+// JSON message stream, one decoded JSON message value (a stream or an error
+// message string) is transiently materialized before the cap is applied, so peak
+// memory for that message tracks the message size, while the retained diagnostic
+// stays at 1 MiB plus the fixed marker.
+//
 // Key Features:
 //   - A single reused Docker Engine client for every build and invocation
 //   - Engines (python, node) answer "what does this runtime need?" as plan data;

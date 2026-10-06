@@ -180,9 +180,10 @@ func TestBuildContextTempDirRemovedOnBuildCancellation(t *testing.T) {
 	}
 }
 
-// TestDependencyBuildContextTempDirRemoved pins the dependency build's temp dir
-// cleanup for both outcomes: buildDependencyImage stages into its own
-// relay-dep-build-* directory, which must be removed on success and on failure.
+// TestDependencyBuildContextTempDirRemoved pins the dependency build context's
+// lifecycle for both outcomes: snapshotDependency stages the manifests into a
+// relay-dep-build-* private root (the build context), buildDependencyImage builds
+// from it, and the caller's release removes it on success and on failure.
 func TestDependencyBuildContextTempDirRemoved(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -195,6 +196,10 @@ func TestDependencyBuildContextTempDirRemoved(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			base := isolatedTmpdir(t)
+			fnDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(fnDir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
+				t.Fatalf("write requirements: %v", err)
+			}
 			seen := false
 			cli := newScriptedDockerClient(t,
 				dockerRoute{
@@ -204,9 +209,12 @@ func TestDependencyBuildContextTempDirRemoved(t *testing.T) {
 			)
 			spec := pythonSpec()
 			deps := pythonRequirementsDeps()
-			snap := dependencySnapshot{files: []dependencyManifest{{name: "requirements.txt", content: []byte("six==1.16.0\n")}}}
+			snap, err := snapshotDependency(fnDir, deps)
+			if err != nil {
+				t.Fatalf("snapshot dependency: %v", err)
+			}
 
-			err := buildDependencyImage(context.Background(), cli, spec, deps, snap, depImageRef("fp"), "fp")
+			err = buildDependencyImage(context.Background(), cli, spec, deps, snap, depImageRef("fp"), "fp", nil)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected the scripted dependency build failure to surface")
 			}
@@ -216,6 +224,9 @@ func TestDependencyBuildContextTempDirRemoved(t *testing.T) {
 			if !seen {
 				t.Fatal("no dependency build context temp dir existed at ImageBuild time; the cleanup assertion would be vacuous")
 			}
+			// The caller (Prepare) releases the snapshot's root after the build;
+			// do the same here and assert it is gone.
+			snap.release()
 			if name, leaked := leakedBuildContextTempDir(base); leaked {
 				t.Fatalf("dependency build context temp dir %q leaked", name)
 			}

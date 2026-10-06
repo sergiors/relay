@@ -86,7 +86,7 @@ type closeClientFunc func(cli *client.Client) error
 // (default: dependencyFingerprintFrom) so a test can inject a counter and prove
 // Prepare computes the dependency digest exactly once and threads that single
 // value through the tag, the label, and the staged bytes.
-type dependencyFingerprintFunc func(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) string
+type dependencyFingerprintFunc func(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) (string, error)
 
 // pingDocker is the production pingFunc: one version-negotiated daemon ping.
 func pingDocker(ctx context.Context, cli *client.Client) error {
@@ -995,11 +995,15 @@ func (m *Manager) prepare(
 	// label, so computing it once and passing it to ensureDependencyImage keeps
 	// the tag, the label, and the staged bytes from ever disagreeing.
 	var depFingerprint string
+	// releaseDep releases the dependency lease (if admitted) AND the
+	// dependency snapshot's private root (the relay-dep-build-* context). It is
+	// deferred so the root is removed on success, failure, and cancellation.
 	releaseDep := func() {
 		if depLease != nil {
 			depLease.Release()
 			depLease = nil
 		}
+		depSnap.release()
 	}
 	// The dependency lease is held from its admission below through the ACTUAL
 	// dependency build (ensureDependencyImage, when the layer is absent) and the
@@ -1016,7 +1020,10 @@ func (m *Manager) prepare(
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
 		}
-		depFingerprint = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
+		depFingerprint, err = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
+		if err != nil {
+			return nil, fmt.Errorf("app %q: dependency fingerprint: %w", fn.Name, err)
+		}
 		prepared.Dependency = depImageRef(depFingerprint)
 		// Admit the dependency layer BEFORE its own reuse/existence probe, the
 		// dependency image build, and the app image build below, so
@@ -1115,7 +1122,7 @@ func (m *Manager) prepare(
 	// app's span; the build itself still runs on the lifecycle-bounded
 	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot); err != nil {
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot, m.metrics); err != nil {
 		buildSpan.RecordError(err)
 		buildSpan.SetStatus(codes.Error, err.Error())
 		buildSpan.End()
@@ -1240,7 +1247,7 @@ func (m *Manager) clipConcurrency(n int) int {
 // snapshot Prepare captured, using the injected seam when set (tests) and the
 // production dependencyFingerprintFrom otherwise. Prepare calls it exactly once
 // per dependency-bearing prepare.
-func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) string {
+func (m *Manager) dependencyFingerprint(arch, platform string, spec plan.Spec, deps plan.Deps, snap dependencySnapshot) (string, error) {
 	if m.depFingerprint != nil {
 		return m.depFingerprint(arch, platform, spec, deps, snap)
 	}
@@ -1306,7 +1313,7 @@ func (m *Manager) ensureDependencyImage(
 	// The dependency layer is a real build, so it is spanned like the app
 	// image build. The span nests under the preparing app's span.
 	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
-	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint); err != nil {
+	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint, m.metrics); err != nil {
 		depBuildSpan.RecordError(err)
 		depBuildSpan.SetStatus(codes.Error, err.Error())
 		depBuildSpan.End()
