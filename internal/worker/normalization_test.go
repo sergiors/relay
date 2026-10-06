@@ -51,3 +51,25 @@ func TestEffectiveMaxBufferedNormalizes(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveMaxEventBytesNormalizes verifies the raw-event byte-cap
+// normalization: a value < 1 falls back to the stream default (zero must not
+// mean unlimited), and a positive value passes through unchanged.
+func TestEffectiveMaxEventBytesNormalizes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero falls back to default", 0, stream.DefaultMaxEventBytes},
+		{"negative falls back to default", -1, stream.DefaultMaxEventBytes},
+		{"positive passes through", 1024, 1024},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveMaxEventBytes(tc.in); got != tc.want {
+				t.Fatalf("effectiveMaxEventBytes(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

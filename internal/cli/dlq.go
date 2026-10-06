@@ -267,7 +267,7 @@ func dlqReplay(ctx context.Context, w io.Writer, store DLQStore, socketPath, id 
 		return fmt.Errorf("unknown DLQ entry %q", id)
 	}
 	if !entry.Replayable() {
-		return fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder)", id)
+		return fmt.Errorf("DLQ entry %q is not replayable: no app/handler to re-execute (malformed-message placeholder or oversized-event summary)", id)
 	}
 
 	if err := worker.ReplayDLQ(ctx, socketPath, entry.App, entry.Handler, []byte(entry.Event), entry.Trace); err != nil {

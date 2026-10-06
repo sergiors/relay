@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -654,6 +655,111 @@ func TestLoadInvalidWarmContainerIdleTimeoutReturnsError(t *testing.T) {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("error %q does not mention %q", err, want)
 				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
+			}
+		})
+	}
+}
+
+// TestLoadMaxEventBytesDefault pins that an unset/empty MAX_EVENT_BYTES
+// resolves to the documented 256 KiB default, and that the hard limit is the
+// documented 1 MiB.
+func TestLoadMaxEventBytesDefault(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_EVENT_BYTES", "")
+	cfg := mustLoad(t)
+	if cfg.MaxEventBytes != DefaultMaxEventBytes {
+		t.Fatalf("MaxEventBytes = %d, want default %d", cfg.MaxEventBytes, DefaultMaxEventBytes)
+	}
+	if DefaultMaxEventBytes != 256<<10 {
+		t.Fatalf("DefaultMaxEventBytes = %d, want 256 KiB", DefaultMaxEventBytes)
+	}
+	if MaxEventBytesLimit != 1<<20 {
+		t.Fatalf("MaxEventBytesLimit = %d, want 1 MiB", MaxEventBytesLimit)
+	}
+}
+
+// TestLoadMaxEventBytesExplicit pins the accepted boundary values: an explicit
+// small value, the default-size value, and the hard maximum all load verbatim.
+func TestLoadMaxEventBytesExplicit(t *testing.T) {
+	for _, value := range []string{"1", "262144", "1048576"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("MAX_EVENT_BYTES", value)
+			cfg := mustLoad(t)
+			want, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatalf("Atoi(%q): %v", value, err)
+			}
+			if cfg.MaxEventBytes != want {
+				t.Fatalf("MaxEventBytes = %d, want %d", cfg.MaxEventBytes, want)
+			}
+		})
+	}
+}
+
+// TestParseMaxEventBytes exercises the parser contract directly: positive ints
+// up to and including the hard maximum parse; empty, zero, negative,
+// non-integer, float, and above-limit values are errors naming the variable.
+func TestParseMaxEventBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      int
+		wantError bool
+	}{
+		{"positive", "1024", 1024, false},
+		{"trimmed positive", " 1024 ", 1024, false},
+		{"default size", strconv.Itoa(DefaultMaxEventBytes), DefaultMaxEventBytes, false},
+		{"hard max accepted", strconv.Itoa(MaxEventBytesLimit), MaxEventBytesLimit, false},
+		{"empty rejected", "", 0, true},
+		{"whitespace rejected", "  ", 0, true},
+		{"zero rejected", "0", 0, true},
+		{"negative rejected", "-1", 0, true},
+		{"non-numeric rejected", "abc", 0, true},
+		{"float rejected", "1.5", 0, true},
+		{"above hard max rejected", strconv.Itoa(MaxEventBytesLimit + 1), 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseMaxEventBytes("MAX_EVENT_BYTES", tt.value)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("ParseMaxEventBytes(%q) = %d, nil; want error", tt.value, got)
+				}
+				if !strings.Contains(err.Error(), "MAX_EVENT_BYTES") {
+					t.Fatalf("error should name the variable: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseMaxEventBytes(%q) error: %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseMaxEventBytes(%q) = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadInvalidMaxEventBytesReturnsError pins the invalid MAX_EVENT_BYTES
+// contract: Load RETURNS an error naming the variable and its bound, logs
+// nothing, and never treats zero as unlimited.
+func TestLoadInvalidMaxEventBytesReturnsError(t *testing.T) {
+	for _, value := range []string{"0", "-1", "abc", "1.5", "1048577"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("MAX_EVENT_BYTES", value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
+			if err == nil {
+				t.Fatalf("Load returned nil error for invalid MAX_EVENT_BYTES=%q; want an error", value)
+			}
+			if !strings.Contains(err.Error(), "MAX_EVENT_BYTES") {
+				t.Fatalf("error %q does not name MAX_EVENT_BYTES", err)
 			}
 			if buf.Len() != 0 {
 				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())

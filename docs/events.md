@@ -20,6 +20,14 @@ never retried. A malformed external-event message (missing `event`, not a string
 not a JSON object) can never succeed and is routed straight to the DLQ on first
 encounter without running a handler, then acknowledged.
 
+A message whose raw `event` value exceeds `MAX_EVENT_BYTES` (default 256 KiB) is
+also non-retryable and routed straight to the DLQ before decode, matching, or a
+handler runs. Because the cap is checked on the raw value, this applies to any
+message kind — ordinary external events and schedule-claim payloads alike. The
+check is a Relay-boundary guard: Redis and go-redis have already materialized the
+entry before Relay can inspect it, so it is not transport-level protection
+against a huge entry, and metadata/RESP overhead is outside the setting.
+
 ## Publishing an event
 
 Any producer can append to the stream. With `redis-cli` against the configured
@@ -234,6 +242,14 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   `handler_attempts` (real execution count), `timestamp` (RFC 3339), and an
   optional `trace` lineage. A malformed-message entry uses `-` for
   `app`/`handler` and `handler_attempts` `0`.
+- An oversized-event entry is intentionally **summary-only and non-replayable**:
+  it carries the same `-` placeholder app/handler (no handler invocation ever
+  ran) and its `event` field is a small diagnostic JSON summary
+  (`relay_summary`, `event_bytes`, `max_event_bytes`) instead of the oversized
+  payload. Relay deliberately does not parse the huge payload for an `event_id`.
+  `relay dlq replay` rejects it as non-replayable; use `inspect` to read the
+  summary and `rm` to remove it. Oversized rejections are counted by the
+  unlabeled `relay_events_oversized_total`.
 
 Manage the DLQ with `relay dlq ls` / `inspect` / `replay` / `rm` — see
 [cli.md](cli.md).

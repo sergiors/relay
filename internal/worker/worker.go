@@ -144,6 +144,16 @@ func effectiveMaxBuffered(n int) int {
 	return n
 }
 
+// effectiveMaxEventBytes mirrors the stream consumer's MaxEventBytes
+// normalization (<1 → stream.DefaultMaxEventBytes) so the "Concurrency limits"
+// log reflects the value actually enforced.
+func effectiveMaxEventBytes(n int) int {
+	if n < 1 {
+		return stream.DefaultMaxEventBytes
+	}
+	return n
+}
+
 // errStartupInterrupted marks a fallible startup operation that failed only
 // because the worker lifecycle was cancelled (SIGTERM/SIGINT) while it was in
 // flight. Run converts it to a nil return: the process is shutting down anyway,
@@ -828,6 +838,7 @@ func Run(logger *slog.Logger) error {
 		Log:               logger,
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
+		MaxEventBytes:     cfg.MaxEventBytes,
 		// Schedule occurrences route directly to the runner, bypassing event
 		// matching; the runner validates the occurrence against the current
 		// template and resolves the handler timeout from it, and stamps the
@@ -993,6 +1004,7 @@ func Run(logger *slog.Logger) error {
 		"Concurrency limits",
 		"max_concurrency", effectiveMaxConcurrency(cfg.MaxConcurrency),
 		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
+		"max_event_bytes", effectiveMaxEventBytes(cfg.MaxEventBytes),
 	)
 
 	// Watch /apps and reconcile apps live: rebuild changed images,

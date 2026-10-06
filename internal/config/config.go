@@ -49,6 +49,16 @@ type Config struct {
 	// worker before they complete/ACK. It bounds the local buffer so the
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
+	// MaxEventBytes is the MAX_EVENT_BYTES value (default 262144, hard max
+	// 1048576): the maximum byte length of a message's raw `event` field. A
+	// message whose raw event value exceeds it is rejected before JSON decode,
+	// schedule classification, event matching, and handler execution, and is
+	// routed to the DLQ with a bounded diagnostic summary instead of the
+	// payload. It bounds the RAW event value only — not the whole Redis entry
+	// or its RESP/response overhead, which Redis and go-redis have already
+	// materialized before Relay can inspect it. It is always positive after
+	// Load: zero is rejected, never read as "unlimited".
+	MaxEventBytes int
 	// Networks is the NETWORKS value: the ordered, de-duplicated global
 	// workload network set. It applies to both execution containers and
 	// persistent service containers this worker creates (a routed service
@@ -107,6 +117,12 @@ type Config struct {
 const (
 	DefaultMaxConcurrency    = 8
 	DefaultMaxBufferedEvents = 16
+	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
+	// value when MAX_EVENT_BYTES is unset/empty. MaxEventBytesLimit is the hard
+	// ceiling: a configured or default value above it is rejected, so the cap
+	// can never be lifted into an unbounded read/parse.
+	DefaultMaxEventBytes = 256 << 10
+	MaxEventBytesLimit   = 1 << 20
 	// DefaultWarmContainerIdleTimeout is the idle-eviction window applied when
 	// WARM_CONTAINER_IDLE_TIMEOUT is unset/empty. The runtime package's own
 	// default is only a fallback for direct NewManager callers; the worker
@@ -134,10 +150,11 @@ const (
 // and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR) to "" (no HTTP
 // server), preserving their opt-in semantics through the caller's non-zero /
 // non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
-// default to 8 and 16 respectively (see ParsePositiveInt); an invalid (zero,
-// negative, or non-integer) value is a returned configuration error. The only
-// value that still logs-and-disables rather than failing is the optional
-// REDIS_STREAM_RETENTION window.
+// default to 8 and 16 respectively (see ParsePositiveInt); MAX_EVENT_BYTES
+// defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
+// an invalid (zero, negative, non-integer, or above-limit) value is a returned
+// configuration error. The only value that still logs-and-disables rather than
+// failing is the optional REDIS_STREAM_RETENTION window.
 func Load(logger *slog.Logger) (Config, error) {
 	var cfg Config
 
@@ -195,6 +212,12 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxBufferedEvents = maxBufferedEvents
 
+	maxEventBytes, err := loadMaxEventBytes(getEnv("MAX_EVENT_BYTES", strconv.Itoa(DefaultMaxEventBytes)))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxEventBytes = maxEventBytes
+
 	cfg.Networks = ParseNetworks(getEnv("NETWORKS", ""))
 	cfg.TraefikNetwork = getEnv("TRAEFIK_NETWORK", "")
 	cfg.TraefikEntryPoints = getEnv("TRAEFIK_ENTRYPOINTS", "")
@@ -234,6 +257,37 @@ func loadPositiveInt(name, value string) (int, error) {
 // (see ParsePositiveDuration).
 func loadPositiveDuration(name, value string) (time.Duration, error) {
 	return ParsePositiveDuration(name, value)
+}
+
+// loadMaxEventBytes parses MAX_EVENT_BYTES. Defaults are resolved at the
+// getEnv call site (the value is always non-empty here), so an invalid value is
+// a returned configuration error naming the variable (see ParseMaxEventBytes).
+func loadMaxEventBytes(value string) (int, error) {
+	return ParseMaxEventBytes("MAX_EVENT_BYTES", value)
+}
+
+// ParseMaxEventBytes parses the MAX_EVENT_BYTES value: the maximum byte length
+// of a message's raw `event` field. Callers resolve the default at the getEnv
+// call site. It accepts any parseable positive integer up to MaxEventBytesLimit
+// (surrounding whitespace trimmed) and rejects empty, non-numeric, float,
+// zero, negative, overflow, and above-limit values; the error names the
+// variable, the required form, and the hard maximum. Zero is never read as
+// "unlimited": the cap must always be a real bound. It is the ceiling analogue
+// of ParsePositiveInt, so a typo fails startup instead of silently removing the
+// oversized-message guard.
+func ParseMaxEventBytes(name, value string) (int, error) {
+	v := strings.TrimSpace(value)
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer no greater than %d", name, value, MaxEventBytesLimit)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be a positive integer no greater than %d", name, value, MaxEventBytesLimit)
+	}
+	if n > MaxEventBytesLimit {
+		return 0, fmt.Errorf("invalid %s %q: must be no greater than %d", name, value, MaxEventBytesLimit)
+	}
+	return n, nil
 }
 
 // ParsePositiveInt parses a positive-integer environment value. Callers resolve

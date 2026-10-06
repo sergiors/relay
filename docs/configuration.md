@@ -27,6 +27,7 @@ automatically.
 | `LOG_LEVEL`                   | `INFO`  | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                         |
 | `MAX_CONCURRENCY`             | `8`     | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                          |
 | `MAX_BUFFERED_EVENTS`         | `16`    | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                           |
+| `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)          | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary. |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`    | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                        |
 | `METRICS_ADDR`                | unset   | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                           |
 | `GIT_WEBHOOK_ADDR`            | unset   | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                              |
@@ -65,6 +66,24 @@ worker concurrency → per-app concurrency → runner/container → ACK
 When the local buffer is full the consumer stops reading, so the backlog stays
 in Redis. A full concurrency slot leaves the message pending (no retry charged)
 and a later reclaim replays it.
+
+### Event size limit
+
+`MAX_EVENT_BYTES` caps the byte length of a message's raw `event` **value**, not
+the whole Redis entry: the entry and the go-redis response have already been
+materialized before Relay can inspect the value, so this is a pre-decode
+guard at the Relay boundary, not transport-level protection. The default is
+256 KiB (`262144`); the hard ceiling is 1 MiB (`1048576`) and a larger value is a
+fatal configuration error. Zero is **not** "unlimited": it is rejected, so the
+cap is always a real bound. The default applies when the variable is unset or
+empty.
+
+A delivered message whose raw `event` value exceeds the cap is rejected before
+JSON decode, schedule classification, event matching, invocation-state
+migration, and handler execution; it is routed non-retryably to the DLQ and the
+message is left pending if the DLQ write fails, exactly like a malformed
+message. See [events.md](events.md) for the DLQ summary semantics. Changing this
+value requires a worker restart.
 
 ### Log levels
 

@@ -43,6 +43,12 @@ const (
 	// buffer so the backlog stays in the Redis stream when the buffer is full
 	// (backpressure).
 	DefaultMaxBufferedEvents = 16
+	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
+	// value when ConsumerConfig.MaxEventBytes is not set (a direct test
+	// construction). It mirrors config.DefaultMaxEventBytes; a leaf package
+	// cannot import config, so the default lives here too. A value above
+	// config.MaxEventBytesLimit is never accepted from the environment.
+	DefaultMaxEventBytes = 256 << 10
 )
 
 // MaxRuleTimeout is the upper bound on any rule's handler timeout. It is the
@@ -88,6 +94,16 @@ type ConsumerConfig struct {
 	// Consume stops reading (backpressure) so the backlog stays in Redis.
 	// Defaults to DefaultMaxBufferedEvents (16) if zero or negative.
 	MaxBufferedEvents int
+	// MaxEventBytes is the maximum byte length of a message's raw `event`
+	// field value. A delivered message whose raw event value exceeds it is
+	// rejected BEFORE JSON decode, schedule classification, event matching,
+	// invocation-state migration, and handler execution, then routed to the DLQ
+	// with a bounded diagnostic summary (never the oversized payload). It
+	// bounds the raw event value only; the Redis entry and go-redis response
+	// have already been materialized before the consumer sees them. Defaults to
+	// DefaultMaxEventBytes (262144) if zero or negative — zero must not mean
+	// "unlimited".
+	MaxEventBytes int
 	// ScheduleRunner, when set, executes messages identified as schedule
 	// occurrences directly against the named app/schedule/handler,
 	// bypassing event matching. msgID is the message's real Redis stream ID, so
@@ -137,6 +153,9 @@ type Consumer struct {
 	// scheduleRunner is the ScheduleRunner seam (see ConsumerConfig). When nil,
 	// well-formed schedule-occurrence messages are treated as normal events.
 	scheduleRunner func(ctx context.Context, msgID string, occ schedule.Occurrence, payload []byte) error
+	// maxEventBytes caps the raw `event` value length (see
+	// ConsumerConfig.MaxEventBytes). It is always positive.
+	maxEventBytes int
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -177,6 +196,14 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.MaxBufferedEvents >= 1 {
 		capacity = cfg.MaxBufferedEvents
 	}
+
+	// The raw-event byte cap defaults to DefaultMaxEventBytes (256 KiB) and
+	// falls back to it on a zero or negative value (a value of 0 must not mean
+	// "unlimited").
+	maxEventBytes := DefaultMaxEventBytes
+	if cfg.MaxEventBytes >= 1 {
+		maxEventBytes = cfg.MaxEventBytes
+	}
 	c := &Consumer{
 		client:          cfg.Client,
 		stream:          cfg.Stream,
@@ -194,6 +221,7 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 		capacity:        capacity,
 		buffer:          newBufferSemaphore(capacity),
 		scheduleRunner:  cfg.ScheduleRunner,
+		maxEventBytes:   maxEventBytes,
 	}
 	// The consumer is always constructed with a functional invocation-state
 	// store. processMessage/processScheduleMessage/routeToDLQ rely on it being
@@ -932,8 +960,29 @@ func (c *Consumer) processMessage(
 		c.clearMissingValueEntry(ctx, msg, missingPayloadUnknownDeliveries, true)
 		return
 	}
-	event, err := classifyMessage(msg)
+	event, err := extractAndDecodeEvent(msg, c.maxEventBytes)
 	if err != nil {
+		var oversize *EventOversizedError
+		if errors.As(err, &oversize) {
+			// An oversized message is rejected BEFORE decode/classification/
+			// matching and routed non-retryably to the DLQ. The DLQ entry carries
+			// a bounded diagnostic summary instead of the oversized payload (see
+			// oversizedEventSummary); it has no handler invocation to attribute,
+			// so it uses the placeholder app/handler and is intentionally
+			// non-replayable. The counter is incremented exactly once here, in the
+			// sole over-limit branch.
+			c.metrics.Inc(metrics.MetricEventsOversized)
+			c.log.Error("Message: event exceeds MAX_EVENT_BYTES; routing to DLQ",
+				"message_id", msg.ID,
+				"delivery_attempt", deliveryNum,
+				"event_bytes", oversize.Bytes,
+				"max_event_bytes", oversize.MaxBytes,
+				"error", err,
+			)
+			outcome, spanErr = "dlq", err
+			c.routeToDLQ(ctx, msg, err, deliveryNum)
+			return
+		}
 		// A malformed message can never succeed, so it goes straight to the DLQ on
 		// first encounter rather than consuming retry cycles.
 		c.log.Error("Message: non-retryable failure; routing to DLQ",
@@ -1363,6 +1412,15 @@ func (c *Consumer) routeToDLQ(
 		// the PEL with exactly the entries already written, never duplicated.
 		c.log.Debug("Message: all DLQ entries already persisted; acking without rewrite",
 			"message_id", msg.ID)
+	}
+	// An oversized-event rejection overrides the DLQ `event` field with a
+	// bounded diagnostic summary, so the oversized raw payload is never copied
+	// into the DLQ. Every other path keeps the original raw event verbatim.
+	if errors.Is(reason, ErrEventOversized) {
+		var oversize *EventOversizedError
+		if errors.As(reason, &oversize) {
+			event = oversizedEventSummary(oversize.Bytes, oversize.MaxBytes)
+		}
 	}
 	// One child span around the whole DLQ write+ack operation. It is a child of
 	// the current message span; the payload and reason text are never attached

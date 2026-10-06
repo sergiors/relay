@@ -40,7 +40,13 @@
 //     ErrInvocationExhausted and HandlerExhaustedError), each carrying its exact
 //     app/handler and handler attempt count. A malformed message that never
 //     reached a handler produces a single entry with the "-" placeholder and an
-//     explicit handler_attempts of 0.
+//     explicit handler_attempts of 0. A message whose raw `event` value exceeds
+//     MAX_EVENT_BYTES is checked at extraction time (before decode, schedule
+//     classification, matching, and invocation-state migration) and routed the
+//     same non-retryable way with the same "-" placeholder, but its DLQ `event`
+//     field is a small diagnostic summary (EventOversizedError reports the
+//     measured bytes and configured max) rather than the oversized payload; such
+//     an entry is intentionally non-replayable.
 //   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
 //     successfully XADD'd its marker becomes "exhausted:<attempt>:<token>:dlq"; a
 //     redelivery (after an XACK failure, a crash, or a partially-written

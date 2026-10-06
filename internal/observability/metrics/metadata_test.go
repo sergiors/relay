@@ -36,6 +36,7 @@ func seedAllMetrics(r *Registry) {
 		MetricSchedulerDegraded,
 		MetricSchedulerRecoveries,
 		MetricMissingPayload,
+		MetricEventsOversized,
 	} {
 		r.Inc(name)
 	}

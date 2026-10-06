@@ -160,25 +160,34 @@ func dlqEntrySpecs(reason error) []dlqEntrySpec {
 // field (the original payload). Since a non-retryable message may be missing
 // the field or contain a non-string, this must not fail.
 func eventString(msg redis.XMessage) string {
-	if raw, ok := msg.Values["event"].(string); ok {
+	if raw, err := extractEventString(msg); err == nil {
 		return raw
 	}
 	return "-"
 }
 
-// classifyMessage extracts and decodes the "event" field. Any error indicates the
-// message is malformed and can never be processed successfully (non-retryable).
-func classifyMessage(msg redis.XMessage) (map[string]any, error) {
+// extractEventString extracts the raw "event" field value as a string. It is
+// the single field-presence/type validation seam: processMessage uses it once
+// and then either applies the byte cap or hands the string to decodeEvent, so
+// the field extraction is never duplicated or reparsed.
+func extractEventString(msg redis.XMessage) (string, error) {
 	raw, ok := msg.Values["event"]
 	if !ok {
-		return nil, fmt.Errorf("missing 'event' field")
+		return "", fmt.Errorf("missing 'event' field")
 	}
 	rawStr, ok := raw.(string)
 	if !ok {
-		return nil, fmt.Errorf("'event' field is not a string")
+		return "", fmt.Errorf("'event' field is not a string")
 	}
-	// Unmarshal into a map rejects JSON that is not an object (arrays, scalars),
-	// which is the desired non-retryable classification.
+	return rawStr, nil
+}
+
+// decodeEvent decodes an already-extracted raw event string into a JSON object.
+// It is the single decode seam, so processMessage applies the byte cap and
+// decodes without a second extraction path. Unmarshal into a map rejects JSON
+// that is not an object (arrays, scalars), which is the desired non-retryable
+// classification.
+func decodeEvent(rawStr string) (map[string]any, error) {
 	var event map[string]any
 	if err := json.Unmarshal([]byte(rawStr), &event); err != nil {
 		return nil, fmt.Errorf("decode event: %w", err)
@@ -188,4 +197,77 @@ func classifyMessage(msg redis.XMessage) (map[string]any, error) {
 		return nil, fmt.Errorf("'event' decodes to null")
 	}
 	return event, nil
+}
+
+// classifyMessage extracts and decodes the "event" field. Any error indicates the
+// message is malformed and can never be processed successfully (non-retryable).
+// It is the single-message convenience form of extractEventString + decodeEvent,
+// kept for the existing tests and any caller that does not need the raw string.
+func classifyMessage(msg redis.XMessage) (map[string]any, error) {
+	rawStr, err := extractEventString(msg)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEvent(rawStr)
+}
+
+// extractAndDecodeEvent is the single extraction+decode seam the processing path
+// uses: it extracts the raw event string once, applies the raw-byte cap
+// (len(raw) is the Go string byte length), and only then decodes. A raw value
+// over maxBytes returns an *EventOversizedError without decoding or matching, so
+// the oversized payload is neither parsed nor fanned out to handlers. maxBytes
+// is always positive (the consumer resolves a default; zero never means
+// unlimited). Missing/non-string/malformed values keep the ordinary
+// non-retryable (malformed) error behavior.
+func extractAndDecodeEvent(msg redis.XMessage, maxBytes int) (map[string]any, error) {
+	rawStr, err := extractEventString(msg)
+	if err != nil {
+		return nil, err
+	}
+	if n := len(rawStr); n > maxBytes {
+		return nil, &EventOversizedError{Bytes: n, MaxBytes: maxBytes}
+	}
+	return decodeEvent(rawStr)
+}
+
+// ErrEventOversized is the stable, non-retryable rejection reason for a message
+// whose raw `event` value exceeds the configured byte cap. It is the sentinel
+// the DLQ `reason` is built around (see EventOversizedError) and is used by
+// tests to assert the oversize path distinct from an ordinary malformed decode
+// failure.
+var ErrEventOversized = errors.New("event oversized")
+
+// EventOversizedError is the rejection returned when a message's raw `event`
+// value is longer than the configured cap. It wraps ErrEventOversized, so
+// errors.Is(err, ErrEventOversized) is the predicate. Its message reports the
+// measured byte length and the configured maximum, never the payload itself.
+type EventOversizedError struct {
+	Bytes    int
+	MaxBytes int
+}
+
+func (e *EventOversizedError) Error() string {
+	return fmt.Sprintf("%s: raw event value is %d bytes, exceeds MAX_EVENT_BYTES %d",
+		ErrEventOversized, e.Bytes, e.MaxBytes)
+}
+
+func (e *EventOversizedError) Unwrap() error { return ErrEventOversized }
+
+// oversizedEventSummary builds the bounded DLQ `event` value for an oversized
+// message. It is deliberately a small diagnostic JSON object carrying the
+// measured byte length and the configured cap (plus a fixed marker), NOT the
+// oversized raw payload: storing the payload would defeat the cap by writing it
+// to the DLQ. No event_id is extracted because that would require parsing the
+// huge payload the cap exists to avoid. Only the fixed string/int fields are
+// marshaled, so Marshal cannot fail; the fallback is deterministic.
+func oversizedEventSummary(n, maxBytes int) string {
+	const marker = "event_oversized"
+	if b, err := json.Marshal(map[string]any{
+		"relay_summary":   marker,
+		"event_bytes":     n,
+		"max_event_bytes": maxBytes,
+	}); err == nil {
+		return string(b)
+	}
+	return fmt.Sprintf(`{"relay_summary":%q,"event_bytes":%d,"max_event_bytes":%d}`, marker, n, maxBytes)
 }

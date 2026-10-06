@@ -190,7 +190,10 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
 - **Services:** `relay_service_reconciles_total{app,outcome}`,
   `relay_service_reconcile_duration_seconds{app}`.
 - **Anomaly:** `relay_missing_payload_total` (reclaimed PEL entries whose stream
-  body no longer exists).
+  body no longer exists) and `relay_events_oversized_total` (delivered messages
+  whose raw `event` value exceeded `MAX_EVENT_BYTES`, rejected before decode and
+  routed non-retryably to the DLQ; unlabeled — event IDs and sizes are never
+  labels).
 - **Builds:** `relay_app_build_failures_total{app}`,
   `relay_app_build_seconds{app}`.
 
@@ -311,6 +314,10 @@ The DLQ stream is `relay:<REDIS_STREAM>:dlq`. `relay dlq ls` lists entries;
 `inspect` shows one entry's metadata and original event; `rm` deletes one;
 `replay` re-executes one entry's exact app/handler once on the running
 worker and deletes it only on success (kept on failure). See [cli.md](cli.md).
+
+Malformed-message and oversized-event entries are non-replayable placeholders (no
+app/handler to re-execute). An oversized entry's `event` is a bounded diagnostic
+summary, never the oversized payload; use `inspect`/`rm` on it.
 
 ## Reliability model and limitations
 
