@@ -82,7 +82,7 @@ func newUniqueOccurrence(prefix string) Occurrence {
 }
 
 // First publish returns true, writes exactly one stream entry, and leaves a dedup
-// key holding the occurrence ID with a positive TTL (~7d).
+// key holding the occurrence ID with a positive TTL (~14d).
 func TestIntegrationPublishIfNewWritesEntryAndTTLedDedupKey(t *testing.T) {
 	cli := testutil.RequireRedis(t)
 	e := newPTestEnv(t, cli)
@@ -107,12 +107,14 @@ func TestIntegrationPublishIfNewWritesEntryAndTTLedDedupKey(t *testing.T) {
 	} else if v != o.ID() {
 		t.Fatalf("dedup key value = %q, want the occurrence ID", v)
 	}
+	// The dedup key must live ~14 days: long enough to outlast the 7-day durable
+	// outbox retention, and finite (<15 days) so it is not effectively permanent.
 	ttl := e.client.PTTL(ctx, key).Val()
 	if ttl <= 0 {
-		t.Fatalf("dedup key PTTL = %s, want positive (~7d)", ttl)
+		t.Fatalf("dedup key PTTL = %s, want positive (~14d)", ttl)
 	}
-	if ttl > 8*24*time.Hour {
-		t.Fatalf("dedup key PTTL = %s, want ~7d not longer", ttl)
+	if ttl < 13*24*time.Hour || ttl > 15*24*time.Hour {
+		t.Fatalf("dedup key PTTL = %s, want ~14d (13d..15d)", ttl)
 	}
 }
 
@@ -136,6 +138,85 @@ func TestIntegrationDuplicateIsNoOp(t *testing.T) {
 	}
 	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
 		t.Fatalf("stream length after duplicate = %d, want 1", n)
+	}
+}
+
+// A duplicate publication must NOT refresh the dedup key's TTL: the key is set
+// only on the first, authoritative publish (the EXISTS branch returns before the
+// SET), so its lifetime is measured from the initial publish and a retry cannot
+// extend dedup protection past the intended window.
+func TestIntegrationDuplicateDoesNotRefreshTTL(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	e := newPTestEnv(t, cli)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
+
+	ctx := context.Background()
+	o := newUniqueOccurrence(e.prefix)
+	if _, err := p.PublishOccurrence(ctx, o); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	key := dedupKey(o)
+	first := e.client.PTTL(ctx, key).Val()
+	if first <= 0 {
+		t.Fatalf("dedup key PTTL after first publish = %s, want positive", first)
+	}
+
+	// Expire most of the TTL, then publish a duplicate and confirm the remaining
+	// TTL did not jump back toward 14d.
+	if err := e.client.PExpire(ctx, key, 30*time.Minute).Err(); err != nil {
+		t.Fatalf("PExpire: %v", err)
+	}
+	if published, err := p.PublishOccurrence(ctx, o); err != nil || published {
+		t.Fatalf("duplicate publish = (%v,%v), want (false,nil)", published, err)
+	}
+	after := e.client.PTTL(ctx, key).Val()
+	if after > 31*time.Minute {
+		t.Fatalf("dedup key PTTL after duplicate = %s, want it NOT refreshed (~30m)", after)
+	}
+	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
+		t.Fatalf("stream length after duplicate = %d, want 1", n)
+	}
+}
+
+// An ambiguous publish (Redis commits the script but the client response is
+// lost) followed by a retry that finds the still-live dedup key resolves as a
+// clean duplicate with exactly one stream entry. This exercises the real Lua
+// script: the first attempt is run directly and its reply discarded (the lost
+// response), then the publisher retry observes the committed key.
+func TestIntegrationAmbiguousPublishRetryIsDuplicate(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	e := newPTestEnv(t, cli)
+	p := NewPublisher(cli, e.stream, testutil.DiscardLogger(), nil)
+	ctx := context.Background()
+	o := newUniqueOccurrence(e.prefix)
+
+	env, err := o.Envelope()
+	if err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	// Run the authoritative script directly and DROP the result: Redis may have
+	// committed both the entry and the key, but the response was lost.
+	_, _ = publishScript.Run(ctx, cli, []string{dedupKey(o), e.stream},
+		o.ID(), occurrenceTTL.Milliseconds(), string(env), "", "", "").Result()
+
+	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
+		t.Fatalf("stream length after the committed-but-unanswered attempt = %d, want 1", n)
+	}
+
+	// The retry of the SAME occurrence must be a clean duplicate: the dedup key
+	// is still live, so no second entry is appended.
+	published, err := p.PublishOccurrence(ctx, o)
+	if err != nil {
+		t.Fatalf("retry publish: %v", err)
+	}
+	if published {
+		t.Fatal("a retry after a committed publish must be a duplicate")
+	}
+	if n := e.client.XLen(ctx, e.stream).Val(); n != 1 {
+		t.Fatalf("stream length = %d, want exactly 1 (no second entry)", n)
+	}
+	if n := e.client.Exists(ctx, dedupKey(o)).Val(); n != 1 {
+		t.Fatalf("dedup key exists = %d, want 1", n)
 	}
 }
 

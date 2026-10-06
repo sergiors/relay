@@ -24,18 +24,27 @@ import (
 // cancelled by shutdown still leaves a recoverable row.
 type Outbox interface {
 	// SavePendingOccurrence inserts p's immutable intent unless a row for the
-	// same id already exists, reporting whether a new row was inserted.
+	// same id already exists, reporting whether a new row was inserted. The
+	// retention deadline is stamped by the store on first insert and never
+	// refreshed by a re-save.
 	SavePendingOccurrence(ctx context.Context, p state.PendingOccurrence) (inserted bool, err error)
-	// ClaimPendingOccurrences leases up to limit due records atomically and
-	// returns them.
+	// ClaimPendingOccurrences leases up to limit due, UNEXPIRED records
+	// atomically and returns them.
 	ClaimPendingOccurrences(ctx context.Context, now, leaseUntil time.Time, limit int) ([]state.PendingOccurrence, error)
 	// ReschedulePendingOccurrence increments a record's attempt count and sets
-	// its next due instant after a failed retry.
+	// its next due instant after a failed retry; it never changes retention.
 	ReschedulePendingOccurrence(ctx context.Context, id string, nextAttempt time.Time) error
 	// DeletePendingOccurrence removes a resolved record. It is idempotent.
 	DeletePendingOccurrence(ctx context.Context, id string) error
-	// NextPendingDue returns the earliest instant a record becomes claimable.
-	NextPendingDue(ctx context.Context) (due time.Time, ok bool, err error)
+	// ExpirePendingOccurrences deletes up to limit records whose retention has
+	// passed and returns how many were removed, so the worker can drain an
+	// expired backlog in bounded batches.
+	ExpirePendingOccurrences(ctx context.Context, now time.Time, limit int) (int, error)
+	// NextPendingDue returns the earliest instant the retry worker must wake for
+	// an unexpired record: the earlier of its next claim time and its retention
+	// deadline, so a record whose backoff would outlive its 7-day expiry still
+	// wakes the loop for bounded cleanup.
+	NextPendingDue(ctx context.Context, now time.Time) (due time.Time, ok bool, err error)
 }
 
 // The local SQLite state store is the production durable retry outbox; this
@@ -56,16 +65,23 @@ const (
 	// pendingWriteTimeout bounds one SQLite outbox write/delete. The outbox is
 	// written off the publish path and must never hang on a wedged write.
 	pendingWriteTimeout = 5 * time.Second
+	// pendingCleanupBatch bounds how many EXPIRED records one cleanup pass
+	// deletes, so a large backlog of unretryable rows drains in bounded
+	// batches rather than one unbounded DELETE. It matches pendingClaimBatch so
+	// a single scan does a bounded amount of both kinds of work.
+	pendingCleanupBatch = pendingClaimBatch
 	// pendingErrorDelay is the pause after a failed scan/due query, so a
 	// persistent database error cannot become a busy loop.
 	pendingErrorDelay = time.Second
 )
 
-// pendingRetryDelays is the durable retry backoff: an unbounded, capped
-// progression indexed by the persisted attempt count. Unlike the bounded
-// in-memory publishRetryDelays (which recovers a brief Redis blip within
-// seconds), this keeps retrying indefinitely across temporary and long outages
-// at a capped cadence. It is a package value so tests can substitute a shorter
+// pendingRetryDelays is the durable retry backoff: a capped progression indexed
+// by the persisted attempt count. Unlike the bounded in-memory publishRetryDelays
+// (which recovers a brief Redis blip within seconds), it keeps retrying across
+// temporary and long outages at a capped cadence. Retrying is bounded by the
+// record's retention deadline (state.PendingRetention, 7 days), not by the
+// attempt count: a record is removed when it expires, after which there is no
+// publish attempt. It is a package value so tests can substitute a shorter
 // budget.
 var pendingRetryDelays = []time.Duration{
 	5 * time.Second,
@@ -77,8 +93,8 @@ var pendingRetryDelays = []time.Duration{
 }
 
 // pendingBackoff returns the retry delay for a record that has already
-// accumulated attempts failed durable retries, capped at the final delay so it
-// retries forever.
+// accumulated attempts failed durable retries, capped at the final delay so the
+// cadence stops growing while the record remains inside its retention window.
 func pendingBackoff(attempts int) time.Duration {
 	if attempts < 0 {
 		attempts = 0
@@ -220,11 +236,14 @@ func (s *Scheduler) StartPendingRetry(ctx context.Context) {
 	}()
 }
 
-// pendingRetryLoop is the durable retry worker: it drains due records in bounded
-// batches, then sleeps until the earliest next due instant, a wake signal, or
-// lifecycle cancellation. It never busy-polls: an empty outbox waits only for a
-// wake or cancellation, and a non-empty one waits on a timer for the next due
-// record. A failed scan/due query pauses briefly rather than spinning.
+// pendingRetryLoop is the durable retry worker: it drains due records and
+// expired records in bounded batches, then sleeps until the earliest next wake
+// instant, a wake signal, or lifecycle cancellation. A wake instant is the
+// earlier of a record's next retry and its retention deadline, so a row whose
+// backoff would outlive its 7-day expiry still wakes the loop in time for the
+// bounded cleanup to remove it. It never busy-polls: an empty outbox waits only
+// for a wake or cancellation, and a non-empty one waits on a timer for the next
+// due record. A failed scan/due query pauses briefly rather than spinning.
 //
 // When the scheduler is paused (degraded), the loop does not publish live
 // occurrences; instead it probes the outbox for recovery, and only once outbox
@@ -338,28 +357,34 @@ func (s *Scheduler) attemptRecovery(ctx context.Context, log *slog.Logger) bool 
 	return true
 }
 
-// NextPendingDue returns the earliest instant a pending record becomes
-// claimable, using the installed outbox. It is a thin accessor so the recovery
-// loop and tests share one path; when no outbox is installed it reports an empty
-// outbox.
+// NextPendingDue returns the earliest instant the retry worker must wake,
+// using the installed outbox: the earlier of an unexpired record's next claim
+// time and its retention deadline (so a record whose backoff would outlive its
+// 7-day expiry still wakes the loop, which then removes it via bounded
+// cleanup). It is a thin accessor so the recovery loop and tests share one path;
+// when no outbox is installed it reports an empty outbox. Expired records are
+// excluded by the store, so only expired leftovers yield ok=false.
 func (s *Scheduler) NextPendingDue(ctx context.Context) (time.Time, bool, error) {
 	ob := s.currentOutbox()
 	if ob == nil {
 		return time.Time{}, false, nil
 	}
-	return ob.NextPendingDue(ctx)
+	return ob.NextPendingDue(ctx, s.now())
 }
 
 // RunPendingOnce performs one durable-retry cycle: it atomically claims up to
-// pendingClaimBatch due records and attempts each, returning the number claimed.
-// It is exported so shutdown and retry behavior can be driven deterministically
-// in tests without timers.
+// pendingClaimBatch due, unexpired records and attempts each, then deletes up to
+// pendingCleanupBatch EXPIRED records. It returns the number of records handled
+// (claimed-and-attempted plus expired-and-removed), so a full batch makes the
+// worker scan again immediately while each individual DB operation stays
+// bounded. It is exported so shutdown and retry behavior can be driven
+// deterministically in tests without timers.
 //
 // A claim that a later lifecycle cancellation interrupts leaves the claimed
 // records leased; they are reclaimed after pendingLease expires, so no
-// occurrence is lost when a publication is cut short at shutdown. A claim error
-// drives the scheduler degraded, so a failing outbox pauses live publication
-// instead of silently dropping durable work.
+// occurrence is lost when a publication is cut short at shutdown. A claim or
+// cleanup error drives the scheduler degraded, so a failing outbox pauses live
+// publication instead of silently dropping durable work.
 func (s *Scheduler) RunPendingOnce(ctx context.Context) (int, error) {
 	ob := s.currentOutbox()
 	if ob == nil {
@@ -381,13 +406,38 @@ func (s *Scheduler) RunPendingOnce(ctx context.Context) (int, error) {
 		s.retryPending(ctx, p, log)
 		processed++
 	}
-	return processed, nil
+
+	// Bounded cleanup of records past their retention deadline. Expired records
+	// are never published (claims exclude them and retryPending re-checks the
+	// deadline), so removing them is the only correct disposition and keeps the
+	// outbox from accumulating unretryable rows. Each call deletes at most
+	// pendingCleanupBatch rows, so a large backlog drains across cycles
+	// rather than in one unbounded statement. A cleanup error is a store fault
+	// and pauses live publication like any other outbox failure; the rows stay
+	// for the next pass. It is skipped when the lifecycle is already cancelled,
+	// so shutdown does not surface a spurious degraded transition.
+	if ctx.Err() != nil {
+		return processed, nil
+	}
+	expired, cerr := ob.ExpirePendingOccurrences(ctx, now, pendingCleanupBatch)
+	if cerr != nil {
+		s.markDegraded(cerr)
+		return processed, cerr
+	}
+	if expired > 0 {
+		s.metrics.Add(metrics.MetricSchedulePendingExpired, int64(expired))
+		log.Warn("Schedule: expired pending occurrences removed",
+			"count", expired, "retention", state.PendingRetention)
+	}
+	return processed + expired, nil
 }
 
 // retryPending attempts one claimed record. A nil-error publication (newly
 // published or a clean duplicate) deletes the record; a failure reschedules it
 // with the durable backoff; a cancellation leaves the record leased for
-// reclaim.
+// reclaim. A record whose retention deadline has passed since the claim is
+// EXPIRED: it is removed, never published and never rescheduled, and it is
+// counted as expiration rather than as a publish attempt.
 //
 // Before any publisher call it validates the record: a row whose stored intent
 // could not be decoded (p.DecodeErr), or whose decoded fields reconstruct an
@@ -397,6 +447,16 @@ func (s *Scheduler) RunPendingOnce(ctx context.Context) (int, error) {
 // bounded backoff, so the durable row is retained and repairable while it does
 // not spin.
 func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence, log *slog.Logger) {
+	// Expiry guard at the claim-to-publish boundary: do not begin an attempt
+	// once now >= expires_at_ms, and never reschedule an expired row. Removing
+	// it here covers the window between the store's claim and this call. It is
+	// expiration, not a publish retry, so it is neither counted nor logged as
+	// one.
+	if !p.ExpiresAt.After(s.now()) {
+		s.expirePending(p, log)
+		return
+	}
+
 	s.metrics.Inc(metrics.MetricSchedulePendingRetries)
 
 	// Identity guard: the stored key is the derived occurrence ID, so the
@@ -449,6 +509,32 @@ func (s *Scheduler) retryPending(ctx context.Context, p state.PendingOccurrence,
 		"occurrence_id", p.ID, "durable_attempts", p.Attempts+1,
 		"next_retry_in", pendingBackoff(p.Attempts), "reason", err,
 	)
+}
+
+// expirePending removes one record whose retention has passed. It is the ONLY
+// disposition for an expired record: never publish, never reschedule. Removal
+// uses a cancellation-independent context so a shutdown cannot leave an expired
+// row behind, and the expiration counter increments only once the delete
+// actually commits, so a failed cleanup is not double-counted and the row is
+// removed by the next bounded cleanup pass. A delete failure drives the
+// scheduler degraded, like any other outbox fault.
+func (s *Scheduler) expirePending(p state.PendingOccurrence, log *slog.Logger) {
+	ob := s.currentOutbox()
+	if ob == nil {
+		return
+	}
+	wctx, cancel := pendingWriteCtx()
+	defer cancel()
+	if err := ob.DeletePendingOccurrence(wctx, p.ID); err != nil {
+		log.Warn("Schedule: expired pending occurrence delete failed; will retry cleanup",
+			"occurrence_id", p.ID, "expires_at", p.ExpiresAt.UTC().Format(time.RFC3339), "reason", err)
+		s.markDegraded(err)
+		return
+	}
+	s.metrics.Inc(metrics.MetricSchedulePendingExpired)
+	log.Warn("Schedule: pending occurrence expired; removed",
+		"app", p.App, "schedule", p.Schedule, "handler", p.Handler,
+		"occurrence_id", p.ID, "expires_at", p.ExpiresAt.UTC().Format(time.RFC3339))
 }
 
 // pendingIdentityError validates a claimed record before publication. It reports

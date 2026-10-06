@@ -74,24 +74,34 @@
 //     never from this state view, and those matcher interfaces cannot be JSON
 //     round-tripped.
 //   - schedule_pending(id PRIMARY KEY, data BLOB NOT NULL, attempts,
-//     next_attempt_ms, lease_until_ms) is the durable schedule-PUBLICATION retry
-//     outbox, not history and not an execution source. The row key is the derived
-//     occurrence ID, and the COMPLETE immutable occurrence intent
-//     (app/schedule/handler/scheduled_at) is the JSON object in data, written
-//     through jsonb(?) and read back with json(data) — the same BLOB-payload
-//     convention as apps.data, so the schema stays stable while the intent
-//     grows. It is written once (INSERT ... ON CONFLICT DO NOTHING, so it is
-//     unique and idempotent), leased per-row so concurrent retriers cannot both
-//     claim it, and deleted only after a publication call resolves with a nil
-//     error (published or a clean duplicate). The intent (id/data) is never
-//     updated after insert; only attempts/next_attempt_ms advance. The scheduling
-//     columns are integer Unix milliseconds. A stored payload that cannot be
-//     decoded, or whose decoded intent does not reconstruct the row's occurrence
-//     ID, is surfaced to the caller and RETAINED (logged and rescheduled, never
-//     published, never deleted) so a repair can still recover it. This table
-//     never drives matching, building, scheduling, or execution: /apps is
-//     authoritative, and the occurrence identity it stores is derived exactly as
-//     on the wire.
+//     next_attempt_ms, lease_until_ms, expires_at_ms) is the durable
+//     schedule-PUBLICATION retry outbox, not history and not an execution
+//     source. The row key is the derived occurrence ID, and the COMPLETE
+//     immutable occurrence intent (app/schedule/handler/scheduled_at) is the
+//     JSON object in data, written through jsonb(?) and read back with json(data)
+//     — the same BLOB-payload convention as apps.data, so the schema stays stable
+//     while the intent grows. It is written once (INSERT ... ON CONFLICT DO
+//     NOTHING, so it is unique and idempotent), leased per-row so concurrent
+//     retriers cannot both claim it, and deleted only after a publication call
+//     resolves with a nil error (published or a clean duplicate) OR after its
+//     retention lapses. The intent (id/data) is never updated after insert; only
+//     attempts/next_attempt_ms advance. The scheduling columns are integer Unix
+//     milliseconds. expires_at_ms is the durable retention deadline, stamped at
+//     first insert as the injected now + 7 days and never modified by a
+//     reschedule or a re-save, so the retry window is bounded and stable across
+//     restarts. A record is EXPIRED once now >= expires_at_ms: it is excluded
+//     from claims (the retrier re-checks the deadline immediately before
+//     publishing), never retried, and removed by a bounded cleanup as an
+//     observable expiration. The deadline is deliberately shorter than the Redis
+//     occurrence dedup key TTL (14 days), so the original key still protects
+//     every retry: an ambiguous publish is resolved as a clean duplicate, and
+//     after expiry no publish is attempted at all. A stored payload that
+//     cannot be decoded, or whose decoded intent does not reconstruct the row's
+//     occurrence ID, is surfaced to the caller and RETAINED (logged and
+//     rescheduled, never published, never deleted) so a repair can still recover
+//     it. This table never drives matching, building, scheduling, or execution:
+//     /apps is authoritative, and the occurrence identity it stores is derived
+//     exactly as on the wire.
 //
 // Secret values are never stored: only the reference names appear in the
 // snapshot. Literal env values are never stored either: env entries keep the
@@ -113,7 +123,10 @@
 // Stats/AppStats values and never touch the JSON. This keeps the schema
 // stable as instrumentation grows: absent fields decode to zero. The typed
 // structs are the source of truth. There is no migration or backward
-// compatibility for payloads written by a different schema.
+// compatibility for payloads written by a different schema, and the internal
+// state schema as a whole — including schedule_pending — carries no
+// backward-compatibility guarantee across versions: it is local coordination
+// state, not a durable public contract.
 //
 // In addition to the event/handler counters, app_stats carries the
 // CUMULATIVE warm-container pool counters (warm acquires, cold starts,

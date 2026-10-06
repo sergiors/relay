@@ -36,6 +36,15 @@ func unitOccurrence() Occurrence {
 	return Occurrence{App: "courses", Schedule: "cleanup", Handler: "jobs.cleanup.handler", ScheduledAt: fixedInstant}
 }
 
+// TestOccurrenceTTLIsFourteenDays pins the dedup TTL at 14 days: it must exceed
+// the 7-day durable outbox retention so the original key still protects every
+// retry, and stay finite so dedup is never effectively permanent.
+func TestOccurrenceTTLIsFourteenDays(t *testing.T) {
+	if occurrenceTTL != 14*24*time.Hour {
+		t.Fatalf("occurrenceTTL = %s, want 14d", occurrenceTTL)
+	}
+}
+
 // TestPublishOccurrenceBranchMatrix drives the three result branches of the
 // publish-if-new script through the runScript seam: a 1 is a fresh publication, a
 // 0 is a clean duplicate (not an error), and a script error is surfaced while

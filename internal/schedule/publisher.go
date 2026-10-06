@@ -15,12 +15,20 @@ import (
 	"relay/internal/observability/tracing"
 )
 
-// occurrenceTTL is how long a schedule-occurrence dedup key survives after
-// publication. It is far longer than any realistic scheduling/recovery window
-// (reclaim cadence is ~1m; invocation state TTL is 7 days), so a dedup key
-// outlives the window during which a redelivery could re-evaluate the same tick.
-// It is an internal constant, not env-configurable, matching invocationRetentionTTL.
-const occurrenceTTL = 7 * 24 * time.Hour
+// occurrenceTTL is how long a schedule-occurrence dedup key survives after a
+// successful publication. It is deliberately LONGER than the durable pending
+// outbox retention (state.PendingRetention, 7 days): a persisted occurrence may
+// be retried only while its outbox row lives, and that row's whole retry window
+// must remain inside the dedup key's lifetime, so an ambiguous publish (the call
+// errored but the entry may have been admitted) is always resolved as a clean
+// duplicate rather than republished. 14 days gives the 7-day retry window a full
+// 7-day margin for the dedup key of the initial successful publish.
+//
+// The key is written only on the first, authoritative publish (the EXISTS check
+// returns early on a duplicate) and is never refreshed by later retries, so this
+// TTL measures from the initial successful publish. It is an internal constant,
+// not env-configurable, and remains finite (~14 days).
+const occurrenceTTL = 14 * 24 * time.Hour
 
 // dedupKey returns the Redis key holding one occurrence's publish-once marker:
 // the "relay:" namespace followed by the occurrence ID, e.g.

@@ -97,10 +97,14 @@ script checks a dedup key and writes the stream entry in one step, so exactly on
 worker wins and publishes one stream entry per logical occurrence. Every other
 worker's simultaneous evaluation of the same tick is a clean no-op.
 
-- Dedup keys live under `relay:schedule:<occurrence_id>` with a **7-day TTL**.
-  They are history only and are never deleted on completion, so a worker whose
-  callback runs later cannot re-publish an occurrence the fleet already
-  completed. Dedup applies to **publication**, not to handler execution.
+- Dedup keys live under `relay:schedule:<occurrence_id>` with a **14-day TTL**,
+  written on the first successful publish and **never refreshed**. They are
+  history only and are never deleted on completion, so a worker whose callback
+  runs later cannot re-publish an occurrence the fleet already completed. Dedup
+  applies to **publication**, not to handler execution. The 14 days deliberately
+  exceed the durable outbox's 7-day retention (see
+  [Publication recovery](#publication-recovery)), so the original key still
+  protects every retry the outbox can make.
 - Once the occurrence entry exists, the consumer group delivers it to one worker.
   It takes the schedule-specific dispatch path, not ordinary event
   classification/pattern matching; PEL / `XAUTOCLAIM` recovery, invocation state,
@@ -146,23 +150,38 @@ A tick is also not a single best-effort publish:
   nil error. A healthy first-attempt success — or a clean duplicate — never
   touches the database.
 - A background **durable retry worker** reclaims persisted occurrences and keeps
-  republishing each one **indefinitely** (a capped backoff of 5s, 15s, 30s, 2m,
-  5m, 10m) until it resolves. A record is claimed with a per-row database lease,
-  so concurrent retriers in the same process cannot both work it; a record
+  republishing each one under a capped backoff (5s, 15s, 30s, 2m, 5m, 10m)
+  **until it resolves or expires**. A record is claimed with a per-row database
+  lease, so concurrent retriers in the same process cannot both work it; a record
   whose lease expires while unresolved is reclaimed automatically. Because the
   occurrence identity is unchanged, a durable retry that finds the occurrence
   already published is a clean duplicate and resolves the row. This survives
   restarts: on startup the worker scans the outbox and retries immediately.
+- **A pending row is retained for at most 7 days**, measured from its first
+  successful durable insertion (not from its attempt count or next-due instant),
+  and never extended by a re-save. The outbox is a bounded recovery mechanism,
+  not an indefinite retry log: after 7 days an unresolved record **expires**. An
+  expired record is **never published** (it is excluded from claims and the
+  retrier re-checks the deadline immediately before publishing), is removed from
+  SQLite by a bounded cleanup, and is surfaced as an expiration
+  (`relay_schedule_pending_expired_total` plus a structured log) — it is
+  deliberately counted as neither a publish success, a failure, nor a duplicate,
+  because no publication is attempted. The Redis dedup key lives 14 days, so it
+  still protects every retry inside the 7-day window: an ambiguous `XADD` is
+  resolved as a clean duplicate while the original key is alive, and at day 7 the
+  row is removed rather than risking a second entry after the key has lapsed.
 - A row is deleted only after a publication call resolved (published or a clean
-  duplicate). If the delete itself fails the row is retained and retried
-  idempotently. An ambiguous `XADD` (the call errored but the entry may exist)
-  is handled by retrying: the retry is a clean duplicate that deletes the row.
+  duplicate), or once it expires. If the delete itself fails the row is retained
+  and retried idempotently. An ambiguous `XADD` (the call errored but the entry
+  may exist) is handled by retrying: the retry is a clean duplicate that deletes
+  the row.
 - A persisted record is republished only after its decoded fields are verified
   to reconstruct exactly the occurrence ID stored in the row key (the same
   derivation the publisher and consumer use). A row whose payload cannot be
   decoded, or whose decoded intent would name a different occurrence, is never
   published and never deleted: it is logged and rescheduled under the same
-  bounded backoff so the durable row is retained and repairable.
+  bounded backoff so the durable row is retained and repairable (until, like any
+  row, it eventually expires).
 - **A durable-store failure pauses publication.** If the persist step above
   fails (the outbox is wired but the write errors), the worker does not fall
   back to more in-memory retries: the occurrence is explicitly logged as
@@ -180,13 +199,14 @@ A tick is also not a single best-effort publish:
   latest occurrence per schedule is recovered — older misses are intentionally
   dropped (bounded recovery, not unbounded backlog replay) — and future
   occurrences are never synthesized. A catch-up another worker already published
-  is a harmless duplicate. The durable outbox is a separate, unbounded retry of
-  occurrences that were **actually attempted**; catch-up remains latest-only.
+  is a harmless duplicate. The durable outbox is a separate, **bounded** (7-day)
+  retry of occurrences that were **actually attempted**; catch-up remains
+  latest-only and time-bounded to 24h.
 
 The local state database therefore records a small, bounded outbox of
 unresolved publications — not execution history and never an execution source.
 `/apps` stays authoritative, and the row disappears as soon as publication
-resolves.
+resolves or its 7-day retention expires.
 
 ## Storage availability
 
@@ -311,12 +331,14 @@ Dispositions stay distinct:
 
 Publication recovery has two layers: the bounded in-memory retry (per tick), and
 a durable outbox that keeps retrying an occurrence that was actually attempted
-but unresolved, indefinitely and across restarts, until publication resolves. The
-24h catch-up remains the bounded, latest-only recovery for occurrences the
-worker never got to attempt (a miss while it was down); older misses are dropped.
-The fleet-level single-publication guarantee always rests on the atomic
-publish-if-new: any retry, durable retry, or catch-up that finds the key already
-present is a clean duplicate.
+but unresolved, across restarts, until publication resolves **or the record's
+7-day retention expires**. The 24h catch-up remains the bounded, latest-only
+recovery for occurrences the worker never got to attempt (a miss while it was
+down); older misses are dropped. The fleet-level single-publication guarantee
+always rests on the atomic publish-if-new: any retry, durable retry, or catch-up
+that finds the key already present is a clean duplicate. The dedup key's 14-day
+TTL outlives the outbox's 7-day retention, so the key is still present for every
+durable retry, and an expired record is removed rather than published.
 
 The durable outbox is required for scheduler correctness: while it is
 unavailable the scheduler does not fire, but that affects **only** schedule

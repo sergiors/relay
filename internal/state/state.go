@@ -172,10 +172,10 @@ type State struct {
 	db  *sql.DB
 	log *slog.Logger
 	// nowFn is an injectable clock used to stamp updated_at/reconcile
-	// timestamps. Production leaves it nil and falls back to the package now()
-	// (time.Now UTC RFC3339), preserving behavior exactly; tests inject a fake
-	// to advance time deterministically without sleeping. Tests must set it
-	// before any writes, so every stamped row uses the fake clock.
+	// timestamps and the schedule_pending retention deadline. Production leaves
+	// it nil and falls back to time.Now, preserving behavior exactly; tests
+	// inject a fake to advance time deterministically without sleeping. Tests
+	// must set it before any writes, so every stamped row uses the fake clock.
 	nowFn func() time.Time
 
 	// statusObserverMu guards statusObserver. Status writes happen from several
@@ -360,19 +360,25 @@ func (st *State) initSchema(ctx context.Context) error {
 		// written through jsonb(?) and read back with json(data), so the schema
 		// stays stable while the intent grows. It is NOT a history table and NOT an
 		// execution source: /apps stays authoritative, and the row exists only
-		// until a later publication resolves (published or a clean duplicate) and
-		// is deleted. The scheduling fields (attempts, next_attempt_ms,
-		// lease_until_ms) are integer Unix milliseconds used to coordinate retry
-		// observations: a row is claimable only while next_attempt_ms and
-		// lease_until_ms are both in the past, and a claim sets lease_until_ms
-		// atomically so concurrent retriers cannot both claim it. The occurrence
-		// intent (id/data) is never updated after insert.
+		// until a later publication resolves (published or a clean duplicate) or its
+		// retention expires and it is removed. The scheduling fields (attempts,
+		// next_attempt_ms, lease_until_ms) are integer Unix milliseconds used to
+		// coordinate retry observations: a row is claimable only while
+		// next_attempt_ms and lease_until_ms are both in the past, and a claim sets
+		// lease_until_ms atomically so concurrent retriers cannot both claim it.
+		// expires_at_ms is the durable retention deadline (integer Unix
+		// milliseconds), stamped at first insert as now + 7 days and never modified
+		// by reschedule; a record with expires_at_ms <= now is expired, is excluded
+		// from claims, and is deleted by the bounded cleanup instead of retried.
+		// The occurrence intent (id/data/expires_at_ms) is never updated after
+		// insert.
 		`CREATE TABLE IF NOT EXISTS schedule_pending (
 			id TEXT PRIMARY KEY,
 			data BLOB NOT NULL,
 			attempts INTEGER NOT NULL DEFAULT 0,
 			next_attempt_ms INTEGER NOT NULL DEFAULT 0,
-			lease_until_ms INTEGER NOT NULL DEFAULT 0
+			lease_until_ms INTEGER NOT NULL DEFAULT 0,
+			expires_at_ms INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS schedule_pending_due
 			ON schedule_pending (next_attempt_ms, lease_until_ms)`,
@@ -387,19 +393,24 @@ func (st *State) initSchema(ctx context.Context) error {
 	return nil
 }
 
-// now returns the current UTC time in RFC3339. It is the package-level default
-// clock; State.nowString prefers the injectable clock when one is set.
-func now() string { return time.Now().UTC().Format(time.RFC3339) }
-
 // nowString returns the current time as an RFC3339 UTC string, using the
 // injectable clock when set and the package default otherwise. It is the single
 // timestamp source for every State write, so an injected clock (tests) governs
 // every updated_at/last_reconcile_at consistently.
 func (st *State) nowString() string {
+	return st.nowTime().UTC().Format(time.RFC3339)
+}
+
+// nowTime returns the current instant as a time.Time from the same injectable
+// clock nowString uses, defaulting to time.Now when no clock is installed. It is
+// the time-valued counterpart of nowString, for writes whose persisted form is
+// integer Unix milliseconds rather than an RFC3339 string (the schedule_pending
+// retention deadline).
+func (st *State) nowTime() time.Time {
 	if st.nowFn != nil {
-		return st.nowFn().UTC().Format(time.RFC3339)
+		return st.nowFn()
 	}
-	return now()
+	return time.Now()
 }
 
 // rebuildTx runs fn inside a transaction, which the rebuild path uses so a

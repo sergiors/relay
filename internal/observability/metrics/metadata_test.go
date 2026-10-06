@@ -32,6 +32,7 @@ func seedAllMetrics(r *Registry) {
 		MetricScheduleCatchUp,
 		MetricSchedulePendingPersisted,
 		MetricSchedulePendingRetries,
+		MetricSchedulePendingExpired,
 		MetricSchedulerDegraded,
 		MetricSchedulerRecoveries,
 		MetricMissingPayload,

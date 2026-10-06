@@ -72,7 +72,7 @@ func TestPendingOccurrencePersistAndResolve(t *testing.T) {
 	if err := c.DeletePendingOccurrence(ctx, "a"); err != nil {
 		t.Fatalf("second delete: %v", err)
 	}
-	if _, ok, err := c.NextPendingDue(ctx); err != nil || ok {
+	if _, ok, err := c.NextPendingDue(ctx, now.Add(4*time.Minute)); err != nil || ok {
 		t.Fatalf("NextPendingDue after delete = (ok %v, err %v), want (false,nil)", ok, err)
 	}
 }
@@ -125,10 +125,11 @@ func TestPendingOccurrenceClaimRespectsDueAndLease(t *testing.T) {
 func TestNextPendingDue(t *testing.T) {
 	ctx := context.Background()
 	c := openTestState(t)
-	if _, ok, err := c.NextPendingDue(ctx); err != nil || ok {
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c.nowFn = func() time.Time { return now }
+	if _, ok, err := c.NextPendingDue(ctx, now); err != nil || ok {
 		t.Fatalf("empty NextPendingDue = (ok %v, err %v), want (false,nil)", ok, err)
 	}
-	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	for _, p := range []PendingOccurrence{
 		pendingOcc("a", now.Add(10*time.Minute)),
 		pendingOcc("b", now.Add(2*time.Minute)),
@@ -138,12 +139,62 @@ func TestNextPendingDue(t *testing.T) {
 			t.Fatalf("save: %v", err)
 		}
 	}
-	due, ok, err := c.NextPendingDue(ctx)
+	due, ok, err := c.NextPendingDue(ctx, now)
 	if err != nil || !ok {
 		t.Fatalf("NextPendingDue = (ok %v, err %v), want (true,nil)", ok, err)
 	}
 	if !due.Equal(now.Add(2 * time.Minute)) {
 		t.Fatalf("NextPendingDue = %v, want the minimum %v", due, now.Add(2*time.Minute))
+	}
+}
+
+// TestNextPendingDueReturnsExpiryWhenBackoffOutlivesRetention pins the
+// expiration-cleanup wakeup: a record whose next retry (backoff) is scheduled
+// after its retention deadline must yield the deadline as its wake instant, so
+// the worker wakes at expiry and removes the row promptly instead of sleeping
+// past the exact 7-day limit. At the deadline the row is excluded from the
+// wake computation and the bounded cleanup deletes it.
+func TestNextPendingDueReturnsExpiryWhenBackoffOutlivesRetention(t *testing.T) {
+	ctx := context.Background()
+	c := openTestState(t)
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c.nowFn = func() time.Time { return now }
+	if _, err := c.SavePendingOccurrence(ctx, pendingOcc("a", now.Add(-time.Minute))); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// The retention deadline expires shortly; the retry is rescheduled well past
+	// it (a backoff that would outlive retention).
+	expiry := now.Add(2 * time.Minute)
+	if _, err := c.db.ExecContext(ctx,
+		`UPDATE schedule_pending SET expires_at_ms = ?, next_attempt_ms = ? WHERE id = 'a'`,
+		expiry.UnixMilli(), now.Add(30*time.Minute).UnixMilli()); err != nil {
+		t.Fatalf("stage row: %v", err)
+	}
+
+	// Wake at the earlier of the two: the retention deadline, not the retry.
+	due, ok, err := c.NextPendingDue(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("NextPendingDue = (ok %v, err %v), want (true,nil)", ok, err)
+	}
+	if !due.Equal(expiry) {
+		t.Fatalf("NextPendingDue = %v, want the expiry wakeup %v", due, expiry)
+	}
+
+	// At the deadline the row is expired: excluded from the wake computation and
+	// removed by the bounded cleanup.
+	if _, ok, err := c.NextPendingDue(ctx, expiry); err != nil || ok {
+		t.Fatalf("NextPendingDue at expiry = (ok %v, err %v), want (false,nil)", ok, err)
+	}
+	n, err := c.ExpirePendingOccurrences(ctx, expiry, 10)
+	if err != nil || n != 1 {
+		t.Fatalf("ExpirePendingOccurrences = (%d,%v), want (1,nil)", n, err)
+	}
+	var remaining int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule_pending WHERE id = 'a'`).Scan(&remaining); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("rows after cleanup = %d, want 0 (removed at expiry)", remaining)
 	}
 }
 
@@ -250,22 +301,22 @@ func TestPendingOccurrenceSurvivesReopen(t *testing.T) {
 }
 
 // TestPendingOccurrenceSchemaAndNoHistoryTable pins the EXACT schedule_pending
-// schema (id/data/attempts/next_attempt_ms/lease_until_ms with the due index),
-// that the outbox is its own table, and that no execution/history table is
-// introduced: the state DB stays a view, not an execution source.
+// schema (id/data/attempts/next_attempt_ms/lease_until_ms/expires_at_ms with the
+// due index), that the outbox is its own table, and that no execution/history
+// table is introduced: the state DB stays a view, not an execution source.
 func TestPendingOccurrenceSchemaAndNoHistoryTable(t *testing.T) {
 	c := openTestState(t)
 	if !tableExists(t, c, "schedule_pending") {
 		t.Fatal("schedule_pending table must exist")
 	}
 	cols := tableColumnSet(t, c, "schedule_pending")
-	for _, want := range []string{"id", "data", "attempts", "next_attempt_ms", "lease_until_ms"} {
+	for _, want := range []string{"id", "data", "attempts", "next_attempt_ms", "lease_until_ms", "expires_at_ms"} {
 		if !cols[want] {
 			t.Errorf("schedule_pending missing column %q: %v", want, cols)
 		}
 	}
-	if len(cols) != 5 {
-		t.Errorf("schedule_pending must have exactly id/data/attempts/next_attempt_ms/lease_until_ms, got %v", cols)
+	if len(cols) != 6 {
+		t.Errorf("schedule_pending must have exactly id/data/attempts/next_attempt_ms/lease_until_ms/expires_at_ms, got %v", cols)
 	}
 	// The occurrence intent is a BLOB payload, not dedicated columns.
 	for _, gone := range []string{"app", "schedule", "handler", "scheduled_at"} {
@@ -329,13 +380,13 @@ func TestPendingOccurrenceCorruptPayloadRetained(t *testing.T) {
 		t.Fatalf("save good: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms)
-		 VALUES ('garbage', ?, 0, 0, 0)`, "not json"); err != nil {
+		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
+		 VALUES ('garbage', ?, 0, 0, 0, ?)`, "not json", now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert garbage: %v", err)
 	}
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms)
-		 VALUES ('incomplete', jsonb('{"app":"x"}'), 0, 0, 0)`); err != nil {
+		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
+		 VALUES ('incomplete', jsonb('{"app":"x"}'), 0, 0, 0, ?)`, now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert incomplete: %v", err)
 	}
 
@@ -386,8 +437,8 @@ func TestPendingOccurrenceCorruptPayloadNeverDeletedByReschedule(t *testing.T) {
 	c := openTestState(t)
 	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	if _, err := c.db.ExecContext(ctx,
-		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms)
-		 VALUES ('bad', ?, 3, 0, 0)`, "corrupt"); err != nil {
+		`INSERT INTO schedule_pending (id, data, attempts, next_attempt_ms, lease_until_ms, expires_at_ms)
+		 VALUES ('bad', ?, 3, 0, 0, ?)`, "corrupt", now.Add(PendingRetention).UnixMilli()); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	// A claim surfaces it with DecodeErr and does not reset its attempts.
@@ -552,5 +603,216 @@ func TestPendingOccurrenceConcurrentPersistIsUnique(t *testing.T) {
 	// Cross-handle race: no SQLite lock/busy error may surface.
 	if s := buf.String(); strings.Contains(s, "locked") || strings.Contains(s, "SQLITE_BUSY") {
 		t.Fatalf("SQLite lock/busy error surfaced across concurrent handles:\n%s", s)
+	}
+}
+
+// TestPendingOccurrenceExpiryExactAndNotRefreshed pins the retention contract:
+// the first insert stamps expires_at_ms = now + PendingRetention, a re-save of
+// the same ID does NOT refresh it, and a reschedule does NOT change it.
+func TestPendingOccurrenceExpiryExactAndNotRefreshed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c := openTestState(t)
+	c.nowFn = func() time.Time { return now }
+
+	if _, err := c.SavePendingOccurrence(ctx, pendingOcc("a", now)); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	wantExpiry := now.Add(PendingRetention)
+
+	var stored int64
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT expires_at_ms FROM schedule_pending WHERE id = 'a'`).Scan(&stored); err != nil {
+		t.Fatalf("read expiry: %v", err)
+	}
+	if stored != wantExpiry.UnixMilli() {
+		t.Fatalf("expires_at_ms = %d, want %d (first insert + 7d)", stored, wantExpiry.UnixMilli())
+	}
+
+	// Re-saving under a LATER clock must not extend the deadline: the row exists,
+	// so ON CONFLICT DO NOTHING leaves expires_at_ms untouched.
+	c.nowFn = func() time.Time { return now.Add(3 * 24 * time.Hour) }
+	inserted, err := c.SavePendingOccurrence(ctx, pendingOcc("a", now))
+	if err != nil || inserted {
+		t.Fatalf("re-save = (%v,%v), want (false,nil)", inserted, err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT expires_at_ms FROM schedule_pending WHERE id = 'a'`).Scan(&stored); err != nil {
+		t.Fatalf("read expiry: %v", err)
+	}
+	if stored != wantExpiry.UnixMilli() {
+		t.Fatalf("expires_at_ms after re-save = %d, want %d (never refreshed)", stored, wantExpiry.UnixMilli())
+	}
+
+	// A reschedule (the failure path) advances attempts/next_attempt only.
+	if err := c.ReschedulePendingOccurrence(ctx, "a", now.Add(time.Minute)); err != nil {
+		t.Fatalf("reschedule: %v", err)
+	}
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT expires_at_ms FROM schedule_pending WHERE id = 'a'`).Scan(&stored); err != nil {
+		t.Fatalf("read expiry: %v", err)
+	}
+	if stored != wantExpiry.UnixMilli() {
+		t.Fatalf("expires_at_ms after reschedule = %d, want %d (reschedule never changes expiry)", stored, wantExpiry.UnixMilli())
+	}
+}
+
+// TestPendingOccurrenceExpiryBoundaryAndClaimExclusion pins the expiry boundary:
+// a record is expired once now >= expires_at_ms (so at exactly the deadline it is
+// expired, and one millisecond before it is not), and an expired record is never
+// claimed. A fresh record is used per boundary so a prior claim's lease cannot
+// mask the expiry decision.
+func TestPendingOccurrenceExpiryBoundaryAndClaimExclusion(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c := openTestState(t)
+	c.nowFn = func() time.Time { return now }
+	save := func() {
+		t.Helper()
+		if _, err := c.SavePendingOccurrence(ctx, pendingOcc("a", now.Add(-time.Minute))); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+	expiry := now.Add(PendingRetention)
+
+	// One millisecond before the deadline the record is claimable.
+	save()
+	before := expiry.Add(-time.Millisecond)
+	if claimed, err := c.ClaimPendingOccurrences(ctx, before, before.Add(time.Minute), 10); err != nil || len(claimed) != 1 {
+		t.Fatalf("claim before expiry = (%v,%v), want the record", ids(claimed), err)
+	}
+	// Recreate the record unleased, then claim at exactly the deadline: it is
+	// expired and must not be claimed.
+	if err := c.DeletePendingOccurrence(ctx, "a"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	save()
+	at := expiry
+	claimed, err := c.ClaimPendingOccurrences(ctx, at, at.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("claim at expiry: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claim at expiry = %v, want none (expired)", ids(claimed))
+	}
+	// NextPendingDue also excludes the expired record.
+	if _, ok, err := c.NextPendingDue(ctx, at); err != nil || ok {
+		t.Fatalf("NextPendingDue with only an expired row = (ok %v, err %v), want (false,nil)", ok, err)
+	}
+}
+
+// TestExpirePendingOccurrencesBoundedAndExcludesLive pins the bounded cleanup: it
+// deletes only records whose retention has passed, is limited to `limit` per
+// call, and leaves unexpired records untouched.
+func TestExpirePendingOccurrencesBoundedAndExcludesLive(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	c := openTestState(t)
+	// Three already-expired rows and one live row. The expired rows are inserted
+	// with an explicit already-past expiry.
+	for _, id := range []string{"e1", "e2", "e3"} {
+		row := pendingOcc(id, now.Add(-time.Hour))
+		if _, err := c.SavePendingOccurrence(ctx, row); err != nil {
+			t.Fatalf("save %s: %v", id, err)
+		}
+	}
+	if _, err := c.SavePendingOccurrence(ctx, pendingOcc("live", now.Add(-time.Hour))); err != nil {
+		t.Fatalf("save live: %v", err)
+	}
+	// Force the three to be already expired (the insert stamped +7d).
+	if _, err := c.db.ExecContext(ctx,
+		`UPDATE schedule_pending SET expires_at_ms = ? WHERE id IN ('e1','e2','e3')`,
+		now.Add(-time.Millisecond).UnixMilli()); err != nil {
+		t.Fatalf("expire rows: %v", err)
+	}
+
+	n, err := c.ExpirePendingOccurrences(ctx, now, 2)
+	if err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("first expire = %d, want 2 (bounded by limit)", n)
+	}
+	n, err = c.ExpirePendingOccurrences(ctx, now, 2)
+	if err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("second expire = %d, want 1 (remaining expired)", n)
+	}
+	n, err = c.ExpirePendingOccurrences(ctx, now, 2)
+	if err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("third expire = %d, want 0 (only live remains)", n)
+	}
+	var live int
+	if err := c.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule_pending WHERE id = 'live'`).Scan(&live); err != nil {
+		t.Fatalf("count live: %v", err)
+	}
+	if live != 1 {
+		t.Fatalf("live rows = %d, want 1 (unexpired record never removed)", live)
+	}
+}
+
+// TestPendingOccurrenceExpirySurvivesReopen pins the crash/restart contract: a
+// record inside its retention window is still claimable after reopening the same
+// file, and its deadline is preserved; a record whose deadline passed while the
+// process was down is excluded from claims and removed by cleanup after reopen.
+func TestPendingOccurrenceExpirySurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	now := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+
+	c1, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	c1.nowFn = func() time.Time { return now }
+	if _, err := c1.SavePendingOccurrence(ctx, pendingOcc("inside", now.Add(-time.Minute))); err != nil {
+		t.Fatalf("save inside: %v", err)
+	}
+	if _, err := c1.SavePendingOccurrence(ctx, pendingOcc("outside", now.Add(-time.Minute))); err != nil {
+		t.Fatalf("save outside: %v", err)
+	}
+	// "outside" expires just after the restart instant; "inside" stays live for
+	// the whole 7-day window.
+	if _, err := c1.db.ExecContext(ctx,
+		`UPDATE schedule_pending SET expires_at_ms = ? WHERE id = 'outside'`,
+		now.Add(2*time.Hour).UnixMilli()); err != nil {
+		t.Fatalf("set outside expiry: %v", err)
+	}
+	if err := c1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	c2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.Close()
+	// At now, "inside" is claimable and "outside" is not yet due-expired.
+	claimed, err := c2.ClaimPendingOccurrences(ctx, now, now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("claim after reopen: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claim after reopen = %v, want both unexpired records", ids(claimed))
+	}
+
+	// Later, past "outside"'s deadline: it is unclaimable and cleaned; "inside"
+	// remains.
+	later := now.Add(3 * time.Hour)
+	claimed, err = c2.ClaimPendingOccurrences(ctx, later, later.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("claim later: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "inside" {
+		t.Fatalf("claim later = %v, want only the still-live record", ids(claimed))
+	}
+	n, err := c2.ExpirePendingOccurrences(ctx, later, 10)
+	if err != nil || n != 1 {
+		t.Fatalf("expire after reopen = (%d,%v), want (1,nil)", n, err)
 	}
 }

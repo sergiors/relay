@@ -136,17 +136,22 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Publication failures retry the same occurrence with a bounded backoff; if that
   in-memory budget is spent (or the tick is cancelled), the complete immutable
   occurrence intent is persisted to the local `state` SQLite outbox
-  (`schedule_pending`) and a `cron`-owned durable retry worker republishes it
-  indefinitely, across restarts, until a publication call resolves nil
-  (published or clean duplicate), when the row is deleted. The outbox is
-  coordination state only — never history, never an execution source — and is
-  untouched on a healthy first-attempt success/duplicate. Rows are claimed with a
-  per-row DB lease, not a global mutex, and never deleted until a call resolves.
-  A record is republished only after its decoded intent is verified to
-  reconstruct the occurrence ID stored in its row key; an undecodable or
-  identity-mismatched row is logged, retained, and rescheduled under the bounded
-  backoff, never published or deleted. Startup catch-up stays the bounded,
-  latest-only 24h recovery for never-attempted misses and is unchanged.
+  (`schedule_pending`) and a `cron`-owned durable retry worker republishes it,
+  across restarts, until a publication call resolves nil (published or clean
+  duplicate), when the row is deleted, OR until its **7-day retention** (from
+  first insertion, `state.PendingRetention`) expires, when the row is removed
+  without any publish attempt and counted as an expiration. The Redis occurrence
+  dedup key lives **14 days** on the authoritative first publish and is never
+  refreshed, so the original key still protects every retry the outbox can make.
+  The outbox is coordination state only — never history, never an execution
+  source — and is untouched on a healthy first-attempt success/duplicate. Rows are
+  claimed with a per-row DB lease, not a global mutex, and never deleted until a
+  call resolves or the row expires. A record is republished only after its decoded
+  intent is verified to reconstruct the occurrence ID stored in its row key; an
+  undecodable or identity-mismatched row is logged, retained, and rescheduled
+  under the bounded backoff, never published or deleted. Startup catch-up stays
+  the bounded, latest-only 24h recovery for never-attempted misses and is
+  unchanged.
 - The durable outbox is REQUIRED for scheduler correctness but is NOT a global
   Relay dependency. The scheduler evaluates/publishes an occurrence only while a
   usable outbox is installed; when `state.Open` fails at startup the scheduler is

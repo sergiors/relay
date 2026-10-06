@@ -35,6 +35,7 @@ func TestNamespacePrefixOnAllMetrics(t *testing.T) {
 	r.Inc(MetricScheduleCatchUp)
 	r.Inc(MetricSchedulePendingPersisted)
 	r.Inc(MetricSchedulePendingRetries)
+	r.Inc(MetricSchedulePendingExpired)
 	r.Inc(MetricSchedulerDegraded)
 	r.Inc(MetricSchedulerRecoveries)
 	r.Inc(MetricMissingPayload)

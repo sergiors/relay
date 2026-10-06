@@ -21,12 +21,17 @@
 // Publication retries always reuse the same logical occurrence and therefore the
 // same deduplication identity. Retries are bounded and stop on success, a clean
 // duplicate, or lifecycle cancellation. A publication that does not resolve is
-// also persisted to a durable outbox and retried indefinitely by the durable
-// retry worker (StartPendingRetry), across restarts, until it resolves; the row
-// is deleted only after a publication call returns a nil error (published or a
-// clean duplicate). On startup, CatchUp may republish the latest missed
-// occurrence for each schedule within a bounded recovery horizon; older
-// occurrences are not replayed and future occurrences are never synthesized.
+// also persisted to a durable outbox and retried by the durable retry worker
+// (StartPendingRetry), across restarts, until it resolves or expires. A row is
+// deleted after a publication call returns a nil error (published or a clean
+// duplicate) OR once its retention deadline passes without resolving (7 days
+// from first insert, state.PendingRetention); an expired record is never
+// published, is counted as an expiration, and is removed by a bounded cleanup.
+// The Redis occurrence dedup key lives 14 days, so the original key still
+// protects every retry the 7-day outbox can make. On startup, CatchUp may
+// republish the latest missed occurrence for each schedule within a bounded
+// recovery horizon; older occurrences are not replayed and future occurrences
+// are never synthesized.
 //
 // Storage gate: the scheduler may not evaluate or publish an occurrence unless a
 // usable durable outbox is installed (SetOutbox, or the storage bootstrap's

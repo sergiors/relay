@@ -44,7 +44,8 @@
 //     relay_schedule_publish_retries_total / relay_schedule_publish_exhausted_total,
 //     and relay_schedule_catchup_total, plus the durable schedule-recovery
 //     counters relay_schedule_pending_persisted_total /
-//     relay_schedule_pending_retries_total, plus the scheduler storage-state
+//     relay_schedule_pending_retries_total / relay_schedule_pending_expired_total,
+//     plus the scheduler storage-state
 //     transition counters relay_scheduler_degraded_total /
 //     relay_scheduler_recoveries_total), plus CounterVecs
 //     relay_handler_invocations_total{outcome,app,handler},

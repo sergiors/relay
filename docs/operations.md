@@ -173,10 +173,14 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   `relay_schedule_publish_exhausted_total`, `relay_schedule_catchup_total`.
 - **Durable schedule recovery:** `relay_schedule_pending_persisted_total`
   (occurrences newly written to the local retry outbox after an immediate
-  publication did not resolve) and `relay_schedule_pending_retries_total`
-  (publication attempts made by the durable retry worker). A resolved attempt
-  removes the outbox row; the publish outcome itself is still counted by the
-  `relay_schedule_occurrences_*` families above.
+  publication did not resolve), `relay_schedule_pending_retries_total`
+  (publication attempts made by the durable retry worker), and
+  `relay_schedule_pending_expired_total` (outbox records removed because their
+  **7-day** retention deadline passed without resolving — an expiration, counted
+  as neither a publish success, failure, nor duplicate, because no publish is
+  attempted). A resolved attempt removes the outbox row; the publish outcome
+  itself is still counted by the `relay_schedule_occurrences_*` families above.
+  The Redis occurrence dedup key lives **14 days**, outliving the 7-day outbox.
 - **Scheduler storage state:** `relay_scheduler_state{state=running|degraded|unavailable}`
   (one-hot gauge of the scheduler's durable-store state),
   `relay_scheduler_degraded_total` (transitions into degraded because an outbox

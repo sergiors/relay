@@ -28,26 +28,42 @@ type fakePending struct {
 // caller sees every due row, so callers must tolerate overlapping claims (the
 // Redis publish-if-new is what makes that safe). It is mutex-protected, so it is
 // safe to drive from concurrent RunPendingOnce calls.
+//
+// nowFn stamps each saved row's retention deadline (state.PendingRetention from
+// the fake clock); nil falls back to time.Now. Tests that exercise expiry set it
+// to a fixed instant so the deadline is deterministic.
 type fakeOutbox struct {
 	mu    sync.Mutex
 	rows  map[string]*fakePending
 	order []string
 
-	saved       []string
-	deleted     []string
+	saved   []string
+	deleted []string
+	expired []string
+
 	rescheduled map[string]time.Time
 
 	saveErr    error
 	claimErr   error
 	reschedErr error
 	deleteErr  error
+	expireErr  error
 	dueErr     error
 
+	nowFn       func() time.Time
 	ignoreLease bool
 }
 
 func newFakeOutbox() *fakeOutbox {
 	return &fakeOutbox{rows: map[string]*fakePending{}, rescheduled: map[string]time.Time{}}
+}
+
+// clock returns the fake's retention clock, defaulting to time.Now.
+func (f *fakeOutbox) clock() time.Time {
+	if f.nowFn != nil {
+		return f.nowFn()
+	}
+	return time.Now()
 }
 
 func (f *fakeOutbox) SavePendingOccurrence(_ context.Context, p state.PendingOccurrence) (bool, error) {
@@ -58,6 +74,11 @@ func (f *fakeOutbox) SavePendingOccurrence(_ context.Context, p state.PendingOcc
 	}
 	if _, ok := f.rows[p.ID]; ok {
 		return false, nil
+	}
+	// Mirror the store: stamp the retention deadline at first insert and never
+	// refresh it on a re-save.
+	if p.ExpiresAt.IsZero() {
+		p.ExpiresAt = f.clock().Add(state.PendingRetention)
 	}
 	f.rows[p.ID] = &fakePending{p: p}
 	f.order = append(f.order, p.ID)
@@ -80,6 +101,10 @@ func (f *fakeOutbox) ClaimPendingOccurrences(ctx context.Context, now, leaseUnti
 		if !ok {
 			continue
 		}
+		// Mirror the store: expired rows are never claimable.
+		if !r.p.ExpiresAt.After(now) {
+			continue
+		}
 		if !f.ignoreLease && (r.p.NextAttempt.After(now) || r.leaseUntil.After(now)) {
 			continue
 		}
@@ -90,6 +115,31 @@ func (f *fakeOutbox) ClaimPendingOccurrences(ctx context.Context, now, leaseUnti
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeOutbox) ExpirePendingOccurrences(_ context.Context, now time.Time, limit int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.expireErr != nil {
+		return 0, f.expireErr
+	}
+	n := 0
+	kept := f.order[:0]
+	for _, id := range f.order {
+		r, ok := f.rows[id]
+		if !ok {
+			continue
+		}
+		if n < limit && !r.p.ExpiresAt.After(now) {
+			delete(f.rows, id)
+			f.expired = append(f.expired, id)
+			n++
+			continue
+		}
+		kept = append(kept, id)
+	}
+	f.order = kept
+	return n, nil
 }
 
 func (f *fakeOutbox) ReschedulePendingOccurrence(_ context.Context, id string, nextAttempt time.Time) error {
@@ -122,7 +172,7 @@ func (f *fakeOutbox) DeletePendingOccurrence(_ context.Context, id string) error
 	return nil
 }
 
-func (f *fakeOutbox) NextPendingDue(ctx context.Context) (time.Time, bool, error) {
+func (f *fakeOutbox) NextPendingDue(ctx context.Context, now time.Time) (time.Time, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return time.Time{}, false, err
 	}
@@ -136,9 +186,18 @@ func (f *fakeOutbox) NextPendingDue(ctx context.Context) (time.Time, bool, error
 		ok   bool
 	)
 	for _, r := range f.rows {
+		if !r.p.ExpiresAt.After(now) {
+			continue
+		}
+		// Mirror the store: the wake instant is the earlier of the next claim
+		// time and the retention deadline, so a row whose backoff outlives its
+		// expiry still wakes the loop for cleanup.
 		d := r.p.NextAttempt
 		if r.leaseUntil.After(d) {
 			d = r.leaseUntil
+		}
+		if r.p.ExpiresAt.Before(d) {
+			d = r.p.ExpiresAt
 		}
 		if !ok || d.Before(best) {
 			best, ok = d, true
@@ -167,6 +226,12 @@ func (f *fakeOutbox) gotDeleted() []string {
 	return append([]string(nil), f.deleted...)
 }
 
+func (f *fakeOutbox) gotExpired() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.expired...)
+}
+
 // pendingOccurrence builds the occurrence a persisted record reconstructs.
 func pendingOccurrence(id, handler string) schedule.Occurrence {
 	return schedule.Occurrence{
@@ -177,9 +242,15 @@ func pendingOccurrence(id, handler string) schedule.Occurrence {
 	}
 }
 
-// seedPending inserts a record for o into ob at the given due instant.
+// seedPending inserts a record for o into ob at the given due instant. The fake
+// outbox stamps a 7-day retention deadline from its clock; seedPending pins that
+// clock to the due instant so seeded records are deterministic and unexpired
+// relative to the frozen test clock.
 func seedPending(t *testing.T, ob *fakeOutbox, o schedule.Occurrence, due time.Time, attempts int) {
 	t.Helper()
+	if ob.nowFn == nil {
+		ob.nowFn = func() time.Time { return due }
+	}
 	inserted, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
 		ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
 		ScheduledAt: o.ScheduledAt, NextAttempt: due,
@@ -897,6 +968,7 @@ func TestRunPendingOnceCorruptOrMismatchedIdentityNeverPublishes(t *testing.T) {
 				ID:          o.ID(),
 				DecodeErr:   errors.New("stored payload is not valid JSON"),
 				NextAttempt: frozen.Add(-time.Minute),
+				ExpiresAt:   frozen.Add(state.PendingRetention),
 			},
 			wantLog: "corrupt; retaining for repair",
 		},
@@ -914,6 +986,7 @@ func TestRunPendingOnceCorruptOrMismatchedIdentityNeverPublishes(t *testing.T) {
 				Handler:     o.Handler,
 				ScheduledAt: o.ScheduledAt.Add(time.Hour),
 				NextAttempt: frozen.Add(-time.Minute),
+				ExpiresAt:   frozen.Add(state.PendingRetention),
 			},
 			wantLog: "corrupt; retaining for repair",
 		},
@@ -1109,7 +1182,7 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 	s2.SetOutbox(st2)
 
 	ctx := context.Background()
-	due, ok, err := st2.NextPendingDue(ctx)
+	due, ok, err := st2.NextPendingDue(ctx, frozen)
 	if err != nil || !ok {
 		t.Fatalf("NextPendingDue after reopen = (ok %v, err %v), want (true,nil)", ok, err)
 	}
@@ -1122,9 +1195,393 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 		t.Fatalf("republished = %v, want the original occurrence %s", calls, o.ID())
 	}
 	// The row is gone and the outbox is empty.
-	if _, ok, err := st2.NextPendingDue(ctx); err != nil || ok {
+	if _, ok, err := st2.NextPendingDue(ctx, frozen); err != nil || ok {
 		t.Fatalf("NextPendingDue after resolution = (ok %v, err %v), want (false,nil)", ok, err)
 	}
+}
+
+// TestRunPendingOnceJustBeforeExpiryPublishes pins that a record that is still
+// inside its retention window when the retry runs is published and resolved
+// normally; expiry only affects records past their deadline.
+func TestRunPendingOnceJustBeforeExpiryPublishes(t *testing.T) {
+	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	// The record was persisted at day zero; "now" is one instant before its
+	// deadline, so it must still be claimed and published.
+	expires := frozen.Add(state.PendingRetention)
+	ob := newFakeOutbox()
+	ob.nowFn = func() time.Time { return frozen }
+	o := pendingOccurrence("a", "jobs.a")
+	inserted, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+		ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+		ScheduledAt: o.ScheduledAt, NextAttempt: frozen.Add(-time.Minute),
+	})
+	if err != nil || !inserted {
+		t.Fatalf("seed = (%v,%v), want (true,nil)", inserted, err)
+	}
+	// Move the fake row's deadline to exactly `expires` and the scheduler clock
+	// to one millisecond before it.
+	ob.mu.Lock()
+	ob.rows[o.ID()].p.ExpiresAt = expires
+	ob.mu.Unlock()
+
+	fp := newFakePublisher(4)
+	fp.published = true
+	m := metrics.New()
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
+	s.now = func() time.Time { return expires.Add(-time.Millisecond) }
+	s.SetOutbox(ob)
+
+	if n, err := s.RunPendingOnce(context.Background()); err != nil || n != 1 {
+		t.Fatalf("RunPendingOnce = (%d,%v), want (1,nil)", n, err)
+	}
+	if got := fp.callCount(); got != 1 {
+		t.Fatalf("publish calls = %d, want 1 (just before expiry publishes)", got)
+	}
+	if ob.has(o.ID()) {
+		t.Fatal("resolved record left behind")
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != 0 {
+		t.Fatalf("expired = %d, want 0 (record had not expired)", got)
+	}
+}
+
+// TestRunPendingOnceExpiredDoesNotPublishAndCleansUp pins the expiry contract:
+// a record whose deadline passed is NEVER published, is removed from the outbox,
+// increments the expiration counter (and NOT the retry/success/failure/duplicate
+// counters), and logs a structured expiration. It covers both the store's claim
+// exclusion and the claim-to-publish guard: here the record is expired before
+// the claim, so it is removed by the bounded cleanup.
+func TestRunPendingOnceExpiredDoesNotPublishAndCleansUp(t *testing.T) {
+	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	o := pendingOccurrence("a", "jobs.a")
+
+	ob := newFakeOutbox()
+	ob.nowFn = func() time.Time { return frozen }
+	inserted, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+		ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+		ScheduledAt: o.ScheduledAt, NextAttempt: frozen.Add(-time.Minute),
+	})
+	if err != nil || !inserted {
+		t.Fatalf("seed = (%v,%v), want (true,nil)", inserted, err)
+	}
+	// The row's deadline is in the past at the scheduler's clock.
+	ob.mu.Lock()
+	ob.rows[o.ID()].p.ExpiresAt = frozen.Add(-time.Second)
+	ob.mu.Unlock()
+
+	fp := newFakePublisher(4)
+	fp.published = true
+	m := metrics.New()
+	var buf testutil.SyncBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := testSchedulerWithMetrics(fp, logger, m)
+	s.now = func() time.Time { return frozen }
+	s.SetOutbox(ob)
+
+	n, err := s.RunPendingOnce(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("RunPendingOnce = (%d,%v), want (1,nil) (one expired record handled)", n, err)
+	}
+	if got := fp.callCount(); got != 0 {
+		t.Fatalf("publish calls = %d, want 0 (an expired record is never published)", got)
+	}
+	if ob.has(o.ID()) {
+		t.Fatal("expired record was not removed")
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != 1 {
+		t.Fatalf("schedule_pending_expired_total = %d, want 1", got)
+	}
+	// Expiration is NOT a publish outcome.
+	if got := m.Counter(metrics.MetricSchedulePendingRetries); got != 0 {
+		t.Fatalf("pending_retries = %d, want 0", got)
+	}
+	if got := m.Counter(metrics.MetricScheduleOccurrencesPublished); got != 0 {
+		t.Fatalf("occurrences_published = %d, want 0", got)
+	}
+	if got := m.Counter(metrics.MetricSchedulePublishFailures); got != 0 {
+		t.Fatalf("publish_failures = %d, want 0", got)
+	}
+	if got := m.Counter(metrics.MetricScheduleOccurrencesDuplicate); got != 0 {
+		t.Fatalf("occurrences_duplicate = %d, want 0", got)
+	}
+	if !strings.Contains(buf.String(), "expired pending occurrences removed") {
+		t.Fatalf("missing structured expiration log:\n%s", buf.String())
+	}
+}
+
+// TestRunPendingOnceClaimedRecordExpiresBeforePublish pins the claim-to-publish
+// time boundary: a record that is not yet expired when claimed (simulated by the
+// outbox returning it) but whose deadline has passed by the time retryPending
+// runs is removed by retryPending WITHOUT a publisher call and counted as
+// expiration, never rescheduled.
+func TestRunPendingOnceClaimedRecordExpiresBeforePublish(t *testing.T) {
+	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	o := pendingOccurrence("a", "jobs.a")
+
+	ob := newFakeOutbox()
+	ob.nowFn = func() time.Time { return frozen }
+	inserted, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+		ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+		ScheduledAt: o.ScheduledAt, NextAttempt: frozen.Add(-time.Minute),
+	})
+	if err != nil || !inserted {
+		t.Fatalf("seed = (%v,%v), want (true,nil)", inserted, err)
+	}
+	// Let the claim succeed: expire the row exactly AT now (expires_at <= now is
+	// expired, but the fake claim excludes it), so the only way it reaches
+	// retryPending is via the direct call below.
+	ob.mu.Lock()
+	ob.rows[o.ID()].p.ExpiresAt = frozen
+	ob.mu.Unlock()
+
+	fp := newFakePublisher(4)
+	fp.published = true
+	m := metrics.New()
+	var buf testutil.SyncBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := testSchedulerWithMetrics(fp, logger, m)
+	s.now = func() time.Time { return frozen }
+	s.SetOutbox(ob)
+
+	// Drive retryPending directly with the expired record: the claim would
+	// exclude it, but a record expiring between claim and publish must still be
+	// rejected by the guard.
+	ob.mu.Lock()
+	rec := ob.rows[o.ID()].p
+	ob.mu.Unlock()
+	s.retryPending(context.Background(), rec, logger)
+	if got := fp.callCount(); got != 0 {
+		t.Fatalf("publish calls = %d, want 0 (expired between claim and publish)", got)
+	}
+	if ob.has(o.ID()) {
+		t.Fatal("record expired before publish was not removed")
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != 1 {
+		t.Fatalf("schedule_pending_expired_total = %d, want 1", got)
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingRetries); got != 0 {
+		t.Fatalf("pending_retries = %d, want 0 (expiry is not a retry)", got)
+	}
+	if !strings.Contains(buf.String(), "expired") {
+		t.Fatalf("missing expiration log:\n%s", buf.String())
+	}
+}
+
+// TestRunPendingOnceExpiredCleanupIsBounded pins that a backlog of expired
+// records is drained in bounded batches: one RunPendingOnce removes at most
+// pendingCleanupBatch, and returns a positive count so the worker scans again.
+func TestRunPendingOnceExpiredCleanupIsBounded(t *testing.T) {
+	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	m := metrics.New()
+	fp := newFakePublisher(1)
+	ob := newFakeOutbox()
+	ob.nowFn = func() time.Time { return frozen }
+	total := pendingCleanupBatch + 3
+	for i := 0; i < total; i++ {
+		o := pendingOccurrence("e"+string(rune('a'+i/26))+string(rune('0'+i%26)), "jobs.e")
+		if _, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+			ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+			ScheduledAt: o.ScheduledAt, NextAttempt: frozen.Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+		ob.mu.Lock()
+		ob.rows[o.ID()].p.ExpiresAt = frozen.Add(-time.Second)
+		ob.mu.Unlock()
+	}
+
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
+	s.now = func() time.Time { return frozen }
+	s.SetOutbox(ob)
+
+	n, err := s.RunPendingOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunPendingOnce: %v", err)
+	}
+	if n != pendingCleanupBatch {
+		t.Fatalf("first cleanup = %d, want the bounded batch %d", n, pendingCleanupBatch)
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != int64(pendingCleanupBatch) {
+		t.Fatalf("expired = %d, want %d", got, pendingCleanupBatch)
+	}
+	// A second pass drains the remainder.
+	n, err = s.RunPendingOnce(context.Background())
+	if err != nil || n != 3 {
+		t.Fatalf("second cleanup = (%d,%v), want (3,nil)", n, err)
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != int64(total) {
+		t.Fatalf("expired total = %d, want %d", got, total)
+	}
+	if _, ok, err := s.NextPendingDue(context.Background()); err != nil || ok {
+		t.Fatalf("NextPendingDue after cleanup = (ok %v, err %v), want (false,nil)", ok, err)
+	}
+}
+
+// TestExpiredRecordIsNotRetryableAfterRestart pins the restart contract with the
+// real SQLite outbox: a row inside retention remains retryable after a process
+// restart, while a row whose deadline has passed is cleaned after restart and
+// never published. The scheduler's injectable clock stands in for wall time, so
+// the "expired" case uses a clock past the row's real 7-day deadline.
+func TestExpiredRecordIsNotRetryableAfterRestart(t *testing.T) {
+	o := pendingOccurrence("a", "jobs.a")
+	save := func(t *testing.T, path string) {
+		t.Helper()
+		st, err := state.Open(path)
+		if err != nil {
+			t.Fatalf("open state: %v", err)
+		}
+		st.SetLogger(testutil.DiscardLogger())
+		if _, err := st.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+			ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+			ScheduledAt: o.ScheduledAt, NextAttempt: time.Now().Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close state: %v", err)
+		}
+	}
+
+	t.Run("inside retention remains retryable", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db.sqlite3")
+		save(t, path)
+		st, err := state.Open(path)
+		if err != nil {
+			t.Fatalf("reopen state: %v", err)
+		}
+		defer st.Close()
+		st.SetLogger(testutil.DiscardLogger())
+		fp := newFakePublisher(4)
+		fp.published = true
+		s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
+		s.now = time.Now // present: the row is well inside its 7-day window
+		s.SetOutbox(st)
+		if n, err := s.RunPendingOnce(context.Background()); err != nil || n != 1 {
+			t.Fatalf("RunPendingOnce = (%d,%v), want (1,nil)", n, err)
+		}
+		if got := fp.callCount(); got != 1 {
+			t.Fatalf("publish calls = %d, want 1 (inside retention is retryable)", got)
+		}
+	})
+
+	t.Run("after expiry is cleaned without publishing", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db.sqlite3")
+		save(t, path)
+		st, err := state.Open(path)
+		if err != nil {
+			t.Fatalf("reopen state: %v", err)
+		}
+		defer st.Close()
+		st.SetLogger(testutil.DiscardLogger())
+		fp := newFakePublisher(4)
+		fp.published = true
+		m := metrics.New()
+		s := testSchedulerWithMetrics(fp, testLogger(), m)
+		// Past the row's real first-insert + 7-day deadline.
+		s.now = func() time.Time { return time.Now().Add(8 * 24 * time.Hour) }
+		s.SetOutbox(st)
+		if n, err := s.RunPendingOnce(context.Background()); err != nil || n != 1 {
+			t.Fatalf("RunPendingOnce = (%d,%v), want (1,nil) (one expired record cleaned)", n, err)
+		}
+		if got := fp.callCount(); got != 0 {
+			t.Fatalf("publish calls = %d, want 0 (expired record never published)", got)
+		}
+		if got := m.Counter(metrics.MetricSchedulePendingExpired); got != 1 {
+			t.Fatalf("expired = %d, want 1", got)
+		}
+		if _, ok, err := st.NextPendingDue(context.Background(), time.Now().Add(8*24*time.Hour)); err != nil || ok {
+			t.Fatalf("NextPendingDue after cleanup = (ok %v, err %v), want (false,nil)", ok, err)
+		}
+	})
+}
+
+// TestPendingRetryDay6AmbiguousPublishResolvesAsDuplicate pins the retry/dedup
+// invariant at its most important point: a record persisted at day 0 that is
+// still retrying at day 6 (inside its 7-day retention) where the original publish
+// actually succeeded but its response was lost. The publisher models that: the
+// first call commits the entry in its dedup state but reports a Redis error (the
+// response was lost), and the retry sees the still-live key and returns a clean
+// duplicate. The row is deleted and only one logical stream entry/ID ever exists.
+func TestPendingRetryDay6AmbiguousPublishResolvesAsDuplicate(t *testing.T) {
+	day0 := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	day6 := day0.Add(6 * 24 * time.Hour)
+	o := pendingOccurrence("a", "jobs.a")
+
+	// One shared publisher: it commits the occurrence but loses the first reply.
+	pub := &ambiguousPublisher{entries: map[string]int{}}
+	// The original, ambiguous publish at day 0.
+	if _, err := pub.PublishOccurrence(context.Background(), o); err == nil {
+		t.Fatal("the ambiguous attempt must surface an error")
+	}
+	if pub.streamEntries() != 1 {
+		t.Fatalf("stream entries = %d, want 1 (committed but reply lost)", pub.streamEntries())
+	}
+
+	// The outbox stamps the real 7-day deadline from day 0.
+	ob := newFakeOutbox()
+	ob.nowFn = func() time.Time { return day0 }
+	inserted, err := ob.SavePendingOccurrence(context.Background(), state.PendingOccurrence{
+		ID: o.ID(), App: o.App, Schedule: o.Schedule, Handler: o.Handler,
+		ScheduledAt: o.ScheduledAt, NextAttempt: day0.Add(-time.Minute),
+	})
+	if err != nil || !inserted {
+		t.Fatalf("seed = (%v,%v), want (true,nil)", inserted, err)
+	}
+
+	// At day 6 the durable retry runs, still inside retention, through the SAME
+	// publisher, and resolves the record as a clean duplicate against the
+	// still-live dedup key.
+	m := metrics.New()
+	s := testSchedulerWithMetrics(pub, testLogger(), m)
+	s.now = func() time.Time { return day6 }
+	s.SetOutbox(ob)
+
+	if n, err := s.RunPendingOnce(context.Background()); err != nil || n != 1 {
+		t.Fatalf("RunPendingOnce = (%d,%v), want (1,nil)", n, err)
+	}
+	if ob.has(o.ID()) {
+		t.Fatal("ambiguous occurrence was not resolved/deleted")
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingExpired); got != 0 {
+		t.Fatalf("expired = %d, want 0 (day 6 is inside retention)", got)
+	}
+	// The dedup key is still live at day 6 (14-day TTL from day 0), so the retry
+	// saw the original and did not publish a second entry.
+	if pub.streamEntries() != 1 {
+		t.Fatalf("stream entries = %d, want 1 (no second entry for the same occurrence)", pub.streamEntries())
+	}
+	if got := m.Counter(metrics.MetricSchedulePendingRetries); got != 1 {
+		t.Fatalf("pending_retries = %d, want 1 (the record was retried, not expired)", got)
+	}
+}
+
+// ambiguousPublisher models the atomic publish-if-new contract as a Redis-like
+// dedup: at most one entry per occurrence ID, ever. Its first attempt records the
+// entry but reports an error, modeling an XADD whose reply was lost; every later
+// attempt for the same ID is a clean duplicate.
+type ambiguousPublisher struct {
+	mu      sync.Mutex
+	entries map[string]int
+}
+
+func (p *ambiguousPublisher) PublishOccurrence(_ context.Context, o schedule.Occurrence) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.entries[o.ID()] > 0 {
+		return false, nil // clean duplicate against the live dedup key
+	}
+	p.entries[o.ID()] = 1
+	return false, errors.New("redis: response lost after commit")
+}
+
+func (p *ambiguousPublisher) streamEntries() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, c := range p.entries {
+		n += c
+	}
+	return n
 }
 
 // signalPublisher signals every publish attempt through a channel and otherwise
