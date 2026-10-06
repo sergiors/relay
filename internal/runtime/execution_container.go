@@ -196,17 +196,7 @@ func startExecutionContainer(
 	// Long-lived reader goroutine: demultiplex the attach stream for the
 	// container's whole lifetime. Reading runs concurrently so a chatty
 	// container cannot dead-lock on a full socket while a request is written.
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		_, _ = stdcopy.StdCopy(c.demux, &stderrSink{d: c.demux}, attach.Reader)
-		// EOF on stdout: flush any trailing partial (user) line, then signal
-		// EOF so the exit monitor (or a pending Invoke) reacts immediately
-		// rather than waiting for the wait-result delivery.
-		c.demux.flushPending()
-		c.demux.flushForwarders()
-		signal(c.eof)
-	}()
+	readerDone := c.startOutputReader()
 
 	// Start. The not-running wait below is only meaningful once running.
 	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
@@ -287,6 +277,27 @@ func signalExit(ch chan exitInfo, info exitInfo) {
 	}
 }
 
+// startOutputReader launches the container's long-lived stdout/stderr
+// demultiplexer goroutine and returns a channel closed when it exits. Reading
+// runs concurrently with request writes so a chatty container cannot dead-lock
+// on a full socket; the goroutine exits when the attach stream reaches EOF or
+// the hijacked conn is closed (the cancellation path), so it is the single
+// long-lived reader for the container's whole lifetime.
+func (c *executionContainer) startOutputReader() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = stdcopy.StdCopy(c.demux, &stderrSink{d: c.demux}, c.attach.Reader)
+		// EOF on stdout: flush any trailing partial (user) line, then signal
+		// EOF so the exit monitor (or a pending Invoke) reacts immediately
+		// rather than waiting for the wait-result delivery.
+		c.demux.flushPending()
+		c.demux.flushForwarders()
+		signal(c.eof)
+	}()
+	return done
+}
+
 // monitor funnels container-death events: exit status, stdout EOF, unexpected
 // protocol frames. A pending invocation is notified via fail (and performs the
 // discard itself); an idle container's death discards directly.
@@ -347,7 +358,19 @@ func exitEvent(info exitInfo) error {
 // Timeout: ctx.Done while in flight kills + removes + discards the container
 // (reason "timeout") and returns the ctx error wrapped exactly like the
 // one-shot path ("docker run: <ctx err>"), preserving retry/log semantics.
-func (c *executionContainer) Invoke(ctx context.Context, handler string, eventJSON []byte, env map[string]string) error {
+//
+// Cancellation must also release the SYNCHRONOUS request write and the
+// long-lived demux reader: both block on the attach's shared hijacked
+// net.Conn, which observes no context, so a ctx.Done select branch alone is
+// unreachable while the write is stuck. A cancellation callback registered at
+// the attach boundary closes that conn — the SDK-supported lifecycle action
+// that releases both operations — but only while this invocation is
+// unresolved; once it completes, the callback is suppressed (see settle).
+func (c *executionContainer) Invoke(
+	ctx context.Context,
+	handler string, eventJSON []byte,
+	env map[string]string,
+) error {
 	c.ioMu.Lock()
 	defer c.ioMu.Unlock()
 
@@ -387,15 +410,86 @@ func (c *executionContainer) Invoke(ctx context.Context, handler string, eventJS
 		// a failure is a bug in the caller's contract, not container state.
 		return fmt.Errorf("docker run: marshal request frame: %w", err)
 	}
+
+	// Cancellation unblocker (see the method comment). The callback closes the
+	// shared hijacked conn FIRST so a Write blocked sending the request frame
+	// and the demux reader blocked in stdcopy.StdCopy are both released
+	// promptly, then poisons the container with the timeout semantics. Its own
+	// attach.Close in discard is a harmless second close.
+	cbDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(cbDone)
+		c.attach.Close()
+		c.discard("timeout")
+	})
+	// settle unregisters the cancellation callback exactly once. It reports
+	// whether cancellation won: false when the callback was suppressed (stop
+	// returned true, so it never has and never will run), true when the callback
+	// had already started, in which case settle waits for it to finish — no
+	// untracked callback may outlive this invocation and close a conn that a
+	// later invocation has been handed. The deferred call joins the callback on
+	// any abnormal exit.
+	settled := false
+	settle := func() bool {
+		if settled {
+			return false
+		}
+		settled = true
+		if stop() {
+			return false
+		}
+		<-cbDone
+		return true
+	}
+	defer settle()
+
 	if _, err := c.attach.Conn.Write(append(frame, '\n')); err != nil {
+		if settle() {
+			// The cancellation callback closed the attach under us: report the
+			// invocation as the timeout with the wrapped ctx error, never a
+			// write failure — the close surfaces here as an I/O error.
+			return fmt.Errorf("docker run: %w", ctx.Err())
+		}
 		// The conn is broken (process died, daemon hiccup): the container is
 		// unusable. Kill + remove (idempotent) and discard.
 		c.discard("protocol_error")
 		return fmt.Errorf("docker run: write request frame: %w", err)
 	}
 
+	const (
+		outcomeResponse = iota
+		outcomeFail
+		outcomeProtoErr
+		outcomeCancel
+		outcomeClosed
+	)
+	var (
+		resp    invokeResponse
+		ev      failEvent
+		outcome int
+	)
 	select {
-	case resp := <-respCh:
+	case resp = <-respCh:
+		outcome = outcomeResponse
+	case ev = <-c.fail:
+		outcome = outcomeFail
+	case <-c.protoErr:
+		outcome = outcomeProtoErr
+	case <-ctx.Done():
+		outcome = outcomeCancel
+	case <-c.closed:
+		outcome = outcomeClosed
+	}
+	if settle() {
+		// The cancellation callback started before this invocation resolved:
+		// cancellation wins consistently, whichever branch the select happened
+		// to pick. The callback has already closed the attach and poisoned the
+		// container with reason "timeout". stop() reporting false implies ctx
+		// is done, so ctx.Err() is non-nil.
+		return fmt.Errorf("docker run: %w", ctx.Err())
+	}
+	switch outcome {
+	case outcomeResponse:
 		if !first {
 			// An actual reuse: this container already served an invocation and
 			// just served another one. DEBUG only — never noisy INFO.
@@ -409,16 +503,20 @@ func (c *executionContainer) Invoke(ctx context.Context, handler string, eventJS
 		// The error string is bounded (see clampResponseError) so the frame can
 		// never exceed the demuxer's line cap.
 		return fmt.Errorf("handler %q failed: %s", handler, clampResponseError(resp.Error))
-	case ev := <-c.fail:
+	case outcomeFail:
 		c.discard(ev.reason)
 		return fmt.Errorf("docker run: %s", ev.err)
-	case <-c.protoErr:
+	case outcomeProtoErr:
 		c.discard("protocol_error")
 		return fmt.Errorf("docker run: unexpected protocol response from container")
-	case <-ctx.Done():
+	case outcomeCancel:
+		// Defensive: a ctx.Done selection normally means the callback already
+		// ran and settle reported true above. If the callback was suppressed in
+		// the settle/ctx race, the invocation is still unresolved, so discard
+		// with the same timeout semantics here.
 		c.discard("timeout")
 		return fmt.Errorf("docker run: %w", ctx.Err())
-	case <-c.closed:
+	default: // outcomeClosed
 		return fmt.Errorf("docker run: container discarded (%s)", c.discardReason())
 	}
 }
