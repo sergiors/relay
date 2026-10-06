@@ -43,7 +43,7 @@ func TestFireRetriesSameOccurrenceThenSucceeds(t *testing.T) {
 		{published: false, err: errBoom},
 		{published: true},
 	}
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
@@ -78,7 +78,7 @@ func TestFireSuccessPathSingleAttempt(t *testing.T) {
 	m := metrics.New()
 	fp := newFakePublisher(4)
 	fp.script = []pubResult{{published: true}}
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
@@ -103,7 +103,7 @@ func TestFireSuccessPathSingleAttempt(t *testing.T) {
 func TestPublishCancellationStopsRetries(t *testing.T) {
 	fp := newFakePublisher(8)
 	fp.err = errBoom
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.wait = func(context.Context, time.Duration) bool { return false } // cancelled wait
 	defer func() { _ = s.Stop(context.Background()) }()
 
@@ -145,7 +145,7 @@ func TestFireRetriesShareOneTrace(t *testing.T) {
 		{published: false, err: errBoom},
 		{published: true},
 	}
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
@@ -351,7 +351,7 @@ func TestCatchUpLatestOnlyWithinHorizon(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 2, 0, 0, time.UTC)
 	m := metrics.New()
 	fp := newFakePublisher(8)
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return now }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
@@ -403,7 +403,7 @@ func TestCatchUpLatestOnlyWithinHorizon(t *testing.T) {
 func TestCatchUpRunsOnce(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC)
 	fp := newFakePublisher(8)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return now }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()
@@ -429,7 +429,7 @@ func TestCatchUpRepeatedIsDeduped(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC)
 	pub := newDedupPublisher()
 	for i := 0; i < 2; i++ {
-		s := New(pub, testLogger())
+		s := testScheduler(pub, testLogger())
 		s.now = func() time.Time { return now }
 		s.wait = noWait
 		s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
@@ -454,7 +454,7 @@ func TestCatchUpRepeatedIsDeduped(t *testing.T) {
 func TestCatchUpCancellationAborts(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 0, 0, 0, time.UTC)
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return now }
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
@@ -474,7 +474,7 @@ func TestCatchUpCancellationAborts(t *testing.T) {
 // never the future next day.
 func TestCatchUpExcludesFutureAndOlderOccurrences(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.wait = noWait
@@ -491,7 +491,7 @@ func TestCatchUpExcludesFutureAndOlderOccurrences(t *testing.T) {
 	// A fresh Scheduler one minute later chooses the same 03:00, never the
 	// future 2026-07-03T03:00.
 	fp2 := newFakePublisher(4)
-	s2 := New(fp2, testLogger())
+	s2 := testScheduler(fp2, testLogger())
 	s2.wait = noWait
 	defer func() { _ = s2.Stop(context.Background()) }()
 	s2.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
@@ -511,7 +511,7 @@ func TestCatchUpExhaustionCounts(t *testing.T) {
 	m := metrics.New()
 	fp := newFakePublisher(16)
 	fp.err = errors.New("boom")
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return now }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()

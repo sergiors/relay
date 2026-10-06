@@ -32,6 +32,8 @@ func seedAllMetrics(r *Registry) {
 		MetricScheduleCatchUp,
 		MetricSchedulePendingPersisted,
 		MetricSchedulePendingRetries,
+		MetricSchedulerDegraded,
+		MetricSchedulerRecoveries,
 		MetricMissingPayload,
 	} {
 		r.Inc(name)
@@ -58,6 +60,7 @@ func seedAllMetrics(r *Registry) {
 	r.SetGaugeLabels(MetricRuntimeContainers, []Label{{"app", "a"}, {"state", RuntimeStateIdle}}, 1)
 	r.SetGaugeLabels(MetricRuntimePoolCapacity, []Label{{"app", "a"}}, 1)
 	r.SetGaugeLabels(MetricAppStatus, []Label{{"app", "a"}, {"status", "ready"}}, 1)
+	r.SetGaugeLabels(MetricSchedulerState, []Label{{"state", SchedulerStateRunning}}, 1)
 	r.IncLabels(MetricRedisReadErrors, []Label{{"operation", RedisOpReadGroup}})
 	r.IncLabels(MetricServiceReconciles, []Label{{"app", "a"}, {"outcome", ServiceOutcomeChanged}})
 	r.ObserveDurationLabels(MetricServiceReconcileDuration, []Label{{"app", "a"}}, 2*time.Second)

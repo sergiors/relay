@@ -74,11 +74,16 @@ const (
 	// each RETRY of a failed schedule publication within the bounded backoff
 	// budget (the initial failed attempt is NOT a retry; it is already counted
 	// by MetricSchedulePublishFailures). MetricSchedulePublishExhausted counts
-	// occurrences whose retry budget was exhausted (a permanently lost
-	// occurrence on this worker). MetricScheduleCatchUp counts occurrences
-	// republished by the startup catch-up scan (each is subject to the same
-	// atomic dedup, so a catch-up that another worker already published shows as
-	// a duplicate, not here).
+	// occurrences whose BOUNDED IMMEDIATE retry loop was exhausted. It is NOT a
+	// terminal loss: when the failed publication attempt was persisted to the
+	// SQLite outbox, the durable retry worker keeps republishing that occurrence
+	// (with the same identity) indefinitely, across restarts, until it resolves
+	// (published or a clean duplicate). Only with no outbox configured does
+	// exhaustion here leave no durable copy. It is deliberately not a handler
+	// exhaustion (that is function_dlq_total) and not a confirmed drop.
+	// MetricScheduleCatchUp counts occurrences republished by the startup
+	// catch-up scan (each is subject to the same atomic dedup, so a catch-up that
+	// another worker already published shows as a duplicate, not here).
 	MetricSchedulePublishRetries   = metricNamespacePrefix + "schedule_publish_retries_total"
 	MetricSchedulePublishExhausted = metricNamespacePrefix + "schedule_publish_exhausted_total"
 	MetricScheduleCatchUp          = metricNamespacePrefix + "schedule_catchup_total"
@@ -96,7 +101,17 @@ const (
 	// durable retry worker.
 	MetricSchedulePendingPersisted = metricNamespacePrefix + "schedule_pending_persisted_total"
 	MetricSchedulePendingRetries   = metricNamespacePrefix + "schedule_pending_retries_total"
-	MetricHandlerInvocations       = metricNamespacePrefix + "handler_invocations_total"
+	// Scheduler storage state. The schedule scheduler requires a usable durable
+	// publication store (the local SQLite outbox) before it may evaluate or
+	// publish occurrences: publication must be persistable before it is
+	// attempted. The one-hot gauge exposes the current state, and the transition
+	// counters make a pause and its recovery observable without scraping the
+	// gauge over time. Deliberately excluded from worker readiness: schedule
+	// firing is not a prerequisite for consuming external events.
+	MetricSchedulerState      = metricNamespacePrefix + "scheduler_state"
+	MetricSchedulerDegraded   = metricNamespacePrefix + "scheduler_degraded_total"
+	MetricSchedulerRecoveries = metricNamespacePrefix + "scheduler_recoveries_total"
+	MetricHandlerInvocations  = metricNamespacePrefix + "handler_invocations_total"
 	// MetricAppBuildFailures counts failed app image and dependency-image
 	// builds. It is APP lifecycle (whether an app could be prepared), not handler
 	// execution, so it keeps the app_ namespace alongside the app identity
@@ -224,10 +239,13 @@ var metricHelp = map[string]string{
 	MetricScheduleOccurrencesDuplicate: "Schedule occurrences skipped because another worker had already published them; the publish-if-new check is a clean no-op.",
 	MetricSchedulePublishFailures:      "Schedule occurrence publish attempts that failed, including envelope encoding errors and Redis script errors; a failed attempt is counted here before any bounded retry.",
 	MetricSchedulePublishRetries:       "Retries of a failed schedule occurrence publication within the bounded backoff budget; the initial failed attempt is counted by schedule_publish_failures_total and every subsequent re-attempt counts here.",
-	MetricSchedulePublishExhausted:     "Schedule occurrences whose bounded publication retry budget was exhausted without a success or duplicate; the occurrence is lost on this worker (other workers may still publish it).",
+	MetricSchedulePublishExhausted:     "Schedule occurrences whose BOUNDED IMMEDIATE publication retry loop was exhausted without a success or duplicate. This is not a terminal loss: when the failed publication attempt was persisted to the durable SQLite outbox, the retry worker keeps republishing the same occurrence indefinitely until it resolves (published or a clean duplicate); only with no outbox configured does exhaustion leave no durable copy. It is not a handler exhaustion (see function_dlq_total).",
 	MetricScheduleCatchUp:              "Schedule occurrences processed by the startup catch-up scan (the latest missed occurrence per schedule within the bounded horizon). Each is subject to the atomic publish-if-new, so the scan's published/duplicate split is counted by schedule_occurrences_published_total / schedule_occurrences_duplicate_total.",
 	MetricSchedulePendingPersisted:     "Schedule occurrences newly persisted to the durable local retry outbox after their immediate Redis publication did not resolve; a re-persist of an occurrence already present is not counted. The occurrence is retried until it publishes or is confirmed a clean duplicate, then the outbox row is deleted.",
 	MetricSchedulePendingRetries:       "Publication attempts made by the durable schedule-publication retry worker for occurrences persisted in the local outbox; a resolved attempt removes the outbox row, a failed one reschedules it.",
+	MetricSchedulerState:               "Current scheduler storage state as a one-hot gauge: exactly one state series is 1 and every other allowed state is 0. Running means a usable durable outbox is installed and live jobs are enabled; degraded means schedule publication is paused because an outbox operation failed; unavailable means no usable outbox could be opened. Schedule firing is not a prerequisite for consuming external events.",
+	MetricSchedulerDegraded:            "Transitions of the schedule scheduler into the degraded state because a durable outbox operation (save, claim, reschedule, delete, or next-due query) failed; each transition counts once, so repeated failures in one degraded episode count once.",
+	MetricSchedulerRecoveries:          "Transitions of the schedule scheduler back to running after being degraded or unavailable, once a usable outbox is installed again and the bounded recovery (pending-row retry plus latest-only catch-up) has completed.",
 
 	MetricHandlerInvocations:              "Handler invocation outcomes by app and handler, counted once per handler attempt; outcome is success or failure.",
 	MetricAppBuildFailures:                "App image and dependency-image build failures by app.",
@@ -269,6 +287,27 @@ var AppStatuses = []string{
 	"ready",
 	"degraded",
 	"unavailable",
+}
+
+// Scheduler state label values for the one-hot MetricSchedulerState gauge.
+// They are a closed, low-cardinality set and mirror internal/cron's internal
+// scheduler states by convention (this leaf package does not import cron):
+// running means a usable outbox is installed and live jobs are enabled;
+// degraded means the scheduler was running and paused because an outbox
+// operation failed; unavailable means no usable outbox could be opened, so the
+// scheduler has never fired on this worker.
+const (
+	SchedulerStateRunning     = "running"
+	SchedulerStateDegraded    = "degraded"
+	SchedulerStateUnavailable = "unavailable"
+)
+
+// SchedulerStates is the closed set of scheduler states surfaced by
+// MetricSchedulerState, in the canonical one-hot order.
+var SchedulerStates = []string{
+	SchedulerStateRunning,
+	SchedulerStateDegraded,
+	SchedulerStateUnavailable,
 }
 
 // Redis read operation label values: the finite set of Redis READ commands the
@@ -521,6 +560,11 @@ func New() *Registry {
 		// durable retry worker). Prometheus-only, like the other schedule counters.
 		MetricSchedulePendingPersisted,
 		MetricSchedulePendingRetries,
+		// Scheduler storage-state transition counters (see internal/cron). They
+		// count entries into degraded and recoveries back to running; the
+		// current state itself is the one-hot MetricSchedulerState gauge.
+		MetricSchedulerDegraded,
+		MetricSchedulerRecoveries,
 		// MetricMissingPayload is a stream-layer anomaly counter fed by the
 		// consumer when it clears a dangling PEL entry (see the constant's doc).
 		MetricMissingPayload,
@@ -723,6 +767,21 @@ func New() *Registry {
 	r.gaugeVecs[MetricAppStatus] = &labeledGaugeVec{
 		order: []string{"app", "status"},
 		vec:   appStatusVec,
+	}
+
+	// Scheduler storage state as a one-hot gauge. The state label is the closed
+	// SchedulerStates set; SetSchedulerState writes all three series atomically
+	// (one 1, two 0), so a dashboard reads the scheduler's state without
+	// summing series. It is process-global (no app label): the scheduler's
+	// durable outbox is shared by every app's schedules on this worker.
+	schedulerStateVec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: MetricSchedulerState,
+		Help: metricHelp[MetricSchedulerState],
+	}, []string{"state"})
+	reg.MustRegister(schedulerStateVec)
+	r.gaugeVecs[MetricSchedulerState] = &labeledGaugeVec{
+		order: []string{"state"},
+		vec:   schedulerStateVec,
 	}
 
 	// Redis read failures, labeled solely by the finite operation set. No error
@@ -979,6 +1038,36 @@ func (r *Registry) RemoveAppStatus(name string) {
 func isAppStatus(status string) bool {
 	for _, s := range AppStatuses {
 		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSchedulerState writes the one-hot scheduler storage-state series: exactly
+// the series for state is set to 1 and every other SchedulerStates value is set
+// to 0, so the exposed set is always coherent and bounded by len(SchedulerStates).
+// The write is a no-op for an unknown state (only the closed set is
+// representable) and for a nil receiver. It creates any missing series, so the
+// scheduler's first state write surfaces all three series rather than only the
+// current one.
+func (r *Registry) SetSchedulerState(state string) {
+	if r == nil || !isSchedulerState(state) {
+		return
+	}
+	for _, s := range SchedulerStates {
+		v := 0.0
+		if s == state {
+			v = 1
+		}
+		r.SetGaugeLabels(MetricSchedulerState, []Label{{Name: "state", Value: s}}, v)
+	}
+}
+
+// isSchedulerState reports whether state is one of the closed SchedulerStates.
+func isSchedulerState(state string) bool {
+	for _, s := range SchedulerStates {
+		if s == state {
 			return true
 		}
 	}

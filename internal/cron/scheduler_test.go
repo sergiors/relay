@@ -196,7 +196,7 @@ func fireNow(t *testing.T, s *Scheduler, name string) {
 // schedules registers none.
 func TestReplaceAppRegistersJobs(t *testing.T) {
 	fp := newFakePublisher(2)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceApp("fn", twoSchedules())
@@ -218,7 +218,7 @@ func TestReplaceAppSkipsUnregisterableSchedule(t *testing.T) {
 	fp := newFakePublisher(1)
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	s := New(fp, logger)
+	s := testScheduler(fp, logger)
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
@@ -248,7 +248,7 @@ func TestReplaceAppSkipsSixFieldSchedule(t *testing.T) {
 	fp := newFakePublisher(1)
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	s := New(fp, logger)
+	s := testScheduler(fp, logger)
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
@@ -274,7 +274,7 @@ func TestReplaceAppSkipsSixFieldSchedule(t *testing.T) {
 // skipped defensively at registration (validation rejects it).
 func TestReplaceAppSkipsEverySchedule(t *testing.T) {
 	fp := newFakePublisher(1)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	s.ReplaceApp("fn", &app.Template{Runtime: "node24", Schedules: []app.Schedule{
@@ -290,7 +290,7 @@ func TestReplaceAppSkipsEverySchedule(t *testing.T) {
 // callback's clock (not the raw wall clock).
 func TestFireSendsPayload(t *testing.T) {
 	fp := newFakePublisher(1)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	// Pin the clock just past the 08:00 matching boundary so the expected due
 	// instant is unambiguous regardless of when the test actually runs.
@@ -362,7 +362,7 @@ func TestTwoWorkersDedupSameTick(t *testing.T) {
 	frozen := time.Date(2026, 7, 1, 8, 0, 30, 0, time.UTC)
 	var workers []*Scheduler
 	for i := 0; i < 2; i++ {
-		s := New(pub, testLogger())
+		s := testScheduler(pub, testLogger())
 		s.now = func() time.Time { return frozen }
 		s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 		s.Start()
@@ -409,7 +409,7 @@ func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
 	var ids []string
 	for i, pin := range pins {
 		fp := newFakePublisher(1)
-		s := New(fp, testLogger())
+		s := testScheduler(fp, testLogger())
 		s.now = func() time.Time { return pin }
 		s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 		s.Start()
@@ -431,7 +431,7 @@ func TestFireMinuteTruncationAbsorbsJitter(t *testing.T) {
 // next two runs are a minute apart and both land on second 0.
 func TestFiveFieldNextRunsOncePerMinute(t *testing.T) {
 	fp := newFakePublisher(1)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "* * * * *", "", ""))
 	s.Start()
@@ -454,7 +454,7 @@ func TestFiveFieldNextRunsOncePerMinute(t *testing.T) {
 // Two schedules fire independently with their own handlers.
 func TestMultipleSchedulesFireIndependently(t *testing.T) {
 	fp := newFakePublisher(2)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", twoSchedules())
 	s.Start()
@@ -481,7 +481,7 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 	m := metrics.New()
 	fp := newFakePublisher(16)
 	fp.err = errBoom
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.wait = func(context.Context, time.Duration) bool { return true } // bounded policy, no real backoff
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
@@ -514,7 +514,7 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 	// returns (false, nil), so no retry is scheduled.
 	fp2 := newFakePublisher(4)
 	fp2.published = false
-	s2 := New(fp2, testLogger())
+	s2 := testScheduler(fp2, testLogger())
 	defer func() { _ = s2.Stop(context.Background()) }()
 	s2.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s2.Start()
@@ -534,7 +534,7 @@ func TestPublishErrorLoggedNotFatal(t *testing.T) {
 // the next run; removing one schedule drops its job; RemoveApp drops all.
 func TestReplaceAppConvergesJobs(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -580,7 +580,7 @@ func TestReplaceAppConvergesJobs(t *testing.T) {
 // with Europe/Rome (UTC+1 winter / UTC+2 CEST), 08:00 local never equals 08:00Z.
 func TestTimezoneChangeShiftsUTCInstant(t *testing.T) {
 	fp := newFakePublisher(2)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -605,7 +605,7 @@ func TestTimezoneChangeShiftsUTCInstant(t *testing.T) {
 // by time.Location: over ~400 days both standard and DST offsets appear.
 func TestNextRunTimezoneAndDST(t *testing.T) {
 	fp := newFakePublisher(1)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 8 * * *", "Europe/Rome", ""))
 	s.Start()
@@ -644,7 +644,7 @@ func TestNextRunTimezoneAndDST(t *testing.T) {
 func TestStopCancelsInFlightPublish(t *testing.T) {
 	fp := newFakePublisher(1)
 	fp.block = make(chan struct{})
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 
@@ -672,7 +672,7 @@ func TestStopCancelsInFlightPublish(t *testing.T) {
 // no-ops (no panic, no new jobs added).
 func TestStopIdempotentAndNoOpsAfterStop(t *testing.T) {
 	fp := newFakePublisher(1)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 	if n := s.JobCount(); n != 1 {
@@ -702,7 +702,7 @@ func TestStopIdempotentAndNoOpsAfterStop(t *testing.T) {
 // job or dropping the schedule.
 func TestReplaceAppScheduleNameStableAcrossHandlerChange(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -744,7 +744,7 @@ func TestReplaceAppScheduleNameStableAcrossHandlerChange(t *testing.T) {
 // touches another.
 func TestReplaceAppSameHandlerMultipleNames(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -794,7 +794,7 @@ func jobIDs(s *Scheduler) map[string]string {
 // every unrelated schedule's job — and its job ID — untouched.
 func TestReplaceAppRetainsUnchangedJobIDs(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -851,7 +851,7 @@ func TestReplaceAppRetainsUnchangedJobIDs(t *testing.T) {
 // same name must NOT replace the gocron job (its ID and next run survive).
 func TestReplaceAppTimeoutOnlyChangeRetainsJobID(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -886,7 +886,7 @@ func TestReplaceAppTimeoutOnlyChangeRetainsJobID(t *testing.T) {
 // removes only that name's job; a sibling schedule keeps its exact job and ID.
 func TestReplaceAppRemovesOnlyNamedSchedule(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -913,7 +913,7 @@ func TestReplaceAppRemovesOnlyNamedSchedule(t *testing.T) {
 // leaving every other schedule untouched.
 func TestReplaceAppRenameRemovesOldOnly(t *testing.T) {
 	fp := newFakePublisher(4)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	defer func() { _ = s.Stop(context.Background()) }()
 	s.Start()
 
@@ -948,7 +948,7 @@ func TestReplaceAppRenameRemovesOldOnly(t *testing.T) {
 func TestReplaceAppKeepsCatchUpRecordsCoherent(t *testing.T) {
 	now := time.Date(2026, 7, 2, 10, 2, 0, 0, time.UTC)
 	fp := newFakePublisher(8)
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return now }
 	s.wait = noWait
 	defer func() { _ = s.Stop(context.Background()) }()

@@ -3,9 +3,11 @@ package cron
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -159,7 +161,96 @@ type Scheduler struct {
 	// whether the worker should keep going. Tests substitute a fake to drive the
 	// loop deterministically without timers.
 	pendingWait pendingWaitFunc
+
+	// state is the scheduler's storage-state gate. The scheduler may evaluate
+	// and publish occurrences only while state is stateRunning with a usable
+	// outbox installed. It starts stateUnavailable (no outbox) and moves to
+	// stateRunning exactly once a usable outbox is installed via
+	// MarkOutboxReady; a runtime outbox failure moves it to stateDegraded and
+	// pauses live publication until a recovery is installed. It is guarded by
+	// mu, but the hot path (fire/publish) reads it via the atomic gate below.
+	state schedulerState
+	// paused is the atomic publication gate mirrored from state: it is true
+	// whenever live schedule publication must not be admitted (no usable outbox,
+	// degraded, or stopped). fire and publishOccurrence observe it WITHOUT the
+	// scheduler lock so an in-flight callback can return promptly and a
+	// concurrent state transition cannot race admission.
+	paused atomic.Bool
+	// fault is set whenever an outbox operation fails and cleared at the start of
+	// a recovery attempt. It lets the recovery detect that an outbox failure
+	// occurred during its drain/catch-up (where the scheduler is already degraded,
+	// so markDegraded cannot otherwise signal it) and keep live publication
+	// paused.
+	fault atomic.Bool
+	// startRequested records that the worker has asked the scheduler to begin
+	// firing (Start was called) while storage was not yet ready. gocron is
+	// started only once the scheduler reaches stateRunning, so a worker that
+	// opened no usable outbox at startup never fires a schedule; when a
+	// recovery installs one, maybeStartGocron starts the deferred gocron
+	// scheduler. Both fields are guarded by mu.
+	startRequested bool
+	gocronStarted  bool
+	// pendingCtx is the lifecycle context supplied to StartPendingRetry, kept so
+	// a recovery can restart the durable retry worker if it was never started
+	// (the startup-unavailable path). It is set once and guarded by mu.
+	pendingCtx context.Context
+	// bootstrapCancel cancels the scheduler-owned storage bootstrap loop (the
+	// startup-unavailable retry of opening a durable outbox); bootstrapDone is
+	// closed when it returns. Both are set by StartStorageBootstrap and joined
+	// by Stop, so no bootstrap open/install can touch the store after the
+	// scheduler barrier returns. Guarded by mu.
+	bootstrapCancel context.CancelFunc
+	bootstrapDone   chan struct{}
+	// ownedCloser, when non-nil, releases a scheduler-owned outbox store opened
+	// by the storage bootstrap (a second/fallback state handle used only because
+	// the worker's global handle was unavailable). Stop closes it AFTER gocron
+	// and the durable retry worker have stopped, so no scheduler work touches it
+	// after close. Guarded by mu.
+	ownedCloser io.Closer
+	// startFn, when non-nil, is the seam used to begin firing; it defaults to
+	// g.Start. Tests substitute a fake so the Start/markRunning-vs-Stop
+	// serialization is observable deterministically. It is invoked ONLY while
+	// s.mu is held (see startGocronNow), so a concurrent Stop cannot interleave
+	// g.Shutdown with it.
+	startFn func()
 }
+
+// schedulerState is the scheduler's storage-state gate. See Scheduler.state.
+type schedulerState int32
+
+const (
+	// stateUninitialized: the zero value, before any explicit storage decision.
+	// It behaves exactly like unavailable (publication paused, state label
+	// "unavailable") but is distinct so MarkStorageUnavailable still logs and
+	// records the metric for the production startup-unavailable decision.
+	stateUninitialized schedulerState = iota
+	// stateUnavailable: no usable durable outbox has been installed, so the
+	// scheduler must not evaluate or publish any occurrence. This is the state
+	// after New and after MarkStorageUnavailable.
+	stateUnavailable
+	// stateRunning: a usable outbox is installed and live publication is
+	// enabled.
+	stateRunning
+	// stateDegraded: the scheduler was running and paused because a runtime
+	// outbox operation failed; existing durable rows remain recoverable and a
+	// recovery reinstalls the outbox and re-enables publication.
+	stateDegraded
+)
+
+// metricLabel returns the metrics.SchedulerState* label for the state.
+func (s schedulerState) metricLabel() string {
+	switch s {
+	case stateRunning:
+		return metrics.SchedulerStateRunning
+	case stateDegraded:
+		return metrics.SchedulerStateDegraded
+	default:
+		return metrics.SchedulerStateUnavailable
+	}
+}
+
+// enabled reports whether the state admits live schedule publication.
+func (s schedulerState) enabled() bool { return s == stateRunning }
 
 // pendingWaitFunc is the durable retry worker's sleep. See Scheduler.pendingWait.
 type pendingWaitFunc func(ctx context.Context, d time.Duration, wake <-chan struct{}) bool
@@ -211,7 +302,7 @@ func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics
 		// (mirroring the webhook provider-name panic style).
 		panic(fmt.Sprintf("cron: construct gocron scheduler: %v", err))
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		log:         logger,
 		pub:         pub,
 		g:           g,
@@ -220,6 +311,30 @@ func NewWithMetrics(pub Publisher, logger *slog.Logger, metricsRegistry *metrics
 		wait:        waitContext,
 		pendingWake: make(chan struct{}, 1),
 		pendingWait: waitPendingContext,
+	}
+	// The scheduler starts unavailable: it may not evaluate or publish an
+	// occurrence until a usable durable outbox is installed (SetOutbox) or it is
+	// explicitly marked unavailable. The atomic pause gate mirrors that initial
+	// state so the publication hot path sees the pause without taking the lock.
+	s.paused.Store(true)
+	// Default the gocron-start seam so Start/markRunning have one serialized
+	// entry point; tests may replace it before invoking Start/markRunning.
+	s.startFn = g.Start
+	return s
+}
+
+// startGocronNow begins firing through the startFn seam. It MUST be called with
+// s.mu held: doing so serializes gocron's non-restartable Start against Stop's
+// g.Shutdown (also initiated under s.mu), so a concurrent Stop can never
+// interleave a Shutdown between this scheduler clearing gocronStarted and the
+// start taking effect. A nil seam falls back to g.Start.
+func (s *Scheduler) startGocronNow() {
+	if s.startFn != nil {
+		s.startFn()
+		return
+	}
+	if s.g != nil {
+		s.g.Start()
 	}
 }
 
@@ -397,16 +512,36 @@ func (s *Scheduler) RemoveApp(name string) {
 
 // Start begins firing scheduled jobs. Jobs added before Start fire from their
 // first cron tick; jobs added later (via ReplaceApp after Start) schedule
-// immediately. It is idempotent-ish: gocron's Start is safe to call once and
-// subsequent calls are no-ops while running.
+// immediately.
+//
+// Start defers gocron until the scheduler is running: if storage is not yet
+// ready (no usable outbox installed, or degraded), Start records the request and
+// returns without starting gocron, so a worker whose state database could not be
+// opened at startup never fires a schedule. When a later recovery installs a
+// usable outbox, markRunning starts the deferred gocron scheduler. It is
+// idempotent: gocron starts at most once.
 func (s *Scheduler) Start() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopped {
+		s.mu.Unlock()
 		return
 	}
-	s.g.Start()
-	s.log.Info("Cron scheduler started", "count", len(s.g.Jobs()))
+	s.startRequested = true
+	if !s.state.enabled() || s.gocronStarted || s.g == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.gocronStarted = true
+	count := len(s.g.Jobs())
+	// Call gocron's Start WHILE STILL HOLDING s.mu, so it is serialized against
+	// Stop's g.Shutdown (which Stop also initiates under s.mu): a concurrent
+	// Stop cannot slip its Shutdown into the unlock/g.Start gap and leave Start
+	// racing or restarting an already-shutdown gocron, which is not restartable
+	// after Shutdown. g.Start is non-blocking, and this mirrors ReplaceApp/
+	// RemoveApp, which already round-trip to gocron under s.mu.
+	s.startGocronNow()
+	s.mu.Unlock()
+	s.log.Info("Cron scheduler started", "count", count)
 }
 
 // JobCount returns the current number of registered schedule jobs. It is used
@@ -438,6 +573,13 @@ func (s *Scheduler) JobCount() int {
 // set instead of returning early. Under an expiring ctx it returns ctx.Err()
 // while the join continues in the background; a barrier re-invocation (with a
 // fresh context) then waits for the real completion. A nil scheduler is a no-op.
+//
+// It also cancels and joins the scheduler's storage bootstrap loop, if any, and
+// then closes any scheduler-OWNED outbox handle (a fallback store the bootstrap
+// opened because the worker's shared state handle was unavailable). Closing the
+// owned handle happens only after gocron, every publisher callback, the durable
+// retry worker, and the bootstrap have stopped, so no scheduler work can touch
+// the store after close. The worker's shared state handle is never touched here.
 func (s *Scheduler) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.stopped {
@@ -447,11 +589,15 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 		// callback may begin (and touch Redis) once Stop has started, and the
 		// watcher below joins those already admitted.
 		s.callbacks.close()
-		// Cancel the durable retry worker too: it touches Redis and the state
-		// DB, so it must be joined before either is torn down. Its in-flight
-		// attempt observes cancellation and leaves its record leased/recoverable.
+		// Cancel the durable retry worker and the storage bootstrap too: both
+		// touch Redis and the state DB, so they must be joined before either is
+		// torn down. An in-flight attempt observes cancellation and leaves its
+		// record leased/recoverable.
 		if s.pendingCancel != nil {
 			s.pendingCancel()
+		}
+		if s.bootstrapCancel != nil {
+			s.bootstrapCancel()
 		}
 		done := make(chan struct{})
 		s.shutdownDone = done
@@ -470,6 +616,7 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 	done := s.shutdownDone
 	callbacksDone := s.callbacks.doneCh()
 	pendingDone := s.pendingDone
+	bootstrapDone := s.bootstrapDone
 	s.mu.Unlock()
 
 	if err := waitShutdown(ctx, done, callbacksDone); err != nil {
@@ -482,9 +629,25 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	if bootstrapDone != nil {
+		select {
+		case <-bootstrapDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.shutdownErr
+	err := s.shutdownErr
+	closer := s.ownedCloser
+	s.ownedCloser = nil
+	s.mu.Unlock()
+	if closer != nil {
+		// A scheduler-owned handle is closed only here, after every scheduler
+		// goroutine has stopped. A close error is not fatal (mirrors the
+		// worker's state close).
+		_ = closer.Close()
+	}
+	return err
 }
 
 // waitShutdown waits under ctx for the gocron shutdown and every admitted Relay
@@ -532,6 +695,15 @@ func waitShutdown(ctx context.Context, shutdownDone, callbacksDone <-chan struct
 // aborts promptly. The schedule-path at-least-once contract after publication is
 // unchanged: the stream layer drives delivery, per-invocation retry, and DLQ.
 func (s *Scheduler) fire(ctx context.Context, fnName, scheduleName, handler string, parsed robfigcron.Schedule) {
+	// Storage gate: if live publication is paused (no usable outbox, degraded,
+	// or stopped) return BEFORE computing an occurrence, so a callback that
+	// arrives while degraded never even derives a due instant. The atomic gate
+	// is read without the scheduler lock.
+	if s.paused.Load() {
+		s.log.Debug("Schedule: tick skipped; scheduler not running",
+			"app", fnName, "schedule", scheduleName, "handler", handler)
+		return
+	}
 	now := s.now()
 	due, ok := latestOccurrence(parsed, now, occurrenceHorizon)
 	if !ok {

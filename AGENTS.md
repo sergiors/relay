@@ -147,6 +147,19 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   identity-mismatched row is logged, retained, and rescheduled under the bounded
   backoff, never published or deleted. Startup catch-up stays the bounded,
   latest-only 24h recovery for never-attempted misses and is unchanged.
+- The durable outbox is REQUIRED for scheduler correctness but is NOT a global
+  Relay dependency. The scheduler evaluates/publishes an occurrence only while a
+  usable outbox is installed; when `state.Open` fails at startup the scheduler is
+  marked unavailable (never starts gocron; one-hot `scheduler_state` gauge +
+  `scheduler_degraded_total`/`scheduler_recoveries_total`) and a scheduler-owned,
+  cancellable, joined bootstrap retries opening the store. It opens a
+  scheduler-owned handle (closed only after scheduler work stops; the shared
+  global handle is never touched), recovers rows, re-runs the same bounded
+  latest-only 24h catch-up, then enables live jobs. A runtime outbox failure
+  pauses live publication (degraded) and is never substituted by in-memory
+  retries; a publish+persist double failure is logged as unresolved, not durably
+  recoverable. Schedule firing is not a prerequisite for consumers, functions,
+  services, metrics/logging/tracing, readiness, or health.
 - Once published it reuses the stream retry/claim/DLQ machinery, so handler
   execution stays at-least-once. The execution contract is frozen at the
   occurrence's FIRST successful admission: before admission a delivery resolves

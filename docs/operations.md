@@ -110,9 +110,9 @@ cleared first on shutdown; it is bound to the worker lifecycle context, so a
 lifecycle cancellation that precedes the clear also reports not-ready. In steady
 state the answer reflects live Redis consumer health, a bounded Docker ping, and
 `NETWORKS` verification, so a dependency failing reports unhealthy and recovery
-reports healthy again. Per-app degraded/unavailable/invalid status, SQLite,
-optional tracing, and asynchronous service convergence/housekeeping do not gate
-worker health.
+reports healthy again. Per-app degraded/unavailable/invalid status, SQLite (and
+therefore the scheduler's storage state), optional tracing, and asynchronous
+service convergence/housekeeping do not gate worker health.
 
 There is no HTTP health/readiness endpoint; health is a CLI command.
 
@@ -177,6 +177,12 @@ relay_events_matched_total + relay_events_unmatched_total`, classified exactly
   (publication attempts made by the durable retry worker). A resolved attempt
   removes the outbox row; the publish outcome itself is still counted by the
   `relay_schedule_occurrences_*` families above.
+- **Scheduler storage state:** `relay_scheduler_state{state=running|degraded|unavailable}`
+  (one-hot gauge of the scheduler's durable-store state),
+  `relay_scheduler_degraded_total` (transitions into degraded because an outbox
+  operation failed), and `relay_scheduler_recoveries_total` (transitions back to
+  running after a bounded recovery). Schedule firing requires a usable outbox,
+  but this state does **not** gate worker readiness or event processing.
 - **Services:** `relay_service_reconciles_total{app,outcome}`,
   `relay_service_reconcile_duration_seconds{app}`.
 - **Anomaly:** `relay_missing_payload_total` (reclaimed PEL entries whose stream

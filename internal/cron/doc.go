@@ -21,13 +21,25 @@
 // Publication retries always reuse the same logical occurrence and therefore the
 // same deduplication identity. Retries are bounded and stop on success, a clean
 // duplicate, or lifecycle cancellation. A publication that does not resolve is
-// also persisted to a durable outbox (when one is wired via SetOutbox) and
-// retried indefinitely by StartPendingRetry's background worker, across
-// restarts, until it resolves; the row is deleted only after a publication call
-// returns a nil error (published or a clean duplicate). On startup, CatchUp may
-// republish the latest missed occurrence for each schedule within a bounded
-// recovery horizon; older occurrences are not replayed and future occurrences
-// are never synthesized.
+// also persisted to a durable outbox and retried indefinitely by the durable
+// retry worker (StartPendingRetry), across restarts, until it resolves; the row
+// is deleted only after a publication call returns a nil error (published or a
+// clean duplicate). On startup, CatchUp may republish the latest missed
+// occurrence for each schedule within a bounded recovery horizon; older
+// occurrences are not replayed and future occurrences are never synthesized.
+//
+// Storage gate: the scheduler may not evaluate or publish an occurrence unless a
+// usable durable outbox is installed (SetOutbox, or the storage bootstrap's
+// installOwnedOutbox). A live tick must be able to persist its occurrence if
+// Redis rejects the publish, so an outbox is required for scheduler correctness;
+// the worker marks the scheduler unavailable when no outbox could be opened
+// (MarkStorageUnavailable) and retries opening one (StartStorageBootstrap). A
+// runtime outbox failure pauses live publication (degraded) until the durable
+// retry worker observes that outbox operations work again, at which point the
+// scheduler recovers: it drains existing rows, re-runs the SAME bounded
+// latest-only catch-up for schedule time that passed while paused, and only then
+// re-enables live ticks. Schedule firing is deliberately NOT a prerequisite for
+// the event consumer, services, or worker readiness.
 //
 // gocron callbacks do not expose the scheduled due instant, so Relay derives the
 // latest occurrence at or before the callback time using the same cron parsing

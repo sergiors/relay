@@ -58,7 +58,7 @@ func (b *blockingPublisher) callCount() int {
 // sequencing waits, and there are no sleeps.
 func TestStopStrictlyJoinsInFlightCallbackAfterBound(t *testing.T) {
 	fp := newBlockingPublisher()
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.ReplaceApp("fn", schedTemplate("jobs.a", "0 3 * * *", "", ""))
 	s.Start()
 

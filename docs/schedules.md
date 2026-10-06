@@ -123,7 +123,16 @@ directly to its configured handler rather than matched against event patterns:
 
 ## Publication recovery
 
-A tick is not a single best-effort publish:
+A tick is not a single best-effort publish. Schedule publication **requires a
+usable durable store**: before a worker may fire a schedule it must have opened
+the local state database, because a live tick has to be able to persist its
+occurrence if Redis rejects the publish. The durable store is the scheduler's
+local SQLite outbox — the same state database Relay already uses — and, when it
+cannot be opened, the worker marks the scheduler **unavailable** (see
+[Storage availability](#storage-availability)) rather than firing schedules it
+could not recover.
+
+A tick is also not a single best-effort publish:
 
 - A failed publish retries the **same logical occurrence** (the ID is computed
   once and never recomputed) with a bounded exponential backoff — 100ms, 500ms,
@@ -154,6 +163,17 @@ A tick is not a single best-effort publish:
   decoded, or whose decoded intent would name a different occurrence, is never
   published and never deleted: it is logged and rescheduled under the same
   bounded backoff so the durable row is retained and repairable.
+- **A durable-store failure pauses publication.** If the persist step above
+  fails (the outbox is wired but the write errors), the worker does not fall
+  back to more in-memory retries: the occurrence is explicitly logged as
+  **unresolved** (it is not claimed to be durably recoverable), the scheduler
+  transitions to **degraded**, and live schedule publication stops until the
+  durable store answers again. The same degraded transition is raised by any
+  outbox operation failure in the retry worker (claim, reschedule, delete, or
+  next-due query). Rows already persisted remain recoverable.
+- On recovery the durable retry worker drains existing rows, re-runs the same
+  bounded **latest-only 24h catch-up** to cover schedule time that passed while
+  paused, and only then re-enables live ticks.
 - On startup, before jobs begin, each worker also performs a bounded
   **catch-up**: for each schedule it republishes the latest missed occurrence
   within a **24-hour horizon**, using the same bounded retry routine. Only the
@@ -167,6 +187,34 @@ The local state database therefore records a small, bounded outbox of
 unresolved publications — not execution history and never an execution source.
 `/apps` stays authoritative, and the row disappears as soon as publication
 resolves.
+
+## Storage availability
+
+Schedule firing depends on the local state database, but that dependency is
+**scoped to the scheduler**: it is required for correct schedule publication and
+is deliberately not a global worker dependency. Consumers, functions, services,
+metrics, logging, and tracing stay fully operational when the store is
+unavailable, and worker readiness (`relay health`) deliberately excludes it.
+
+- **Startup.** If the state database cannot be opened at startup, the worker
+  does **not** fail, does not start gocron, and marks the scheduler
+  **unavailable** (logged and exposed as a one-hot `scheduler_state` gauge). A
+  scheduler-owned, cancellable bootstrap then retries opening the store on a
+  fixed cadence. Once it opens, the worker initializes the outbox, recovers
+  existing rows, runs the bounded latest-only catch-up, and enables live jobs.
+  The recovered handle is owned by the scheduler and closed only after all
+  scheduler work has stopped — the worker's shared state handle is never
+  disturbed.
+- **Runtime.** If an outbox operation fails while running, the scheduler
+  transitions to **degraded**: callbacks arriving while degraded return before
+  computing or publishing an occurrence, so no attempt is made against a store
+  that cannot record it. The durable retry worker keeps probing the store,
+  backing off on error, and detects recovery; it never terminates the worker.
+- **Metrics.** `scheduler_state{state=running|degraded|unavailable}` is a
+  one-hot gauge, and `scheduler_degraded_total` /
+  `scheduler_recoveries_total` count entries into degraded and recoveries back
+  to running. `/apps` remains the source of schedule configuration: SQLite is
+  only the scheduler's durable publication-coordination store.
 
 ## Live changes
 
@@ -269,6 +317,14 @@ worker never got to attempt (a miss while it was down); older misses are dropped
 The fleet-level single-publication guarantee always rests on the atomic
 publish-if-new: any retry, durable retry, or catch-up that finds the key already
 present is a clean duplicate.
+
+The durable outbox is required for scheduler correctness: while it is
+unavailable the scheduler does not fire, but that affects **only** schedule
+publication. External event consumption, functions, services, metrics, logging,
+tracing, and worker readiness are unaffected (see
+[Storage availability](#storage-availability)). An outbox operation failure at
+runtime pauses publication (degraded); a recovery drains pending rows and re-runs
+the same bounded latest-only catch-up before live ticks resume.
 
 Schedule occurrences bypass event matching, so they do **not** advance the
 event-classification counters (`events_received_total`, `events_matched_total`,

@@ -42,7 +42,11 @@
 //     relay_schedule_occurrences_duplicate_total,
 //     relay_schedule_publish_failures_total, the bounded-retry counters
 //     relay_schedule_publish_retries_total / relay_schedule_publish_exhausted_total,
-//     and relay_schedule_catchup_total), plus CounterVecs
+//     and relay_schedule_catchup_total, plus the durable schedule-recovery
+//     counters relay_schedule_pending_persisted_total /
+//     relay_schedule_pending_retries_total, plus the scheduler storage-state
+//     transition counters relay_scheduler_degraded_total /
+//     relay_scheduler_recoveries_total), plus CounterVecs
 //     relay_handler_invocations_total{outcome,app,handler},
 //     relay_app_build_failures_total{app}, the per-app operational
 //     counters relay_app_events_matched_total{app},
@@ -61,8 +65,11 @@
 //     (Redis backlog depth and age sampled by the stream consumer),
 //     relay_buffered_events (the consumer's local in-flight buffer occupancy),
 //     relay_in_flight_invocations (the runner's current executing
-//     invocation count), and relay_app_status{app,status} (one-hot
-//     public lifecycle: exactly one of the closed status set is 1).
+//     invocation count), relay_app_status{app,status} (one-hot
+//     public lifecycle: exactly one of the closed status set is 1), and
+//     relay_scheduler_state{state=running|degraded|unavailable} (one-hot
+//     scheduler storage state; schedule firing is not a prerequisite for event
+//     processing).
 //   - Selective operational counters: relay_redis_read_errors_total{operation}
 //     (failed Redis reads by the finite operation set; no raw error label) and
 //     relay_service_reconciles_total{app,outcome=changed|unchanged|error}

@@ -212,7 +212,7 @@ func TestPublishHealthyPathsDoNotTouchOutbox(t *testing.T) {
 			fp := newFakePublisher(4)
 			fp.published = tc.pub
 			ob := newFakeOutbox()
-			s := NewWithMetrics(fp, testLogger(), m)
+			s := testSchedulerWithMetrics(fp, testLogger(), m)
 			s.now = func() time.Time { return frozen }
 			s.wait = noWait
 			s.SetOutbox(ob)
@@ -245,7 +245,7 @@ func TestPublishExhaustionPersistsOccurrence(t *testing.T) {
 	fp := newFakePublisher(16)
 	fp.err = errBoom
 	ob := newFakeOutbox()
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	s.SetOutbox(ob)
@@ -298,7 +298,7 @@ func TestPublishInMemoryRecoveryResolvesPending(t *testing.T) {
 		{published: true},
 	}
 	ob := newFakeOutbox()
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	s.SetOutbox(ob)
@@ -328,7 +328,7 @@ func TestPublishCancellationPersistsAndLeavesRecoverable(t *testing.T) {
 	fp := newFakePublisher(8)
 	fp.err = errBoom
 	// A cancelled wait stops the bounded loop after the first failure.
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return frozen }
 	s.wait = func(context.Context, time.Duration) bool { return false }
 	ob := newFakeOutbox()
@@ -359,7 +359,7 @@ func TestRunPendingOncePublishesAndDeletes(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
-	s := NewWithMetrics(fp, testLogger(), m)
+	s := testSchedulerWithMetrics(fp, testLogger(), m)
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -393,7 +393,7 @@ func TestRunPendingOnceDuplicateResolves(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -416,7 +416,7 @@ func TestRunPendingOnceFailureReschedules(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -451,7 +451,7 @@ func TestRunPendingOnceDeleteFailureRetainsRow(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -473,7 +473,7 @@ func TestRunPendingOnceCancellationLeavesRow(t *testing.T) {
 	o := pendingOccurrence("a", "jobs.a")
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -504,7 +504,7 @@ func TestRunPendingOnceClaimExpiryRescan(t *testing.T) {
 	ob.rows[o.ID()].leaseUntil = frozen.Add(-time.Second)
 	ob.mu.Unlock()
 
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -532,7 +532,7 @@ func TestOverlappingImmediateAndRetryPublishesSafe(t *testing.T) {
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
 	makeSched := func() *Scheduler {
-		s := New(pub, testLogger())
+		s := testScheduler(pub, testLogger())
 		s.now = func() time.Time { return frozen }
 		s.SetOutbox(ob)
 		return s
@@ -610,7 +610,7 @@ func TestStartPendingRetryScansAndStops(t *testing.T) {
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
 	fp := newSignalPublisher()
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -644,7 +644,7 @@ func TestStopCancelsAndJoinsPendingRetry(t *testing.T) {
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
 	fp := newBlockingPendingPublisher()
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -689,7 +689,7 @@ func TestPendingRetryLoopDoesNotBusyPoll(t *testing.T) {
 
 	t.Run("empty outbox waits indefinitely", func(t *testing.T) {
 		ob := newFakeOutbox()
-		s := New(newFakePublisher(1), testLogger())
+		s := testScheduler(newFakePublisher(1), testLogger())
 		s.now = func() time.Time { return frozen }
 		s.SetOutbox(ob)
 		var got []time.Duration
@@ -707,7 +707,7 @@ func TestPendingRetryLoopDoesNotBusyPoll(t *testing.T) {
 		ob := newFakeOutbox()
 		o := pendingOccurrence("a", "jobs.a")
 		seedPending(t, ob, o, frozen.Add(3*time.Minute), 0)
-		s := New(newFakePublisher(1), testLogger())
+		s := testScheduler(newFakePublisher(1), testLogger())
 		s.now = func() time.Time { return frozen }
 		s.SetOutbox(ob)
 		var saw time.Duration
@@ -727,7 +727,7 @@ func TestPendingRetryLoopDoesNotBusyPoll(t *testing.T) {
 func TestPendingRetryLoopWakesOnPersist(t *testing.T) {
 	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	ob := newFakeOutbox()
-	s := New(newFakePublisher(1), testLogger())
+	s := testScheduler(newFakePublisher(1), testLogger())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -769,7 +769,7 @@ func TestPendingRetryScanErrorDoesNotSpin(t *testing.T) {
 	frozen := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
 	ob := newFakeOutbox()
 	ob.claimErr = errBoom
-	s := New(newFakePublisher(1), testLogger())
+	s := testScheduler(newFakePublisher(1), testLogger())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -796,7 +796,7 @@ func TestDurableRetryLogsDistinguishOutcomes(t *testing.T) {
 	var bufExhaust testutil.SyncBuffer
 	fp := newFakePublisher(16)
 	fp.err = errBoom
-	s := NewWithMetrics(fp, slog.New(slog.NewTextHandler(&bufExhaust, &slog.HandlerOptions{Level: slog.LevelDebug})), metrics.New())
+	s := testSchedulerWithMetrics(fp, slog.New(slog.NewTextHandler(&bufExhaust, &slog.HandlerOptions{Level: slog.LevelDebug})), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	s.SetOutbox(newFakeOutbox())
@@ -812,7 +812,7 @@ func TestDurableRetryLogsDistinguishOutcomes(t *testing.T) {
 		p := newFakePublisher(4)
 		p.published, p.err = pub, pubErr
 		var buf testutil.SyncBuffer
-		sc := NewWithMetrics(p, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), metrics.New())
+		sc := testSchedulerWithMetrics(p, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), metrics.New())
 		sc.now = func() time.Time { return frozen }
 		sc.SetOutbox(ob)
 		if _, err := sc.RunPendingOnce(context.Background()); err != nil {
@@ -839,7 +839,7 @@ func TestPendingRetryIndependentOfLiveScheduleChanges(t *testing.T) {
 	fp := newFakePublisher(16)
 	fp.err = errBoom
 	ob := newFakeOutbox()
-	s := NewWithMetrics(fp, testLogger(), metrics.New())
+	s := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s.now = func() time.Time { return frozen }
 	s.wait = noWait
 	s.SetOutbox(ob)
@@ -865,7 +865,7 @@ func TestPendingRetryIndependentOfLiveScheduleChanges(t *testing.T) {
 	// schedule no longer exists locally.
 	fp2 := newFakePublisher(4)
 	fp2.published = true
-	s2 := NewWithMetrics(fp2, testLogger(), metrics.New())
+	s2 := testSchedulerWithMetrics(fp2, testLogger(), metrics.New())
 	s2.now = func() time.Time { return frozen }
 	s2.SetOutbox(ob)
 	if n, err := s2.RunPendingOnce(context.Background()); err != nil || n != 1 {
@@ -933,7 +933,7 @@ func TestRunPendingOnceCorruptOrMismatchedIdentityNeverPublishes(t *testing.T) {
 
 			var buf testutil.SyncBuffer
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			s := NewWithMetrics(fp, logger, metrics.New())
+			s := testSchedulerWithMetrics(fp, logger, metrics.New())
 			s.now = func() time.Time { return frozen }
 			s.SetOutbox(ob)
 
@@ -987,7 +987,7 @@ func TestStopJoinsPendingRetryBeforeGocronStart(t *testing.T) {
 	seedPending(t, ob, o, frozen.Add(-time.Minute), 0)
 
 	fp := newBlockingPendingPublisher()
-	s := New(fp, testLogger())
+	s := testScheduler(fp, testLogger())
 	s.now = func() time.Time { return frozen }
 	s.SetOutbox(ob)
 
@@ -1025,10 +1025,19 @@ func TestStopJoinsPendingRetryBeforeGocronStart(t *testing.T) {
 
 // TestStartPendingRetryNoopWithoutOutboxOrAfterStop pins the guard rails: with no
 // outbox there is nothing to run, and after Stop the worker is not resurrected.
+// It deliberately builds a NO-OUTBOX scheduler (raw New) so the "no outbox" leg
+// is exercised; production never leaves the scheduler without an outbox (it is
+// either installed or the scheduler is marked unavailable).
 func TestStartPendingRetryNoopWithoutOutboxOrAfterStop(t *testing.T) {
 	s := New(newFakePublisher(1), testLogger())
 	// No outbox: start is a no-op and Stop returns immediately.
 	s.StartPendingRetry(context.Background())
+	s.mu.Lock()
+	started := s.pendingDone
+	s.mu.Unlock()
+	if started != nil {
+		t.Fatal("StartPendingRetry started a worker with no outbox")
+	}
 	if err := s.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop = %v, want nil", err)
 	}
@@ -1077,7 +1086,7 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 	// Immediate publish exhausts its bounded budget and persists.
 	fp := newFakePublisher(16)
 	fp.err = errBoom
-	s1 := NewWithMetrics(fp, testLogger(), metrics.New())
+	s1 := testSchedulerWithMetrics(fp, testLogger(), metrics.New())
 	s1.now = func() time.Time { return frozen }
 	s1.wait = noWait
 	s1.SetOutbox(st1)
@@ -1095,7 +1104,7 @@ func TestDurableRetryThroughRealStateDB(t *testing.T) {
 	st2.SetLogger(testutil.DiscardLogger())
 	fp2 := newFakePublisher(4)
 	fp2.published = true
-	s2 := NewWithMetrics(fp2, testLogger(), metrics.New())
+	s2 := testSchedulerWithMetrics(fp2, testLogger(), metrics.New())
 	s2.now = func() time.Time { return frozen }
 	s2.SetOutbox(st2)
 

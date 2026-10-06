@@ -132,8 +132,14 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 // a crash during the bounded backoff window still leaves the occurrence
 // recoverable. The durable row is deleted only when this call resolves with a nil
 // error (published or clean duplicate), so a row never outlives a resolved
-// publication. With no outbox configured the loop is exactly the bounded
-// in-memory retry it always was.
+// publication.
+//
+// A persist failure (an outbox is installed but the write errors) is NOT
+// recovered by more in-memory retries: the scheduler is driven degraded and the
+// occurrence is returned unresolved. With no outbox installed the loop is the
+// bounded in-memory retry it always was (standalone/test schedulers); production
+// never enters that mode because the scheduler is gated on an installed outbox
+// and marked unavailable otherwise.
 //
 // One `schedule.publish` logical span wraps the WHOLE retry loop, so all
 // attempts of one occurrence share a single trace. The Publisher opens its own
@@ -145,6 +151,20 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 // failure and each duplicate result as a duplicate. This loop adds the
 // bounded-policy counters (retries performed, and exhaustion of the budget).
 func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence, catchUp bool) (published, resolved bool) {
+	return s.publish(ctx, o, catchUp, true)
+}
+
+// publish is the shared body of publishOccurrence. gated enables the storage
+// gate: live ticks (and the ordinary startup catch-up) pass true, while an
+// explicit recovery catch-up passes false so it can publish schedule time that
+// passed while the scheduler was paused, BEFORE markRunning re-enables live
+// ticks. The atomic pause gate is read without the scheduler lock.
+func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp, gated bool) (published, resolved bool) {
+	if gated && s.paused.Load() {
+		s.log.Debug("Schedule: publication skipped; scheduler not running",
+			"app", o.App, "schedule", o.Schedule, "handler", o.Handler, "catchup", catchUp)
+		return false, false
+	}
 	ctx, span := tracing.Start(ctx, "schedule.publish",
 		trace.WithAttributes(
 			attribute.String("relay.app", o.App),
@@ -174,7 +194,9 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 			// context, so this succeeds even though ctx is already done.
 			log.Debug("Schedule: publish cancelled before first attempt", "catchup", catchUp)
 			span.SetAttributes(attribute.String("relay.outcome", "cancelled"))
-			s.persistPending(o, log)
+			if _, perr := s.persistPending(o, log); perr != nil {
+				s.markDegraded(perr)
+			}
 			return false, false
 		}
 		if attempt > 0 {
@@ -207,7 +229,23 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 			// during the bounded backoff window still leaves the occurrence
 			// recoverable. A healthy first-attempt success/duplicate never
 			// reaches here, so the local DB is untouched on the healthy path.
-			queued = s.persistPending(o, log)
+			var perr error
+			queued, perr = s.persistPending(o, log)
+			if perr != nil {
+				// An outbox is installed but persisting failed. In-memory
+				// retries cannot substitute for durability: the occurrence would
+				// be lost on a crash. Pause live publication immediately and
+				// surface this occurrence as explicitly UNRESOLVED (not durably
+				// recoverable) rather than continuing to retry in memory.
+				s.markDegraded(perr)
+				span.RecordError(perr)
+				span.SetStatus(codes.Error, perr.Error())
+				span.SetAttributes(attribute.String("relay.outcome", "unresolved"))
+				log.Warn("Schedule: occurrence unresolved; publish and durable persist both failed",
+					"app", o.App, "schedule", o.Schedule, "handler", o.Handler,
+					"occurrence_id", id, "catchup", catchUp, "reason", err)
+				return false, false
+			}
 		}
 		if ctx.Err() != nil {
 			// The attempt failed because the lifecycle was cancelled (the
@@ -227,7 +265,9 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 			log.Warn("Schedule: publish retries exhausted", "attempts", attempt+1, "catchup", catchUp, "reason", err)
 			// The bounded in-memory budget is spent; the durable record (when
 			// configured) now carries the occurrence to the retry worker, which
-			// keeps trying across temporary/long outages and restarts.
+			// keeps trying across temporary/long outages and restarts. With no
+			// outbox (standalone/test schedulers) there is no durable copy, which
+			// is the documented bounded-retry-only behavior.
 			return false, false
 		}
 
@@ -263,20 +303,46 @@ func (s *Scheduler) publishOccurrence(ctx context.Context, o schedule.Occurrence
 //     worker independently performs races on one Redis key, so exactly one
 //     stream entry is written and a repeated recovery (across workers or
 //     restarts) is a harmless no-op. This is why duplicate catch-up is safe.
-//   - It runs at most once per Scheduler: live ReplaceApp calls must never
-//     synthesize additional catch-up (a changed schedule converges FUTURE
-//     occurrences only).
+//   - It runs at most once per Scheduler lifecycle: live ReplaceApp calls must
+//     never synthesize additional catch-up (a changed schedule converges FUTURE
+//     occurrences only). A recovery from a paused period re-runs the SAME
+//     bounded scan, which is idempotent under the atomic dedup.
 //
 // It returns the number of occurrences newly published by this worker (not
 // counting clean duplicates another worker won). A cancelled ctx aborts the
 // scan with whatever it has published so far.
 func (s *Scheduler) CatchUp(ctx context.Context) int {
+	// A catch-up while live publication is paused (no usable outbox, degraded,
+	// or stopped) would publish nothing and must NOT consume the once-only flag:
+	// the recovery path re-runs the same bounded scan once storage is usable.
+	if s.paused.Load() {
+		s.log.Debug("Schedule: catch-up skipped; scheduler not running")
+		return 0
+	}
 	s.mu.Lock()
 	if s.stopped || s.catchUpDone {
 		s.mu.Unlock()
 		return 0
 	}
 	s.catchUpDone = true
+	s.mu.Unlock()
+	return s.catchUpScan(ctx, true)
+}
+
+// catchUpScan is the shared bounded latest-only catch-up scan used by both the
+// once-per-startup CatchUp and a recovery from a paused period. It republishes,
+// per registered schedule, the latest occurrence at or before one `now` snapshot
+// within occurrenceHorizon, through the same bounded retry routine as a live
+// tick. It is idempotent under the atomic publish-if-new, so a recovery scan
+// cannot double-publish. gated distinguishes the ordinary (paused-gated) startup
+// catch-up from a recovery scan, which runs while the scheduler is still paused
+// but with the outbox freshly installed.
+func (s *Scheduler) catchUpScan(ctx context.Context, gated bool) int {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return 0
+	}
 	entries := make([]registeredSchedule, len(s.schedules))
 	copy(entries, s.schedules)
 	s.mu.Unlock()
@@ -293,10 +359,24 @@ func (s *Scheduler) CatchUp(ctx context.Context) int {
 		// counter, so the two are independent.
 		s.metrics.Inc(metrics.MetricScheduleCatchUp)
 		o := schedule.Occurrence{App: e.fn, Schedule: e.name, Handler: e.handler, ScheduledAt: due}
-		if pub, resolved := s.publishOccurrence(ctx, o, true); resolved && pub {
+		if pub, resolved := s.publish(ctx, o, true, gated); resolved && pub {
 			published++
 		}
 	}
-	s.log.Debug("Schedule: startup catch-up complete", "schedules", len(entries), "published", published)
+	s.log.Debug("Schedule: catch-up scan complete", "schedules", len(entries), "published", published)
 	return published
+}
+
+// recoveryCatchUp re-runs the bounded latest-only catch-up after the scheduler
+// recovers from an unavailable or degraded period, to cover schedule time that
+// passed while live publication was paused. It deliberately reuses the exact
+// same 24h latest-only policy and atomic-dedup semantics as startup catch-up: it
+// is a bounded recovery, never an unbounded backlog replay. It runs UNGATED
+// (the scheduler is still paused while recovering) so the recovered occurrences
+// can be published before live ticks are re-enabled.
+func (s *Scheduler) recoveryCatchUp(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.catchUpScan(ctx, false)
 }

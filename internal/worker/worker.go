@@ -36,6 +36,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/signal"
 	"sync"
@@ -587,8 +588,11 @@ func Run(logger *slog.Logger) error {
 		"duration", time.Since(fingerprintStart),
 	)
 
-	// All state errors are non-fatal. A nil handle is never registered, so
-	// shutdown simply skips its close.
+	// All state errors are non-fatal to the worker as a whole, but the scheduler
+	// requires the durable outbox for correctness: a nil handle is never
+	// registered for close, the scheduler is marked unavailable and a
+	// scheduler-owned bootstrap retries opening the store (see the scheduler
+	// wiring below). Consumers, services, metrics, and readiness are unaffected.
 	_, stateSpan := tracing.Start(startupCtx, "state.initialize")
 	st, err := state.Open(state.DBPath)
 	if err != nil {
@@ -947,22 +951,24 @@ func Run(logger *slog.Logger) error {
 	// task goroutine is still running), so a Relay publisher callback — or the
 	// durable retry worker — can outlive g.Shutdown and still touch Redis. This
 	// barrier strictly joins both the gocron shutdown, every admitted publisher
-	// callback, AND the durable retry worker. Registering it here means an early
-	// startup failure after this point still joins them before the later state/
-	// Redis teardown runs, rather than leaving the retry worker mid-operation.
-	// Stop is idempotent and also guards against a scheduler that was never
-	// Started, so an early-return shutdown is safe.
+	// callback, the durable retry worker, AND (when storage was unavailable at
+	// startup) the scheduler-owned storage-bootstrap loop, before closing any
+	// scheduler-owned state handle. Redis is released in a later step, so this
+	// guarantees no scheduler work can touch Redis or SQLite after the step
+	// returns. Registering it here means an early startup failure after this
+	// point still joins them. Stop is idempotent and also guards against a
+	// scheduler that was never Started, so an early-return shutdown is safe.
 	shutdown.register(schedulerBarrierStep(sched.Stop))
-	// Wire the durable publication-retry outbox and worker. When the local
-	// state DB is unavailable (st==nil) there is no durable store, so the
-	// scheduler keeps its bounded in-memory retry only — state failures are
-	// never fatal. The retry worker is started BEFORE catch-up so a record
-	// persisted by a failed catch-up is retried promptly; the barrier above
-	// already covers it.
-	if st != nil {
-		sched.SetOutbox(st)
-		sched.StartPendingRetry(ctx)
-	}
+	// Schedule firing REQUIRES a usable durable outbox: a live tick must be able
+	// to persist its occurrence if Redis rejects the publish. The outbox is the
+	// local state DB. When the shared handle opened above (st) is available it is
+	// wired directly; when it is nil, the scheduler is explicitly marked
+	// unavailable (it will NOT fire) and a scheduler-owned bootstrap retries
+	// opening the store on the fixed delay. SQLite is required for scheduler
+	// correctness, but it is NOT a global worker dependency: consumers,
+	// functions, services, metrics, logging, and tracing stay operational either
+	// way, and worker readiness deliberately excludes it.
+	wireSchedulerStorage(ctx, sched, st, schedulerStorageOpener(state.DBPath, logger, metricsInstance))
 	for _, fn := range apps {
 		sched.ReplaceApp(fn.Name, fn.Template)
 	}
@@ -974,7 +980,9 @@ func Run(logger *slog.Logger) error {
 	// reconciler can converge live changes and before Start; the existing atomic
 	// publish-if-new makes a catch-up that another worker already published a
 	// harmless duplicate. Older misses are intentionally dropped (bounded
-	// recovery, not backlog replay).
+	// recovery, not backlog replay). When storage is unavailable this is a no-op
+	// and does NOT consume the once-only flag: the storage-bootstrap recovery
+	// re-runs the same bounded scan once the outbox is usable.
 	catchUpCtx, catchUpSpan := tracing.Start(startupCtx, "schedule.catchup")
 	if n := sched.CatchUp(catchUpCtx); n > 0 {
 		logger.Info("Scheduler: startup catch-up published missed occurrences", "count", n)
@@ -1591,6 +1599,69 @@ func shutdownServices(
 ) error {
 	_, err := svcCtrl.ShutdownCleanup(ctx, hostname)
 	return err
+}
+
+// schedulerStorage is the narrow scheduler view the worker's storage wiring
+// needs. *cron.Scheduler satisfies it. It is defined here (not in cron) so the
+// worker-owned wiring decision — install the shared handle when available, or
+// mark unavailable and start a bootstrap otherwise — is unit-testable with a
+// deterministic fake and without a real state DB or gocron.
+type schedulerStorage interface {
+	SetOutbox(o cron.Outbox)
+	StartPendingRetry(ctx context.Context)
+	MarkStorageUnavailable()
+	StartStorageBootstrap(ctx context.Context, open cron.OutboxOpener)
+}
+
+var _ schedulerStorage = (*cron.Scheduler)(nil)
+
+// wireSchedulerStorage connects the scheduler to its durable outbox. A non-nil
+// shared state handle is installed and its durable retry worker started, which
+// enables schedule publication. A nil shared handle means the global
+// state.Open failed: the scheduler is marked unavailable (so it never fires a
+// schedule without a durable store) and a scheduler-owned, cancellable bootstrap
+// retries opening the store; on success the bootstrap installs it, recovers
+// existing rows, runs the bounded latest-only catch-up, and enables publication.
+// It never fails and never gates the event consumer or services.
+func wireSchedulerStorage(
+	ctx context.Context,
+	sched schedulerStorage,
+	shared *state.State,
+	open cron.OutboxOpener,
+) {
+	if shared != nil {
+		sched.SetOutbox(shared)
+		sched.StartPendingRetry(ctx)
+		return
+	}
+	sched.MarkStorageUnavailable()
+	// Record the lifecycle first so a later bootstrap recovery can start the
+	// durable retry worker without re-supplying the context; no worker is started
+	// while no outbox is installed.
+	sched.StartPendingRetry(ctx)
+	sched.StartStorageBootstrap(ctx, open)
+}
+
+// schedulerStorageOpener returns the cron.OutboxOpener the worker's
+// storage-unavailable bootstrap uses to retry opening the scheduler's durable
+// outbox (the local state DB) when the shared handle could not be opened at
+// startup. path is state.DBPath in production; it is a parameter so the retry
+// path is unit-testable without touching the fixed production location. The
+// opened *state.State is a scheduler-OWNED handle: cron closes it after all
+// scheduler work has stopped, so the shared global handle is never touched. It
+// deliberately calls state.Open path — the smallest clean equivalent — and wires
+// the same status observer so a recovered store's status writes still project
+// onto the app_status gauge.
+func schedulerStorageOpener(path string, logger *slog.Logger, metricsInstance *metrics.Registry) cron.OutboxOpener {
+	return func() (cron.Outbox, io.Closer, error) {
+		st, err := state.Open(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		st.SetLogger(logger)
+		wireStatusObserver(st, metricsInstance)
+		return st, st, nil
+	}
 }
 
 // setupMetrics constructs the metrics components. The accounting registry is
