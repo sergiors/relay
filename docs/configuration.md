@@ -29,7 +29,7 @@ automatically.
 | `MAX_CONCURRENT_BUILDS`       | `2`                | positive integer                                                        | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                  |
 | `MAX_WARM_CONTAINERS`         | `8`                | positive integer                                                        | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.        |
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
-| `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)                      | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                |
+| `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
 | `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
 | `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
@@ -134,11 +134,15 @@ counts invocations that had to wait at the bound.
 `MAX_EVENT_BYTES` caps the byte length of a message's raw `event` **value**, not
 the whole Redis entry: the entry and the go-redis response have already been
 materialized before Relay can inspect the value, so this is a pre-decode
-guard at the Relay boundary, not transport-level protection. The default is
-256 KiB (`262144`); the hard ceiling is 1 MiB (`1048576`) and a larger value is a
-fatal configuration error. Zero is **not** "unlimited": it is rejected, so the
-cap is always a real bound. The default applies when the variable is unset or
-empty.
+guard at the Relay boundary, not transport-level protection. The value is a
+human-readable binary size — an integer with an optional case-sensitive binary
+suffix `B`, `KiB`, `MiB`, or `GiB` (e.g. `256B`, `256KiB`, `1MiB`) — or a bare
+integer byte count for backwards compatibility with the former numeric form
+(e.g. `262144`). The default is `256KiB` (262144 bytes); the hard ceiling is
+`1MiB` (1048576 bytes) and a larger value is a fatal configuration error.
+Decimal suffixes (`KB`/`MB`/`GB`) are rejected so a size is never ambiguous, and
+zero is **not** "unlimited": it is rejected, so the cap is always a real bound.
+The default applies when the variable is unset or empty.
 
 A delivered message whose raw `event` value exceeds the cap is rejected before
 JSON decode, schedule classification, event matching, invocation-state

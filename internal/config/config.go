@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"relay/internal/bytesize"
 )
 
 // Config holds the application settings Relay's runtime (see internal/worker)
@@ -99,15 +101,18 @@ type Config struct {
 	// worker before they complete/ACK. It bounds the local buffer so the
 	// backlog stays in Redis when full. It is always positive after Load.
 	MaxBufferedEvents int
-	// MaxEventBytes is the MAX_EVENT_BYTES value (default 262144, hard max
-	// 1048576): the maximum byte length of a message's raw `event` field. A
-	// message whose raw event value exceeds it is rejected before JSON decode,
-	// schedule classification, event matching, and handler execution, and is
-	// routed to the DLQ with a bounded diagnostic summary instead of the
-	// payload. It bounds the RAW event value only — not the whole Redis entry
-	// or its RESP/response overhead, which Redis and go-redis have already
-	// materialized before Relay can inspect it. It is always positive after
-	// Load: zero is rejected, never read as "unlimited".
+	// MaxEventBytes is the MAX_EVENT_BYTES value (default 256KiB, hard max
+	// 1MiB): the maximum byte length of a message's raw `event` field. The
+	// environment value accepts a human-readable binary size (B/KiB/MiB/GiB)
+	// or a bare integer byte count for backwards compatibility (see
+	// ParseMaxEventBytes). A message whose raw event value exceeds it is
+	// rejected before JSON decode, schedule classification, event matching,
+	// and handler execution, and is routed to the DLQ with a bounded
+	// diagnostic summary instead of the payload. It bounds the RAW event
+	// value only — not the whole Redis entry or its RESP/response overhead,
+	// which Redis and go-redis have already materialized before Relay can
+	// inspect it. It is always positive after Load: zero is rejected, never
+	// read as "unlimited".
 	MaxEventBytes int
 	// Networks is the NETWORKS value: the ordered, de-duplicated global
 	// workload network set. It applies to both execution containers and
@@ -238,7 +243,8 @@ const (
 // UNSET, while an explicitly empty value disables the respective retention (0).
 // MAX_CONCURRENT_INVOCATIONS and MAX_CONCURRENT_BUILDS default to 8 and 2, and
 // MAX_BUFFERED_EVENTS to 16 (see ParsePositiveInt); MAX_EVENT_BYTES
-// defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
+// defaults to 256KiB with a hard ceiling of 1MiB and accepts a human-readable
+// binary size or a bare integer byte count (see ParseMaxEventBytes);
 // MAX_WARM_CONTAINERS defaults to 8; an invalid (zero, negative, non-integer,
 // or above-limit) value is a returned configuration error. The retention
 // windows instead log-and-disable rather than failing startup.
@@ -321,7 +327,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.MaxBufferedEvents = maxBufferedEvents
 
-	maxEventBytes, err := loadMaxEventBytes(getEnv("MAX_EVENT_BYTES", strconv.Itoa(DefaultMaxEventBytes)))
+	maxEventBytes, err := loadMaxEventBytes(getEnv("MAX_EVENT_BYTES", bytesize.Format(DefaultMaxEventBytes)))
 	if err != nil {
 		return Config{}, err
 	}
@@ -377,26 +383,24 @@ func loadMaxEventBytes(value string) (int, error) {
 
 // ParseMaxEventBytes parses the MAX_EVENT_BYTES value: the maximum byte length
 // of a message's raw `event` field. Callers resolve the default at the getEnv
-// call site. It accepts any parseable positive integer up to MaxEventBytesLimit
-// (surrounding whitespace trimmed) and rejects empty, non-numeric, float,
-// zero, negative, overflow, and above-limit values; the error names the
-// variable, the required form, and the hard maximum. Zero is never read as
+// call site. It accepts a human-readable binary size (B, KiB, MiB, or GiB; e.g.
+// "256KiB", "1MiB") or a bare positive integer byte count for backwards
+// compatibility (e.g. "262144"), up to MaxEventBytesLimit (surrounding
+// whitespace trimmed). It rejects empty, non-numeric, float, zero, negative,
+// decimal units (KB/MB/GB), overflow, and above-limit values; the error names
+// the variable, the required form, and the hard maximum. Zero is never read as
 // "unlimited": the cap must always be a real bound. It is the ceiling analogue
 // of ParsePositiveInt, so a typo fails startup instead of silently removing the
 // oversized-message guard.
 func ParseMaxEventBytes(name, value string) (int, error) {
-	v := strings.TrimSpace(value)
-	n, err := strconv.Atoi(v)
+	n, err := bytesize.ParseSize(value)
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: must be a positive integer no greater than %d", name, value, MaxEventBytesLimit)
+		return 0, fmt.Errorf("invalid %s %q: %v (hard maximum %s)", name, value, err, bytesize.Format(MaxEventBytesLimit))
 	}
-	if n <= 0 {
-		return 0, fmt.Errorf("invalid %s %q: must be a positive integer no greater than %d", name, value, MaxEventBytesLimit)
+	if n > int64(MaxEventBytesLimit) {
+		return 0, fmt.Errorf("invalid %s %q: must be no greater than %s", name, value, bytesize.Format(MaxEventBytesLimit))
 	}
-	if n > MaxEventBytesLimit {
-		return 0, fmt.Errorf("invalid %s %q: must be no greater than %d", name, value, MaxEventBytesLimit)
-	}
-	return n, nil
+	return int(n), nil
 }
 
 // ParsePositiveInt parses a positive-integer environment value. Callers resolve

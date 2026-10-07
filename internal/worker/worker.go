@@ -47,6 +47,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 
 	"relay/internal/app"
+	"relay/internal/bytesize"
 	"relay/internal/config"
 	"relay/internal/cron"
 	gitwh "relay/internal/git/webhook"
@@ -163,6 +164,24 @@ func effectiveMaxEventBytes(n int) int {
 		return stream.DefaultMaxEventBytes
 	}
 	return n
+}
+
+// logConcurrencyLimits emits the startup "Concurrency limits" summary. Each
+// value is the one actually enforced: the invocation/build/buffered limits go
+// through the same <1 normalization their consumers apply, max_warm_containers
+// is used verbatim, and max_event_bytes is rendered as a human-readable binary
+// size (via bytesize.Format) so the enforced 256 KiB default logs as
+// "256KiB" rather than its raw 262144 byte count. It is split out of Run so the
+// emitted summary is testable without exercising the full worker startup.
+func logConcurrencyLimits(logger *slog.Logger, cfg config.Config) {
+	logger.Info(
+		"Concurrency limits",
+		"max_concurrent_invocations", effectiveMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
+		"max_concurrent_builds", effectiveMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
+		"max_warm_containers", cfg.MaxWarmContainers,
+		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
+		"max_event_bytes", bytesize.Format(int64(effectiveMaxEventBytes(cfg.MaxEventBytes))),
+	)
 }
 
 // errStartupInterrupted marks a fallible startup operation that failed only
@@ -1050,14 +1069,7 @@ func Run(logger *slog.Logger) error {
 	}
 	catchUpSpan.End()
 
-	logger.Info(
-		"Concurrency limits",
-		"max_concurrent_invocations", effectiveMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
-		"max_concurrent_builds", effectiveMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
-		"max_warm_containers", cfg.MaxWarmContainers,
-		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
-		"max_event_bytes", effectiveMaxEventBytes(cfg.MaxEventBytes),
-	)
+	logConcurrencyLimits(logger, cfg)
 
 	// Watch /apps and reconcile apps live: rebuild changed images,
 	// discover new ones, drop removed ones. The runner's registry is swapped

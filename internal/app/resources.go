@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"regexp"
-	"strconv"
 
 	"gopkg.in/yaml.v3"
+
+	"relay/internal/bytesize"
 )
 
 // Default per-container resource limits applied to an app whose template
@@ -31,20 +31,6 @@ const (
 // fingerprint. 16 hex chars = 64 bits, matching the service identity/env hash
 // convention (serviceIdentityHashLen) so resource labels share one shape.
 const resourceFingerprintLen = 16
-
-// memoryPattern matches a binary-size memory limit: a positive integer followed
-// by exactly one of the binary suffixes KiB, MiB, or GiB. Decimal suffixes
-// (KB/MB/GB) and un-suffixed numbers are deliberately rejected: Docker's
-// memory limit is binary, and accepting both families would make "1MB" and
-// "1MiB" ambiguous to a template author.
-var memoryPattern = regexp.MustCompile(`^([0-9]+)(KiB|MiB|GiB)$`)
-
-// memoryUnitBytes maps the accepted binary suffix to its byte multiplier.
-var memoryUnitBytes = map[string]int64{
-	"KiB": 1 << 10,
-	"MiB": 1 << 20,
-	"GiB": 1 << 30,
-}
 
 // ResourceLimits is an app's EFFECTIVE per-container resource configuration:
 // every field is resolved (never zero) after ParseTemplate. It is a plain value
@@ -159,9 +145,9 @@ func resolveResourceLimits(raw *rawResourceLimits) (ResourceLimits, error) {
 
 // resolveResourceMemory parses the optional `resources.memory`. A nil value
 // yields the default; otherwise it must be a string of the form
-// "<positive integer>(KiB|MiB|GiB)" (e.g. "256MiB"). Decimal suffixes
-// (KB/MB/GB), a bare number, a non-string type, zero, or an overflow are
-// rejected.
+// "<positive integer>(KiB|MiB|GiB)" (e.g. "256MiB"). Parsing is delegated to
+// bytesize.ParseMemory, so decimal suffixes (KB/MB/GB), a bare number, the byte
+// unit (B), a non-string type, zero, and an overflow are all rejected.
 func resolveResourceMemory(raw any) (int64, error) {
 	if raw == nil {
 		return DefaultResourceMemoryBytes, nil
@@ -170,19 +156,11 @@ func resolveResourceMemory(raw any) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("resources.memory must be a size string such as %q, got %v", "256MiB", raw)
 	}
-	m := memoryPattern.FindStringSubmatch(s)
-	if m == nil {
-		return 0, fmt.Errorf("resources.memory %q must be an integer followed by KiB, MiB, or GiB (e.g. %q)", s, "256MiB")
+	n, err := bytesize.ParseMemory(s)
+	if err != nil {
+		return 0, fmt.Errorf("resources.memory %q %w (e.g. %q)", s, err, "256MiB")
 	}
-	n, err := strconv.ParseInt(m[1], 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("resources.memory %q must be a positive size", s)
-	}
-	unit := memoryUnitBytes[m[2]]
-	if n > math.MaxInt64/unit {
-		return 0, fmt.Errorf("resources.memory %q overflows the maximum supported size", s)
-	}
-	return n * unit, nil
+	return n, nil
 }
 
 // resolveResourceCPUs parses the optional `resources.cpus`. A nil value yields

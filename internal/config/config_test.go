@@ -917,28 +917,37 @@ func TestLoadMaxEventBytesDefault(t *testing.T) {
 	}
 }
 
-// TestLoadMaxEventBytesExplicit pins the accepted boundary values: an explicit
-// small value, the default-size value, and the hard maximum all load verbatim.
+// TestLoadMaxEventBytesExplicit pins the accepted boundary values: a small size
+// in bytes, the default-size value in both notations, and the hard maximum in
+// both notations all load verbatim. Values above the cap are rejected.
 func TestLoadMaxEventBytesExplicit(t *testing.T) {
-	for _, value := range []string{"1", "262144", "1048576"} {
-		t.Run(value, func(t *testing.T) {
+	tests := []struct {
+		value string
+		want  int
+	}{
+		{"1", 1},
+		{"256B", 256},
+		{"256KiB", 256 << 10},
+		{"262144", 256 << 10}, // legacy bare-integer bytes
+		{"1MiB", 1 << 20},
+		{"1048576", 1 << 20}, // legacy bare-integer bytes at the cap
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
 			setRequiredEnv(t)
-			t.Setenv("MAX_EVENT_BYTES", value)
+			t.Setenv("MAX_EVENT_BYTES", tt.value)
 			cfg := mustLoad(t)
-			want, err := strconv.Atoi(value)
-			if err != nil {
-				t.Fatalf("Atoi(%q): %v", value, err)
-			}
-			if cfg.MaxEventBytes != want {
-				t.Fatalf("MaxEventBytes = %d, want %d", cfg.MaxEventBytes, want)
+			if cfg.MaxEventBytes != tt.want {
+				t.Fatalf("MaxEventBytes = %d, want %d", cfg.MaxEventBytes, tt.want)
 			}
 		})
 	}
 }
 
-// TestParseMaxEventBytes exercises the parser contract directly: positive ints
-// up to and including the hard maximum parse; empty, zero, negative,
-// non-integer, float, and above-limit values are errors naming the variable.
+// TestParseMaxEventBytes exercises the parser contract directly: human-readable
+// binary sizes and legacy bare byte counts up to and including the hard maximum
+// parse; empty, zero, negative, non-integer, float, decimal units, overflow,
+// and above-limit values are errors naming the variable.
 func TestParseMaxEventBytes(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -946,17 +955,29 @@ func TestParseMaxEventBytes(t *testing.T) {
 		want      int
 		wantError bool
 	}{
-		{"positive", "1024", 1024, false},
-		{"trimmed positive", " 1024 ", 1024, false},
-		{"default size", strconv.Itoa(DefaultMaxEventBytes), DefaultMaxEventBytes, false},
-		{"hard max accepted", strconv.Itoa(MaxEventBytesLimit), MaxEventBytesLimit, false},
+		{"bytes suffix", "256B", 256, false},
+		{"kib suffix", "256KiB", 256 << 10, false},
+		{"mib suffix at cap", "1MiB", 1 << 20, false},
+		{"mib suffix above cap", "2MiB", 0, true},
+		{"bare bytes legacy", "1024", 1024, false},
+		{"trimmed size", " 256KiB ", 256 << 10, false},
+		{"default size legacy", strconv.Itoa(DefaultMaxEventBytes), DefaultMaxEventBytes, false},
+		{"hard max accepted legacy", strconv.Itoa(MaxEventBytesLimit), MaxEventBytesLimit, false},
 		{"empty rejected", "", 0, true},
 		{"whitespace rejected", "  ", 0, true},
 		{"zero rejected", "0", 0, true},
+		{"zero bytes rejected", "0B", 0, true},
 		{"negative rejected", "-1", 0, true},
 		{"non-numeric rejected", "abc", 0, true},
 		{"float rejected", "1.5", 0, true},
+		{"float with unit rejected", "1.5MiB", 0, true},
+		{"decimal kib rejected", "256KB", 0, true},
+		{"decimal mib rejected", "1MB", 0, true},
+		{"bare unit rejected", "B", 0, true},
+		{"unit only rejected", "MiB", 0, true},
+		{"space between value and unit rejected", "256 KiB", 0, true},
 		{"above hard max rejected", strconv.Itoa(MaxEventBytesLimit + 1), 0, true},
+		{"overflow rejected", "9223372036854775807GiB", 0, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -982,9 +1003,10 @@ func TestParseMaxEventBytes(t *testing.T) {
 
 // TestLoadInvalidMaxEventBytesReturnsError pins the invalid MAX_EVENT_BYTES
 // contract: Load RETURNS an error naming the variable and its bound, logs
-// nothing, and never treats zero as unlimited.
+// nothing, and never treats zero as unlimited. Decimal units and an oversized
+// human-readable size are rejected just like their numeric equivalents.
 func TestLoadInvalidMaxEventBytesReturnsError(t *testing.T) {
-	for _, value := range []string{"0", "-1", "abc", "1.5", "1048577"} {
+	for _, value := range []string{"0", "0B", "-1", "abc", "1.5", "256KB", "2MiB", "1048577"} {
 		t.Run(value, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv("MAX_EVENT_BYTES", value)

@@ -12,7 +12,8 @@
 // the NETWORKS list) stay zero/empty when unset and are gated by the caller;
 // only the optional retention windows log-and-disable on a bad value instead of
 // failing. The parse helpers (ParsePositiveInt, ParsePositiveDuration,
-// ParseOptionalPositiveInt, ParseLogLevel, ParseNetworks) are exported and pure
+// ParseOptionalPositiveInt, ParseLogLevel, ParseMaxEventBytes, ParseNetworks)
+// are exported and pure
 // so they are directly testable; RedisOptions
 // maps a Redis address or DSN to go-redis options without echoing credentials.
 package config
