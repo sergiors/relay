@@ -110,6 +110,15 @@ claims a handler attempt:
   by a later reclaim, exactly like a full concurrency slot — it is **not**
   charged a handler retry and is not dead-lettered. This is the deliberate
   difference from a handler failure.
+- The admission above is deliberately before the claim, so saturation itself
+  never spends a handler attempt. A narrow race can still arise when admission
+  succeeds (an idle container existed) but that container is taken before the
+  create: the create then reports saturation **after** the attempt was already
+  claimed. As with a crash between the claim and the handler start, that claimed
+  attempt is spent (no failure/retry/DLQ is charged, the message stays pending and
+  is replayed); the claim alone never exhausts, so only a later attempt that
+  actually runs and fails can dead-letter the message. See
+  [events.md](events.md#where-the-attempt-count-advances).
 - A stale-version throwaway container (a request for an already-retired image) is
   **not** counted against the bound; the bound covers the regular pooled
   population only.

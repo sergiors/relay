@@ -1479,6 +1479,18 @@ func (r *Runner) runInvocation(
 // and returns the first failure's plain error immediately, with no invocation
 // wrapping or DLQ attribution.
 //
+// The per-invocation attempt is claimed (TryStart) only AFTER the concurrency
+// slots and the warm-container budget are admitted, so a capacity rejection
+// spends no attempt. The claim is the persisted attempt boundary: a crash after
+// a confirmed claim but before the handler runs spends that attempt when its
+// running deadline later elapses. The configured retry budget bounds normal
+// failing executions but does not cap admitted claims across repeated crashes, so
+// the persisted count can exceed 1+retries before any real failure (see
+// internal/stream/doc.go). TryStart itself never exhausts, though: exhaustion is
+// recorded here only when a later attempt actually runs and fails with the
+// persisted count already at or above 1+retries, so a crash alone cannot DLQ a
+// message.
+//
 // Pending desired generations: the registry can hold, beside the active set, a
 // PENDING desired template for a valid generation that is being prepared but is
 // not yet runnable (see Registry.SetPending). Pending rules are MATCHED — they
@@ -1790,8 +1802,10 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			// one handler never prevents later handlers from running.
 			executeRule := func() (invocationOutcome, error) {
 				// The per-invocation handler attempt/claim. With invocation
-				// state it comes from TryStart (Redis-backed, incremented per
-				// actual execution, with a fresh opaque token). Without
+				// state it comes from TryStart (Redis-backed: the persisted
+				// attempt advances at the confirmed claim, with a fresh opaque
+				// token; execution and its metrics normally follow, but a
+				// post-claim crash can spend a claim unexecuted). Without
 				// invocation state there is no persisted handler attempt, so it
 				// stays the zero claim (explicitly not attributed): the delivery
 				// count is NOT reused as a handler attempt count, because
@@ -1928,12 +1942,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					claim = startClaim
 				}
 				handlerAttempt := claim.Attempt
-				// The invocation attempt has actually begun: the TryStart above
-				// (or the absence of invocation state, for direct callers)
-				// claimed it and the slots are held. This is the
-				// last_execution_at attribution point — every claimed attempt
-				// counts, retries included (they are real executions), while
-				// the skip branches returned above never reach it.
+				// The claimed attempt has begun: the TryStart above (or the
+				// absence of invocation state, for direct callers) claimed it and
+				// the slots are held. The persisted attempt advances at that
+				// claim; execution normally follows immediately, but a crash (or
+				// the create-time budget race) after the claim can leave it spent
+				// unexecuted. This is where last_execution_at is stamped — once
+				// per claimed attempt, retries included — and the skip branches
+				// returned above never reach it.
 				r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampExecution, time.Now().Unix())
 				r.log.Debug("App rule: matched event",
 					handlerLogFields(hasState, pf.fn.Name, rule.Handler, msgID, handlerAttempt, deliveryAttempt)...,
@@ -2010,9 +2026,16 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// The container could not be created because the global warm
 					// budget saturated at create time (a race between admission
 					// and the actual create). This is BACKPRESSURE, not a handler
-					// failure: leave the invocation pending with no attempt
-					// accounting — the claimed marker's deadline will elapse and a
-					// later delivery retries the claim without charging a retry.
+					// failure: no failure, retry, or DLQ accounting is charged and
+					// the message stays pending. The attempt claimed by TryStart
+					// above IS nonetheless spent — this is the accepted
+					// claim-before-execute window (the same one a crash between the
+					// claim and the handler start falls in): the claimed running
+					// marker's deadline simply elapses, and a later delivery claims
+					// the NEXT attempt. Pre-claim backpressure (a slot timeout or a
+					// saturated warm-budget admission above) never reaches a claim
+					// and so spends nothing. Nothing here exhausts: the eventual
+					// DLQ still needs a later attempt to actually run and fail.
 					skippedPending = true
 					r.log.Debug("App handler: warm-container budget saturated at create; leaving pending",
 						"app", pf.fn.Name,
@@ -2636,7 +2659,10 @@ func (r *Runner) invokeHandler(
 		}
 		// A create-time warm-budget saturation is BACKPRESSURE, not a handler
 		// failure: leave the occurrence pending (a later delivery retries the
-		// claim) without charging a retry or a DLQ.
+		// claim) without charging a retry or a DLQ. As on the event path, this
+		// race happens after the confirmed admission, so the attempt it claimed
+		// is spent even though nothing is charged (see Handle's create-time
+		// saturation branch).
 		if warmSaturated(err) {
 			r.log.Debug("Schedule: warm-container budget saturated at create; leaving pending",
 				"app", fnName,
@@ -3105,10 +3131,12 @@ func (r *Runner) invokeOnce(
 	claim stream.InvocationClaim,
 	msgID string,
 ) error {
-	// The invocation attempt has actually begun: the caller claimed it via
-	// TryStart (or is a direct no-state caller) and holds the concurrency
-	// slots. This is the schedule path's last_execution_at attribution point —
-	// every claimed attempt counts, retries included.
+	// The claimed attempt has begun: the caller claimed it via TryStart (or is a
+	// direct no-state caller) and holds the concurrency slots. The persisted
+	// attempt advances at that claim; execution normally follows, though a
+	// post-claim crash can leave it spent unexecuted. This is the schedule path's
+	// last_execution_at attribution point — once per claimed attempt, retries
+	// included.
 	r.metrics.SetAppTimestamp(pf.fn.Name, metrics.AppTimestampExecution, time.Now().Unix())
 
 	// Resolve the template's env values and secret references immediately before

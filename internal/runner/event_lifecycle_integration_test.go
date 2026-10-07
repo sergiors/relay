@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -675,4 +676,125 @@ func mustTemplateForIntegration(t *testing.T, yaml string) *app.Template {
 		t.Fatalf("parse template: %v", err)
 	}
 	return tmpl
+}
+
+// runningValue encodes a persisted running marker carrying the given absolute
+// deadline and attempt, with a valid opaque lowercase-hex claim token. It lets a
+// test seed the exact state a process crash after a confirmed TryStart leaves
+// behind (the handler never entered).
+func runningValue(deadline time.Time, attempt int) string {
+	return "running:" + strconv.FormatInt(deadline.UnixMilli(), 10) +
+		":" + strconv.Itoa(attempt) + ":" + strings.Repeat("a", 32)
+}
+
+// TestIntegrationCrashAfterClaimSpendsAttemptWithoutHandlerExecution pins the
+// F-002 claim-before-execute window end to end against real Redis. A running
+// marker for attempt 1 with an already-elapsed deadline is exactly the value a
+// confirmed TryStart leaves if the process dies before the handler runs (the
+// TryStart transition itself is pinned by the stream package's
+// TestIntegrationAtomicCrashReclaimAfterDeadline). Once the reclaim observes the
+// elapsed deadline it claims attempt 2, runs the handler exactly once, and — with
+// retries:0 — exhausts. The whole message is terminal, so it routes to the DLQ and
+// is ACKed, and the DLQ's handler_attempts is 2 even though the handler executed
+// once: the unexecuted claim was spent. Note the DLQ is driven by the reclaim's
+// real failing EXECUTION, not by the crash: a crash alone claims an attempt but
+// never exhausts (TryStart has no retry budget).
+func TestIntegrationCrashAfterClaimSpendsAttemptWithoutHandlerExecution(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &countingExecutor{fail: true}
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
+	e := newEventEnv(t)
+	id := e.xadd(`{"a":1}`)
+
+	// Seed the post-claim crash state BEFORE the consumer starts: attempt 1 is
+	// persisted as running with an already-elapsed deadline, and no transition ever
+	// followed.
+	if err := e.client.HSet(context.Background(), e.invocationKey(id),
+		"beta/index.run", runningValue(time.Now().Add(-time.Hour), 1)).Err(); err != nil {
+		t.Fatalf("seed crash state: %v", err)
+	}
+
+	e.start(r.Handle)
+
+	// The reclaim claims attempt 2, which fails and exhausts: the message routes to
+	// the DLQ and is ACKed.
+	e.eventually("message routed to DLQ after the post-crash attempt", func() bool {
+		_, ok := e.dlqEntry(id)
+		return ok
+	})
+	e.eventually("message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("invocation-state key terminal-retained after DLQ", func() bool {
+		return e.isRetained(id)
+	})
+
+	// The handler ran exactly once (attempt 2); the crashed claim of attempt 1 was
+	// spent without executing.
+	if got := exec.count(); got != 1 {
+		t.Fatalf("handler executions = %d, want 1 (attempt 1 was claimed but never ran)", got)
+	}
+	m, ok := e.dlqEntry(id)
+	if !ok {
+		t.Fatalf("expected a DLQ entry for %s", id)
+	}
+	if m.Values["handler_attempts"] != "2" {
+		t.Errorf("handler_attempts = %v, want 2 (the claim before the crash consumed attempt 1)", m.Values["handler_attempts"])
+	}
+	if m.Values["app"] != "beta" || m.Values["handler"] != "index.run" {
+		t.Errorf("DLQ app/handler = %v/%v, want beta/index.run", m.Values["app"], m.Values["handler"])
+	}
+}
+
+// TestIntegrationProtectedClaimStaysPendingWithoutAckOrDLQ pins the other half of
+// the window against real Redis: while the persisted running marker's deadline has
+// not elapsed (the crashed attempt could still be executing elsewhere, or is being
+// waited out), every reclaim leaves the message PENDING — never ACKed, never
+// DLQ'd, and the handler is never called. Nothing is charged until the claim's
+// deadline actually elapses.
+func TestIntegrationProtectedClaimStaysPendingWithoutAckOrDLQ(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &countingExecutor{}
+	r := NewWithMetrics([]*PreparedApp{fnWithRetries(t, "beta", 0, exec)}, testutil.DiscardLogger(), nil)
+	e := newEventEnv(t)
+	id := e.xadd(`{"a":1}`)
+
+	// A future deadline (the crashed attempt's protected window): reclaims must not
+	// run the handler.
+	if err := e.client.HSet(context.Background(), e.invocationKey(id),
+		"beta/index.run", runningValue(time.Now().Add(time.Hour), 1)).Err(); err != nil {
+		t.Fatalf("seed protected state: %v", err)
+	}
+
+	// Count deliveries so the test observes the protected path REPEATEDLY (the
+	// first delivery plus at least one reclaim) without any wall-clock sleep: each
+	// reclaim re-delivers the still-pending message and must again skip it. An ACK
+	// or DLQ on the first delivery would stop re-delivery, so waiting for at least
+	// two deliveries is itself the deterministic proof that the message stayed
+	// pending across a reclaim.
+	var deliveries atomic.Int64
+	e.start(func(ctx context.Context, msgID string, event map[string]any) error {
+		deliveries.Add(1)
+		return r.Handle(ctx, msgID, event)
+	})
+
+	e.eventually("protected invocation delivered, then reclaimed at least once", func() bool {
+		return deliveries.Load() >= 2
+	})
+
+	// Invariants hold at every protected delivery: still pending, never DLQ'd, the
+	// handler never ran, and the running marker is untouched.
+	if _, ok := e.pending(id); !ok {
+		t.Fatalf("message left the PEL while its invocation was protected")
+	}
+	if _, ok := e.dlqEntry(id); ok {
+		t.Fatalf("a protected invocation must never be DLQ'd")
+	}
+	if exec.count() != 0 {
+		t.Fatalf("executor calls = %d, want 0 (protected claim must not execute)", exec.count())
+	}
+	if v, err := e.stateField(id, "beta/index.run"); err != nil || !strings.HasPrefix(v, "running:") {
+		t.Fatalf("marker = %q, err=%v, want an unchanged running marker", v, err)
+	}
 }

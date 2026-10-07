@@ -192,7 +192,10 @@ once, so handlers must be idempotent.
   total attempts) with a fixed backoff — 1m, 2m, 5m, then 10m capped — recorded
   as a `next_attempt_at` deadline in per-invocation state. A redelivery before
   that deadline skips the invocation without executing it.
-- The attempt count is the **real handler execution count**. The Redis PEL
+- The persisted attempt count is the number of **admitted claims** (`TryStart`),
+  which normally equals the real handler execution count but can exceed it in the
+  crash-before-execute window described
+  [below](#where-the-attempt-count-advances). It drives exhaustion; the Redis PEL
   delivery count is diagnostic only and is not the retry driver.
 - If a matched invocation cannot run because its app is unavailable, the
   message stays pending (no handler attempt counted) and is never DLQ'd for
@@ -207,6 +210,41 @@ once, so handlers must be idempotent.
 - A `TryStart` claim error fails **closed**: the handler is not executed and the
   message stays pending, because running a duplicate could race a replica that
   won the same claim.
+
+### Where the attempt count advances
+
+The **claim is the attempt boundary**, not the handler start. The runner
+persists the attempt (via `TryStart`, atomically with the running deadline and a
+fresh claim token) only **after** both the concurrency slot and the warm-container
+budget have been admitted, and every later transition — retry, completion,
+exhaustion — is compare-and-set on that claim. This makes the capacity gates
+strictly non-charging:
+
+- A **congestion/backpressure** rejection before the claim (no concurrency slot
+  within the bounded wait, or a saturated warm-container budget) records no
+  attempt and charges no retry or DLQ: the message stays pending and is replayed.
+- A crash **after** a confirmed claim but **before** the handler actually starts
+  leaves the persisted running marker behind. Its deadline simply elapses (the
+  message is never lost and the invocation is not permanently locked), after which
+  a reclaim claims the **next** attempt. The unexecuted attempt is therefore
+  consumed, and repeated lost claims raise the persisted count further. The
+  configured retry budget bounds normal failing executions, not guaranteed
+  user-code runs: it does **not** cap admitted claims across repeated crashes, so
+  the persisted count can exceed `1 + retries` before any real failure. This is
+  the accepted at-least-once trade-off (a bounded exposure of at most one attempt
+  per crash); closing it would require a two-phase claim/execute handshake that
+  at-least-once delivery does not provide. The same accounting applies to the
+  narrow create-time warm-budget race, which happens after the claim like any
+  other crash in that window.
+
+  `TryStart` **claims but does not exhaust**: it has no retry budget and never
+  writes a terminal marker, so a crash **alone** never dead-letters a message — it
+  only advances the persisted attempt count. The invocation becomes terminal (and
+  the message routable to the DLQ) only when a **later** delivery actually runs the
+  handler and it fails with the persisted count already at or above
+  `1 + retries`. In other words, repeated lost claims can make the next **real**
+  failure exhaust with a larger persisted attempt count; the failure is what
+  triggers the DLQ.
 
 ### Invocation state persistence
 
@@ -249,7 +287,9 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   entries already written and writes only the missing ones.
 - Entry fields: `original_stream`, `original_id`, `group`, `consumer`, `event`,
   `reason`, `app`, `handler`, `deliveries` (diagnostic PEL count),
-  `handler_attempts` (real execution count), `timestamp` (RFC 3339), and an
+  `handler_attempts` (the persisted admitted-claim count; normally the real
+  execution count, but a crash or abandoned claim can advance it without an
+  execution), `timestamp` (RFC 3339), and an
   optional `trace` lineage. A malformed-message entry uses `-` for
   `app`/`handler` and `handler_attempts` `0`.
 - An oversized-event entry is intentionally **summary-only and non-replayable**:

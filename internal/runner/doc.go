@@ -19,9 +19,10 @@
 //     a PENDING desired template for a valid generation being prepared but not
 //     yet runnable (a brand-new app's first build, or an existing app's rebuild
 //     to new rules). A pending rule matches and engages its app but is treated
-//     exactly like an unavailable match: it never executes, claims a TryStart,
-//     exhausts, ACKs, or DLQs, and it keeps the message pending so an event
-//     arriving during preparation is never ACKed away as unmatched. A pending
+//     exactly like an unavailable match: it never executes and does not claim
+//     TryStart or advance its attempt count, never exhausts, ACKs, or DLQs;
+//     it only holds the event pending, so an event arriving during preparation
+//     is never ACKed away as unmatched. A pending
 //     rule whose invocation is also matched by the active generation is deduped
 //     by "<app>/<handler>", so the active generation executes it and it is not
 //     separately held. Installing the new generation (or removing/invalidating
@@ -36,6 +37,19 @@
 //     attempts (1 + rule.Retries) are exhausted it is marked terminal. Outcomes
 //     are per-invocation and aggregated after the full rule loop (the loop is
 //     sequential, never parallel)
+//   - Attempt boundary: the concurrency slots and the warm-container budget are
+//     admitted BEFORE the per-invocation attempt is claimed, so a capacity
+//     rejection (a slot timeout or a saturated warm budget) records no attempt
+//     and charges no retry or DLQ. The claim itself (stream.InvocationState.TryStart)
+//     is the persisted attempt boundary: a crash after a confirmed claim but
+//     before the handler starts spends that attempt when its running deadline
+//     later elapses. The configured retry budget bounds normal failing executions
+//     but does NOT cap admitted claims across repeated crashes, so the persisted
+//     count can exceed 1+retries before any real failure — the accepted
+//     at-least-once window (see internal/stream/doc.go). TryStart claims without a
+//     retry budget and never writes a terminal marker, so a crash alone cannot
+//     DLQ: exhaustion is recorded here only after a later real execution fails
+//     with the persisted attempt already at or above 1+retries
 //   - Outcome: each matching invocation gets its own independent attempt on
 //     every delivery — a failure in one handler never prevents the others from
 //     running. Handle then aggregates the per-invocation outcomes into a single

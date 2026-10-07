@@ -136,8 +136,11 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   `now_ms < deadline_ms`. Every transition is one atomic Lua script, and
   active-claim transitions CAS both attempt and claim token, so a stale claim can
   never overwrite a newer claim or a terminal marker.
-- Retry backoff is fixed (1m/2m/5m/10m capped); the attempt count is the real
-  execution count, distinct from the diagnostic PEL delivery count. Recovery
+- Retry backoff is fixed (1m/2m/5m/10m capped); the persisted attempt count is
+  the number of admitted claims (normally the real execution count, but a crash
+  after a confirmed claim and before execution spends one without running the
+  handler — the claim alone never exhausts, so a later real failure is what
+  DLQs), distinct from the diagnostic PEL delivery count. Recovery
   reclaims idle pending messages (XAUTOCLAIM) as a message-level backstop, not
   the retry timer; whether a handler runs is decided per invocation from state.
 - A message is acked only after all matched invocations are terminal. Exhaustion

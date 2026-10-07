@@ -109,9 +109,35 @@
 // "ok" and the exhausted forms are terminal: TryStart never re-opens them, and
 // MarkComplete never downgrades an exhausted marker (success must not resurrect
 // a message already routed to the DLQ). `handler_attempts` is the runner's
-// persisted attempt count (incremented only on a CONFIRMED TryStart claim),
-// distinct from the Redis stream delivery count. The trace lineage is a sibling
-// hash field (never part of the lifecycle value). While the message is
+// persisted attempt count, distinct from the Redis stream delivery count.
+//
+// TryStart is the persisted attempt boundary: it is the only place handler_attempts
+// advances, and every active-claim transition (failure/retry, completion,
+// exhaustion) is CASed on the attempt+token it returns. The runner calls it only
+// after the concurrency slots and the warm-budget admission have been granted, so
+// a PRE-claim capacity rejection (a slot timeout or a saturated warm budget)
+// records no attempt and charges no retry or DLQ. There is a deliberate
+// claim-before-execute window: a crash (or a create-time warm-budget race) AFTER a
+// confirmed claim but BEFORE the handler starts leaves the running marker
+// persisted, so its deadline simply elapses and the next delivery claims the NEXT
+// attempt. The unexecuted attempt is therefore spent — the configured retry budget
+// bounds normal failing executions but does NOT cap admitted claims across
+// repeated crashes, so the persisted count can exceed 1+retries before any real
+// failure. Crucially, TryStart CLAIMS but does NOT itself EXHAUST: it carries no
+// retry budget and never writes an exhausted marker, so a crash ALONE can never
+// dead-letter a message — it only raises the persisted count. Exhaustion, and
+// therefore the DLQ, still requires a later delivery whose handler actually RUNS
+// and FAILS after the persisted count has reached 1+retries (the first such real
+// failure exhausts); repeated lost claims can make that eventual real failure
+// exhaust with a larger persisted attempt count. This is at-most-one-attempt of
+// exposure per crash and is accepted: it is bounded, the message is never lost,
+// the handler never runs in the window, and closing it would require a two-phase
+// claim/execute transaction that at-least-once delivery does not provide. A
+// Redis/transport error on TryStart is a genuinely unknown outcome and is handled
+// separately (see below): nothing is claimed and the handler must not run.
+//
+// The trace lineage is a sibling hash field (never part of the lifecycle value).
+// While the message is
 // recoverable (still in the PEL) every mutation keeps the hash PERSISTENT — no
 // TTL — so a reclaim always observes the marker and carries its attempt forward
 // instead of resetting the attempt count, no matter how long the message sat
@@ -161,6 +187,16 @@
 //     health state (Healthy) fed by real operations, so an embedder or
 //     orchestrator can observe readiness without a separate PING
 //   - Shutdown cancellation leaves messages pending, not counted as attempts
+//   - The persisted handler attempt advances ONLY on a confirmed TryStart claim,
+//     which the runner issues after the concurrency and warm-budget capacity gates;
+//     a pre-claim capacity rejection charges no retry or DLQ. A crash (or a
+//     create-time warm-budget race) between a confirmed claim and the handler start
+//     consumes the claimed attempt, because the claim — not the executor dispatch —
+//     advances the persisted attempt count. That claim alone never exhausts (a
+//     crash alone cannot DLQ): the terminal exhausted marker is written only by a
+//     later real failed attempt via MarkExhausted. The configured retry budget
+//     bounds normal failing executions but does NOT cap admitted claims across
+//     repeated crashes. The bounded exposure is documented above
 //   - Panic boundary: processMessage registers a recover so a panic in the
 //     handler handoff (including runner code outside its per-invocation
 //     recover) is converted into the standard failure path — the message is

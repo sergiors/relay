@@ -170,6 +170,13 @@ func TestRunnerWarmBudgetAdmissionWaitBoundedBySlotWait(t *testing.T) {
 // but the container create then reported ErrWarmBudgetSaturated. Handle must
 // leave the invocation pending (ErrInvocationNotEligible) with NO handler
 // failure/retry/exhaustion accounting and no DLQ.
+//
+// The claim-before-execute boundary is explicit here: this race happens AFTER
+// the confirmed TryStart, so the claimed attempt IS spent (attempt 1 is on
+// record) even though no failure is charged. That is the accepted F-002 window
+// — the same one a crash between the claim and the executor start falls in —
+// and is distinct from a PRE-claim capacity rejection (warm admission or slot
+// timeout), which reaches no claim and records nothing.
 func TestRunnerWarmBudgetCreateSaturationLeavesPendingWithoutCharge(t *testing.T) {
 	exec := &warmAdmitterExecutor{executeErr: runtime.ErrWarmBudgetSaturated}
 	app := buildFn(fnSpec{name: "fn", rules: []app.EventRule{alwaysMatchRule(time.Second)}}, exec)
@@ -183,6 +190,9 @@ func TestRunnerWarmBudgetCreateSaturationLeavesPendingWithoutCharge(t *testing.T
 	if !errors.Is(err, stream.ErrInvocationNotEligible) {
 		t.Fatalf("Handle on create-time saturation = %v, want ErrInvocationNotEligible", err)
 	}
+	if got := prog.attempts["fn/index.run"]; got != 1 {
+		t.Fatalf("handler attempt after create-time saturation = %d, want 1 (the post-claim race spends the claimed attempt)", got)
+	}
 	prog.mu.Lock()
 	defer prog.mu.Unlock()
 	if len(prog.failures) != 0 || len(prog.exhausted) != 0 {
@@ -191,7 +201,9 @@ func TestRunnerWarmBudgetCreateSaturationLeavesPendingWithoutCharge(t *testing.T
 }
 
 // TestRunnerWarmBudgetScheduleCreateSaturationLeavesPending pins the same
-// create-time saturation mapping on the schedule path.
+// create-time saturation mapping on the schedule path: the post-claim race
+// leaves the occurrence pending with no failure/retry charge, but — exactly as
+// on the event path — the attempt already claimed by the admission IS spent.
 func TestRunnerWarmBudgetScheduleCreateSaturationLeavesPending(t *testing.T) {
 	exec := &warmAdmitterExecutor{executeErr: runtime.ErrWarmBudgetSaturated}
 	app := schedFn(t, "fn", exec, time.Second)
@@ -204,6 +216,9 @@ func TestRunnerWarmBudgetScheduleCreateSaturationLeavesPending(t *testing.T) {
 	err := r.InvokeHandler(ctx, "m-1", "fn", "sched", "index.run", []byte(`{}`))
 	if !errors.Is(err, stream.ErrInvocationNotEligible) {
 		t.Fatalf("InvokeHandler on create-time saturation = %v, want ErrInvocationNotEligible", err)
+	}
+	if got := prog.attempts["fn/index.run"]; got != 1 {
+		t.Fatalf("handler attempt after create-time saturation = %d, want 1 (the post-claim race spends the claimed attempt)", got)
 	}
 	prog.mu.Lock()
 	defer prog.mu.Unlock()

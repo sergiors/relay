@@ -535,6 +535,57 @@ func TestInvocationTryStartElapsedDeadlineIsEligible(t *testing.T) {
 	}
 }
 
+// TestInvocationTryStartNeverExhaustsAcrossRepeatedElapsedClaims pins the store
+// transition behind the claim-before-execute window: TryStart claims an attempt
+// but carries no retry budget and never writes a terminal marker. Repeated
+// claims whose deadlines have elapsed each carry the attempt forward (n+1) and
+// leave the field running, so unexecuted claims can raise the persisted count
+// arbitrarily; only an explicit MarkExhausted — which the runner performs after
+// a real failed attempt, never on a claim alone — makes it terminal. The
+// Redis-script implementation of the same transition is pinned by
+// TestIntegrationAtomicTryStartAttemptOnce and
+// TestIntegrationAtomicCrashReclaimAfterDeadline.
+func TestInvocationTryStartNeverExhaustsAcrossRepeatedElapsedClaims(t *testing.T) {
+	store := newFakeInvocationStore(nil)
+	now := time.Unix(0, 1757000000000000000)
+	p := NewInvocationState(context.Background(), store, "s", "g", "m-0",
+		slog.New(slog.DiscardHandler), WithClock(func() time.Time { return now }))
+
+	const claims = 5
+	var last InvocationClaim
+	for i := 1; i <= claims; i++ {
+		started, claim, wait, err := p.TryStart("fn/h", time.Second)
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if !started || claim.Attempt != i || wait != 0 {
+			t.Fatalf("claim %d = (started=%v, %+v, wait=%s), want (true, attempt %d, 0)", i, started, claim, wait, i)
+		}
+		if p.IsTerminal("fn/h") {
+			t.Fatalf("invocation terminal after claim %d; TryStart must not exhaust", i)
+		}
+		kind, _, n, ok := parseInvocationState(store.fields["fn/h"])
+		if !ok || kind != kindRunning || n != i {
+			t.Fatalf("marker after claim %d = %q, want a running attempt-%d marker", i, store.fields["fn/h"], i)
+		}
+		last = claim
+		// Let the claimed running deadline elapse so the next claim is eligible.
+		now = now.Add(2 * time.Second)
+	}
+
+	// Exhaustion is a separate, explicit transition; it is what a real failed
+	// attempt triggers, not the claim itself.
+	if !p.MarkExhausted("fn/h", last) {
+		t.Fatal("MarkExhausted on the current claim = false, want true")
+	}
+	if !p.IsTerminal("fn/h") {
+		t.Fatal("invocation should be terminal after MarkExhausted")
+	}
+	if _, _, ok := parseExhaustedValue(store.fields["fn/h"]); !ok {
+		t.Fatalf("marker = %q, want an exhausted marker", store.fields["fn/h"])
+	}
+}
+
 // TestInvocationRecordFailureRequiresConfirmedClaim pins that RecordFailure is
 // claim-gated: a failure transition with no matching active claim (an absent
 // marker, or a zero claim) writes nothing. Every active-claim-originated

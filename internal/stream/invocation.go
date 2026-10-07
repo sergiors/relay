@@ -1705,6 +1705,16 @@ type InvocationState interface {
 	// another replica), and wait == 0 means it is terminal (complete or
 	// exhausted) and will never be eligible again.
 	//
+	// It is the persisted handler-attempt boundary: the runner calls it only after
+	// the concurrency and warm-budget capacity gates, so a pre-claim capacity
+	// rejection spends no attempt. A crash after a confirmed claim but before the
+	// caller executes leaves the running marker, whose deadline elapses and yields
+	// the NEXT attempt on a later delivery — so the claimed attempt is spent even
+	// though the handler never ran (the accepted at-least-once window). TryStart
+	// CLAIMS but does not EXHAUST: it never writes a terminal marker and has no
+	// retry budget, so a crash alone cannot dead-letter; the exhausted marker is
+	// written only by MarkExhausted after a later real failed attempt.
+	//
 	// An error means the claim outcome is UNKNOWN (a Redis/transport error, or a
 	// failure to generate the claim token): the caller MUST leave the message
 	// pending and MUST NOT execute the handler on this delivery. It is
@@ -1873,9 +1883,12 @@ func (e ExhaustedInvocation) Reason() string {
 //
 // The stream layer extracts Invocations when it dead-letters the message so each
 // DLQ entry's handler_attempts is attributed from the handler retry state, never
-// from the Redis delivery count. That distinction matters because a message can
-// be reclaimed (delivered) many times while a handler attempt advances only on
-// real executions, so deliveries >= handler_attempts.
+// from the Redis delivery count. That distinction matters because a handler
+// attempt advances on each admitted TryStart claim — normally matching a real
+// execution, but a post-claim crash can spend a claim unexecuted, so the
+// persisted count can exceed the real execution count — while a message can be
+// reclaimed (delivered) many times without claiming a new attempt, so
+// deliveries >= handler_attempts and the delivery count stays diagnostic only.
 type HandlerExhaustedError struct {
 	// Invocations is the exhausted invocation set. It is non-empty on this
 	// error in production; an empty set degrades to the bare sentinel reason.

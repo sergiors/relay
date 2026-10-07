@@ -1035,3 +1035,66 @@ func TestIntegrationScheduleValidTimestampExecutes(t *testing.T) {
 		t.Fatal("a valid firing must not be dead-lettered")
 	}
 }
+
+// TestIntegrationScheduleCrashAfterAdmissionSpendsAttempt pins the schedule-path
+// F-002 window end to end against real Redis: an admitted occurrence whose first
+// attempt crashed after the confirmed admission (attempt 1 persisted as running but
+// the handler never entered). With retries:0, the reclaim's claim of attempt 2 runs
+// the handler once, fails, and exhausts the occurrence — so the message routes to
+// the DLQ with handler_attempts 2 despite a single handler execution. As on the
+// event path, the crash alone did not exhaust: the reclaim's real failing
+// execution is what wrote the terminal marker.
+func TestIntegrationScheduleCrashAfterAdmissionSpendsAttempt(t *testing.T) {
+	_ = redisAvailable(t)
+	exec := &stateAwareExecutor{fail: 1000} // always fails
+	r := registerScheduleFn(t, exec, 0)     // retries:0 → exhaust on the next attempt
+	e := newScheduleEnv(t, r)
+	o := scheduleOcc(time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC))
+	id := e.xadd(o)
+
+	// Seed the post-admission crash: the descriptor is pinned AND the admitted
+	// handler is running at attempt 1 with an already-elapsed deadline, and no
+	// transition ever followed.
+	if err := e.client.HSet(context.Background(), e.invocationKey(id),
+		scheduleFnName+"/"+scheduleHandler, runningValue(time.Now().Add(-time.Hour), 1)).Err(); err != nil {
+		t.Fatalf("seed crash state: %v", err)
+	}
+	if err := e.client.HSet(context.Background(), e.invocationKey(id), "__schedule",
+		streamEncodeDescriptor(t, streamScheduleDescriptor{
+			Schedule: scheduleHandler, Handler: scheduleHandler, Timeout: time.Second, Retries: 0,
+		})).Err(); err != nil {
+		t.Fatalf("seed descriptor: %v", err)
+	}
+
+	e.start()
+
+	e.eventually("occurrence routed to DLQ after the post-crash attempt", func() bool {
+		return e.inDlq(id)
+	})
+	e.eventually("occurrence acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+
+	if got := exec.count(); got != 1 {
+		t.Fatalf("handler executions = %d, want 1 (the crashed attempt 1 never ran)", got)
+	}
+	m, ok := e.dlqGet()[id]
+	if !ok {
+		t.Fatalf("expected a DLQ entry for %s", id)
+	}
+	if m.Values["handler_attempts"] != "2" {
+		t.Errorf("handler_attempts = %v, want 2 (the claim before the crash consumed attempt 1)", m.Values["handler_attempts"])
+	}
+}
+
+// streamEncodeDescriptor renders the stream package's descriptor grammar
+// ("sd1:<timeout_ms>:<retries>:<b64 schedule>:<b64 handler>") for tests that need
+// to seed a pinned admission without going through the runner.
+func streamEncodeDescriptor(t *testing.T, d streamScheduleDescriptor) string {
+	t.Helper()
+	return "sd1:" + strconv.FormatInt(d.Timeout.Milliseconds(), 10) +
+		":" + strconv.Itoa(d.Retries) +
+		":" + base64.RawURLEncoding.EncodeToString([]byte(d.Schedule)) +
+		":" + base64.RawURLEncoding.EncodeToString([]byte(d.Handler))
+}
