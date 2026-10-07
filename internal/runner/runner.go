@@ -888,6 +888,29 @@ func warmSaturated(err error) bool {
 	return errors.Is(err, runtime.ErrWarmBudgetSaturated)
 }
 
+// lifecycleCancelled reports whether the DELIVERY context (the worker lifecycle
+// context the stream layer hands the runner) is already canceled, i.e. the
+// worker is shutting down. A cancellation must not change the PERSISTED
+// retry/exhaustion decision: if it were treated as a failed attempt, a shutdown
+// could schedule a retry backoff or write a terminal exhaustion marker (and thus
+// a DLQ entry) for work the handler never had a chance to finish, while the
+// stream layer leaves the message pending anyway (see processMessage). The
+// runner therefore refuses to claim an attempt once the lifecycle is canceled
+// (pre-claim check on each path) and refuses to issue a retry transition or an
+// exhausted marker for a canceled delivery (recordFailure's guard). This is
+// deliberately narrower than "a cancellation charges nothing": the execution
+// failure telemetry (handler_failure_total, the labeled invocation-outcome and
+// per-app failure counters, and last_failure_at) is incremented as soon as a
+// post-claim executor reports an error, BEFORE recordFailure's guard is
+// consulted, so a post-claim cancellation is still counted as a failure in
+// telemetry while the persisted invocation state is left untouched. The check is
+// on the PARENT context, never the invocation's own timeout context: a genuine
+// handler timeout (context.DeadlineExceeded on a live delivery) still records
+// normally.
+func lifecycleCancelled(ctx context.Context) bool {
+	return ctx.Err() != nil
+}
+
 // admitWarm pre-admits ctx against the worker-global warm-container budget
 // (MAX_WARM_CONTAINERS) BEFORE a handler attempt is claimed, returning a context
 // carrying the permit and whether admission succeeded. ok=false means every warm
@@ -1865,6 +1888,29 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				}
 				warmPermit := runtime.WarmPermitFrom(warmCtx)
 				defer warmPermit.Release()
+				// A lifecycle cancellation that landed while this invocation
+				// waited for capacity must not claim an attempt: with no claim
+				// there is no retry budget or exhaustion to charge, and the
+				// message is left pending for a live consumer after restart
+				// (satisfying "shutdown leaves messages pending, not counted as
+				// attempts"). The concurrency slots and warm permit acquired
+				// above are released by the deferred releases on this return
+				// path. This check is deliberately BEFORE TryStart: a
+				// cancellation that races an already-confirmed claim is
+				// PRESERVED (the claim is spent, never rolled back) and handled
+				// by recordFailure's cancellation gate below. Gated on hasState
+				// because only the state-carrying path claims a persisted
+				// attempt.
+				if hasState && lifecycleCancelled(ctx) {
+					skippedPending = true
+					r.log.Debug("App handler: lifecycle canceled before claim; leaving pending without claiming an attempt",
+						"app", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"delivery_attempt", int(deliveryAttempt),
+					)
+					return outcomePendingSkip, nil
+				}
 				// Claim the invocation for this execution before running it.
 				// TryStart atomically persists an absolute running deadline
 				// (now + timeout), the attempt, and a fresh claim token, and
@@ -1962,7 +2008,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// next matching rule so each independent invocation gets its own
 					// failed attempt.
 					if hasState {
-						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: marshal event: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -1979,7 +2025,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 				extraEnv, err := r.resolveExtraEnv(ctx, pf.fn.Template)
 				if err != nil {
 					if hasState {
-						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
@@ -2081,7 +2127,7 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					// end-of-loop aggregate, so an invocation may exhaust while
 					// others still run.
 					if hasState {
-						return r.recordFailure(invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
+						return r.recordFailure(ctx, invState, invocation, claim, rule.Retries, pf.fn.Name, rule.Handler, msgID, err)
 					}
 					// No invocation state (direct callers/tests): every failure
 					// counts as a retry driver, but there is no Redis-backed
@@ -2553,6 +2599,20 @@ func (r *Runner) invokeHandler(
 		desc.Timeout = cap
 	}
 
+	// A lifecycle cancellation that landed while the occurrence waited for
+	// capacity must not claim an attempt (same contract as Handle's event
+	// path). The concurrency slots and warm permit acquired above are released
+	// by the deferred releases on this return path. This is BEFORE the atomic
+	// admission: a cancellation racing an already-confirmed claim is PRESERVED
+	// (spent, never rolled back) and handled by recordFailure's cancellation
+	// gate below. This branch is reached only on the state-carrying path, which
+	// is the only path that claims a persisted attempt.
+	if lifecycleCancelled(ctx) {
+		r.log.Debug("Schedule: lifecycle canceled before claim; leaving pending without claiming an attempt",
+			"app", fnName, "handler", desc.Handler)
+		return stream.ErrInvocationNotEligible
+	}
+
 	// Atomically pin the descriptor (only when none is pinned) and claim the
 	// invocation. A lost descriptor race is resolved inside the handle: the
 	// pinned descriptor is adopted and the admission retried, so the winning
@@ -2679,7 +2739,7 @@ func (r *Runner) invokeHandler(
 		// wraps stream.ErrInvocationExhausted and carries the exhausted handler
 		// attempt). A schedule has exactly ONE invocation (this one), so the message
 		// is terminal and the stream routes it to the DLQ.
-		outcome, retErr := r.recordFailure(invState, invocation, admission.Claim, retries, fnName, handler, msgID, err)
+		outcome, retErr := r.recordFailure(ctx, invState, invocation, admission.Claim, retries, fnName, handler, msgID, err)
 		if outcome == outcomePendingSkip {
 			// A stale transition (the claim was superseded, or the marker is
 			// already terminal): do NOT ACK a superseded claim's outcome — leave
@@ -3309,7 +3369,21 @@ func (r *Runner) recordHandlerFailure(fnName, handler string, duration time.Dura
 // retry state rather than the message delivery count. Its message names the
 // same attempt count, keeping the DLQ `reason` consistent with
 // `handler_attempts`.
+//
+// Lifecycle cancellation: a failure observed after the delivery context was
+// canceled (worker shutdown) must not change the PERSISTED retry/exhaustion
+// decision, regardless of the persisted attempt count. recordFailure returns
+// (outcomePendingSkip, nil) without issuing either transition, so a shutdown can
+// never schedule a retry backoff or write an exhaustion marker (and therefore
+// never a DLQ entry); the claim, if one was confirmed, is left in place and its
+// running deadline elapses so a later delivery claims the next attempt. The
+// stream layer leaves the message pending either way. This guard covers only the
+// persisted invocation state: the caller has already incremented the failure
+// telemetry (handler_failure_total etc.) for the post-claim execution error that
+// brought it here, so a shutdown-canceled execution is still visible in those
+// counters even though no retry/exhaustion transition is issued.
 func (r *Runner) recordFailure(
+	ctx context.Context,
 	invState stream.InvocationState,
 	invocation string,
 	claim stream.InvocationClaim,
@@ -3317,6 +3391,28 @@ func (r *Runner) recordFailure(
 	fnName, handler, msgID string,
 	origErr error,
 ) (invocationOutcome, error) {
+	// A lifecycle cancellation must not produce a persisted failed-attempt
+	// transition. The delivery is being abandoned by a shutdown and the stream
+	// layer will leave the message pending regardless, so scheduling a retry
+	// backoff or writing a terminal exhaustion marker here would let a shutdown
+	// consume the retry budget or dead-letter work the handler never had a chance
+	// to run. (The caller has already counted the failure telemetry for any
+	// post-claim execution error; only this persisted transition is suppressed.)
+	// Leave the claim (if any) in place: its running deadline elapses and a later
+	// delivery claims the NEXT attempt. Reported as a pending skip (no retry/DLQ
+	// transition) exactly like a protected skip. This is evaluated BEFORE either
+	// transition, so even a script that would otherwise commit is not issued for
+	// a canceled delivery.
+	if lifecycleCancelled(ctx) {
+		r.log.Debug("App handler: attempt canceled during shutdown; leaving pending without charging retry/exhaustion",
+			"app", fnName,
+			"handler", handler,
+			"message_id", msgID,
+			"handler_attempt", claim.Attempt,
+			"reason", origErr,
+		)
+		return outcomePendingSkip, nil
+	}
 	handlerAttempt := claim.Attempt
 	maxAttempts := 1 + retries
 	if handlerAttempt >= maxAttempts {

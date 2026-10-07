@@ -186,7 +186,16 @@
 //     jittered exponential backoff (1s..30s cap) and the consumer exposes a
 //     health state (Healthy) fed by real operations, so an embedder or
 //     orchestrator can observe readiness without a separate PING
-//   - Shutdown cancellation leaves messages pending, not counted as attempts
+//   - Shutdown cancellation leaves messages pending and changes no persisted
+//     retry/exhaustion state: a cancellation that lands before the claim claims
+//     no attempt, and one that lands after a confirmed claim leaves the claim in
+//     place (spent, never rolled back) while writing no retry backoff and no
+//     exhausted marker. The claimed attempt's running deadline simply elapses,
+//     so a later delivery claims the next attempt and no shutdown can consume
+//     the retry budget or dead-letter work. This is narrower than "cancellation
+//     charges nothing": the runner's failure telemetry is still incremented for
+//     a post-claim execution error before its cancellation guard suppresses the
+//     persisted transition
 //   - The persisted handler attempt advances ONLY on a confirmed TryStart claim,
 //     which the runner issues after the concurrency and warm-budget capacity gates;
 //     a pre-claim capacity rejection charges no retry or DLQ. A crash (or a

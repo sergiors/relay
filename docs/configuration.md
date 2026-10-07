@@ -83,7 +83,26 @@ runner/container → ACK
 
 When the local buffer is full the consumer stops reading, so the backlog stays
 in Redis. A full concurrency slot leaves the message pending (no retry charged)
-and a later reclaim replays it.
+and a later reclaim replays it. A worker shutdown is treated the same way: a
+lifecycle cancellation claims no handler attempt if it lands before the claim,
+and writes no retry backoff or exhausted/DLQ marker if it lands after one, so
+shutdown cannot consume the retry budget or dead-letter work (the stream leaves
+the message pending either way). This is a statement about persisted invocation
+state, not telemetry: a post-claim execution that reports an error during
+shutdown is still counted as a handler failure.
+
+Backpressure is local and two-stage. The bounded buffer is independent of the
+execution concurrency: when every execution slot is busy but buffer space
+remains, the consumer may still read the next batch, so those messages are
+delivered into Redis's **PEL** rather than staying unread. That is not a loss —
+they remain recoverable and are replayed once a slot frees — but the pending set
+can grow up to the buffer bound while execution is saturated. Relay applies no
+per-app fairness policy: the global concurrency bound is shared by whichever
+invocation acquires a slot (no reservation, aging, or weighted scheduling), so a
+continuously busy app can delay another app's backlog without a latency
+guarantee. Reclaimed pending work is processed on a single reclaim goroutine, so
+one slow reclaimed handler delays the rest of that batch — bounded by the
+handler timeout — while fresh reads continue on the consume loop.
 
 ### Warm-container bound
 

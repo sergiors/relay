@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,12 +26,20 @@ type warmAdmitterExecutor struct {
 	// admitBlock, when non-nil, makes AcquireWarmPermit block until it is closed
 	// or the passed context is done (to exercise the runner's slotWait bound).
 	admitBlock chan struct{}
+	// admitEntered, when non-nil, is closed once when AcquireWarmPermit is first
+	// entered, so a test can deterministically cancel or release AFTER admission
+	// is in flight without a sleep.
+	admitEntered     chan struct{}
+	admitEnteredOnce sync.Once
 	// admits counts AcquireWarmPermit calls.
 	admits int
 }
 
 func (e *warmAdmitterExecutor) AcquireWarmPermit(ctx context.Context) (*runtime.WarmPermit, error) {
 	e.admits++
+	if e.admitEntered != nil {
+		e.admitEnteredOnce.Do(func() { close(e.admitEntered) })
+	}
 	if e.admitBlock != nil {
 		select {
 		case <-e.admitBlock:

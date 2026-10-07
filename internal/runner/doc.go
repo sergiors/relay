@@ -43,13 +43,23 @@
 //     and charges no retry or DLQ. The claim itself (stream.InvocationState.TryStart)
 //     is the persisted attempt boundary: a crash after a confirmed claim but
 //     before the handler starts spends that attempt when its running deadline
-//     later elapses. The configured retry budget bounds normal failing executions
-//     but does NOT cap admitted claims across repeated crashes, so the persisted
-//     count can exceed 1+retries before any real failure — the accepted
-//     at-least-once window (see internal/stream/doc.go). TryStart claims without a
-//     retry budget and never writes a terminal marker, so a crash alone cannot
-//     DLQ: exhaustion is recorded here only after a later real execution fails
-//     with the persisted attempt already at or above 1+retries
+//     later elapses. A worker-shutdown cancellation changes no persisted
+//     retry/exhaustion state: if it lands before the claim no attempt is claimed
+//     at all, and if it lands after a confirmed claim that attempt is spent but
+//     no retry backoff or exhausted/DLQ marker is written (recordFailure refuses
+//     to issue a canceled delivery's transition), so shutdown cannot consume the
+//     retry budget or dead-letter work. This is deliberately narrower than
+//     "cancellation charges nothing": the handler failure telemetry
+//     (handler_failure_total etc.) is still incremented for a post-claim
+//     execution error before recordFailure's guard suppresses the persisted
+//     transition. The configured retry
+//     budget bounds normal failing executions but does NOT cap admitted claims
+//     across repeated crashes, so the persisted count can exceed 1+retries before
+//     any real failure — the accepted at-least-once window (see
+//     internal/stream/doc.go). TryStart claims without a retry budget and never
+//     writes a terminal marker, so a crash alone cannot DLQ: exhaustion is
+//     recorded here only after a later real execution fails with the persisted
+//     attempt already at or above 1+retries
 //   - Outcome: each matching invocation gets its own independent attempt on
 //     every delivery — a failure in one handler never prevents the others from
 //     running. Handle then aggregates the per-invocation outcomes into a single

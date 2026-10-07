@@ -223,6 +223,19 @@ strictly non-charging:
 - A **congestion/backpressure** rejection before the claim (no concurrency slot
   within the bounded wait, or a saturated warm-container budget) records no
   attempt and charges no retry or DLQ: the message stays pending and is replayed.
+- A **lifecycle cancellation** (worker shutdown) changes no **persisted**
+  retry/exhaustion state. If it lands before the claim, no attempt is claimed at
+  all; if it lands after a confirmed claim, that claimed attempt is spent exactly
+  like a crash in the same window (see below), but **no** retry backoff and
+  **no** exhausted/DLQ marker is written. The stream leaves the message pending
+  regardless, so repeated shutdowns cannot consume the retry budget or
+  dead-letter work. This is narrower than "the failure is not charged": failure
+  **telemetry** is separate from persisted invocation state, and a post-claim
+  execution that reports an error on a canceled delivery is still counted by
+  `handler_failure_total`, the labeled invocation-outcome and per-app failure
+  counters, and the `last_failure_at` app timestamp. The runner records the
+  execution failure before its cancellation guard suppresses the persisted
+  transition, so the counter moves even though no retry/exhaustion state does.
 - A crash **after** a confirmed claim but **before** the handler actually starts
   leaves the persisted running marker behind. Its deadline simply elapses (the
   message is never lost and the invocation is not permanently locked), after which
