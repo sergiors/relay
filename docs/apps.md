@@ -277,6 +277,15 @@ evicted after `WARM_CONTAINER_IDLE_TIMEOUT` (default `5m`). A container's
 **version** is its resolved image content, so the same tag whose content changed
 is a new generation that drains the old one.
 
+Each app's pool is bounded by its resolved `concurrency`, but those bounds are
+per app. Across all apps a worker also enforces a single global hard bound,
+`MAX_WARM_CONTAINERS` (default `8`), on the number of warm **execution**
+containers it keeps: when a new container is needed and the bound is reached, the
+globally oldest **idle** container is evicted to make room; if every container is
+busy, the invocation stays pending (backpressure) rather than exceeding the bound
+or killing a busy container. Persistent service containers are outside this bound.
+See [configuration.md](configuration.md#warm-container-bound).
+
 Every execution container is hardened: non-root (uid 10001), all Linux
 capabilities dropped, read-only root filesystem with a bounded `/tmp` tmpfs,
 per-container memory/CPU/PID limits, outbound networking enabled.

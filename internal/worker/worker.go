@@ -481,6 +481,13 @@ func Run(logger *slog.Logger) error {
 				// buffer. It is startup configuration; a change requires a worker
 				// restart.
 				runtime.WithMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
+				// The worker-global hard bound (MAX_WARM_CONTAINERS) on warm
+				// EXECUTION containers this worker keeps across all apps. It
+				// bounds the pooled execution-container population (idle + busy),
+				// independent of invocation concurrency; persistent service
+				// containers are outside it. It is startup configuration; a
+				// change requires a worker restart.
+				runtime.WithMaxWarmContainers(cfg.MaxWarmContainers),
 				// The worker-global Docker networks (NETWORKS) every execution
 				// container joins at create time. They are verified by the next
 				// preflight step before any app is prepared or any container
@@ -1047,6 +1054,7 @@ func Run(logger *slog.Logger) error {
 		"Concurrency limits",
 		"max_concurrent_invocations", effectiveMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
 		"max_concurrent_builds", effectiveMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
+		"max_warm_containers", cfg.MaxWarmContainers,
 		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
 		"max_event_bytes", effectiveMaxEventBytes(cfg.MaxEventBytes),
 	)

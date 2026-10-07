@@ -83,6 +83,17 @@ type Config struct {
 	// N workers can run up to N * MaxConcurrentBuilds preparations. It is always
 	// positive after Load.
 	MaxConcurrentBuilds int
+	// MaxWarmContainers is the MAX_WARM_CONTAINERS value (default 8): the hard
+	// per-worker bound on warm EXECUTION containers this worker keeps across all
+	// apps (idle + busy + in-flight creates), enforced globally rather than per
+	// app. It is a count bound on the pooled execution-container population,
+	// not an invocation-concurrency limit: when every warm container is busy and
+	// none can be evicted, an invocation is left pending (backpressure) rather
+	// than starting an extra container. Persistent service containers and
+	// stale-version throwaway containers are outside this bound. It is
+	// INDEPENDENT of MaxConcurrentInvocations and is startup configuration; each
+	// worker enforces its own. It is always positive after Load.
+	MaxWarmContainers int
 	// MaxBufferedEvents is the MAX_BUFFERED_EVENTS value (default 16): the
 	// number of events already read from Redis and still held locally by this
 	// worker before they complete/ACK. It bounds the local buffer so the
@@ -156,8 +167,13 @@ type Config struct {
 // env-facing defaults.
 const (
 	DefaultMaxConcurrentInvocations = 8
-	DefaultMaxConcurrentBuilds      = 2
-	DefaultMaxBufferedEvents        = 16
+	// DefaultMaxConcurrentBuilds is the MAX_CONCURRENT_BUILDS value and
+	// DefaultMaxWarmContainers the MAX_WARM_CONTAINERS value. The runtime
+	// package keeps its own mirroring constants (a leaf package cannot import
+	// config); this package owns the env-facing defaults.
+	DefaultMaxConcurrentBuilds = 2
+	DefaultMaxWarmContainers   = 8
+	DefaultMaxBufferedEvents   = 16
 	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
 	// value when MAX_EVENT_BYTES is unset/empty. MaxEventBytesLimit is the hard
 	// ceiling: a configured or default value above it is rejected, so the cap
@@ -223,9 +239,9 @@ const (
 // MAX_CONCURRENT_INVOCATIONS and MAX_CONCURRENT_BUILDS default to 8 and 2, and
 // MAX_BUFFERED_EVENTS to 16 (see ParsePositiveInt); MAX_EVENT_BYTES
 // defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
-// an invalid (zero, negative, non-integer, or above-limit) value is a returned
-// configuration error. The retention windows instead log-and-disable rather
-// than failing startup.
+// MAX_WARM_CONTAINERS defaults to 8; an invalid (zero, negative, non-integer,
+// or above-limit) value is a returned configuration error. The retention
+// windows instead log-and-disable rather than failing startup.
 func Load(logger *slog.Logger) (Config, error) {
 	var cfg Config
 
@@ -286,6 +302,15 @@ func Load(logger *slog.Logger) (Config, error) {
 		return Config{}, err
 	}
 	cfg.MaxConcurrentBuilds = maxBuilds
+
+	maxWarm, err := loadPositiveInt(
+		"MAX_WARM_CONTAINERS",
+		getEnv("MAX_WARM_CONTAINERS", strconv.Itoa(DefaultMaxWarmContainers)),
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxWarmContainers = maxWarm
 
 	maxBufferedEvents, err := loadPositiveInt(
 		"MAX_BUFFERED_EVENTS",

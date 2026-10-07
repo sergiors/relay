@@ -41,6 +41,50 @@ type contextDiscarder interface {
 	discardContext(ctx context.Context, reason string) bool
 }
 
+// removalConfirmer is an optional reusableContainer capability: a container that
+// can confirm its physical Docker container is gone after a teardown. The
+// production *executionContainer records removal success when its remove call
+// returns (benign not-found/conflict count as success) and reports it here. A
+// container without this capability (test fakes) is treated as confirmed once it
+// is dead, preserving the pool's long-standing "dead == gone" model for them.
+type removalConfirmer interface {
+	removalConfirmed() bool
+}
+
+// removalWaiter is an optional capability of a removalConfirmer whose teardown may
+// still be in flight: it exposes a channel closed when that teardown has decided
+// its outcome. A container that died by its OWN path sets dead() at teardown start,
+// so a concurrent pool reaping path can observe dead() before the removal outcome
+// is recorded; waiting on this channel makes the confirmation race-free instead of
+// permanently withholding the slot. The production *executionContainer returns its
+// closed channel.
+type removalWaiter interface {
+	removalDone() <-chan struct{}
+}
+
+// containerRemovalConfirmed reports whether c's physical container is known to be
+// gone. It prefers the container's own confirmation (the production
+// executionContainer sets it only when its remove succeeded); a container that
+// implements no such capability is confirmed once it is dead. When the container
+// can wait out its teardown, it first waits (bounded by ctx) for the in-flight
+// teardown to record its outcome and then re-reads it, so a container being torn
+// down concurrently is neither counted as freed before that is known nor leaked
+// afterwards. A container whose teardown failed stays unconfirmed, so its
+// warm-budget slot remains reserved.
+func containerRemovalConfirmed(ctx context.Context, c reusableContainer) bool {
+	rc, ok := c.(removalConfirmer)
+	if !ok {
+		return c.dead()
+	}
+	if w, ok := c.(removalWaiter); ok && !rc.removalConfirmed() {
+		select {
+		case <-w.removalDone():
+		case <-ctx.Done():
+		}
+	}
+	return rc.removalConfirmed()
+}
+
 // discardOnContext tears c down on ctx when the container supports a
 // context-aware teardown, falling back to its detached discard otherwise. Every
 // pool teardown funnels through it so the shutdown path is context-bounded while
@@ -137,6 +181,24 @@ type containerCache struct {
 	// app on removal. Guarded by mu.
 	resources map[string]app.ResourceLimits
 	closed    bool
+
+	// maxWarm is the global hard bound on this cache's warm EXECUTION
+	// containers across every app (MAX_WARM_CONTAINERS; <=0 means unbounded,
+	// the directly constructed cache's default). warmCount is the number of
+	// live regular pooled containers (idle + busy) plus in-flight creates that
+	// currently hold a slot; it is kept <= maxWarm. warmNotify is closed and
+	// replaced on every slot release/close to wake a blocked reserveWarm.
+	// warmClosed is set by closeWarm so a reserveWarm racing shutdown fails
+	// immediately. All four are guarded by warmMu, which is a LEAF lock:
+	// warmMu -> cache.mu -> pool.mu is the allowed order (reserveWarm takes
+	// cache.mu/pool.mu only while NOT holding warmMu), and no path takes warmMu
+	// while holding cache.mu or pool.mu. Persistent service containers and
+	// transient stale-version throwaways are deliberately outside this bound.
+	warmMu     sync.Mutex
+	maxWarm    int
+	warmCount  int
+	warmNotify chan struct{}
+	warmClosed bool
 
 	// idleTimeout is how long a healthy idle pooled container may stay before
 	// the maintenance sweep evicts it (see evictIdle). Set once at construction;
@@ -355,10 +417,22 @@ type pooledContainer struct {
 	// list; the maintenance sweep evicts a healthy idle container once
 	// now-idleSince reaches the configured timeout.
 	idleSince time.Time
+	// warm is the global warm-budget reservation this container holds while it
+	// is a live regular pooled container (nil when the budget is unbounded or
+	// this is a transient throwaway). It is released exactly once on discard —
+	// but only when the physical container is confirmed gone (see
+	// containerRemovalConfirmed); a teardown that could not remove the container
+	// keeps this reservation for the Manager's lifetime so the counted bound is
+	// never exceeded by an orphan. Guarded by the owning pool's mu for
+	// assignment; warmOnce/Release are safe under races.
+	warm *WarmPermit
 	// discardOnce guards the per-container discard metric: several teardown
 	// paths may race to discard the same wrapper (lease release, eviction,
 	// removal, close), but the discard counter increments exactly once.
 	discardOnce sync.Once
+	// warmOnce guards releaseContainerWarmSlot so the global warm slot is
+	// released exactly once even when several discard paths race.
+	warmOnce sync.Once
 }
 
 // matchesVersion reports whether the wrapper's container was created for the
@@ -367,6 +441,9 @@ func (pc *pooledContainer) matchesVersion(image, config string) bool {
 	return pc.image == image && pc.config == config
 }
 
+// newContainerCache returns an empty cache. maxWarm stays 0 (unbounded) until
+// NewManager sets it, so a directly constructed cache behaves exactly as before
+// the global warm bound existed.
 func newContainerCache() *containerCache {
 	return &containerCache{
 		pools:         map[string]*appPool{},
@@ -374,6 +451,7 @@ func newContainerCache() *containerCache {
 		removedApps:   map[string]bool{},
 		capacity:      map[string]int{},
 		resources:     map[string]app.ResourceLimits{},
+		warmNotify:    make(chan struct{}),
 	}
 }
 
@@ -788,6 +866,17 @@ func (cc *containerCache) acquireVersion(
 		}
 	}
 
+	// A pre-admitted global warm-budget permit (MAX_WARM_CONTAINERS) carried on
+	// the invocation context. It is consumed by a freshly created container
+	// (released on that container's discard) or released unused when an existing
+	// idle container is leased; a saturated budget with every container busy
+	// never reaches here because reserveWarm waits upstream. A nil permit
+	// (unbounded cache, or a caller that did not pre-admit) makes Execute
+	// reserve its own at create time. The closure (not a method value) captures
+	// the variable so a create-time reserve assigned below is released too.
+	permit := WarmPermitFrom(ctx)
+	defer func() { permit.Release() }()
+
 	// A panic escaping start() must not leak a capacity reservation, or the
 	// pool would be permanently at capacity. reserved/transientReserved track
 	// which reservation is currently held so the unwind path can roll it back
@@ -968,7 +1057,7 @@ func (cc *containerCache) acquireVersion(
 			p.publishPoolGaugesLocked()
 			p.recordAcquireLocked(metrics.RuntimeOutcomeWarm, time.Since(acquiredAt))
 			p.mu.Unlock()
-			p.discardReaped(reaped)
+			p.discardReaped(ctx, reaped)
 			return &containerLease{pool: p, pc: pc}, nil
 		}
 
@@ -978,7 +1067,30 @@ func (cc *containerCache) acquireVersion(
 			p.publishPoolGaugesLocked()
 			reserved = p
 			p.mu.Unlock()
-			p.discardReaped(reaped)
+			p.discardReaped(ctx, reaped)
+
+			// Global warm budget (MAX_WARM_CONTAINERS): reserve a COUNTED slot
+			// for the container about to be created. A pre-admitted counted permit
+			// (acquired before the handler attempt) is reused; a non-counting
+			// permit (admitted while idle capacity existed) or no permit
+			// (unbounded cache / direct caller) reserves a counted slot now,
+			// evicting the globally oldest idle container if the budget is full.
+			// If no slot can be reserved — every warm container is busy, a
+			// concurrent lease took the idle container admission expected, or the
+			// evicted container's physical removal could not be confirmed (its
+			// slot stays reserved) — the create is refused with
+			// ErrWarmBudgetSaturated (never blocking a claimed attempt): the runner
+			// maps it to a pending skip.
+			if permit == nil || !permit.held {
+				wp, werr := cc.ensureWarmSlot(ctx)
+				if werr != nil {
+					p.mu.Lock()
+					reserved = nil
+					p.rollbackStartLocked(false)
+					return nil, werr
+				}
+				permit = wp
+			}
 
 			c, err := start()
 			p.mu.Lock()
@@ -1016,9 +1128,16 @@ func (cc *containerCache) acquireVersion(
 			if p.active == nil || !p.active.matches(image, config) || p.versionRetired(image, config) {
 				pc.retired = true
 				pc.retireReason = p.retiredReasonLocked(image, config)
+				// A throwaway is outside the global warm bound, so its counted
+				// reservation is freed by the deferred Release, not attached.
 				p.transient[pc] = struct{}{}
 			} else {
 				pc.gen = p.active
+				// The container now owns the counted warm slot; it is released
+				// exactly once on discard. consume() makes the deferred Release
+				// a no-op and marks the permit as owned by the container.
+				pc.warm = permit
+				permit.consume()
 				p.active.busy[pc] = struct{}{}
 			}
 			p.publishPoolGaugesLocked()
@@ -1033,7 +1152,7 @@ func (cc *containerCache) acquireVersion(
 		recordWait(p)
 		notify := p.notify
 		p.mu.Unlock()
-		p.discardReaped(reaped)
+		p.discardReaped(ctx, reaped)
 
 		select {
 		case <-notify:
@@ -1439,7 +1558,8 @@ func (cc *containerCache) evictIdle() {
 // path — and a cancelled lifecycle makes the pass return promptly (each
 // teardown is still capped by containerOpTimeout). A failed teardown is never
 // reinserted (the container has already lost its idle slot), so a cleanup
-// failure can only leak the container, never resurrect it.
+// failure can only leak the container and its global warm-budget slot, never
+// resurrect it.
 func (cc *containerCache) evictIdleContext(ctx context.Context) {
 	now := time.Now()
 	if cc.now != nil {
@@ -1544,6 +1664,9 @@ func (cc *containerCache) closeContext(ctx context.Context) {
 		pools = append(pools, p)
 	}
 	cc.mu.Unlock()
+	// Wake any warm-budget waiter so a blocked reserveWarm fails immediately
+	// with errPoolClosed rather than waiting for the caller's context.
+	cc.closeWarm()
 
 	var all []pooledDiscard
 	for _, p := range pools {
@@ -1759,9 +1882,18 @@ func (p *appPool) release(pc *pooledContainer) {
 	}
 	p.pruneDrainingLocked()
 	removing := p.removing
+	becameIdle := !drop
 	p.publishPoolGaugesLocked()
 	p.signalLocked()
 	p.mu.Unlock()
+
+	if becameIdle {
+		// A container just became idle: a global warm-budget waiter that was
+		// admitted non-counting but found no reusable idle container at
+		// admission time can now reuse it. Signalled after p.mu is dropped to
+		// respect the warmMu -> cache.mu -> pool.mu lock order.
+		p.cache.signalWarm()
+	}
 
 	// Always funnel through discardContainer: when reason is "" the container
 	// already tore itself down (timeout/process_exit/protocol_error) and its own

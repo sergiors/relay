@@ -549,14 +549,15 @@ func TestLoadInvalidLogLevelReturnsError(t *testing.T) {
 }
 
 // TestLoadConcurrencyDefaults pins that unset MAX_CONCURRENT_INVOCATIONS,
-// MAX_CONCURRENT_BUILDS, and MAX_BUFFERED_EVENTS resolve to their documented
-// defaults (8, 2, and 16). Load needs the required REDIS_* vars set
-// (setRequiredEnv).
+// MAX_CONCURRENT_BUILDS, MAX_BUFFERED_EVENTS, and MAX_WARM_CONTAINERS resolve
+// to their documented defaults (8, 2, 16, and 8). Load needs the required
+// REDIS_* vars set (setRequiredEnv).
 func TestLoadConcurrencyDefaults(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("MAX_CONCURRENT_INVOCATIONS", "")
 	t.Setenv("MAX_CONCURRENT_BUILDS", "")
 	t.Setenv("MAX_BUFFERED_EVENTS", "")
+	t.Setenv("MAX_WARM_CONTAINERS", "")
 	cfg := mustLoad(t)
 	if cfg.MaxConcurrentInvocations != DefaultMaxConcurrentInvocations {
 		t.Fatalf("MaxConcurrentInvocations = %d, want default %d", cfg.MaxConcurrentInvocations, DefaultMaxConcurrentInvocations)
@@ -567,6 +568,9 @@ func TestLoadConcurrencyDefaults(t *testing.T) {
 	if cfg.MaxBufferedEvents != DefaultMaxBufferedEvents {
 		t.Fatalf("MaxBufferedEvents = %d, want default %d", cfg.MaxBufferedEvents, DefaultMaxBufferedEvents)
 	}
+	if cfg.MaxWarmContainers != DefaultMaxWarmContainers {
+		t.Fatalf("MaxWarmContainers = %d, want default %d", cfg.MaxWarmContainers, DefaultMaxWarmContainers)
+	}
 }
 
 // TestLoadConcurrencyExplicitValues pins that explicit positive values are
@@ -576,6 +580,7 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 	t.Setenv("MAX_CONCURRENT_INVOCATIONS", "4")
 	t.Setenv("MAX_CONCURRENT_BUILDS", "5")
 	t.Setenv("MAX_BUFFERED_EVENTS", "32")
+	t.Setenv("MAX_WARM_CONTAINERS", "3")
 	cfg := mustLoad(t)
 	if cfg.MaxConcurrentInvocations != 4 {
 		t.Fatalf("MaxConcurrentInvocations = %d, want 4", cfg.MaxConcurrentInvocations)
@@ -585,6 +590,9 @@ func TestLoadConcurrencyExplicitValues(t *testing.T) {
 	}
 	if cfg.MaxBufferedEvents != 32 {
 		t.Fatalf("MaxBufferedEvents = %d, want 32", cfg.MaxBufferedEvents)
+	}
+	if cfg.MaxWarmContainers != 3 {
+		t.Fatalf("MaxWarmContainers = %d, want 3", cfg.MaxWarmContainers)
 	}
 }
 
@@ -763,6 +771,9 @@ func TestLoadInvalidConcurrencyReturnsError(t *testing.T) {
 		{"MAX_CONCURRENT_BUILDS", "-1", "MAX_CONCURRENT_BUILDS"},
 		{"MAX_CONCURRENT_BUILDS", "two", "MAX_CONCURRENT_BUILDS"},
 		{"MAX_BUFFERED_EVENTS", "-1", "MAX_BUFFERED_EVENTS"},
+		{"MAX_WARM_CONTAINERS", "0", "MAX_WARM_CONTAINERS"},
+		{"MAX_WARM_CONTAINERS", "-1", "MAX_WARM_CONTAINERS"},
+		{"MAX_WARM_CONTAINERS", "abc", "MAX_WARM_CONTAINERS"},
 	} {
 		t.Run(tt.env+"="+tt.value, func(t *testing.T) {
 			setRequiredEnv(t)

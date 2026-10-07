@@ -64,18 +64,32 @@ type executionContainerHarness struct {
 
 func newExecutionContainerHarness(t *testing.T) *executionContainerHarness {
 	t.Helper()
+	return newExecutionContainerHarnessWithRemove(t, 0)
+}
+
+// newExecutionContainerHarnessWithRemove is newExecutionContainerHarness with a
+// controllable Docker removal outcome: removeStatus 0 (or 200) scripts a
+// successful remove; a 5xx status scripts a genuine removal failure (the daemon
+// refused), letting a test pin how a teardown that could not clean up is
+// accounted.
+func newExecutionContainerHarnessWithRemove(t *testing.T, removeStatus int) *executionContainerHarness {
+	t.Helper()
 	clientEnd, peerEnd := net.Pipe()
 	conn := &observingConn{Conn: clientEnd, writeEntered: make(chan struct{})}
 	h := &executionContainerHarness{peer: peerEnd, writeEntered: conn.writeEntered}
 	h.br = bufio.NewReader(peerEnd)
 
+	rmBody := "{}"
+	if removeStatus >= 400 {
+		rmBody = `{"message":"remove boom"}`
+	}
 	cli := newScriptedDockerClient(t,
 		dockerRoute{method: http.MethodPost, path: "/kill", onMatch: func() {
 			h.mu.Lock()
 			h.kills++
 			h.mu.Unlock()
 		}},
-		dockerRoute{method: http.MethodDelete, path: "/containers/", onMatch: func() {
+		dockerRoute{method: http.MethodDelete, path: "/containers/", status: removeStatus, body: rmBody, onMatch: func() {
 			h.mu.Lock()
 			h.remove++
 			h.mu.Unlock()
@@ -595,6 +609,64 @@ func TestManagerShutdownReleasesInflightBlockedAttach(t *testing.T) {
 	waitReaderExit(t, h)
 	if h.killsDone() < 1 || h.removesDone() < 1 {
 		t.Fatalf("shutdown teardown did not kill/remove the busy container: kills=%d removes=%d",
+			h.killsDone(), h.removesDone())
+	}
+}
+
+// TestExecutionContainerRemovalConfirmedOnSuccess pins the production removal
+// outcome: a teardown whose Docker remove succeeds (or finds the container
+// already gone) reports removalConfirmed, and removalDone closes, so the pool can
+// safely return the container's warm-budget slot.
+func TestExecutionContainerRemovalConfirmedOnSuccess(t *testing.T) {
+	h := newExecutionContainerHarness(t)
+
+	if h.c.removalConfirmed() {
+		t.Fatal("a live container must not report confirmed removal")
+	}
+	if !h.c.discard(reasonShutdown) {
+		t.Fatal("the first discard must perform the teardown")
+	}
+	if !h.c.removalConfirmed() {
+		t.Fatal("a successful remove must confirm removal")
+	}
+	select {
+	case <-h.c.removalDone():
+	default:
+		t.Fatal("removalDone must be closed once the teardown recorded its outcome")
+	}
+	h.assertTornDown(t)
+	// discard is idempotent: a race loser performs no teardown and does not change
+	// the recorded outcome.
+	if h.c.discard(reasonShutdown) {
+		t.Fatal("a second discard must be a no-op")
+	}
+}
+
+// TestExecutionContainerRemovalUnconfirmedOnFailure pins the failure half: when the
+// Docker remove genuinely fails, the container is still poisoned (never reusable)
+// and its removalDone closes, but removalConfirmed stays false so the pool keeps
+// its warm-budget slot reserved rather than admitting a fresh container on phantom
+// capacity.
+func TestExecutionContainerRemovalUnconfirmedOnFailure(t *testing.T) {
+	h := newExecutionContainerHarnessWithRemove(t, http.StatusInternalServerError)
+
+	if !h.c.discard(reasonShutdown) {
+		t.Fatal("the first discard must perform the teardown")
+	}
+	if !h.c.dead() {
+		t.Fatal("a failed removal must still poison the container against reuse")
+	}
+	if h.c.removalConfirmed() {
+		t.Fatal("a genuine remove failure must NOT confirm removal")
+	}
+	select {
+	case <-h.c.removalDone():
+	default:
+		t.Fatal("removalDone must close even when the removal failed")
+	}
+	// Kill was still attempted, and exactly one remove call was made.
+	if h.killsDone() < 1 || h.removesDone() != 1 {
+		t.Fatalf("teardown calls: kills=%d removes=%d, want kill>=1 remove==1",
 			h.killsDone(), h.removesDone())
 	}
 }

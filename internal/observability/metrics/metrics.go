@@ -217,6 +217,16 @@ const (
 	MetricRuntimeContainerDiscards        = metricNamespacePrefix + "runtime_container_discards_total"
 	MetricRuntimeContainerAcquireDuration = metricNamespacePrefix + "runtime_container_acquire_duration_seconds"
 	MetricRuntimeContainerWaits           = metricNamespacePrefix + "runtime_container_waits_total"
+
+	// Global warm-container budget (MAX_WARM_CONTAINERS). Unlike the per-app
+	// pool series these are worker-global, unlabeled gauges: the capacity is the
+	// configured hard bound and the usage is the number of warm execution
+	// containers (idle + busy) currently counted against it. Waits counts
+	// invocations that had to block at the global bound because every warm
+	// container was busy. Persistent service containers are excluded.
+	MetricRuntimeWarmCapacity   = metricNamespacePrefix + "runtime_warm_capacity"
+	MetricRuntimeWarmContainers = metricNamespacePrefix + "runtime_warm_containers"
+	MetricRuntimeWarmWaits      = metricNamespacePrefix + "runtime_warm_waits_total"
 )
 
 // metricHelp carries the Prometheus HELP text for EVERY registered metric,
@@ -285,15 +295,18 @@ var metricHelp = map[string]string{
 	MetricAppBuild:                        "App image and dependency-image build duration in seconds by app.",
 	MetricRuntimeContainerAcquireDuration: "Warm-container pool acquire duration in seconds by app, observed for successful acquires only and including any capacity wait.",
 
-	MetricPendingEntries:       "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
-	MetricPendingOldestAge:     "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
-	MetricBufferedEvents:       "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
-	MetricInFlightInvocations:  "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
-	MetricMissingPayload:       "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
-	MetricEventsOversized:      "Delivered messages whose raw event value exceeded MAX_EVENT_BYTES, counted once per processing delivery that rejects the message before decode, schedule classification, event matching, invocation-state migration, or handler execution and routes it non-retryably to the DLQ. A redelivery of the same oversized entry counts again. Unlabeled: the event ID and byte size are never labels.",
-	MetricBuildOutputTruncated: "Docker build responses whose retained diagnostic reached the internal 1 MiB build-output retention bound and had further output discarded; the response stream is still fully drained, only the retained diagnostic is bounded. Unlabeled: the app name and byte size are never labels.",
-	MetricRuntimeContainers:    "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
-	MetricRuntimePoolCapacity:  "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS).",
+	MetricPendingEntries:        "Current number of pending (delivered but unacknowledged) entries in the Redis consumer group, sampled from XPENDING.",
+	MetricPendingOldestAge:      "Current age in seconds of the oldest pending entry in the Redis consumer group, sampled from XPENDING.",
+	MetricBufferedEvents:        "Current number of events held in the stream consumer's local in-flight buffer, set on each acquire and release.",
+	MetricInFlightInvocations:   "Current number of invocations executing in this worker, set on each concurrency-slot acquire and release.",
+	MetricMissingPayload:        "Reclaimed pending entries whose stream body no longer exists (trimmed or deleted before acknowledgement), counted once per entry when its dangling PEL reference is cleared. These entries cannot be processed and are neither handler attempts nor DLQ entries; a nonzero value signals an unsafe trim or an external delete racing Relay.",
+	MetricEventsOversized:       "Delivered messages whose raw event value exceeded MAX_EVENT_BYTES, counted once per processing delivery that rejects the message before decode, schedule classification, event matching, invocation-state migration, or handler execution and routes it non-retryably to the DLQ. A redelivery of the same oversized entry counts again. Unlabeled: the event ID and byte size are never labels.",
+	MetricBuildOutputTruncated:  "Docker build responses whose retained diagnostic reached the internal 1 MiB build-output retention bound and had further output discarded; the response stream is still fully drained, only the retained diagnostic is bounded. Unlabeled: the app name and byte size are never labels.",
+	MetricRuntimeContainers:     "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
+	MetricRuntimePoolCapacity:   "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS).",
+	MetricRuntimeWarmCapacity:   "Configured hard per-worker bound on warm execution containers across all apps (MAX_WARM_CONTAINERS). Persistent service containers are excluded.",
+	MetricRuntimeWarmContainers: "Current number of warm execution containers counted against the worker-global MAX_WARM_CONTAINERS bound (idle plus busy regular pooled containers). Persistent service containers and stale-version throwaway containers are excluded.",
+	MetricRuntimeWarmWaits:      "Invocations that had to block at the worker-global MAX_WARM_CONTAINERS bound because every warm execution container was busy and none could be evicted; a blocked invocation is left pending (backpressure) and is not charged a handler attempt.",
 
 	MetricAppStatus:                "Current public lifecycle status of the app as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
 	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",
@@ -603,6 +616,10 @@ func New() *Registry {
 		// diagnostic was cut at the internal retention bound (see the constant's
 		// doc).
 		MetricBuildOutputTruncated,
+		// MetricRuntimeWarmWaits counts invocations that had to block at the
+		// worker-global MAX_WARM_CONTAINERS bound because every warm execution
+		// container was busy (see the constant's doc).
+		MetricRuntimeWarmWaits,
 	} {
 		c := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(c)
@@ -716,6 +733,10 @@ func New() *Registry {
 	for _, name := range []string{
 		MetricBufferedEvents,
 		MetricInFlightInvocations,
+		// Global warm-container budget gauges: the configured bound and the
+		// current counted warm execution containers (MAX_WARM_CONTAINERS).
+		MetricRuntimeWarmCapacity,
+		MetricRuntimeWarmContainers,
 	} {
 		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: metricHelp[name]})
 		reg.MustRegister(g)

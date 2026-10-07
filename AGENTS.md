@@ -54,7 +54,19 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   (`MAX_CONCURRENT_BUILDS`, default 2) bounds concurrent runtime-backed image
   preparations — source snapshot, dependency snapshot, and Docker builds — one
   immutable permit held for a preparation's whole duration; it is per worker, not
-  a host-wide quota, and does not bound invocations or events.
+  a host-wide quota, and does not bound invocations or events. Independently
+  again, a worker-global hard bound on warm execution containers
+  (`MAX_WARM_CONTAINERS`, default 8) caps the aggregate pooled population across
+  all apps (idle + busy, plus in-flight creates; persistent service containers
+  and stale-version throwaways excluded). It is applied before an invocation
+  claims a handler attempt: at the bound the globally oldest IDLE container is
+  LRU-evicted; when every container is busy the invocation is left pending
+  (backpressure) — never charged a retry, never DLQ'd — rather than evict a busy
+  container or exceed the bound. A container's slot is returned only once its
+  physical removal is confirmed: a teardown whose Docker remove genuinely fails
+  leaves the container poisoned but keeps its slot reserved for the worker's
+  lifetime, so the bound counts live containers rather than tracked ones and a
+  fresh container is never admitted on phantom capacity.
 - Matching also includes a valid generation being PREPARED but not yet runnable.
   The reconciler publishes the desired generation's event rules as a pending,
   non-runnable entry in the registry (atomically with its candidate index)

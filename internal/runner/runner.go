@@ -38,6 +38,15 @@ const DefaultMaxConcurrentInvocations = 8
 // "Concurrency and backpressure" note).
 const slotWaitTimeout = 30 * time.Second
 
+// warmAdmitWait bounds how long Handle/InvokeHandler wait for a slot in the
+// worker-global warm-container budget (MAX_WARM_CONTAINERS) before leaving the
+// work pending. It is deliberately much shorter than slotWaitTimeout so the
+// COMBINED wait (concurrency slot + warm budget) stays well below the stream
+// layer's MinPendingIdle reclaim threshold (1m): 30s + 5s = 35s. A saturated
+// budget is relieved as containers free, and the wait avoids reclaim churn on a
+// brief overlap without ever charging a handler attempt.
+const warmAdmitWait = 5 * time.Second
+
 // Manual-invocation sentinel errors. They let the worker socket map a manual
 // invocation failure onto a stable wire code without inspecting error strings
 // (see internal/worker/socket.go). They are returned (wrapped) by
@@ -518,6 +527,12 @@ type Runner struct {
 	// the same way cleaner above is resolved (one pass over the registry).
 	invalidatorOnce sync.Once
 	invalidator     ContainerInvalidator
+	// warmAdmitter resolves to the executor's warm-budget admitter capability
+	// (runtime.WarmAdmitter) the same way cleaner above is resolved (one pass
+	// over the registry); a nil admitter means warm-budget admission is
+	// unconditional (fake/in-process executors, an unbounded runtime).
+	warmAdmitterOnce sync.Once
+	warmAdmitter     runtime.WarmAdmitter
 	// hostname is this worker's container-ownership identity, stamped as the
 	// relay.hostname label on every execution container via RunMeta. It is the
 	// same value as the Redis consumer identity. It must be set (via
@@ -566,6 +581,11 @@ type Runner struct {
 	// defaults to slotWaitTimeout and is overridable by tests (package-internal
 	// tests set r.slotWait directly to keep the slot-timeout tests fast).
 	slotWait time.Duration
+	// warmWait is how long an invocation waits for a slot in the worker-global
+	// warm-container budget (MAX_WARM_CONTAINERS) before being left pending. It
+	// defaults to warmAdmitWait and is overridable by tests (package-internal
+	// tests set r.warmWait directly to keep the warm-admission tests fast).
+	warmWait time.Duration
 	// imageCleanupRetryDelays is the bounded backoff between retries of an image
 	// removal that was skipped because a relay-owned container still references
 	// it. It defaults to the production ~60s horizon (2+4+8+16+30s across 5
@@ -745,6 +765,7 @@ func NewWithMetrics(prepared []*PreparedApp, logger *slog.Logger, registry *metr
 		refs:                    newImageRefCounter(),
 		fnSems:                  map[string]*semaphore{},
 		slotWait:                slotWaitTimeout,
+		warmWait:                warmAdmitWait,
 		imageCleanupRetryDelays: defaultImageCleanupRetryDelays,
 	}
 	// maxConcurrentInvocations defaults to DefaultMaxConcurrentInvocations so an uncalled
@@ -841,6 +862,63 @@ func (r *Runner) invalidatorResolver() ContainerInvalidator {
 		}
 	})
 	return r.invalidator
+}
+
+// warmAdmitterResolver returns the runner's resolved warm-budget admitter, or
+// nil when the executor does not implement it (fake executors in tests, or an
+// unbounded runtime). Resolution scans the registry snapshot once and caches,
+// mirroring invalidatorResolver.
+func (r *Runner) warmAdmitterResolver() runtime.WarmAdmitter {
+	r.warmAdmitterOnce.Do(func() {
+		for _, pf := range r.reg.snapshot() {
+			if adm, ok := pf.executor.(runtime.WarmAdmitter); ok {
+				r.warmAdmitter = adm
+				return
+			}
+		}
+	})
+	return r.warmAdmitter
+}
+
+// warmSaturated reports whether err is the runtime's create-time warm-budget
+// saturation sentinel (a narrow race between admission and container create). It
+// is BACKPRESSURE, not a handler failure: the caller must leave the work pending
+// without charging a retry or a DLQ entry.
+func warmSaturated(err error) bool {
+	return errors.Is(err, runtime.ErrWarmBudgetSaturated)
+}
+
+// admitWarm pre-admits ctx against the worker-global warm-container budget
+// (MAX_WARM_CONTAINERS) BEFORE a handler attempt is claimed, returning a context
+// carrying the permit and whether admission succeeded. ok=false means every warm
+// execution container is busy and none can be evicted within warmAdmitWait
+// (backpressure): the caller MUST leave the work pending WITHOUT claiming a
+// handler attempt, so no retry budget is charged. When the executor exposes no
+// warm admitter (fake/in-process executors, an unbounded runtime) admission is
+// unconditional and the context is returned unchanged.
+//
+// The permit is released by Manager.Execute when it is not consumed (an idle
+// container was leased) or by the owning container on discard when it is; a
+// caller that admits and then does not execute must release it, which the
+// consume-aware WarmPermit.Release makes safe. The wait is bounded by
+// warmAdmitWait (not r.slotWait) so the combined concurrency-plus-warm wait
+// stays below the stream reclaim threshold; tests may shorten it via r.warmWait.
+func (r *Runner) admitWarm(ctx context.Context) (context.Context, bool) {
+	adm := r.warmAdmitterResolver()
+	if adm == nil {
+		return ctx, true
+	}
+	wait := r.warmWait
+	if wait <= 0 {
+		wait = warmAdmitWait
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	permit, err := adm.AcquireWarmPermit(waitCtx)
+	if err != nil {
+		return ctx, false
+	}
+	return runtime.WithWarmPermit(ctx, permit), true
 }
 
 // ImageInUse reports whether any execution is currently holding a reference to
@@ -1752,6 +1830,27 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					)
 				}
 				defer releaseSlots()
+				// Pre-admit the worker-global warm-container budget
+				// (MAX_WARM_CONTAINERS) BEFORE TryStart, so a saturated warm
+				// budget leaves the invocation pending (backpressure) without
+				// claiming a handler attempt or charging a retry. The permit is
+				// consumed by the container Execute creates (released on its
+				// discard) or released unused here when Execute reuses an idle
+				// container; the deferred Release below is the safety net for the
+				// paths that do not reach Execute.
+				warmCtx, warmOK := r.admitWarm(ctx)
+				if !warmOK {
+					skippedPending = true
+					r.log.Debug("App handler: warm-container budget saturated; leaving pending",
+						"app", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+						"delivery_attempt", int(deliveryAttempt),
+					)
+					return outcomePendingSkip, nil
+				}
+				warmPermit := runtime.WarmPermitFrom(warmCtx)
+				defer warmPermit.Release()
 				// Claim the invocation for this execution before running it.
 				// TryStart atomically persists an absolute running deadline
 				// (now + timeout), the attempt, and a fresh claim token, and
@@ -1869,6 +1968,14 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 					return outcomeRetryable, fmt.Errorf("app %q handler %q: %w", pf.fn.Name, rule.Handler, err)
 				}
 				invokeCtx, cancel := context.WithTimeout(ctx, timeout)
+				// Carry the pre-admitted warm-budget permit into Execute so a
+				// newly created container owns the counted slot. The permit is
+				// released by Execute (unused, on a warm lease) or by the
+				// container on discard; the deferred release above is the safety
+				// net for paths that never reach Execute.
+				if warmPermit != nil {
+					invokeCtx = runtime.WithWarmPermit(invokeCtx, warmPermit)
+				}
 				// Stamp the invocation's diagnostic metadata into the context so
 				// the executor can attach it as container labels. This keeps the
 				// Executor interface (and every test fake) unchanged.
@@ -1898,6 +2005,21 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 							"stack", string(debug.Stack()),
 						)...,
 					)
+				}
+				if warmSaturated(err) {
+					// The container could not be created because the global warm
+					// budget saturated at create time (a race between admission
+					// and the actual create). This is BACKPRESSURE, not a handler
+					// failure: leave the invocation pending with no attempt
+					// accounting — the claimed marker's deadline will elapse and a
+					// later delivery retries the claim without charging a retry.
+					skippedPending = true
+					r.log.Debug("App handler: warm-container budget saturated at create; leaving pending",
+						"app", pf.fn.Name,
+						"handler", rule.Handler,
+						"message_id", msgID,
+					)
+					return outcomePendingSkip, nil
 				}
 				if err != nil {
 					r.metrics.IncLabels(metrics.MetricHandlerInvocations,
@@ -2279,6 +2401,21 @@ func (r *Runner) invokeHandler(
 	}
 	defer releaseSlots()
 
+	// Pre-admit the worker-global warm-container budget (MAX_WARM_CONTAINERS)
+	// before any handler attempt is claimed, so a saturated warm budget leaves
+	// the occurrence pending (backpressure) instead of charging a retry. The
+	// permit rides the invocation context into Execute.
+	schedCtx, warmOK := r.admitWarm(ctx)
+	if !warmOK {
+		r.log.Debug("Schedule: warm-container budget saturated; leaving pending",
+			"app", fnName, "handler", handler)
+		if hasState {
+			return stream.ErrInvocationNotEligible
+		}
+		return fmt.Errorf("schedule invocation: warm-container budget saturated")
+	}
+	defer runtime.WarmPermitFrom(schedCtx).Release()
+
 	// The state-free path (direct callers/tests, DLQ replay) preserves the legacy
 	// single-attempt behavior exactly: resolve the current schedule, cap the
 	// timeout, and execute once. No descriptor, no broker lifecycle.
@@ -2287,7 +2424,7 @@ func (r *Runner) invokeHandler(
 		if cap := time.Duration(r.maxHandlerTimeout.Load()); cap > 0 && desc.Timeout > cap {
 			desc.Timeout = cap
 		}
-		return r.invokeOnce(ctx, pf, desc.Handler, payload, desc.Timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
+		return r.invokeOnce(schedCtx, pf, desc.Handler, payload, desc.Timeout, pin, nil, "", stream.InvocationClaim{}, msgID)
 	}
 
 	// Read the pinned schedule descriptor ONCE (a Redis read, and the
@@ -2489,13 +2626,23 @@ func (r *Runner) invokeHandler(
 		}
 	}
 
-	err = r.invokeOnce(ctx, pf, handler, payload, timeout, pin, invState, invocation, admission.Claim, msgID)
+	err = r.invokeOnce(schedCtx, pf, handler, payload, timeout, pin, invState, invocation, admission.Claim, msgID)
 	if err != nil {
 		// A stale completion (the claim was superseded or the marker is already
 		// terminal) is not a handler failure: do NOT ACK a superseded claim's
 		// outcome — leave the message pending so a later delivery resolves it.
 		if errors.Is(err, stream.ErrInvocationNotEligible) {
 			return err
+		}
+		// A create-time warm-budget saturation is BACKPRESSURE, not a handler
+		// failure: leave the occurrence pending (a later delivery retries the
+		// claim) without charging a retry or a DLQ.
+		if warmSaturated(err) {
+			r.log.Debug("Schedule: warm-container budget saturated at create; leaving pending",
+				"app", fnName,
+				"handler", handler,
+			)
+			return stream.ErrInvocationNotEligible
 		}
 		// A failed attempt — resolve extra env, marshal, execution, or timeout
 		// failures all land here. recordFailure decides retry vs exhaustion using
@@ -2742,8 +2889,26 @@ func (r *Runner) InvokeApp(
 			continue
 		}
 
+		// Pre-admit the worker-global warm-container budget before claiming an
+		// attempt. A manual invocation is an operator action, not a stream
+		// delivery, so a saturated budget is reported as an error (no pending
+		// semantics) and the later rules are still tried.
+		warmCtx, warmOK := r.admitWarm(ctx)
+		if !warmOK {
+			releaseSlots()
+			r.log.Warn("App invoke: warm-container budget saturated",
+				"app", name,
+				"handler", rule.Handler,
+			)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("app %q handler %q: warm-container budget saturated", name, rule.Handler)
+			}
+			continue
+		}
+
 		err := func() error {
 			defer releaseSlots()
+			defer runtime.WarmPermitFrom(warmCtx).Release()
 
 			// The handler attempt is about to begin: this is the
 			// last_execution_at attribution point, exactly as Handle's rule loop
@@ -2757,7 +2922,7 @@ func (r *Runner) InvokeApp(
 				return fmt.Errorf("app %q handler %q: %w", name, rule.Handler, err)
 			}
 
-			invokeCtx, cancel := context.WithTimeout(ctx, timeout)
+			invokeCtx, cancel := context.WithTimeout(warmCtx, timeout)
 			// Stamp the invocation's diagnostic metadata so the execution
 			// container carries its owner and identity labels. The type is the
 			// event one-shot type: a manual invocation runs an event rule against
@@ -2787,6 +2952,15 @@ func (r *Runner) InvokeApp(
 					"panic_value", fmt.Sprintf("%v", panicValue),
 					"stack", string(debug.Stack()),
 				)
+			}
+			if warmSaturated(err) {
+				// Backpressure, not a handler failure: a manual invocation is
+				// synchronous, so report it without counting a handler failure.
+				r.log.Warn("App invoke: warm-container budget saturated",
+					"app", name,
+					"handler", rule.Handler,
+				)
+				return fmt.Errorf("app %q handler %q: warm-container budget saturated", name, rule.Handler)
 			}
 			if err != nil {
 				r.recordHandlerFailure(name, rule.Handler, elapsed)

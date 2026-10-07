@@ -78,7 +78,14 @@ type executionContainer struct {
 	closed   chan struct{} // closed exactly once when discarded
 
 	// dying is the discard CAS: only the first discarder closes/tears down.
-	dying    atomic.Bool
+	dying atomic.Bool
+	// removed records that the physical Docker container is CONFIRMED gone
+	// (removed, or already absent because AutoRemove/not-found won the race). It
+	// is set at most once, only when the first discarder's remove succeeds; a
+	// genuine remove failure leaves it false forever, so the container's global
+	// warm-budget slot stays conservatively reserved for the Manager's lifetime
+	// (see removalConfirmed and discardContainerContext).
+	removed  atomic.Bool
 	reasonMu sync.Mutex
 	reason   string
 
@@ -550,6 +557,13 @@ func (c *executionContainer) discard(reason string) bool {
 // waiting promptly when the shutdown step's bound expires instead of running on
 // the container's own detached 5s-per-call context. The CAS/reason/closed
 // bookkeeping is shared with discard and idempotent.
+//
+// The return value reports whether THIS call performed the teardown; race losers
+// (an earlier discard already set dying) return false without touching the
+// container. `removed` is set only when removeContainerContext reports success
+// (or the container was already gone, see benignRemovalErr), so the pool can tell
+// a torn-down-and-gone container from one whose physical removal failed and keep
+// the latter's global warm-budget slot reserved.
 func (c *executionContainer) discardContext(ctx context.Context, reason string) bool {
 	if !c.dying.CompareAndSwap(false, true) {
 		return false
@@ -559,8 +573,13 @@ func (c *executionContainer) discardContext(ctx context.Context, reason string) 
 	c.reasonMu.Unlock()
 	killContainerContext(ctx, c.cli, c.id)
 	if err := removeContainerContext(ctx, c.cli, c.id); err != nil {
+		// A genuine removal failure: the container may survive as an orphan.
+		// `removed` stays false so its warm-budget slot is never returned for the
+		// Manager's lifetime (see removalConfirmed / discardContainerContext).
 		c.log.Warn("Runtime container: remove container failed",
 			"container", c.id, "reason", reason, "error", err)
+	} else {
+		c.removed.Store(true)
 	}
 	c.attach.Close()
 	close(c.closed)
@@ -571,6 +590,20 @@ func (c *executionContainer) discardContext(ctx context.Context, reason string) 
 
 // dead reports whether the container has been discarded (poisoned).
 func (c *executionContainer) dead() bool { return c.dying.Load() }
+
+// removalConfirmed reports whether the physical Docker container is CONFIRMED
+// gone: removeContainerContext succeeded (removed, or already absent because
+// AutoRemove/not-found won the race). It is false when a genuine removal failure
+// left the container possibly alive, so the pool never returns that container's
+// warm-budget slot and a fresh container is never admitted on phantom capacity.
+func (c *executionContainer) removalConfirmed() bool { return c.removed.Load() }
+
+// removalDone is closed once the first discarder has recorded its removal outcome
+// (see discardContext). A pool reaping a container that died by its own path uses
+// it to wait out a still-in-flight teardown before deciding whether the physical
+// container is gone, rather than observing dead() and permanently withholding the
+// warm-budget slot.
+func (c *executionContainer) removalDone() <-chan struct{} { return c.closed }
 
 func (c *executionContainer) discardReason() string {
 	c.reasonMu.Lock()

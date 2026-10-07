@@ -92,6 +92,16 @@ func (f *fakeContainer) attempts() int {
 	return f.discardAttempts
 }
 
+// removalConfirmed implements removalConfirmer: a fake container's physical
+// removal is confirmed when it actually tore down (dead) and its discard did not
+// fail. A discardFails container models a teardown that could not clean up, so its
+// warm-budget slot must stay reserved.
+func (f *fakeContainer) removalConfirmed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deadFlag && !f.discardFails
+}
+
 func (f *fakeContainer) dead() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()

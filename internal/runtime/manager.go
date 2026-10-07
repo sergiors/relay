@@ -74,6 +74,13 @@ const DefaultMaxConcurrentInvocations = 8
 // independent of the invocation-concurrency cap.
 const DefaultMaxConcurrentBuilds = 2
 
+// DefaultMaxWarmContainers is the worker-global hard bound on warm execution
+// containers applied by NewManager when no WithMaxWarmContainers option is
+// given. It mirrors config.DefaultMaxWarmContainers (this leaf package cannot
+// import config); the worker always passes config's resolved value explicitly.
+// A zero value falls back to this constant, never "unbounded".
+const DefaultMaxWarmContainers = 8
+
 // managerPingTimeout bounds the startup Docker daemon ping. The ping is rooted
 // in the manager lifecycle (the worker's signal context) so it is cancelled at
 // shutdown, but it must also be finite on its own: a wedged daemon must fail
@@ -151,6 +158,14 @@ type Manager struct {
 	// built lazily and race-safely (see buildLimiterFor) so a Manager
 	// constructed directly by tests is bounded too.
 	maxConcurrentBuilds int
+	// maxWarmContainers is the worker-global hard bound (MAX_WARM_CONTAINERS) on
+	// warm EXECUTION containers this worker keeps across all apps. It is set
+	// once at construction (WithMaxWarmContainers; the worker wires config's
+	// resolved value) and read without the lock: startup configuration, not
+	// hot-reloadable. A zero value falls back to DefaultMaxWarmContainers, never
+	// "unbounded". It bounds the pooled execution-container population, not
+	// invocation concurrency; persistent service containers are outside it.
+	maxWarmContainers int
 	// buildLimit is the per-Manager preparation semaphore. It is created by
 	// NewManager; a Manager constructed directly by tests lazily initializes it
 	// on first use (buildLimiterFor), so every preparation is bounded even when
@@ -287,6 +302,10 @@ type managerOptions struct {
 	// pipelines. Zero means the package default (DefaultMaxConcurrentBuilds),
 	// never "unbounded".
 	maxConcurrentBuilds int
+	// maxWarmContainers is the worker-global hard bound on warm execution
+	// containers (MAX_WARM_CONTAINERS). Zero means the package default
+	// (DefaultMaxWarmContainers), never "unbounded".
+	maxWarmContainers int
 	// networks is the worker-global Docker network set every execution container
 	// joins at create time (see WithNetworks). Nil/empty means no extra
 	// networks (default bridge behavior).
@@ -342,6 +361,19 @@ func WithMaxConcurrentInvocations(n int) ManagerOption {
 // NewManager caller that omits it gets DefaultMaxConcurrentBuilds.
 func WithMaxConcurrentBuilds(n int) ManagerOption {
 	return func(o *managerOptions) { o.maxConcurrentBuilds = n }
+}
+
+// WithMaxWarmContainers sets the worker-global hard bound (MAX_WARM_CONTAINERS)
+// on warm EXECUTION containers this worker keeps across all apps. It is a count
+// bound on the pooled execution-container population (idle + busy + in-flight
+// creates), independent of MAX_CONCURRENT_INVOCATIONS; persistent service
+// containers and stale-version throwaway containers are excluded. A
+// non-positive value is treated as DefaultMaxWarmContainers (never "unbounded").
+// It is startup configuration: changing it requires a worker restart. The worker
+// wires it from config; a direct NewManager caller that omits it gets
+// DefaultMaxWarmContainers.
+func WithMaxWarmContainers(n int) ManagerOption {
+	return func(o *managerOptions) { o.maxWarmContainers = n }
 }
 
 // WithNetworks sets the worker-global Docker network set (NETWORKS) that every
@@ -451,6 +483,7 @@ func NewManager(
 		hostname:                 hostname,
 		maxConcurrentInvocations: resolved.maxConcurrentInvocations,
 		maxConcurrentBuilds:      resolved.maxConcurrentBuilds,
+		maxWarmContainers:        resolved.maxWarmContainers,
 		networks:                 resolved.networks,
 		done:                     make(chan struct{}),
 		maintDone:                make(chan struct{}),
@@ -476,6 +509,8 @@ func NewManager(
 	mgr.containers.idleTimeout = resolved.idleTimeout
 	mgr.containers.now = resolved.now
 	mgr.containers.metrics = registry
+	mgr.containers.maxWarm = resolved.maxWarmContainers
+	mgr.containers.publishWarmCapacity()
 	mgr.leases = newImageCoordinator()
 	mgr.maintInterval = maintenanceInterval(resolved.idleTimeout)
 	if !resolved.deferredMaintenance {
@@ -538,6 +573,9 @@ func resolveManagerOptions(opts []ManagerOption) managerOptions {
 	}
 	if resolved.maxConcurrentBuilds < 1 {
 		resolved.maxConcurrentBuilds = DefaultMaxConcurrentBuilds
+	}
+	if resolved.maxWarmContainers < 1 {
+		resolved.maxWarmContainers = DefaultMaxWarmContainers
 	}
 	return resolved
 }

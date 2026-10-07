@@ -27,6 +27,7 @@ automatically.
 | `LOG_LEVEL`                   | `INFO`             | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                               |
 | `MAX_CONCURRENT_INVOCATIONS`  | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
 | `MAX_CONCURRENT_BUILDS`       | `2`                | positive integer                                                        | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                  |
+| `MAX_WARM_CONTAINERS`         | `8`                | positive integer                                                        | Fails startup. Hard per-worker bound on warm **execution** containers across all apps (idle + busy); when saturated every idle container is LRU-evicted, and if all are busy the invocation stays pending. See below.        |
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
 | `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)                      | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
@@ -76,12 +77,57 @@ does not.
 
 ```
 Redis stream → bounded local buffer → matcher/dispatcher →
-worker concurrency → per-app concurrency → runner/container → ACK
+worker concurrency → per-app concurrency → warm-container budget →
+runner/container → ACK
 ```
 
 When the local buffer is full the consumer stops reading, so the backlog stays
 in Redis. A full concurrency slot leaves the message pending (no retry charged)
 and a later reclaim replays it.
+
+### Warm-container bound
+
+`MAX_WARM_CONTAINERS` (default `8`) is a **per-worker** hard bound on the warm
+**execution** containers Relay keeps across every app — a count bound on the
+pooled execution-container population (idle **plus** busy, plus in-flight
+creates), independent of `MAX_CONCURRENT_INVOCATIONS` and of any single app's
+`concurrency`. It exists because the per-app warm pools are otherwise unbounded in
+aggregate: `10` apps each with `concurrency: 2` could keep `20` warm containers
+alive even though at most `MAX_CONCURRENT_INVOCATIONS` invocations run at once.
+
+Enforcement is global (not per app) and is applied **before** an invocation
+claims a handler attempt:
+
+- While the bound has room, an invocation is admitted and a container slot is
+  reserved.
+- At the bound, the globally **oldest idle** execution container (by last-use
+  time, across all apps) is evicted to make room, with the
+  `warm_eviction` discard reason. Only **idle** containers are ever evicted; a
+  **busy** container is never killed, and neither are the persistent service
+  containers (which are outside this bound).
+- When the bound is full and every execution container is busy, no container can
+  be evicted: the invocation is left **pending** (backpressure) and is replayed
+  by a later reclaim, exactly like a full concurrency slot — it is **not**
+  charged a handler retry and is not dead-lettered. This is the deliberate
+  difference from a handler failure.
+- A stale-version throwaway container (a request for an already-retired image) is
+  **not** counted against the bound; the bound covers the regular pooled
+  population only.
+- A container counts against the bound until its physical removal is
+  **confirmed**. When a teardown's Docker remove genuinely fails, the container
+  is still poisoned against reuse but its slot stays reserved for the worker's
+  lifetime; a fresh container is never admitted on that phantom capacity, so the
+  bound is a true upper bound on live containers rather than on tracked ones.
+
+The idle timeout (`WARM_CONTAINER_IDLE_TIMEOUT`) still evicts on age; the bound
+is an additional cap that evicts the oldest idle container early only when a new
+container actually needs the room. `MAX_WARM_CONTAINERS` is startup
+configuration: changing it requires a worker restart. A value below `1` is a
+fatal configuration error (zero is never read as "unbounded").
+
+The `relay_runtime_warm_capacity` and `relay_runtime_warm_containers` gauges
+report the configured bound and current usage; `relay_runtime_warm_waits_total`
+counts invocations that had to wait at the bound.
 
 ### Event size limit
 

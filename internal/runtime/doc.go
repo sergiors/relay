@@ -16,11 +16,13 @@
 //     must never cut off a legitimate image build; the lifecycle root keeps
 //     builds cancellable on Relay shutdown.
 //   - Execute: a leased container from the app's warm pool (bounded by the
-//     app's resolved concurrency), event JSON on stdin, stdout/stderr
+//     app's resolved concurrency, and by the worker-global MAX_WARM_CONTAINERS
+//     bound across all apps), event JSON on stdin, stdout/stderr
 //     forwarded verbatim to the process output sink as a raw transport (not
 //     slog); healthy idle containers are evicted by a single maintenance loop
 //     once idle longer than the configured timeout, and a removed app's
-//     warm state is discarded (see container_cache.go). NewManager starts that
+//     warm state is discarded (see container_cache.go and warm_budget.go).
+//     NewManager starts that
 //     loop eagerly; WithDeferredMaintenance suppresses it so a caller that must
 //     verify its own prerequisites first (the worker's NETWORKS preflight)
 //     starts it explicitly with StartMaintenance, and Close is safe either way.

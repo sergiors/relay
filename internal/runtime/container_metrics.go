@@ -240,28 +240,42 @@ func (p *appPool) discardContainer(pc *pooledContainer, reason string) {
 // discardContainerContext is discardContainer with a caller-supplied bound: a
 // context-aware container (the production executionContainer) observes ctx in
 // its kill/remove, so a shutdown teardown is cancelled promptly. Metric
-// recording is identical.
-func (p *appPool) discardContainerContext(ctx context.Context, pc *pooledContainer, reason string) {
+// recording is identical. It also releases the container's global warm-budget
+// reservation (MAX_WARM_CONTAINERS) exactly once — but ONLY when the physical
+// container is confirmed gone (removed, already absent, or dead with known
+// cleanup). It reports whether THIS call freed the slot. A genuine removal
+// failure leaves the container possibly alive, so its slot stays reserved for the
+// Manager's lifetime; a fresh container is never admitted on phantom capacity,
+// and a later invocation must travel the warm saturation/backpressure path
+// rather than over-committing.
+func (p *appPool) discardContainerContext(ctx context.Context, pc *pooledContainer, reason string) bool {
 	if pc == nil {
-		return
+		return false
 	}
 	if !pc.c.dead() {
 		discardOnContext(pc.c, ctx, reason)
 	}
+	released := false
+	if containerRemovalConfirmed(ctx, pc.c) {
+		released = pc.releaseContainerWarmSlot()
+	}
 	p.recordDiscard(pc, reason)
+	return released
 }
 
 // discardReaped disposes the containers an acquire removed from the idle list
 // or discarded on a transition. It runs outside the pool lock; dead containers
 // are still recorded (their own path tore them down, e.g. process_exit while
-// idle), but their discard is not attempted again.
-func (p *appPool) discardReaped(reaped []*pooledContainer) {
+// idle), but their discard is not attempted again. ctx bounds the (rare) wait for
+// an in-flight self-teardown to report its removal outcome, so a cancelled
+// acquire is never held past its bound.
+func (p *appPool) discardReaped(ctx context.Context, reaped []*pooledContainer) {
 	for _, pc := range reaped {
 		reason := pc.retireReason
 		if reason == "" {
 			reason = reasonImageChanged
 		}
-		p.discardContainer(pc, reason)
+		p.discardContainerContext(ctx, pc, reason)
 	}
 }
 
