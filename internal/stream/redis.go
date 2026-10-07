@@ -1339,18 +1339,23 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 // the DLQ stream. Skipping already-persisted entries is what makes retrying a
 // partially-written multi-entry DLQ (after a failed XACK, a crash, or a partial
 // write) idempotent: the retry writes only the missing entries and never
-// duplicates the ones that succeeded.
+// duplicates the ones that succeeded. (The atomic persist script also refuses to
+// rewrite an already-marked entry, so this pre-filter is a round-trip
+// optimization and a metrics guard, not the correctness boundary.)
 //
 // It also returns each retained spec's exact exhausted claim identity (from the
-// marker) so the subsequent DLQ-persistence upgrade CASes that identity, never a
+// marker) so the subsequent atomic DLQ-persistence CASes that identity, never a
 // guessed one. A spec with no well-formed exhausted marker carries a zero claim;
-// the upgrade then refuses (a marker-less invocation cannot be upgraded, and its
-// entry is still written because it was not marked persisted).
+// the atomic script then refuses it without writing, and the message stays
+// pending rather than appending an unattributable entry (a marker-less exhausted
+// invocation is an anomaly: the runner writes the exhausted marker before it
+// reports exhaustion).
 //
-// A store read error fails safe: the spec is kept so the entry is rewritten (a
+// A store read error fails safe: the spec is kept so the entry is retried (a
 // duplicate is allowed under at-least-once, while skipping a required write
 // would lose the entry). A spec with no invocation ID (the malformed-message
-// placeholder) is always kept; it has no persistence marker to consult.
+// placeholder) is always kept; the atomic script skips it via its reserved
+// message-scoped marker.
 func (c *Consumer) unpersistedDLQSpecs(ctx context.Context, msgID string, specs []dlqEntrySpec) []dlqEntrySpec {
 	out := make([]dlqEntrySpec, 0, len(specs))
 	for _, spec := range specs {
@@ -1400,9 +1405,12 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 }
 
 // routeToDLQ writes one DLQ entry per exhausted invocation and only then acks
-// the original. The XADD-before-XACK ordering matters: if any DLQ write fails
-// the original stays pending so the next recovery cycle retries the remaining
-// writes rather than losing the message.
+// the original. Each entry's XADD and its persistence marker are performed by
+// ONE atomic script (invocationStateStore.persistDLQ), so a crash or error
+// between the append and the marker can never leave an unmarked entry that a
+// redelivery would append again (F-008); if the script fails, nothing was
+// written and the original stays pending so the next recovery cycle retries the
+// remaining writes rather than losing the message.
 //
 // Per-invocation entries: reason is the runner's terminal *HandlerExhaustedError
 // carrying the exact app/handler and exhausted attempt for every terminal
@@ -1410,16 +1418,19 @@ func (c *Consumer) dlqTraceFor(ctx context.Context, msgID, invocation string) st
 // precisely-attributed entry each (see dlqEntrySpecs). A reason without that
 // typed metadata (a malformed message routed pre-handler) produces a single
 // placeholder entry with an explicit handler_attempts of 0, never one invented
-// from the delivery count.
+// from the delivery count; its persistence uses a reserved message-scoped field
+// instead of a handler identity.
 //
 // Idempotent retry without scanning the DLQ: each invocation's exhausted marker
 // records whether its entry has already been persisted
-// ("exhausted:<attempt>:<token>:dlq") and retains the exhausted claim identity.
-// On a redelivery after an XACK failure or a crash — or after a partial
-// multi-entry write — invocations whose entry already exists are skipped, so the
-// retry writes only the missing entries and can never duplicate (or lose) the
-// ones that succeeded. The upgrade CASes the retained exhausted identity, so a
-// stale XADD outcome can never downgrade a newer exhausted marker or a success.
+// ("exhausted:<attempt>:<token>:dlq"), and the malformed placeholder records its
+// own reserved marker. On a redelivery after an XACK failure or a crash — or
+// after a partial multi-entry write — invocations whose entry already exists are
+// skipped (by the pre-filter and, defensively, by the atomic script itself), so
+// the retry writes only the missing entries and can never duplicate (or lose)
+// the ones that succeeded. The atomic script CASes the retained exhausted
+// identity, so a stale claim can never append an unattributable entry or
+// downgrade a newer marker.
 //
 // deliveryAttempts is the authoritative Redis Stream/PEL delivery count passed
 // through the consumer/reclaim flow (the DLQ `deliveries` field, diagnostic
@@ -1466,13 +1477,19 @@ func (c *Consumer) routeToDLQ(
 			c.stream, msg.ID, c.group, c.consumer,
 			event, spec.reason, spec.app, spec.handler, deliveries, spec.attempts, spec.trace,
 		)
-		if _, err := c.client.XAdd(ctx, &redis.XAddArgs{
-			Stream: c.dlqStream,
-			Values: entry,
-		}).Result(); err != nil {
+		// One atomic script appends the entry AND records its persistence
+		// (per-invocation ":dlq" marker, or the message-scoped placeholder field
+		// for the malformed-message path), so a crash or error between the two
+		// can never leave a duplicate or unmarked entry. On any failure nothing
+		// was written: leave the message pending so the next recovery cycle
+		// retries the remaining writes rather than losing the message.
+		wrote, err := c.invStateStore.persistDLQ(
+			ctx, c.dlqStream, c.stream, c.group, msg.ID, spec.invocation, spec.claim, entry,
+		)
+		if err != nil {
 			dlqSpan.RecordError(err)
 			dlqSpan.SetStatus(codes.Error, err.Error())
-			c.log.Error("Message: DLQ write failed (leaving pending)",
+			c.log.Error("Message: DLQ persistence failed (leaving pending)",
 				"message_id", msg.ID,
 				"delivery_attempt", deliveries,
 				"invocation", spec.invocation,
@@ -1481,20 +1498,15 @@ func (c *Consumer) routeToDLQ(
 			c.noteOutcome(err, 0)
 			return
 		}
-		c.metrics.Inc(metrics.MetricDLQEntries)
-		// Record per-invocation DLQ persistence ONLY after the XADD succeeded,
-		// so a failed write is retried on redelivery while a successful one is
-		// skipped. The marker is upgraded CASed on the exact exhausted claim
-		// identity read from the marker (spec.claim), so a stale XADD outcome can
-		// never downgrade a newer exhausted marker or a success. A mark failure is
-		// logged only: the entry is already written and the worst case is a
-		// duplicate on the next redelivery.
-		if spec.invocation != "" {
-			if _, err := c.invStateStore.markExhaustedDLQ(ctx, c.stream, c.group, msg.ID, spec.invocation, spec.claim); err != nil {
-				c.log.Warn("Message: mark DLQ persisted failed",
-					"message_id", msg.ID, "invocation", spec.invocation, "error", err)
-			}
+		if !wrote {
+			// The entry/placeholder was already persisted (a concurrent or
+			// replayed delivery won the race). No new entry was appended, so the
+			// DLQ counter is deliberately not incremented.
+			c.log.Debug("Message: DLQ entry already persisted; skipping write",
+				"message_id", msg.ID, "invocation", spec.invocation)
+			continue
 		}
+		c.metrics.Inc(metrics.MetricDLQEntries)
 		c.log.Error("Message: invocation routed to DLQ",
 			"message_id", msg.ID,
 			"dlq_stream", c.dlqStream,

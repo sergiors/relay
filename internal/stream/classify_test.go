@@ -303,9 +303,7 @@ func TestUnpersistedDLQSpecsIdempotentRetry(t *testing.T) {
 	}
 
 	// Once fnC is marked persisted too, only the absent fnB remains.
-	if _, err := store.markExhaustedDLQ(context.Background(), "s", "g", "m-0", "fnC/index.run", InvocationClaim{Attempt: 2, Token: "cc"}); err != nil {
-		t.Fatalf("markExhaustedDLQ: %v", err)
-	}
+	store.fields["fnC/index.run"] = exhaustedValue(InvocationClaim{Attempt: 2, Token: "cc"}, true)
 	got = c.unpersistedDLQSpecs(context.Background(), "m-0", specs)
 	if len(got) != 1 || got[0].invocation != "fnB/index.run" {
 		t.Fatalf("after marking fnC persisted, specs = %+v, want [fnB]", got)

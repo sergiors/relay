@@ -34,7 +34,10 @@
 //     entry is fabricated (Redis 7+ reports such entries in XAUTOCLAIM's purged
 //     deleted-id array; older servers return them with nil values).
 //   - Dead-lettering: exhausted or malformed messages are XADD'd to the DLQ
-//     before the original is acknowledged. Exhaustion is per-invocation: when
+//     before the original is acknowledged. Each entry's XADD and its
+//     persistence marker are written by ONE atomic Lua script, so a crash or
+//     error between the two can never leave a duplicate or unmarked entry.
+//     Exhaustion is per-invocation: when
 //     every non-complete matched invocation is exhausted, the whole message is
 //     routed to the DLQ and one entry is written PER exhausted invocation (see
 //     ErrInvocationExhausted and HandlerExhaustedError), each carrying its exact
@@ -48,7 +51,9 @@
 //     measured bytes and configured max) rather than the oversized payload; such
 //     an entry is intentionally non-replayable.
 //   - DLQ idempotency without scanning the DLQ: once an invocation's entry is
-//     successfully XADD'd its marker becomes "exhausted:<attempt>:<token>:dlq"; a
+//     successfully appended its marker becomes "exhausted:<attempt>:<token>:dlq"
+//     in the SAME atomic step; the malformed-message placeholder records a
+//     reserved message-scoped field instead of a fabricated handler identity. A
 //     redelivery (after an XACK failure, a crash, or a partially-written
 //     multi-entry DLQ) skips the already-persisted entries and writes only the
 //     missing ones. The original is ACKed only after all required entries are
@@ -74,7 +79,9 @@
 //     TryStartScheduled), so the handler/timeout/retries it was admitted under
 //     are stable through retry/reclaim/DLQ even if the schedule is later changed
 //     or removed; the descriptor is a sibling field, never an invocation ID, and
-//     it is never a DLQ/attribution key.
+//     it is never a DLQ/attribution key. A malformed-message DLQ placeholder
+//     records its persistence under the reserved "__dlq" field (also never an
+//     invocation ID), since it has no handler to carry a per-invocation marker.
 //
 // Deadlines are integer Unix MILLISECONDS end to end. An active
 // running/next_attempt_at marker is protected iff now_ms < deadline_ms and
@@ -85,17 +92,20 @@
 // Each successful claim generates a crypto-random, opaque token BEFORE the EVAL
 // and persists it only on a win, so "<attempt>:<token>" is the claim identity.
 // Every transition that originates from an active claim (fail/retry, complete,
-// exhaust, and the DLQ marker upgrade) CASes BOTH attempt and token against the
-// current active marker; a mismatch is an explicit stale/refused result (false),
-// never a Redis error. Terminal exhausted markers retain their claim identity
-// ("exhausted:<attempt>:<token>") so the DLQ-persistence upgrade can CAS the
+// exhaust) CASes BOTH attempt and token against the current active marker, and
+// the atomic DLQ append CASes the same exhausted identity; a mismatch is an
+// explicit stale/refused result (false/error), never a silent overwrite.
+// Terminal exhausted markers retain their claim identity
+// ("exhausted:<attempt>:<token>") so the DLQ-persistence step can CAS the
 // same exhausted claim and can never downgrade a newer exhausted marker or a
 // success. Tokens are never logged, used as metric labels, or written to the DLQ.
 //
 // Invocation-state transitions are atomic: every lifecycle write (claim,
-// failure, completion, exhaustion, classification, trace) is a single Lua
-// script, so concurrent replicas cannot both start the same invocation and a
-// stale claim can never overwrite a newer claim's or a terminal marker.
+// failure, completion, exhaustion, classification, trace) and the DLQ
+// append+marker pair are single Lua scripts, so concurrent replicas cannot both
+// start the same invocation, a stale claim can never overwrite a newer claim's
+// or a terminal marker, and a DLQ entry can never be appended without its
+// persistence marker (or vice versa).
 //
 // The per-invocation state machine is:
 //
@@ -104,7 +114,7 @@
 //	running/next_attempt_at --(now_ms >= deadline_ms)--> eligible --> running:<...#<n+1>:<new token>>
 //	running/next_attempt_at --MarkComplete--> ok                (terminal success, CASed on the claim)
 //	running/next_attempt_at --MarkExhausted--> exhausted:<n>:<token>    (terminal, CASed on the claim)
-//	exhausted:<n>:<token> --MarkExhaustedDLQ--> exhausted:<n>:<token>:dlq (terminal, entry persisted, CASed on the exhausted claim)
+//	exhausted:<n>:<token> --persistDLQ (atomic append)--> exhausted:<n>:<token>:dlq (terminal, entry persisted, CASed on the exhausted claim)
 //
 // "ok" and the exhausted forms are terminal: TryStart never re-opens them, and
 // MarkComplete never downgrades an exhausted marker (success must not resurrect

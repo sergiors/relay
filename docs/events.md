@@ -286,9 +286,14 @@ occurrence functions use this shared invocation/DLQ infrastructure.
 - The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key). It
   has no consumer group, PEL, or XACK flow: entries are written once and read
   only by the admin `relay dlq` commands.
-- Entries are written **before** the XACK. If a write fails, the original stays
-  pending and the exhausted invocation is skipped and re-reported on redelivery,
-  so the message is re-routed rather than acknowledged without an entry.
+- Each entry's append and its persistence marker are written by **one atomic
+  script** (atomic append + marker), so the two are never split: there is no
+  app-visible gap in which an entry is written but unmarked, or marked but
+  missing. Entries are written **before** the XACK. If the atomic persistence
+  fails, nothing was written, the original stays pending, and the invocation is
+  re-reported on redelivery, so the message is re-routed rather than
+  acknowledged without an entry. See
+  [DLQ persistence contract](#dlq-persistence-contract).
 - The DLQ is trimmed **age-only** by `REDIS_DLQ_RETENTION` (default 7 days, an
   `XTRIM <dlq> MINID ~` with no `ACKED` mode and no group/XACK dependency). This
   is separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim and
@@ -296,8 +301,11 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   three are independent windows. See
   [configuration.md](configuration.md#stream-and-dlq-retention).
 - Idempotency without scanning: once an invocation's entry is persisted its
-  marker becomes `exhausted:<attempt>:<token>:dlq`, so a redelivery skips the
-  entries already written and writes only the missing ones.
+  marker becomes `exhausted:<attempt>:<token>:dlq` in the same atomic step, so a
+  redelivery skips the entries already written and writes only the missing ones.
+  A malformed-message entry has no handler invocation, so its persistence is
+  recorded under a reserved message-scoped field in the same invocation-state
+  hash instead of a fabricated app/handler identity.
 - Entry fields: `original_stream`, `original_id`, `group`, `consumer`, `event`,
   `reason`, `app`, `handler`, `deliveries` (diagnostic PEL count),
   `handler_attempts` (the persisted admitted-claim count; normally the real
@@ -313,6 +321,41 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   `relay dlq replay` rejects it as non-replayable; use `inspect` to read the
   summary and `rm` to remove it. Oversized rejections are counted by the
   unlabeled `relay_events_oversized_total`.
+
+### DLQ persistence contract
+
+- **Idempotency is per exhausted invocation.** The unit of idempotency is one
+  exhausted invocation, keyed by its invocation-state hash (message +
+  `<app>/<handler>`): while that state is retained, one exhausted invocation
+  yields **at most one** persisted DLQ entry. The malformed-message placeholder
+  is the message-scoped analogue, recorded under a reserved field of the same
+  hash.
+- **Atomic append + marker.** A DLQ entry's append and the marker recording its
+  persistence are written by **one atomic script**, so they are never split:
+  either both take effect or neither does, and there is no app-visible gap in
+  which a marked entry is missing or an entry is left unmarked. The marker is
+  written while the source message is still recoverable, so it stays PERSISTENT
+  (see
+  [Invocation state persistence](#invocation-state-persistence)).
+- **Source XACK follows all required persistence.** The source message is
+  acknowledged only **after** every required DLQ entry has been persisted. If
+  the atomic persistence fails, nothing was written, the original stays pending,
+  and the invocation is re-reported on redelivery, so the message is re-routed
+  rather than acknowledged without its entries.
+- **Failed or crashed XACK after successful persistence.** If the XACK fails or
+  the process crashes after the entry was persisted, the message stays in the
+  PEL and is redelivered; the persisted marker makes the redelivery **skip** that
+  invocation's entry instead of appending it again.
+- **Partial fan-out.** A message matching several apps or handlers writes one
+  entry per exhausted invocation. A redelivery after a partial write (some
+  entries persisted, then an error, crash, or failed XACK) **skips the entries
+  already persisted and retries only the missing ones**, so completed entries are
+  neither duplicated nor lost.
+- **At-least-once, not exactly-once.** These guarantees make DLQ persistence
+  idempotent and correctly ordered; they do **not** make source delivery or
+  handler processing exactly-once. A handler can still run more than once, so
+  handlers must be idempotent (see
+  [Delivery, retry, and ACK](#delivery-retry-and-ack)).
 
 Manage the DLQ with `relay dlq ls` / `inspect` / `replay` / `rm` — see
 [cli.md](cli.md).

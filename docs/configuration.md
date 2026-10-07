@@ -237,7 +237,8 @@ the hash is **persistent with no TTL**, regardless of this value; the window
 starts only once the message is no longer recoverable.
 
 - It bounds terminal bookkeeping (`ok` / `exhausted` / `exhausted:…:dlq`
-  markers, plus the reserved classification/trace/schedule fields): how long a
+  markers, plus the reserved classification/trace/schedule fields and the
+  malformed-message DLQ placeholder field): how long a
   completed or exhausted invocation stays inspectable after its message left the
   PEL. It does **not** affect retries or ACK ordering.
 - The TTL is applied atomically with the reserved terminal marker, and is

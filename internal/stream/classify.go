@@ -109,10 +109,11 @@ type dlqEntrySpec struct {
 	// recorded.
 	trace string
 	// claim is the exhausted claim identity (attempt + token) retained by the
-	// invocation's exhausted marker at DLQ-write time. routeToDLQ CASes the
-	// markExhaustedDLQ upgrade on it, so a stale XADD outcome can never upgrade a
-	// newer/foreign marker. It is the zero claim when there is no well-formed
-	// exhausted marker (the placeholder, or a marker-less invocation).
+	// invocation's exhausted marker at DLQ-write time. persistDLQ CASes the
+	// atomic append+upgrade on it, so a stale claim can never append an
+	// unattributable entry or upgrade a newer/foreign marker. It is the zero
+	// claim when there is no well-formed exhausted marker (the placeholder, or a
+	// marker-less invocation).
 	claim InvocationClaim
 }
 

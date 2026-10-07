@@ -1203,6 +1203,59 @@ func TestIntegrationPerInvocationDLQXACKFailureRetryIsIdempotent(t *testing.T) {
 	e.waitRetained(t, key)
 }
 
+// TestIntegrationPlaceholderDLQXACKFailureRetryIsIdempotent pins F-008 for the
+// malformed-message path end to end: the placeholder's persistence is recorded
+// by a message-scoped reserved field, so a redelivery after a lost XACK (the
+// marker and entry were already written) must NOT append a second entry. The
+// message is ACKed and its state terminal-retained.
+func TestIntegrationPlaceholderDLQXACKFailureRetryIsIdempotent(t *testing.T) {
+	testutil.RequireRedis(t)
+	e := newEnv(t, ConsumerConfig{})
+	// A malformed message (no `event` field) routes straight to the DLQ without
+	// reaching a handler.
+	id, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: e.stream,
+		Values: map[string]any{"not_event": "x"},
+	}).Result()
+	if err != nil {
+		t.Fatalf("xadd malformed: %v", err)
+	}
+	msg := e.readOneIntoPEL(t)
+	if msg.ID != id {
+		t.Fatalf("read message %s, want %s", msg.ID, id)
+	}
+	key := invocationStateKey(e.stream, e.group, id)
+
+	// Simulate a prior delivery that wrote the placeholder entry and marker but
+	// whose XACK failed.
+	if _, err := e.client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: e.consumer.dlqStream,
+		Values: dlqPayload(e.stream, id, e.group, e.consumer.consumer, "-",
+			"decode event: missing 'event' field", dlqNoHandler, dlqNoHandler, 1, 0, ""),
+	}).Result(); err != nil {
+		t.Fatalf("seed DLQ entry: %v", err)
+	}
+	if err := e.client.HSet(context.Background(), key, dlqPlaceholderField, "1").Err(); err != nil {
+		t.Fatalf("seed placeholder marker: %v", err)
+	}
+
+	handlerRan := false
+	e.consumer.processMessage(context.Background(), msg, 2, func(context.Context, string, map[string]any) error {
+		handlerRan = true
+		return nil
+	})
+	if handlerRan {
+		t.Fatal("handler must not run for a malformed message")
+	}
+	if got := len(e.dlqFor(id)); got != 1 {
+		t.Fatalf("DLQ entries = %d, want 1 (no duplicate placeholder on the XACK-failure retry)", got)
+	}
+	if _, ok := e.pending()[id]; ok {
+		t.Fatalf("message %s should be acked on the idempotent retry", id)
+	}
+	e.waitRetained(t, key)
+}
+
 func TestIntegrationRestartResilience(t *testing.T) {
 	testutil.RequireRedis(t)
 	const event = `{"restart":1}`

@@ -295,7 +295,11 @@ at startup.
 next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
   transition is one atomic Lua script; active-claim transitions CAS both attempt
   and claim token, so a stale claim can never overwrite a newer claim or a
-  terminal marker. While the message is pending the hash is **persistent**;
+  terminal marker. The DLQ append and its persistence marker are one atomic
+  script as well, so an entry can never be written without its marker (or vice
+  versa); a malformed-message placeholder records a reserved message-scoped field
+  instead of a handler identity. While the message is pending the hash is
+  **persistent**;
   only after it leaves the PEL (successful XACK or a cleared
   missing-payload reference) does it switch to terminal retention with the
   configured `REDIS_INVOCATION_RETENTION` TTL (default 48h; empty/0/negative

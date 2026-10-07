@@ -488,19 +488,33 @@ func TestIntegrationAtomicTerminalExhaustionAndDLQ(t *testing.T) {
 		t.Fatalf("exhaustedState = (%+v,%v,%v,%v), want the retained claim, no dlq", exClaim, dlq, ok, err)
 	}
 
-	// A foreign identity cannot upgrade the marker.
-	if ok, err := store.markExhaustedDLQ(ctx, stream, group, msgID, "fn/h", InvocationClaim{Attempt: 1, Token: "deadbeef"}); err != nil || ok {
-		t.Fatalf("foreign markExhaustedDLQ = (%v,%v), want (false,nil)", ok, err)
+	// The atomic DLQ persistence appends the entry and upgrades the marker in one
+	// script. A foreign identity is refused (an error, nothing appended).
+	dlqStream := stream + "-dlq"
+	t.Cleanup(func() { _ = cli.Del(context.Background(), dlqStream).Err() })
+	entry := map[string]any{"original_id": msgID, "app": "fn", "handler": "h"}
+	if wrote, err := store.persistDLQ(ctx, dlqStream, stream, group, msgID, "fn/h", InvocationClaim{Attempt: 1, Token: "deadbeef"}, entry); err == nil || wrote {
+		t.Fatalf("foreign persistDLQ = (%v,%v), want (false,error)", wrote, err)
 	}
-	// The owning identity upgrades it; a second upgrade is monotonic (still true).
-	if ok, err := store.markExhaustedDLQ(ctx, stream, group, msgID, "fn/h", claim); err != nil || !ok {
-		t.Fatalf("markExhaustedDLQ = (%v,%v), want (true,nil)", ok, err)
+	if n, err := cli.XLen(ctx, dlqStream).Result(); err != nil || n != 0 {
+		t.Fatalf("foreign persistDLQ appended %d entries (err %v), want 0", n, err)
+	}
+	// The owning identity appends exactly one entry and upgrades the marker.
+	if wrote, err := store.persistDLQ(ctx, dlqStream, stream, group, msgID, "fn/h", claim, entry); err != nil || !wrote {
+		t.Fatalf("persistDLQ = (%v,%v), want (true,nil)", wrote, err)
 	}
 	if v := marker(t, cli, stream, group, msgID, "fn/h"); v != exhaustedValue(claim, true) {
 		t.Fatalf("marker = %q, want the dlq-suffixed exhausted marker", v)
 	}
-	if ok, err := store.markExhaustedDLQ(ctx, stream, group, msgID, "fn/h", claim); err != nil || !ok {
-		t.Fatalf("re markExhaustedDLQ = (%v,%v), want (true,nil)", ok, err)
+	if n, err := cli.XLen(ctx, dlqStream).Result(); err != nil || n != 1 {
+		t.Fatalf("persistDLQ XLen = %d (err %v), want 1", n, err)
+	}
+	// A second call is monotonic: wrote=false and no second entry.
+	if wrote, err := store.persistDLQ(ctx, dlqStream, stream, group, msgID, "fn/h", claim, entry); err != nil || wrote {
+		t.Fatalf("re persistDLQ = (%v,%v), want (false,nil)", wrote, err)
+	}
+	if n, err := cli.XLen(ctx, dlqStream).Result(); err != nil || n != 1 {
+		t.Fatalf("re persistDLQ XLen = %d (err %v), want 1 (no duplicate)", n, err)
 	}
 	if _, dlq, ok, err := store.exhaustedState(ctx, stream, group, msgID, "fn/h"); err != nil || !ok || !dlq {
 		t.Fatalf("exhaustedState after upgrade = (dlq=%v ok=%v err=%v), want dlq", dlq, ok, err)
@@ -567,8 +581,13 @@ func TestIntegrationAtomicRecoverableStateIsPersistent(t *testing.T) {
 		_, err := store.markExhausted(ctx, stream, group, msgID, "fn/ex", claim)
 		return err
 	})
-	mutateAndCheckPersistent("markExhaustedDLQ", func() error {
-		_, err := store.markExhaustedDLQ(ctx, stream, group, msgID, "fn/ex", claim)
+	// Seed an exhausted marker so the atomic DLQ persistence has a claim to CAS.
+	exClaim := InvocationClaim{Attempt: 1, Token: "ee01"}
+	seedMarker(t, cli, stream, group, msgID, "fn/ex", exhaustedValue(exClaim, false))
+	dlqStream := stream + "-dlq"
+	t.Cleanup(func() { _ = cli.Del(context.Background(), dlqStream).Err() })
+	mutateAndCheckPersistent("persistDLQ", func() error {
+		_, err := store.persistDLQ(ctx, dlqStream, stream, group, msgID, "fn/ex", exClaim, map[string]any{"original_id": msgID})
 		return err
 	})
 	mutateAndCheckPersistent("claimClassification", func() error {

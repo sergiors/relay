@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -584,30 +585,79 @@ redis.call('PERSIST', KEYS[1])
 return 1
 `)
 
-	// markExhaustedDLQScript upgrades an EXISTING exhausted marker to the
-	// ":dlq" form, but only when its retained identity matches the exhausted
-	// claim (attempt + token). An existing ":dlq" marker is monotonic (returns
-	// 1); "ok"/active/absent markers or a different (newer) exhausted identity
-	// are preserved (returns 0), so a stale XADD outcome can never downgrade a
-	// newer exhausted marker or a success.
+	// persistDLQScript ATOMICALLY appends one DLQ entry to the DLQ stream AND
+	// records its persistence in the message's invocation-state hash, in one
+	// script, so a crash or error between the append and the marker can never
+	// happen (F-008): either both take effect (returns 1) or neither does.
 	//
-	// KEYS[1] = invocation-state hash;
-	// ARGV[1] = invocation field, ARGV[2] = exhausted attempt, ARGV[3] =
-	// exhausted token, ARGV[4] = terminal marker field.
-	// Returns 1 when the exhausted marker already/now records the DLQ, 0 else.
+	// It serves both DLQ entry kinds:
 	//
-	// The DLQ-persistence marker is written after the XADD but before the XACK,
-	// so it keeps the key PERSISTENT: a redelivery after a failed XACK must see
-	// it to stay idempotent.
-	markExhaustedDLQScript = redis.NewScript(luaInvocationHelpers + `
-if redis.call('HEXISTS', KEYS[1], ARGV[4]) == 1 then return 0 end
-local v = redis.call('HGET', KEYS[1], ARGV[1])
-if not v then return 0 end
-local a, tok, dlq = parse_exhausted(v)
-if not a then return 0 end
-if a ~= ARGV[2] or tok ~= ARGV[3] then return 0 end
-if dlq then return 1 end
-redis.call('HSET', KEYS[1], ARGV[1], 'exhausted:'..a..':'..tok..':dlq')
+	//   - A real exhausted invocation (ARGV[2] non-empty): the marker must
+	//     ALREADY be a well-formed exhausted marker whose retained identity
+	//     matches the supplied claim (attempt + token). On a match the entry is
+	//     appended and the marker is upgraded to "exhausted:<attempt>:<token>:dlq"
+	//     (the existing convention). An already-":dlq" marker is monotonic and
+	//     written nothing (returns 0). A missing, foreign, or non-exhausted
+	//     marker is REFUSED (returns -1) without writing, so a stale/guessed
+	//     claim can never append an unattributable entry or downgrade a newer
+	//     marker.
+	//   - The malformed-message placeholder (ARGV[2] empty): a message-scoped
+	//     reserved field (ARGV[3]) records that this message's placeholder entry
+	//     has been persisted. It is set in the SAME hash as the invocation
+	//     markers (the hash is already scoped by stream/group/msgID), so it needs
+	//     no fabricated app/handler identity. An already-marked placeholder is a
+	//     no-op (returns 0).
+	//
+	// KEYS[1] = invocation-state hash; KEYS[2] = DLQ stream.
+	// ARGV[1] = terminal marker field,
+	// ARGV[2] = invocation field ("" for the placeholder),
+	// ARGV[3] = placeholder marker field,
+	// ARGV[4] = exhausted attempt (decimal string; "" for the placeholder),
+	// ARGV[5] = exhausted claim token ("" for the placeholder),
+	// ARGV[6..] = flat XADD field/value pairs (an even, non-zero count).
+	// Returns 1 when this call appended the entry, 0 when it was already
+	// recorded (no write), -1 when refused (no write).
+	//
+	// Every validation runs BEFORE the XADD. A Lua error after a successful
+	// write cannot roll that write back, so a wrong-type or terminal-retained
+	// hash and a missing/mismatched exhausted marker must all be rejected before
+	// any write, leaving no partial effect. Within a single script no other
+	// command interleaves, so once the hash type is validated the post-XADD HSET
+	// cannot fail.
+	//
+	// The persistence marker is written while the message is still recoverable
+	// (the XACK may not have run), so it keeps the key PERSISTENT: a redelivery
+	// after a failed XACK must see it to stay idempotent.
+	//
+	// Redis Cluster: this script touches two keys (the invocation-state hash and
+	// the DLQ stream). A clustered deployment would require both to hash to the
+	// same slot (e.g. a shared hash tag); Relay uses a single-node *redis.Client,
+	// so the keys are always co-located.
+	persistDLQScript = redis.NewScript(luaInvocationHelpers + `
+local kt = redis.call('TYPE', KEYS[1])
+if kt['ok'] ~= 'none' and kt['ok'] ~= 'hash' then return -1 end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return -1 end
+
+local n = #ARGV
+if n <= 5 or (n - 5) % 2 ~= 0 then return -1 end
+
+local invocation = ARGV[2]
+if invocation ~= '' then
+  local v = redis.call('HGET', KEYS[1], invocation)
+  if not v then return -1 end
+  local a, tok, dlq = parse_exhausted(v)
+  if not a then return -1 end
+  if a ~= ARGV[4] or tok ~= ARGV[5] then return -1 end
+  if dlq then return 0 end
+  redis.call('XADD', KEYS[2], '*', unpack(ARGV, 6, n))
+  redis.call('HSET', KEYS[1], invocation, 'exhausted:'..a..':'..tok..':dlq')
+  redis.call('PERSIST', KEYS[1])
+  return 1
+end
+
+if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then return 0 end
+redis.call('XADD', KEYS[2], '*', unpack(ARGV, 6, n))
+redis.call('HSET', KEYS[1], ARGV[3], '1')
 redis.call('PERSIST', KEYS[1])
 return 1
 `)
@@ -813,13 +863,26 @@ type invocationStateStore interface {
 	// is retained so the later DLQ upgrade can CAS it). It returns false when the
 	// marker is not owned by the claim.
 	markExhausted(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
-	// markExhaustedDLQ upgrades an EXISTING exhausted marker matching the given
-	// exhausted claim (attempt+token) to the terminal "...:dlq" form, recording
-	// that this invocation's DLQ entry has been persisted. It is written only
-	// after a successful XADD so a redelivery (e.g. after an XACK failure) can
-	// skip the write idempotently. It never downgrades a newer exhausted marker
-	// or a success.
-	markExhaustedDLQ(ctx context.Context, stream, group, msgID, invocation string, claim InvocationClaim) (bool, error)
+	// persistDLQ atomically appends one DLQ entry to dlqStream and records its
+	// persistence in the message's invocation-state hash, in a single Lua script
+	// (see persistDLQScript), so a crash or error between the append and the
+	// marker can never leave a duplicate or unmarked entry (F-008).
+	//
+	// For a real invocation it requires an existing exhausted marker matching the
+	// supplied claim (attempt+token) and upgrades it to ":dlq"; for the
+	// malformed-message placeholder (invocation == "") it records a reserved
+	// message-scoped field instead of inventing a handler identity. wrote reports
+	// whether THIS call appended the entry; wrote=false with err=nil means the
+	// entry was already recorded, so no write happened and no DLQ counter should
+	// be incremented. An error means the outcome is UNKNOWN or refused: nothing
+	// was written, and the caller must NOT ACK the source message.
+	persistDLQ(
+		ctx context.Context,
+		dlqStream string,
+		stream, group, msgID, invocation string,
+		claim InvocationClaim,
+		entry map[string]any,
+	) (wrote bool, err error)
 	// exhaustedState reads the invocation's exhausted marker, returning its
 	// retained claim identity and whether its DLQ entry is already persisted. It
 	// lets routeToDLQ skip an invocation whose entry was already written AND
@@ -907,6 +970,17 @@ const traceFieldPrefix = "__trace:"
 // TTL); terminal retention applies its TTL to the whole hash after the ACK,
 // exactly like every other field.
 const scheduleField = "__schedule"
+
+// dlqPlaceholderField is the reserved invocation-state hash field that records
+// that the malformed-message placeholder DLQ entry for this message has already
+// been persisted (see persistDLQScript). A malformed message never reaches a
+// handler, so it has no "<app>/<handler>" invocation to carry a per-invocation
+// persistence marker; this message-scoped field takes its place and is in the
+// SAME per-message hash (already keyed by stream/group/msgID), so no fabricated
+// function or handler identity is invented. Like terminalField,
+// classificationField, traceFieldPrefix, and scheduleField it cannot collide with
+// a real invocation ID (a leading "__" is not a legal app name).
+const dlqPlaceholderField = "__dlq"
 
 // traceField returns the reserved hash field holding invocation's persisted
 // trace lineage.
@@ -1309,37 +1383,69 @@ func (store *invocationStore) markExhausted(
 	return ok == 1, nil
 }
 
-// markExhaustedDLQ upgrades the invocation's exhausted marker to
-// "exhausted:<attempt>:<token>:dlq" via the atomic markExhaustedDLQ script,
-// recording that its DLQ entry has been persisted. It CASes the retained
-// exhausted identity (attempt + token) so a stale XADD outcome can never
-// downgrade a newer exhausted marker or a success: only the exact exhausted
-// claim that owns the marker is upgraded. It is called only AFTER a successful
-// XADD, so a later redelivery can skip the (already-written) entry without
-// scanning the DLQ stream. An existing ":dlq" marker returns true (monotonic);
-// "ok"/active/absent/other-identity markers return false.
-func (store *invocationStore) markExhaustedDLQ(
+// persistDLQ atomically appends one DLQ entry to dlqStream and records its
+// persistence in the message's invocation-state hash via the atomic
+// persistDLQScript (see its contract). For a real invocation it CASes the
+// retained exhausted identity (attempt + token); for the placeholder
+// (invocation == "") it records the message-scoped dlqPlaceholderField. It is
+// called only after the entry's fields are built, so the append and the marker
+// can never diverge.
+//
+// wrote reports whether this call appended the entry; wrote=false with err=nil
+// means the entry/placeholder was already recorded (a no-op, so no new entry and
+// no DLQ counter increment). A refused store verdict (wrong hash type,
+// terminal-retained hash, or a missing/foreign exhausted marker) and a
+// Redis/transport error both return err != nil: nothing was written and the
+// caller must leave the message pending (no ACK) because persistence is
+// uncertain.
+func (store *invocationStore) persistDLQ(
 	ctx context.Context,
-	stream,
-	group,
-	msgID,
-	invocation string,
+	dlqStream, stream, group, msgID, invocation string,
 	claim InvocationClaim,
+	entry map[string]any,
 ) (bool, error) {
-	if !claim.valid() {
-		return false, nil
+	attempt, token := "", ""
+	if invocation != "" {
+		attempt = strconv.Itoa(claim.Attempt)
+		token = claim.Token
 	}
-	key := invocationStateKey(stream, group, msgID)
-	ok, err := markExhaustedDLQScript.Run(ctx, store.client, []string{key},
-		invocation,
-		claim.Attempt,
-		claim.Token,
-		terminalField,
+	args := make([]any, 0, 5+2*len(entry))
+	args = append(args, terminalField, invocation, dlqPlaceholderField, attempt, token)
+	args = append(args, flatDLQEntry(entry)...)
+	res, err := persistDLQScript.Run(ctx, store.client,
+		[]string{invocationStateKey(stream, group, msgID), dlqStream},
+		args...,
 	).Int64()
 	if err != nil {
 		return false, err
 	}
-	return ok == 1, nil
+	switch res {
+	case 1:
+		return true, nil
+	case 0:
+		return false, nil
+	default:
+		return false, fmt.Errorf("DLQ persistence refused for invocation %q (state %d)", invocation, res)
+	}
+}
+
+// flatDLQEntry flattens a DLQ entry field map into the ordered key/value ARGV
+// list persistDLQScript forwards to XADD. Keys are sorted so the wire arguments
+// are deterministic (Redis does not care about field order, but a stable order
+// keeps tests and packet captures reproducible).
+func flatDLQEntry(entry map[string]any) []any {
+	keys := make([]string, 0, len(entry))
+	for k := range entry {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	args := make([]any, 0, 2*len(entry))
+	for _, k := range keys {
+		// Stringify every value so the script's XADD always receives bulk
+		// strings, exactly as the former map-based XAdd encoded them.
+		args = append(args, k, fmt.Sprint(entry[k]))
+	}
+	return args
 }
 
 // exhaustedState reads the invocation's exhausted marker, returning its retained
@@ -1349,10 +1455,11 @@ func (store *invocationStore) markExhaustedDLQ(
 //
 // It serves routeToDLQ twice: the dlq flag lets it skip an invocation whose
 // entry was already written, and the retained claim identity is the exact CAS
-// key for the subsequent markExhaustedDLQ upgrade, so a stale/foreign marker can
-// never be upgraded. A read error returns (zero, false, false, err); the caller
-// fails safe by treating the entry as not persisted (a duplicate is allowed
-// under at-least-once, while skipping a required write would lose the entry).
+// key for the subsequent atomic persistDLQ append+upgrade, so a stale/foreign
+// marker can never be appended or upgraded. A read error returns
+// (zero, false, false, err); the caller fails safe by treating the entry as not
+// persisted (a duplicate is allowed under at-least-once, while skipping a
+// required write would lose the entry).
 func (store *invocationStore) exhaustedState(
 	ctx context.Context,
 	stream,
@@ -1668,7 +1775,7 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 //	completes       → "ok"                                  (MarkComplete, CASed on the claim)
 //	fails (retry)   → "next_attempt_at:<deadline_ms>:<n>:<token>" (RecordFailure, same claim)
 //	exhausted       → "exhausted:<n>:<token>"               (MarkExhausted, CASed on the claim)
-//	DLQ persisted   → "exhausted:<n>:<token>:dlq"           (MarkExhaustedDLQ, CASed on the exhausted claim)
+//	DLQ persisted   → "exhausted:<n>:<token>:dlq"           (stream layer's atomic persistDLQ append, CASed on the exhausted claim)
 //
 // A crash mid-attempt leaves "running:<deadline_ms>:<n>:<token>", whose deadline
 // simply elapses (the persistent hash keeps the marker; nothing expires out of
