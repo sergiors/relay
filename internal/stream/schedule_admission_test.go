@@ -167,7 +167,7 @@ func TestScheduleDescriptorLifecycleThroughTerminalRetention(t *testing.T) {
 	}
 
 	// The stream switches the hash to terminal retention after the ACK.
-	if err := store.retainTerminal(context.Background(), "s", "g", "m-0"); err != nil {
+	if err := store.retainTerminal(context.Background(), "s", "g", "m-0", DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	// The descriptor is still readable (it expires with the whole hash, and a

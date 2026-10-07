@@ -76,6 +76,43 @@ func TestNewConsumerDefaults(t *testing.T) {
 	}
 }
 
+// TestNewConsumerInvocationRetention pins the terminal invocation-state
+// retention resolution: a nil InvocationRetention (direct/internal construction)
+// falls back to the package default (DefaultInvocationRetention, 48h), while a
+// non-nil pointer — including an explicit disable (0) — is honored verbatim and
+// is never defaulted back. This is what lets the worker pass an operator's
+// REDIS_INVOCATION_RETENTION=0 disable through unchanged.
+func TestNewConsumerInvocationRetention(t *testing.T) {
+	base := func() ConsumerConfig {
+		return ConsumerConfig{
+			Client: redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
+			Stream: "events",
+			Log:    slog.New(slog.DiscardHandler),
+		}
+	}
+
+	// nil => package default.
+	if got := NewConsumer(base()).invocationRetention; got != DefaultInvocationRetention {
+		t.Errorf("nil InvocationRetention = %s, want default %s", got, DefaultInvocationRetention)
+	}
+
+	// Explicit value is honored.
+	cfg := base()
+	explicit := 12 * time.Hour
+	cfg.InvocationRetention = &explicit
+	if got := NewConsumer(cfg).invocationRetention; got != 12*time.Hour {
+		t.Errorf("explicit InvocationRetention = %s, want 12h", got)
+	}
+
+	// Explicit zero disable is preserved (NOT defaulted to 48h).
+	zeroCfg := base()
+	zero := time.Duration(0)
+	zeroCfg.InvocationRetention = &zero
+	if got := NewConsumer(zeroCfg).invocationRetention; got != 0 {
+		t.Errorf("explicit zero InvocationRetention = %s, want 0 (disabled)", got)
+	}
+}
+
 // TestMaxRuleTimeoutMatchesAppMaxTimeout pins the cross-package invariant
 // that stream.MaxRuleTimeout and app.MaxTimeout are the same value. The
 // stream layer derives its reclaim threshold from this cap, so a divergence

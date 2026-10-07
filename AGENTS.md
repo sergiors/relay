@@ -112,7 +112,9 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   the message is recoverable (pending in the PEL) the hash is persistent with no
   TTL; only after it leaves the PEL (a successful XACK, or a cleared
   missing-payload reference) is it switched to terminal retention (a reserved
-  terminal marker plus a ~7-day TTL), after which every lifecycle transition is
+  terminal marker plus the configured `REDIS_INVOCATION_RETENTION` TTL, default
+  `48h`; empty/0/negative disables the expiry but still writes the marker, leaving
+  the hash persistent), after which every lifecycle transition is
   inert and only expiry removes it.
 - Deadlines are integer Unix milliseconds; a marker is protected exactly while
   `now_ms < deadline_ms`. Every transition is one atomic Lua script, and

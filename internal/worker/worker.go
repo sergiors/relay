@@ -839,6 +839,14 @@ func Run(logger *slog.Logger) error {
 		Metrics:           metricsInstance,
 		MaxBufferedEvents: cfg.MaxBufferedEvents,
 		MaxEventBytes:     cfg.MaxEventBytes,
+		// Terminal invocation-state retention (cfg.InvocationRetention from
+		// REDIS_INVOCATION_RETENTION, default 48h; unset/empty/zero/negative
+		// behavior is resolved by config.Load). Passed as an explicit pointer so
+		// an operator's disable (0) is honored verbatim and never defaulted back
+		// to 48h by the stream package. It is the TTL the consumer applies to a
+		// message's invocation-state hash only AFTER it leaves the PEL; while
+		// recoverable the hash stays persistent.
+		InvocationRetention: &cfg.InvocationRetention,
 		// Schedule occurrences route directly to the runner, bypassing event
 		// matching; the runner validates the occurrence against the current
 		// template and resolves the handler timeout from it, and stamps the

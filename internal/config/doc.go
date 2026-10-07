@@ -7,11 +7,11 @@
 // invented settings. Required Redis variables (REDIS_URI, REDIS_STREAM,
 // REDIS_GROUP) and malformed tuning knobs are RETURNED as errors from Load, not
 // fatal: the caller propagates them to cmd/main.go, the sole process boundary
-// that prints the error and owns os.Exit. The optional knobs (stream retention,
-// metrics/webhook addresses, Traefik routing, and the NETWORKS list) stay
-// zero/empty when unset and are gated by the caller; only the optional stream
-// retention window logs-and-disables on a bad value instead of failing. The
-// parse helpers (ParsePositiveInt, ParsePositiveDuration,
+// that prints the error and owns os.Exit. The optional knobs (stream, DLQ, and
+// invocation-state retention, metrics/webhook addresses, Traefik routing, and
+// the NETWORKS list) stay zero/empty when unset and are gated by the caller;
+// only the optional retention windows log-and-disable on a bad value instead of
+// failing. The parse helpers (ParsePositiveInt, ParsePositiveDuration,
 // ParseOptionalPositiveInt, ParseLogLevel, ParseNetworks) are exported and pure
 // so they are directly testable; RedisOptions
 // maps a Redis address or DSN to go-redis options without echoing credentials.

@@ -217,7 +217,9 @@ long a message sits pending its `running`/`next_attempt_at`/terminal markers are
 still there when a reclaim reads them. Only after the message has left the PEL —
 a successful XACK on the success, obsolete-schedule, or DLQ path, or a cleared
 missing-payload PEL reference — is the hash switched to **terminal retention**:
-a reserved marker plus a ~7-day TTL. Once retained, every lifecycle transition
+a reserved marker plus the configured `REDIS_INVOCATION_RETENTION` TTL (default
+`48h`; empty/`0`/negative disables the expiry while still writing the marker, so
+the hash stays persistent). Once retained, every lifecycle transition
 from a stale in-memory delivery is inert, so it can neither mutate the retained
 state nor remove the retention TTL. A hash left un-retained (for example a crash
 in the ACK→retain window) is simply leaked, never prematurely expired.
@@ -238,8 +240,9 @@ occurrence functions use this shared invocation/DLQ infrastructure.
   so the message is re-routed rather than acknowledged without an entry.
 - The DLQ is trimmed **age-only** by `REDIS_DLQ_RETENTION` (default 7 days, an
   `XTRIM <dlq> MINID ~` with no `ACKED` mode and no group/XACK dependency). This
-  is separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim; the
-  two target disjoint keys. See
+  is separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim and
+  from `REDIS_INVOCATION_RETENTION` (the terminal invocation-state TTL); all
+  three are independent windows. See
   [configuration.md](configuration.md#stream-and-dlq-retention).
 - Idempotency without scanning: once an invocation's entry is persisted its
   marker becomes `exhausted:<attempt>:<token>:dlq`, so a redelivery skips the

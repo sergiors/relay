@@ -40,7 +40,21 @@ type Config struct {
 	// XTRIM ... MINID ~ (no ACKED mode), because the DLQ has no consumer group,
 	// PEL, or XACK flow to protect.
 	DLQRetention time.Duration
-	MetricsAddr  string
+	// InvocationRetention is the TERMINAL invocation-state retention window
+	// (REDIS_INVOCATION_RETENTION). Unset defaults to
+	// DefaultInvocationRetention (48h); an explicitly empty, zero, or negative
+	// value disables terminal retention (0), and a malformed value logs and
+	// disables it. Unlike StreamRetention/DLQRetention this does not trim a
+	// stream: it is the TTL the stream layer applies to a message's
+	// invocation-state hash ONLY after the message has left the PEL (a
+	// successful XACK on the success/obsolete/DLQ path, or a cleared
+	// missing-payload PEL reference). While the message is recoverable the hash
+	// stays PERSISTENT regardless of this value. When disabled (0) the terminal
+	// marker is still written atomically, so the hash stays persistent and
+	// terminal/stale-transition guards are unchanged — only the expiry is
+	// omitted.
+	InvocationRetention time.Duration
+	MetricsAddr         string
 	// GitWebhookAddr is the address for the GitHub webhook server
 	// (POST /github) that triggers an automatic git sync on matching pushes.
 	// Like MetricsAddr it is opt-in via the GIT_WEBHOOK_ADDR environment
@@ -152,10 +166,22 @@ const (
 	// DefaultDLQRetention is the dead-letter-queue retention window applied when
 	// REDIS_DLQ_RETENTION is UNSET; an explicitly empty value disables it. The
 	// DLQ has no consumer group, so its trim is AGE-ONLY (MINID ~, no ACKED).
-	// Seven days mirrors the schedule outbox's retention and the invocation
-	// state's terminal TTL, so a dead-lettered entry outlives the state that
-	// could replay it.
+	// Seven days mirrors the schedule outbox's retention, so a dead-lettered
+	// entry outlives the schedule occurrence's SQLite-outbox window. It is
+	// INDEPENDENT of the invocation-state terminal TTL below: a DLQ entry is
+	// stream data, a terminal invocation-state hash is a per-message Redis hash.
 	DefaultDLQRetention = 7 * 24 * time.Hour
+	// DefaultInvocationRetention is the terminal invocation-state retention
+	// window applied when REDIS_INVOCATION_RETENTION is UNSET; an explicitly
+	// empty value disables it. It is the TTL applied to a message's
+	// invocation-state hash only after the message has left the PEL. The
+	// internal/stream package cannot import config, so it keeps a mirroring
+	// default (stream.DefaultInvocationRetention), applied when a direct
+	// NewConsumer/NewInvocationState caller supplies no explicit window; the
+	// worker always passes config's resolved value (see ConsumerConfig).
+	// Forty-eight hours is the historical terminal-bookkeeping window after
+	// this change (it replaced a hard-coded 7 days).
+	DefaultInvocationRetention = 48 * time.Hour
 )
 
 // Load reads Relay's configuration from the environment and returns a Config and
@@ -176,11 +202,12 @@ const (
 // The optional variables are read with os.Getenv and stay zero/empty when
 // unset: the metrics and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR)
 // stay "" (no HTTP server), preserving their opt-in semantics through the
-// caller's non-empty guards. The two retention windows are the exception to the
-// "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
-// DefaultStreamRetention (24h) and REDIS_DLQ_RETENTION to DefaultDLQRetention (7
-// days) when UNSET, while an explicitly empty value disables the respective
-// retention (0). MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
+// caller's non-empty guards. The three retention windows are the exception to
+// the "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
+// DefaultStreamRetention (24h), REDIS_DLQ_RETENTION to DefaultDLQRetention (7
+// days), and REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h) when
+// UNSET, while an explicitly empty value disables the respective retention (0).
+// MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
 // default to 8 and 16 respectively (see ParsePositiveInt); MAX_EVENT_BYTES
 // defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
 // an invalid (zero, negative, non-integer, or above-limit) value is a returned
@@ -219,6 +246,7 @@ func Load(logger *slog.Logger) (Config, error) {
 	// empty value keeps the historical opt-out (disabled).
 	cfg.StreamRetention = retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
 	cfg.DLQRetention = retentionEnv(logger, "REDIS_DLQ_RETENTION", DefaultDLQRetention)
+	cfg.InvocationRetention = retentionEnv(logger, "REDIS_INVOCATION_RETENTION", DefaultInvocationRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
 
@@ -477,8 +505,9 @@ func retentionEnv(logger *slog.Logger, name string, defaultWindow time.Duration)
 // rather than failing startup. This is deliberate — a typo in one optional
 // variable must not take down the worker; the operator sees the log line and
 // the disabled behavior. The value carries no credentials, so echoing it in the
-// log line is safe. The same helper serves REDIS_STREAM_RETENTION and
-// REDIS_DLQ_RETENTION; only the caller's unset default differs.
+// log line is safe. The same helper serves REDIS_STREAM_RETENTION,
+// REDIS_DLQ_RETENTION, and REDIS_INVOCATION_RETENTION; only the caller's unset
+// default differs.
 func parseRetention(logger *slog.Logger, name, value string) time.Duration {
 	if strings.TrimSpace(value) == "" {
 		return 0

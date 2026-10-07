@@ -15,21 +15,28 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// invocationRetentionTTL is how long a message's invocation-state hash survives
-// AFTER the message has left the PEL — a successful XACK on the success,
-// obsolete, or DLQ path, or a cleared missing-payload PEL reference. Recoverable
-// state (any hash whose message is still pending and can therefore be
-// redelivered) is deliberately PERSISTENT, with NO TTL: it must never expire out
-// from under a redelivery, which would reset the attempt/reclaim accounting. The
-// retention TTL is applied only by retainTerminal, atomically with the reserved
-// terminal marker, once the message is no longer recoverable.
+// DefaultInvocationRetention is the fallback terminal invocation-state retention
+// window applied when a ConsumerConfig does not explicitly configure one (a nil
+// InvocationRetention pointer). It mirrors config.DefaultInvocationRetention
+// (48h); a leaf package cannot import config, so the default lives here too. The
+// worker always passes the config-resolved value, so this fallback is for direct
+// NewConsumer callers and internal construction only.
+//
+// It is how long a message's invocation-state hash survives AFTER the message
+// has left the PEL — a successful XACK on the success, obsolete, or DLQ path, or
+// a cleared missing-payload PEL reference. Recoverable state (any hash whose
+// message is still pending and can therefore be redelivered) is deliberately
+// PERSISTENT, with NO TTL: it must never expire out from under a redelivery,
+// which would reset the attempt/reclaim accounting. The retention TTL is applied
+// only by retainTerminal, atomically with the reserved terminal marker, once the
+// message is no longer recoverable.
 //
 // It is a retention window for terminal bookkeeping (so a completed/exhausted
 // marker survives long enough to be inspected) and a cleanup safety net: if the
 // post-ACK retention never runs (a crash in the ACK→retain gap), the hash is
 // simply leaked rather than lost — a persistent leak is strictly safer than
 // premature state loss.
-const invocationRetentionTTL = 7 * 24 * time.Hour
+const DefaultInvocationRetention = 48 * time.Hour
 
 // claimTokenBytes is the size of the crypto-random per-claim nonce. 16 bytes
 // (128 bits) makes a token collision between two independent claims
@@ -236,18 +243,21 @@ func ttlMillis(d time.Duration) int64 {
 // no longer recoverable: the message it belongs to has left the PEL (a
 // successful XACK on the success/obsolete/DLQ path, or a cleared/purged
 // missing-payload PEL reference), so retainTerminal switched the hash to
-// terminal retention (invocationRetentionTTL). While the field is present every
-// lifecycle script is inert: a stale transition from an in-memory delivery can
-// neither mutate the retained state nor remove the retention TTL (which would
-// resurrect an unrecoverable hash). Like classificationField and traceFieldPrefix
+// terminal retention. While the field is present every lifecycle script is
+// inert: a stale transition from an in-memory delivery can neither mutate the
+// retained state nor remove the retention TTL (which would resurrect an
+// unrecoverable hash). Like classificationField and traceFieldPrefix
 // it cannot collide with a real invocation ID (a leading "__" is not a legal
 // app name).
 const terminalField = "__terminal"
 
 // retentionTTLMillis returns the terminal retention TTL in integer milliseconds
-// for the PEXPIRE argument passed to the retain script.
-func retentionTTLMillis() int64 {
-	return ttlMillis(invocationRetentionTTL)
+// for the PEXPIRE argument passed to the retain script. Zero means terminal
+// retention is DISABLED: the retain script still writes the terminal marker
+// atomically but leaves the hash persistent (no expiry), so terminal/stale-
+// transition guards are unchanged while no TTL is applied.
+func retentionTTLMillis(retention time.Duration) int64 {
+	return ttlMillis(retention)
 }
 
 // toInt64 coerces a value returned from a Lua EVAL reply (an int64 by default,
@@ -668,14 +678,28 @@ return 1
 	// that races the retention) never re-extends the TTL. A missing key (the
 	// retention already expired, or state was never written) returns 0.
 	//
+	// ARGV[2] is the terminal retention TTL in integer milliseconds, where a
+	// non-positive value means terminal retention is DISABLED (configured as
+	// empty/0/negative): the marker is still written atomically, but the key is
+	// PERSISTed instead of expiring, so terminal bookkeeping survives with no
+	// TTL and stale-transition guards are unchanged. This matters because a
+	// freshly written hash may inherit no TTL while a legacy one could carry a
+	// residual TTL — PERSIST guarantees the disabled contract explicitly.
+	//
 	// KEYS[1] = invocation-state hash;
-	// ARGV[1] = terminal marker field, ARGV[2] = retention TTL ms.
+	// ARGV[1] = terminal marker field, ARGV[2] = retention TTL ms (>0) or
+	// disabled (<=0).
 	// Returns 1 when the hash is now terminal-retained, 0 when it does not exist.
 	retainTerminalScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 1 end
 redis.call('HSET', KEYS[1], ARGV[1], '1')
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+local ttl = tonumber(ARGV[2])
+if ttl == nil or ttl <= 0 then
+  redis.call('PERSIST', KEYS[1])
+else
+  redis.call('PEXPIRE', KEYS[1], ttl)
+end
 return 1
 `)
 )
@@ -828,7 +852,14 @@ type invocationStateStore interface {
 	// never re-extends an already-terminal hash. A retention failure is logged,
 	// never fatal: the hash is simply left persistent (a leak, never a premature
 	// loss).
-	retainTerminal(ctx context.Context, stream, group, msgID string) error
+	//
+	// retention is the resolved terminal window: a positive value applies that
+	// PEXPIRE TTL, while zero (or negative) DISABLES retention — the marker is
+	// still written atomically but the hash is left PERSISTENT instead of
+	// expiring. The caller owns the resolved value (the consumer carries it from
+	// ConsumerConfig.InvocationRetention), so an explicit operator disable is
+	// never silently replaced by a default.
+	retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error
 	// makeRecoverable clears any legacy/recoverable-time TTL from an EXISTING
 	// invocation-state hash so it is PERSISTENT for as long as its message is
 	// pending. It is called at the start of processing a delivery, before the
@@ -930,8 +961,8 @@ func traceField(invocation string) string {
 // therefore redeliverable) the hash is PERSISTENT — no TTL. Only once the
 // message has left the PEL (a successful XACK on the success/obsolete/DLQ path,
 // or a cleared/purged missing-payload PEL reference) does retainTerminal switch
-// it to invocationRetentionTTL. A hash that never gets retained is leaked, never
-// prematurely expired: safe by construction.
+// it to terminal retention (the configured invocation window). A hash that never
+// gets retained is leaked, never prematurely expired: safe by construction.
 //
 // It is the stream layer's domain (Redis), but the runner decides which
 // invocations match, so the store is exposed to the runner through the
@@ -1352,11 +1383,16 @@ func (store *invocationStore) exhaustedState(
 // script inert, so a stale in-memory delivery cannot mutate the retained state
 // or remove the TTL. The upgrade is monotonic: a repeated call never re-extends
 // an already-terminal hash. A missing key is a no-op (nothing to retain).
-func (store *invocationStore) retainTerminal(ctx context.Context, stream, group, msgID string) error {
+//
+// retention is the resolved terminal window: >0 applies the PEXPIRE TTL, while
+// <=0 disables retention (the marker is written but the hash is left PERSISTENT,
+// never inheriting a residual TTL). The script receives the millisecond value,
+// so a disabled window is passed as 0 (see retentionTTLMillis).
+func (store *invocationStore) retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error {
 	_, err := retainTerminalScript.Run(ctx, store.client,
 		[]string{invocationStateKey(stream, group, msgID)},
 		terminalField,
-		retentionTTLMillis(),
+		retentionTTLMillis(retention),
 	).Int64()
 	return err
 }
@@ -1649,7 +1685,7 @@ func parseInvocationState(v string) (kind invocationKind, deadline time.Time, at
 // (still in the PEL) the hash is PERSISTENT, so a redelivery always observes the
 // marker regardless of how long the message sat pending. Only after the message
 // leaves the PEL does the stream layer switch the hash to terminal retention
-// (invocationRetentionTTL) via the reserved terminal marker.
+// (the configured invocation retention) via the reserved terminal marker.
 type InvocationState interface {
 	IsComplete(invocation string) bool
 	// MarkComplete records the invocation complete, CASed on the claim returned

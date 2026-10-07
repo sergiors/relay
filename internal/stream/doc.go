@@ -65,8 +65,9 @@
 //     message is acknowledged when all matching invocations are complete.
 //     While the message is recoverable the key is PERSISTENT (no TTL); only
 //     after a successful ACK (success, obsolete schedule, or DLQ) does the state
-//     switch to terminal retention (a reserved marker plus the ~7-day
-//     invocationRetentionTTL) so a stale in-memory delivery can neither mutate
+//     switch to terminal retention (a reserved marker plus the configured
+//     invocation retention, REDIS_INVOCATION_RETENTION, default 48h) so a stale
+//     in-memory delivery can neither mutate
 //     nor resurrect it. A schedule occurrence additionally pins an immutable
 //     admission descriptor under the reserved "__schedule" field, atomically
 //     with its first successful claim (see ScheduleDescriptor and
@@ -115,8 +116,10 @@
 // TTL — so a reclaim always observes the marker and carries its attempt forward
 // instead of resetting the attempt count, no matter how long the message sat
 // pending. Only after a successful ACK does the state switch to terminal
-// retention (a reserved marker plus the ~7-day invocationRetentionTTL). A
-// running marker that is not renewed (a crash) does not expire out of Redis —
+// retention (a reserved marker plus the configured invocation retention,
+// REDIS_INVOCATION_RETENTION, default 48h; empty/0/negative disables it so the
+// marker is written but the hash stays persistent). A running marker that is
+// not renewed (a crash) does not expire out of Redis —
 // the persistent hash keeps it — but its deadline simply elapses, after which
 // TryStart treats the marker as eligible: reclaim then starts attempt n+1 with a
 // fresh token, so there is no permanent lock. Race ordering is defined by Redis's

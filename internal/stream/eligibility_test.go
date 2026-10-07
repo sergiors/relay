@@ -373,8 +373,10 @@ func (f *fakeInvocationStore) recordTrace(_ context.Context, _, _, _, invocation
 
 // retainTerminal models retainTerminalScript: the message-level terminal marker
 // is set (monotonically) and the message is considered no longer recoverable.
-// Repeated calls are no-ops; a hash that never existed is not created.
-func (f *fakeInvocationStore) retainTerminal(_ context.Context, _, _, _ string) error {
+// Repeated calls are no-ops; a hash that never existed is not created. The
+// retention window is irrelevant to the in-memory fake (it models no TTLs), so
+// it is ignored.
+func (f *fakeInvocationStore) retainTerminal(_ context.Context, _, _, _ string, _ time.Duration) error {
 	if len(f.fields) == 0 && !f.retained {
 		// No hash to retain (mirrors the script's EXISTS guard).
 		return nil
@@ -741,7 +743,7 @@ func TestInvocationTerminalRetentionGuardsStaleWrites(t *testing.T) {
 	}
 
 	// The message leaves the PEL: retain.
-	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+	if err := store.retainTerminal(ctx, "s", "g", "m-0", DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	if !store.terminalRetained() {
@@ -785,7 +787,7 @@ func TestInvocationRetentionIsMonotonicAndNoopWhenAbsent(t *testing.T) {
 	store := &fakeInvocationStore{fields: map[string]string{}}
 
 	// Absent hash: no-op.
-	if err := store.retainTerminal(ctx, "s", "g", "missing"); err != nil {
+	if err := store.retainTerminal(ctx, "s", "g", "missing", DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal(absent): %v", err)
 	}
 	if store.terminalRetained() {
@@ -794,10 +796,10 @@ func TestInvocationRetentionIsMonotonicAndNoopWhenAbsent(t *testing.T) {
 
 	// Present hash: retain, then a second retain keeps it retained.
 	store.fields["fn/h"] = "ok"
-	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+	if err := store.retainTerminal(ctx, "s", "g", "m-0", DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
-	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+	if err := store.retainTerminal(ctx, "s", "g", "m-0", DefaultInvocationRetention); err != nil {
 		t.Fatalf("second retainTerminal: %v", err)
 	}
 	if !store.terminalRetained() {
@@ -834,7 +836,7 @@ func TestInvocationMakeRecoverableMigratesNonTerminalOnly(t *testing.T) {
 	}
 
 	// Terminal-retained: never migrated again.
-	if err := store.retainTerminal(ctx, "s", "g", "m-0"); err != nil {
+	if err := store.retainTerminal(ctx, "s", "g", "m-0", DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	if err := store.makeRecoverable(ctx, "s", "g", "m-0"); err != nil {

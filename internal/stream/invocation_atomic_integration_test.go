@@ -520,7 +520,7 @@ func TestIntegrationAtomicRecoverableStateIsPersistent(t *testing.T) {
 
 	// A very long deadline must NOT introduce a TTL: the key is persistent.
 	now := time.Now()
-	longTimeout := invocationRetentionTTL + 48*time.Hour
+	longTimeout := DefaultInvocationRetention + 48*time.Hour
 	started, claim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(longTimeout))
 	if err != nil || !started {
 		t.Fatalf("tryStart = (%v,%+v,%v)", started, claim, err)
@@ -602,7 +602,7 @@ func TestIntegrationAtomicRetainTerminalPinsTTLAndGuardsStaleWrites(t *testing.T
 	}
 
 	// Retain: the marker is present and the retention TTL is applied.
-	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+	if err := store.retainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	if v, err := cli.HGet(ctx, key, terminalField).Result(); err != nil || v != "1" {
@@ -612,15 +612,15 @@ func TestIntegrationAtomicRetainTerminalPinsTTLAndGuardsStaleWrites(t *testing.T
 	if err != nil {
 		t.Fatalf("pttl after retain: %v", err)
 	}
-	if ttl <= 0 || ttl > invocationRetentionTTL {
-		t.Fatalf("retention PTTL = %s, want (0, %s]", ttl, invocationRetentionTTL)
+	if ttl <= 0 || ttl > DefaultInvocationRetention {
+		t.Fatalf("retention PTTL = %s, want (0, %s]", ttl, DefaultInvocationRetention)
 	}
 
 	// Monotonic: a second retain must NOT re-extend the TTL. Sleep enough to
 	// distinguish the two, then confirm the deadline moved no later.
 	before := time.Now().Add(ttl)
 	time.Sleep(300 * time.Millisecond)
-	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+	if err := store.retainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err != nil {
 		t.Fatalf("second retainTerminal: %v", err)
 	}
 	ttl2, err := cli.PTTL(ctx, key).Result()
@@ -658,10 +658,96 @@ func TestIntegrationAtomicRetainTerminalPinsTTLAndGuardsStaleWrites(t *testing.T
 	}
 }
 
+// TestIntegrationAtomicRetainTerminalDisabledWritesMarkerPersistent pins the
+// explicit-disable contract (REDIS_INVOCATION_RETENTION empty/0/negative): the
+// terminal marker is still written atomically, so terminal/stale-transition
+// guards are unchanged, but NO TTL is applied — the hash is PERSISTed and stays
+// terminal forever (until an operator deletes it). This is distinct from the
+// positive-window path in the test above.
+func TestIntegrationAtomicRetainTerminalDisabledWritesMarkerPersistent(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	now := time.Now()
+	started, claim, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(time.Hour))
+	if err != nil || !started {
+		t.Fatalf("tryStart = (%v,%+v,%v)", started, claim, err)
+	}
+	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim); err != nil || !ok {
+		t.Fatalf("markComplete = (%v,%v)", ok, err)
+	}
+
+	// Retain with a disabled (zero) window: the marker is written, no TTL.
+	if err := store.retainTerminal(ctx, stream, group, msgID, 0); err != nil {
+		t.Fatalf("retainTerminal(disabled): %v", err)
+	}
+	if v, err := cli.HGet(ctx, key, terminalField).Result(); err != nil || v != "1" {
+		t.Fatalf("terminal field = %q (err %v), want \"1\"", v, err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("PTTL after disabled retain = %s (err %v), want -1 (persistent, no TTL)", d, err)
+	}
+
+	// Stale transitions are still inert: the marker guards them.
+	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/h", claim); err != nil || ok {
+		t.Fatalf("markComplete after disabled retain = (%v,%v), want (false,nil)", ok, err)
+	}
+	if s, _, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", time.Now(), time.Now().Add(time.Hour)); err != nil || s {
+		t.Fatalf("tryStart after disabled retain = (%v,%v), want (false,nil)", s, err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("PTTL after stale writes = %s (err %v), want -1 (still persistent)", d, err)
+	}
+
+	// A repeated disabled retain must NOT introduce a TTL either (monotonic).
+	if err := store.retainTerminal(ctx, stream, group, msgID, 0); err != nil {
+		t.Fatalf("second retainTerminal(disabled): %v", err)
+	}
+	if d, err := cli.PTTL(ctx, key).Result(); err != nil || d != -1 {
+		t.Fatalf("PTTL after repeated disabled retain = %s (err %v), want -1 (persistent)", d, err)
+	}
+}
+
+// TestIntegrationAtomicRetainTerminalHonorsConfiguredWindow pins that
+// store.retainTerminal applies exactly the window it is handed, not a
+// package-level default: a short configured value yields that PTTL, so the
+// resolved REDIS_INVOCATION_RETENTION (not a hard-coded constant) drives the
+// terminal expiry.
+func TestIntegrationAtomicRetainTerminalHonorsConfiguredWindow(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	store, stream, group, msgID := atomicStateStore(t, cli)
+	ctx := context.Background()
+	key := invocationStateKey(stream, group, msgID)
+
+	now := time.Now()
+	if started, _, _, err := store.tryStart(ctx, stream, group, msgID, "fn/h", now, now.Add(time.Hour)); err != nil || !started {
+		t.Fatalf("tryStart = (%v,%v)", started, err)
+	}
+
+	const configured = 90 * time.Second
+	if err := store.retainTerminal(ctx, stream, group, msgID, configured); err != nil {
+		t.Fatalf("retainTerminal(configured): %v", err)
+	}
+	ttl, err := cli.PTTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("pttl after configured retain: %v", err)
+	}
+	if ttl <= 0 || ttl > configured {
+		t.Fatalf("retention PTTL = %s, want (0, %s] (the configured window)", ttl, configured)
+	}
+	// It must be materially shorter than the default, proving the configured
+	// value (not the default) was applied.
+	if ttl >= DefaultInvocationRetention {
+		t.Fatalf("retention PTTL = %s, want well under the default %s", ttl, DefaultInvocationRetention)
+	}
+}
+
 // TestIntegrationAtomicRetentionTTLExpiresHash proves the terminal retention
 // mechanism's expiry path, not just its setup: the retain script applies the TTL
 // it is handed and Redis removes the hash once that TTL elapses. Production
-// hands the script invocationRetentionTTL, which is far too long to wait out in
+// hands the script DefaultInvocationRetention, which is far too long to wait out in
 // a test, so this runs the SAME script with a short test TTL on a unique key and
 // polls until the key is gone. The configured production window is still pinned
 // here (and by TestRetentionTTLMillis), so a shortened production TTL cannot hide
@@ -672,9 +758,9 @@ func TestIntegrationAtomicRetentionTTLExpiresHash(t *testing.T) {
 	ctx := context.Background()
 	key := invocationStateKey(stream, group, msgID)
 
-	if got := retentionTTLMillis(); got != int64(invocationRetentionTTL/time.Millisecond) || invocationRetentionTTL <= 0 {
+	if got := retentionTTLMillis(DefaultInvocationRetention); got != int64(DefaultInvocationRetention/time.Millisecond) || DefaultInvocationRetention <= 0 {
 		t.Fatalf("production retention TTL = %dms (const %s), want %dms positive",
-			got, invocationRetentionTTL, int64(invocationRetentionTTL/time.Millisecond))
+			got, DefaultInvocationRetention, int64(DefaultInvocationRetention/time.Millisecond))
 	}
 
 	// Seed the hash as a real delivery would leave it, so expiry proves the TTL
@@ -738,7 +824,7 @@ func TestIntegrationAtomicMakeRecoverableMigratesLegacyTTL(t *testing.T) {
 	}
 
 	// Retain, then assert makeRecoverable never removes terminal retention.
-	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+	if err := store.retainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	if err := store.makeRecoverable(ctx, stream, group, msgID); err != nil {
@@ -1166,7 +1252,7 @@ func TestIntegrationAtomicScheduleDescriptorSurvivesRetentionAndStaysImmutable(t
 	if ok, err := store.markComplete(ctx, stream, group, msgID, "fn/jobs.old", claim); err != nil || !ok {
 		t.Fatalf("markComplete = (%v,%v)", ok, err)
 	}
-	if err := store.retainTerminal(ctx, stream, group, msgID); err != nil {
+	if err := store.retainTerminal(ctx, stream, group, msgID, DefaultInvocationRetention); err != nil {
 		t.Fatalf("retainTerminal: %v", err)
 	}
 	if got := pinnedDescriptor(t, cli, stream, group, msgID); got != encodeScheduleDescriptor(pinned) {

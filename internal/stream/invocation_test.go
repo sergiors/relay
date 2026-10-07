@@ -179,13 +179,23 @@ func TestNextAttemptAndExhaustedValueRoundTrip(t *testing.T) {
 
 // TestRetentionTTLMillis pins the terminal retention TTL conversion: the
 // retention window is expressed in integer milliseconds for the PEXPIRE the
-// retain script applies after a message leaves the PEL.
+// retain script applies after a message leaves the PEL. A non-positive window
+// converts to 0, which the script reads as "disabled" (marker only, no expiry).
 func TestRetentionTTLMillis(t *testing.T) {
-	if got := retentionTTLMillis(); got != int64(invocationRetentionTTL/time.Millisecond) {
-		t.Fatalf("retentionTTLMillis() = %d, want %d", got, int64(invocationRetentionTTL/time.Millisecond))
+	if got := retentionTTLMillis(DefaultInvocationRetention); got != int64(DefaultInvocationRetention/time.Millisecond) {
+		t.Fatalf("retentionTTLMillis(default) = %d, want %d", got, int64(DefaultInvocationRetention/time.Millisecond))
 	}
-	if invocationRetentionTTL <= 0 {
-		t.Fatalf("invocationRetentionTTL = %s, want a positive retention window", invocationRetentionTTL)
+	if DefaultInvocationRetention <= 0 {
+		t.Fatalf("DefaultInvocationRetention = %s, want a positive retention window", DefaultInvocationRetention)
+	}
+	if got := retentionTTLMillis(12 * time.Hour); got != int64(12*time.Hour/time.Millisecond) {
+		t.Fatalf("retentionTTLMillis(12h) = %d, want %d", got, int64(12*time.Hour/time.Millisecond))
+	}
+	if got := retentionTTLMillis(0); got != 0 {
+		t.Fatalf("retentionTTLMillis(0) = %d, want 0 (disabled)", got)
+	}
+	if got := retentionTTLMillis(-time.Minute); got > 0 {
+		t.Fatalf("retentionTTLMillis(-1m) = %d, want <= 0 (disabled)", got)
 	}
 }
 

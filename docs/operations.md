@@ -297,8 +297,10 @@ next_attempt_at:<deadline>`, `exhausted`, and `exhausted:…:dlq`. Every
   and claim token, so a stale claim can never overwrite a newer claim or a
   terminal marker. While the message is pending the hash is **persistent**;
   only after it leaves the PEL (successful XACK or a cleared
-  missing-payload reference) does it switch to terminal retention with a ~7-day
-  TTL. A hash whose retention never runs is leaked, never prematurely expired.
+  missing-payload reference) does it switch to terminal retention with the
+  configured `REDIS_INVOCATION_RETENTION` TTL (default 48h; empty/0/negative
+  disables the expiry, leaving the marked hash persistent). A hash whose
+  retention never runs is leaked, never prematurely expired.
 - Deadlines are integer Unix milliseconds, compared exactly (`now_ms <
 deadline_ms` is protected).
 - Recovery reclaims idle pending messages (`XAUTOCLAIM`, default 1m) as a

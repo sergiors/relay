@@ -768,9 +768,9 @@ type retainCountingStore struct {
 	retainCalls atomic.Int64
 }
 
-func (s *retainCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string) error {
+func (s *retainCountingStore) retainTerminal(ctx context.Context, stream, group, msgID string, retention time.Duration) error {
 	s.retainCalls.Add(1)
-	return s.invocationStateStore.retainTerminal(ctx, stream, group, msgID)
+	return s.invocationStateStore.retainTerminal(ctx, stream, group, msgID, retention)
 }
 
 // TestIntegrationSuccessfulHandlerXACKFailureLeavesPendingAndRecoverable pins

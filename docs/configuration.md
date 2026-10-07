@@ -34,6 +34,7 @@ automatically.
 | `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
 | `REDIS_STREAM_RETENTION`      | `24h`              | Go duration (`6h`, `90m`)                                               | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                |
 | `REDIS_DLQ_RETENTION`         | `7d` (`168h`)      | Go duration (`168h`, `90m`)                                             | The optional value that **logs and disables** instead of failing. Age-only DLQ trim. See below.                                                                                                                             |
+| `REDIS_INVOCATION_RETENTION`  | `48h`              | Go duration (`12h`, `90m`)                                             | The optional value that **logs and disables** instead of failing. Terminal invocation-state TTL only. See below.                                                                                                            |
 | `TRAEFIK_NETWORK`             | unset              | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                      |
 | `TRAEFIK_ENTRYPOINTS`         | unset              | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`) | Passed through verbatim into the router label; no default.                                                                                                                                                                  |
 | `TRAEFIK_CERTRESOLVER`        | unset              | resolver name (`letsencrypt`)                                           | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                                                                                                  |
@@ -94,11 +95,11 @@ Fatal startup failures always log regardless of the configured level.
 
 ### Stream and DLQ retention
 
-Two independent retention windows trim two different streams. Both are **Go
-durations** parsed with `time.ParseDuration`; there is no day suffix (`7d` is
-**not** valid), so a 7-day override is written `168h`. Both are startup
-configuration (restart to change) and neither affects ACK, retry, DLQ routing,
-or the scheduler/outbox.
+Three independent retention windows trim or bound three different things. All
+are **Go durations** parsed with `time.ParseDuration`; there is no day suffix
+(`7d` is **not** valid), so a 7-day override is written `168h`. All are startup
+configuration (restart to change) and none affects ACK, retry, DLQ routing, or
+the scheduler/outbox.
 
 `REDIS_STREAM_RETENTION` (default `24h`) drives the main stream trim. A single
 goroutine inside `relay start` periodically trims the configured source stream
@@ -135,18 +136,51 @@ XACK flow**, so it is trimmed **age-only**:
   the DLQ trim never touches the source. Neither changes ACK-before-DLQ
   ordering.
 
-**Unset vs. explicitly empty.** For both windows, leaving the variable **unset**
-applies the documented default (`24h` / `168h`); setting it to an **empty**
-(or whitespace-only) string (`REDIS_STREAM_RETENTION=`) disables that retention
-(`0`). A malformed value and an explicit `0` or negative value log a line naming
-the variable and disable that retention; **retention values never fail
-startup**.
+`REDIS_INVOCATION_RETENTION` (default `48h`) is **not a stream trim**: it is the
+TTL applied to a message's per-invocation Redis hash (`relay:invocation:…`) only
+**after the message has left the PEL** — a successful XACK on the success,
+obsolete-schedule, or DLQ path, or a cleared missing-payload PEL reference.
+While the message is recoverable (still in the PEL and therefore redeliverable)
+the hash is **persistent with no TTL**, regardless of this value; the window
+starts only once the message is no longer recoverable.
+
+- It bounds terminal bookkeeping (`ok` / `exhausted` / `exhausted:…:dlq`
+  markers, plus the reserved classification/trace/schedule fields): how long a
+  completed or exhausted invocation stays inspectable after its message left the
+  PEL. It does **not** affect retries or ACK ordering.
+- The TTL is applied atomically with the reserved terminal marker, and is
+  monotonic: a repeated retention (e.g. a redelivery racing the ACK) never
+  re-extends it, and a stale in-memory transition can neither mutate the
+  terminal state nor remove the TTL.
+- This window is **independent** of `REDIS_DLQ_RETENTION` (which trims DLQ stream
+  entries) and of the scheduler's SQLite outbox, whose 7-day retention is a
+  separate, local mechanism. A dead-lettered entry and the terminal hash for the
+  same message are two different Redis/SQLite objects with their own windows.
+
+**Unset vs. explicitly empty.** For all three windows, leaving the variable
+**unset** applies the documented default (`24h` / `168h` / `48h`); setting it to
+an **empty** (or whitespace-only) string (`REDIS_STREAM_RETENTION=`) disables
+that retention (`0`). A malformed value and an explicit `0` or negative value log
+a line naming the variable and disable that behavior; **retention values never
+fail startup**.
+
+For `REDIS_INVOCATION_RETENTION`, a disabled value (`0`) still writes the
+terminal marker atomically — every stale-transition guard is unchanged — but
+leaves the hash **persistent** (no expiry), so terminal bookkeeping survives
+until an operator removes the keys. Re-enabling the setting later does **not**
+retroactively assign a TTL to those earlier persistent terminal hashes — there is
+no sweeper, and only a newly written terminal marker receives the expiry — which
+preserves terminal-marker atomicity instead of adding a global scan. The worker
+passes the operator's resolved value through verbatim, so an explicit `0` is
+never silently replaced by the `48h` default.
 
 ```bash
 REDIS_STREAM_RETENTION=6h          # trim the source stream (ACKED)
 REDIS_DLQ_RETENTION=168h          # trim the DLQ after 7 days (age-only)
+REDIS_INVOCATION_RETENTION=12h    # expire terminal invocation state after 12h
 REDIS_STREAM_RETENTION=          # disable source retention
 REDIS_DLQ_RETENTION=             # disable DLQ retention
+REDIS_INVOCATION_RETENTION=       # keep terminal invocation state persistent (no TTL)
 ```
 
 ## Environment owned by other libraries

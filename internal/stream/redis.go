@@ -104,6 +104,17 @@ type ConsumerConfig struct {
 	// DefaultMaxEventBytes (262144) if zero or negative — zero must not mean
 	// "unlimited".
 	MaxEventBytes int
+	// InvocationRetention is the TERMINAL invocation-state retention window
+	// (config REDIS_INVOCATION_RETENTION) the consumer applies after a message
+	// leaves the PEL. It is a POINTER so an explicit disable (0) is
+	// distinguishable from "unconfigured": nil means the caller did not
+	// configure it and the package default (DefaultInvocationRetention, 48h) is
+	// used, while a non-nil value is honored verbatim — including 0, which
+	// disables terminal expiry (the marker is still written; the hash is left
+	// PERSISTENT). This is what lets the worker deliberately pass an operator's
+	// empty/0/negative value without NewConsumer defaulting it back to 48h. The
+	// worker always sets it from config; direct callers may leave it nil.
+	InvocationRetention *time.Duration
 	// ScheduleRunner, when set, executes messages identified as schedule
 	// occurrences directly against the named app/schedule/handler,
 	// bypassing event matching. msgID is the message's real Redis stream ID, so
@@ -156,6 +167,11 @@ type Consumer struct {
 	// maxEventBytes caps the raw `event` value length (see
 	// ConsumerConfig.MaxEventBytes). It is always positive.
 	maxEventBytes int
+	// invocationRetention is the resolved terminal invocation-state window
+	// applied after a message leaves the PEL (see
+	// ConsumerConfig.InvocationRetention). A non-positive value disables
+	// terminal expiry; the consumer still writes the terminal marker.
+	invocationRetention time.Duration
 }
 
 func NewConsumer(cfg ConsumerConfig) *Consumer {
@@ -204,24 +220,35 @@ func newConsumer(cfg ConsumerConfig, store invocationStateStore) *Consumer {
 	if cfg.MaxEventBytes >= 1 {
 		maxEventBytes = cfg.MaxEventBytes
 	}
+
+	// Terminal invocation-state retention: a nil pointer means the caller did
+	// not configure it (direct/internal construction) and the package default
+	// applies; a non-nil pointer is honored VERBATIM, so an explicit 0 from the
+	// worker's REDIS_INVOCATION_RETENTION is preserved as "disabled" rather than
+	// being defaulted back to 48h.
+	invocationRetention := DefaultInvocationRetention
+	if cfg.InvocationRetention != nil {
+		invocationRetention = *cfg.InvocationRetention
+	}
 	c := &Consumer{
-		client:          cfg.Client,
-		stream:          cfg.Stream,
-		group:           cfg.Group,
-		consumer:        cfg.Consumer,
-		block:           cfg.Block,
-		count:           cfg.Count,
-		reclaimInterval: cfg.ReclaimInterval,
-		minPendingIdle:  cfg.MinPendingIdle,
-		dlqStream:       DLQStreamFor(cfg.Stream),
-		log:             cfg.Log,
-		metrics:         cfg.Metrics,
-		metricsInterval: cfg.MetricsInterval,
-		backoff:         newBackoff(cfg.backoffTable, cfg.backoffJitter),
-		capacity:        capacity,
-		buffer:          newBufferSemaphore(capacity),
-		scheduleRunner:  cfg.ScheduleRunner,
-		maxEventBytes:   maxEventBytes,
+		client:              cfg.Client,
+		stream:              cfg.Stream,
+		group:               cfg.Group,
+		consumer:            cfg.Consumer,
+		block:               cfg.Block,
+		count:               cfg.Count,
+		reclaimInterval:     cfg.ReclaimInterval,
+		minPendingIdle:      cfg.MinPendingIdle,
+		dlqStream:           DLQStreamFor(cfg.Stream),
+		log:                 cfg.Log,
+		metrics:             cfg.Metrics,
+		metricsInterval:     cfg.MetricsInterval,
+		backoff:             newBackoff(cfg.backoffTable, cfg.backoffJitter),
+		capacity:            capacity,
+		buffer:              newBufferSemaphore(capacity),
+		scheduleRunner:      cfg.ScheduleRunner,
+		maxEventBytes:       maxEventBytes,
+		invocationRetention: invocationRetention,
 	}
 	// The consumer is always constructed with a functional invocation-state
 	// store. processMessage/processScheduleMessage/routeToDLQ rely on it being
@@ -840,7 +867,7 @@ func (c *Consumer) clearMissingValueEntry(ctx context.Context, msg redis.XMessag
 	}
 	// The dangling PEL reference is gone: retain the (never-completing)
 	// invocation state under the retention TTL instead of leaking it.
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		c.log.Warn("Message: retain invocation state for missing-value entry failed",
 			"message_id", msg.ID, "error", err)
 	}
@@ -1137,7 +1164,7 @@ func (c *Consumer) processMessage(
 	// (persistent, no TTL) for the redelivery to skip completed handlers. A
 	// retention failure is logged only: the state is simply left persistent (a
 	// leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		c.log.Warn("Message: retain invocation state failed", "message_id", msg.ID, "error", err)
 	}
 }
@@ -1239,7 +1266,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 			// Retain the invocation-state hash after a successful ACK, exactly
 			// like the success tail. A retention failure is logged only; the
 			// state is left persistent (a leak, never a premature loss).
-			if cerr := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID); cerr != nil {
+			if cerr := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); cerr != nil {
 				c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", cerr)
 			}
 			return "acked", nil
@@ -1300,7 +1327,7 @@ func (c *Consumer) processScheduleMessage(ctx context.Context, msgID string, del
 	// Switch the invocation-state hash to terminal retention after a successful
 	// ACK, exactly like processMessage. A retention failure is logged only; the
 	// state is left persistent (a leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID); err != nil {
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msgID, c.invocationRetention); err != nil {
 		c.log.Warn("Schedule: message retain invocation state failed", "message_id", msgID, "error", err)
 	}
 	return "acked", nil
@@ -1492,7 +1519,7 @@ func (c *Consumer) routeToDLQ(
 	// (including the per-invocation DLQ-persisted markers) must remain
 	// recoverable (persistent, no TTL). A retention failure is logged only; the
 	// state is left persistent (a leak, never a premature loss).
-	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID); err != nil {
+	if err := c.invStateStore.retainTerminal(ctx, c.stream, c.group, msg.ID, c.invocationRetention); err != nil {
 		c.log.Warn("Message: retain invocation state after DLQ failed", "message_id", msg.ID, "error", err)
 	}
 }
