@@ -548,16 +548,21 @@ func TestLoadInvalidLogLevelReturnsError(t *testing.T) {
 	}
 }
 
-// TestLoadConcurrencyDefaults pins that unset MAX_CONCURRENCY and
-// MAX_BUFFERED_EVENTS resolve to their documented defaults (8 and 16). Load
-// needs the required REDIS_* vars set (setRequiredEnv).
+// TestLoadConcurrencyDefaults pins that unset MAX_CONCURRENT_INVOCATIONS,
+// MAX_CONCURRENT_BUILDS, and MAX_BUFFERED_EVENTS resolve to their documented
+// defaults (8, 2, and 16). Load needs the required REDIS_* vars set
+// (setRequiredEnv).
 func TestLoadConcurrencyDefaults(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("MAX_CONCURRENCY", "")
+	t.Setenv("MAX_CONCURRENT_INVOCATIONS", "")
+	t.Setenv("MAX_CONCURRENT_BUILDS", "")
 	t.Setenv("MAX_BUFFERED_EVENTS", "")
 	cfg := mustLoad(t)
-	if cfg.MaxConcurrency != DefaultMaxConcurrency {
-		t.Fatalf("MaxConcurrency = %d, want default %d", cfg.MaxConcurrency, DefaultMaxConcurrency)
+	if cfg.MaxConcurrentInvocations != DefaultMaxConcurrentInvocations {
+		t.Fatalf("MaxConcurrentInvocations = %d, want default %d", cfg.MaxConcurrentInvocations, DefaultMaxConcurrentInvocations)
+	}
+	if cfg.MaxConcurrentBuilds != DefaultMaxConcurrentBuilds {
+		t.Fatalf("MaxConcurrentBuilds = %d, want default %d", cfg.MaxConcurrentBuilds, DefaultMaxConcurrentBuilds)
 	}
 	if cfg.MaxBufferedEvents != DefaultMaxBufferedEvents {
 		t.Fatalf("MaxBufferedEvents = %d, want default %d", cfg.MaxBufferedEvents, DefaultMaxBufferedEvents)
@@ -568,14 +573,36 @@ func TestLoadConcurrencyDefaults(t *testing.T) {
 // honored.
 func TestLoadConcurrencyExplicitValues(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("MAX_CONCURRENCY", "4")
+	t.Setenv("MAX_CONCURRENT_INVOCATIONS", "4")
+	t.Setenv("MAX_CONCURRENT_BUILDS", "5")
 	t.Setenv("MAX_BUFFERED_EVENTS", "32")
 	cfg := mustLoad(t)
-	if cfg.MaxConcurrency != 4 {
-		t.Fatalf("MaxConcurrency = %d, want 4", cfg.MaxConcurrency)
+	if cfg.MaxConcurrentInvocations != 4 {
+		t.Fatalf("MaxConcurrentInvocations = %d, want 4", cfg.MaxConcurrentInvocations)
+	}
+	if cfg.MaxConcurrentBuilds != 5 {
+		t.Fatalf("MaxConcurrentBuilds = %d, want 5", cfg.MaxConcurrentBuilds)
 	}
 	if cfg.MaxBufferedEvents != 32 {
 		t.Fatalf("MaxBufferedEvents = %d, want 32", cfg.MaxBufferedEvents)
+	}
+}
+
+// TestLoadNoLegacyConcurrencyAlias pins that the pre-rename environment name is
+// NOT a compatibility alias: setting MAX_CONCURRENCY alone leaves the new
+// fields at their documented defaults, so the old variable has no effect
+// whatsoever. This is the no-alias contract the rename requires.
+func TestLoadNoLegacyConcurrencyAlias(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_CONCURRENCY", "3")
+	cfg := mustLoad(t)
+	if cfg.MaxConcurrentInvocations != DefaultMaxConcurrentInvocations {
+		t.Fatalf("MaxConcurrentInvocations = %d after setting only MAX_CONCURRENCY; want default %d (no alias)",
+			cfg.MaxConcurrentInvocations, DefaultMaxConcurrentInvocations)
+	}
+	if cfg.MaxConcurrentBuilds != DefaultMaxConcurrentBuilds {
+		t.Fatalf("MaxConcurrentBuilds = %d with only MAX_CONCURRENCY set; want default %d",
+			cfg.MaxConcurrentBuilds, DefaultMaxConcurrentBuilds)
 	}
 }
 
@@ -703,12 +730,12 @@ func TestParsePositiveInt(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParsePositiveInt("MAX_CONCURRENCY", tt.value)
+			got, err := ParsePositiveInt("MAX_CONCURRENT_INVOCATIONS", tt.value)
 			if tt.wantError {
 				if err == nil {
 					t.Fatalf("ParsePositiveInt(%q) = %d, nil; want error", tt.value, got)
 				}
-				if !strings.Contains(err.Error(), "MAX_CONCURRENCY") {
+				if !strings.Contains(err.Error(), "MAX_CONCURRENT_INVOCATIONS") {
 					t.Fatalf("error should name the variable: %v", err)
 				}
 				return
@@ -730,8 +757,11 @@ func TestLoadInvalidConcurrencyReturnsError(t *testing.T) {
 	for _, tt := range []struct {
 		env, value, wantVar string
 	}{
-		{"MAX_CONCURRENCY", "0", "MAX_CONCURRENCY"},
-		{"MAX_CONCURRENCY", "abc", "MAX_CONCURRENCY"},
+		{"MAX_CONCURRENT_INVOCATIONS", "0", "MAX_CONCURRENT_INVOCATIONS"},
+		{"MAX_CONCURRENT_INVOCATIONS", "abc", "MAX_CONCURRENT_INVOCATIONS"},
+		{"MAX_CONCURRENT_BUILDS", "0", "MAX_CONCURRENT_BUILDS"},
+		{"MAX_CONCURRENT_BUILDS", "-1", "MAX_CONCURRENT_BUILDS"},
+		{"MAX_CONCURRENT_BUILDS", "two", "MAX_CONCURRENT_BUILDS"},
 		{"MAX_BUFFERED_EVENTS", "-1", "MAX_BUFFERED_EVENTS"},
 	} {
 		t.Run(tt.env+"="+tt.value, func(t *testing.T) {

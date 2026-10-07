@@ -24,9 +24,9 @@ const DefaultRetries = 4
 // DefaultConcurrency is the per-app concurrency applied to a template that
 // omits the top-level `concurrency` key. It bounds how many invocations of THIS
 // app's handlers may execute concurrently within a single Relay worker
-// (the worker-global cap in MAX_CONCURRENCY is a separate, broader limit). A
-// template that specifies `concurrency` must be a positive integer; zero,
-// negative, or non-integer values fail validation.
+// (the worker-global cap in MAX_CONCURRENT_INVOCATIONS is a separate, broader
+// limit). A template that specifies `concurrency` must be a positive integer;
+// zero, negative, or non-integer values fail validation.
 const DefaultConcurrency = 2
 
 // DefaultServicePort is the port applied to a service that omits an explicit

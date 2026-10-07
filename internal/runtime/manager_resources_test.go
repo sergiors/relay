@@ -15,7 +15,7 @@ import (
 // value does not churn. It drives the real Execute path with the injectable
 // container-start seam (no Docker daemon).
 func TestExecutePublishesResourcesAndRotatesGeneration(t *testing.T) {
-	m := &Manager{maxConcurrency: 4}
+	m := &Manager{maxConcurrentInvocations: 4}
 	m.containers = newContainerCache()
 
 	var mu sync.Mutex

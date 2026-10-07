@@ -293,7 +293,7 @@ var metricHelp = map[string]string{
 	MetricEventsOversized:      "Delivered messages whose raw event value exceeded MAX_EVENT_BYTES, counted once per processing delivery that rejects the message before decode, schedule classification, event matching, invocation-state migration, or handler execution and routes it non-retryably to the DLQ. A redelivery of the same oversized entry counts again. Unlabeled: the event ID and byte size are never labels.",
 	MetricBuildOutputTruncated: "Docker build responses whose retained diagnostic reached the internal 1 MiB build-output retention bound and had further output discarded; the response stream is still fully drained, only the retained diagnostic is bounded. Unlabeled: the app name and byte size are never labels.",
 	MetricRuntimeContainers:    "Current number of warm-container pool containers by app and state (idle, busy, or starting).",
-	MetricRuntimePoolCapacity:  "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENCY).",
+	MetricRuntimePoolCapacity:  "Current resolved per-app concurrency bound of the warm-container pool (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS).",
 
 	MetricAppStatus:                "Current public lifecycle status of the app as a one-hot gauge: exactly one status series is 1 and every other allowed status is 0.",
 	MetricRedisReadErrors:          "Failed Redis read commands by the finite operation that failed; one increment per failed command.",

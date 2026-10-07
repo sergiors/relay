@@ -145,7 +145,7 @@ func newIdentityManager(t *testing.T) (*Manager, *identityResolver, *startRecord
 	t.Helper()
 	res := &identityResolver{}
 	start := &startRecorder{}
-	m := &Manager{log: testutil.DiscardLogger(), maxConcurrency: 4, containers: newContainerCache()}
+	m := &Manager{log: testutil.DiscardLogger(), maxConcurrentInvocations: 4, containers: newContainerCache()}
 	m.resolveImageIdentityFn = res.resolve
 	m.startContainerFn = start.start
 	start.created = make(chan *fakeContainer, 8)
@@ -501,7 +501,7 @@ func TestExecuteSameContentResourceChangeStillPooled(t *testing.T) {
 // degrades to the reference identity rather than failing the invocation: the
 // container is created from the reference (no content ID) and still served.
 func TestExecuteIdentityResolutionFailureStillServes(t *testing.T) {
-	m := &Manager{log: testutil.DiscardLogger(), maxConcurrency: 2, containers: newContainerCache()}
+	m := &Manager{log: testutil.DiscardLogger(), maxConcurrentInvocations: 2, containers: newContainerCache()}
 	m.resolveImageIdentityFn = func(_ context.Context, ref, _ string) (resolvedImage, error) {
 		return resolvedImage{}, errors.New("resolution boom")
 	}

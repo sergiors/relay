@@ -25,7 +25,8 @@ automatically.
 | Variable                      | Default            | Format / accepted values                                                | Behavior when invalid                                                                                                                                                                                                       |
 | ----------------------------- | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `LOG_LEVEL`                   | `INFO`             | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                               |
-| `MAX_CONCURRENCY`             | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
+| `MAX_CONCURRENT_INVOCATIONS`  | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
+| `MAX_CONCURRENT_BUILDS`       | `2`                | positive integer                                                        | Fails startup. Bounds concurrent runtime-backed image-preparation pipelines **per worker**.                                                                                                                                  |
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
 | `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)                      | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
@@ -55,10 +56,23 @@ configuration: changing it requires a worker restart.
 
 ### Concurrency and backpressure
 
-`MAX_CONCURRENCY` and `MAX_BUFFERED_EVENTS` are **per worker**. With `N`
-replicas the effective global totals multiply. `MAX_CONCURRENCY` is startup
-configuration (restart to change); a template's per-app `concurrency` is
-clipped to it live and is documented in [apps.md](apps.md).
+`MAX_CONCURRENT_INVOCATIONS` and `MAX_BUFFERED_EVENTS` are **per worker**. With
+`N` replicas the effective global totals multiply.
+`MAX_CONCURRENT_INVOCATIONS` is startup configuration (restart to change); a
+template's per-app `concurrency` is clipped to it live and is documented in
+[apps.md](apps.md).
+
+`MAX_CONCURRENT_BUILDS` (default `2`) is also **per worker** and bounds how many
+runtime-backed image-preparation pipelines run at once: one pipeline — source
+selection and snapshot, dependency snapshot, reuse probes, dependency image
+build, and app image build — holds one slot for its **whole** duration, so a
+preparation's dependency and app sub-builds are sequential within its slot. It
+is independent of `MAX_CONCURRENT_INVOCATIONS` and of `MAX_BUFFERED_EVENTS`, and
+it is **not** a host-wide resource quota: each worker enforces its own, so a
+deployment of `N` workers can run up to `N * MAX_CONCURRENT_BUILDS` preparations
+concurrently. It is startup configuration (restart to change). Only
+runtime-backed preparations take a slot; a template-only (no-runtime) prepare
+does not.
 
 ```
 Redis stream → bounded local buffer → matcher/dispatcher →

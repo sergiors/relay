@@ -49,8 +49,12 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 - Matching includes currently-unavailable apps: the event is still
   `matched`, its invocation stays pending, and it is never DLQ'd for
   unavailability alone. Effective concurrency is
-  `min(template concurrency, MAX_CONCURRENCY)`, bounding the runner semaphore and
-  the warm pool.
+  `min(template concurrency, MAX_CONCURRENT_INVOCATIONS)`, bounding the runner
+  semaphore and the warm pool. Independently, a per-worker preparation cap
+  (`MAX_CONCURRENT_BUILDS`, default 2) bounds concurrent runtime-backed image
+  preparations — source snapshot, dependency snapshot, and Docker builds — one
+  immutable permit held for a preparation's whole duration; it is per worker, not
+  a host-wide quota, and does not bound invocations or events.
 - Matching also includes a valid generation being PREPARED but not yet runnable.
   The reconciler publishes the desired generation's event rules as a pending,
   non-runnable entry in the registry (atomically with its candidate index)

@@ -204,7 +204,7 @@ func TestInvokeHandlerSlotTimeoutLeavesPending(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
 	r := NewWithMetrics([]*PreparedApp{schedFnRetries(t, "fn", holding, app.DefaultTimeout, app.DefaultRetries)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(1)
+	r.SetMaxConcurrentInvocations(1)
 	r.slotWait = 50 * time.Millisecond
 
 	// First invocation acquires the single per-app slot and blocks.

@@ -135,11 +135,11 @@ no trailing `.`).
 
 `concurrency` bounds how many of this app's invocations run at once
 **within a single worker** (per app, per worker). It is clipped to the
-worker-global `MAX_CONCURRENCY`, so the effective limit is
-`min(concurrency, MAX_CONCURRENCY)` (for example `15` with the default cap of
-`8` is capped at `8`). It must be a positive integer; omitted templates default
-to `2`. A hot-swapped change is applied live without a restart;
-`MAX_CONCURRENCY` is startup configuration.
+worker-global `MAX_CONCURRENT_INVOCATIONS`, so the effective limit is
+`min(concurrency, MAX_CONCURRENT_INVOCATIONS)` (for example `15` with the default
+cap of `8` is capped at `8`). It must be a positive integer; omitted templates
+default to `2`. A hot-swapped change is applied live without a restart;
+`MAX_CONCURRENT_INVOCATIONS` is startup configuration.
 
 The same effective value sizes both the app's runner semaphore and its warm
 container pool, so admission, the pool capacity gauge, and `app inspect`

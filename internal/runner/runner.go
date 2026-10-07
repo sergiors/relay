@@ -22,12 +22,12 @@ import (
 	"relay/internal/stream"
 )
 
-// DefaultMaxConcurrency is the runner's default global cap on concurrently
-// executing invocations in a single worker (MAX_CONCURRENCY). A zero or
-// negative value passed to SetMaxConcurrency falls back to this. The runner
+// DefaultMaxConcurrentInvocations is the runner's default global cap on concurrently
+// executing invocations in a single worker (MAX_CONCURRENT_INVOCATIONS). A zero or
+// negative value passed to SetMaxConcurrentInvocations falls back to this. The runner
 // deliberately owns this constant (it cannot import config; worker wires the
 // cfg value).
-const DefaultMaxConcurrency = 8
+const DefaultMaxConcurrentInvocations = 8
 
 // slotWaitTimeout bounds how long Handle waits for a free concurrency slot
 // (global or per-app) before giving up. It is deliberately well below the
@@ -537,14 +537,14 @@ type Runner struct {
 	// references secrets then fails the invocation with a clear error). It is
 	// set via SetSecretProvider; the worker wires the production local provider.
 	secrets secrets.Provider
-	// maxConcurrency is the worker-global cap on concurrently executing
-	// invocations (0 = uncapped, which SetMaxConcurrency normalizes to
-	// DefaultMaxConcurrency). It is stored as an atomic so a SetMaxConcurrency
+	// maxConcurrentInvocations is the worker-global cap on concurrently executing
+	// invocations (0 = uncapped, which SetMaxConcurrentInvocations normalizes to
+	// DefaultMaxConcurrentInvocations). It is stored as an atomic so a SetMaxConcurrentInvocations
 	// call (worker wires it right after construction) and concurrent Handle
 	// calls read a consistent value.
-	maxConcurrency atomic.Int64
+	maxConcurrentInvocations atomic.Int64
 	// globalSem is the global concurrency semaphore, sized to the (normalized)
-	// max concurrency. It is stored as an atomic pointer so a SetMaxConcurrency
+	// max concurrency. It is stored as an atomic pointer so a SetMaxConcurrentInvocations
 	// call (worker wires it right after construction) is race-free against
 	// concurrent Handle calls reading it: readers get either the old or the new
 	// semaphore, both of which are internally consistent.
@@ -747,11 +747,11 @@ func NewWithMetrics(prepared []*PreparedApp, logger *slog.Logger, registry *metr
 		slotWait:                slotWaitTimeout,
 		imageCleanupRetryDelays: defaultImageCleanupRetryDelays,
 	}
-	// maxConcurrency defaults to DefaultMaxConcurrency so an uncalled
-	// SetMaxConcurrency (a runner constructed directly, as in tests) still has a
-	// bounded global concurrency. SetMaxConcurrency overwrites it.
-	r.maxConcurrency.Store(DefaultMaxConcurrency)
-	r.globalSem.Store(newSemaphore(DefaultMaxConcurrency))
+	// maxConcurrentInvocations defaults to DefaultMaxConcurrentInvocations so an uncalled
+	// SetMaxConcurrentInvocations (a runner constructed directly, as in tests) still has a
+	// bounded global concurrency. SetMaxConcurrentInvocations overwrites it.
+	r.maxConcurrentInvocations.Store(DefaultMaxConcurrentInvocations)
+	r.globalSem.Store(newSemaphore(DefaultMaxConcurrentInvocations))
 	// When a retired image's last in-flight execution releases it, run the async
 	// removal automatically. r is fully built before any goroutine can run, and
 	// imageRemovedIdle is nil-safe on a nil cleaner.
@@ -799,17 +799,17 @@ func (r *Runner) SetSecretProvider(provider secrets.Provider) {
 	r.secrets = provider
 }
 
-// SetMaxConcurrency sets the worker-global cap on concurrently executing
+// SetMaxConcurrentInvocations sets the worker-global cap on concurrently executing
 // invocations. A value of 0 or negative (the zero value) falls back to
-// DefaultMaxConcurrency (8); a value of 0 must not mean "unbounded". It takes
+// DefaultMaxConcurrentInvocations (8); a value of 0 must not mean "unbounded". It takes
 // effect on the next Handle. It is wired by the worker right next to
 // SetHostname/SetSecretProvider/SetMaxHandlerTimeout. The global semaphore is
 // (re)built on the next acquisition, so a call after construction resizes it.
-func (r *Runner) SetMaxConcurrency(n int) {
+func (r *Runner) SetMaxConcurrentInvocations(n int) {
 	if n < 1 {
-		n = DefaultMaxConcurrency
+		n = DefaultMaxConcurrentInvocations
 	}
-	r.maxConcurrency.Store(int64(n))
+	r.maxConcurrentInvocations.Store(int64(n))
 	r.globalSem.Store(newSemaphore(n))
 }
 
@@ -1096,11 +1096,11 @@ func (r *Runner) executeWithRefs(
 // REPLACED (not mutated) when the app's resolved concurrency changes, so an
 // in-flight acquisition still releases to the semaphore pointer it captured
 // while new acquisitions use the resized one; the global semaphore is rebuilt by
-// SetMaxConcurrency.
+// SetMaxConcurrentInvocations.
 //
 // The per-app semaphore is the ONLY per-app invocation limiter: the
 // runtime's warm container pool is sized from the same effective concurrency
-// (template concurrency clipped to MAX_CONCURRENCY), so the semaphore always
+// (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS), so the semaphore always
 // admits no more concurrent Execute calls than the pool has containers, and the
 // pool never blocks in the runner path. The global semaphore is the broader cap
 // shared across apps.
@@ -1158,17 +1158,17 @@ func (s *semaphore) release() {
 // only the caller's snapshot value (see currentConcurrency): an in-flight Handle
 // holding an older snapshot cannot resize the semaphore backwards after a newer
 // snapshot already applied a larger bound. The resolved value is additionally
-// clipped to the worker-global MAX_CONCURRENCY (see effectiveConcurrency), so a
+// clipped to the worker-global MAX_CONCURRENT_INVOCATIONS (see effectiveConcurrency), so a
 // app asking for more than the global cap never gets a per-app
 // semaphore larger than the global one — and the runtime's warm-pool bound,
 // also clipped to the cap, agrees with it.
 func (r *Runner) concurrencySems(fnName string, fnConcurrency int) (global *semaphore, fn *semaphore) {
-	// Global semaphore: normalized on construction / SetMaxConcurrency; it is
+	// Global semaphore: normalized on construction / SetMaxConcurrentInvocations; it is
 	// always non-nil in practice. Guard nil defensively (a zero-valued Runner
 	// in tests would read nil).
 	global = r.globalSem.Load()
 	if global == nil {
-		global = newSemaphore(DefaultMaxConcurrency)
+		global = newSemaphore(DefaultMaxConcurrentInvocations)
 	}
 	fnConcurrency = r.effectiveConcurrency(fnName, fnConcurrency)
 	r.fnSemsMu.Lock()
@@ -1205,22 +1205,22 @@ func (r *Runner) currentConcurrency(fnName string, fallback int) int {
 
 // effectiveConcurrency returns the per-app semaphore capacity for fnName:
 // its current resolved template concurrency clipped to the worker-global
-// MAX_CONCURRENCY. Clipping matters when the template asks for more than the
-// global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8): the per-app
+// MAX_CONCURRENT_INVOCATIONS. Clipping matters when the template asks for more than the
+// global cap (e.g. concurrency 15 with MAX_CONCURRENT_INVOCATIONS=8): the per-app
 // semaphore is then sized to the cap, matching the runtime's effective warm-pool
 // bound, so the pool and the semaphore never disagree. A zero/negative template
-// value falls back to app.DefaultConcurrency; a zero maxConcurrency (a
-// zero-valued Runner in tests) falls back to DefaultMaxConcurrency, never
-// "uncapped". The global value is read fresh, so a SetMaxConcurrency call is
+// value falls back to app.DefaultConcurrency; a zero maxConcurrentInvocations (a
+// zero-valued Runner in tests) falls back to DefaultMaxConcurrentInvocations, never
+// "uncapped". The global value is read fresh, so a SetMaxConcurrentInvocations call is
 // reflected on the next acquisition (which resizes the app's semaphore).
 func (r *Runner) effectiveConcurrency(fnName string, fallback int) int {
 	n := r.currentConcurrency(fnName, fallback)
 	if n < 1 {
 		n = app.DefaultConcurrency
 	}
-	limit := int(r.maxConcurrency.Load())
+	limit := int(r.maxConcurrentInvocations.Load())
 	if limit < 1 {
-		limit = DefaultMaxConcurrency
+		limit = DefaultMaxConcurrentInvocations
 	}
 	if n > limit {
 		return limit

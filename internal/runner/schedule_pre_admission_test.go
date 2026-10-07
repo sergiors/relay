@@ -107,7 +107,7 @@ func TestInvokeHandlerPreAdmissionRefreshUsesReloadedSchedule(t *testing.T) {
 		old := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
 		r := NewWithMetrics([]*PreparedApp{old}, testutil.DiscardLogger(), nil)
-		r.SetMaxConcurrency(1)
+		r.SetMaxConcurrentInvocations(1)
 		holdGlobalSlot(r)
 
 		prog := newFakeInvocationState()
@@ -168,7 +168,7 @@ func TestInvokeHandlerPreAdmissionRefreshAppRemovedObsolete(t *testing.T) {
 		pf := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
 		r := NewWithMetrics([]*PreparedApp{pf}, testutil.DiscardLogger(), nil)
-		r.SetMaxConcurrency(1)
+		r.SetMaxConcurrentInvocations(1)
 		holdGlobalSlot(r)
 
 		prog := newFakeInvocationState()
@@ -215,7 +215,7 @@ func TestInvokeHandlerPreAdmissionRefreshScheduleRemovedObsolete(t *testing.T) {
 		old := schedLeaseFn(t, "fn", "relay-app-fn:v1", exec,
 			sched("cleanup", "jobs.old", 30*time.Second, 4))
 		r := NewWithMetrics([]*PreparedApp{old}, testutil.DiscardLogger(), nil)
-		r.SetMaxConcurrency(1)
+		r.SetMaxConcurrentInvocations(1)
 		holdGlobalSlot(r)
 
 		prog := newFakeInvocationState()

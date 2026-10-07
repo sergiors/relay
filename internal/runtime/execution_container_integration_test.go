@@ -948,16 +948,16 @@ events:
 	}
 }
 
-// TestIntegrationPrepareClipsConcurrencyToGlobal drives the MAX_CONCURRENCY clip
+// TestIntegrationPrepareClipsConcurrencyToGlobal drives the MAX_CONCURRENT_INVOCATIONS clip
 // end to end against Docker: an app whose template asks for concurrency 15
 // under the default worker-global cap of 8 is prepared with an EFFECTIVE bound
 // of 8, and its warm pool's capacity gauge and live snapshot report 8 (not 15).
 // A later hot-swap to concurrency 4 re-clips to 4. This proves the effective
-// min(app concurrency, MAX_CONCURRENCY) — not the raw template value —
+// min(app concurrency, MAX_CONCURRENT_INVOCATIONS) — not the raw template value —
 // drives runtime pool capacity.
 func TestIntegrationPrepareClipsConcurrencyToGlobal(t *testing.T) {
 	testutil.RequireDocker(t)
-	// newMetricsManager builds via NewManager with no WithMaxConcurrency, so the
+	// newMetricsManager builds via NewManager with no WithMaxConcurrentInvocations, so the
 	// worker-global cap is the package default (8), mirroring config's default.
 	m, reg := newMetricsManager(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -979,7 +979,7 @@ events:
 		t.Fatalf("prepare concurrency 15: %v", err)
 	}
 	if p1.Concurrency != 8 {
-		t.Fatalf("prepared concurrency = %d, want 8 (clipped to MAX_CONCURRENCY)", p1.Concurrency)
+		t.Fatalf("prepared concurrency = %d, want 8 (clipped to MAX_CONCURRENT_INVOCATIONS)", p1.Concurrency)
 	}
 	// Warm the pool and verify the clipped bound, not 15.
 	execCtx := context.WithValue(context.Background(), runMetaKey{},

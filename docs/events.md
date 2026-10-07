@@ -167,8 +167,8 @@ sorted name order) and each app's rules in declaration order:
   turn.
 - **Across messages, invocations run concurrently.** Distinct events (and
   distinct workers) execute simultaneously, bounded by the worker-global
-  `MAX_CONCURRENCY` and the per-app effective concurrency
-  (`min(concurrency, MAX_CONCURRENCY)`).
+  `MAX_CONCURRENT_INVOCATIONS` and the per-app effective concurrency
+  (`min(concurrency, MAX_CONCURRENT_INVOCATIONS)`).
 - A failure in one matching handler does **not** prevent the remaining matched
   handlers of that message from running. Each matching invocation gets its own
   independent attempt and outcome.

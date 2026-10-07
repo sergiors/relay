@@ -124,12 +124,23 @@ const shutdownStepTimeout = 5 * time.Second
 // bounded, so it still terminates.
 const shutdownAggregateTimeout = 2 * time.Minute
 
-// effectiveMaxConcurrency mirrors the runner's SetMaxConcurrency normalization
-// (<1 → runner.DefaultMaxConcurrency) so the "Concurrency limits" log reflects
+// effectiveMaxConcurrentInvocations mirrors the runner's
+// SetMaxConcurrentInvocations normalization
+// (<1 → runner.DefaultMaxConcurrentInvocations) so the "Concurrency limits" log reflects
 // the value actually enforced regardless of the configured raw value.
-func effectiveMaxConcurrency(n int) int {
+func effectiveMaxConcurrentInvocations(n int) int {
 	if n < 1 {
-		return runner.DefaultMaxConcurrency
+		return runner.DefaultMaxConcurrentInvocations
+	}
+	return n
+}
+
+// effectiveMaxConcurrentBuilds mirrors the runtime's WithMaxConcurrentBuilds
+// normalization (<1 → runtime.DefaultMaxConcurrentBuilds) so the "Concurrency
+// limits" log reflects the value actually enforced.
+func effectiveMaxConcurrentBuilds(n int) int {
+	if n < 1 {
+		return runtime.DefaultMaxConcurrentBuilds
 	}
 	return n
 }
@@ -455,13 +466,21 @@ func Run(logger *slog.Logger) error {
 				metricsInstance,
 				cfg.ConsumerName,
 				runtime.WithWarmContainerIdleTimeout(cfg.WarmContainerIdleTimeout),
-				// The SAME MAX_CONCURRENCY the runner's global semaphore uses:
+				// The SAME MAX_CONCURRENT_INVOCATIONS the runner's global semaphore uses:
 				// the runtime clips each app's effective per-app
 				// concurrency to it, so a template asking for more than the
-				// worker-global cap (e.g. 15 with MAX_CONCURRENCY=8) warms,
+				// worker-global cap (e.g. 15 with MAX_CONCURRENT_INVOCATIONS=8) warms,
 				// reports, and admits only the cap's worth. It is startup
 				// configuration; a global change requires a worker restart.
-				runtime.WithMaxConcurrency(cfg.MaxConcurrency),
+				runtime.WithMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
+				// The per-worker cap (MAX_CONCURRENT_BUILDS) on runtime-backed
+				// image-preparation pipelines running concurrently. It bounds the
+				// whole preparation (source selection/snapshot, dependency
+				// snapshot, reuse probes, dependency and app image builds), so it
+				// is independent of invocation concurrency and of the local event
+				// buffer. It is startup configuration; a change requires a worker
+				// restart.
+				runtime.WithMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
 				// The worker-global Docker networks (NETWORKS) every execution
 				// container joins at create time. They are verified by the next
 				// preflight step before any app is prepared or any container
@@ -815,9 +834,9 @@ func Run(logger *slog.Logger) error {
 	// (app.MaxTimeout). Defense in depth: a misconfigured or hot-swapped
 	// template can never run a handler past the cap.
 	runWorker.SetMaxHandlerTimeout(stream.MaxRuleTimeout)
-	// Bound the number of invocations executing concurrently (MAX_CONCURRENCY);
+	// Bound the number of invocations executing concurrently (MAX_CONCURRENT_INVOCATIONS);
 	// a value < 1 falls back to the runner's default.
-	runWorker.SetMaxConcurrency(cfg.MaxConcurrency)
+	runWorker.SetMaxConcurrentInvocations(cfg.MaxConcurrentInvocations)
 
 	// Expose the live runner to the manual-invocation socket command. It was
 	// wired after the socket was created (the runner is built later, once images
@@ -1026,7 +1045,8 @@ func Run(logger *slog.Logger) error {
 
 	logger.Info(
 		"Concurrency limits",
-		"max_concurrency", effectiveMaxConcurrency(cfg.MaxConcurrency),
+		"max_concurrent_invocations", effectiveMaxConcurrentInvocations(cfg.MaxConcurrentInvocations),
+		"max_concurrent_builds", effectiveMaxConcurrentBuilds(cfg.MaxConcurrentBuilds),
 		"max_buffered_events", effectiveMaxBuffered(cfg.MaxBufferedEvents),
 		"max_event_bytes", effectiveMaxEventBytes(cfg.MaxEventBytes),
 	)

@@ -57,7 +57,7 @@ func (c *capturingContainer) lastEnv() map[string]string {
 // low-cardinality attributes (app/image) only.
 func TestExecuteDynamicEnvNotAttachedToSpans(t *testing.T) {
 	rec := withSpanRecorder(t)
-	m := &Manager{maxConcurrency: 4}
+	m := &Manager{maxConcurrentInvocations: 4}
 	m.containers = newContainerCache()
 	c := &capturingContainer{}
 	m.startContainerFn = func(_ context.Context, _ string, _ resolvedImage, _ []string, _ app.ResourceLimits, _ RunMeta) (reusableContainer, error) {
@@ -88,7 +88,7 @@ func TestExecuteDynamicEnvNotAttachedToSpans(t *testing.T) {
 // frame's env map. It drives the real Manager.Execute path with the injectable
 // start seam and a frame-capturing container, so no Docker daemon is needed.
 func TestExecuteContainerEnvIsPlanOnlyDynamicEnvIsFrameOnly(t *testing.T) {
-	m := &Manager{maxConcurrency: 4}
+	m := &Manager{maxConcurrentInvocations: 4}
 	m.containers = newContainerCache()
 
 	const secretCanary = "CANARY-SECRET-VALUE-9b21"
@@ -141,7 +141,7 @@ func TestExecuteContainerEnvIsPlanOnlyDynamicEnvIsFrameOnly(t *testing.T) {
 // dynamic value is reflected in the next request frame: the frame is rebuilt per
 // invocation from the caller's extraEnv, so no value is cached in the container.
 func TestExecuteDynamicEnvChangesPerInvocationFrame(t *testing.T) {
-	m := &Manager{maxConcurrency: 4}
+	m := &Manager{maxConcurrentInvocations: 4}
 	m.containers = newContainerCache()
 
 	c := &capturingContainer{}

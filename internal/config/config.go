@@ -67,11 +67,22 @@ type Config struct {
 	// LogLevel is the slog level selected by LOG_LEVEL (default Info). It is
 	// used by cmd/main.go to build the process logger after config.Load.
 	LogLevel slog.Level
-	// MaxConcurrency is the MAX_CONCURRENCY value (default 8): the total number
-	// of app invocations executing concurrently in this single Relay
-	// worker. Values below the default fall back in the runner (see
-	// runner.SetMaxConcurrency); it is always positive after Load.
-	MaxConcurrency int
+	// MaxConcurrentInvocations is the MAX_CONCURRENT_INVOCATIONS value (default
+	// 8): the total number of app invocations executing concurrently in this
+	// single Relay worker. Values below the default fall back in the runner (see
+	// runner.SetMaxConcurrentInvocations); it is always positive after Load.
+	MaxConcurrentInvocations int
+	// MaxConcurrentBuilds is the MAX_CONCURRENT_BUILDS value (default 2): the
+	// cap on runtime-backed image-preparation pipelines running concurrently in
+	// this single Relay worker. One preparation pipeline (source selection and
+	// snapshot, dependency snapshot, dependency image build, app image build)
+	// occupies one slot for its WHOLE duration, so a preparation's dependency
+	// and app sub-builds are sequential within one permit. It is INDEPENDENT of
+	// MaxConcurrentInvocations and of MAX_BUFFERED_EVENTS, and it is not a
+	// host-wide resource quota: each worker enforces its own, so a deployment of
+	// N workers can run up to N * MaxConcurrentBuilds preparations. It is always
+	// positive after Load.
+	MaxConcurrentBuilds int
 	// MaxBufferedEvents is the MAX_BUFFERED_EVENTS value (default 16): the
 	// number of events already read from Redis and still held locally by this
 	// worker before they complete/ACK. It bounds the local buffer so the
@@ -133,18 +144,20 @@ type Config struct {
 	// evicts it. Unset/empty defaults to DefaultWarmContainerIdleTimeout (5m);
 	// it must be a positive Go duration (e.g. "5m", "90s") — an invalid or
 	// non-positive value is a fatal configuration error, matching
-	// MAX_CONCURRENCY rather than REDIS_STREAM_RETENTION's log-and-disable
+	// MAX_CONCURRENT_INVOCATIONS rather than REDIS_STREAM_RETENTION's log-and-disable
 	// style (a typo in a container-warmth knob must not silently change runtime
 	// behavior). It is always positive after Load.
 	WarmContainerIdleTimeout time.Duration
 }
 
-// Default max-concurrency and max-buffered-events values. The runner and stream
-// layers keep their own copies of these constants (a leaf package cannot import
-// config); this package owns the env-facing defaults.
+// Default max-concurrency, max-build-concurrency, and max-buffered-events
+// values. The runner and runtime layers keep their own copies of these
+// constants (a leaf package cannot import config); this package owns the
+// env-facing defaults.
 const (
-	DefaultMaxConcurrency    = 8
-	DefaultMaxBufferedEvents = 16
+	DefaultMaxConcurrentInvocations = 8
+	DefaultMaxConcurrentBuilds      = 2
+	DefaultMaxBufferedEvents        = 16
 	// DefaultMaxEventBytes is the byte cap applied to a message's raw `event`
 	// value when MAX_EVENT_BYTES is unset/empty. MaxEventBytesLimit is the hard
 	// ceiling: a configured or default value above it is rejected, so the cap
@@ -207,8 +220,8 @@ const (
 // DefaultStreamRetention (24h), REDIS_DLQ_RETENTION to DefaultDLQRetention (7
 // days), and REDIS_INVOCATION_RETENTION to DefaultInvocationRetention (48h) when
 // UNSET, while an explicitly empty value disables the respective retention (0).
-// MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
-// default to 8 and 16 respectively (see ParsePositiveInt); MAX_EVENT_BYTES
+// MAX_CONCURRENT_INVOCATIONS and MAX_CONCURRENT_BUILDS default to 8 and 2, and
+// MAX_BUFFERED_EVENTS to 16 (see ParsePositiveInt); MAX_EVENT_BYTES
 // defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
 // an invalid (zero, negative, non-integer, or above-limit) value is a returned
 // configuration error. The retention windows instead log-and-disable rather
@@ -256,14 +269,23 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.LogLevel = level
 
-	maxConcurrency, err := loadPositiveInt(
-		"MAX_CONCURRENCY",
-		getEnv("MAX_CONCURRENCY", strconv.Itoa(DefaultMaxConcurrency)),
+	maxInvocations, err := loadPositiveInt(
+		"MAX_CONCURRENT_INVOCATIONS",
+		getEnv("MAX_CONCURRENT_INVOCATIONS", strconv.Itoa(DefaultMaxConcurrentInvocations)),
 	)
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.MaxConcurrency = maxConcurrency
+	cfg.MaxConcurrentInvocations = maxInvocations
+
+	maxBuilds, err := loadPositiveInt(
+		"MAX_CONCURRENT_BUILDS",
+		getEnv("MAX_CONCURRENT_BUILDS", strconv.Itoa(DefaultMaxConcurrentBuilds)),
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.MaxConcurrentBuilds = maxBuilds
 
 	maxBufferedEvents, err := loadPositiveInt(
 		"MAX_BUFFERED_EVENTS",

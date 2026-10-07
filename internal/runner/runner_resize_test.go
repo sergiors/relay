@@ -18,7 +18,7 @@ import (
 func TestRunnerPerAppSemaphoreResizedLive(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 4, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(16)
+	r.SetMaxConcurrentInvocations(16)
 
 	// Warm the per-app semaphore at capacity 4.
 	runConcurrent(t, r, 8)
@@ -58,7 +58,7 @@ func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(16)
+	r.SetMaxConcurrentInvocations(16)
 
 	firstDone := make(chan struct{})
 	go func() {
@@ -100,7 +100,7 @@ func TestRunnerSemaphoreResizeDoesNotStrandInFlight(t *testing.T) {
 func TestRunnerRemoveAppSemaphore(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 20 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 5, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(16)
+	r.SetMaxConcurrentInvocations(16)
 
 	// Warm the semaphore at 5.
 	runConcurrent(t, r, 5)
@@ -129,7 +129,7 @@ func TestRunnerRemoveAppSemaphore(t *testing.T) {
 func TestRunnerPerAppSemaphoreRaceSafety(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 2, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(16)
+	r.SetMaxConcurrentInvocations(16)
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -194,20 +194,20 @@ func TestRunnerSemaphoreResizeIsRegistryAuthoritative(t *testing.T) {
 }
 
 // TestRunnerPerAppSemaphoreClipsToGlobal proves the per-app semaphore
-// is sized to min(template concurrency, MAX_CONCURRENCY): an app asking for
+// is sized to min(template concurrency, MAX_CONCURRENT_INVOCATIONS): an app asking for
 // 15 under a global cap of 8 gets a capacity-8 semaphore (not 15), matching the
 // runtime's clipped warm-pool bound. A later live reconcile to 4 resizes it to
-// 4. This is the runner half of "app concurrency 15 with MAX_CONCURRENCY=8
+// 4. This is the runner half of "app concurrency 15 with MAX_CONCURRENT_INVOCATIONS=8
 // => effective live capacity 8".
 func TestRunnerPerAppSemaphoreClipsToGlobal(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 40 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 15, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(8)
+	r.SetMaxConcurrentInvocations(8)
 
 	// The installed semaphore capacity is the effective bound, not the raw 15.
 	_, s := r.concurrencySems("f", 15)
 	if s.capacity != 8 {
-		t.Fatalf("per-function semaphore capacity = %d, want 8 (clipped to MAX_CONCURRENCY)", s.capacity)
+		t.Fatalf("per-function semaphore capacity = %d, want 8 (clipped to MAX_CONCURRENT_INVOCATIONS)", s.capacity)
 	}
 
 	// Admission agrees: 16 concurrent Handles never exceed the global cap of 8.
@@ -232,10 +232,10 @@ func TestRunnerPerAppSemaphoreClipsToGlobal(t *testing.T) {
 // TestRunnerEffectiveConcurrencyClipsAndDefaults pins the clip rule directly: a
 // value above the global cap is clipped, one below is untouched, a
 // zero/negative template value falls back to the app default, and a
-// zero-valued Runner's global falls back to DefaultMaxConcurrency.
+// zero-valued Runner's global falls back to DefaultMaxConcurrentInvocations.
 func TestRunnerEffectiveConcurrencyClipsAndDefaults(t *testing.T) {
 	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(8)
+	r.SetMaxConcurrentInvocations(8)
 
 	if got := r.effectiveConcurrency("abs", 15); got != 8 {
 		t.Fatalf("effectiveConcurrency(15) = %d, want 8", got)
@@ -248,8 +248,8 @@ func TestRunnerEffectiveConcurrencyClipsAndDefaults(t *testing.T) {
 	}
 
 	var zero Runner
-	if got := zero.effectiveConcurrency("abs", 15); got != DefaultMaxConcurrency {
-		t.Fatalf("zero Runner effectiveConcurrency(15) = %d, want default %d", got, DefaultMaxConcurrency)
+	if got := zero.effectiveConcurrency("abs", 15); got != DefaultMaxConcurrentInvocations {
+		t.Fatalf("zero Runner effectiveConcurrency(15) = %d, want default %d", got, DefaultMaxConcurrentInvocations)
 	}
 }
 

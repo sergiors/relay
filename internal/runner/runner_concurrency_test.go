@@ -109,12 +109,12 @@ func TestRunnerGlobalConcurrencyDefault(t *testing.T) {
 	}
 }
 
-// TestRunnerGlobalConcurrencyExplicit proves SetMaxConcurrency(2) caps global
+// TestRunnerGlobalConcurrencyExplicit proves SetMaxConcurrentInvocations(2) caps global
 // concurrency.
 func TestRunnerGlobalConcurrencyExplicit(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(2)
+	r.SetMaxConcurrentInvocations(2)
 
 	runConcurrent(t, r, 12)
 
@@ -133,7 +133,7 @@ func TestRunnerPerAppDefault(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 50 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 0, exec)}, testutil.DiscardLogger(), nil)
 	// Raise the global cap so the per-app limit is the binding one.
-	r.SetMaxConcurrency(16)
+	r.SetMaxConcurrentInvocations(16)
 
 	runConcurrent(t, r, 16)
 
@@ -150,7 +150,7 @@ func TestRunnerPerAppDefault(t *testing.T) {
 func TestRunnerPerAppExplicit1(t *testing.T) {
 	exec := &concurrencyTrackingExecutor{blockDur: 30 * time.Millisecond}
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(8)
+	r.SetMaxConcurrentInvocations(8)
 
 	runConcurrent(t, r, 8)
 
@@ -172,7 +172,7 @@ func TestRunnerGlobalSharedAcrossApps(t *testing.T) {
 		fnWithConcurrency(t, "a", 8, shared),
 		fnWithConcurrency(t, "b", 8, shared),
 	}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(2)
+	r.SetMaxConcurrentInvocations(2)
 
 	runTwo(t, r, 12)
 
@@ -197,7 +197,7 @@ func TestRunnerPerAppIndependent(t *testing.T) {
 		fnWithConcurrency(t, "a", 2, shared),
 		fnWithConcurrency(t, "b", 2, shared),
 	}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(8)
+	r.SetMaxConcurrentInvocations(8)
 
 	runTwo(t, r, 8)
 
@@ -219,7 +219,7 @@ func TestRunnerSlotTimeoutLeavesPending(t *testing.T) {
 	release := make(chan struct{})
 	holding := newBlockingExecutor(release)
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, holding)}, testutil.DiscardLogger(), nil)
-	r.SetMaxConcurrency(1)
+	r.SetMaxConcurrentInvocations(1)
 	// Test override (package-internal field): keep the wait short so the timeout
 	// path is exercised quickly without a 30s wait.
 	r.slotWait = 50 * time.Millisecond
@@ -263,7 +263,7 @@ func TestRunnerConcurrencyWaitsCounter(t *testing.T) {
 	release := make(chan struct{})
 	exec := newBlockingExecutor(release)
 	r := NewWithMetrics([]*PreparedApp{fnWithConcurrency(t, "f", 1, exec)}, testutil.DiscardLogger(), m)
-	r.SetMaxConcurrency(1)
+	r.SetMaxConcurrentInvocations(1)
 	r.slotWait = 50 * time.Millisecond
 
 	// First invocation holds the sole slot.

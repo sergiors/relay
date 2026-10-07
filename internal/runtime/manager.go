@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/moby/moby/client"
@@ -53,13 +54,25 @@ func engineFor(spec plan.Spec) (interface {
 // config); the worker always passes config's resolved value explicitly.
 const DefaultWarmContainerIdleTimeout = 5 * time.Minute
 
-// DefaultMaxConcurrency is the worker-global concurrency cap applied by
-// NewManager when no WithMaxConcurrency option is given. It mirrors
-// config.DefaultMaxConcurrency and runner.DefaultMaxConcurrency (this leaf
+// DefaultMaxConcurrentInvocations is the worker-global concurrency cap applied by
+// NewManager when no WithMaxConcurrentInvocations option is given. It mirrors
+// config.DefaultMaxConcurrentInvocations and runner.DefaultMaxConcurrentInvocations (this leaf
 // package cannot import either); the worker always passes config's resolved
 // value explicitly, and a Manager constructed directly by tests leaves
-// maxConcurrency zero (treated as this default, never "uncapped").
-const DefaultMaxConcurrency = 8
+// maxConcurrentInvocations zero (treated as this default, never "uncapped").
+const DefaultMaxConcurrentInvocations = 8
+
+// DefaultMaxConcurrentBuilds is the cap on runtime-backed image-preparation
+// pipelines running concurrently in this worker, applied by NewManager when no
+// WithMaxConcurrentBuilds option is given. It mirrors
+// config.DefaultMaxConcurrentBuilds (this leaf package cannot import config);
+// the worker always passes config's resolved value explicitly, and a Manager
+// constructed directly by tests leaves maxConcurrentBuilds zero (treated as
+// this default, never unbounded). The cap is per Manager (one per worker), so
+// it bounds aggregate preparation — source selection/snapshot, dependency
+// snapshot, reuse probes, dependency image build, and app image build — and is
+// independent of the invocation-concurrency cap.
+const DefaultMaxConcurrentBuilds = 2
 
 // managerPingTimeout bounds the startup Docker daemon ping. The ping is rooted
 // in the manager lifecycle (the worker's signal context) so it is cancelled at
@@ -113,19 +126,39 @@ type Manager struct {
 	// same. The startup orphan sweep uses it to distinguish this worker's
 	// stalled containers from those of every other worker sharing the daemon.
 	hostname string
-	// maxConcurrency is the worker-global concurrency cap (MAX_CONCURRENCY): the
+	// maxConcurrentInvocations is the worker-global concurrency cap (MAX_CONCURRENT_INVOCATIONS): the
 	// SAME value the runner uses for its global semaphore. It clips every
 	// app's effective per-app concurrency to
-	// min(template concurrency, maxConcurrency) in Prepare/Execute, so the warm
+	// min(template concurrency, maxConcurrentInvocations) in Prepare/Execute, so the warm
 	// pool, its capacity gauge, PoolSnapshot/the CLI, and the runner's
 	// per-app semaphore all agree on one effective bound. It is set once at
-	// construction (WithMaxConcurrency; the worker wires config's resolved
-	// value) and read without the lock: MAX_CONCURRENCY is startup
+	// construction (WithMaxConcurrentInvocations; the worker wires config's resolved
+	// value) and read without the lock: MAX_CONCURRENT_INVOCATIONS is startup
 	// configuration and is NOT hot-reloadable, so a global change requires a
-	// worker restart. A zero value falls back to DefaultMaxConcurrency, never
+	// worker restart. A zero value falls back to DefaultMaxConcurrentInvocations, never
 	// "uncapped" (a Manager constructed directly by tests behaves like the
 	// default runner).
-	maxConcurrency int
+	maxConcurrentInvocations int
+	// maxConcurrentBuilds is the per-worker cap (MAX_CONCURRENT_BUILDS) on
+	// runtime-backed image-preparation pipelines running concurrently: one
+	// permit is held for a preparation's WHOLE duration — source selection and
+	// snapshot, dependency snapshot, reuse probes, dependency image build, and
+	// app image build — so dependency and app sub-builds are sequential within
+	// one permit. It is set once at construction (WithMaxConcurrentBuilds; the
+	// worker wires config's resolved value) and read without the lock: it is
+	// startup configuration and is NOT hot-reloadable. A zero value falls back
+	// to DefaultMaxConcurrentBuilds, never "unbounded". The limiter itself is
+	// built lazily and race-safely (see buildLimiterFor) so a Manager
+	// constructed directly by tests is bounded too.
+	maxConcurrentBuilds int
+	// buildLimit is the per-Manager preparation semaphore. It is created by
+	// NewManager; a Manager constructed directly by tests lazily initializes it
+	// on first use (buildLimiterFor), so every preparation is bounded even when
+	// the option was never supplied. Capacity is immutable after creation. It is
+	// an atomic pointer so the lazy fallback can be read concurrently with a
+	// racing initialization without a data race.
+	buildLimit     atomic.Pointer[buildLimiter]
+	buildLimitInit sync.Once
 	// networks is the worker-global Docker network set (NETWORKS) every
 	// execution container this manager creates joins at create time. It is set
 	// once at construction (WithNetworks; the worker wires config's resolved
@@ -227,6 +260,13 @@ type Manager struct {
 	// released when Prepare returns — including on the cancellation path. It is
 	// read and never mutated after construction.
 	afterSourceSnapshot func(*app.SourceSnapshot)
+	// afterBuildPermit is the deterministic seam immediately after a
+	// runtime-backed prepare acquires its preparation permit and before any
+	// source selection, snapshot, or build work. It is nil in production and
+	// never called then. A test uses it to hold a preparation inside the
+	// bounded section (tracking how many run concurrently) and to prove the
+	// per-worker build cap is enforced without sleeps.
+	afterBuildPermit func()
 }
 
 // ManagerOption tunes NewManager. Options keep the three-argument constructor
@@ -239,10 +279,14 @@ type managerOptions struct {
 	// idleTimeout is the warm-container idle-eviction window. Zero means the
 	// package default (DefaultWarmContainerIdleTimeout).
 	idleTimeout time.Duration
-	// maxConcurrency is the worker-global concurrency cap. Zero means the
-	// package default (DefaultMaxConcurrency), matching the runner's
+	// maxConcurrentInvocations is the worker-global concurrency cap. Zero means the
+	// package default (DefaultMaxConcurrentInvocations), matching the runner's
 	// normalization.
-	maxConcurrency int
+	maxConcurrentInvocations int
+	// maxConcurrentBuilds is the cap on concurrent runtime-backed preparation
+	// pipelines. Zero means the package default (DefaultMaxConcurrentBuilds),
+	// never "unbounded".
+	maxConcurrentBuilds int
 	// networks is the worker-global Docker network set every execution container
 	// joins at create time (see WithNetworks). Nil/empty means no extra
 	// networks (default bridge behavior).
@@ -272,16 +316,32 @@ func WithWarmContainerIdleTimeout(idleTimeout time.Duration) ManagerOption {
 	return func(o *managerOptions) { o.idleTimeout = idleTimeout }
 }
 
-// WithMaxConcurrency sets the worker-global concurrency cap (MAX_CONCURRENCY).
-// It is the SAME value the worker passes to runner.SetMaxConcurrency, so the
+// WithMaxConcurrentInvocations sets the worker-global concurrency cap (MAX_CONCURRENT_INVOCATIONS).
+// It is the SAME value the worker passes to runner.SetMaxConcurrentInvocations, so the
 // warm pool's effective bound and the runner's per-app semaphore agree.
-// A non-positive value is treated as DefaultMaxConcurrency (never "uncapped"),
+// A non-positive value is treated as DefaultMaxConcurrentInvocations (never "uncapped"),
 // matching the runner's normalization. It is startup configuration: changing it
 // requires a worker restart (there is no live setter; the runner's global
 // semaphore is likewise built once at startup). The worker wires it from
-// config; a direct NewManager caller that omits it gets DefaultMaxConcurrency.
-func WithMaxConcurrency(n int) ManagerOption {
-	return func(o *managerOptions) { o.maxConcurrency = n }
+// config; a direct NewManager caller that omits it gets DefaultMaxConcurrentInvocations.
+func WithMaxConcurrentInvocations(n int) ManagerOption {
+	return func(o *managerOptions) { o.maxConcurrentInvocations = n }
+}
+
+// WithMaxConcurrentBuilds sets the per-worker cap (MAX_CONCURRENT_BUILDS) on
+// runtime-backed image-preparation pipelines running concurrently. A permit is
+// held for a preparation's whole duration (source selection and snapshot,
+// dependency snapshot, reuse probes, dependency image build, and app image
+// build), so the cap bounds aggregate preparation, not just each Docker build
+// call. It is independent of the invocation-concurrency cap and of the local
+// event buffer, and it is NOT a host-wide resource quota: each worker enforces
+// its own, so N workers may run up to N * capacity preparations. A
+// non-positive value is treated as DefaultMaxConcurrentBuilds (never
+// "unbounded"). It is startup configuration: changing it requires a worker
+// restart (there is no live setter). The worker wires it from config; a direct
+// NewManager caller that omits it gets DefaultMaxConcurrentBuilds.
+func WithMaxConcurrentBuilds(n int) ManagerOption {
+	return func(o *managerOptions) { o.maxConcurrentBuilds = n }
 }
 
 // WithNetworks sets the worker-global Docker network set (NETWORKS) that every
@@ -385,17 +445,23 @@ func NewManager(
 		return nil, fmt.Errorf("cannot connect to Docker daemon: %w", pingErr)
 	}
 	mgr := &Manager{
-		log:            logger,
-		cli:            cli,
-		metrics:        registry,
-		hostname:       hostname,
-		maxConcurrency: resolved.maxConcurrency,
-		networks:       resolved.networks,
-		done:           make(chan struct{}),
-		maintDone:      make(chan struct{}),
-		now:            resolved.now,
-		pullChecks:     map[string]time.Time{},
+		log:                      logger,
+		cli:                      cli,
+		metrics:                  registry,
+		hostname:                 hostname,
+		maxConcurrentInvocations: resolved.maxConcurrentInvocations,
+		maxConcurrentBuilds:      resolved.maxConcurrentBuilds,
+		networks:                 resolved.networks,
+		done:                     make(chan struct{}),
+		maintDone:                make(chan struct{}),
+		now:                      resolved.now,
+		pullChecks:               map[string]time.Time{},
 	}
+	// Construct the preparation limiter now with the resolved capacity, so the
+	// lazy fallback in buildLimiterFor is never needed for a NewManager-built
+	// Manager. A direct-construction Manager (tests) builds an equivalent one on
+	// first use. Capacity is immutable after construction.
+	mgr.buildLimit.Store(newBuildLimiter(resolved.maxConcurrentBuilds))
 	if mgr.now == nil {
 		mgr.now = time.Now
 	}
@@ -467,10 +533,87 @@ func resolveManagerOptions(opts []ManagerOption) managerOptions {
 	if resolved.idleTimeout <= 0 {
 		resolved.idleTimeout = DefaultWarmContainerIdleTimeout
 	}
-	if resolved.maxConcurrency < 1 {
-		resolved.maxConcurrency = DefaultMaxConcurrency
+	if resolved.maxConcurrentInvocations < 1 {
+		resolved.maxConcurrentInvocations = DefaultMaxConcurrentInvocations
+	}
+	if resolved.maxConcurrentBuilds < 1 {
+		resolved.maxConcurrentBuilds = DefaultMaxConcurrentBuilds
 	}
 	return resolved
+}
+
+// buildLimiter is the per-Manager counting semaphore that bounds how many
+// runtime-backed image-preparation pipelines run concurrently. It is a plain
+// buffered channel of permits, mirroring the runner's invocation semaphore: a
+// preparation holds one permit for its WHOLE duration (source selection and
+// snapshot, dependency snapshot, reuse probes, dependency image build, and app
+// image build), so the cap bounds aggregate preparation and dependency/app
+// sub-builds are sequential within one permit. Capacity is immutable after
+// construction; a Manager owns exactly one limiter, so the bound is per worker,
+// never global across workers.
+type buildLimiter struct {
+	permits chan struct{}
+}
+
+// newBuildLimiter returns a limiter with capacity n. The caller normalizes n to
+// be positive (DefaultMaxConcurrentBuilds at minimum), so the channel is never
+// zero-capacity/unbounded.
+func newBuildLimiter(n int) *buildLimiter {
+	return &buildLimiter{permits: make(chan struct{}, n)}
+}
+
+// acquire takes one preparation permit, blocking until a permit frees or ctx is
+// done. On success the caller MUST release exactly once. On cancellation it
+// returns ctx.Err() and holds no permit, so a cancelled preparation never enters
+// the bounded section and never needs a release.
+//
+// Cancellation is preferred even when a permit is free: the pre-select ctx.Err
+// check and the post-send re-check make a cancelled waiter lose deterministically
+// instead of letting select choose pseudo-randomly between a ready permit and a
+// ready ctx.Done. The re-check hands the just-taken permit straight back, so a
+// cancellation racing a freed slot still leaks no capacity.
+func (l *buildLimiter) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case l.permits <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			// Both arms were ready and select picked the permit. Release it so
+			// the cancellation path holds no slot and the caller never starts.
+			l.release()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// release returns one preparation permit. It must be called exactly once per
+// successful acquire.
+func (l *buildLimiter) release() {
+	<-l.permits
+}
+
+// buildLimiterFor returns the Manager's preparation limiter, lazily creating a
+// default-capacity one only for a Manager constructed directly (tests) that
+// never went through NewManager. The sync.Once makes the fallback race-safe, so
+// concurrent preparations cannot each build their own limiter, and the limiter
+// is stored in an atomic pointer so a racing initialization can also be read
+// safely. Capacity is immutable once created.
+func (m *Manager) buildLimiterFor() *buildLimiter {
+	if l := m.buildLimit.Load(); l != nil {
+		return l
+	}
+	m.buildLimitInit.Do(func() {
+		capacity := m.maxConcurrentBuilds
+		if capacity < 1 {
+			capacity = DefaultMaxConcurrentBuilds
+		}
+		m.buildLimit.Store(newBuildLimiter(capacity))
+	})
+	return m.buildLimit.Load()
 }
 
 // maintenanceInterval derives the single maintenance-loop tick from the idle
@@ -690,12 +833,12 @@ type Prepared struct {
 	Env []string
 	// Concurrency is the app's EFFECTIVE per-app concurrency: the
 	// template's resolved `concurrency` clipped to the worker-global
-	// MAX_CONCURRENCY (see Manager.effectiveConcurrency). It is the bound on the
+	// MAX_CONCURRENT_INVOCATIONS (see Manager.effectiveConcurrency). It is the bound on the
 	// app's warm container pool: at most this many containers are kept and
 	// leased concurrently. It intentionally matches the runner's per-app
 	// semaphore (also clipped to the global cap) so the pool is not a second
 	// limiter in the runner path; direct Execute callers that bypass the runner
-	// are bounded by it. Because MAX_CONCURRENCY is startup configuration, a
+	// are bounded by it. Because MAX_CONCURRENT_INVOCATIONS is startup configuration, a
 	// global change requires a worker restart; a hot-swapped template
 	// `concurrency` is re-clipped live on each successful Prepare.
 	Concurrency int
@@ -867,6 +1010,31 @@ func (m *Manager) prepare(
 		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
 		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
 		return prepared, nil
+	}
+
+	// Acquire one preparation permit BEFORE any runtime-backed disk/metadata
+	// work, so the per-worker cap (MAX_CONCURRENT_BUILDS) bounds the WHOLE
+	// pipeline that follows — source selection (when resolved here), the source
+	// snapshot, the dependency snapshot, the reuse probes, the dependency image
+	// build, and the app image build — not merely the Docker call. Dependency
+	// and app sub-builds are therefore sequential within one permit. The wait
+	// selects on the caller's ctx and returns ctx.Err() WITHOUT taking the
+	// snapshot, probing, building, or logging when cancelled; the build itself
+	// stays independently bounded by the manager lifecycle once the permit is
+	// held, since the limiter capacity is immutable and the permits channel is
+	// never closed. The deferred release runs on every return, failure, and
+	// panic. The limiter is per Manager (one per worker), so this bounds this
+	// worker's preparations only.
+	limit := m.buildLimiterFor()
+	if err := limit.acquire(ctx); err != nil {
+		return nil, fmt.Errorf("app %q: wait for build slot: %w", fn.Name, err)
+	}
+	defer limit.release()
+	if m.afterBuildPermit != nil {
+		// Test-only seam: fires immediately after the permit is acquired and
+		// before any source/build work, so a test can hold a preparation inside
+		// the bounded section without sleeps. Nil in production.
+		m.afterBuildPermit()
 	}
 
 	// Resolve the source-selection policy ONCE. The policy (the app's
@@ -1213,8 +1381,8 @@ func resolveConcurrency(fn app.App) int {
 
 // effectiveConcurrency returns the app's EFFECTIVE per-app
 // concurrency for the warm container pool: the template's resolved concurrency
-// clipped to the worker-global MAX_CONCURRENCY. When the template asks for more
-// than the global cap (e.g. concurrency 15 with MAX_CONCURRENCY=8), the pool
+// clipped to the worker-global MAX_CONCURRENT_INVOCATIONS. When the template asks for more
+// than the global cap (e.g. concurrency 15 with MAX_CONCURRENT_INVOCATIONS=8), the pool
 // warms, reports, and admits only the cap's worth — the effective intersection
 // of the two limits the README documents, matching the runner's clipped
 // per-app semaphore.
@@ -1223,9 +1391,9 @@ func (m *Manager) effectiveConcurrency(fn app.App) int {
 }
 
 // clipConcurrency clips an already-resolved per-app concurrency to the
-// worker-global MAX_CONCURRENCY. A value below 1 is treated as
-// app.DefaultConcurrency first, and a zero Manager.maxConcurrency (a
-// Manager constructed directly by tests) is treated as DefaultMaxConcurrency,
+// worker-global MAX_CONCURRENT_INVOCATIONS. A value below 1 is treated as
+// app.DefaultConcurrency first, and a zero Manager.maxConcurrentInvocations (a
+// Manager constructed directly by tests) is treated as DefaultMaxConcurrentInvocations,
 // never "uncapped". It is the single clipping rule applied by Prepare and
 // Execute, so a hand-built Prepared (direct/integration callers) can never
 // warm a pool larger than the worker-global cap.
@@ -1233,9 +1401,9 @@ func (m *Manager) clipConcurrency(n int) int {
 	if n < 1 {
 		n = app.DefaultConcurrency
 	}
-	limit := m.maxConcurrency
+	limit := m.maxConcurrentInvocations
 	if limit < 1 {
-		limit = DefaultMaxConcurrency
+		limit = DefaultMaxConcurrentInvocations
 	}
 	if n > limit {
 		return limit
@@ -1356,7 +1524,7 @@ func (m *Manager) ensureDependencyImage(
 // error, image change). A handler failure (ok:false) does NOT discard it.
 //
 // The pool's bound is Prepared.Concurrency (the effective value, already
-// clipped to MAX_CONCURRENCY by Prepare and re-clipped here), the same value
+// clipped to MAX_CONCURRENT_INVOCATIONS by Prepare and re-clipped here), the same value
 // the runner's per-app semaphore uses, so in the runner path the pool
 // never blocks (the semaphore already admits at most that many concurrent
 // calls). Direct callers that bypass the runner are bounded by the pool itself;
@@ -1465,7 +1633,7 @@ func (m *Manager) Execute(
 		return m.startContainer(ctx, prepared.Name, img, prepared.Env, limits, idMeta)
 	}
 	// Prepared.Concurrency is populated by Prepare as the effective bound
-	// (template concurrency clipped to MAX_CONCURRENCY). A hand-built Prepared
+	// (template concurrency clipped to MAX_CONCURRENT_INVOCATIONS). A hand-built Prepared
 	// (direct/integration callers) may carry the raw template value or leave it
 	// zero, so clip it here too: the pool bound can never exceed the
 	// worker-global cap, and the same bound the runner's clipped per-app
