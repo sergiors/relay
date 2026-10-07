@@ -24,6 +24,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/app"
 	"relay/internal/config"
 	"relay/internal/stream"
 	"relay/internal/testutil"
@@ -585,4 +586,93 @@ func TestIntegrationMixedFanOutAvailableCompletesUnavailableStaysPending(t *test
 	if got := availableExec.count(); got != 1 {
 		t.Fatalf("completed available invocation must not re-run: calls = %d, want 1", got)
 	}
+}
+
+// TestIntegrationPendingDesiredRuleStaysPendingThenRuns is the end-to-end
+// regression for the new-app / new-rule event-loss fix. A brand-new app is
+// represented in the registry ONLY by its PENDING desired template (no active,
+// runnable generation) — exactly the state during its first image build. A
+// message matching a pending rule must:
+//
+//   - be delivered into the PEL and STAY pending across reclaim cycles (never
+//     ACKed as unmatched, never DLQ'd) while the generation is pending;
+//   - not execute any handler while pending;
+//   - once the generation becomes ACTIVE (the pending entry is replaced by a
+//     runnable app with the SAME name under the SAME invocation identity), a
+//     reclaim redelivery must run the handler, ACK the message, and clear the
+//     invocation-state key.
+func TestIntegrationPendingDesiredRuleStaysPendingThenRuns(t *testing.T) {
+	_ = redisAvailable(t)
+	recovered := &countingExecutor{}
+	r := NewWithMetrics(nil, testutil.DiscardLogger(), nil)
+	// Represent the app as pending-only: the desired rules are matchable but not
+	// runnable.
+	r.Registry().SetPending("pending-app", app.App{
+		Name:     "pending-app",
+		Template: mustTemplateForIntegration(t, pendingIntegrationTemplate),
+	})
+	e := newEventEnv(t)
+	id := e.xadd(`{"event_name":"created"}`)
+	e.start(r.Handle)
+
+	// The message is delivered into the PEL and stays pending across the reclaim
+	// grace window, never ACKed (matched-but-unavailable, not unmatched) and
+	// never DLQ'd; no handler runs.
+	e.eventually("pending event delivered into PEL", func() bool {
+		_, ok := e.pending(id)
+		return ok
+	})
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, ok := e.pending(id); !ok {
+			t.Fatalf("pending-desired event must stay pending, not be acked as unmatched")
+		}
+		if _, ok := e.dlqEntry(id); ok {
+			t.Fatalf("pending-desired event must not be DLQ'd")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if recovered.count() != 0 {
+		t.Fatalf("pending generation must not execute: calls = %d, want 0", recovered.count())
+	}
+
+	// Preparation succeeds: publish the runnable generation under the SAME name
+	// (Replace clears the pending entry atomically). A reclaim redelivery runs the
+	// handler, ACKs the message, and clears the invocation-state key.
+	r.Registry().Replace("pending-app", alwaysMatchFn(t, "pending-app", recovered))
+	if r.Registry().HasPending("pending-app") {
+		t.Fatal("Replace must clear the pending entry")
+	}
+	e.eventually("activated handler executed", func() bool {
+		return recovered.count() == 1
+	})
+	e.eventually("message acked (gone from PEL)", func() bool {
+		_, ok := e.pending(id)
+		return !ok
+	})
+	e.eventually("invocation-state key terminal-retained after ack", func() bool {
+		return e.isRetained(id)
+	})
+	if _, ok := e.dlqEntry(id); ok {
+		t.Fatalf("activated event must never be DLQ'd")
+	}
+}
+
+// pendingIntegrationTemplate is a single-rule template matching the integration
+// event used above.
+const pendingIntegrationTemplate = `runtime: node24
+events:
+  - handler: handler.created
+    pattern:
+      event_name: [created]
+`
+
+// mustTemplateForIntegration parses a template for the pending integration test.
+func mustTemplateForIntegration(t *testing.T, yaml string) *app.Template {
+	t.Helper()
+	tmpl, err := app.ParseTemplate([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse template: %v", err)
+	}
+	return tmpl
 }

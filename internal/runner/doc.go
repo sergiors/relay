@@ -15,6 +15,17 @@
 //     for unavailability. A mixed message runs its available invocations to
 //     completion and holds pending only for the unavailable one; once the
 //     app is rebuilt, a redelivery finishes the outstanding work
+//   - Pending desired generations: beside the active set the registry can hold
+//     a PENDING desired template for a valid generation being prepared but not
+//     yet runnable (a brand-new app's first build, or an existing app's rebuild
+//     to new rules). A pending rule matches and engages its app but is treated
+//     exactly like an unavailable match: it never executes, claims a TryStart,
+//     exhausts, ACKs, or DLQs, and it keeps the message pending so an event
+//     arriving during preparation is never ACKed away as unmatched. A pending
+//     rule whose invocation is also matched by the active generation is deduped
+//     by "<app>/<handler>", so the active generation executes it and it is not
+//     separately held. Installing the new generation (or removing/invalidating
+//     the app) clears the pending entry atomically with the registry mutation.
 //   - Skip: when the stream layer injects invocation state into the context,
 //     a matching handler whose "<app>/<rule-handler>" invocation already
 //     succeeded on a previous delivery, is protected by an active attempt

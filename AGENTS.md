@@ -51,6 +51,19 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   unavailability alone. Effective concurrency is
   `min(template concurrency, MAX_CONCURRENCY)`, bounding the runner semaphore and
   the warm pool.
+- Matching also includes a valid generation being PREPARED but not yet runnable.
+  The reconciler publishes the desired generation's event rules as a pending,
+  non-runnable entry in the registry (atomically with its candidate index)
+  BEFORE the source fingerprint walk and image build, so a delivery during
+  preparation is matched-but-unavailable and stays pending instead of being
+  ACKed as unmatched. A pending match never executes, claims `TryStart`,
+  exhausts, ACKs, or DLQs; it is deduped by `<app>/<handler>` against the active
+  generation so a rule active in v1 executes without being blocked by an
+  identical pending v2 rule. The active generation is retained throughout
+  (`Registry.Replace` installs the new active generation and clears the pending
+  entry in one locked step); an invalid/removed desired definition, an unchanged
+  no-build path, and an unavailable-placeholder reconcile all clear pending so no
+  removed rule keeps gating events.
 - Delivery is at-least-once, never exactly-once: handlers must be idempotent.
 - State, metrics, and cleanup failures are logged, never fatal. Redis/transport
   errors leave messages pending (fail open); a claim error (`TryStart`) fails

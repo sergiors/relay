@@ -122,13 +122,31 @@ type Registry struct {
 	// exact scan. The map is replaced wholesale on every mutation (never mutated
 	// in place), so a snapshot's shared reference stays immutable.
 	ruleIdx map[*PreparedApp]*eventmatch.RuleIndex
+	// pending holds, per app name, the desired template of a valid generation
+	// that is being prepared but is not yet runnable: a brand-new app's first
+	// build, or an available active generation being rebuilt to a new one. A
+	// pending entry is immutable and non-runnable (it is built with
+	// NewUnavailable: no image, no executor, no publication lease). It exists
+	// ONLY to keep event matching live during preparation: a delivery matching a
+	// pending rule is matched-but-unavailable and stays pending instead of being
+	// acknowledged as unmatched. Pending entries never execute, claim a
+	// TryStart, exhaust, ACK, or DLQ. The slice is replaced/rebuilt under the
+	// registry lock together with pendingIdx, so a snapshot can never observe a
+	// pending set from one generation and an index from another.
+	pending []*PreparedApp
+	// pendingIdx maps each pending entry to its immutable candidate index, built
+	// from that entry's desired events in the SAME locked mutation as pending.
+	pendingIdx map[*PreparedApp]*eventmatch.RuleIndex
 }
 
-// buildRuleIndex derives the per-app candidate index from the current
-// prepared set. It is called while the registry lock is held, immediately after
-// the app slice is updated, so the index and the slice share one generation.
-// Entries whose template is nil (only reachable from a hand-built value, never
-// the loader) are omitted; matching falls back to a full exact scan for them.
+// buildRuleIndex derives the per-app candidate index from the given prepared
+// set. It is called while the registry lock is held, immediately after the app
+// slice is updated, so the index and the slice share one generation. The same
+// builder serves both the active set and the pending desired set (each rebuilt
+// under the lock in the SAME mutation as its slice), so a snapshot can never
+// observe a slice from one generation and an index from another. Entries whose
+// template is nil (only reachable from a hand-built value, never the loader) are
+// omitted; matching falls back to a full exact scan for them.
 func buildRuleIndex(fns []*PreparedApp) map[*PreparedApp]*eventmatch.RuleIndex {
 	if len(fns) == 0 {
 		return nil
@@ -141,6 +159,17 @@ func buildRuleIndex(fns []*PreparedApp) map[*PreparedApp]*eventmatch.RuleIndex {
 		out[pf] = eventmatch.NewRuleIndex(pf.fn.Template.Events)
 	}
 	return out
+}
+
+// pendingIndexEntry finds the pending desired entry for name in the slice,
+// returning its index or -1. Callers hold the registry lock.
+func pendingIndexEntry(pending []*PreparedApp, name string) int {
+	for i, pf := range pending {
+		if pf != nil && pf.fn.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 func (r *Registry) snapshot() []*PreparedApp {
@@ -166,6 +195,15 @@ type pinnedSnapshot struct {
 	// under the same read lock. It is shared immutably, so one Handle consumes
 	// exactly one index generation for the whole delivery.
 	ruleIdx map[*PreparedApp]*eventmatch.RuleIndex
+	// pending is the pending-desired generation published WITH fns. Its entries
+	// are non-runnable (NewUnavailable) placeholders for valid generations being
+	// prepared but not yet active. They never execute; they only contribute
+	// matched-but-unavailable invocations so a delivery during preparation stays
+	// pending instead of being acknowledged as unmatched.
+	pending []*PreparedApp
+	// pendingIdx is the candidate index generation for pending, captured under
+	// the same read lock so pending and its index are coherent.
+	pendingIdx map[*PreparedApp]*eventmatch.RuleIndex
 }
 
 // rulesFor returns the immutable candidate index bound to pf in this snapshot's
@@ -178,6 +216,17 @@ func (s *pinnedSnapshot) rulesFor(pf *PreparedApp) *eventmatch.RuleIndex {
 	return s.ruleIdx[pf]
 }
 
+// pendingRulesFor returns the immutable candidate index bound to pf in this
+// snapshot's pending generation, or nil when pf has no pending index (a
+// nil-template entry), in which case the caller must fall back to a full exact
+// scan.
+func (s *pinnedSnapshot) pendingRulesFor(pf *PreparedApp) *eventmatch.RuleIndex {
+	if s == nil || s.pendingIdx == nil {
+		return nil
+	}
+	return s.pendingIdx[pf]
+}
+
 // matchingRules returns the rules of pf matching event under THIS snapshot's
 // index generation. When pf has a published candidate index the indexed matcher
 // is used (anchor prefilter plus exact verification, identical to a full scan);
@@ -186,6 +235,18 @@ func (s *pinnedSnapshot) rulesFor(pf *PreparedApp) *eventmatch.RuleIndex {
 // so every match decision in one Handle call comes from one index generation.
 func (s *pinnedSnapshot) matchingRules(pf *PreparedApp, event map[string]any) []app.EventRule {
 	if ix := s.rulesFor(pf); ix != nil {
+		return ix.MatchingEventRules(event)
+	}
+	if pf == nil || pf.fn.Template == nil {
+		return nil
+	}
+	return eventmatch.MatchingEventRules(pf.fn.Template.Events, event)
+}
+
+// matchingPendingRules is matchingRules for a pending desired entry, bound to
+// the snapshot's pending index generation.
+func (s *pinnedSnapshot) matchingPendingRules(pf *PreparedApp, event map[string]any) []app.EventRule {
+	if ix := s.pendingRulesFor(pf); ix != nil {
 		return ix.MatchingEventRules(event)
 	}
 	if pf == nil || pf.fn.Template == nil {
@@ -225,9 +286,11 @@ func (r *Registry) snapshotPinned() *pinnedSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := &pinnedSnapshot{
-		fns:     append([]*PreparedApp(nil), r.fns...),
-		pins:    make(map[*PreparedApp]*runtime.ImageLease, len(r.fns)),
-		ruleIdx: r.ruleIdx,
+		fns:        append([]*PreparedApp(nil), r.fns...),
+		pins:       make(map[*PreparedApp]*runtime.ImageLease, len(r.fns)),
+		ruleIdx:    r.ruleIdx,
+		pending:    append([]*PreparedApp(nil), r.pending...),
+		pendingIdx: r.pendingIdx,
 	}
 	for _, pf := range out.fns {
 		if lease := pf.sharePublication(); lease != nil {
@@ -266,6 +329,12 @@ func (r *Registry) Set(fns []*PreparedApp) {
 	// Rebuild the candidate index in the same locked step as the slice, so a
 	// snapshot either sees both from the old generation or both from the new one.
 	r.ruleIdx = buildRuleIndex(r.fns)
+	// A wholesale replacement is the initial-population seam (construction and
+	// tests), where no reconcile is preparing a generation: reset any pending
+	// desired entries so a snapshot can never observe a stale pending set beside
+	// a freshly Set active set.
+	r.pending = nil
+	r.pendingIdx = nil
 	r.mu.Unlock()
 	releaseSuperseded(old, fns)
 }
@@ -275,6 +344,11 @@ func (r *Registry) Set(fns []*PreparedApp) {
 // The superseded entry's publication lease is released AFTER the swap, so any
 // snapshot that pinned it before the swap keeps the image admitted until that
 // snapshot's work drains.
+//
+// Replace also ATOMICALLY clears any pending desired entry for name: publishing
+// the runnable generation (success) and removing the app both supersede the
+// in-preparation desired view, so a reader never sees a successful new active
+// snapshot beside its now-obsolete pending rules.
 func (r *Registry) Replace(name string, pf *PreparedApp) {
 	r.mu.Lock()
 	var superseded *PreparedApp
@@ -302,12 +376,74 @@ func (r *Registry) Replace(name string, pf *PreparedApp) {
 	// than mutating the previous map) keeps every already-published snapshot's
 	// shared index immutable.
 	r.ruleIdx = buildRuleIndex(r.fns)
+	// Clear the pending desired entry in the SAME locked step (the removal above
+	// handles a pending-only name that had no active entry).
+	if i := pendingIndexEntry(r.pending, name); i >= 0 {
+		r.pending = append(r.pending[:i], r.pending[i+1:]...)
+		r.pendingIdx = buildRuleIndex(r.pending)
+	}
 	r.mu.Unlock()
 	// An app replacement supersedes only the old entry; an add/remove
 	// supersedes only the removed entry.
 	if superseded != nil && superseded != pf {
 		superseded.ReleasePublication()
 	}
+}
+
+// SetPending installs (or replaces) the pending desired entry for name: a valid
+// generation's event rules that is being prepared but is not yet runnable. The
+// entry is a non-runnable NewUnavailable placeholder that carries the desired
+// rules for MATCHING only — no image, executor, or publication lease — so a
+// delivery matching a pending rule is matched-but-unavailable and stays pending
+// instead of being acknowledged as unmatched. Pending entries never execute,
+// claim a TryStart, exhaust, ACK, or DLQ. The pending slice and its candidate
+// index are rebuilt in the SAME locked step, so no snapshot can observe a
+// partial pending generation.
+func (r *Registry) SetPending(name string, fn app.App) {
+	pf := NewUnavailable(fn)
+	r.mu.Lock()
+	if i := pendingIndexEntry(r.pending, name); i >= 0 {
+		r.pending[i] = pf
+	} else {
+		r.pending = append(r.pending, pf)
+		sortFn(r.pending)
+	}
+	r.pendingIdx = buildRuleIndex(r.pending)
+	r.mu.Unlock()
+}
+
+// ClearPending drops the pending desired entry for name, if any. It is used when
+// a reconcile decides no image transition is needed (unchanged, resource-only),
+// when the desired definition is invalid, and on removal — so a stale desired
+// rule never keeps gating events.
+func (r *Registry) ClearPending(name string) {
+	r.mu.Lock()
+	if i := pendingIndexEntry(r.pending, name); i >= 0 {
+		r.pending = append(r.pending[:i], r.pending[i+1:]...)
+		r.pendingIdx = buildRuleIndex(r.pending)
+	}
+	r.mu.Unlock()
+}
+
+// PendingNames returns a snapshot of the names that currently have a pending
+// desired entry (a valid generation being prepared but not yet runnable). It is
+// the removal-sweep companion to Names: a pending-only name is not in Names, so
+// the reconciler must enumerate it too to detect a vanished directory.
+func (r *Registry) PendingNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.pending))
+	for _, pf := range r.pending {
+		out = append(out, pf.fn.Name)
+	}
+	return out
+}
+
+// HasPending reports whether name currently has a pending desired entry.
+func (r *Registry) HasPending(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return pendingIndexEntry(r.pending, name) >= 0
 }
 
 // releaseSuperseded releases the publication leases of the old entries that are
@@ -1265,6 +1401,20 @@ func (r *Runner) runInvocation(
 // and returns the first failure's plain error immediately, with no invocation
 // wrapping or DLQ attribution.
 //
+// Pending desired generations: the registry can hold, beside the active set, a
+// PENDING desired template for a valid generation that is being prepared but is
+// not yet runnable (see Registry.SetPending). Pending rules are MATCHED — they
+// engage their app and keep the message pending as unavailable — but they never
+// execute, claim a TryStart, exhaust, ACK, or DLQ. This closes the event-loss
+// window during preparation: a delivery that matches ONLY a pending rule (a
+// brand-new app before its first image, or a new rule not yet in the active
+// generation) is matched-but-unavailable rather than unmatched, so it is never
+// ACKed away. A pending rule whose invocation is ALSO matched by the active
+// generation is deduped by "<app>/<handler>": the active generation executes it
+// and it is not separately held. When the new generation is installed (or the
+// app is removed/invalidated) the pending entry is cleared atomically with the
+// registry mutation.
+//
 // Return contract (with invocation state, aggregated after the full rule loop):
 //   - a plain (retryable) error when any matched invocation had a retryable
 //     failure this delivery — regardless of other invocations' outcomes — so
@@ -1398,6 +1548,56 @@ func (r *Runner) Handle(ctx context.Context, msgID string, event map[string]any)
 			matched = append(matched, invocation)
 			if !pf.available {
 				unavailableMatched = append(unavailableMatched, invocation)
+			}
+		}
+	}
+
+	// Pending desired matches: a valid generation being PREPARED but not yet
+	// runnable contributes its desired invocations as matched-but-unavailable,
+	// so a delivery arriving during preparation stays pending instead of being
+	// acknowledged as unmatched (the new-app / new-rule event-loss gap this
+	// closes). Pending entries are non-runnable placeholders (no image, no
+	// executor): they are matched here for CLASSIFICATION and holding only and
+	// are deliberately absent from the execution loop below. Dedupe by
+	// invocation identity against the active matches: a rule that is active in
+	// v1 and also present in pending v2 is executed by the active path and must
+	// not be separately held. A pending-only invocation still counts as matched
+	// and engages its app, but its non-terminal (unresolved) state keeps the
+	// message pending — it never executes, claims a TryStart, exhausts, ACKs, or
+	// DLQs.
+	matchedSet := make(map[string]struct{}, len(matched))
+	for _, inv := range matched {
+		matchedSet[inv] = struct{}{}
+	}
+	matchedFnSet := make(map[string]struct{}, len(matchedFns))
+	for _, fnName := range matchedFns {
+		matchedFnSet[fnName] = struct{}{}
+	}
+	for _, pf := range snap.pending {
+		if pf.fn.Template == nil {
+			continue
+		}
+		rules := snap.matchingPendingRules(pf, event)
+		if len(rules) == 0 {
+			continue
+		}
+		engaged := false
+		for _, rule := range rules {
+			invocation := pf.fn.Name + "/" + rule.Handler
+			if _, dup := matchedSet[invocation]; dup {
+				// Already matched (and executable) through the active
+				// generation: do not separately hold the same invocation.
+				continue
+			}
+			matchedSet[invocation] = struct{}{}
+			matched = append(matched, invocation)
+			unavailableMatched = append(unavailableMatched, invocation)
+			engaged = true
+		}
+		if engaged {
+			if _, dup := matchedFnSet[pf.fn.Name]; !dup {
+				matchedFnSet[pf.fn.Name] = struct{}{}
+				matchedFns = append(matchedFns, pf.fn.Name)
 			}
 		}
 	}

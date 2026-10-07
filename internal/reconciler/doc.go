@@ -13,6 +13,20 @@
 //   - A healthy app is never replaced until its replacement is ready
 //   - A previously-failed (unavailable) build is retried when its fingerprint
 //     is stable, so a broken app recovers without further edits
+//   - Event-loss safety during preparation: at the earliest safe point after a
+//     template parses (before the source fingerprint walk and image build) the
+//     desired generation's event rules are published into the registry as a
+//     PENDING, non-runnable entry. Matching is registry-only, so without this a
+//     delivery arriving during a brand-new app's first build (or an existing
+//     app's rebuild to new rules) would match nothing and be ACKed as unmatched.
+//     A pending match is matched-but-unavailable: it holds the message pending
+//     and never executes, claims a TryStart, exhausts, ACKs, or DLQs. The active
+//     generation is retained throughout, so v1 rules stay executable while v2 is
+//     prepared; a build failure retains both v1 and the v2 pending rules; success
+//     installs the new active generation and clears the pending entry atomically
+//     (Registry.Replace). An invalid or removed desired definition, an unchanged
+//     no-build path, and an unavailable-placeholder reconcile all clear pending
+//     so no removed rule keeps gating events.
 //   - Live/periodic reload applies the SAME discovery path policy as startup
 //     (app.LoadSingle): a legal single-element name and a real direct-child
 //     directory of the root, never a symlink. An invalid path (bad name, symlink

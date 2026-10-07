@@ -582,12 +582,38 @@ func (r *Reconciler) reconcileAll() {
 		seen[e.Name()] = true
 		r.dispatch(e.Name())
 	}
-	// Apps still registered but no longer on disk were removed.
-	for _, name := range r.reg.Names() {
-		if !seen[name] {
-			r.dispatch(name)
-		}
+	// Apps still registered but no longer on disk were removed. A brand-new app
+	// whose first preparation has not yet completed exists ONLY as a pending
+	// desired entry (nothing is published as active until the build succeeds),
+	// so PendingNames must be swept too: otherwise a directory that vanishes
+	// during preparation would leave a stale pending entry gating events
+	// forever.
+	for _, name := range r.missingNames(seen) {
+		r.dispatch(name)
 	}
+}
+
+// missingNames returns the registered names (active and pending-only) that are
+// NOT present on disk, so reconcileAll dispatches them for removal. An app that
+// is BOTH active and pending (an available generation being rebuilt) is returned
+// once.
+func (r *Reconciler) missingNames(seen map[string]bool) []string {
+	var out []string
+	added := map[string]bool{}
+	add := func(name string) {
+		if seen[name] || added[name] {
+			return
+		}
+		added[name] = true
+		out = append(out, name)
+	}
+	for _, name := range r.reg.Names() {
+		add(name)
+	}
+	for _, name := range r.reg.PendingNames() {
+		add(name)
+	}
+	return out
 }
 
 // reconcileApp is the core decision point for one app. It is serialized
@@ -618,6 +644,14 @@ func (r *Reconciler) reconcileApp(name string) {
 			r.remove(name)
 			return
 		}
+		// Every other load failure (not-ready/mid-copy, invalid path, flaky read,
+		// unreadable/invalid template) means the desired definition is not a
+		// valid generation to prepare, so no desired pending rules are
+		// manufactured. Any stale pending entry from a previous, now-invalid
+		// desired state is cleared so removed rules cannot keep gating events;
+		// the previously-active generation (if any) is retained exactly as
+		// today.
+		r.reg.ClearPending(name)
 		if errors.Is(err, app.ErrNotReady) {
 			// Directory exists but template isn't there yet (mid-copy); wait for
 			// more events rather than dropping a previously-active app. The
@@ -656,6 +690,40 @@ func (r *Reconciler) reconcileApp(name string) {
 	}
 	dir := fn.Dir
 
+	// Publish the desired generation's event rules into the registry as PENDING
+	// at the earliest safe point after the template parsed, BEFORE the
+	// (potentially long) source fingerprint walk and image build. Matching is
+	// registry-only, so without this a delivery arriving during first
+	// preparation of a brand-new app (or during the rebuild of an existing one)
+	// would match nothing and be ACKed as unmatched — the event-loss window this
+	// closes. The pending representation is non-runnable (NewUnavailable): it
+	// contributes matched-but-unavailable invocations so the message stays
+	// pending, never executes, claims a TryStart, exhausts, ACKs, or DLQs.
+	//
+	// The representation depends on the CURRENT active entry:
+	//   - available active generation (v1 being rebuilt to v2): keep v1 active
+	//     and executable, and add v2's rules as pending, so v1-only rules run and
+	//     v2-only rules hold.
+	//   - unavailable active placeholder (a startup/previous build failure, no
+	//     image): replace it in place with the current desired template so its
+	//     unavailable rules are coherent (a removed old rule stops gating) and
+	//     clear any pending entry. There is no executable generation to preserve.
+	//   - absent (brand-new app): add the desired rules as pending only; nothing
+	//     is published as active until preparation succeeds.
+	//
+	// A template with no event rules (a service-only/no-runtime app) has nothing
+	// to hold, so any stale pending entry is cleared instead: service behavior is
+	// never disturbed and no empty pending entry lingers.
+	cur := r.reg.GetByName(name)
+	switch {
+	case cur != nil && !isAvailable(cur):
+		r.reg.Replace(name, runner.NewUnavailable(fn))
+	case len(fn.Template.Events) == 0:
+		r.reg.ClearPending(name)
+	default:
+		r.reg.SetPending(name, fn)
+	}
+
 	// Compute the fingerprint AND (for a runtime-backed app) the resolved
 	// source selection in ONE traversal, then carry BOTH into the rebuild below.
 	// The selection is handed to the Manager's selection-aware Prepare so the
@@ -675,7 +743,11 @@ func (r *Reconciler) reconcileApp(name string) {
 		// The desired definition is present and parseable but its source could
 		// not be fingerprinted, so the desired generation cannot be trusted.
 		// Record the failed view while retaining the active generation and
-		// leaving the runtime registry untouched.
+		// leaving the runtime registry untouched. The pending desired rules
+		// published above are deliberately RETAINED: the configuration is valid
+		// and preparation may succeed on a later pass, so holding matching
+		// events pending (rather than ACKing them as unmatched) is the
+		// at-least-once direction.
 		r.recordInvalidDesired(name, err)
 		return
 	}
@@ -684,11 +756,14 @@ func (r *Reconciler) reconcileApp(name string) {
 	known, hasFingerprint := r.fingerprints[name]
 	r.mu.Unlock()
 
-	cur := r.reg.GetByName(name)
 	// Skip a rebuild only when the current build is healthy AND content is
 	// unchanged. A previously-failed build (unavailable) is retried even if the
 	// fingerprint is stable, so a broken app recovers without edits.
 	if cur != nil && isAvailable(cur) && hasFingerprint && known == fp {
+		// No image transition is needed, so the pending desired rules published
+		// above (which, for a byte-identical template, are the same rules as the
+		// active generation) are cleared: no stale pending state may linger.
+		r.reg.ClearPending(name)
 		// Skipped checks are deliberately NOT persisted as the last reconcile:
 		// RecordReconcileSuccess/Failure record the last MEANINGFUL operation and
 		// its timestamp; a periodic no-op must not hide a recent success or
