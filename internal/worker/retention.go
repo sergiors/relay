@@ -36,10 +36,21 @@ type streamTrimmer interface {
 	XTrimMinIDApproxMode(ctx context.Context, key string, minID string, limit int64, mode string) *redis.IntCmd
 }
 
-// Retention tick cadence. The interval is derived from the retention window
+// dlqTrimmer is the narrow seam the DLQ retention loop needs from Redis: a
+// single approximate MINID trim with NO trim-reference mode. The DLQ has no
+// consumer group, PEL, or XACK flow to protect, so an age-only trim is safe and
+// the mode token (ACKED/KEEPREF) is neither required nor meaningful there.
+// *redis.Client satisfies it. It is deliberately separate from streamTrimmer:
+// keeping the seams distinct means the main trim cannot accidentally lose its
+// ACKED mode, and the DLQ trim cannot accidentally acquire one.
+type dlqTrimmer interface {
+	XTrimMinIDApprox(ctx context.Context, key string, minID string, limit int64) *redis.IntCmd
+}
+
+// retentionTickInterval derives the tick cadence from the retention window
 // (retention/24, clamped to [1m, 1h]) rather than being a second env var, so
 // there is exactly one knob to reason about and the cadence scales with the
-// window. The reasoning:
+// window. Both the main-stream and DLQ retention loops share it. The reasoning:
 //
 //   - retention/24 gives a coarse-grained cadence: for the canonical 6h window
 //     that is 15 minutes, so the stream is trimmed ~4 times per window. A
@@ -77,6 +88,15 @@ func retentionCutoffID(now time.Time) string {
 // (XTRIM <stream> MINID ~ <minID> ACKED, LIMIT omitted because limit==0) so the
 // retention loop never touches raw commands. It returns the number of entries
 // removed (approximate under the "~" rule).
+//
+// Boundedness: the operation is bounded by the 30s per-call context the loop
+// supplies, not by an effort LIMIT. LIMIT is deliberately omitted: a finite
+// LIMIT would remove at most that many entries per tick, so retention could not
+// keep up with a fast producer and the stream would grow unbounded despite a
+// configured window. Because the trim is a single O(removed) command under a
+// hard context deadline, omission stays bounded in time and lets one tick clear
+// as much of the eligible range as Redis can — the correct trade for a
+// retention loop.
 //
 // Approximate-trim granularity: Redis implements "~" over whole internal stream
 // nodes (listpack blocks of up to stream-node-max-entries, default 100), so
@@ -145,11 +165,13 @@ func retentionTick(
 // retention window silently doing nothing is a correctness surprise: the
 // operator asked for trimming and must know it is refused (and why) rather than
 // discovering it from an unbounded stream — or, worse, getting an unsafe trim.
+// The disable is scoped to the MAIN stream only; DLQ retention uses a mode-less
+// trim and is unaffected.
 func logRetentionUnsupported(logger *slog.Logger, stream string, err error) {
 	logger.Error(
 		"Retention: disabled; Redis rejected the ACKED trim mode (requires Redis 8.2+); "+
 			"refusing to trim with the unsafe default, which can evict entries still pending in a consumer group. "+
-			"Upgrade Redis or unset REDIS_STREAM_RETENTION",
+			"Upgrade Redis or set REDIS_STREAM_RETENTION empty to disable main-stream retention explicitly",
 		"stream", stream,
 		"error", err,
 	)
@@ -212,6 +234,85 @@ func retentionLoop(
 				logRetentionUnsupported(logger, stream, trimErr)
 				return
 			}
+		}
+	}
+}
+
+// dlqRetentionTick computes the cutoff (now - retention) and performs one
+// age-only approximate MINID trim of the Relay-owned DLQ stream, logging the
+// outcome. It is the unit of work shared by the initial DLQ trim and every
+// ticker tick, and mirrors retentionTick; now is injectable for deterministic
+// tests.
+//
+// Unlike retentionTick there is no mode and therefore no capability signal and
+// no disable path, so this always returns without error: the DLQ has no consumer
+// groups or PEL, so an age-only trim is always safe and any failure is
+// transient. A failure is logged and swallowed — retention is best-effort and
+// must never stop the worker; the caller retries on the next tick. Trimming a
+// missing or empty stream is not an error either: Redis returns 0 removed.
+func dlqRetentionTick(
+	ctx context.Context,
+	client dlqTrimmer,
+	stream string,
+	retention time.Duration,
+	now func() time.Time,
+	logger *slog.Logger,
+) {
+	cutoffID := retentionCutoffID(now().Add(-retention))
+	n, err := trimDLQStream(ctx, client, stream, cutoffID)
+	if err != nil {
+		logger.Warn("DLQ retention: trim failed; will retry next tick", "stream", stream, "error", err)
+		return
+	}
+	logger.Debug("DLQ retention: trimmed stream", "stream", stream, "cutoff", cutoffID, "removed", n)
+}
+
+// trimDLQStream issues a single approximate age-only MINID trim against the DLQ
+// stream. It is the mode-less analogue of trimStream: no ACKED/KEEPREF token is
+// sent, so it works on every Redis that supports XTRIM MINID ~ (no server-mode
+// capability requirement) and does not depend on any consumer group, PEL, or
+// XACK. LIMIT is omitted (limit==0) for the same reason as the main trim — see
+// trimStream for the approximate-trim granularity note.
+func trimDLQStream(ctx context.Context, client dlqTrimmer, stream, cutoffID string) (int64, error) {
+	return client.XTrimMinIDApprox(ctx, stream, cutoffID, 0).Result()
+}
+
+// dlqRetentionLoop is the periodic DLQ-retention loop. It mirrors retentionLoop
+// in cadence and bounded per-trim context, but trims ONLY the Relay-owned DLQ
+// stream with an age-only approximate MINID trim: it never touches the source
+// stream and never requires the ACKED mode, so a pre-8.2 server that disables
+// main retention does not disable DLQ retention (the DLQ needs no group-aware
+// semantics). It runs in its own goroutine owned by the worker lifecycle and
+// stops when ctx is cancelled. A transient trim failure is logged and retried on
+// the next tick, never fatal.
+func dlqRetentionLoop(
+	ctx context.Context,
+	client dlqTrimmer,
+	stream string,
+	retention time.Duration,
+	logger *slog.Logger,
+) {
+	interval := retentionTickInterval(retention)
+	logger.Info("DLQ retention: starting", "stream", stream, "window", retention, "tick", interval)
+
+	// Initial trim immediately (bounded) so an already-large DLQ is trimmed
+	// without waiting a full interval. A transient failure is logged by
+	// dlqRetentionTick and the loop continues; there is no capability check to
+	// perform (no mode).
+	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	dlqRetentionTick(initCtx, client, stream, retention, time.Now, logger)
+	initCancel()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			trimCtx, trimCancel := context.WithTimeout(ctx, 30*time.Second)
+			dlqRetentionTick(trimCtx, client, stream, retention, time.Now, logger)
+			trimCancel()
 		}
 	}
 }

@@ -169,11 +169,12 @@ func TestLoadGitWebhookAddrPassthrough(t *testing.T) {
 	}
 }
 
-// TestStreamRetention covers the REDIS_STREAM_RETENTION parsing contract via the
-// pure parseRetention helper: retention is log-and-disable: unset/empty disables
+// TestStreamRetention covers the retention parsing contract via the pure
+// parseRetention helper (shared by REDIS_STREAM_RETENTION and
+// REDIS_DLQ_RETENTION): retention is log-and-disable: empty/whitespace disables
 // retention (0, no log); a valid duration parses; an invalid duration and a
-// zero/negative value log a line mentioning REDIS_STREAM_RETENTION and return 0
-// (disabled). A bad value therefore never fails startup.
+// zero/negative value log a line naming the variable and return 0 (disabled). A
+// bad value therefore never fails startup.
 func TestStreamRetention(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -181,7 +182,8 @@ func TestStreamRetention(t *testing.T) {
 		want       time.Duration
 		wantLogged bool
 	}{
-		{"unset disables, no log", "", 0, false},
+		{"empty disables, no log", "", 0, false},
+		{"whitespace disables, no log", "   ", 0, false},
 		{"valid 6h", "6h", 6 * time.Hour, false},
 		{"valid 30m", "30m", 30 * time.Minute, false},
 		{"invalid duration logs and disables", "bogus", 0, true},
@@ -191,7 +193,7 @@ func TestStreamRetention(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logger, buf := testLogger()
-			got := parseRetention(logger, tt.value)
+			got := parseRetention(logger, "REDIS_STREAM_RETENTION", tt.value)
 			if got != tt.want {
 				t.Fatalf("parseRetention(%q) = %v, want %v", tt.value, got, tt.want)
 			}
@@ -201,6 +203,150 @@ func TestStreamRetention(t *testing.T) {
 					tt.value, gotLogged, tt.wantLogged, buf.String())
 			}
 		})
+	}
+}
+
+// TestRetentionEnvUnsetVsEmpty pins the UNSET-vs-explicitly-empty distinction:
+// UNSET applies the caller's default window, while an explicitly empty value
+// parses to 0 (disabled), preserving the historical opt-out.
+func TestRetentionEnvUnsetVsEmpty(t *testing.T) {
+	t.Run("unset applies default", func(t *testing.T) {
+		t.Setenv("REDIS_STREAM_RETENTION", "")
+		os.Unsetenv("REDIS_STREAM_RETENTION")
+		logger, buf := testLogger()
+		got := retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
+		if got != DefaultStreamRetention {
+			t.Fatalf("retentionEnv(unset) = %v, want default %v", got, DefaultStreamRetention)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("retentionEnv(unset) logged %q; want no log", buf.String())
+		}
+	})
+
+	t.Run("explicitly empty disables", func(t *testing.T) {
+		t.Setenv("REDIS_STREAM_RETENTION", "")
+		logger, buf := testLogger()
+		got := retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
+		if got != 0 {
+			t.Fatalf("retentionEnv(empty) = %v, want 0 (disabled)", got)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("retentionEnv(empty) logged %q; want no log", buf.String())
+		}
+	})
+}
+
+// TestLoadRetentionDefaults pins that the retention windows default to 24h
+// (source) and 7 days (DLQ) when their variables are UNSET, and that the
+// defaults are the documented constants.
+func TestLoadRetentionDefaults(t *testing.T) {
+	setRequiredEnv(t)
+	// t.Setenv registers the ambient value for restoration; the following
+	// Unsetenv then makes the variable truly UNSET so the default path (not the
+	// explicitly-empty disable path) is exercised, without leaking to other
+	// tests.
+	t.Setenv("REDIS_STREAM_RETENTION", "")
+	os.Unsetenv("REDIS_STREAM_RETENTION")
+	t.Setenv("REDIS_DLQ_RETENTION", "")
+	os.Unsetenv("REDIS_DLQ_RETENTION")
+
+	cfg := mustLoad(t)
+	if cfg.StreamRetention != 24*time.Hour {
+		t.Fatalf("StreamRetention = %v, want 24h default", cfg.StreamRetention)
+	}
+	if cfg.DLQRetention != 7*24*time.Hour {
+		t.Fatalf("DLQRetention = %v, want 7d default", cfg.DLQRetention)
+	}
+	if DefaultStreamRetention != 24*time.Hour {
+		t.Fatalf("DefaultStreamRetention = %v, want 24h", DefaultStreamRetention)
+	}
+	if DefaultDLQRetention != 7*24*time.Hour {
+		t.Fatalf("DefaultDLQRetention = %v, want 7d", DefaultDLQRetention)
+	}
+}
+
+// TestLoadRetentionExplicitValues pins that explicit Go durations are honored
+// exactly for both retention variables, including the 168h (7-day) override and
+// the legacy 24h value.
+func TestLoadRetentionExplicitValues(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("REDIS_STREAM_RETENTION", "24h")
+	t.Setenv("REDIS_DLQ_RETENTION", "168h")
+	cfg := mustLoad(t)
+	if cfg.StreamRetention != 24*time.Hour {
+		t.Fatalf("StreamRetention = %v, want 24h", cfg.StreamRetention)
+	}
+	if cfg.DLQRetention != 168*time.Hour {
+		t.Fatalf("DLQRetention = %v, want 168h", cfg.DLQRetention)
+	}
+
+	t.Setenv("REDIS_STREAM_RETENTION", "90m")
+	t.Setenv("REDIS_DLQ_RETENTION", "90m")
+	cfg = mustLoad(t)
+	if cfg.StreamRetention != 90*time.Minute || cfg.DLQRetention != 90*time.Minute {
+		t.Fatalf("retention windows = %v/%v, want 90m/90m", cfg.StreamRetention, cfg.DLQRetention)
+	}
+}
+
+// TestLoadRetentionExplicitDisable pins that an explicitly empty or zero value
+// disables the respective retention (0) rather than falling back to the default.
+func TestLoadRetentionExplicitDisable(t *testing.T) {
+	for _, value := range []string{"", "0"} {
+		t.Run("stream="+value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("REDIS_STREAM_RETENTION", value)
+			t.Setenv("REDIS_DLQ_RETENTION", "")
+			os.Unsetenv("REDIS_DLQ_RETENTION")
+			cfg := mustLoad(t)
+			if cfg.StreamRetention != 0 {
+				t.Fatalf("StreamRetention = %v, want 0 (disabled) for %q", cfg.StreamRetention, value)
+			}
+			if cfg.DLQRetention != DefaultDLQRetention {
+				t.Fatalf("DLQRetention = %v, want default %v (unset)", cfg.DLQRetention, DefaultDLQRetention)
+			}
+		})
+		t.Run("dlq="+value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("REDIS_DLQ_RETENTION", value)
+			t.Setenv("REDIS_STREAM_RETENTION", "")
+			os.Unsetenv("REDIS_STREAM_RETENTION")
+			cfg := mustLoad(t)
+			if cfg.DLQRetention != 0 {
+				t.Fatalf("DLQRetention = %v, want 0 (disabled) for %q", cfg.DLQRetention, value)
+			}
+			if cfg.StreamRetention != DefaultStreamRetention {
+				t.Fatalf("StreamRetention = %v, want default %v (unset)", cfg.StreamRetention, DefaultStreamRetention)
+			}
+		})
+	}
+}
+
+// TestLoadRetentionMalformedLogsAndDisables pins that a malformed or negative
+// value for either retention variable logs a line naming the variable, disables
+// that retention (0), and never fails Load.
+func TestLoadRetentionMalformedLogsAndDisables(t *testing.T) {
+	for _, variable := range []string{"REDIS_STREAM_RETENTION", "REDIS_DLQ_RETENTION"} {
+		for _, value := range []string{"bogus", "-5m", "7d"} {
+			t.Run(variable+"="+value, func(t *testing.T) {
+				setRequiredEnv(t)
+				t.Setenv(variable, value)
+
+				logger, buf := testLogger()
+				cfg, err := Load(logger)
+				if err != nil {
+					t.Fatalf("Load returned error %v, want nil (retention is log-and-disable)", err)
+				}
+				if cfg.StreamRetention != 0 && variable == "REDIS_STREAM_RETENTION" {
+					t.Fatalf("StreamRetention = %v, want 0 (disabled)", cfg.StreamRetention)
+				}
+				if cfg.DLQRetention != 0 && variable == "REDIS_DLQ_RETENTION" {
+					t.Fatalf("DLQRetention = %v, want 0 (disabled)", cfg.DLQRetention)
+				}
+				if !strings.Contains(buf.String(), variable) {
+					t.Fatalf("Load log does not mention %s: %q", variable, buf.String())
+				}
+			})
+		}
 	}
 }
 

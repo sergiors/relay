@@ -18,15 +18,29 @@ import (
 //
 // The required fields name the Redis stream, group, and address the worker
 // consumes; ConsumerName is the resolved hostname identity (see consumerNameFromHost);
-// and the two optional values (StreamRetention, MetricsAddr) are zero when
-// disabled, so gating on non-zero / non-empty keeps them opt-in.
+// and the address values (MetricsAddr, GitWebhookAddr) are empty when disabled,
+// so gating on non-empty keeps them opt-in.
 type Config struct {
-	RedisURI        string
-	RedisStream     string
-	RedisGroup      string
-	ConsumerName    string
+	RedisURI     string
+	RedisStream  string
+	RedisGroup   string
+	ConsumerName string
+	// StreamRetention is the source-stream retention window
+	// (REDIS_STREAM_RETENTION). Unset defaults to DefaultStreamRetention
+	// (24h); an explicitly empty, zero, or negative value disables main-stream
+	// retention (0), and a malformed value logs and disables it. The worker
+	// trims the configured source stream with XTRIM ... ACKED, so entries are
+	// removed only once every consumer group has acknowledged them.
 	StreamRetention time.Duration
-	MetricsAddr     string
+	// DLQRetention is the dead-letter-queue retention window
+	// (REDIS_DLQ_RETENTION). Unset defaults to DefaultDLQRetention (7 days);
+	// an explicitly empty, zero, or negative value disables DLQ retention (0),
+	// and a malformed value logs and disables it. Unlike StreamRetention this
+	// is AGE-ONLY: the worker trims the Relay-owned DLQ stream with
+	// XTRIM ... MINID ~ (no ACKED mode), because the DLQ has no consumer group,
+	// PEL, or XACK flow to protect.
+	DLQRetention time.Duration
+	MetricsAddr  string
 	// GitWebhookAddr is the address for the GitHub webhook server
 	// (POST /github) that triggers an automatic git sync on matching pushes.
 	// Like MetricsAddr it is opt-in via the GIT_WEBHOOK_ADDR environment
@@ -128,6 +142,20 @@ const (
 	// default is only a fallback for direct NewManager callers; the worker
 	// always passes config's resolved value.
 	DefaultWarmContainerIdleTimeout = 5 * time.Minute
+	// DefaultStreamRetention is the source-stream retention window applied when
+	// REDIS_STREAM_RETENTION is UNSET. An explicitly empty value still disables
+	// retention (see StreamRetention), preserving the historical opt-out. The
+	// source trim uses XTRIM ... ACKED, so the default is safe on a shared
+	// stream: an entry is removed only once every consumer group has
+	// acknowledged it.
+	DefaultStreamRetention = 24 * time.Hour
+	// DefaultDLQRetention is the dead-letter-queue retention window applied when
+	// REDIS_DLQ_RETENTION is UNSET; an explicitly empty value disables it. The
+	// DLQ has no consumer group, so its trim is AGE-ONLY (MINID ~, no ACKED).
+	// Seven days mirrors the schedule outbox's retention and the invocation
+	// state's terminal TTL, so a dead-lettered entry outlives the state that
+	// could replay it.
+	DefaultDLQRetention = 7 * 24 * time.Hour
 )
 
 // Load reads Relay's configuration from the environment and returns a Config and
@@ -146,15 +174,18 @@ const (
 // The required REDIS_* variables must be non-empty or Load returns an error (see
 // requiredEnv); the consumer name is hostname-resolved via consumerNameFromHost.
 // The optional variables are read with os.Getenv and stay zero/empty when
-// unset: retention maps to 0 (disabled, see parseRetention) and the metrics
-// and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR) to "" (no HTTP
-// server), preserving their opt-in semantics through the caller's non-zero /
-// non-empty guards. MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
+// unset: the metrics and git-webhook addresses (METRICS_ADDR, GIT_WEBHOOK_ADDR)
+// stay "" (no HTTP server), preserving their opt-in semantics through the
+// caller's non-empty guards. The two retention windows are the exception to the
+// "zero when unset" rule: REDIS_STREAM_RETENTION defaults to
+// DefaultStreamRetention (24h) and REDIS_DLQ_RETENTION to DefaultDLQRetention (7
+// days) when UNSET, while an explicitly empty value disables the respective
+// retention (0). MAX_CONCURRENCY and MAX_BUFFERED_EVENTS
 // default to 8 and 16 respectively (see ParsePositiveInt); MAX_EVENT_BYTES
 // defaults to 262144 with a hard ceiling of 1048576 (see ParseMaxEventBytes);
 // an invalid (zero, negative, non-integer, or above-limit) value is a returned
-// configuration error. The only value that still logs-and-disables rather than
-// failing is the optional REDIS_STREAM_RETENTION window.
+// configuration error. The retention windows instead log-and-disable rather
+// than failing startup.
 func Load(logger *slog.Logger) (Config, error) {
 	var cfg Config
 
@@ -182,9 +213,12 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.ConsumerName = consumer
 
-	// REDIS_STREAM_RETENTION is the one optional knob that degrades rather than
-	// fails: parseRetention logs and returns 0 (disabled) for a bad value.
-	cfg.StreamRetention = parseRetention(logger, getEnv("REDIS_STREAM_RETENTION", ""))
+	// Retention windows degrade rather than fail startup: a bad value logs and
+	// disables the respective retention. The unset-vs-empty distinction is
+	// deliberate — UNSET applies the documented default, while an explicitly
+	// empty value keeps the historical opt-out (disabled).
+	cfg.StreamRetention = retentionEnv(logger, "REDIS_STREAM_RETENTION", DefaultStreamRetention)
+	cfg.DLQRetention = retentionEnv(logger, "REDIS_DLQ_RETENTION", DefaultDLQRetention)
 	cfg.MetricsAddr = getEnv("METRICS_ADDR", "")
 	cfg.GitWebhookAddr = getEnv("GIT_WEBHOOK_ADDR", "")
 
@@ -420,26 +454,42 @@ func loadLogLevel(value string) (slog.Level, error) {
 	return ParseLogLevel(value)
 }
 
-// parseRetention parses a stream-retention window from REDIS_STREAM_RETENTION
-// (passed as value). It returns 0 when value is unset or empty, which disables
-// stream retention entirely (no goroutine, no trims). A malformed duration or a
-// zero/negative value is logged and retention is disabled (0): a bad
-// REDIS_STREAM_RETENTION therefore logs and disables retention rather than
-// failing startup. This is a deliberate change — a typo in one optional
+// retentionEnv resolves a retention window from the environment variable name.
+// Unlike getEnv it distinguishes UNSET from explicitly empty: UNSET returns
+// defaultWindow (the documented default), while an explicitly set value — empty
+// included — is parsed by parseRetention, where empty/zero/negative disables
+// retention (0). This preserves the historical opt-out: setting the variable to
+// an empty string still turns retention off, while leaving it unset keeps the
+// default on by default.
+func retentionEnv(logger *slog.Logger, name string, defaultWindow time.Duration) time.Duration {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return defaultWindow
+	}
+	return parseRetention(logger, name, value)
+}
+
+// parseRetention parses a stream-retention window from the environment variable
+// name (passed as value). It returns 0 when value is empty or whitespace-only,
+// which disables retention entirely (no goroutine, no trims). A malformed
+// duration or a zero/negative value is logged (naming the variable) and
+// retention is disabled (0): a bad retention value therefore logs and disables
+// rather than failing startup. This is deliberate — a typo in one optional
 // variable must not take down the worker; the operator sees the log line and
-// the retained (disabled) behavior. The value carries no credentials, so
-// echoing it in the log line is safe.
-func parseRetention(logger *slog.Logger, value string) time.Duration {
-	if value == "" {
+// the disabled behavior. The value carries no credentials, so echoing it in the
+// log line is safe. The same helper serves REDIS_STREAM_RETENTION and
+// REDIS_DLQ_RETENTION; only the caller's unset default differs.
+func parseRetention(logger *slog.Logger, name, value string) time.Duration {
+	if strings.TrimSpace(value) == "" {
 		return 0
 	}
 	d, err := time.ParseDuration(value)
 	if err != nil {
-		logger.Warn("Redis: invalid REDIS_STREAM_RETENTION; retention disabled", "value", value, "error", err)
+		logger.Warn("Redis: invalid retention window; retention disabled", "variable", name, "value", value, "error", err)
 		return 0
 	}
 	if d <= 0 {
-		logger.Warn("Redis: REDIS_STREAM_RETENTION must be positive; retention disabled", "value", value)
+		logger.Warn("Redis: retention window must be positive; retention disabled", "variable", name, "value", value)
 		return 0
 	}
 	return d

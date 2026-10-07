@@ -923,19 +923,35 @@ func Run(logger *slog.Logger) error {
 	}()
 
 	// Optional internal stream retention (cfg.StreamRetention from
-	// REDIS_STREAM_RETENTION): a single goroutine periodically trims the
+	// REDIS_STREAM_RETENTION, default 24h; unset/empty/zero/negative behavior is
+	// resolved by config.Load): a single goroutine periodically trims the
 	// configured stream with XTRIM MINID ~ ... ACKED so entries older than the
 	// window are removed only once every consumer group has acknowledged them.
-	// Completely separate from ACK/retry/DLQ semantics; a malformed or
-	// non-positive value is logged by config.Load and retention is disabled. On
-	// a server that does not support ACKED (pre-8.2) the loop logs and disables
-	// itself rather than trimming unsafely.
+	// Completely separate from ACK/retry/DLQ semantics. On a server that does not
+	// support ACKED (pre-8.2) the loop logs and disables itself rather than
+	// trimming unsafely.
 	if cfg.StreamRetention > 0 {
 		retentionDone := make(chan struct{})
 		loopDones = append(loopDones, retentionDone)
 		go func() {
 			defer close(retentionDone)
 			retentionLoop(ctx, client, cfg.RedisStream, cfg.StreamRetention, logger)
+		}()
+	}
+
+	// Optional DLQ retention (cfg.DLQRetention from REDIS_DLQ_RETENTION, default
+	// 7 days; unset/empty/zero/negative behavior is resolved by config.Load): a
+	// separate goroutine age-trims ONLY the Relay-owned DLQ stream derived from
+	// the configured source (stream.DLQStreamFor) with a mode-less
+	// XTRIM MINID ~. The DLQ has no consumer group, PEL, or XACK, so it needs no
+	// ACKED mode and is independent of the main stream's capability. This never
+	// touches the source stream and never affects ACK-before-DLQ ordering.
+	if cfg.DLQRetention > 0 {
+		dlqRetentionDone := make(chan struct{})
+		loopDones = append(loopDones, dlqRetentionDone)
+		go func() {
+			defer close(dlqRetentionDone)
+			dlqRetentionLoop(ctx, client, stream.DLQStreamFor(cfg.RedisStream), cfg.DLQRetention, logger)
 		}()
 	}
 

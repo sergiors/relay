@@ -10,6 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"relay/internal/stream"
 	"relay/internal/testutil"
 )
 
@@ -268,6 +269,288 @@ func TestIntegrationRetentionAckedMultipleGroups(t *testing.T) {
 	if len(msgs) == 0 || msgs[len(msgs)-1].ID != recentID {
 		t.Fatalf("recent entry must remain; got %v", firstID(msgs))
 	}
+}
+
+// TestIntegrationDLQRetentionTrimsOldEntries verifies the age-only DLQ trim
+// against a real Redis: entries older than the window are removed and a recent
+// entry survives, with NO consumer group, XACK, or PEL involved. The DLQ key is
+// derived via stream.DLQStreamFor so the target matches the runtime helper.
+//
+// The DLQ trim is mode-less (no ACKED), so this test deliberately does NOT call
+// requireAckedTrimMode: DLQ retention must work on a server that disables main
+// retention.
+func TestIntegrationDLQRetentionTrimsOldEntries(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	t.Cleanup(func() { _ = cli.Close() })
+
+	ctx := context.Background()
+	source := fmt.Sprintf("relay:dlqretention-src:%d", time.Now().UnixNano())
+	dlq := stream.DLQStreamFor(source)
+	t.Cleanup(func() {
+		_ = cli.Del(ctx, source).Err()
+		_ = cli.Del(ctx, dlq).Err()
+	})
+
+	now := time.Now()
+	oldMillis := now.Add(-2 * time.Hour).UnixMilli()
+	recentMillis := now.Add(-time.Second).UnixMilli()
+
+	// One full old node (so "~" can drop it) plus a recent entry. No group is
+	// created and nothing is acked — the DLQ has no PEL to protect.
+	const oldCount = 100
+	for i := 0; i < oldCount; i++ {
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{
+			Stream: dlq,
+			ID:     fmt.Sprintf("%d-%d", oldMillis, i+1),
+			Values: map[string]any{"reason": "old"},
+		}).Result(); err != nil {
+			t.Fatalf("xadd old %d: %v", i, err)
+		}
+	}
+	recentID := fmt.Sprintf("%d-1", recentMillis)
+	if _, err := cli.XAdd(ctx, &redis.XAddArgs{
+		Stream: dlq,
+		ID:     recentID,
+		Values: map[string]any{"reason": "recent"},
+	}).Result(); err != nil {
+		t.Fatalf("xadd recent: %v", err)
+	}
+
+	dlqRetentionTick(ctx, cli, dlq, time.Hour, time.Now, testutil.DiscardLogger())
+
+	msgs, err := cli.XRange(ctx, dlq, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("xrange len = %d, want 1 (old entries trimmed, recent remains): %+v", len(msgs), msgs)
+	}
+	if msgs[0].ID != recentID {
+		t.Fatalf("remaining DLQ entry = %q, want recent %s", msgs[0].ID, recentID)
+	}
+}
+
+// TestIntegrationDLQRetentionIgnoresPendingPEL proves the DLQ trim is age-only
+// and does NOT depend on XACK or PEL clearance, unlike the ACKED main-stream
+// trim. It stands up a synthetic consumer group that reads an entire old stream
+// node into its PEL and never acknowledges it, then age-trims with a
+// deterministic 1h cutoff. The old node must be removed even though the pending
+// references are still outstanding (XPENDING count stays at the unacked count),
+// while the recent entry survives. This is intentionally the opposite of the
+// main-stream ACKED contract (see TestIntegrationRetentionAckedProtectsPending),
+// where a pending reference blocks the trim.
+//
+// The trim is mode-less (no ACKED token), so this test deliberately does NOT
+// call requireAckedTrimMode: it is meaningful on every Redis that supports
+// XTRIM MINID ~, including the 7.x line that rejects ACKED.
+func TestIntegrationDLQRetentionIgnoresPendingPEL(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	t.Cleanup(func() { _ = cli.Close() })
+
+	ctx := context.Background()
+	source := fmt.Sprintf("relay:dlqretention-pel-src:%d", time.Now().UnixNano())
+	dlq := stream.DLQStreamFor(source)
+	group := dlq + "-group"
+	t.Cleanup(func() {
+		// Deleting the stream also drops its consumer group and PEL.
+		_ = cli.Del(ctx, dlq).Err()
+		_ = cli.Del(ctx, source).Err()
+	})
+
+	// Deterministic cutoff: `now` is injected into dlqRetentionTick, so the
+	// cutoff is now-1h regardless of wall-clock time.
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	oldMillis := now.Add(-2 * time.Hour).UnixMilli()
+	recentMillis := now.Add(-time.Second).UnixMilli()
+
+	// One full old node (so "~" can drop it) plus a recent entry, mirroring the
+	// existing age-trim case.
+	const oldCount = 100
+	for i := 0; i < oldCount; i++ {
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{
+			Stream: dlq,
+			ID:     fmt.Sprintf("%d-%d", oldMillis, i+1),
+			Values: map[string]any{"reason": "old"},
+		}).Result(); err != nil {
+			t.Fatalf("xadd old %d: %v", i, err)
+		}
+	}
+	recentID := fmt.Sprintf("%d-1", recentMillis)
+	if _, err := cli.XAdd(ctx, &redis.XAddArgs{
+		Stream: dlq,
+		ID:     recentID,
+		Values: map[string]any{"reason": "recent"},
+	}).Result(); err != nil {
+		t.Fatalf("xadd recent: %v", err)
+	}
+
+	// Read the whole old node into the PEL and never acknowledge it.
+	if err := cli.XGroupCreateMkStream(ctx, dlq, group, "0").Err(); err != nil {
+		t.Fatalf("xgroup create: %v", err)
+	}
+	if _, err := cli.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: group, Consumer: "c", Streams: []string{dlq, ">"}, Count: oldCount,
+	}).Result(); err != nil {
+		t.Fatalf("xreadgroup: %v", err)
+	}
+	before, err := cli.XPending(ctx, dlq, group).Result()
+	if err != nil {
+		t.Fatalf("xpending before: %v", err)
+	}
+	if before.Count != oldCount {
+		t.Fatalf("pending before trim = %d, want %d (old node read but unacked)", before.Count, oldCount)
+	}
+
+	// Age-only trim with a 1h window: the unacked old node is still past the
+	// cutoff and must be removed; the PEL must not protect it.
+	dlqRetentionTick(ctx, cli, dlq, time.Hour, func() time.Time { return now }, testutil.DiscardLogger())
+
+	msgs, err := cli.XRange(ctx, dlq, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("xrange len = %d, want 1 (unacked old node trimmed, recent remains): %+v", len(msgs), msgs)
+	}
+	if msgs[0].ID != recentID {
+		t.Fatalf("remaining DLQ entry = %q, want recent %s", msgs[0].ID, recentID)
+	}
+
+	// The references survive the trim as dangling PEL entries: the trim ignored
+	// them rather than clearing or waiting on them.
+	after, err := cli.XPending(ctx, dlq, group).Result()
+	if err != nil {
+		t.Fatalf("xpending after: %v", err)
+	}
+	if after.Count <= 0 {
+		t.Fatalf("pending references after trim = %d, want > 0 (trim must not clear the PEL)", after.Count)
+	}
+}
+
+// TestIntegrationDLQRetentionMissingStream pins that the DLQ trim tolerates an
+// absent key: Redis returns 0 removed with no error, and the retention loop path
+// must neither error nor create the stream. This is the explicit missing-key
+// case the age-trim loop relies on (a worker with no exhausted invocations has
+// no DLQ stream at all).
+func TestIntegrationDLQRetentionMissingStream(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	t.Cleanup(func() { _ = cli.Close() })
+
+	ctx := context.Background()
+	missing := stream.DLQStreamFor(fmt.Sprintf("relay:dlqretention-missing-src:%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = cli.Del(ctx, missing).Err() })
+
+	if exists, err := cli.Exists(ctx, missing).Result(); err != nil {
+		t.Fatalf("exists: %v", err)
+	} else if exists != 0 {
+		t.Fatalf("precondition: key %s must not exist", missing)
+	}
+
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	cutoff := retentionCutoffID(now.Add(-time.Hour))
+
+	n, err := trimDLQStream(ctx, cli, missing, cutoff)
+	if err != nil {
+		t.Fatalf("trimDLQStream on an absent key must not error: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("trimDLQStream on an absent key removed %d entries, want 0", n)
+	}
+
+	// The loop entry point must tolerate the same absent key and must not
+	// materialize the stream as a side effect.
+	dlqRetentionTick(ctx, cli, missing, time.Hour, func() time.Time { return now }, testutil.DiscardLogger())
+	if exists, err := cli.Exists(ctx, missing).Result(); err != nil {
+		t.Fatalf("exists after tick: %v", err)
+	} else if exists != 0 {
+		t.Fatalf("DLQ retention must not create an absent stream")
+	}
+}
+
+// TestIntegrationDLQRetentionTargetIsolation verifies the two retention loops
+// target disjoint streams: an ACKED main-stream trim (retentionTick) leaves the
+// DLQ untouched, and an age-only DLQ trim (dlqRetentionTick) leaves the source
+// untouched. Both streams get one full old node plus a recent entry; after the
+// main trim only the source's old node is gone, and after the DLQ trim only the
+// DLQ's old node is gone.
+func TestIntegrationDLQRetentionTargetIsolation(t *testing.T) {
+	cli := testutil.RequireRedis(t)
+	t.Cleanup(func() { _ = cli.Close() })
+	requireAckedTrimMode(t, cli)
+
+	ctx := context.Background()
+	source := fmt.Sprintf("relay:retention-isolation:%d", time.Now().UnixNano())
+	dlq := stream.DLQStreamFor(source)
+	t.Cleanup(func() {
+		_ = cli.Del(ctx, source).Err()
+		_ = cli.Del(ctx, dlq).Err()
+	})
+
+	now := time.Now()
+	oldMillis := now.Add(-2 * time.Hour).UnixMilli()
+	recentMillis := now.Add(-time.Second).UnixMilli()
+
+	fill := func(key string) (oldFirst, recent string) {
+		const nodeSize = 100
+		for i := 0; i < nodeSize; i++ {
+			id := fmt.Sprintf("%d-%d", oldMillis, i+1)
+			if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: key, ID: id, Values: map[string]any{"v": "old"}}).Result(); err != nil {
+				t.Fatalf("xadd old %s %d: %v", key, i, err)
+			}
+			if i == 0 {
+				oldFirst = id
+			}
+		}
+		recent = fmt.Sprintf("%d-1", recentMillis)
+		if _, err := cli.XAdd(ctx, &redis.XAddArgs{Stream: key, ID: recent, Values: map[string]any{"v": "recent"}}).Result(); err != nil {
+			t.Fatalf("xadd recent %s: %v", key, err)
+		}
+		return oldFirst, recent
+	}
+
+	srcOldFirst, srcRecent := fill(source)
+	dlqOldFirst, dlqRecent := fill(dlq)
+
+	// Main trim: source old node removed, source recent retained, DLQ untouched.
+	if err := retentionTick(ctx, cli, source, time.Hour, time.Now, testutil.DiscardLogger()); err != nil {
+		t.Fatalf("retentionTick: %v", err)
+	}
+	if hasID(t, cli, source, srcOldFirst) {
+		t.Fatalf("main trim must remove source old entry %s", srcOldFirst)
+	}
+	if !hasID(t, cli, source, srcRecent) {
+		t.Fatalf("main trim must retain source recent entry %s", srcRecent)
+	}
+	if !hasID(t, cli, dlq, dlqOldFirst) {
+		t.Fatalf("main trim must NOT touch the DLQ (old entry %s)", dlqOldFirst)
+	}
+
+	// DLQ trim: DLQ old node removed, DLQ recent retained, source untouched.
+	dlqRetentionTick(ctx, cli, dlq, time.Hour, time.Now, testutil.DiscardLogger())
+	if hasID(t, cli, dlq, dlqOldFirst) {
+		t.Fatalf("DLQ trim must remove DLQ old entry %s", dlqOldFirst)
+	}
+	if !hasID(t, cli, dlq, dlqRecent) {
+		t.Fatalf("DLQ trim must retain DLQ recent entry %s", dlqRecent)
+	}
+	if !hasID(t, cli, source, srcRecent) {
+		t.Fatalf("DLQ trim must NOT touch the source recent entry %s", srcRecent)
+	}
+}
+
+// hasID reports whether the stream key currently contains an entry with id.
+func hasID(t *testing.T, cli *redis.Client, key, id string) bool {
+	t.Helper()
+	msgs, err := cli.XRange(context.Background(), key, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange %s: %v", key, err)
+	}
+	for _, m := range msgs {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // firstID returns the ID of the first message or "" for an empty slice; a small

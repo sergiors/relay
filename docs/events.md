@@ -230,10 +230,17 @@ exhausted invocation**, so an external event matching several apps or handlers
 that all exhaust produces one correctly-attributed entry each. Scheduled
 occurrence functions use this shared invocation/DLQ infrastructure.
 
-- The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key).
+- The DLQ stream is `relay:<REDIS_STREAM>:dlq` (a Relay-owned `relay:` key). It
+  has no consumer group, PEL, or XACK flow: entries are written once and read
+  only by the admin `relay dlq` commands.
 - Entries are written **before** the XACK. If a write fails, the original stays
   pending and the exhausted invocation is skipped and re-reported on redelivery,
   so the message is re-routed rather than acknowledged without an entry.
+- The DLQ is trimmed **age-only** by `REDIS_DLQ_RETENTION` (default 7 days, an
+  `XTRIM <dlq> MINID ~` with no `ACKED` mode and no group/XACK dependency). This
+  is separate from the source stream's `REDIS_STREAM_RETENTION` ACKED trim; the
+  two target disjoint keys. See
+  [configuration.md](configuration.md#stream-and-dlq-retention).
 - Idempotency without scanning: once an invocation's entry is persisted its
   marker becomes `exhausted:<attempt>:<token>:dlq`, so a redelivery skips the
   entries already written and writes only the missing ones.

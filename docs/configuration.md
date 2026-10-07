@@ -22,22 +22,23 @@ automatically.
 
 ## Optional
 
-| Variable                      | Default | Format / accepted values                                                | Behavior when invalid                                                                                                                                 |
-| ----------------------------- | ------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LOG_LEVEL`                   | `INFO`  | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                         |
-| `MAX_CONCURRENCY`             | `8`     | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                          |
-| `MAX_BUFFERED_EVENTS`         | `16`    | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                           |
-| `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)          | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary. |
-| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`    | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                        |
-| `METRICS_ADDR`                | unset   | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                           |
-| `GIT_WEBHOOK_ADDR`            | unset   | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                              |
-| `NETWORKS`                    | unset   | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
-| `REDIS_STREAM_RETENTION`      | unset   | Go duration (`6h`)                                                      | The one optional value that **logs and disables** instead of failing. See below.                                                                      |
-| `TRAEFIK_NETWORK`             | unset   | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                               |
-| `TRAEFIK_ENTRYPOINTS`         | unset   | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`) | Passed through verbatim into the router label; no default.                                                                                            |
-| `TRAEFIK_CERTRESOLVER`        | unset   | resolver name (`letsencrypt`)                                           | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                            |
-| `TRAEFIK_PRIORITY`            | unset   | positive integer                                                        | Any provided value must be positive (a fatal error otherwise); unset omits the label.                                                                 |
-| `TRAEFIK_HOST_OVERRIDE`       | unset   | hostname suffix (`localhost`)                                           | Replaces the domain of each routed host, keeping its left-most label (`issuer.example.com` → `issuer.localhost`). Unset uses declared hosts verbatim. |
+| Variable                      | Default            | Format / accepted values                                                | Behavior when invalid                                                                                                                                                                                                       |
+| ----------------------------- | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`                   | `INFO`             | `DEBUG`, `INFO`, `WARN`, `ERROR` (case-insensitive, trimmed)            | Fails startup. `WARNING` is **not** an alias.                                                                                                                                                                               |
+| `MAX_CONCURRENCY`             | `8`                | positive integer                                                        | Fails startup. Bounds concurrent invocations **per worker**.                                                                                                                                                                |
+| `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
+| `MAX_EVENT_BYTES`             | `262144` (256 KiB) | positive integer bytes, hard max `1048576` (1 MiB)                      | Fails startup on zero/negative/non-integer/>1 MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                                |
+| `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
+| `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
+| `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
+| `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
+| `REDIS_STREAM_RETENTION`      | `24h`              | Go duration (`6h`, `90m`)                                               | The optional value that **logs and disables** instead of failing. See below.                                                                                                                                                |
+| `REDIS_DLQ_RETENTION`         | `7d` (`168h`)      | Go duration (`168h`, `90m`)                                             | The optional value that **logs and disables** instead of failing. Age-only DLQ trim. See below.                                                                                                                             |
+| `TRAEFIK_NETWORK`             | unset              | Docker network name                                                     | Required only when a service declares `host`; verified on every routed reconcile and joined in addition to `NETWORKS`.                                                                                                      |
+| `TRAEFIK_ENTRYPOINTS`         | unset              | comma-separated Traefik entrypoint names (`websecure`, `web,websecure`) | Passed through verbatim into the router label; no default.                                                                                                                                                                  |
+| `TRAEFIK_CERTRESOLVER`        | unset              | resolver name (`letsencrypt`)                                           | When set, adds both `tls=true` and `tls.certresolver`; unset adds neither.                                                                                                                                                  |
+| `TRAEFIK_PRIORITY`            | unset              | positive integer                                                        | Any provided value must be positive (a fatal error otherwise); unset omits the label.                                                                                                                                       |
+| `TRAEFIK_HOST_OVERRIDE`       | unset              | hostname suffix (`localhost`)                                           | Replaces the domain of each routed host, keeping its left-most label (`issuer.example.com` → `issuer.localhost`). Unset uses declared hosts verbatim.                                                                       |
 
 `METRICS_ADDR`, `GIT_WEBHOOK_ADDR`, and the `TRAEFIK_*` values are read only by
 the worker; the read-only admin commands that don't need Redis still call
@@ -91,11 +92,17 @@ value requires a worker restart.
 raw transport forwarded verbatim at every level, independent of `LOG_LEVEL`.
 Fatal startup failures always log regardless of the configured level.
 
-### Stream retention
+### Stream and DLQ retention
 
-`REDIS_STREAM_RETENTION` is opt-in. When set, a single goroutine inside
-`relay start` periodically trims the stream with
-`XTRIM <stream> MINID ~ <cutoff> ACKED`, where `<cutoff>` is
+Two independent retention windows trim two different streams. Both are **Go
+durations** parsed with `time.ParseDuration`; there is no day suffix (`7d` is
+**not** valid), so a 7-day override is written `168h`. Both are startup
+configuration (restart to change) and neither affects ACK, retry, DLQ routing,
+or the scheduler/outbox.
+
+`REDIS_STREAM_RETENTION` (default `24h`) drives the main stream trim. A single
+goroutine inside `relay start` periodically trims the configured source stream
+with `XTRIM <stream> MINID ~ <cutoff> ACKED`, where `<cutoff>` is
 `<now - retention>` in Unix milliseconds.
 
 - The tick interval is derived automatically from the window (`retention / 24`,
@@ -103,12 +110,44 @@ Fatal startup failures always log regardless of the configured level.
 - The trim is approximate (`~`) and runs in **`ACKED`** mode, not the Redis
   default `KEEPREF`: an entry is removed only once **every** consumer group on
   the stream has read and acknowledged it. A group that never drains therefore
-  blocks trimming of the range it covers (the safe direction).
+  blocks trimming of the range it covers (the safe direction); pending entries
+  and unread current groups are protected.
 - **Requires Redis 8.2+.** On an older server Relay refuses to trim, logs
   `Retention: disabled`, and never falls back to a mode that could evict pending
-  entries.
-- Unset disables retention entirely. A malformed or non-positive value logs and
-  disables retention; it never fails startup.
+  entries. This disables **only** the main stream trim; DLQ retention below is
+  unaffected.
+
+`REDIS_DLQ_RETENTION` (default `7d`, i.e. `168h`) drives the DLQ trim. The
+Relay-owned `relay:<REDIS_STREAM>:dlq` stream has **no consumer group, PEL, or
+XACK flow**, so it is trimmed **age-only**:
+
+- A separate goroutine trims **only** that DLQ key with
+  `XTRIM <dlq> MINID ~ <cutoff>` — no `ACKED` (or any) mode token — so it works
+  on every Redis that supports `XTRIM MINID ~` and does not depend on the
+  server's `ACKED` support.
+- The cutoff and derived tick cadence are the same as the main stream
+  (`<now - retention>`, `retention / 24` clamped to `[1m, 1h]`).
+- This is a bounded failure-history window, **not** a per-entry TTL and not a
+  replay guarantee: a DLQ entry older than the window is removed whether or not
+  anyone inspected or replayed it. `relay dlq ls|inspect|replay|rm` still work on
+  what remains.
+- The two trims target disjoint keys: the main trim never touches the DLQ and
+  the DLQ trim never touches the source. Neither changes ACK-before-DLQ
+  ordering.
+
+**Unset vs. explicitly empty.** For both windows, leaving the variable **unset**
+applies the documented default (`24h` / `168h`); setting it to an **empty**
+(or whitespace-only) string (`REDIS_STREAM_RETENTION=`) disables that retention
+(`0`). A malformed value and an explicit `0` or negative value log a line naming
+the variable and disable that retention; **retention values never fail
+startup**.
+
+```bash
+REDIS_STREAM_RETENTION=6h          # trim the source stream (ACKED)
+REDIS_DLQ_RETENTION=168h          # trim the DLQ after 7 days (age-only)
+REDIS_STREAM_RETENTION=          # disable source retention
+REDIS_DLQ_RETENTION=             # disable DLQ retention
+```
 
 ## Environment owned by other libraries
 
