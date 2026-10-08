@@ -49,8 +49,21 @@ func (m *Manager) buildContext() (context.Context, context.CancelFunc) {
 
 // renderDockerfile is the ONLY Dockerfile renderer, shared by every engine; an
 // engine must express its concerns as plan data rather than generate a
-// Dockerfile. It emits FROM/WORKDIR/COPY/RUN/USER/ENTRYPOINT from the plan.
+// Dockerfile. It emits FROM/WORKDIR/COPY/RUN/USER/ENTRYPOINT from the plan, with
+// the app source copied into WorkDir (the historical baked-source image).
 func renderDockerfile(p plan.BuildPlan) string {
+	return renderDockerfileWithSource(p, true)
+}
+
+// renderDockerfileWithSource is renderDockerfile with the source COPY made
+// optional. copySource is false for a SOURCE_MOUNT app image: the app's live
+// source is bind-mounted at runtime instead of being copied, so the generated
+// plan files (the bootstrap, an injected package.json) and the install/user/
+// entrypoint steps are emitted exactly as before but the `COPY . WorkDir` line
+// is omitted. The build context still contains the selected source (it is the
+// same immutable snapshot the fingerprint was derived from), so the tag and the
+// mounted tree can never describe different bytes.
+func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) string {
 	var b strings.Builder
 
 	b.WriteString("FROM " + p.BaseImage + "\n")
@@ -59,11 +72,13 @@ func renderDockerfile(p plan.BuildPlan) string {
 	}
 
 	// App sources are copied into WorkDir.
-	dest := p.WorkDir
-	if dest == "" {
-		dest = "/"
+	if copySource {
+		dest := p.WorkDir
+		if dest == "" {
+			dest = "/"
+		}
+		b.WriteString("COPY . " + dest + "\n")
 	}
-	b.WriteString("COPY . " + dest + "\n")
 
 	// The builder mirrors each file's absolute Path into a relative context path
 	// (leading '/' stripped), so COPY sources that same relative path and writes
@@ -121,6 +136,11 @@ func quoteEntrypointJSON(args []string) string {
 	return b.String()
 }
 
+// buildImage stages one app image from the immutable source snapshot and the
+// engine's build plan. copySource is true for the historical baked-source image
+// and false for a SOURCE_MOUNT app image, whose live source is bind-mounted at
+// runtime instead of copied; either way the generated plan files and the build
+// context come from the one captured snapshot.
 func buildImage(
 	ctx context.Context,
 	cli *client.Client,
@@ -131,6 +151,7 @@ func buildImage(
 	labels map[string]string,
 	snapshot *app.SourceSnapshot,
 	reg *metrics.Registry,
+	copySource bool,
 ) error {
 	// snapshot is the SINGLE immutable read the caller already fingerprinted: the
 	// image is staged from exactly the bytes its tag was derived from, so a
@@ -156,7 +177,7 @@ func buildImage(
 		return err
 	}
 
-	dockerfile := renderDockerfile(p)
+	dockerfile := renderDockerfileWithSource(p, copySource)
 	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return fmt.Errorf("app %q: write dockerfile: %w", name, err)
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
@@ -127,11 +128,23 @@ func startExecutionContainer(
 	networks []string,
 	limits app.ResourceLimits,
 	meta RunMeta,
+	workDir string,
+	mounts ...mount.Mount,
 ) (*executionContainer, error) {
+	hostConfig := hardenedHostConfig(true, limits)
+	// A SOURCE_MOUNT app mounts its live source read-only at the engine workdir
+	// (managed by the caller). An empty list is the historical no-mount shape.
+	if len(mounts) > 0 {
+		hostConfig.Mounts = mounts
+	}
 	createOps := client.ContainerCreateOptions{
 		Config: &container.Config{
 			Image: image,
 			Env:   env,
+			// workDir is the SOURCE_MOUNT app root (Node's /app/src) so
+			// process.cwd() and relative filesystem operations see the app's
+			// source; empty preserves the image WORKDIR (/app) exactly.
+			WorkingDir: workDir,
 			// OpenStdin stays true; StdinOnce must be FALSE — the container is
 			// reused across invocations, so stdin must stay open for its
 			// lifetime and must not be auto-closed after the daemon sees one
@@ -150,8 +163,9 @@ func startExecutionContainer(
 		// running. The read-only rootfs, dropped caps, bounded /tmp tmpfs, and
 		// non-root user baked into the image are identical to the one-shot
 		// containers; only the memory/CPU/pids limits follow the app's
-		// effective resource configuration.
-		HostConfig: hardenedHostConfig(true, limits),
+		// effective resource configuration. The optional SOURCE_MOUNT bind is
+		// read-only and adds no writable surface.
+		HostConfig: hostConfig,
 	}
 	if endpoints := executionEndpoints(networks); len(endpoints) > 0 {
 		createOps.NetworkingConfig = &network.NetworkingConfig{EndpointsConfig: endpoints}

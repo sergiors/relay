@@ -450,6 +450,219 @@ func TestPlanTSWithTsconfig(t *testing.T) {
 	}
 }
 
+// TestPlanSourceMountedPersistsEsbuildAndMountsSource pins the SOURCE_MOUNT
+// Node plan: no source is baked, the pinned esbuild is installed PERSISTENTLY
+// (never removed) so the bootstrap can bundle TypeScript at container startup,
+// the live source is mounted at the DISTINCT SourceMountTarget (/app/src, so
+// /app/node_modules stays visible), and the bootstrap ENTRYPOINT carries the
+// --source-mount flag. A mixed JS+TS handler set produces no build-time bundle.
+func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "src/order.ts", "export function handler(e) {}\n")
+	writeSource(t, dir, "src/plain.js", "export function handler(e) {}\n")
+	// A host node_modules triggers the bounded node_modules mask (the path Docker
+	// can mount over because the bind carries it).
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatalf("mkdir node_modules: %v", err)
+	}
+
+	spec := specByName(t, "node24")
+	spec.SourceMounted = true
+	p, err := Engine{}.Plan(spec, dir, []string{"src.order", "src.plain"})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p.WorkDir != "/app" {
+		t.Errorf("work dir = %q, want /app", p.WorkDir)
+	}
+	if p.SourceMountTarget != SourceMountTarget || p.SourceMountTarget == "/app" {
+		t.Fatalf("source mount target = %q, want %q (distinct from /app)", p.SourceMountTarget, SourceMountTarget)
+	}
+	if p.SourceMountWorkDir != SourceMountTarget {
+		t.Errorf("source mount work dir = %q, want %q (the app root, so cwd sees the source)", p.SourceMountWorkDir, SourceMountTarget)
+	}
+	if len(p.SourceMountMasks) != 1 || p.SourceMountMasks[0] != SourceMountNodeModules {
+		t.Errorf("source mount masks = %v, want [%s] (host node_modules must not shadow the dependency image)", p.SourceMountMasks, SourceMountNodeModules)
+	}
+	if SourceMountNodeModules != SourceMountTarget+"/node_modules" {
+		t.Fatalf("mask %q must be the node_modules under the mount target %q", SourceMountNodeModules, SourceMountTarget)
+	}
+	if len(p.Entrypoint) != 3 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" || p.Entrypoint[2] != sourceMountFlag {
+		t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs %s]", p.Entrypoint, sourceMountFlag)
+	}
+	if len(p.Install) != 2 {
+		t.Fatalf("Install = %v, want the managed OTel install plus one persistent esbuild install", p.Install)
+	}
+	if !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
+		t.Errorf("Install[0] = %q, want the managed OTel API install", p.Install[0])
+	}
+	esb := p.Install[1]
+	for _, want := range []string{
+		"npm install --prefix /relay/esbuild",
+		"esbuild@" + esbuildVersion,
+		"--cache /tmp/relay-npm-cache",
+		"rm -rf /tmp/relay-npm-cache",
+	} {
+		if !strings.Contains(esb, want) {
+			t.Errorf("persistent esbuild install missing %q:\n%s", want, esb)
+		}
+	}
+	// The persistent prefix must NOT be removed (the runtime needs the tool).
+	if strings.Contains(esb, "rm -rf /relay/esbuild") {
+		t.Errorf("persistent esbuild must survive the build:\n%s", esb)
+	}
+	// No build-time transpilation: bundling moved to container startup.
+	if strings.Contains(strings.Join(p.Install, "\n"), "--bundle") {
+		t.Errorf("source-mounted plan must not bundle at build time: %v", p.Install)
+	}
+}
+
+// TestPlanSourceMountedShipsSharedResolveHook pins that a source-mounted Node
+// plan writes the shared ESM resolve hook at ResolveHookPath, while a baked plan
+// never does: a baked image has no mount, and shipping the file would change the
+// baked plan byte-for-byte.
+func TestPlanSourceMountedShipsSharedResolveHook(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
+
+	mounted := specByName(t, "node24")
+	mounted.SourceMounted = true
+	p, err := Engine{}.Plan(mounted, dir, []string{"index"})
+	if err != nil {
+		t.Fatalf("mounted plan: %v", err)
+	}
+	var found bool
+	for _, f := range p.Files {
+		if f.Path == ResolveHookPath {
+			found = true
+			if string(f.Content) != string(ResolveHook) {
+				t.Error("resolve hook plan file content must be the embedded ResolveHook")
+			}
+			if f.Mode != fs.FileMode(0o644) {
+				t.Errorf("resolve hook mode = %v, want 0644", f.Mode)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("mounted plan must include %s", ResolveHookPath)
+	}
+	if ResolveHookPath != "/relay/resolve-hook.mjs" {
+		t.Fatalf("ResolveHookPath = %q, want /relay/resolve-hook.mjs", ResolveHookPath)
+	}
+
+	baked, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	if err != nil {
+		t.Fatalf("baked plan: %v", err)
+	}
+	for _, f := range baked.Files {
+		if f.Path == ResolveHookPath {
+			t.Fatalf("baked plan must NOT include the resolve hook, got %s", f.Path)
+		}
+	}
+}
+
+// TestPlanBakedHasNoSourceMountLayout pins the SOURCE_MOUNT=false invariant: a
+// baked plan declares no work-dir override and no mask, so its rendered
+// Dockerfile and container create shape are byte-for-byte the historical one.
+func TestPlanBakedHasNoSourceMountLayout(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "index.js", "export function handler(e) {}\n")
+	p, err := Engine{}.Plan(specByName(t, "node24"), dir, []string{"index"})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if p.SourceMountTarget != "" || p.SourceMountWorkDir != "" || len(p.SourceMountMasks) != 0 {
+		t.Fatalf("baked plan must declare no source-mount layout, got target=%q workdir=%q masks=%v",
+			p.SourceMountTarget, p.SourceMountWorkDir, p.SourceMountMasks)
+	}
+}
+
+// TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent pins the bounded mask
+// decision: a host node_modules directory yields the single /app/src/node_modules
+// mask (the only path that can shadow the dependency tree), while its absence
+// yields NO mask because Docker cannot create a mountpoint inside the read-only
+// source bind.
+func TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent(t *testing.T) {
+	spec := specByName(t, "node24")
+	spec.SourceMounted = true
+
+	absent := t.TempDir()
+	writeSource(t, absent, "index.js", "export function handler(e) {}\n")
+	p, err := Engine{}.Plan(spec, absent, []string{"index"})
+	if err != nil {
+		t.Fatalf("plan without node_modules: %v", err)
+	}
+	if len(p.SourceMountMasks) != 0 {
+		t.Fatalf("masks = %v, want none when the host has no node_modules", p.SourceMountMasks)
+	}
+
+	present := t.TempDir()
+	writeSource(t, present, "index.js", "export function handler(e) {}\n")
+	if err := os.MkdirAll(filepath.Join(present, "node_modules", "dep"), 0o755); err != nil {
+		t.Fatalf("mkdir node_modules: %v", err)
+	}
+	p, err = Engine{}.Plan(spec, present, []string{"index"})
+	if err != nil {
+		t.Fatalf("plan with node_modules: %v", err)
+	}
+	if len(p.SourceMountMasks) != 1 || p.SourceMountMasks[0] != SourceMountNodeModules {
+		t.Fatalf("masks = %v, want [%s]", p.SourceMountMasks, SourceMountNodeModules)
+	}
+}
+
+// TestPlanSourceMountedDepsUnchanged pins that mount mode changes only the
+// source-carrying concerns: the dependency layer, base image, user setup, and
+// injected ESM package.json are identical to the baked plan, so a dependency
+// manifest change still flows through the normal dependency fingerprint and the
+// app image rebuild.
+func TestPlanSourceMountedDepsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "package.json", `{"type":"module"}`)
+	writeSource(t, dir, "package-lock.json", `{}`)
+
+	baked, err := Engine{}.Plan(specByName(t, "node24"), dir, nil)
+	if err != nil {
+		t.Fatalf("baked plan: %v", err)
+	}
+	spec := specByName(t, "node24")
+	spec.SourceMounted = true
+	mounted, err := Engine{}.Plan(spec, dir, nil)
+	if err != nil {
+		t.Fatalf("mounted plan: %v", err)
+	}
+	if !baked.Deps.Equal(mounted.Deps) {
+		t.Errorf("deps changed under SOURCE_MOUNT: baked %+v mounted %+v", baked.Deps, mounted.Deps)
+	}
+	if baked.BaseImage != mounted.BaseImage {
+		t.Errorf("base image changed under SOURCE_MOUNT: %q -> %q", baked.BaseImage, mounted.BaseImage)
+	}
+	if baked.UserSetup != mounted.UserSetup || baked.User != mounted.User {
+		t.Errorf("user setup changed under SOURCE_MOUNT")
+	}
+}
+
+// TestPlanSourceMountedStillValidatesHandlers pins that mount mode keeps the
+// deterministic build-time module validation: a missing or ambiguous handler
+// still fails Plan, so a source-mounted image never defers the error to every
+// invocation.
+func TestPlanSourceMountedStillValidatesHandlers(t *testing.T) {
+	spec := specByName(t, "node24")
+	spec.SourceMounted = true
+
+	dir := t.TempDir()
+	writeSource(t, dir, "x.ts", "export function handler(e) {}\n")
+	if _, err := (Engine{}).Plan(spec, dir, []string{"missing"}); err == nil {
+		t.Error("expected a missing-module error under SOURCE_MOUNT")
+	}
+
+	ambiguous := t.TempDir()
+	writeSource(t, ambiguous, "x.js", "export function handler(e) {}\n")
+	writeSource(t, ambiguous, "x.ts", "export function handler(e) {}\n")
+	if _, err := (Engine{}).Plan(spec, ambiguous, []string{"x"}); err == nil {
+		t.Error("expected an ambiguity error under SOURCE_MOUNT")
+	}
+}
+
 // TestPlanMultipleHandlersOneInstallDedup pins batching: several TypeScript
 // handlers share exactly one esbuild install, and the caller's sorted+deduped
 // list is compiled in order.

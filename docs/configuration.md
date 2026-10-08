@@ -31,6 +31,7 @@ automatically.
 | `MAX_BUFFERED_EVENTS`         | `16`               | positive integer                                                        | Fails startup. Bounds messages read from Redis and held locally per worker.                                                                                                                                                 |
 | `MAX_EVENT_BYTES`             | `256KiB`           | human-readable binary size (`256B`, `256KiB`, `1MiB`; bare integer bytes accepted) | Fails startup on zero/negative/malformed/decimal-unit/above-1MiB. Byte length of a message's raw `event` value; over-limit messages are non-retryably dead-lettered with a bounded summary.                                |
 | `WARM_CONTAINER_IDLE_TIMEOUT` | `5m`               | positive Go duration (`90s`, `10m`, `1h30m`)                            | Fails startup.                                                                                                                                                                                                              |
+| `SOURCE_MOUNT`                | `false`            | boolean (`1`, `t`, `true`, `0`, `f`, `false`; trimmed)                  | Fails startup on an unparseable value. Bind-mounts the live app source read-only into containers instead of baking it, for runtimes with a mountable dependency layout (Python and Node). See below.                  |
 | `METRICS_ADDR`                | unset              | listen address (`:9090`)                                                | Empty disables the Prometheus endpoint. A bind failure is fatal at startup.                                                                                                                                                 |
 | `GIT_WEBHOOK_ADDR`            | unset              | listen address (`:8081`)                                                | Empty disables the GitHub webhook. A bind failure is fatal. Starts only when the git source also names a webhook secret.                                                                                                    |
 | `NETWORKS`                    | unset              | comma-separated Docker network names                                    | Parsed at startup (trimmed, de-duplicated, declaration order kept). Every name is verified to exist; a missing network fails startup. Applied to execution containers and (as an order-independent set) service containers. |
@@ -156,6 +157,87 @@ fatal configuration error (zero is never read as "unbounded").
 The `relay_runtime_warm_capacity` and `relay_runtime_warm_containers` gauges
 report the configured bound and current usage; `relay_runtime_warm_waits_total`
 counts invocations that had to wait at the bound.
+
+### Source mount
+
+`SOURCE_MOUNT` (default `false`) changes how a runtime-backed app's **source**
+reaches its containers. When enabled, for every runtime with a mountable
+dependency layout — Python, whose dependencies install into the system
+site-packages *outside* the app directory, and Node, whose `node_modules` and
+persisted esbuild live under `/app` while the source is mounted at the distinct
+`/app/src` — Relay builds the app image **without baking the source** and
+bind-mounts the app's live directory read-only into its execution and
+entrypoint-service containers. Python mounts at the engine work directory
+(`/app`); Node mounts at `/app/src` so the bind never hides `/app/node_modules`,
+and its bootstrap bundles any TypeScript handler at container startup with the
+same pinned esbuild the baked build used. It is startup configuration: changing
+it requires a worker restart. `SOURCE_MOUNT=false` preserves the historical
+baked-source image exactly.
+
+Consequences:
+
+- **Source edits do not rebuild.** The app image becomes a function of the
+  runtime, dependencies, bootstrap, and entrypoint only; a source-only change
+  reuses the same image. The reconciler still detects the edit from the source
+  fingerprint and **advances the runtime generation**, so warm execution
+  containers are recycled (idle discarded, busy drained) and entrypoint service
+  replicas are replaced through the normal start-before-stop path — a warm
+  container that had already imported the old modules never serves stale code.
+- **Dependency changes still rebuild.** A changed manifest changes the content
+  addressed dependency image and therefore the app image tag, exactly as before;
+  the dependency lifecycle is unchanged.
+- **Runtime support is per runtime.** Python and Node are mountable, with
+  runtime-specific placements: Python mounts the source at `/app` (its packages
+  live in the system site-packages, outside the mount); Node mounts at `/app/src`
+  so `/app/node_modules` stays visible, resolves handlers from the mount, and
+  transpiles TypeScript at container startup with the pinned esbuild persisted in
+  the image (a JS-only Node app still carries the tool so a JS/TS source edit
+  never changes the image). A runtime whose dependency layout cannot support this
+  keeps the baked image.
+- **Node runs at the app root and never shadows the dependency image.** A
+  source-mounted Node execution or entrypoint-service container runs with
+  `/app/src` as its working directory, so `process.cwd()` and relative paths see
+  the app root. A source-mounted Node image carries a shared resolve hook at
+  `/relay/resolve-hook.mjs`: the invocation bootstrap imports it, and an
+  entrypoint service — which never runs the bootstrap — preloads it with
+  `node --import /relay/resolve-hook.mjs`. The hook re-anchors bare imports and
+  CommonJS requires from the mounted source to the dependency image's
+  `/app/node_modules`, so a host copy can never shadow it. When the host app
+  directory already carries a top-level `node_modules` at preparation time,
+  Relay additionally masks that one bounded path (`/app/src/node_modules`) with
+  an empty, read-only filesystem as best-effort defense-in-depth for resolution
+  paths outside the hook. A host `node_modules` that appears after the app's
+  last preparation (and is excluded from the source fingerprint, e.g. by
+  `.gitignore`) carries no mask, but the preloaded hook still keeps the
+  dependency image authoritative.
+- **The bind path is resolved by the Docker daemon**, not by the Relay
+  process. Relay normally passes the app's directory (e.g. `/apps/foo`), which
+  the daemon resolves on its own host filesystem. When Relay itself runs as a
+  container on the same daemon — the bundled Compose layout, where the host's app
+  tree is bind-mounted at `/apps` inside Relay — Relay instead inspects its own
+  container and maps `/apps/foo` to the inspected mount's host `Source` plus the
+  relative path, so the daemon binds the exact same live tree, read-only. The
+  resolver is conservative: it maps only a path covered by one of Relay's own
+  bind mounts (the most-specific mount wins), it verifies the inspected container
+  really is this Relay before trusting it, and any failure falls back to the plain
+  app directory without mutating app data; the daemon's own source-existence
+  validation remains the final authority. Native-host Relay and any container
+  where no mapping can be established (for example a custom `hostname:`) keep the
+  plain app directory. A daemon on a *remote* host — not the daemon Relay itself
+  runs on — still cannot see Relay's app tree and remains unsupported.
+
+Operational caveats:
+
+- The bind is mounted read-only, and invocation containers already run with a
+  read-only root filesystem and a non-root user; the source must be readable by
+  the container user.
+- The whole app directory is mounted, including `template.yaml`, any `.git`
+  metadata, and files excluded from the build by `.gitignore` (for example a
+  local `.env`). `template.yaml` holds environment *values* and secret
+  *references* (never resolved secret values), which the baked image
+  deliberately omits. Enable `SOURCE_MOUNT` only for app directories you are
+  willing to expose to the handler process and its container.
+- `SOURCE_MOUNT` does not add anything to the application environment.
 
 ### Event size limit
 

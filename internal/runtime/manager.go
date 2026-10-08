@@ -213,6 +213,29 @@ type Manager struct {
 	// pullMu.
 	pullMu     sync.Mutex
 	pullChecks map[string]time.Time
+	// sourceMount is the worker-global SOURCE_MOUNT switch: when true, a runtime
+	// whose dependency layout permits it (plan.Spec.MountableSource) builds a
+	// source-independent app image and bind-mounts the app's live /apps source
+	// read-only at runtime instead of baking it. It is set once at construction
+	// (WithSourceMount; the worker wires config's resolved value) and read
+	// without the lock: it is startup configuration and is NOT hot-reloadable.
+	// False (the default) preserves the historical baked-source behavior exactly.
+	sourceMount bool
+	// mounts records, per app, the live source mount published by a successful
+	// Prepare (see setSourceMount). It is read at execution-container create and
+	// by ResolveServiceImage, and cleared on removal or when an app stops being
+	// mountable. Guarded by mountMu.
+	mountMu sync.RWMutex
+	mounts  map[string]SourceMount
+	// selfMounts caches the lazy resolution of Relay's OWN container's mounts,
+	// used to translate a SOURCE_MOUNT app path into the path the Docker daemon
+	// actually sees when Relay is itself a container (see daemonSourcePath). A
+	// zero value resolves on first use.
+	selfMounts containerMounts
+	// containerDetect overrides the container self-identification precondition
+	// used by daemonSourcePath. Nil uses the production default (the worker
+	// hostname is container-ID-like). Set only by tests.
+	containerDetect func() bool
 
 	// done is closed by Close to stop the single maintenance loop (the only
 	// eviction driver; there is never a ticker or goroutine per container).
@@ -325,6 +348,9 @@ type managerOptions struct {
 	// explicitly with StartMaintenance once its own prerequisites (the worker's
 	// NETWORKS verification) hold. False preserves the historical eager start.
 	deferredMaintenance bool
+	// sourceMount is the worker-global SOURCE_MOUNT switch (WithSourceMount).
+	// False preserves the historical baked-source behavior.
+	sourceMount bool
 }
 
 // WithWarmContainerIdleTimeout sets how long a healthy idle warm execution
@@ -399,6 +425,18 @@ func WithNetworks(networks []string) ManagerOption {
 // without wiring a signal context.
 func WithLifecycleContext(lifecycle context.Context) ManagerOption {
 	return func(o *managerOptions) { o.lifecycle = lifecycle }
+}
+
+// WithSourceMount enables or disables SOURCE_MOUNT for this worker: when true,
+// a runtime whose dependency layout permits it (plan.Spec.MountableSource, i.e.
+// Python and Node) builds a source-independent app image and bind-mounts the
+// app's live /apps source read-only into its execution and entrypoint-service
+// containers instead of baking it. The worker wires config's resolved
+// SOURCE_MOUNT value; a direct NewManager caller that omits it gets the
+// historical baked-source behavior (false). It is startup configuration:
+// changing it requires a worker restart.
+func WithSourceMount(enabled bool) ManagerOption {
+	return func(o *managerOptions) { o.sourceMount = enabled }
 }
 
 // WithDeferredMaintenance makes NewManager return WITHOUT starting the
@@ -488,6 +526,7 @@ func NewManager(
 		done:                     make(chan struct{}),
 		maintDone:                make(chan struct{}),
 		now:                      resolved.now,
+		sourceMount:              resolved.sourceMount,
 		pullChecks:               map[string]time.Time{},
 	}
 	// Construct the preparation limiter now with the resolved capacity, so the
@@ -857,7 +896,8 @@ func (m *Manager) startContainer(
 	if m.startContainerFn != nil {
 		return m.startContainerFn(ctx, fnName, img, env, limits, meta)
 	}
-	return startExecutionContainer(ctx, m.cli, m.log, fnName, img.createImage(), env, m.networks, limits, meta)
+	workDir, mounts := m.executionSourceMount(fnName)
+	return startExecutionContainer(ctx, m.cli, m.log, fnName, img.createImage(), env, m.networks, limits, meta, workDir, mounts...)
 }
 
 // Prepared is an app whose image has been built.
@@ -1047,6 +1087,9 @@ func (m *Manager) prepare(
 		m.containers.activateApp(fn.Name, "")
 		m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
 		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
+		// A no-runtime app has no app image and no source to mount; clear any
+		// stale mount record from a previous runtime-backed version.
+		m.clearSourceMount(fn.Name)
 		return prepared, nil
 	}
 
@@ -1136,6 +1179,26 @@ func (m *Manager) prepare(
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 	}
 
+	// mountSource is the SOURCE_MOUNT decision for THIS app: enabled globally and
+	// permitted by the runtime's dependency layout. It is resolved BEFORE Plan so
+	// the engine can shape a source-mounted image (Node persists its pinned
+	// esbuild for runtime TypeScript transpilation instead of baking generated
+	// files). Only when it is true is the live source bind-mounted and the image
+	// built without baking it.
+	mountSource := m.sourceMount && spec.MountableSource
+	spec.SourceMounted = mountSource
+
+	// sourceHostPath is the path the Docker daemon must be given for the live
+	// source bind. Under the bundled Compose layout Relay runs in a container
+	// whose /apps is a host bind mount, so fn.Dir (/apps/foo) is NOT
+	// daemon-visible; daemonSourcePath maps it to the inspected mount's Source
+	// plus the relative path. Native-host Relay and every unmappable case keep
+	// fn.Dir, and Docker's own source validation is still the final authority.
+	sourceHostPath := fn.Dir
+	if mountSource {
+		sourceHostPath = m.daemonSourcePath(ctx, fn.Dir)
+	}
+
 	eng, err := engineFor(spec)
 	if err != nil {
 		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
@@ -1146,7 +1209,14 @@ func (m *Manager) prepare(
 		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
 	}
 
-	image := ImageRef(fn.Name, fp)
+	// mountTarget is the in-container path the live source is mounted at. An
+	// engine may place it OUTSIDE the workdir when dependencies or generated
+	// files live under the workdir (Node mounts at /app/src so /app/node_modules
+	// stays visible); an empty target falls back to the workdir (Python).
+	mountTarget := planResult.SourceMountTarget
+	if mountTarget == "" {
+		mountTarget = planResult.WorkDir
+	}
 
 	// bootstrapHash pins the runtime-injected bootstrap content (the engine's
 	// embedded plan files) plus the entrypoint onto the image as a label. The
@@ -1155,18 +1225,61 @@ func (m *Manager) prepare(
 	// (e.g. by an older Relay version) under the exact same tag.
 	bootstrapLabelHash := bootstrapHash(planResult)
 
-	// Prepare the dependency label reference for the return value on both paths.
-	// On the build path it is the dependency image built FROM; on the reuse path
-	// it is computed WITHOUT building (the dependency image obviously exists, or
-	// the existing app image — which inherits its layers — would never have
-	// built). Computing the dependency fingerprint needs the same fnDir reads the
-	// app fingerprint above already performed, so it stays cheap.
+	// The dependency manifest snapshot is captured ONCE when the app declares
+	// deps, so the dependency fingerprint and the bytes staged into the
+	// dependency image come from the same read. It is computed BEFORE the app
+	// image reference because the app image's FROM is the dependency reference:
+	// a manifest-content change (a new dependency fingerprint/tag) must produce a
+	// new app tag and rebuild the app image even when the app source is
+	// unchanged, or the reuse probe would serve a stale app image.
+	var depSnap dependencySnapshot
+	// depFingerprint is the content address computed ONCE from the immutable
+	// snapshot. It names the tag (depRef) and is stamped as the image's label,
+	// so computing it once and passing it to ensureDependencyImage keeps the
+	// tag, the label, and the staged bytes from ever disagreeing.
+	var depFingerprint string
+	// depRef names the dependency image this app image is built FROM ("" when
+	// the app declares no deps).
+	var depRef string
+	// The dependency snapshot's private root (the relay-dep-build-* context) is
+	// removed on success, failure, and cancellation. The release is deferred
+	// BEFORE the block so a fingerprint failure after a successful capture still
+	// removes it; release is nil-safe on the zero snapshot.
+	defer depSnap.release()
+	if !planResult.Deps.IsZero() {
+		depSnap, err = snapshotDependency(fn.Dir, planResult.Deps)
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
+		}
+		depFingerprint, err = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
+		if err != nil {
+			return nil, fmt.Errorf("app %q: dependency fingerprint: %w", fn.Name, err)
+		}
+		depRef = depImageRef(depFingerprint)
+	}
+
+	// The app image reference. For the historical baked-source image it embeds
+	// the source fingerprint, so every source version is a distinct image. Under
+	// SOURCE_MOUNT the live source is bind-mounted instead of baked, so the tag
+	// is derived from the non-source inputs (runtime, dependency, bootstrap) and
+	// a source-only change reuses the same image; the reconciler advances the
+	// warm/service generation from the source fingerprint instead (see
+	// Prepared.Fingerprint).
+	imageFingerprint := fp
+	if mountSource {
+		imageFingerprint = sourceMountImageFingerprint(spec.Name, depRef, renderDockerfileWithSource(planResult, false))
+	}
+	image := ImageRef(fn.Name, imageFingerprint)
+
 	prepared := &Prepared{
 		Name:        fn.Name,
 		Image:       image,
 		Fingerprint: fp,
 		Env:         planResult.Env,
 		Concurrency: m.effectiveConcurrency(fn),
+		// The dependency image the app image is built FROM (both paths); it is
+		// the input to dependency garbage collection.
+		Dependency: depRef,
 	}
 
 	// Admit the app image reference BEFORE any probe or build. Holding this
@@ -1189,27 +1302,15 @@ func (m *Manager) prepare(
 	}()
 	prepared.lease = funcLease
 
-	// The dependency manifest snapshot is captured ONCE when the app
-	// declares deps, so the dependency fingerprint (and thus the tag) and the
-	// bytes staged into the dependency image come from the same read. It is also
-	// used on the reuse path merely to name the dependency without touching the
-	// daemon.
-	var depSnap dependencySnapshot
 	var depLease *ImageLease
-	// depFingerprint is the content address computed ONCE from the immutable
-	// snapshot below. It names the tag (depRef) and is stamped as the image's
-	// label, so computing it once and passing it to ensureDependencyImage keeps
-	// the tag, the label, and the staged bytes from ever disagreeing.
-	var depFingerprint string
-	// releaseDep releases the dependency lease (if admitted) AND the
-	// dependency snapshot's private root (the relay-dep-build-* context). It is
-	// deferred so the root is removed on success, failure, and cancellation.
+	// releaseDep releases the dependency lease (if admitted). The dependency
+	// snapshot root is released by the deferred depSnap.release above. It is
+	// deferred so the lease is dropped on success, failure, and cancellation.
 	releaseDep := func() {
 		if depLease != nil {
 			depLease.Release()
 			depLease = nil
 		}
-		depSnap.release()
 	}
 	// The dependency lease is held from its admission below through the ACTUAL
 	// dependency build (ensureDependencyImage, when the layer is absent) and the
@@ -1218,26 +1319,14 @@ func (m *Manager) prepare(
 	// The lease therefore spans the whole dependency use in Prepare, not merely
 	// the probe. See TestPrepareDependencyLeaseSpansBuildVsGC.
 	defer releaseDep()
-	if !planResult.Deps.IsZero() {
-		// Split out the pure fingerprint computation so the reuse path below can
-		// name the app image's dependency without touching the daemon; the
-		// snapshot is the single read shared with the build path.
-		depSnap, err = snapshotDependency(fn.Dir, planResult.Deps)
-		if err != nil {
-			return nil, fmt.Errorf("app %q: %w", fn.Name, fmt.Errorf("dependency fingerprint: %w", err))
-		}
-		depFingerprint, err = m.dependencyFingerprint(arch, platform, spec, planResult.Deps, depSnap)
-		if err != nil {
-			return nil, fmt.Errorf("app %q: dependency fingerprint: %w", fn.Name, err)
-		}
-		prepared.Dependency = depImageRef(depFingerprint)
+	if depRef != "" {
 		// Admit the dependency layer BEFORE its own reuse/existence probe, the
 		// dependency image build, and the app image build below, so
 		// dependency GC's retirement gate cannot remove the layer between the
 		// probe and the FROM consumption.
-		depLease, err = m.AcquireImageLease(prepared.Dependency)
+		depLease, err = m.AcquireImageLease(depRef)
 		if err != nil {
-			return nil, fmt.Errorf("app %q: dependency %s: %w", fn.Name, prepared.Dependency, err)
+			return nil, fmt.Errorf("app %q: dependency %s: %w", fn.Name, depRef, err)
 		}
 	}
 
@@ -1268,6 +1357,21 @@ func (m *Manager) prepare(
 		// image fingerprint, so a resource-only change reaches the live pool
 		// here (or via SetAppResources on the reconciler's skip path).
 		m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
+		// Publish the live source mount (or clear a stale one) so a source-only
+		// change — which reuses this exact image — still reaches execution and
+		// entrypoint-service containers. Identity is the source fingerprint the
+		// reconciler compared; the mount itself is the app's live /apps dir.
+		if mountSource {
+			m.setSourceMount(fn.Name, SourceMount{
+				HostPath: sourceHostPath,
+				Target:   mountTarget,
+				WorkDir:  planResult.SourceMountWorkDir,
+				Masks:    planResult.SourceMountMasks,
+				Identity: fp,
+			})
+		} else {
+			m.clearSourceMount(fn.Name)
+		}
 		leaseTransferred = true
 		return prepared, nil
 	}
@@ -1289,9 +1393,10 @@ func (m *Manager) prepare(
 	// and every version with identical (runtime + arch + manifest + install), so
 	// a changed requirements.txt yields a NEW tag and an unchanged one reuses the
 	// existing layer with no rebuild (even when the app's source changed).
-	depRef := prepared.Dependency
 	if !planResult.Deps.IsZero() {
-		depRef, err = m.ensureDependencyImage(ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef)
+		depRef, err = m.ensureDependencyImage(
+			ctx, fn, spec, planResult.Deps, depSnap, depFingerprint, depRef,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("app %q: %w", fn.Name, err)
 		}
@@ -1328,7 +1433,33 @@ func (m *Manager) prepare(
 	// app's span; the build itself still runs on the lifecycle-bounded
 	// buildCtx. Only a real build is spanned; a reuse probe (above) is not.
 	_, buildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, image)
-	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash), sourceSnapshot, m.metrics); err != nil {
+	// The managed-image relay.fingerprint label. For a baked-source image it is
+	// the source fingerprint the tag embeds. For a SOURCE_MOUNT image it is
+	// deliberately EMPTY: the image is source-independent, and Execute derives
+	// the warm generation identity from Prepared.Fingerprint (the live source
+	// fingerprint) by falling back to it when no label is present. Stamping the
+	// build-time fingerprint would freeze the generation identity at build time
+	// and a later source-only change would not recycle the warm containers.
+	// The managed-image relay.fingerprint label. For a baked-source image it is
+	// the source fingerprint the tag embeds. For a SOURCE_MOUNT image it is
+	// deliberately EMPTY: the image is source-independent, and Execute derives
+	// the warm generation identity from Prepared.Fingerprint (the live source
+	// fingerprint) by falling back to it when no label is present. Stamping the
+	// build-time fingerprint would freeze the generation identity at build time
+	// and a later source-only change would not recycle the warm containers.
+	//
+	// The label is stamped as an explicit EMPTY string rather than omitted: a
+	// source-mounted app image is built FROM a dependency image, and Docker
+	// INHERITS labels through FROM, so an omitted label would surface the
+	// dependency image's own relay.fingerprint (the constant dependency
+	// fingerprint) and freeze the warm generation. The empty value CLEARS the
+	// inherited label, so inspection yields "" and the Prepared fingerprint is
+	// used.
+	appLabels := appImageLabels(fn.Name, fp, depRef, bootstrapLabelHash)
+	if mountSource {
+		appLabels[labelFingerprint] = ""
+	}
+	if err := buildImage(buildCtx, m.cli, fn.Name, fn, planResult, image, appLabels, sourceSnapshot, m.metrics, !mountSource); err != nil {
 		buildSpan.RecordError(err)
 		buildSpan.SetStatus(codes.Error, err.Error())
 		buildSpan.End()
@@ -1364,6 +1495,19 @@ func (m *Manager) prepare(
 	m.containers.activateApp(fn.Name, image)
 	m.containers.setAppConcurrency(fn.Name, prepared.Concurrency)
 	m.containers.setAppResources(fn.Name, fn.Template.ResourceLimits())
+	// Publish the live source mount for this now-active version (or clear a
+	// stale one), mirroring the reuse path above.
+	if mountSource {
+		m.setSourceMount(fn.Name, SourceMount{
+			HostPath: sourceHostPath,
+			Target:   mountTarget,
+			WorkDir:  planResult.SourceMountWorkDir,
+			Masks:    planResult.SourceMountMasks,
+			Identity: fp,
+		})
+	} else {
+		m.clearSourceMount(fn.Name)
+	}
 	leaseTransferred = true
 	prepared.Dependency = depRef
 	return prepared, nil
@@ -1755,6 +1899,9 @@ func (m *Manager) RemoveApp(name string) {
 	// re-added app starts with an immediate remote check and the in-memory
 	// map does not grow without bound across removals.
 	m.forgetServicePullChecks(name)
+	// Drop the app's recorded live source mount so a later re-added app (possibly
+	// with a different runtime) never inherits a stale mount.
+	m.clearSourceMount(name)
 }
 
 // envMap parses "K=V" entries into a map, later entries winning on duplicate

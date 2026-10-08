@@ -33,10 +33,18 @@ const serviceImagePullInterval = time.Hour
 // Entry is the per-container entrypoint override. A nil Entry means the
 // container preserves the image's own ENTRYPOINT/CMD — true for the `image`
 // source. Only the runtime-managed `entrypoint` source overrides it.
+//
+// Mount, when non-nil, is the app's live source mount (SOURCE_MOUNT) for an
+// entrypoint service whose runtime permits it. It is nil for an `image` source
+// (Relay does not mount into external images). Its Identity is the source
+// fingerprint the service reconciler compares to detect a source-only change and
+// replace the container; its Target is the source root the Entry override was
+// re-rooted at.
 type ServiceImage struct {
 	Ref   string
 	ID    string
 	Entry []string
+	Mount *SourceMount
 }
 
 // ResolveServiceImage resolves the desired image for one service from its
@@ -65,7 +73,19 @@ func (m *Manager) ResolveServiceImage(
 		if err != nil {
 			return ServiceImage{}, err
 		}
-		return ServiceImage{Ref: appImage, Entry: entry}, nil
+		img := ServiceImage{Ref: appImage, Entry: entry}
+		// An entrypoint service runs the app image. When SOURCE_MOUNT applies to
+		// this app/runtime, its live source is mounted read-only and the service
+		// reconciler replaces the container when the source fingerprint changes.
+		// The mount is recorded by Prepare; an unresolved record (no Prepare yet)
+		// yields no mount, i.e. the historical baked-image behavior. The mount may
+		// place the source at a path other than the baked workdir (Node mounts at
+		// /app/src), so the entry override is re-rooted at the target.
+		if sm, ok := m.sourceMountFor(fnName); ok {
+			img.Mount = &sm
+			img.Entry = serviceEntryForSourceMount(img.Entry, sm.Target, tmpl.Runtime)
+		}
+		return img, nil
 	}
 }
 

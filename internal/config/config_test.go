@@ -1025,3 +1025,123 @@ func TestLoadInvalidMaxEventBytesReturnsError(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadSourceMountDefault pins that SOURCE_MOUNT is opt-out by default: the
+// variable truly UNSET and an explicitly EMPTY value both resolve to false.
+func TestLoadSourceMountDefault(t *testing.T) {
+	setRequiredEnv(t)
+
+	t.Setenv("SOURCE_MOUNT", "")
+	os.Unsetenv("SOURCE_MOUNT")
+	if cfg := mustLoad(t); cfg.SourceMount {
+		t.Fatalf("SourceMount = true, want false when unset")
+	}
+
+	t.Setenv("SOURCE_MOUNT", "")
+	if cfg := mustLoad(t); cfg.SourceMount {
+		t.Fatalf("SourceMount = true, want false when empty")
+	}
+}
+
+// TestLoadSourceMountExplicit pins that SOURCE_MOUNT resolves through Load for
+// every strconv.ParseBool accepted form, including the compose-style "1".
+func TestLoadSourceMountExplicit(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{"1", true},
+		{"0", false},
+		{"t", true},
+		{"T", true},
+		{"TRUE", true},
+		{"true", true},
+		{"True", true},
+		{"f", false},
+		{"F", false},
+		{"FALSE", false},
+		{"false", false},
+		{"False", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SOURCE_MOUNT", tt.value)
+			cfg := mustLoad(t)
+			if cfg.SourceMount != tt.want {
+				t.Fatalf("SourceMount = %v, want %v for %q", cfg.SourceMount, tt.want, tt.value)
+			}
+		})
+	}
+}
+
+// TestParseBool exercises the shared boolean parser directly. It accepts every
+// strconv.ParseBool form (trimmed); empty, non-boolean, and numeric-adjacent
+// values error naming the variable. Load surfaces that error unchanged.
+func TestParseBool(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      bool
+		wantError bool
+	}{
+		{"one", "1", true, false},
+		{"zero", "0", false, false},
+		{"lower true", "true", true, false},
+		{"title true", "True", true, false},
+		{"upper true", "TRUE", true, false},
+		{"lower false", "false", false, false},
+		{"trimmed true", " 1 ", true, false},
+		{"empty rejected", "", false, true},
+		{"whitespace rejected", "  ", false, true},
+		{"non-boolean rejected", "yes", false, true},
+		{"numeric two rejected", "2", false, true},
+		{"negative rejected", "-1", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseBool("SOURCE_MOUNT", tt.value)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("ParseBool(%q) = %v, nil; want error", tt.value, got)
+				}
+				if !strings.Contains(err.Error(), "SOURCE_MOUNT") {
+					t.Fatalf("error should name the variable: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseBool(%q) error: %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseBool(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadInvalidSourceMountReturnsError pins the invalid SOURCE_MOUNT contract:
+// Load RETURNS an error naming the variable and its boolean requirement, and
+// logs nothing, so a typo fails startup instead of silently coercing.
+func TestLoadInvalidSourceMountReturnsError(t *testing.T) {
+	for _, value := range []string{"yes", "2", "-1", "on", "off"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SOURCE_MOUNT", value)
+
+			logger, buf := testLogger()
+			_, err := Load(logger)
+			if err == nil {
+				t.Fatalf("Load returned nil error for invalid SOURCE_MOUNT=%q; want an error", value)
+			}
+			for _, want := range []string{"SOURCE_MOUNT", "boolean"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Fatalf("Load logged %q for a returned config error; want no fatal log", buf.String())
+			}
+		})
+	}
+}

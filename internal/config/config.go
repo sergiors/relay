@@ -164,6 +164,14 @@ type Config struct {
 	// style (a typo in a container-warmth knob must not silently change runtime
 	// behavior). It is always positive after Load.
 	WarmContainerIdleTimeout time.Duration
+	// SourceMount is the optional SOURCE_MOUNT value (default false): whether
+	// the app source tree is bind-mounted into execution containers instead of
+	// being copied/baked into the runtime image. It is a plain boolean and is
+	// parsed with strconv.ParseBool's accepted forms (see ParseBool); an
+	// unparseable value is a returned configuration error naming the variable
+	// rather than being silently coerced. It is consumed by the runtime layer;
+	// this package only resolves and validates it.
+	SourceMount bool
 }
 
 // Default max-concurrency, max-build-concurrency, and max-buffered-events
@@ -355,6 +363,12 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 	cfg.WarmContainerIdleTimeout = warmTimeout
 
+	sourceMount, err := loadBool("SOURCE_MOUNT", getEnv("SOURCE_MOUNT", "false"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SourceMount = sourceMount
+
 	return cfg, nil
 }
 
@@ -379,6 +393,28 @@ func loadPositiveDuration(name, value string) (time.Duration, error) {
 // a returned configuration error naming the variable (see ParseMaxEventBytes).
 func loadMaxEventBytes(value string) (int, error) {
 	return ParseMaxEventBytes("MAX_EVENT_BYTES", value)
+}
+
+// loadBool parses a boolean environment value. Defaults are resolved at the
+// getEnv call site (the value is always non-empty here), so an invalid value is
+// a returned configuration error naming the variable (see ParseBool).
+func loadBool(name, value string) (bool, error) {
+	return ParseBool(name, value)
+}
+
+// ParseBool parses a boolean environment value using strconv.ParseBool's
+// accepted forms (1, t, T, TRUE, true, True, 0, f, F, FALSE, false, False);
+// surrounding whitespace is trimmed first. Callers resolve any default at the
+// getEnv call site. An empty or otherwise unparseable value is an error naming
+// the variable, so a typo fatally fails startup rather than silently flipping a
+// behavior (unlike the log-and-disable retention windows).
+func ParseBool(name, value string) (bool, error) {
+	v := strings.TrimSpace(value)
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: must be a boolean", name, value)
+	}
+	return b, nil
 }
 
 // ParseMaxEventBytes parses the MAX_EVENT_BYTES value: the maximum byte length

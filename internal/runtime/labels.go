@@ -74,6 +74,16 @@ const (
 	// per container.
 	labelNetworks = "relay.networks"
 
+	// labelSource pins the source fingerprint a SOURCE_MOUNT service container's
+	// live read-only bind mount corresponds to. It is stamped only for a managed
+	// entrypoint service whose runtime permits source mounting; the reconciler
+	// compares it against the freshly resolved source fingerprint so a source-only
+	// edit — which never changes the (source-independent) image reference —
+	// replaces the running container instead of leaving stale code. It is omitted
+	// for every other container, so a container carries it only when it actually
+	// has a source mount.
+	labelSource = "relay.source"
+
 	// labelEnvHash pins the exact effective environment a service replica was
 	// created with: a short content hash over the Config.Env slice (runtime plan
 	// env + template env + resolved secrets + PORT), never any value itself.

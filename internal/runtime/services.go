@@ -16,6 +16,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 
 	"relay/internal/app"
+	"relay/internal/runtime/node"
 	"relay/internal/runtime/python"
 )
 
@@ -80,6 +81,12 @@ type ServiceSpec struct {
 	// verifies the global set at startup. A network that disappears after
 	// verification surfaces as a create error rather than a chaos fix-up.
 	Networks []string
+	// SourceMount, when non-nil, is the app's live read-only source mount
+	// (SOURCE_MOUNT). It is set only for an entrypoint service whose runtime
+	// permits it; an external `image` service never receives one. Its Identity is
+	// stamped as relay.source so the reconciler can replace the container on a
+	// source-only change.
+	SourceMount *SourceMount
 }
 
 // ServiceContainer is one discovered service container, as stamped on its
@@ -126,6 +133,13 @@ type ServiceContainer struct {
 	// before the label existed). The service reconciler compares it to the
 	// desired set to detect a network change.
 	Networks string
+	// SourceID is the source fingerprint a SOURCE_MOUNT container's live
+	// read-only bind mount corresponds to, parsed from relay.source. It is "" for
+	// a container with no source mount (including every container created before
+	// SOURCE_MOUNT, and every external-image service). The service reconciler
+	// compares it to the desired fingerprint to replace a container whose mounted
+	// source has changed under an unchanged image reference.
+	SourceID string
 	// Labels is the container's FULL label set (nil-safe; nil when the
 	// container has none). The service reconciler compares routing metadata
 	// through it without Relay parsing or interpreting foreign label names.
@@ -348,6 +362,10 @@ func EnvHash(env []string) string {
 func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]string {
 	envHash := EnvHash(spec.Env)
 	resourceHash := spec.Resources.OrDefault().Fingerprint()
+	sourceID := ""
+	if spec.SourceMount != nil {
+		sourceID = spec.SourceMount.Identity
+	}
 	labels := map[string]string{
 		labelType:      ContainerTypeService,
 		labelApp:       spec.App,
@@ -365,6 +383,9 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 	}
 	if networks := NetworksLabel(spec.Networks...); networks != "" {
 		labels[labelNetworks] = networks
+	}
+	if sourceID != "" {
+		labels[labelSource] = sourceID
 	}
 	for k, v := range spec.Labels {
 		labels[k] = v
@@ -393,6 +414,13 @@ func serviceLabels(spec ServiceSpec, hostname string, replica int) map[string]st
 		labels[labelNetworks] = networks
 	} else {
 		delete(labels, labelNetworks)
+	}
+	// The source fingerprint is ownership metadata too; re-apply it last and
+	// clear a spoofed value when the service has no source mount.
+	if sourceID != "" {
+		labels[labelSource] = sourceID
+	} else {
+		delete(labels, labelSource)
 	}
 	return labels
 }
@@ -478,6 +506,13 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// ENTRYPOINT/CMD.
 		cfg.Entrypoint = spec.Entry
 	}
+	// A SOURCE_MOUNT entrypoint service runs with the app's source root as its
+	// working directory (Node's /app/src), matching the pooled runtime so
+	// process.cwd() and relative paths see the app root. Empty preserves the
+	// image WORKDIR (/app) exactly.
+	if spec.SourceMount != nil {
+		cfg.WorkingDir = spec.SourceMount.WorkDir
+	}
 
 	createOps := client.ContainerCreateOptions{
 		Config: cfg,
@@ -488,6 +523,12 @@ func (m *Manager) StartService(ctx context.Context, spec ServiceSpec, replica in
 		// A unique physical name per start, so the replacement generation can
 		// be created while the generation it replaces is still running.
 		Name: serviceContainerNameForStart(spec.App, spec.Name, replica),
+	}
+	// A SOURCE_MOUNT entrypoint service mounts its live source read-only; an
+	// external `image` service never does, so its HostConfig is byte-for-byte the
+	// pre-SOURCE_MOUNT shape.
+	if mounts := bindMounts(spec.SourceMount); len(mounts) > 0 {
+		createOps.HostConfig.Mounts = mounts
 	}
 	if endpoints := serviceEndpoints(spec.Networks); len(endpoints) > 0 {
 		// Join every configured network at create time (containers must belong to
@@ -606,6 +647,7 @@ func (m *Manager) ServiceContainerList(ctx context.Context) ([]ServiceContainer,
 			EnvHash:   c.Labels[labelEnvHash],
 			Resources: c.Labels[labelResources],
 			Networks:  c.Labels[labelNetworks],
+			SourceID:  c.Labels[labelSource],
 			Labels:    labelsCopy,
 		})
 	}
@@ -766,6 +808,47 @@ func validateServiceEntrypoint(entrypoint string) error {
 	return nil
 }
 
+// serviceEntryForSourceMount rewrites a service entry override so it addresses
+// the app's live source at the SOURCE_MOUNT target instead of the baked image
+// workdir, and preloads the runtime's shared resolve hook where one exists.
+// A node entry is `node /app/<entrypoint>`; when the mount places the source
+// elsewhere (Node mounts at /app/src so node_modules stays visible) the path
+// token is re-rooted at the target AND the shared resolve hook is preloaded
+// (`node --import /relay/resolve-hook.mjs /app/src/<entrypoint>`), because a
+// mounted Node entrypoint service never runs the invocation bootstrap and would
+// otherwise let a host node_modules that appears after preparation shadow the
+// dependency image. A Python entry (`python -m app.main`) carries no
+// workdir-prefixed token and is returned unchanged, and a target equal to the
+// baked workdir makes both the rewrite and the preload a no-op, so an unmounted
+// or Python service keeps its historical command byte-for-byte.
+func serviceEntryForSourceMount(entry []string, target, runtimeName string) []string {
+	if len(entry) == 0 || target == "" {
+		return entry
+	}
+	var out []string
+	for i, arg := range entry {
+		if !strings.HasPrefix(arg, serviceBakedWorkDir+"/") {
+			continue
+		}
+		if out == nil {
+			out = append([]string(nil), entry...)
+		}
+		out[i] = target + strings.TrimPrefix(arg, serviceBakedWorkDir)
+	}
+	if out == nil {
+		return entry
+	}
+	// Preload the shared hook only when the source is mounted at a DISTINCT root:
+	// the hook re-anchors bare specifiers from MOUNT_ROOT to the baked workdir, so
+	// a workdir-equal target (Python, and the Node no-op case) must stay
+	// byte-for-byte. The hook file exists only in a source-mounted Node image, so
+	// this is emitted only for node24 under a distinct mount target.
+	if target != serviceBakedWorkDir && runtimeName == "node24" {
+		out = append([]string{out[0], "--import", node.ResolveHookPath}, out[1:]...)
+	}
+	return out
+}
+
 // ServiceEntry returns the container entrypoint override for a service
 // entrypoint file on the given runtime, or an error for an unsupported runtime
 // or an invalid entrypoint. One image serves both invocations and services
@@ -790,10 +873,14 @@ func ServiceEntry(runtimeName, entrypoint string) ([]string, error) {
 	}
 	switch runtimeName {
 	case "node24":
-		return []string{"node", "/app/" + entrypoint}, nil
+		return []string{"node", serviceBakedWorkDir + "/" + entrypoint}, nil
 	case "python3.14":
 		return python.ServiceCommand(entrypoint)
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q for services", runtimeName)
 	}
 }
+
+// serviceBakedWorkDir is the image workdir where a baked app's source is
+// COPYied, and the prefix a node service entry uses to address it.
+const serviceBakedWorkDir = "/app"

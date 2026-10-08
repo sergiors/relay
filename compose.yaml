@@ -28,6 +28,8 @@ services:
 
       - LOG_LEVEL=DEBUG
 
+      - SOURCE_MOUNT=1
+
     volumes:
       - ./examples/apps:/apps:ro
       - relay-data:/var/lib/relay

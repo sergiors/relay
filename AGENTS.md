@@ -105,16 +105,39 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
 
 ## Runtime identity and generation
 
-- One image per app, versioned by source fingerprint (selected source plus
-  applicable `.gitignore` files; `template.yaml` verbatim; `resources` excluded).
-  A rebuild is a new immutable image; the old version keeps serving until the new
-  one is prepared and swapped in; resource-only edits instead reuse the image and
-  rotate containers.
+- By default (`SOURCE_MOUNT=false`) one image per app is versioned by source
+  fingerprint (selected source plus applicable `.gitignore` files; `template.yaml`
+  verbatim; `resources` excluded), so the immutable baked image IS the source
+  identity. A rebuild is a new immutable image; the old version keeps serving
+  until the new one is prepared and swapped in; resource-only edits instead reuse
+  the image and rotate containers.
+- `SOURCE_MOUNT` (startup configuration, default `false`) makes a mountable
+  runtime's app image source-INDEPENDENT: Python and Node images are built
+  without baking the source and bind-mount the app's live directory read-only at
+  container create, so a source-only edit reuses the same image. The
+  selected-source fingerprint still advances the runtime generation, recycling
+  and draining pooled execution containers and replacing managed
+  entrypoint-service replicas through the normal start-before-stop path, so a
+  container that already imported the old modules never serves stale code.
+  Dependency fingerprints/images stay authoritative — a manifest change still
+  rebuilds the dependency layer and the app image. Placements are
+  runtime-specific: Python mounts the app root at `/app` (dependencies live in
+  system site-packages, outside the mount); Node mounts the source at the
+  distinct `/app/src` and keeps `node_modules` and its pinned esbuild under
+  `/app` (masking a host `node_modules` and re-anchoring resolution to the
+  dependency image). The bind source is the app's daemon-host path and is always
+  read-only: native-host Relay passes the app dir (e.g. `/apps/foo`), while a
+  containerized Relay (the bundled Compose layout) conservatively maps an app dir
+  covered by one of its own inspected bind mounts to that mount's host Source plus
+  the relative path, falling back to the app dir otherwise — the Docker daemon
+  always performs the final source resolution. A runtime without a mountable
+  dependency layout keeps the baked image.
 - Dependency layers are content-addressed, shared, and never auto-pruned; Relay
   removes only its own images, and only once unreferenced. A container's version
-  is its resolved image content, not its tag: a version change drains the old
-  generation (idle containers discarded, busy ones finish then discarded) with no
-  new invocation leased to it.
+  is its resolved image content (the live source fingerprint under `SOURCE_MOUNT`,
+  where the image deliberately carries no fingerprint label), not its tag: a
+  version change drains the old generation (idle containers discarded, busy ones
+  finish then discarded) with no new invocation leased to it.
 - Warm containers are created lazily up to effective concurrency and evicted on
   idle timeout; execution containers are hardened (non-root, dropped caps,
   read-only rootfs, per-container limits) with Docker AutoRemove.

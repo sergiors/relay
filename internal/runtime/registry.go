@@ -31,11 +31,17 @@ var specs = map[string]plan.Spec{
 		Engine:     plan.EnginePython,
 		BaseImage:  "python:3.14-slim",
 		ToolCopies: []plan.ImageCopy{uvImage},
+		// Python installs dependencies in system site-packages, outside /app,
+		// so mounting live source at /app does not hide runtime dependencies.
+		MountableSource: true,
 	},
 	"node24": {
 		Name:      "node24",
 		Engine:    plan.EngineNode,
 		BaseImage: "node:24-alpine",
+		// Node keeps dependencies under /app, so live source is mounted at
+		// /app/src to keep /app/node_modules available.
+		MountableSource: true,
 	},
 }
 

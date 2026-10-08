@@ -38,6 +38,7 @@ type fakeContainer struct {
 	entry     []string // the long-lived process command passed to StartService
 	envHash   string   // relay.env_hash as stamped at create (spec.Env's hash); "" = legacy/unlabeled
 	resources string   // relay.resources as stamped at create (spec.Resources' fingerprint); "" = legacy/unlabeled
+	sourceID  string   // relay.source as stamped at create (spec.SourceMount.Identity); "" = no mount
 	labels    map[string]string
 	networks  []string // spec.Networks passed to StartService (global + routing networks)
 	hostname  string   // the worker identity (relay.hostname) that owns the container
@@ -50,6 +51,15 @@ func (c *fakeContainer) effectiveSourceRef() string {
 		return c.sourceRef
 	}
 	return c.entrypoint
+}
+
+// sourceMountIdentity mirrors production serviceLabels: the relay.source value a
+// StartService call stamps for a SOURCE_MOUNT spec ("" when there is no mount).
+func sourceMountIdentity(spec runtime.ServiceSpec) string {
+	if spec.SourceMount == nil {
+		return ""
+	}
+	return spec.SourceMount.Identity
 }
 
 // defaultFakeHostname is the worker identity containers get when started via
@@ -72,6 +82,10 @@ type fakeDocker struct {
 	resolveErr      map[string]error
 	resolveCalls    []string // identities passed to ResolveServiceImage, in order
 	resolvedImages  map[string]string
+	// mountIdentity, when a source reference has an entry, makes
+	// ResolveServiceImage return an entrypoint source with a live source Mount
+	// carrying that identity, so tests can exercise SOURCE_MOUNT convergence.
+	mountIdentity map[string]string
 	// startGate, when non-nil, is called AFTER a container is created and BEFORE
 	// StartService returns, with the lock released. It lets a test park a
 	// replacement at the exact post-start/pre-commit boundary (e.g. to enqueue a
@@ -117,7 +131,11 @@ func (f *fakeDocker) ResolveServiceImage(ctx context.Context, fnName string, tmp
 		if err != nil {
 			return runtime.ServiceImage{}, err
 		}
-		return runtime.ServiceImage{Ref: appImage, Entry: entry}, nil
+		img := runtime.ServiceImage{Ref: appImage, Entry: entry}
+		if id := f.mountIdentity[identity]; id != "" {
+			img.Mount = &runtime.SourceMount{HostPath: "/apps/" + fnName, Target: "/app", Identity: id}
+		}
+		return img, nil
 	}
 }
 
@@ -150,6 +168,7 @@ func (f *fakeDocker) StartService(_ context.Context, spec runtime.ServiceSpec, r
 		// stamped too, so a resource-only change replaces the container.
 		envHash:   runtime.EnvHash(spec.Env),
 		resources: spec.Resources.OrDefault().Fingerprint(),
+		sourceID:  sourceMountIdentity(spec),
 		labels:    spec.Labels,
 		networks:  append([]string(nil), spec.Networks...),
 		hostname:  defaultFakeHostname,
@@ -188,6 +207,7 @@ func (f *fakeDocker) ServiceContainerList(context.Context) ([]runtime.ServiceCon
 			EnvHash:   c.envHash,
 			Resources: c.resources,
 			Networks:  runtime.NetworksLabel(c.networks...),
+			SourceID:  c.sourceID,
 			Labels:    c.labels,
 		})
 	}
@@ -239,6 +259,21 @@ func (f *fakeDocker) setState(id string, st container.ContainerState) {
 	if c, ok := f.ctrs[id]; ok {
 		c.state = st
 	}
+}
+
+// setMountIdentity sets the SOURCE_MOUNT identity ResolveServiceImage reports
+// for a source reference (empty disables the mount).
+func (f *fakeDocker) setMountIdentity(sourceRef, identity string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mountIdentity == nil {
+		f.mountIdentity = map[string]string{}
+	}
+	if identity == "" {
+		delete(f.mountIdentity, sourceRef)
+		return
+	}
+	f.mountIdentity[sourceRef] = identity
 }
 
 // order returns the recorded transition sequence (start/stop/remove), so tests

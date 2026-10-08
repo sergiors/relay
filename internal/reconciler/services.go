@@ -550,19 +550,29 @@ func reconcileWithObserver(
 
 		// A container is CONVERGED (a keep candidate) only when it is both
 		// healthy (running) and currently configured correctly (source reference,
-		// image, image content, port, effective environment, and Docker networks
-		// all match the desired values) and carries a real replica label.
-		// Anything else — exited/dead/removing, a changed source, a changed image,
-		// a moved external tag (image content changed), a changed port, a changed
-		// env/secret (env hash mismatch), a changed network set, or an unlabeled
-		// legacy container (Replica == -1) — is a non-converged generation that a
-		// converged replacement supersedes. In addition, the container's labels
-		// must match the desired routing label set exactly: a changed host/path/
-		// port leaves stale Traefik labels pointing traffic at whatever the old
-		// container served, so the container is replaced. SourceRef comparison
-		// matters for an `image` source whose two references resolve to the same
-		// bytes: the container still carries the old relay.identity and must be
-		// replaced so its label reflects the configured source.
+		// image, image content, port, effective environment, source mount, and
+		// Docker networks all match the desired values) and carries a real
+		// replica label. Anything else — exited/dead/removing, a changed source, a
+		// changed image, a moved external tag (image content changed), a changed
+		// port, a changed env/secret (env hash mismatch), a changed network set, a
+		// changed mounted source (relay.source), or an unlabeled legacy container
+		// (Replica == -1) — is a non-converged generation that a converged
+		// replacement supersedes. In addition, the container's labels must match
+		// the desired routing label set exactly: a changed host/path/port leaves
+		// stale Traefik labels pointing traffic at whatever the old container
+		// served, so the container is replaced. SourceRef comparison matters for
+		// an `image` source whose two references resolve to the same bytes: the
+		// container still carries the old relay.identity and must be replaced so
+		// its label reflects the configured source.
+		//
+		// desiredSourceID is the live source fingerprint for a SOURCE_MOUNT
+		// entrypoint service ("" otherwise). It never changes the image reference,
+		// so without this comparison a source-only edit would leave the running
+		// container serving stale code.
+		desiredSourceID := ""
+		if resolved.Mount != nil {
+			desiredSourceID = resolved.Mount.Identity
+		}
 		converged := func(ctr runtime.ServiceContainer) bool {
 			return ctr.State == container.StateRunning &&
 				ctr.SourceRef == sourceRef &&
@@ -572,6 +582,7 @@ func reconcileWithObserver(
 				ctr.EnvHash == envHash &&
 				ctr.Resources == resourceHash &&
 				ctr.Networks == desiredNetworks &&
+				ctr.SourceID == desiredSourceID &&
 				ctr.Replica >= 0 &&
 				routingLabelsMatch(routeLabels, ctr.Labels)
 		}
@@ -580,17 +591,18 @@ func reconcileWithObserver(
 		// deficit slot below.
 		newSpec := func() runtime.ServiceSpec {
 			return runtime.ServiceSpec{
-				App:       fnName,
-				Name:      name,
-				SourceRef: sourceRef,
-				Port:      svc.Port,
-				Image:     resolved.Ref,
-				ImageID:   resolved.ID,
-				Entry:     resolved.Entry,
-				Env:       env,
-				Resources: resources,
-				Labels:    routeLabels,
-				Networks:  desiredNetworkSet,
+				App:         fnName,
+				Name:        name,
+				SourceRef:   sourceRef,
+				Port:        svc.Port,
+				Image:       resolved.Ref,
+				ImageID:     resolved.ID,
+				Entry:       resolved.Entry,
+				Env:         env,
+				Resources:   resources,
+				Labels:      routeLabels,
+				Networks:    desiredNetworkSet,
+				SourceMount: resolved.Mount,
 			}
 		}
 

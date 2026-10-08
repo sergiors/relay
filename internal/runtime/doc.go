@@ -15,6 +15,29 @@
 //     embedders and tests may call with any context), and a caller's deadline
 //     must never cut off a legitimate image build; the lifecycle root keeps
 //     builds cancellable on Relay shutdown.
+//   - Source mount (SOURCE_MOUNT): when enabled, a runtime whose dependency
+//     layout permits it (Python and Node; see plan.Spec.MountableSource) builds
+//     the app image WITHOUT the source and bind-mounts the app's live directory
+//     read-only at the runtime's source root. Python mounts at the workdir
+//     (/app), where its system site-packages live outside the mount; Node mounts
+//     at a distinct subdirectory (/app/src) so /app/node_modules and its
+//     persisted pinned esbuild stay visible, and its bootstrap bundles any
+//     TypeScript handler at container startup with that same esbuild. A
+//     source-mounted Node image also carries a shared resolve hook
+//     (/relay/resolve-hook.mjs) that the invocation bootstrap imports and a
+//     mounted Node entrypoint service preloads with `node --import`, so a host
+//     node_modules cannot shadow the dependency image (for an ESM import or a
+//     CommonJS require) even when it appears after
+//     preparation (and therefore carries no mask). A
+//     source-only edit then reuses the same image while the advanced source
+//     fingerprint recycles the app's warm containers and replaces its entrypoint
+//     service replicas. SOURCE_MOUNT=false is the historical baked-source
+//     behavior. The bind source is normally the app dir (fn.Dir), which the
+//     Docker daemon resolves on its own host filesystem; when Relay itself runs
+//     in a container on that daemon (the bundled Compose layout) and the app dir
+//     lies under one of Relay's own bind mounts, Relay inspects its own container
+//     and passes that mount's host Source plus the relative path instead, so the
+//     daemon binds the same live tree read-only. See source_mount.go.
 //   - Execute: a leased container from the app's warm pool (bounded by the
 //     app's resolved concurrency, and by the worker-global MAX_WARM_CONTAINERS
 //     bound across all apps), event JSON on stdin, stdout/stderr

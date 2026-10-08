@@ -18,6 +18,22 @@ type Spec struct {
 	Name      string
 	Engine    Engine
 	BaseImage string
+	// MountableSource reports whether this runtime's dependency layout lets the
+	// app source be bind-mounted read-only instead of baked (SOURCE_MOUNT)
+	// WITHOUT hiding installed dependencies. It is true for Python (whose
+	// dependencies live outside the workdir, in the system site-packages) and for
+	// Node (whose dependencies stay under the workdir while the live source is
+	// mounted at a distinct path OUTSIDE the dependency tree; see
+	// BuildPlan.SourceMountTarget). A false value means the source is always
+	// copied into the image, exactly as when SOURCE_MOUNT is disabled.
+	MountableSource bool
+	// SourceMounted is the RESOLVED per-preparation SOURCE_MOUNT decision: the
+	// global switch is enabled AND this runtime is MountableSource. It is set by
+	// the caller (runtime.Manager.prepare) on the plan's value copy and lets an
+	// engine shape a source-mounted image (e.g. Node persists its pinned esbuild
+	// for runtime TypeScript transpilation instead of transpiling at build time).
+	// A false value means the historical baked-source image, byte-for-byte.
+	SourceMounted bool
 	// ToolCopies are external-image COPY --from directives every image for this
 	// runtime needs (e.g. a pinned tool binary). They are applied to BOTH the
 	// app image and its dependency base image, because the dependency image
@@ -128,4 +144,30 @@ type BuildPlan struct {
 	ToolCopies []ImageCopy
 	// Entrypoint is the container entrypoint as a JSON-array ENTRYPOINT.
 	Entrypoint []string
+	// SourceMountTarget, when non-empty, is the in-container path a SOURCE_MOUNT
+	// bind of the live app source is mounted at, distinct from WorkDir when the
+	// runtime keeps dependencies (and generated files) under WorkDir so the
+	// mount cannot hide them (Node mounts the source at WorkDir/src while
+	// /app/node_modules stays visible). Empty means the source is mounted at
+	// WorkDir (Python) or baked, depending on the caller's SOURCE_MOUNT
+	// decision.
+	SourceMountTarget string
+	// SourceMountWorkDir, when non-empty, is the in-container working directory
+	// a SOURCE_MOUNT container runs with, so process.cwd() and relative
+	// filesystem operations see the app's SOURCE ROOT. It is set only when that
+	// root differs from the image WorkDir (Node's source root is /app/src);
+	// empty preserves the image WorkDir (Python, whose source root equals its
+	// workdir, and every baked image).
+	SourceMountWorkDir string
+	// SourceMountMasks are in-container paths masked with an empty, read-only
+	// filesystem for a SOURCE_MOUNT container, so a bind of the live app
+	// directory can never shadow a path the image itself owns. Node masks
+	// <SourceMountTarget>/node_modules when the host already carries it, as
+	// best-effort defense-in-depth; the shared resolve hook (written to
+	// node.ResolveHookPath and preloaded by the bootstrap and by a mounted Node
+	// entrypoint service) is the unconditional guarantee that bare imports and
+	// requires resolve from the dependency image's /app/node_modules, so a host
+	// node_modules that appears only after preparation cannot shadow it either.
+	// Empty means no mask.
+	SourceMountMasks []string
 }

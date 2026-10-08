@@ -86,12 +86,14 @@ The managed runtimes and dependency handling are:
 | Runtime      | Base image         | Dependencies                                                                                                                               |
 | ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` (native uv project, installed locked); else `requirements.txt` via `uv pip install --system`.                 |
-| `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none. TypeScript is bundled at build time. |
+| `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none. TypeScript is bundled at build time (or at container startup under `SOURCE_MOUNT`). |
 
 Python dependencies are installed with uv, never pip. A `uv.lock` without
 `pyproject.toml` (or vice versa) is an error rather than a guess. `node24`
 accepts JavaScript **and** TypeScript handlers; TypeScript is transpiled and
-bundled by Relay at build time (esbuild is never needed in your `package.json`).
+bundled by Relay — at build time for a baked image, or at container startup from
+the live mount under `SOURCE_MOUNT` — so esbuild is never needed in your
+`package.json`.
 
 ### Handlers
 
@@ -219,6 +221,22 @@ Relay builds **one image per app**, versioned by source fingerprint:
 - A template that needs no runtime (its only services use the `image` source)
   builds **no app image at all**; its fingerprint is computed over
   `template.yaml` alone, and Relay does not scan the source tree for it.
+- With `SOURCE_MOUNT` enabled, a mountable runtime (Python and Node) instead
+  builds an image **without** the source and bind-mounts the live app directory
+  read-only (Python at `/app`; Node at `/app/src`, so `/app/node_modules` stays
+  visible and TypeScript is bundled at container startup); the image tag is then
+  derived from the runtime, dependency, and bootstrap only, and a source-only
+  edit reuses the image while advancing the runtime generation. A Node
+  source-mounted container runs with `/app/src` as its working directory (so
+  `process.cwd()` and relative paths see the app root). A source-mounted Node
+  image also carries a shared resolve hook (`/relay/resolve-hook.mjs`) that
+  the invocation bootstrap imports and a mounted Node entrypoint service
+  preloads with `node --import`, so bare imports and CommonJS requires always
+  resolve from the dependency image's `/app/node_modules` rather than a host
+  copy — even when a host `node_modules` appears only after preparation. A host
+  `node_modules` present at preparation time is additionally masked with an empty
+  read-only filesystem at `/app/src/node_modules`. See
+  [configuration.md](configuration.md#source-mount).
 
 Relay manages only its own labeled images in the `relay-app-*` / `relay-dep-*`
 namespaces (ownership is the strict `relay.type=app`/`dependency` label, not
@@ -307,6 +325,9 @@ Relay watches `/apps` and reconciles changes live: a new directory is
 built and becomes available to event matching and schedule dispatch; edits to
 template/source/dependencies rebuild only that app; a failed rebuild keeps the
 previous working version and retries on the next change or the 30s periodic pass.
+Under `SOURCE_MOUNT`, a source-only edit does not rebuild (the source is
+mounted), but the advanced fingerprint recycles the app's warm containers and
+replaces its entrypoint service replicas so the new code takes effect.
 An app whose image cannot be built
 is marked unavailable but is still **matched**: an event matching only an
 unavailable app counts as matched and stays pending (never DLQ'd for

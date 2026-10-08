@@ -25,6 +25,22 @@ var bootstrap []byte
 // Bootstrap exposes the embedded bootstrap so tests can verify its content.
 var Bootstrap = bootstrap
 
+//go:embed resolve-hook.mjs
+var resolveHook []byte
+
+// ResolveHook exposes the embedded shared resolve hook module (ESM and
+// CommonJS) so tests can verify its content and the plan writes it into a
+// source-mounted image.
+var ResolveHook = resolveHook
+
+// ResolveHookPath is the in-image path of the shared resolve hook module
+// (see resolve-hook.mjs). The mounted plan writes the embedded ResolveHook here;
+// the bootstrap dynamically imports it (./resolve-hook.mjs, relative to
+// /relay/bootstrap.mjs) and a mounted Node entrypoint service preloads it with
+// `node --import <ResolveHookPath>`. It is present ONLY in a source-mounted
+// image; a baked image has no mount and never receives the file.
+const ResolveHookPath = "/relay/resolve-hook.mjs"
+
 type Engine struct{}
 
 var entrypoint = []string{"node", "/relay/bootstrap.mjs"}
@@ -60,6 +76,74 @@ const (
 	esbuildCache  = "/tmp/relay-npm-cache"
 	esbuildBin    = esbuildPrefix + "/node_modules/.bin/esbuild"
 )
+
+// Source-mount (SOURCE_MOUNT) layout for Node.
+//
+// The live app source is bind-mounted read-only at SourceMountTarget, a
+// subdirectory of the image workdir, so /app/node_modules (installed by the
+// dependency image and the app image's managed API install) stays VISIBLE
+// underneath it: Node resolves a bare import from the mounted handler by walking
+// up to /app/node_modules. The distinct target is what lets Node be mountable at
+// all (mounting the source over /app would hide the dependencies).
+//
+// The whole app directory is mounted, so a host node_modules would sit at
+// SourceMountTarget/node_modules and Node would search it BEFORE /app/node_modules,
+// shadowing the dependency image. The unconditional guarantee is the shared
+// synchronous resolve hook in resolve-hook.mjs (written to ResolveHookPath only
+// for a source-mounted image): it re-anchors bare specifiers whose parent module
+// lives under the mount (or under the generated TypeScript overlay) to
+// /app/node_modules — through Node's own resolver for an ESM import, and through
+// a dependency-root require() for a CommonJS require, because Node's default
+// require resolver ignores a re-anchored parentURL — so a host node_modules that
+// appears AFTER preparation — and therefore carries no mask — cannot shadow the
+// dependency image. The one exception is the app's own package self-reference
+// (a manifest with name+exports), which is resolved through the MOUNTED
+// /app/src/package.json with native semantics, because its exports targets are
+// app source paths under the mount rather than dependency-tree paths. The same module
+// is consumed by both the pooled invocation bootstrap (dynamically imported when
+// mounted) and a mounted Node entrypoint service, which never runs the bootstrap
+// and instead preloads the hook with `node --import /relay/resolve-hook.mjs`. In
+// addition, Relay masks that one bounded path (SourceMountNodeModules) with an
+// empty read-only filesystem whenever the host app root already carries it; the
+// mask is best-effort defense-in-depth for resolution paths the hook cannot
+// intercept, but it can only be created when the path exists at prepare time
+// because Docker cannot create a mountpoint inside the read-only source bind.
+// Relay runs the container with SourceMountTarget as its working directory so
+// process.cwd() and relative paths see the app root.
+//
+// The bootstrap learns it is mounted from the --source-mount flag the plan puts
+// on the image ENTRYPOINT (argv, not environment, so a template env value can
+// never redirect module resolution), resolves handlers from SourceMountTarget,
+// and bundles any TypeScript handler at container startup with the same pinned
+// esbuild the baked build used. That is why the mounted image PERSISTS esbuild at
+// mountedEsbuildPrefix instead of removing it in the build layer.
+const (
+	// sourceMountFlag marks a source-mounted image's bootstrap invocation.
+	sourceMountFlag = "--source-mount"
+	// SourceMountTarget is where a SOURCE_MOUNT bind mounts the app source.
+	SourceMountTarget = "/app/src"
+	// SourceMountNodeModules is the path masked with an empty read-only
+	// filesystem under SOURCE_MOUNT WHEN the host already carries it at prepare
+	// time. The host app directory is mounted whole at SourceMountTarget, so a
+	// host node_modules would sit at /app/src/node_modules and Node's module
+	// resolution would find it BEFORE /app/node_modules, letting host modules
+	// shadow the dependency image. The mask is best-effort defense-in-depth for
+	// resolution paths outside the hook; the shared resolve hook
+	// (resolve-hook.mjs) already re-anchors bare imports AND requires to
+	// /app/node_modules whether or not a mask exists, so a host node_modules
+	// created after preparation cannot shadow the dependency image either.
+	SourceMountNodeModules = SourceMountTarget + "/node_modules"
+	// mountedEsbuildPrefix is the persistent image path the pinned esbuild is
+	// installed into for a source-mounted app.
+	mountedEsbuildPrefix = "/relay/esbuild"
+	// mountedEsbuildBin is the esbuild executable the bootstrap runs.
+	mountedEsbuildBin = mountedEsbuildPrefix + "/node_modules/.bin/esbuild"
+)
+
+// otelInstall is the managed OpenTelemetry API install, applied to EVERY Node
+// image (mounted or baked) so the bootstrap and user modules resolve one shared
+// API singleton from /app/node_modules.
+const otelInstall = "npm install --omit=dev --no-save @opentelemetry/api@" + otelAPIVersion
 
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
 // Relay app so the container never runs as root and the identity is stable
@@ -124,6 +208,17 @@ func (s handlerSource) outPath() string {
 // TypeScript handlers produces no Install step at all. A module that resolves to
 // neither a JS nor a TS source — or to both — fails Plan, turning what would be a
 // per-invocation "module not found" into a deterministic build-time error.
+//
+// When spec.SourceMounted is set the plan instead describes a
+// source-independent image: no source is baked (the caller omits the COPY), the
+// live source is mounted at SourceMountTarget, the shared resolve hook is
+// written to ResolveHookPath (the bootstrap imports it and a mounted Node
+// entrypoint service preloads it), and the pinned esbuild is
+// installed PERSISTENTLY so the bootstrap can bundle TypeScript handlers at
+// container startup (a source edit is not a rebuild). Handler resolution still
+// runs at plan time, so a missing or ambiguous module fails the build before any
+// container starts. The mounted plan is a deterministic function of non-source
+// inputs only, so a source-only edit reuses the same image tag.
 func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildPlan, error) {
 	files := []plan.File{{
 		Path:    "/relay/bootstrap.mjs",
@@ -172,29 +267,87 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	}
 
 	// Resolve every handler module so a missing or ambiguous module fails the
-	// build now, and collect the TypeScript ones into ONE combined install/compile
-	// RUN: esbuild is installed exactly once regardless of handler count.
+	// build now. For a baked image the TypeScript ones are collected into ONE
+	// combined install/compile RUN (esbuild is installed exactly once regardless
+	// of handler count); for a source-mounted image the same resolution is a pure
+	// validation step because transpilation happens at container startup.
 	tsSources, err := handlerSources(fnDir, handlers)
 	if err != nil {
 		return plan.BuildPlan{}, err
 	}
-	var install []string
-	install = append(install, "npm install --omit=dev --no-save @opentelemetry/api@"+otelAPIVersion)
-	if len(tsSources) > 0 {
+
+	// entry is the image ENTRYPOINT. A source-mounted image adds the
+	// --source-mount flag so the bootstrap resolves from the mounted root and
+	// bundles TypeScript on demand; a baked image keeps the two-element form
+	// byte-for-byte.
+	entry := entrypoint
+	// mountTarget is the in-container path a SOURCE_MOUNT bind targets (empty for
+	// a baked image, where the caller mounts nothing).
+	var mountTarget string
+	// mountWorkDir is the working directory a SOURCE_MOUNT container runs with so
+	// process.cwd() and relative paths see the app root (empty preserves the
+	// image workdir).
+	var mountWorkDir string
+	// mountMasks are the bounded in-container paths masked with an empty,
+	// read-only filesystem so the whole-directory bind cannot shadow them.
+	var mountMasks []string
+	install := []string{otelInstall}
+	if spec.SourceMounted {
+		entry = []string{"node", "/relay/bootstrap.mjs", sourceMountFlag}
+		mountTarget = SourceMountTarget
+		mountWorkDir = SourceMountTarget
+		// The shared resolve hook is written into the image ONLY for a
+		// source-mounted app: the bootstrap imports it and a mounted Node
+		// entrypoint service preloads it, and a baked image has no mount so it
+		// must never carry the file (it would otherwise change the baked plan).
+		files = append(files, plan.File{
+			Path:    ResolveHookPath,
+			Content: resolveHook,
+			Mode:    fs.FileMode(0o644),
+		})
+		// Mask the host node_modules only when it exists: the whole-directory bind
+		// already carries the mountpoint in that case, whereas Docker cannot create
+		// a mountpoint inside the read-only bind when the path is absent. This is
+		// best-effort defense-in-depth for resolution paths outside the hook; the
+		// shared resolve hook is the unconditional guarantee for bare import and
+		// require resolution, so a host node_modules created after this plan
+		// cannot shadow the dependency image for an invocation or an entrypoint
+		// service.
+		if dirExists(fnDir, "node_modules") {
+			mountMasks = []string{SourceMountNodeModules}
+		}
+		install = append(install, mountedEsbuildInstall())
+	} else if len(tsSources) > 0 {
 		install = append(install, esbuildCommand(spec.Name, tsSources, fileExists(fnDir, tsconfigFile)))
 	}
 
 	return plan.BuildPlan{
-		BaseImage:  spec.BaseImage,
-		WorkDir:    workDir,
-		Files:      files,
-		Deps:       deps,
-		Install:    install,
-		ToolCopies: spec.ToolCopies,
-		UserSetup:  userSetup,
-		User:       userID,
-		Entrypoint: entrypoint,
+		BaseImage:          spec.BaseImage,
+		WorkDir:            workDir,
+		Files:              files,
+		Deps:               deps,
+		Install:            install,
+		ToolCopies:         spec.ToolCopies,
+		UserSetup:          userSetup,
+		User:               userID,
+		Entrypoint:         entry,
+		SourceMountTarget:  mountTarget,
+		SourceMountWorkDir: mountWorkDir,
+		SourceMountMasks:   mountMasks,
 	}, nil
+}
+
+// mountedEsbuildInstall returns the single RUN that installs the pinned esbuild
+// into the image's PERSISTENT path (mountedEsbuildPrefix) for a source-mounted
+// app. Unlike the baked build, the tool is deliberately NOT removed: the
+// bootstrap runs it at container startup to bundle TypeScript handlers from the
+// live mount. The npm cache is still created and removed in the SAME layer so it
+// never bloats the image.
+func mountedEsbuildInstall() string {
+	return "npm install --prefix " + shellQuoteArg(mountedEsbuildPrefix) +
+		" --no-save --cache " + shellQuoteArg(esbuildCache) +
+		" --silent esbuild@" + shellQuoteArg(esbuildVersion) +
+		" && rm -rf " + shellQuoteArg(esbuildCache)
 }
 
 // handlerSources resolves every handler module and returns the TypeScript ones
@@ -399,4 +552,13 @@ func stat(fnDir, name string) error {
 func fileExists(fnDir, name string) bool {
 	info, err := os.Stat(filepath.Join(fnDir, name))
 	return err == nil && info.Mode().IsRegular()
+}
+
+// dirExists reports whether name exists in fnDir as a directory (following
+// symlinks). It is used to decide whether the whole-directory SOURCE_MOUNT bind
+// carries a node_modules that could shadow the dependency image; a non-directory
+// entry is not a shadowing tree.
+func dirExists(fnDir, name string) bool {
+	info, err := os.Stat(filepath.Join(fnDir, name))
+	return err == nil && info.IsDir()
 }
