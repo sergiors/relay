@@ -167,16 +167,21 @@ gocron (every worker) -> atomic publish-if-new -> same stream -> one worker
   handler.
 - Only minute-granularity schedules are accepted; sub-minute and relative forms
   are rejected because their identity is not deterministic across workers.
-- Publication failures retry the same occurrence with a bounded backoff; if that
-  in-memory budget is spent (or the tick is cancelled), the complete immutable
-  occurrence intent is persisted to the local `state` SQLite outbox
-  (`schedule_pending`) and a `cron`-owned durable retry worker republishes it,
-  across restarts, until a publication call resolves nil (published or clean
-  duplicate), when the row is deleted, OR until its **7-day retention** (from
-  first insertion, `state.PendingRetention`) expires, when the row is removed
-  without any publish attempt and counted as an expiration. The Redis occurrence
-  dedup key lives **14 days** on the authoritative first publish and is never
-  refreshed, so the original key still protects every retry the outbox can make.
+- Publication failures retry the same occurrence with a bounded backoff; the
+  FIRST failed attempt — and a cancellation before any attempt — persists the
+  complete immutable occurrence intent to the local `state` SQLite outbox
+  (`schedule_pending`) BEFORE the bounded in-memory retries continue, so a crash
+  during the backoff window still leaves the occurrence recoverable; a healthy
+  first-attempt success/duplicate never touches the outbox. An outbox write
+  failure makes the occurrence unresolved and the scheduler degraded — in-memory
+  retries never substitute for durability. A `cron`-owned durable retry worker
+  republishes the row, across restarts, until a publication call resolves nil
+  (published or clean duplicate), when the row is deleted, OR until its **7-day
+  retention** (from first insertion, `state.PendingRetention`) expires, when the
+  row is removed without any publish attempt and counted as an expiration. The
+  Redis occurrence dedup key lives **14 days** on the authoritative first publish
+  and is never refreshed, so the original key still protects every retry the
+  outbox can make.
   The outbox is coordination state only — never history, never an execution
   source — and is untouched on a healthy first-attempt success/duplicate. Rows are
   claimed with a per-row DB lease, not a global mutex, and never deleted until a

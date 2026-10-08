@@ -136,10 +136,11 @@ func latestOccurrence(sch robfigcron.Schedule, now time.Time, horizon time.Durat
 //
 // A persist failure (an outbox is installed but the write errors) is NOT
 // recovered by more in-memory retries: the scheduler is driven degraded and the
-// occurrence is returned unresolved. With no outbox installed the loop is the
-// bounded in-memory retry it always was (standalone/test schedulers); production
-// never enters that mode because the scheduler is gated on an installed outbox
-// and marked unavailable otherwise.
+// occurrence is returned unresolved. A low-level invocation of this helper with
+// no outbox installed still runs the bounded in-memory retry with no durable
+// copy (the standalone/test behavior), but production never enters that path:
+// live ticks are gated on stateRunning, which requires a usable outbox, so the
+// worker either installs one or marks the scheduler unavailable.
 //
 // One `schedule.publish` logical span wraps the WHOLE retry loop, so all
 // attempts of one occurrence share a single trace. The Publisher opens its own
@@ -263,11 +264,12 @@ func (s *Scheduler) publish(ctx context.Context, o schedule.Occurrence, catchUp,
 			span.SetStatus(codes.Error, err.Error())
 			span.SetAttributes(attribute.String("relay.outcome", "exhausted"))
 			log.Warn("Schedule: publish retries exhausted", "attempts", attempt+1, "catchup", catchUp, "reason", err)
-			// The bounded in-memory budget is spent; the durable record (when
-			// configured) now carries the occurrence to the retry worker, which
-			// keeps trying across temporary/long outages and restarts. With no
-			// outbox (standalone/test schedulers) there is no durable copy, which
-			// is the documented bounded-retry-only behavior.
+			// The bounded in-memory budget is spent; the durable record written on
+			// the first failure now carries the occurrence to the retry worker,
+			// which keeps trying across temporary/long outages and restarts. A
+			// low-level invocation with no outbox has no durable copy and simply
+			// gives up here (the standalone/test behavior); production never
+			// enters that path because the storage gate requires a usable outbox.
 			return false, false
 		}
 

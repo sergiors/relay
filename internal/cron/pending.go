@@ -111,10 +111,11 @@ func pendingBackoff(attempts int) time.Duration {
 // scheduler: it transitions to running so live publication is enabled (gocron is
 // not started here; that happens in Start, or in markRunning once the worker has
 // requested it). A nil outbox is a no-op. A scheduler that is never given an
-// outbox and never marked unavailable keeps the documented standalone behavior
-// (bounded in-memory retry only); the production worker always either installs an
-// outbox or marks the scheduler unavailable, so it is never unsupervised. A nil
-// receiver is a no-op.
+// outbox stays unavailable (the storage gate): it neither fires nor publishes a
+// live occurrence until a usable outbox is installed, so the bounded in-memory
+// retry is unreachable from the gated live path. The production worker always
+// either installs an outbox or marks the scheduler unavailable, so it is never
+// unsupervised. A nil receiver is a no-op.
 func (s *Scheduler) SetOutbox(o Outbox) {
 	if s == nil || o == nil {
 		return

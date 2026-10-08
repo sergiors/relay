@@ -142,11 +142,15 @@ type Scheduler struct {
 	// sleep-free.
 	wait func(ctx context.Context, d time.Duration) bool
 
-	// outbox is the optional durable publication-retry store. It is nil when the
-	// worker has not wired state (standalone/test schedulers), in which case the
-	// scheduler behaves exactly as before: bounded in-memory retry only. It is
-	// installed by SetOutbox BEFORE StartPendingRetry/Start and then only read,
-	// so no lock is needed on the publication path.
+	// outbox is the durable publication-retry store. It is nil until a usable
+	// store is installed (SetOutbox, or a bootstrap recovery), and the scheduler
+	// stays unavailable while nil: live jobs neither fire nor publish until it is
+	// installed (the storage gate). A standalone/test scheduler that calls the
+	// low-level publish helper directly with no outbox still falls back to
+	// bounded in-memory retry, but production never reaches that path: the worker
+	// either installs an outbox or marks the scheduler unavailable. It is read
+	// under mu via currentOutbox, so a recovery that installs or replaces it
+	// cannot race the publication path.
 	outbox Outbox
 	// pendingWake signals the durable retry worker that a record was persisted.
 	// It is a buffered (capacity 1) channel created by the constructor.
