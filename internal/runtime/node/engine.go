@@ -1,9 +1,9 @@
 // Package node is the Node.js runtime engine. It holds the language-specific
 // preparation knowledge for Node.js (ESM) apps: the embedded bootstrap,
-// the dependency handling (package-lock.json / package.json), the TypeScript
-// handler transpilation, and the container entrypoint. It does NOT run docker
-// build or generate Dockerfiles; it produces a generic runtime.BuildPlan that
-// the Docker builder renders.
+// the dependency handling (package.json / pnpm-lock.yaml, installed with pnpm),
+// the TypeScript handler transpilation, and the container entrypoint. It does
+// NOT run docker build or generate Dockerfiles; it produces a generic
+// runtime.BuildPlan that the Docker builder renders.
 package node
 
 import (
@@ -47,7 +47,13 @@ var entrypoint = []string{"node", "/relay/bootstrap.mjs"}
 
 const workDir = "/app"
 const pkgFile = "package.json"
-const lockFile = "package-lock.json"
+const pnpmLockFile = "pnpm-lock.yaml"
+
+// npmLockFile is the npm lockfile. Relay installs Node dependencies with pnpm
+// only, so its presence is an error (see dependencyPlan): silently ignoring it
+// would let an app believe its pinned npm tree was installed when Relay would
+// instead install a pnpm tree it never resolved.
+const npmLockFile = "package-lock.json"
 
 // tsconfigFile is the optional TypeScript compiler configuration esbuild reads
 // when it is present in the app directory. Relay never type-checks; the
@@ -56,24 +62,67 @@ const lockFile = "package-lock.json"
 const tsconfigFile = "tsconfig.json"
 
 // esbuildVersion pins the esbuild the Node engine transpiles TypeScript
-// handlers with. Package constant like relay.UvImageTag: upgrades are a
-// one-line change, never a floating "latest". Relay installs it per build
-// with the base image's own npm into an ephemeral layer (removed again), so
-// the user's package.json never needs esbuild and the tooling stays out of
-// the final execution layer. Note there is no public esbuild image to COPY
-// a binary from (ghcr.io/evanw/esbuild does not exist).
+// handlers with. Package constant like runtime.PnpmImageTag: upgrades are a
+// one-line change, never a floating "latest". Relay installs it per build with
+// pnpm into an ephemeral layer (removed again), so the user's package.json never
+// needs esbuild and the tooling stays out of the final execution layer.
 const esbuildVersion = "0.28.2"
 
 // The bootstrap and user instrumentation must resolve the same API singleton
 // from /app so a user-installed SDK observes the managed invocation context.
 const otelAPIVersion = "1.9.0"
 
+// pnpmStoreDir is the single scratch content-addressable store every pnpm
+// install uses. It is created and removed in the same RUN as the install that
+// populated it, so the store (and the pnpm metadata it holds) never becomes
+// part of an image; the installed node_modules entries are hardlinks that keep
+// working after the store directory is removed.
+const pnpmStoreDir = "/tmp/relay-pnpm-store"
+
+// otelProjectDir is the private pnpm project the managed OpenTelemetry API is
+// installed into. It is kept separate from /app so the managed install never
+// rewrites the app's package.json or pnpm-lock.yaml (pnpm add always saves), and
+// its single package is linked into /app/node_modules (see otelInstall).
+const otelProjectDir = "/relay/otel"
+
+// pnpmCLIPath is the in-image path of the pnpm JavaScript CLI copied from the
+// official pnpm image (registry.PnpmImageTag). The dependency image invokes it
+// directly with node, before any wrapper exists; the app image also exposes it
+// through pnpmWrapperPath.
+const pnpmCLIPath = "/opt/pnpm/dist/pnpm.mjs"
+
+// pnpmWrapperPath is the directly-executable pnpm the runtime image exposes.
+const pnpmWrapperPath = "/usr/local/bin/pnpm"
+
+// pnpmWrapperInstall creates pnpmWrapperPath as a tiny POSIX shell wrapper
+// around the copied pnpm CLI. The official pnpm 11 image ships the CLI as a
+// non-executable, shebang-less ES module (dist/pnpm.mjs) that resolves its
+// worker relative to its own directory, so a plain COPY to /usr/local/bin/pnpm
+// is neither executable nor self-contained. Copying the whole dist directory
+// (the RuntimeTool) and adding this wrapper is the minimal fix using the
+// existing image-COPY tool and a normal build Install RUN. It runs BEFORE every
+// app-image install command that invokes `pnpm`.
+const pnpmWrapperInstall = "printf '%s\\n' '#!/bin/sh' 'exec node " + pnpmCLIPath + " \"$@\"' > " + pnpmWrapperPath + " && chmod 0755 " + pnpmWrapperPath
+
+// pnpmInstall installs an app's production dependency tree from the committed
+// pnpm lock, in the DEPENDENCY image (which has the copied CLI but no wrapper),
+// so it invokes the CLI directly with node. --frozen-lockfile fails the build if
+// package.json and pnpm-lock.yaml disagree instead of silently re-resolving, and
+// --prod drops devDependencies.
+// --config.dangerouslyAllowAllBuilds=true restores npm's long-standing behavior
+// of running dependency lifecycle (build) scripts: pnpm blocks them by default
+// (ERR_PNPM_IGNORED_BUILDS), which would leave any dependency with a
+// native/install step broken. The scratch store is removed in the same RUN so it
+// never bloats the layer (the node_modules entries are hardlinks and keep
+// working after the store directory is gone).
+const pnpmInstall = "node " + pnpmCLIPath + " install --prod --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --store-dir " + pnpmStoreDir +
+	" && rm -rf " + pnpmStoreDir
+
 // Ephemeral build-tooling paths. Both live under /tmp and are created AND
-// removed in the same RUN, so neither the pinned esbuild nor its npm cache ever
+// removed in the same RUN, so neither the pinned esbuild nor the pnpm store ever
 // becomes part of the execution image.
 const (
 	esbuildPrefix = "/tmp/relay-esbuild"
-	esbuildCache  = "/tmp/relay-npm-cache"
 	esbuildBin    = esbuildPrefix + "/node_modules/.bin/esbuild"
 )
 
@@ -143,7 +192,32 @@ const (
 // otelInstall is the managed OpenTelemetry API install, applied to EVERY Node
 // image (mounted or baked) so the bootstrap and user modules resolve one shared
 // API singleton from /app/node_modules.
-const otelInstall = "npm install --omit=dev --no-save @opentelemetry/api@" + otelAPIVersion
+//
+// It installs with pnpm into a PRIVATE project (otelProjectDir) and links the
+// single package into /app/node_modules rather than running `pnpm add` in /app:
+// pnpm add always saves, so installing in /app would rewrite the app's
+// package.json and pnpm-lock.yaml. @opentelemetry/api has no dependencies, so
+// one symlink is the whole install and the bootstrap's createRequire from /app
+// resolves the same singleton user modules do. The store is removed in the same
+// RUN. This preserves the previous npm `--no-save` behavior (the managed version
+// wins over a declared one) without touching the app's manifest. It runs AFTER
+// pnpmWrapperInstall, so `pnpm` is the wrapper.
+//
+// The target package path is removed before the link is created: the app's
+// vendored node_modules may already carry a REAL @opentelemetry/api directory,
+// and `ln -sfn` treats an existing real directory as a destination to link
+// INSIDE (creating .../api/api or failing) rather than replacing it. Removing
+// only the package path (never the parent @opentelemetry scope, which may hold
+// other packages) makes the managed version win unconditionally. `rm -rf` does
+// not follow a symlink, so it is also correct when a previous install already
+// left a link there.
+const otelInstall = "mkdir -p " + otelProjectDir +
+	" && printf '%s' '{\"name\":\"relay-otel\",\"private\":true}' > " + otelProjectDir + "/package.json" +
+	" && pnpm add -C " + otelProjectDir + " --store-dir " + pnpmStoreDir + " --save-exact @opentelemetry/api@" + otelAPIVersion +
+	" && mkdir -p " + workDir + "/node_modules/@opentelemetry" +
+	" && rm -rf " + workDir + "/node_modules/@opentelemetry/api" +
+	" && ln -s " + otelProjectDir + "/node_modules/@opentelemetry/api " + workDir + "/node_modules/@opentelemetry/api" +
+	" && rm -rf " + pnpmStoreDir
 
 // The runtime user is a fixed numeric identity (10001:10001) shared by every
 // Relay app so the container never runs as root and the identity is stable
@@ -196,9 +270,14 @@ func (s handlerSource) outPath() string {
 }
 
 // Plan returns the generic build plan for a Node.js app. It only inspects
-// fnDir (for package-lock.json, package.json, tsconfig.json, and the handler
+// fnDir (for package.json, pnpm-lock.yaml, tsconfig.json, and the handler
 // sources) and never writes into it; any injected file is returned for the
 // builder to write.
+//
+// Dependency detection is deterministic and pnpm-only (see dependencyPlan):
+// package.json + pnpm-lock.yaml install with pnpm; a package.json without a
+// pnpm lock, a pnpm lock without a package.json, or any package-lock.json are
+// errors with actionable messages. No npm fallback exists.
 //
 // handlers are the handler MODULE parts declared by the app's template
 // (sorted and deduped by the caller). Each is resolved to a source file under
@@ -226,39 +305,16 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		Mode:    fs.FileMode(0o644),
 	}}
 
-	// A package.json / package-lock.json declares the app's dependencies:
-	// a reusable layer that installs them into /app (the app WORKDIR).
-	var deps plan.Deps
-
-	lockErr := stat(fnDir, lockFile)
-	pkgErr := stat(fnDir, pkgFile)
-
-	switch {
-	case lockErr == nil && pkgErr == nil:
-		// A lockfile pins the exact tree, so npm ci reproduces it: deterministic,
-		// correct, and the fastest install. Both files are listed so a lock change
-		// (a different pinned tree) re-fingerprints the layer even when the
-		// manifest is unchanged.
-		deps = plan.Deps{Files: []string{pkgFile, lockFile}, Install: "npm ci --omit=dev", Dir: workDir}
-	case pkgErr == nil:
-		// No lock: npm install resolves from the manifest.
-		deps = plan.Deps{Files: []string{pkgFile}, Install: "npm install --omit=dev", Dir: workDir}
-	case lockErr == nil:
-		// A lock without a manifest is unusual (npm ci needs both) but preserve
-		// the previous engine's intent to ci-install from the lock. Only the
-		// present file is listed so fingerprinting and the dep build never read a
-		// missing manifest.
-		//
-		// Intentional surface: npm ci fails without a package.json, so this
-		// branch's build fails loudly — the same failure mode as the previous
-		// single-stage behavior. Operators get an explicit error rather than
-		// silent misbehavior. No ESM package.json is injected here because the
-		// Deps path replaces the inject.
-		deps = plan.Deps{Files: []string{lockFile}, Install: "npm ci --omit=dev", Dir: workDir}
-	default:
-		// No package.json or lock: inject a minimal ESM package.json so .js files
-		// are treated as ESM. There are no dependencies, so no Deps and no
-		// dependency image.
+	// The app's dependency layer is derived from its manifests. dependencyPlan
+	// enforces the pnpm-only policy: a package.json must ship a pnpm-lock.yaml,
+	// and any package-lock.json is rejected. When the app declares neither a
+	// package.json nor a lock, a minimal ESM package.json is injected so .js
+	// files are treated as ESM and there is no dependency image.
+	deps, err := dependencyPlan(fnDir)
+	if err != nil {
+		return plan.BuildPlan{}, err
+	}
+	if deps.IsZero() && !fileExists(fnDir, pkgFile) {
 		files = append(files, plan.File{
 			Path:    filepath.Join(workDir, pkgFile),
 			Content: esmPackageJSON,
@@ -291,7 +347,10 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	// mountMasks are the bounded in-container paths masked with an empty,
 	// read-only filesystem so the whole-directory bind cannot shadow them.
 	var mountMasks []string
-	install := []string{otelInstall}
+	// The app image always exposes an executable /usr/local/bin/pnpm (a wrapper
+	// around the copied CLI), then installs the managed API and any build
+	// tooling through it. The wrapper must be created first.
+	install := []string{pnpmWrapperInstall, otelInstall}
 	if spec.SourceMounted {
 		entry = []string{"node", "/relay/bootstrap.mjs", sourceMountFlag}
 		mountTarget = SourceMountTarget
@@ -337,17 +396,74 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	}, nil
 }
 
+// dependencyPlan resolves fnDir's Node dependency manifests into a Deps value
+// (zero when the app declares none) or an actionable error. Node dependencies
+// are installed with pnpm only:
+//
+//   - package.json + pnpm-lock.yaml: a frozen production install from the
+//     committed lock. Both files are listed so a change to either the declared
+//     dependency set or the resolved lock re-fingerprints the layer.
+//   - package.json without pnpm-lock.yaml: an error — Relay never resolves a
+//     fresh tree, so the app must commit a pnpm lock.
+//   - pnpm-lock.yaml without package.json: an error — a lock alone cannot be
+//     installed.
+//   - package-lock.json (npm), with or without a pnpm lock: an error — npm is
+//     not a supported package manager for Relay-managed Node apps, and silently
+//     ignoring an npm lock would let an app believe its pinned tree was used.
+//   - none: no dependency layer (Plan injects an ESM package.json).
+func dependencyPlan(fnDir string) (plan.Deps, error) {
+	pkg := fileExists(fnDir, pkgFile)
+	pnpmLock := fileExists(fnDir, pnpmLockFile)
+	npmLock := fileExists(fnDir, npmLockFile)
+
+	if npmLock {
+		if pnpmLock {
+			return plan.Deps{}, fmt.Errorf(
+				"%s is not supported: Relay installs Node dependencies with pnpm. Remove %s and keep only %s (run `pnpm install --lockfile-only`)",
+				npmLockFile, npmLockFile, pnpmLockFile)
+		}
+		return plan.Deps{}, fmt.Errorf(
+			"%s is not supported: Relay installs Node dependencies with pnpm. Remove it and commit a %s (run `pnpm install --lockfile-only`)",
+			npmLockFile, pnpmLockFile)
+	}
+
+	switch {
+	case pkg && pnpmLock:
+		return plan.Deps{Files: []string{pkgFile, pnpmLockFile}, Install: pnpmInstall, Dir: workDir}, nil
+	case pkg:
+		return plan.Deps{}, fmt.Errorf(
+			"%s is present but %s is missing: Relay installs Node dependencies only from a committed pnpm lock. Run `pnpm install --lockfile-only` and commit %s",
+			pkgFile, pnpmLockFile, pnpmLockFile)
+	case pnpmLock:
+		return plan.Deps{}, fmt.Errorf(
+			"%s is present without %s: commit both files together (run `pnpm install --lockfile-only`)",
+			pnpmLockFile, pkgFile)
+	default:
+		return plan.Deps{}, nil
+	}
+}
+
+// pnpmEsbuildAdd returns the command that installs the pinned esbuild into
+// prefix with pnpm. prefix is created first because pnpm's --dir requires an
+// existing directory, and --allow-build=esbuild lets esbuild's install script
+// validate its prebuilt platform binary (pnpm blocks dependency build scripts by
+// default). --save-exact pins the installed version. The caller removes the
+// scratch pnpm store in the same RUN.
+func pnpmEsbuildAdd(prefix string) string {
+	return "mkdir -p " + shellQuoteArg(prefix) +
+		" && pnpm add -C " + shellQuoteArg(prefix) +
+		" --store-dir " + shellQuoteArg(pnpmStoreDir) +
+		" --save-exact --allow-build=esbuild esbuild@" + shellQuoteArg(esbuildVersion)
+}
+
 // mountedEsbuildInstall returns the single RUN that installs the pinned esbuild
 // into the image's PERSISTENT path (mountedEsbuildPrefix) for a source-mounted
 // app. Unlike the baked build, the tool is deliberately NOT removed: the
 // bootstrap runs it at container startup to bundle TypeScript handlers from the
-// live mount. The npm cache is still created and removed in the SAME layer so it
-// never bloats the image.
+// live mount. The pnpm store is still created and removed in the SAME layer so
+// it never bloats the image.
 func mountedEsbuildInstall() string {
-	return "npm install --prefix " + shellQuoteArg(mountedEsbuildPrefix) +
-		" --no-save --cache " + shellQuoteArg(esbuildCache) +
-		" --silent esbuild@" + shellQuoteArg(esbuildVersion) +
-		" && rm -rf " + shellQuoteArg(esbuildCache)
+	return pnpmEsbuildAdd(mountedEsbuildPrefix) + " && rm -rf " + shellQuoteArg(pnpmStoreDir)
 }
 
 // handlerSources resolves every handler module and returns the TypeScript ones
@@ -464,11 +580,11 @@ func firstExisting(fnDir string, candidates []string) string {
 }
 
 // esbuildCommand builds ONE RUN command that installs the pinned esbuild into an
-// ephemeral /tmp prefix, transpiles every TypeScript handler, then removes the
-// tooling and the npm cache in the SAME layer. A single install serves every
-// handler, and the cleanup keeps the build tooling out of the final execution
-// layer. Paths are absolute in the image and esbuild is invoked with its own
-// flag=value syntax (esbuild rejects the space-separated form).
+// ephemeral /tmp prefix with pnpm, transpiles every TypeScript handler, then
+// removes the tooling and the pnpm store in the SAME layer. A single install
+// serves every handler, and the cleanup keeps the build tooling out of the final
+// execution layer. Paths are absolute in the image and esbuild is invoked with
+// its own flag=value syntax (esbuild rejects the space-separated form).
 //
 // Flags: --bundle follows the user's local .ts module graph; --packages=external
 // keeps bare node_modules imports out of the bundle so they resolve at runtime
@@ -481,14 +597,10 @@ func firstExisting(fnDir string, candidates []string) string {
 // shellQuoteArg, so a handler-derived path (a user may name a source file with
 // shell metacharacters, e.g. "o$rder.ts" or "a;b.ts") is always a single
 // argument and is never expanded, split, or executed by the build shell. The
-// fixed prefixes/caches/versions are constants and pass through quoted-or-bare
+// fixed prefixes/stores/versions are constants and pass through quoted-or-bare
 // like any other value.
 func esbuildCommand(specName string, sources []handlerSource, tsconfig bool) string {
-	parts := []string{
-		"npm install --prefix " + shellQuoteArg(esbuildPrefix) +
-			" --no-save --cache " + shellQuoteArg(esbuildCache) +
-			" --silent esbuild@" + shellQuoteArg(esbuildVersion),
-	}
+	parts := []string{pnpmEsbuildAdd(esbuildPrefix)}
 	tsconfigFlag := ""
 	if tsconfig {
 		tsconfigFlag = " --tsconfig=" + shellQuoteArg(path.Join(workDir, tsconfigFile))
@@ -503,7 +615,7 @@ func esbuildCommand(specName string, sources []handlerSource, tsconfig bool) str
 			tsconfigFlag,
 		))
 	}
-	parts = append(parts, "rm -rf "+shellQuoteArg(esbuildPrefix)+" "+shellQuoteArg(esbuildCache))
+	parts = append(parts, "rm -rf "+shellQuoteArg(esbuildPrefix)+" "+shellQuoteArg(pnpmStoreDir))
 	return strings.Join(parts, " && ")
 }
 
@@ -541,11 +653,6 @@ func isShellSafeArg(s string) bool {
 		}
 	}
 	return true
-}
-
-func stat(fnDir, name string) error {
-	_, err := os.Stat(filepath.Join(fnDir, name))
-	return err
 }
 
 // fileExists reports whether name exists in fnDir as a regular file.

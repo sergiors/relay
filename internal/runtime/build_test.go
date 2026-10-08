@@ -65,7 +65,7 @@ func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 		Files: []plan.File{
 			{Path: "/relay/bootstrap.mjs", Content: []byte("x"), Mode: fs.FileMode(0o644)},
 		},
-		Install:    []string{"npm ci --omit=dev"},
+		Install:    []string{"pnpm install --prod --frozen-lockfile"},
 		Entrypoint: []string{"node", "/relay/bootstrap.mjs"},
 	}
 
@@ -83,7 +83,7 @@ func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 	if !strings.Contains(df, "COPY relay/bootstrap.mjs /relay/") {
 		t.Errorf("expected COPY bootstrap line, got:\n%s", df)
 	}
-	if !strings.Contains(df, "RUN npm ci --omit=dev") {
+	if !strings.Contains(df, "RUN pnpm install --prod --frozen-lockfile") {
 		t.Errorf("expected RUN line, got:\n%s", df)
 	}
 	if !strings.Contains(df, `ENTRYPOINT ["node", "/relay/bootstrap.mjs"]`) {

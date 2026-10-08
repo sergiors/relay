@@ -46,9 +46,8 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if !p.Deps.IsZero() {
 				t.Errorf("expected zero Deps without package files, got %+v", p.Deps)
 			}
-			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-				t.Errorf("expected the managed OTel API install, got %v", p.Install)
-			}
+			requirePnpmWrapper(t, p)
+			requireOTelInstall(t, p)
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" {
 				t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs]", p.Entrypoint)
 			}
@@ -92,7 +91,10 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 	}
 }
 
-func TestPlanWithPackageJSONOnly(t *testing.T) {
+// TestPlanWithPackageJSONOnlyRequiresLock pins the pnpm-only policy: a
+// package.json without a committed pnpm-lock.yaml is an actionable error, never
+// an npm install fallback.
+func TestPlanWithPackageJSONOnlyRequiresLock(t *testing.T) {
 	for _, spec := range testSpecs {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -100,16 +102,54 @@ func TestPlanWithPackageJSONOnly(t *testing.T) {
 				t.Fatalf("write package.json: %v", err)
 			}
 
+			_, err := Engine{}.Plan(spec, dir, nil)
+			if err == nil {
+				t.Fatal("expected an error for package.json without pnpm-lock.yaml")
+			}
+			if !strings.Contains(err.Error(), "pnpm-lock.yaml") {
+				t.Errorf("error = %q, want it to name pnpm-lock.yaml", err)
+			}
+			if !strings.Contains(err.Error(), "pnpm install --lockfile-only") {
+				t.Errorf("error = %q, want the actionable pnpm lock instruction", err)
+			}
+		})
+	}
+}
+
+// TestPlanWithPnpmLock pins the pnpm dependency layer: package.json +
+// pnpm-lock.yaml install with a frozen production pnpm install (the dependency
+// image invokes the copied CLI directly, before any wrapper exists), and both
+// files are listed so either a manifest or a lock change re-fingerprints the
+// layer even when the other is unchanged.
+func TestPlanWithPnpmLock(t *testing.T) {
+	for _, spec := range testSpecs {
+		t.Run(spec.Name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSource(t, dir, "package.json", `{"type":"module"}`)
+			writeSource(t, dir, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+
 			p, err := Engine{}.Plan(spec, dir, nil)
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-				t.Errorf("expected the managed OTel API install, got %v", p.Install)
-			}
-			want := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+			requirePnpmWrapper(t, p)
+			requireOTelInstall(t, p)
+			want := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: pnpmInstall, Dir: "/app"}
 			if !p.Deps.Equal(want) {
 				t.Errorf("deps = %+v, want %+v", p.Deps, want)
+			}
+			// The dependency image invokes the copied CLI directly (no wrapper
+			// exists there yet), frozen and production-only, with dependency
+			// lifecycle scripts re-enabled.
+			for _, want := range []string{
+				"node " + pnpmCLIPath + " install",
+				"--prod",
+				"--frozen-lockfile",
+				"--config.dangerouslyAllowAllBuilds=true",
+			} {
+				if !strings.Contains(p.Deps.Install, want) {
+					t.Errorf("install = %q, want %q", p.Deps.Install, want)
+				}
 			}
 			for _, f := range p.Files {
 				if f.Path == filepath.Join("/app", "package.json") {
@@ -120,87 +160,95 @@ func TestPlanWithPackageJSONOnly(t *testing.T) {
 	}
 }
 
-func TestPlanWithLock(t *testing.T) {
+// TestPlanPnpmLockOnlyErrors pins that a pnpm lock without a package.json is an
+// actionable error (a lock alone cannot be installed), not a build that fails
+// later.
+func TestPlanPnpmLockOnlyErrors(t *testing.T) {
 	for _, spec := range testSpecs {
 		t.Run(spec.Name, func(t *testing.T) {
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
-				t.Fatalf("write package.json: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
-				t.Fatalf("write package-lock.json: %v", err)
-			}
+			writeSource(t, dir, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
 
-			p, err := Engine{}.Plan(spec, dir, nil)
-			if err != nil {
-				t.Fatalf("plan: %v", err)
+			_, err := Engine{}.Plan(spec, dir, nil)
+			if err == nil {
+				t.Fatal("expected an error for pnpm-lock.yaml without package.json")
 			}
-			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-				t.Errorf("expected the managed OTel API install, got %v", p.Install)
+			if !strings.Contains(err.Error(), "pnpm-lock.yaml") {
+				t.Errorf("error = %q, want it to name pnpm-lock.yaml", err)
 			}
-			// Both the lock and the manifest are listed so a lock change (a
-			// different pinned tree) re-fingerprints the layer even when the
-			// manifest is unchanged.
-			want := plan.Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
-			if !p.Deps.Equal(want) {
-				t.Errorf("deps = %+v, want %+v", p.Deps, want)
-			}
-			for _, f := range p.Files {
-				if f.Path == filepath.Join("/app", "package.json") {
-					t.Error("did not expect injected package.json when a lock exists")
+		})
+	}
+}
+
+// TestPlanRejectsNpmLock pins that package-lock.json is unsupported, both alone
+// and alongside a pnpm lock: Relay never installs from npm's lock, and it must
+// reject rather than silently prefer one lock.
+func TestPlanRejectsNpmLock(t *testing.T) {
+	for _, spec := range testSpecs {
+		t.Run(spec.Name, func(t *testing.T) {
+			for _, withPnpm := range []bool{false, true} {
+				dir := t.TempDir()
+				writeSource(t, dir, "package.json", `{"type":"module"}`)
+				writeSource(t, dir, "package-lock.json", `{}`)
+				if withPnpm {
+					writeSource(t, dir, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+				}
+
+				_, err := Engine{}.Plan(spec, dir, nil)
+				if err == nil {
+					t.Fatalf("expected package-lock.json to be rejected (withPnpm=%v)", withPnpm)
+				}
+				if !strings.Contains(err.Error(), "package-lock.json") {
+					t.Errorf("error = %q, want it to name package-lock.json", err)
 				}
 			}
 		})
 	}
 }
 
-func TestPlanWithLockOnly(t *testing.T) {
-	for _, spec := range testSpecs {
-		t.Run(spec.Name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
-				t.Fatalf("write package-lock.json: %v", err)
-			}
-
-			p, err := Engine{}.Plan(spec, dir, nil)
-			if err != nil {
-				t.Fatalf("plan: %v", err)
-			}
-			// A lock without a manifest is unusual; only the present file is
-			// listed so fingerprinting/the dep build never read a missing file.
-			want := plan.Deps{Files: []string{"package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
-			if !p.Deps.Equal(want) {
-				t.Errorf("deps = %+v, want %+v", p.Deps, want)
-			}
-		})
+// TestPlanOtelInstallUsesPnpm pins that the managed OpenTelemetry API install
+// uses pnpm (never npm) and installs into a private project linked into
+// /app/node_modules, so the app's own package.json/pnpm-lock.yaml are never
+// rewritten (pnpm add always saves).
+func TestPlanOtelInstallUsesPnpm(t *testing.T) {
+	dir := t.TempDir()
+	p, err := Engine{}.Plan(specByName(t, "node24"), dir, nil)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
 	}
-}
-
-func TestPlanWithLockOnlyNoInject(t *testing.T) {
-	for _, spec := range testSpecs {
-		t.Run(spec.Name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
-				t.Fatalf("write package-lock.json: %v", err)
-			}
-
-			p, err := Engine{}.Plan(spec, dir, nil)
-			if err != nil {
-				t.Fatalf("plan: %v", err)
-			}
-			// Lock-only still routes through the Deps install path: npm ci must
-			// fail loudly during the build (no package.json), never silently be
-			// covered up by injecting an ESM package.json here.
-			want := plan.Deps{Files: []string{"package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
-			if !p.Deps.Equal(want) {
-				t.Errorf("deps = %+v, want %+v", p.Deps, want)
-			}
-			for _, f := range p.Files {
-				if f.Path == filepath.Join("/app", "package.json") {
-					t.Error("did not expect injected package.json for a lock-only function")
-				}
-			}
-		})
+	otel := requireOTelInstall(t, p)
+	for _, want := range []string{
+		"pnpm add -C " + otelProjectDir,
+		"@opentelemetry/api@" + otelAPIVersion,
+	} {
+		if !strings.Contains(otel, want) {
+			t.Errorf("managed OTel install missing %q:\n%s", want, otel)
+		}
+	}
+	// The managed version must win over a vendored REAL @opentelemetry/api
+	// directory: the target package path is removed BEFORE the symlink is created
+	// (ln -sfn would link INSIDE an existing real directory instead of replacing
+	// it), and only that package path is removed, never the parent
+	// @opentelemetry scope that may hold other packages.
+	linkStep := "mkdir -p " + workDir + "/node_modules/@opentelemetry" +
+		" && rm -rf " + workDir + "/node_modules/@opentelemetry/api" +
+		" && ln -s " + otelProjectDir + "/node_modules/@opentelemetry/api " + workDir + "/node_modules/@opentelemetry/api"
+	if !strings.Contains(otel, linkStep) {
+		t.Errorf("managed OTel install must remove the package path before linking it in order:\nwant %q\ngot  %s", linkStep, otel)
+	}
+	if strings.Contains(otel, "ln -sfn") {
+		t.Errorf("managed OTel install must not use ln -sfn (fails on an existing real directory):\n%s", otel)
+	}
+	// Removing the parent @opentelemetry scope would delete sibling packages.
+	if strings.Contains(otel, "rm -rf "+workDir+"/node_modules/@opentelemetry &&") {
+		t.Errorf("managed OTel install must not remove the parent @opentelemetry scope:\n%s", otel)
+	}
+	if strings.Contains(otel, "npm install") {
+		t.Errorf("managed OTel install must use pnpm:\n%s", otel)
+	}
+	// It must not run in /app, which would rewrite the app's manifest/lock.
+	if strings.Contains(otel, "-C /app ") || strings.Contains(otel, "--dir /app") {
+		t.Errorf("managed OTel install must not run in /app:\n%s", otel)
 	}
 }
 
@@ -242,6 +290,35 @@ func requireInstall(t *testing.T, p plan.BuildPlan) string {
 	return ""
 }
 
+// requirePnpmWrapper returns the pnpm wrapper install command (the
+// /usr/local/bin/pnpm shell wrapper around the copied CLI), failing when the
+// plan omits it. Every Node image must expose a directly-executable pnpm so
+// build-time installs can invoke it.
+func requirePnpmWrapper(t *testing.T, p plan.BuildPlan) string {
+	t.Helper()
+	for _, cmd := range p.Install {
+		if strings.Contains(cmd, pnpmWrapperPath) {
+			return cmd
+		}
+	}
+	t.Fatalf("Install = %v, want the %s wrapper install", p.Install, pnpmWrapperPath)
+	return ""
+}
+
+// requireOTelInstall returns the managed OpenTelemetry API install command,
+// failing when the plan omits it. It is not necessarily the first Install entry:
+// the pnpm wrapper precedes it in every Node image.
+func requireOTelInstall(t *testing.T, p plan.BuildPlan) string {
+	t.Helper()
+	for _, cmd := range p.Install {
+		if strings.Contains(cmd, "@opentelemetry/api@"+otelAPIVersion) {
+			return cmd
+		}
+	}
+	t.Fatalf("Install = %v, want the managed OTel API install", p.Install)
+	return ""
+}
+
 // TestPlanJSHandlersNoBuild asserts the JavaScript path is untouched: a .js
 // handler, a nil handler list, and an all-JS multi-handler app all produce
 // no Install step and an unchanged dependency layer. JavaScript must never be
@@ -258,9 +335,8 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 				if err != nil {
 					t.Fatalf("plan(%v): %v", handlers, err)
 				}
-				if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-					t.Errorf("handlers %v: Install = %v, want the managed OTel API install", handlers, p.Install)
-				}
+				requirePnpmWrapper(t, p)
+				requireOTelInstall(t, p)
 				if !p.Deps.IsZero() {
 					t.Errorf("handlers %v: Deps = %+v, want zero", handlers, p.Deps)
 				}
@@ -270,9 +346,9 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 }
 
 // TestPlanTSHandlerBuilds pins the TypeScript build command: one RUN that installs
-// the pinned esbuild, bundles the .ts source to a sibling .mjs with the runtime's
-// own version as --target, keeps packages external, and removes the tooling and
-// npm cache in the same layer.
+// the pinned esbuild with pnpm, bundles the .ts source to a sibling .mjs with the
+// runtime's own version as --target, keeps packages external, and removes the
+// tooling and the pnpm store in the same layer.
 func TestPlanTSHandlerBuilds(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "src/order.ts", "export function handler(e) {}\n")
@@ -284,8 +360,10 @@ func TestPlanTSHandlerBuilds(t *testing.T) {
 	cmd := requireInstall(t, p)
 
 	for _, want := range []string{
-		"npm install --prefix /tmp/relay-esbuild",
-		"--cache /tmp/relay-npm-cache",
+		"mkdir -p /tmp/relay-esbuild",
+		"pnpm add -C /tmp/relay-esbuild",
+		"--store-dir /tmp/relay-pnpm-store",
+		"--allow-build=esbuild",
 		"esbuild@" + esbuildVersion,
 		"--bundle /app/src/order.ts",
 		"--outfile=/app/src/order.mjs",
@@ -294,11 +372,15 @@ func TestPlanTSHandlerBuilds(t *testing.T) {
 		"--target=node24",
 		"--packages=external",
 		"--log-level=warning",
-		"rm -rf /tmp/relay-esbuild /tmp/relay-npm-cache",
+		"rm -rf /tmp/relay-esbuild /tmp/relay-pnpm-store",
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("Install command missing %q:\n%s", want, cmd)
 		}
+	}
+	// The esbuild tooling must be installed with pnpm, never npm.
+	if strings.Contains(cmd, "npm install") || strings.Contains(cmd, "npm ci") {
+		t.Errorf("esbuild tooling must be installed with pnpm, got:\n%s", cmd)
 	}
 	// No tsconfig.json in the app dir: the flag must be absent.
 	if strings.Contains(cmd, "--tsconfig") {
@@ -306,8 +388,8 @@ func TestPlanTSHandlerBuilds(t *testing.T) {
 	}
 	// The tooling install must precede the first bundle and the cleanup must
 	// follow the last one, all joined into a single RUN.
-	if strings.Index(cmd, "npm install") > strings.Index(cmd, "--bundle") {
-		t.Errorf("npm install must come before the bundling:\n%s", cmd)
+	if strings.Index(cmd, "pnpm add") > strings.Index(cmd, "--bundle") {
+		t.Errorf("pnpm add must come before the bundling:\n%s", cmd)
 	}
 	if strings.Index(cmd, "--bundle") > strings.Index(cmd, "rm -rf") {
 		t.Errorf("cleanup must come after the bundling:\n%s", cmd)
@@ -425,9 +507,8 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			if len(p.Install) != 1 || !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-				t.Errorf("JS-only resolution must produce the managed OTel API install, got %v", p.Install)
-			}
+			requirePnpmWrapper(t, p)
+			requireOTelInstall(t, p)
 		})
 	}
 }
@@ -490,18 +571,17 @@ func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 	if len(p.Entrypoint) != 3 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" || p.Entrypoint[2] != sourceMountFlag {
 		t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs %s]", p.Entrypoint, sourceMountFlag)
 	}
-	if len(p.Install) != 2 {
-		t.Fatalf("Install = %v, want the managed OTel install plus one persistent esbuild install", p.Install)
-	}
-	if !strings.Contains(p.Install[0], "@opentelemetry/api@"+otelAPIVersion) {
-		t.Errorf("Install[0] = %q, want the managed OTel API install", p.Install[0])
-	}
-	esb := p.Install[1]
+	// The wrapper, the managed OTel install, and one persistent esbuild install.
+	requirePnpmWrapper(t, p)
+	requireOTelInstall(t, p)
+	esb := requireInstall(t, p)
 	for _, want := range []string{
-		"npm install --prefix /relay/esbuild",
+		"mkdir -p /relay/esbuild",
+		"pnpm add -C /relay/esbuild",
 		"esbuild@" + esbuildVersion,
-		"--cache /tmp/relay-npm-cache",
-		"rm -rf /tmp/relay-npm-cache",
+		"--store-dir /tmp/relay-pnpm-store",
+		"--allow-build=esbuild",
+		"rm -rf /tmp/relay-pnpm-store",
 	} {
 		if !strings.Contains(esb, want) {
 			t.Errorf("persistent esbuild install missing %q:\n%s", want, esb)
@@ -510,6 +590,10 @@ func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 	// The persistent prefix must NOT be removed (the runtime needs the tool).
 	if strings.Contains(esb, "rm -rf /relay/esbuild") {
 		t.Errorf("persistent esbuild must survive the build:\n%s", esb)
+	}
+	// The tooling must be installed with pnpm, never npm.
+	if strings.Contains(esb, "npm install") {
+		t.Errorf("persistent esbuild must be installed with pnpm:\n%s", esb)
 	}
 	// No build-time transpilation: bundling moved to container startup.
 	if strings.Contains(strings.Join(p.Install, "\n"), "--bundle") {
@@ -618,7 +702,7 @@ func TestPlanSourceMountedMasksHostNodeModulesOnlyWhenPresent(t *testing.T) {
 func TestPlanSourceMountedDepsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "package.json", `{"type":"module"}`)
-	writeSource(t, dir, "package-lock.json", `{}`)
+	writeSource(t, dir, "pnpm-lock.yaml", `lockfileVersion: '9.0'`)
 
 	baked, err := Engine{}.Plan(specByName(t, "node24"), dir, nil)
 	if err != nil {
@@ -676,8 +760,8 @@ func TestPlanMultipleHandlersOneInstallDedup(t *testing.T) {
 		t.Fatalf("plan: %v", err)
 	}
 	cmd := requireInstall(t, p)
-	if got := strings.Count(cmd, "npm install --prefix"); got != 1 {
-		t.Errorf("npm install count = %d, want exactly 1", got)
+	if got := strings.Count(cmd, "pnpm add -C /tmp/relay-esbuild"); got != 1 {
+		t.Errorf("pnpm add count = %d, want exactly 1", got)
 	}
 	if got := strings.Count(cmd, "--bundle "); got != 2 {
 		t.Errorf("esbuild bundle count = %d, want 2:\n%s", got, cmd)
@@ -863,9 +947,9 @@ func TestPlanShellQuoteNestedJSAndTSUnchanged(t *testing.T) {
 	for _, want := range []string{
 		"--bundle /app/src/deep/order.ts",
 		"--outfile=/app/src/deep/order.mjs",
-		"npm install --prefix /tmp/relay-esbuild",
-		"--cache /tmp/relay-npm-cache",
-		"rm -rf /tmp/relay-esbuild /tmp/relay-npm-cache",
+		"pnpm add -C /tmp/relay-esbuild",
+		"--store-dir /tmp/relay-pnpm-store",
+		"rm -rf /tmp/relay-esbuild /tmp/relay-pnpm-store",
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("command missing unchanged %q:\n%s", want, cmd)

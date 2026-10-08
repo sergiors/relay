@@ -83,13 +83,17 @@ image-only template is still a parse error.
 
 The managed runtimes and dependency handling are:
 
-| Runtime      | Base image         | Dependencies                                                                                                                               |
-| ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` (native uv project, installed locked); else `requirements.txt` via `uv pip install --system`.                 |
-| `node24`     | `node:24-alpine`   | `package-lock.json` → `npm ci --omit=dev`; else `package.json` → `npm install --omit=dev`; else none. TypeScript is bundled at build time (or at container startup under `SOURCE_MOUNT`). |
+| Runtime      | Base image         | Dependencies                                                                                                                                                                                                                                                 |
+| ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `python3.14` | `python:3.14-slim` | `uv.lock` + `pyproject.toml` (native uv project, installed locked); else `requirements.txt` via `uv pip install --system`.                                                                                                                                   |
+| `node24`     | `node:24-alpine`   | `pnpm-lock.yaml` + `package.json` → `pnpm install --prod --frozen-lockfile`; a `package.json` without `pnpm-lock.yaml` is an error, and `package-lock.json` is rejected. TypeScript is bundled at build time (or at container startup under `SOURCE_MOUNT`). |
 
-Python dependencies are installed with uv, never pip. A `uv.lock` without
-`pyproject.toml` (or vice versa) is an error rather than a guess. `node24`
+Python dependencies are installed with uv, never pip. Node dependencies are
+installed with pnpm, never npm: a committed `pnpm-lock.yaml` is mandatory
+whenever the app has a `package.json`, and an npm `package-lock.json` is
+rejected rather than silently used. A `uv.lock` without `pyproject.toml` (or
+vice versa) is an error rather than a guess, and the same holds for
+`pnpm-lock.yaml` without `package.json`. `node24`
 accepts JavaScript **and** TypeScript handlers; TypeScript is transpiled and
 bundled by Relay — at build time for a baked image, or at container startup from
 the live mount under `SOURCE_MOUNT` — so esbuild is never needed in your
@@ -254,7 +258,7 @@ heap with the total size of the source tree:
 - **Build input is streamed, not buffered.** The selected source is staged to a
   private on-disk directory (the snapshot above) and the fingerprint is
   computed in the same single pass; ordinary source bodies and dependency
-  manifests (e.g. a large `package-lock.json`) are copied/hashed with bounded
+  manifests (e.g. a large `pnpm-lock.yaml`) are copied/hashed with bounded
   buffers and file metadata, not held in the worker heap. That directory is the
   build context, and the context tar is streamed directly to the Docker daemon
   through a pipe; the whole tar is never materialized in the worker heap. The

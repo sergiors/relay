@@ -71,15 +71,33 @@ func TestPythonSpecPinsUvTool(t *testing.T) {
 	}
 }
 
-// TestNodeSpecHasNoRuntimeTools verifies the runtime-tool mechanism is opt-in
-// per runtime: node does not require the uv binary.
-func TestNodeSpecHasNoRuntimeTools(t *testing.T) {
+// TestNodeSpecPinsPnpmTool verifies the Node runtime declares the pinned pnpm
+// runtime tool: the pnpm JS CLI distribution copied out of the official pnpm
+// image at a pinned, immutable tag. It also guards against a floating "latest".
+func TestNodeSpecPinsPnpmTool(t *testing.T) {
 	spec, err := lookup("node24")
 	if err != nil {
 		t.Fatalf("lookup node24: %v", err)
 	}
-	if len(spec.RuntimeTools) != 0 {
-		t.Errorf("node24 runtime tools = %+v, want none", spec.RuntimeTools)
+	if len(spec.RuntimeTools) != 1 {
+		t.Fatalf("node24 runtime tools = %+v, want exactly the pnpm tool", spec.RuntimeTools)
+	}
+	tool := spec.RuntimeTools[0]
+	if tool.From != PnpmImageTag {
+		t.Errorf("pnpm tool source = %q, want %q", tool.From, PnpmImageTag)
+	}
+	if tool.Source != "/opt/pnpm/dist" || tool.Destination != "/opt/pnpm/dist" {
+		t.Errorf("pnpm tool = %+v, want /opt/pnpm/dist -> /opt/pnpm/dist", tool)
+	}
+	if !strings.HasPrefix(tool.From, "ghcr.io/pnpm/pnpm:") {
+		t.Errorf("pnpm tool source = %q, want the official ghcr.io/pnpm/pnpm source", tool.From)
+	}
+	version := strings.TrimPrefix(tool.From, "ghcr.io/pnpm/pnpm:")
+	if version == "latest" || version == "" {
+		t.Errorf("pnpm tool version = %q, must be a pinned version, never latest", version)
+	}
+	if strings.Count(version, ".") != 2 {
+		t.Errorf("pnpm tool version = %q, want a full pinned major.minor.patch version", version)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"relay/internal/app"
+	"relay/internal/runtime/node"
 	"relay/internal/runtime/plan"
 )
 
@@ -185,13 +186,13 @@ func TestDependencyFingerprintCanonicalFileOrder(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o644); err != nil {
 		t.Fatalf("write lock: %v", err)
 	}
 	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
 
-	ab := plan.Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
-	ba := plan.Deps{Files: []string{"package-lock.json", "package.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+	ab := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
+	ba := plan.Deps{Files: []string{"pnpm-lock.yaml", "package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	fpAB, err := DependencyFingerprint("arm64", "linux", spec, dir, ab)
 	if err != nil {
@@ -287,6 +288,112 @@ func TestDependencyFingerprintNativePair(t *testing.T) {
 	}
 	if lf == base {
 		t.Error("changing uv.lock must change the dependency fingerprint")
+	}
+}
+
+// TestDependencyFingerprintNodePlanDepsPairSensitivity pins the Node counterpart
+// of the native-pair rule using the ENGINE's OWN dependency declaration rather
+// than a hand-built plan.Deps: it calls node.Engine{}.Plan on a real app dir and
+// feeds the returned Deps to DependencyFingerprint. The Node engine must declare
+// BOTH package.json and pnpm-lock.yaml, so changing either one ALONE (the other
+// left byte-for-byte unchanged) re-fingerprints the shared relay-dep-* layer,
+// while a source-only edit leaves the dependency fingerprint untouched because
+// source is app identity, not a dependency input.
+func TestDependencyFingerprintNodePlanDepsPairSensitivity(t *testing.T) {
+	dir := t.TempDir()
+	const pkg = `{"type":"module","dependencies":{"picocolors":"^1.0.0"}}`
+	writeNodeTestFile(t, dir, "package.json", pkg)
+	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
+	writeNodeTestFile(t, dir, "index.js", "export function handler(e) {}\n")
+
+	spec, err := lookup("node24")
+	if err != nil {
+		t.Fatalf("lookup node24: %v", err)
+	}
+
+	// planDeps is the production path: the Node engine's actual Plan(...).Deps
+	// for the current manifest bytes on disk.
+	planDeps := func() plan.Deps {
+		t.Helper()
+		p, err := node.Engine{}.Plan(spec, dir, []string{"index"})
+		if err != nil {
+			t.Fatalf("node plan: %v", err)
+		}
+		if p.Deps.IsZero() {
+			t.Fatalf("node plan returned zero Deps, want the package.json + pnpm-lock.yaml layer")
+		}
+		return p.Deps
+	}
+	fingerprint := func() string {
+		t.Helper()
+		fp, err := DependencyFingerprint(arch, platform, spec, dir, planDeps())
+		if err != nil {
+			t.Fatalf("dependency fingerprint: %v", err)
+		}
+		return fp
+	}
+
+	// Both manifests must be declared, so either one is an input to the layer.
+	deps := planDeps()
+	if len(deps.Files) != 2 || deps.Files[0] != "package.json" || deps.Files[1] != "pnpm-lock.yaml" {
+		t.Fatalf("node Deps.Files = %v, want [package.json pnpm-lock.yaml]", deps.Files)
+	}
+
+	base := fingerprint()
+
+	// Change package.json ALONE: pnpm-lock.yaml is left byte-for-byte unchanged.
+	writeNodeTestFile(t, dir, "package.json", `{"type":"module","dependencies":{"picocolors":"^1.0.0","ms":"2.1.3"}}`)
+	if got := fingerprint(); got == base {
+		t.Error("changing package.json alone must change the Node dependency fingerprint")
+	}
+
+	// Restore package.json, then change pnpm-lock.yaml ALONE.
+	writeNodeTestFile(t, dir, "package.json", pkg)
+	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolorsMs)
+	if got := fingerprint(); got == base {
+		t.Error("changing pnpm-lock.yaml alone must change the Node dependency fingerprint")
+	}
+
+	// Restore the manifests: the fingerprint returns to base, proving the edits
+	// above changed it through the manifest bytes and nothing else.
+	writeNodeTestFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
+	if got := fingerprint(); got != base {
+		t.Fatalf("restoring the manifests must restore the Node dependency fingerprint: %s != %s", got, base)
+	}
+
+	// A source-only edit is app identity, not dependency input: the dependency
+	// fingerprint must not move.
+	writeNodeTestFile(t, dir, "index.js", "export function handler(e) { return 1; }\n")
+	if got := fingerprint(); got != base {
+		t.Error("a source-only edit must not change the Node dependency fingerprint")
+	}
+}
+
+// TestDependencyFingerprintPnpmTool pins that the pinned pnpm runtime tool is
+// part of the Node dependency identity: bumping its image tag yields a different
+// layer even with identical manifests.
+func TestDependencyFingerprintPnpmTool(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n"), 0o644); err != nil {
+		t.Fatalf("write pnpm-lock.yaml: %v", err)
+	}
+	deps := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
+	base := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{pnpmTool}}
+
+	orig, err := DependencyFingerprint("amd64", "linux", base, dir, deps)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+
+	bumped := base
+	bumped.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/pnpm/pnpm:99.0.0", Source: "/opt/pnpm/dist", Destination: "/opt/pnpm/dist"}}
+	if got, err := DependencyFingerprint("amd64", "linux", bumped, dir, deps); err != nil {
+		t.Fatalf("fingerprint bumped: %v", err)
+	} else if got == orig {
+		t.Error("a changed pnpm tool image tag must change the dependency fingerprint")
 	}
 }
 
@@ -389,7 +496,7 @@ func TestTypeScriptEditsInvalidateAppNotDependency(t *testing.T) {
 	}
 
 	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
-	deps := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+	deps := plan.Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	funcBefore := fpOf(t, dir)
 	depBefore, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)
@@ -449,7 +556,7 @@ func TestTypeScriptIgnoredFileChangesNeitherFingerprint(t *testing.T) {
 	}
 
 	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine"}
-	deps := plan.Deps{Files: []string{"package.json"}, Install: "npm install --omit=dev", Dir: "/app"}
+	deps := plan.Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	funcBefore := fpOf(t, dir)
 	depBefore, err := DependencyFingerprint("arm64", "linux", spec, dir, deps)

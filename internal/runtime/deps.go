@@ -22,7 +22,7 @@ import (
 // dependency image even if a manifest is edited concurrently.
 //
 // The manifests live on disk under root (which IS the dependency build context),
-// not in memory, so a large manifest such as a package-lock.json is never held
+// not in memory, so a large manifest such as a pnpm-lock.yaml is never held
 // in the worker heap. The fingerprint is recomputed deterministically from the
 // staged bytes (see dependencyFingerprintFrom), so it remains valid even after
 // the root is removed.
@@ -134,7 +134,7 @@ func (s *dependencySnapshot) release() {
 //     the OS userland the native wheels / node modules are built for — two
 //     specs could share a display name but differ in base, and vice versa.
 //   - the machine architecture (GOARCH + GOOS) of the BUILD HOST. pip install /
-//     npm install produce arch-specific compiled artifacts (native wheels, node
+//     pnpm install produce arch-specific compiled artifacts (native wheels, node
 //     native modules), and Relay builds on the same daemon it executes on, so
 //     the build host's architecture is the correct key (see #5). It is injected
 //     as a parameter so tests can simulate other architectures without relying
@@ -191,9 +191,10 @@ func dependencyFingerprintFrom(
 	hashField(h, arch)
 	hashField(h, platform)
 
-	// External build tools the install depends on (e.g. the pinned uv binary).
-	// Hashed in plan order: RuntimeTools is a fixed registry-declared list, and
-	// the field boundaries keep distinct tool sets from colliding.
+	// External build tools the install depends on (e.g. the pinned uv binary or
+	// the pinned pnpm JS CLI distribution). Hashed in plan order: RuntimeTools is
+	// a fixed registry-declared list, and the field boundaries keep distinct tool
+	// sets from colliding.
 	for _, tool := range spec.RuntimeTools {
 		hashField(h, tool.From)
 		hashField(h, tool.Source)

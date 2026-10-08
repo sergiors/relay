@@ -93,8 +93,8 @@ func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) string {
 	}
 
 	// Runtime tools pull a pinned binary out of another image (e.g. the uv
-	// distroless image). They are emitted BEFORE the install RUN so the
-	// dependency install can already use the tool.
+	// distroless image or the official pnpm image). They are emitted BEFORE the
+	// install RUN so the dependency install can already use the tool.
 	for _, tool := range p.RuntimeTools {
 		b.WriteString("COPY --from=" + tool.From + " " + tool.Source + " " + tool.Destination + "\n")
 	}

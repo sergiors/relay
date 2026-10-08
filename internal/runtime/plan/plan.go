@@ -56,12 +56,12 @@ type File struct {
 }
 
 // RuntimeTool is an external tool a runtime requires in its images (e.g. the
-// pinned uv binary). It is how a runtime acquires a versioned external tool
-// without changing its base image: the tool lives in an external image, and the
-// single generic Dockerfile renderer materializes it (currently as a COPY
-// --from, an implementation detail of the builder rather than part of this
-// type's meaning), so engines express the tool as plan data rather than a
-// Dockerfile.
+// pinned uv binary or the pinned pnpm JS CLI distribution). It is how a runtime
+// acquires a versioned external tool without changing its base image: the tool
+// lives in an external image, and the single generic Dockerfile renderer
+// materializes it (currently as a COPY --from, an implementation detail of the
+// builder rather than part of this type's meaning), so engines express the tool
+// as plan data rather than a Dockerfile.
 type RuntimeTool struct {
 	// From is the source image reference the tool is taken from. Callers
 	// should pin it (tag or digest); a moving tag would make otherwise
@@ -82,7 +82,7 @@ type RuntimeTool struct {
 // command, and the directory the dependencies land in. Zero value = no deps.
 type Deps struct {
 	// Files are the dependency manifest files, RELATIVE to the app dir
-	// (e.g. "requirements.txt"; node: "package.json", "package-lock.json").
+	// (e.g. "requirements.txt"; node: "package.json", "pnpm-lock.yaml").
 	Files []string
 	// Install is the shell command that installs the dependencies from the
 	// manifest files into InstallDir, run inside the dependency-image build.

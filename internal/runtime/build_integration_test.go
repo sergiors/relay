@@ -257,8 +257,8 @@ events:
 // (b) intentionally KEEPS its classic-builder intermediate containers for
 // debugging (the daemon only removes intermediates when the build completed
 // successfully; Remove:true does not apply to failed builds). It uses a
-// malformed package.json so the node engine's `npm install --omit=dev` step
-// fails deterministically.
+// malformed package.json so the node engine's `pnpm install --prod
+// --frozen-lockfile` step fails deterministically.
 func TestIntegrationFailedBuildKeepsIntermediatesAndPropagatesError(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -273,8 +273,12 @@ events:
       event_name: [INSERT]
 `)
 	writeFile(t, dir, "index.js", "export function hi(e){ console.log('hi'); }\n")
-	// Malformed package.json: the engine's `npm install --omit=dev` step must
-	// fail parsing it, failing the build deterministically.
+	// A committed pnpm lock is required for a package.json to reach the install
+	// step; the malformed manifest then fails `pnpm install --frozen-lockfile`
+	// deterministically (instead of the engine's missing-lock plan error).
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockEmpty)
+	// Malformed package.json: the engine's `pnpm install --prod --frozen-lockfile`
+	// step must fail parsing it, failing the build deterministically.
 	writeFile(t, dir, "package.json", "{ not json")
 
 	fn := app.App{Name: "failed-build-int", Dir: dir, Template: &app.Template{Runtime: "node24"}}
@@ -297,11 +301,11 @@ events:
 	}
 	t.Logf("prepare error: %v", err)
 
-	// The error must propagate the build stream: assert it carries the npm
+	// The error must propagate the build stream: assert it carries the pnpm/JSON
 	// failure text, proving drainBuildResponse surfaced the stream error rather
 	// than a silent success. Keep to a stable substring observed on the daemon.
-	if !strings.Contains(err.Error(), "npm") && !strings.Contains(err.Error(), "JSON") {
-		t.Errorf("expected the build-stream error to mention npm/JSON, got: %v", err)
+	if !strings.Contains(err.Error(), "pnpm") && !strings.Contains(err.Error(), "JSON") && !strings.Contains(err.Error(), "package.json") {
+		t.Errorf("expected the build-stream error to mention pnpm/JSON/package.json, got: %v", err)
 	}
 
 	// After the failed build, at least one NEW classic-builder intermediate

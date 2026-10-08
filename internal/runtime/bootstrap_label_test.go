@@ -70,17 +70,30 @@ func TestBootstrapHashChangesWithInjectedContent(t *testing.T) {
 		t.Error("changing the pinned tool version must change the bootstrap hash")
 	}
 
+	// The pinned pnpm tool is image content too: its source image/version must
+	// change the hash so an otherwise source-current image is rebuilt.
+	pnpmToolChanged := base
+	pnpmToolChanged.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/pnpm/pnpm:11.24.0", Source: "/opt/pnpm/dist", Destination: "/opt/pnpm/dist"}}
+	if got := bootstrapHash(pnpmToolChanged); got == orig {
+		t.Error("adding the pnpm runtime tool must change the bootstrap hash")
+	}
+	pnpmToolBumped := pnpmToolChanged
+	pnpmToolBumped.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/pnpm/pnpm:11.24.1", Source: "/opt/pnpm/dist", Destination: "/opt/pnpm/dist"}}
+	if got := bootstrapHash(pnpmToolBumped); got == bootstrapHash(pnpmToolChanged) {
+		t.Error("changing the pinned pnpm image tag must change the bootstrap hash")
+	}
+
 	// Build-time Install commands (e.g. the pinned esbuild TypeScript
 	// transpilation) are image content too: a different compile step or esbuild
 	// version must change the hash so an older image is rebuilt under the same
 	// app fingerprint tag.
 	installAdded := base
-	installAdded.Install = []string{"npm install --prefix /tmp/relay-esbuild --no-save --silent esbuild@0.28.2"}
+	installAdded.Install = []string{"pnpm add -C /tmp/relay-esbuild --store-dir /tmp/relay-pnpm-store --save-exact --allow-build=esbuild esbuild@0.28.2"}
 	if got := bootstrapHash(installAdded); got == orig {
 		t.Error("adding a build Install command must change the bootstrap hash")
 	}
 	installBumped := installAdded
-	installBumped.Install = []string{"npm install --prefix /tmp/relay-esbuild --no-save --silent esbuild@0.29.0"}
+	installBumped.Install = []string{"pnpm add -C /tmp/relay-esbuild --store-dir /tmp/relay-pnpm-store --save-exact --allow-build=esbuild esbuild@0.29.0"}
 	if got := bootstrapHash(installBumped); got == bootstrapHash(installAdded) {
 		t.Error("changing the pinned esbuild version must change the bootstrap hash")
 	}

@@ -377,6 +377,7 @@ events:
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.ts", `
 import colors from "picocolors";
 export function handler(event: { event_id: string }): void {
@@ -409,7 +410,7 @@ export function handler(event: { event_id: string }): void {
 // TestIntegrationNodeTSExampleEndToEnd drives the real
 // examples/apps/order-confirmation-typescript example: a TypeScript handler
 // at src/handler.ts importing two local .ts modules (a type module and a message
-// module), with a committed tsconfig.json and package-lock.json.
+// module), with a committed tsconfig.json and pnpm-lock.yaml.
 func TestIntegrationNodeTSExampleEndToEnd(t *testing.T) {
 	testutil.RequireDocker(t)
 

@@ -92,6 +92,7 @@ func TestIntegrationSourceMountNodeJSReflectsSourceChange(t *testing.T) {
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 export function handler(event) {
@@ -162,6 +163,74 @@ export function handler(event) {
 	awaitAppOutput(t, ctx, out, "js V2 2")
 }
 
+// TestIntegrationSourceMountNodeCJSReflectsSourceChange is the CommonJS
+// counterpart of the JS test: the mounted app is a CommonJS package (no
+// "type":"module") whose handler uses require(), and the shared resolve hook
+// re-anchors that require to the dependency image's /app/node_modules, so a
+// pnpm-installed CJS dependency resolves even though the mount carries the
+// source. A source-only edit reuses the image and runs the edited code.
+func TestIntegrationSourceMountNodeCJSReflectsSourceChange(t *testing.T) {
+	cli := testutil.RequireDocker(t)
+	depBefore := depTagSet(context.Background(), cli)
+	t.Cleanup(cleanupNewDepImagesSince(cli, depBefore))
+
+	dir := t.TempDir()
+	writeFile(t, dir, "package.json", `{
+  "dependencies": {"picocolors": "^1.0.0"}
+}`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
+	writeFile(t, dir, "index.js", `
+const colors = require("picocolors");
+exports.handler = function (event) {
+  console.log(colors.red("cjs V1 " + event.event_id));
+};
+`)
+
+	fn := app.App{Name: "src-mount-node-cjs-it", Dir: dir, Template: &app.Template{Runtime: "node24"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	m, err := NewManager(testutil.DiscardLogger(), nil, "test-host", WithSourceMount(true))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+	out := newAppOutputSink(t)
+
+	first, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer cleanupImage(cli, ctx, first.Image)
+	if first.Dependency == "" {
+		t.Fatal("expected the Node app to build FROM a dependency image")
+	}
+	if err := m.Execute(ctx, first, "index.handler", []byte(`{"event_id":"1"}`), nil); err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+	awaitAppOutput(t, ctx, out, "cjs V1 1")
+
+	// Source-only edit: the image is reused (the source is mounted) and the
+	// advanced fingerprint rotates the warm generation onto the edited code.
+	writeFile(t, dir, "index.js", `
+const colors = require("picocolors");
+exports.handler = function (event) {
+  console.log(colors.red("cjs V2 " + event.event_id));
+};
+`)
+	second, err := m.Prepare(ctx, fn)
+	if err != nil {
+		t.Fatalf("re-prepare: %v", err)
+	}
+	if second.Image != first.Image {
+		t.Fatalf("source-only change moved the image tag: %q -> %q", first.Image, second.Image)
+	}
+	if err := m.Execute(ctx, second, "index.handler", []byte(`{"event_id":"2"}`), nil); err != nil {
+		t.Fatalf("second execute: %v", err)
+	}
+	awaitAppOutput(t, ctx, out, "cjs V2 2")
+}
+
 // TestIntegrationSourceMountNodeTSReflectsSourceChange is the end-to-end proof of
 // SOURCE_MOUNT for Node TypeScript: the image is built WITHOUT the source and
 // carries a PERSISTENT pinned esbuild, the live .ts graph is bind-mounted at
@@ -178,6 +247,7 @@ func TestIntegrationSourceMountNodeTSReflectsSourceChange(t *testing.T) {
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "message.ts", `
 export function message(event: { event_id: string }): string {
   return "ts V1 " + event.event_id;
@@ -267,6 +337,7 @@ func TestIntegrationSourceMountNodeTSSelfReference(t *testing.T) {
   "dependencies": {"picocolors": "^1.0.0"},
   "exports": {"./lib/util": "./lib/impl/util.ts"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	if err := os.MkdirAll(filepath.Join(dir, "lib", "impl"), 0o755); err != nil {
 		t.Fatalf("mkdir lib/impl: %v", err)
 	}
@@ -359,6 +430,7 @@ func TestIntegrationSourceMountNodeHostNodeModulesDoesNotShadow(t *testing.T) {
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 export function handler(event) {
@@ -424,6 +496,7 @@ func TestIntegrationSourceMountNodeLateHostNodeModulesDoesNotShadow(t *testing.T
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 export function handler(event) {
@@ -499,6 +572,7 @@ func TestIntegrationSourceMountNodeWorkingDirIsAppRoot(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{"type":"module"}`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockEmpty)
 	writeFile(t, dir, "data.txt", "relative-ok\n")
 	writeFile(t, dir, "index.js", `
 import { readFileSync } from "node:fs";
@@ -554,6 +628,7 @@ func TestIntegrationSourceMountNodeServiceLateHostNodeModulesDoesNotShadow(t *te
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
@@ -673,6 +748,7 @@ func TestIntegrationSourceMountNodeServiceWorkingDir(t *testing.T) {
 
 	dir := t.TempDir()
 	writeFile(t, dir, "package.json", `{"type":"module"}`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockEmpty)
 	writeFile(t, dir, "data.txt", "svc-relative-ok\n")
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
@@ -773,6 +849,7 @@ func TestIntegrationSourceMountNodeDependencyChangeBuildsAndExecutes(t *testing.
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 export function handler(event) {
@@ -809,6 +886,7 @@ export function handler(event) {
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0", "ms": "2.1.3"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolorsMs)
 	writeFile(t, dir, "index.js", `
 import colors from "picocolors";
 import ms from "ms";
@@ -861,6 +939,7 @@ func writeSourceMountGateApp(t *testing.T) string {
 	dir := t.TempDir()
 	writeFile(t, dir, ".gitignore", "gate.txt\n")
 	writeFile(t, dir, "package.json", `{"type":"module"}`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockEmpty)
 	writeFile(t, dir, "gate.txt", sourceMountGateClosed)
 	writeFile(t, dir, "index.js", `
 import { readFileSync } from "node:fs";
@@ -1188,6 +1267,7 @@ func TestIntegrationSourceMountNodeServiceSourceReplacementReusesDependency(t *t
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	if err := os.MkdirAll(filepath.Join(dir, "app"), 0o755); err != nil {
 		t.Fatalf("mkdir app: %v", err)
 	}
@@ -1381,6 +1461,7 @@ func TestIntegrationSourceMountNodeTSTsconfigAliasReflectsSourceChange(t *testin
   "type": "module",
   "dependencies": {"picocolors": "^1.0.0"}
 }`)
+	writeFile(t, dir, "pnpm-lock.yaml", nodePnpmLockPicocolors)
 	// paths aliases are relative to baseUrl (the app root mounted at /app/src).
 	writeFile(t, dir, "tsconfig.json", `{
   "compilerOptions": {

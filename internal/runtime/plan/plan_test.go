@@ -14,7 +14,7 @@ func TestDepsIsZero(t *testing.T) {
 		{"zero value", Deps{}, true},
 		{"install only", Deps{Install: "pip install", Dir: "/app"}, true},
 		{"files present", Deps{Files: []string{"requirements.txt"}}, false},
-		{"full", Deps{Files: []string{"package.json"}, Install: "npm ci", Dir: "/app"}, false},
+		{"full", Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -29,14 +29,14 @@ func TestDepsIsZero(t *testing.T) {
 // each distinct field (Install, Dir, file name, file order) makes two Deps
 // unequal, while identical values compare equal.
 func TestDepsEqualSymmetryAndFieldSensitivity(t *testing.T) {
-	base := Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+	base := Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 
 	if !base.Equal(base) {
 		t.Fatal("Deps must equal itself")
 	}
 
 	// Equal must be symmetric.
-	same := Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm ci --omit=dev", Dir: "/app"}
+	same := Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}
 	if !base.Equal(same) || !same.Equal(base) {
 		t.Fatal("identical Deps must compare equal in both directions")
 	}
@@ -45,13 +45,13 @@ func TestDepsEqualSymmetryAndFieldSensitivity(t *testing.T) {
 		name string
 		o    Deps
 	}{
-		{"install differs", Deps{Files: []string{"package.json", "package-lock.json"}, Install: "npm install", Dir: "/app"}},
-		{"dir differs", Deps{Files: []string{"package.json", "package-lock.json"},
-			Install: "npm ci --omit=dev", Dir: "/opt"}},
-		{"file name differs", Deps{Files: []string{"package.json", "yarn.lock"}, Install: "npm ci --omit=dev", Dir: "/app"}},
-		{"file reordered", Deps{Files: []string{"package-lock.json", "package.json"},
-			Install: "npm ci --omit=dev", Dir: "/app"}},
-		{"file count differs", Deps{Files: []string{"package.json"}, Install: "npm ci --omit=dev", Dir: "/app"}},
+		{"install differs", Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: "pnpm install", Dir: "/app"}},
+		{"dir differs", Deps{Files: []string{"package.json", "pnpm-lock.yaml"},
+			Install: "pnpm install --prod --frozen-lockfile", Dir: "/opt"}},
+		{"file name differs", Deps{Files: []string{"package.json", "other-lock.yaml"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}},
+		{"file reordered", Deps{Files: []string{"pnpm-lock.yaml", "package.json"},
+			Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}},
+		{"file count differs", Deps{Files: []string{"package.json"}, Install: "pnpm install --prod --frozen-lockfile", Dir: "/app"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
