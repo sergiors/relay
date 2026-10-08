@@ -62,12 +62,12 @@ func TestDepsEqualSymmetryAndFieldSensitivity(t *testing.T) {
 	}
 }
 
-// TestImageCopyCarriesPinnedReference pins the external-tool copy shape: the
+// TestRuntimeToolCarriesPinnedReference pins the external-tool shape: the
 // source image reference, the file to copy, and the destination are all carried
-// verbatim, so an engine can express a pinned (never latest) tool copy.
-func TestImageCopyCarriesPinnedReference(t *testing.T) {
-	tc := ImageCopy{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv"}
-	if tc.From == "" || tc.Source == "" || tc.Dest == "" {
-		t.Fatalf("ImageCopy fields must be carried, got %+v", tc)
+// verbatim, so an engine can express a pinned (never latest) runtime tool.
+func TestRuntimeToolCarriesPinnedReference(t *testing.T) {
+	tool := RuntimeTool{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv"}
+	if tool.From == "" || tool.Source == "" || tool.Destination == "" {
+		t.Fatalf("RuntimeTool fields must be carried, got %+v", tool)
 	}
 }

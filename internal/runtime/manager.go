@@ -1406,9 +1406,10 @@ func (m *Manager) prepare(
 		// image carries no install RUN of its own — only UserSetup/User/Env/
 		// Entrypoint on top of the dependency layer. The dependency image was
 		// built with the runtime's external tools (e.g. uv), so the app
-		// image inherits them via FROM and does not need to copy them again.
+		// image inherits them via FROM and does not need to materialize them
+		// again.
 		planResult.BaseImage = depRef
-		planResult.ToolCopies = nil
+		planResult.RuntimeTools = nil
 	}
 
 	start := time.Now()

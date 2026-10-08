@@ -34,12 +34,16 @@ type Spec struct {
 	// for runtime TypeScript transpilation instead of transpiling at build time).
 	// A false value means the historical baked-source image, byte-for-byte.
 	SourceMounted bool
-	// ToolCopies are external-image COPY --from directives every image for this
-	// runtime needs (e.g. a pinned tool binary). They are applied to BOTH the
-	// app image and its dependency base image, because the dependency image
-	// is built FROM BaseImage (not from the app image) and still needs the
-	// tool to run its install. Empty when the runtime needs no external tool.
-	ToolCopies []ImageCopy
+	// RuntimeTools are the external tools this runtime requires in every image
+	// it builds (e.g. a pinned binary such as uv). A RuntimeTool is an external
+	// dependency of the runtime, not a Dockerfile concept; the builder
+	// materializes each one (currently as a COPY --from, an implementation
+	// detail) and the type only names the tool's source reference, file, and
+	// destination. They are applied to BOTH the app image and its dependency
+	// base image, because the dependency image is built FROM BaseImage (not from
+	// the app image) and still needs the tool to run its install. Empty when the
+	// runtime needs no external tool.
+	RuntimeTools []RuntimeTool
 }
 
 // File is a file the builder mirrors into the build context: Path is the
@@ -51,20 +55,23 @@ type File struct {
 	Mode    fs.FileMode
 }
 
-// ImageCopy is a build-time COPY --from directive that pulls a file out of an
-// EXTERNAL image into the image being built (e.g. the pinned uv binary). It is
-// how a runtime acquires a versioned external tool without changing its base
-// image; the single generic Dockerfile renderer emits it, so engines express
-// the copy as plan data rather than a Dockerfile.
-type ImageCopy struct {
-	// From is the source image reference. Callers should pin it (tag or
-	// digest); a moving tag would make otherwise identical builds differ.
+// RuntimeTool is an external tool a runtime requires in its images (e.g. the
+// pinned uv binary). It is how a runtime acquires a versioned external tool
+// without changing its base image: the tool lives in an external image, and the
+// single generic Dockerfile renderer materializes it (currently as a COPY
+// --from, an implementation detail of the builder rather than part of this
+// type's meaning), so engines express the tool as plan data rather than a
+// Dockerfile.
+type RuntimeTool struct {
+	// From is the source image reference the tool is taken from. Callers
+	// should pin it (tag or digest); a moving tag would make otherwise
+	// identical builds differ.
 	From string
 	// Source is the path copied out of From (e.g. "/uv").
 	Source string
-	// Dest is the destination path in the image being built (e.g.
-	// "/usr/local/bin/uv").
-	Dest string
+	// Destination is the path the tool is written to in the image being built
+	// (e.g. "/usr/local/bin/uv").
+	Destination string
 }
 
 // BuildPlan is how an app directory becomes an image. Engines answer "what
@@ -137,11 +144,11 @@ type BuildPlan struct {
 	// runtime (not build time). They are merged after the base RELAY_HANDLER
 	// variable. Empty when the runtime needs no extra environment.
 	Env []string
-	// ToolCopies are build-time COPY --from directives pulling external tool
-	// binaries into this image (see Spec.ToolCopies). The builder applies them
-	// before the dependency install so the install can use the tool. Empty when
-	// the image needs no external tool.
-	ToolCopies []ImageCopy
+	// RuntimeTools are the external tools this image requires (see
+	// Spec.RuntimeTools). The builder materializes them before the dependency
+	// install so the install can use the tool. Empty when the image needs no
+	// external tool.
+	RuntimeTools []RuntimeTool
 	// Entrypoint is the container entrypoint as a JSON-array ENTRYPOINT.
 	Entrypoint []string
 	// SourceMountTarget, when non-empty, is the in-container path a SOURCE_MOUNT

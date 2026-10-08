@@ -10,12 +10,12 @@ import (
 
 // bootstrapHash returns a short (16 hex char) sha256 over the plan's
 // runtime-injected files (the embedded bootstrap and anything else the engine
-// injects, e.g. a package.json), the externally copied runtime tools (the pinned
-// uv binary), the build-time Install commands (e.g. the pinned esbuild
-// TypeScript transpilation), AND the entrypoint. It is the content the
-// relay.bootstrap image label pins: an image whose label differs was built with a
-// different (stale) bootstrap, tool version, or compile step and must be rebuilt
-// even though its tag is content-current for the app source.
+// injects, e.g. a package.json), the runtime's external tools (the pinned uv
+// binary), the build-time Install commands (e.g. the pinned esbuild TypeScript
+// transpilation), AND the entrypoint. It is the content the relay.bootstrap
+// image label pins: an image whose label differs was built with a different
+// (stale) bootstrap, tool version, or compile step and must be rebuilt even
+// though its tag is content-current for the app source.
 func bootstrapHash(p plan.BuildPlan) string {
 	h := sha256.New()
 	for _, f := range p.Files {
@@ -24,12 +24,12 @@ func bootstrapHash(p plan.BuildPlan) string {
 		_, _ = h.Write(f.Content)
 		_, _ = h.Write([]byte{0})
 	}
-	for _, tc := range p.ToolCopies {
-		_, _ = h.Write([]byte(tc.From))
+	for _, tool := range p.RuntimeTools {
+		_, _ = h.Write([]byte(tool.From))
 		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tc.Source))
+		_, _ = h.Write([]byte(tool.Source))
 		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tc.Dest))
+		_, _ = h.Write([]byte(tool.Destination))
 		_, _ = h.Write([]byte{0})
 	}
 	for _, cmd := range p.Install {

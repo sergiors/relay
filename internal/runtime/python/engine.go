@@ -152,16 +152,16 @@ func (Engine) Plan(spec plan.Spec, fnDir string, _ []string) (plan.BuildPlan, er
 	// otelAPIFloor). uv is available: the no-deps app image copies it as a
 	// tool, and a deps app image inherits it from the dependency base.
 	return plan.BuildPlan{
-		BaseImage:  spec.BaseImage,
-		WorkDir:    workDir,
-		Files:      files,
-		Deps:       deps,
-		Install:    []string{otelInstall},
-		ToolCopies: spec.ToolCopies,
-		UserSetup:  userSetup,
-		User:       userID,
-		Env:        []string{noBytecodeEnv},
-		Entrypoint: entrypoint,
+		BaseImage:    spec.BaseImage,
+		WorkDir:      workDir,
+		Files:        files,
+		Deps:         deps,
+		Install:      []string{otelInstall},
+		RuntimeTools: spec.RuntimeTools,
+		UserSetup:    userSetup,
+		User:         userID,
+		Env:          []string{noBytecodeEnv},
+		Entrypoint:   entrypoint,
 	}, nil
 }
 

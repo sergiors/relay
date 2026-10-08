@@ -327,7 +327,7 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 		Files:              files,
 		Deps:               deps,
 		Install:            install,
-		ToolCopies:         spec.ToolCopies,
+		RuntimeTools:       spec.RuntimeTools,
 		UserSetup:          userSetup,
 		User:               userID,
 		Entrypoint:         entry,

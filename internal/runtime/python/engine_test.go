@@ -11,30 +11,30 @@ import (
 )
 
 // testUvTag is a stand-in for the production pinned uv image tag. The engine
-// treats ToolCopies as opaque plan data passed through from the spec, so any
+// treats RuntimeTools as opaque plan data passed through from the spec, so any
 // pinned tag exercises it; the real pin is asserted in the runtime registry
 // tests (runtime.UvImageTag).
 const testUvTag = "ghcr.io/astral-sh/uv:0.12.17"
 
 // Two runtime versions served by the same Python engine. The engine must
 // produce identical build logic for both, differing only in the base image
-// (and tool copies) taken from the spec. The second spec is test-only and is
+// (and runtime tools) taken from the spec. The second spec is test-only and is
 // never registered in the runtime registry.
 var testSpecs = []plan.Spec{
 	{
 		Name:      "python3.14",
 		Engine:    plan.EnginePython,
 		BaseImage: "python:3.14-slim",
-		ToolCopies: []plan.ImageCopy{{
-			From: testUvTag, Source: "/uv", Dest: "/usr/local/bin/uv",
+		RuntimeTools: []plan.RuntimeTool{{
+			From: testUvTag, Source: "/uv", Destination: "/usr/local/bin/uv",
 		}},
 	},
 	{
 		Name:      "python3.15",
 		Engine:    plan.EnginePython,
 		BaseImage: "python:3.15-slim",
-		ToolCopies: []plan.ImageCopy{{
-			From: testUvTag, Source: "/uv", Dest: "/usr/local/bin/uv",
+		RuntimeTools: []plan.RuntimeTool{{
+			From: testUvTag, Source: "/uv", Destination: "/usr/local/bin/uv",
 		}},
 	},
 }
@@ -87,10 +87,10 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 				t.Errorf("env = %v, want [PYTHONDONTWRITEBYTECODE=1]", p.Env)
 			}
 
-			// The uv tool copy is carried through even with no dependencies, so
-			// uv is always present in a Python runtime image.
-			if len(p.ToolCopies) != 1 || p.ToolCopies[0].Dest != "/usr/local/bin/uv" {
-				t.Errorf("tool copies = %+v, want the uv copy", p.ToolCopies)
+			// The uv runtime tool is carried through even with no dependencies,
+			// so uv is always present in a Python runtime image.
+			if len(p.RuntimeTools) != 1 || p.RuntimeTools[0].Destination != "/usr/local/bin/uv" {
+				t.Errorf("runtime tools = %+v, want the uv tool", p.RuntimeTools)
 			}
 
 			var found bool

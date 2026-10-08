@@ -99,9 +99,10 @@
 //     this package answers "how do I build it?" and knows nothing about Python
 //     imports or Node module resolution. Engines declare an app's reusable
 //     dependency layer (manifest files + install command) via plan.Deps and any
-//     external tool they need via plan.Spec.ToolCopies (the pinned uv binary for
-//     Python); the renderer emits the COPY --from and the dependency image
-//     inherits the tool. The dependency images and their content-addressed
+//     external tools the runtime requires via plan.Spec.RuntimeTools (the
+//     pinned uv binary for Python); the renderer materializes each tool as a
+//     COPY --from (an implementation detail) and the dependency image inherits
+//     the tool. The dependency images and their content-addressed
 //     `relay-dep-*` references live entirely here. The dependency fingerprint
 //     keys on the base image TAG, not its digest (a documented limitation).
 //   - The package knows nothing about matching or Redis

@@ -159,16 +159,18 @@ ENTRYPOINT ["python", "/relay/bootstrap.py"]
 	}
 }
 
-// TestRenderDockerfileToolCopies verifies external tool copies (the uv binary)
-// are emitted as `COPY --from=<image> <src> <dest>` BEFORE the install RUN, so
-// the install can use the tool. The order is the whole point: a copy after the
-// install would make uv unavailable at install time.
-func TestRenderDockerfileToolCopies(t *testing.T) {
+// TestRenderDockerfileRuntimeTools verifies a runtime tool (the uv binary) is
+// materialized as `COPY --from=<image> <src> <dest>` BEFORE the install RUN, so
+// the install can use the tool. The order is the whole point: a tool after the
+// install would make uv unavailable at install time. The full golden output also
+// pins that a RuntimeTool renders byte-for-byte as the historical external tool
+// copy did.
+func TestRenderDockerfileRuntimeTools(t *testing.T) {
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
-		ToolCopies: []plan.ImageCopy{{
-			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv",
+		RuntimeTools: []plan.RuntimeTool{{
+			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv",
 		}},
 		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
 	}
@@ -176,16 +178,28 @@ func TestRenderDockerfileToolCopies(t *testing.T) {
 	df := renderDockerfile(p)
 	wantLine := "COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv"
 	if !strings.Contains(df, wantLine) {
-		t.Fatalf("expected tool copy line %q, got:\n%s", wantLine, df)
+		t.Fatalf("expected runtime tool line %q, got:\n%s", wantLine, df)
 	}
 	copyIdx := strings.Index(df, wantLine)
 	installIdx := strings.Index(df, "RUN uv pip install")
 	if copyIdx < 0 || installIdx < 0 || copyIdx > installIdx {
-		t.Errorf("tool copy must precede the install RUN (copy=%d install=%d):\n%s", copyIdx, installIdx, df)
+		t.Errorf("runtime tool must precede the install RUN (copy=%d install=%d):\n%s", copyIdx, installIdx, df)
 	}
 	// Never a floating tag: the renderer copies the pinned reference verbatim.
 	if strings.Contains(df, "uv:latest") {
-		t.Errorf("tool copy must not use a floating latest tag:\n%s", df)
+		t.Errorf("runtime tool must not use a floating latest tag:\n%s", df)
+	}
+
+	// The exact rendering is unchanged by the terminology rename: the tool is
+	// still a COPY --from in the same position.
+	want := `FROM python:3.14-slim
+WORKDIR /app
+COPY . /app
+COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv
+RUN uv pip install --system --no-cache -r requirements.txt
+`
+	if df != want {
+		t.Errorf("rendered dockerfile mismatch.\n--- got ---\n%s\n--- want ---\n%s", df, want)
 	}
 }
 
@@ -214,14 +228,14 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 func TestRenderDockerfileDependencyBase(t *testing.T) {
 	// buildDependencyImage builds this plan (note Deps is intentionally zero so
 	// the renderer emits the plain COPY . path, not a nested dep base). The
-	// dependency base image is built FROM the raw runtime base, so it must copy
-	// the runtime's tool (uv) itself — this is how the dependency install gets
-	// uv even though it does not inherit it from an app image.
+	// dependency base image is built FROM the raw runtime base, so it must
+	// materialize the runtime's tool (uv) itself — this is how the dependency
+	// install gets uv even though it does not inherit it from an app image.
 	p := plan.BuildPlan{
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
-		ToolCopies: []plan.ImageCopy{{
-			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv",
+		RuntimeTools: []plan.RuntimeTool{{
+			From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv",
 		}},
 		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
 	}
@@ -239,7 +253,7 @@ func TestRenderDockerfileDependencyBase(t *testing.T) {
 		t.Errorf("expected COPY manifests line, got:\n%s", df)
 	}
 	if !strings.Contains(df, "COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv") {
-		t.Errorf("expected uv tool copy line in the dependency base, got:\n%s", df)
+		t.Errorf("expected uv runtime tool line in the dependency base, got:\n%s", df)
 	}
 	if !strings.Contains(df, "RUN uv pip install --system --no-cache -r requirements.txt") {
 		t.Errorf("expected RUN install line, got:\n%s", df)

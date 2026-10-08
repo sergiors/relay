@@ -60,12 +60,12 @@ func TestBootstrapHashChangesWithInjectedContent(t *testing.T) {
 	// The pinned external tool (uv) is part of the image content: a uv version
 	// bump must change the hash so an otherwise source-current image is rebuilt.
 	toolChanged := base
-	toolChanged.ToolCopies = []plan.ImageCopy{{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Dest: "/usr/local/bin/uv"}}
+	toolChanged.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv"}}
 	if got := bootstrapHash(toolChanged); got == orig {
-		t.Error("changing the external tool copy must change the bootstrap hash")
+		t.Error("changing the runtime tool must change the bootstrap hash")
 	}
 	toolBumped := toolChanged
-	toolBumped.ToolCopies = []plan.ImageCopy{{From: "ghcr.io/astral-sh/uv:0.12.18", Source: "/uv", Dest: "/usr/local/bin/uv"}}
+	toolBumped.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/astral-sh/uv:0.12.18", Source: "/uv", Destination: "/usr/local/bin/uv"}}
 	if got := bootstrapHash(toolBumped); got == bootstrapHash(toolChanged) {
 		t.Error("changing the pinned tool version must change the bootstrap hash")
 	}

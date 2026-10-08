@@ -18,8 +18,8 @@ func pythonSpec() plan.Spec {
 		Name:      "python3.14",
 		Engine:    plan.EnginePython,
 		BaseImage: "python:3.14-slim",
-		ToolCopies: []plan.ImageCopy{{
-			From: UvImageTag, Source: "/uv", Dest: "/usr/local/bin/uv",
+		RuntimeTools: []plan.RuntimeTool{{
+			From: UvImageTag, Source: "/uv", Destination: "/usr/local/bin/uv",
 		}},
 	}
 }
@@ -143,11 +143,11 @@ func TestDependencyFingerprintSensitivity(t *testing.T) {
 	// The pinned external install tool (uv) shapes the installed payload: a
 	// version bump must yield a new layer.
 	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) {
-		s.ToolCopies = []plan.ImageCopy{{From: "ghcr.io/astral-sh/uv:0.12.18", Source: "/uv", Dest: "/usr/local/bin/uv"}}
+		s.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/astral-sh/uv:0.12.18", Source: "/uv", Destination: "/usr/local/bin/uv"}}
 	}); fp == orig {
 		t.Error("changing the pinned install tool version must change the fingerprint")
 	}
-	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) { s.ToolCopies = nil }); fp == orig {
+	if fp := mutate(func(s *plan.Spec, _ *plan.Deps) { s.RuntimeTools = nil }); fp == orig {
 		t.Error("removing the install tool must change the fingerprint")
 	}
 	// Install command and directory.

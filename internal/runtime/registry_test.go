@@ -40,46 +40,46 @@ func TestLookupResolvesRuntimeSpecAndRejectsUnknown(t *testing.T) {
 	}
 }
 
-// TestPythonSpecPinsUvImage verifies the Python runtime declares the pinned uv
-// tool copy (source ghcr.io/astral-sh/uv:<pinned>) so every Python image has the
-// uv binary. It also guards against a floating "latest" tag: the version must
-// be an explicit semver so builds are reproducible.
-func TestPythonSpecPinsUvImage(t *testing.T) {
+// TestPythonSpecPinsUvTool verifies the Python runtime declares the pinned uv
+// runtime tool (source ghcr.io/astral-sh/uv:<pinned>) so every Python image has
+// the uv binary. It also guards against a floating "latest" tag: the version
+// must be an explicit semver so builds are reproducible.
+func TestPythonSpecPinsUvTool(t *testing.T) {
 	spec, err := lookup("python3.14")
 	if err != nil {
 		t.Fatalf("lookup python3.14: %v", err)
 	}
-	if len(spec.ToolCopies) != 1 {
-		t.Fatalf("python3.14 tool copies = %+v, want exactly the uv copy", spec.ToolCopies)
+	if len(spec.RuntimeTools) != 1 {
+		t.Fatalf("python3.14 runtime tools = %+v, want exactly the uv tool", spec.RuntimeTools)
 	}
-	tc := spec.ToolCopies[0]
-	if tc.From != UvImageTag {
-		t.Errorf("uv image = %q, want %q", tc.From, UvImageTag)
+	tool := spec.RuntimeTools[0]
+	if tool.From != UvImageTag {
+		t.Errorf("uv tool source = %q, want %q", tool.From, UvImageTag)
 	}
-	if tc.Source != "/uv" || tc.Dest != "/usr/local/bin/uv" {
-		t.Errorf("uv copy = %+v, want /uv -> /usr/local/bin/uv", tc)
+	if tool.Source != "/uv" || tool.Destination != "/usr/local/bin/uv" {
+		t.Errorf("uv tool = %+v, want /uv -> /usr/local/bin/uv", tool)
 	}
-	if !strings.HasPrefix(tc.From, "ghcr.io/astral-sh/uv:") {
-		t.Errorf("uv image = %q, want the official ghcr.io/astral-sh/uv source", tc.From)
+	if !strings.HasPrefix(tool.From, "ghcr.io/astral-sh/uv:") {
+		t.Errorf("uv tool source = %q, want the official ghcr.io/astral-sh/uv source", tool.From)
 	}
-	version := strings.TrimPrefix(tc.From, "ghcr.io/astral-sh/uv:")
+	version := strings.TrimPrefix(tool.From, "ghcr.io/astral-sh/uv:")
 	if version == "latest" || version == "" {
-		t.Errorf("uv image version = %q, must be a pinned version, never latest", version)
+		t.Errorf("uv tool version = %q, must be a pinned version, never latest", version)
 	}
 	if strings.Count(version, ".") != 2 {
-		t.Errorf("uv image version = %q, want a full pinned major.minor.patch version", version)
+		t.Errorf("uv tool version = %q, want a full pinned major.minor.patch version", version)
 	}
 }
 
-// TestNodeSpecHasNoToolCopies verifies the tool-copy mechanism is opt-in per
-// runtime: node does not copy the uv binary.
-func TestNodeSpecHasNoToolCopies(t *testing.T) {
+// TestNodeSpecHasNoRuntimeTools verifies the runtime-tool mechanism is opt-in
+// per runtime: node does not require the uv binary.
+func TestNodeSpecHasNoRuntimeTools(t *testing.T) {
 	spec, err := lookup("node24")
 	if err != nil {
 		t.Fatalf("lookup node24: %v", err)
 	}
-	if len(spec.ToolCopies) != 0 {
-		t.Errorf("node24 tool copies = %+v, want none", spec.ToolCopies)
+	if len(spec.RuntimeTools) != 0 {
+		t.Errorf("node24 runtime tools = %+v, want none", spec.RuntimeTools)
 	}
 }
 
