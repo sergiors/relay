@@ -44,18 +44,17 @@ events:
 	return app.App{Name: name, Dir: dir, Template: &app.Template{Runtime: "node24"}}
 }
 
-// TestIntegrationNodeNoDepsHasPnpmBinary verifies the pinned pnpm CLI is
+// TestIntegrationNodeNoDepsHasPnpmBinary verifies the pinned pnpm binary is
 // present and directly executable in a Node runtime image even when the app
 // declares no dependencies, by building the app image and running
 // `test -x /usr/local/bin/pnpm && pnpm --version` in a one-off container: the
-// explicit executable check pins the wrapper's installed path, and the version
-// pins the CLI it resolves to. It also asserts Node 24 is the managed runtime
-// alongside it.
+// explicit executable check pins the installed path, and the version pins the
+// binary. It also asserts Node 24 is the managed runtime alongside it.
 //
-// The pinned pnpm image ships the CLI as a JavaScript distribution at
-// /opt/pnpm/dist, copied whole into the image; the runtime image adds the
-// /usr/local/bin/pnpm wrapper around it, so `pnpm` works on node:24-alpine
-// without a glibc-native binary.
+// The pinned pnpm release ships a statically linked musl standalone binary; the
+// runtime tool downloads the checksum-pinned archive for the target architecture
+// and extracts the bare `pnpm` binary to /usr/local/bin/pnpm, so it runs on
+// node:24-alpine with no JS wrapper and no glibc dependency.
 func TestIntegrationNodeNoDepsHasPnpmBinary(t *testing.T) {
 	cli := testutil.RequireDocker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -87,9 +86,8 @@ events:
 	if err != nil {
 		t.Fatalf("run pnpm --version: %v", err)
 	}
-	wantVersion := strings.TrimPrefix(PnpmImageTag, "ghcr.io/pnpm/pnpm:")
-	if !strings.Contains(out, wantVersion) {
-		t.Errorf("expected the pinned pnpm %s binary in the image, got: %q", wantVersion, out)
+	if !strings.Contains(out, PnpmVersion) {
+		t.Errorf("expected the pinned pnpm %s binary in the image, got: %q", PnpmVersion, out)
 	}
 
 	nodeOut, err := runImageCommand(ctx, t, p.Image, []string{"node", "--version"})

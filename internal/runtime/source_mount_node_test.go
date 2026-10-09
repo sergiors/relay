@@ -81,7 +81,7 @@ func TestPrepareSourceMountNodeSourceOnlyChangeDoesNotBuildDependency(t *testing
 
 	// Both the dependency image and the source-independent app image are present
 	// with the current bootstrap label, so Prepare must reuse them.
-	present := fmt.Sprintf(`{"Id":"sha256:deadbeef","Config":{"Labels":{%q:%q}}}`, labelBootstrap, bootstrapHash(nodeMountedPlan(t, fn)))
+	present := fmt.Sprintf(`{"Id":"sha256:deadbeef","Config":{"Labels":{%q:%q}}}`, labelBootstrap, mustBootstrapHash(t, nodeMountedPlan(t, fn)))
 
 	var second buildCounts
 	cli2 := newScriptedDockerClient(t,

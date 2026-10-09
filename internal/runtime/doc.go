@@ -100,10 +100,12 @@
 //     imports or Node module resolution. Engines declare an app's reusable
 //     dependency layer (manifest files + install command) via plan.Deps and any
 //     external tools the runtime requires via plan.Spec.RuntimeTools (the
-//     pinned uv binary for Python and the pinned pnpm JS CLI distribution for
-//     Node); the
-//     renderer materializes each tool as a COPY --from (an implementation
-//     detail) and the dependency image inherits the tool. The dependency images
+//     pinned uv binary for Python and the pinned pnpm standalone binary for
+//     Node, the latter acquired as a checksum-pinned per-architecture remote
+//     archive); the
+//     renderer materializes each tool (a COPY --from for an image copy, or a
+//     download/verify/extract RUN for a remote archive) and the dependency
+//     image inherits the tool. The dependency images
 //     and their content-addressed
 //     `relay-dep-*` references live entirely here. The dependency fingerprint
 //     keys on the base image TAG, not its digest (a documented limitation).

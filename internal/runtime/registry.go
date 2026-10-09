@@ -23,28 +23,50 @@ var uvTool = plan.RuntimeTool{
 	Destination: "/usr/local/bin/uv",
 }
 
-// PnpmImageTag is the pinned official pnpm image tag Relay takes the pnpm
-// JavaScript CLI distribution from. It is a package constant (and a test
-// asserts it) so the version is explicit, deterministic, and upgrades are a
-// one-line change — never a floating "latest". pnpm 11 is used deliberately:
-// its image ships a runnable JS CLI at /opt/pnpm/dist, whereas pnpm 12's image
-// ships only a glibc-native binary that cannot run on node:24-alpine.
-const PnpmImageTag = "ghcr.io/pnpm/pnpm:11.24.0"
+// PnpmVersion is the pinned pnpm release Relay provides in every Node image. It
+// is a package constant (and a test asserts it) so the version is explicit,
+// deterministic, and upgrades are a one-line change — never a floating
+// "latest". pnpm 12 ships self-contained, statically linked musl binaries, so
+// Relay downloads the official Linux musl artifact directly instead of copying
+// a JS distribution out of an image and wrapping it around the base Node
+// binary.
+const PnpmVersion = "12.10.1"
 
-// pnpmTool is the external tool the Node runtime requires: the pinned pnpm JS
-// CLI distribution, copied out of the official pnpm image. The WHOLE
-// /opt/pnpm/dist directory is copied because pnpm's CLI resolves its worker and
-// vendored modules relative to its own location. The engine creates the
-// /usr/local/bin/pnpm wrapper (see node.pnpmWrapperInstall) so the runtime has
-// a directly-executable pnpm; the dependency image invokes the CLI directly via
-// `node /opt/pnpm/dist/pnpm.mjs`.
-//
-// The official pnpm 12 image is glibc/Debian and its native binary cannot run
-// on node:24-alpine (musl); pnpm 11's JS CLI runs under the base image's Node.
+// pnpmReleaseBaseURL is the immutable GitHub release download root for the
+// pinned pnpm version. Each artifact is content-addressed by the SHA-256
+// recorded in pnpmTool, so the build verifies exactly the release bytes.
+const pnpmReleaseBaseURL = "https://github.com/pnpm/pnpm/releases/download/v" + PnpmVersion + "/"
+
+// pnpmMember is the archive member holding the standalone pnpm executable, and
+// pnpmDestination is where every Node image exposes it. The binary is
+// statically linked (musl), so it runs on node:24-alpine with no wrapper and no
+// dependency on the base image's Node interpreter.
+const (
+	pnpmMember      = "pnpm"
+	pnpmDestination = "/usr/local/bin/pnpm"
+)
+
+// pnpmTool is the external tool required by the Node runtime: the pinned pnpm
+// standalone binary, acquired as a checksum-pinned remote archive per target
+// architecture. Only the musl amd64 and arm64 artifacts are supported; a build
+// for any other architecture fails rather than baking a wrong-architecture
+// binary.
 var pnpmTool = plan.RuntimeTool{
-	From:        PnpmImageTag,
-	Source:      "/opt/pnpm/dist",
-	Destination: "/opt/pnpm/dist",
+	Destination: pnpmDestination,
+	Artifact: &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{
+		{
+			Arch:   "amd64",
+			URL:    pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
+			SHA256: "f2ad050a705ab433e6c1c4fd57d584462896062b048e9d29a90548ad6d91f91b",
+			Member: pnpmMember,
+		},
+		{
+			Arch:   "arm64",
+			URL:    pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
+			SHA256: "906259045aaef37a3fe6145fabdc1cc3195da523a788900875bf97be3b40333e",
+			Member: pnpmMember,
+		},
+	}},
 }
 
 // Supported runtimes. Runtime versions exist only here; adding a version (e.g.

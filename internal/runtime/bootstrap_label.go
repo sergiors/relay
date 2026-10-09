@@ -11,13 +11,18 @@ import (
 // bootstrapHash returns a short (16 hex char) sha256 over the plan's
 // runtime-injected files (the embedded bootstrap and anything else the engine
 // injects, e.g. a package.json), the runtime's external tools (the pinned uv
-// binary or the pinned pnpm JS CLI distribution), the build-time Install
-// commands (e.g. the pinned esbuild TypeScript transpilation), AND the
-// entrypoint. It is the content the relay.bootstrap image label pins: an image
-// whose label differs was built with a different (stale) bootstrap, tool
-// version, or compile step and must be rebuilt even though its tag is
-// content-current for the app source.
-func bootstrapHash(p plan.BuildPlan) string {
+// binary or the pinned pnpm artifact), the build-time Install commands (e.g.
+// the pinned esbuild TypeScript transpilation), AND the entrypoint. It is the
+// content the relay.bootstrap image label pins: an image whose label differs
+// was built with a different (stale) bootstrap, tool version, or compile step
+// and must be rebuilt even though its tag is content-current for the app source.
+//
+// Each runtime tool is hashed by its RESOLVED identity for the plan's target
+// architecture (the artifact variant selected by arch), so the pinned download
+// URL, checksum, member, and destination are all part of the image identity and
+// a tool bump re-fingerprints the image. An artifact tool with no variant for
+// arch is an error, never a hash of an unresolved tool.
+func bootstrapHash(p plan.BuildPlan, arch string) (string, error) {
 	h := sha256.New()
 	for _, f := range p.Files {
 		_, _ = h.Write([]byte(f.Path))
@@ -26,12 +31,9 @@ func bootstrapHash(p plan.BuildPlan) string {
 		_, _ = h.Write([]byte{0})
 	}
 	for _, tool := range p.RuntimeTools {
-		_, _ = h.Write([]byte(tool.From))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tool.Source))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(tool.Destination))
-		_, _ = h.Write([]byte{0})
+		if err := hashRuntimeTool(h, tool, arch); err != nil {
+			return "", err
+		}
 	}
 	for _, cmd := range p.Install {
 		hashField(h, cmd)
@@ -40,7 +42,7 @@ func bootstrapHash(p plan.BuildPlan) string {
 		_, _ = h.Write([]byte(e))
 		_, _ = h.Write([]byte{0})
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // bootstrapLabelMatches reports whether the image with the given reference

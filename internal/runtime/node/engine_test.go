@@ -46,7 +46,6 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 			if !p.Deps.IsZero() {
 				t.Errorf("expected zero Deps without package files, got %+v", p.Deps)
 			}
-			requirePnpmWrapper(t, p)
 			requireOTelInstall(t, p)
 			if len(p.Entrypoint) != 2 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" {
 				t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs]", p.Entrypoint)
@@ -91,6 +90,34 @@ func TestPlanBootstrapAndBase(t *testing.T) {
 	}
 }
 
+// TestPlanCarriesRuntimeTools verifies the engine passes the spec's runtime
+// tools (the pnpm archive artifact) through to the plan unchanged, including
+// the artifact variant data: the builder, not the engine, materializes them.
+func TestPlanCarriesRuntimeTools(t *testing.T) {
+	tool := plan.RuntimeTool{
+		Destination: "/usr/local/bin/pnpm",
+		Artifact: &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{{
+			Arch: "amd64", URL: "https://example.test/pnpm.tgz", SHA256: strings.Repeat("a", 64), Member: "pnpm",
+		}}},
+	}
+	spec := plan.Spec{Name: "node24", Engine: plan.EngineNode, BaseImage: "node:24-alpine", RuntimeTools: []plan.RuntimeTool{tool}}
+
+	p, err := Engine{}.Plan(spec, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(p.RuntimeTools) != 1 {
+		t.Fatalf("RuntimeTools = %+v, want the spec's one artifact tool", p.RuntimeTools)
+	}
+	got := p.RuntimeTools[0]
+	if got.Destination != "/usr/local/bin/pnpm" || got.Artifact == nil {
+		t.Errorf("RuntimeTools[0] = %+v, want the pnpm archive artifact at /usr/local/bin/pnpm", got)
+	}
+	if _, ok := got.Artifact.VariantForArch("amd64"); !ok {
+		t.Error("the pnpm artifact must carry its amd64 variant through the plan")
+	}
+}
+
 // TestPlanWithPackageJSONOnlyRequiresLock pins the pnpm-only policy: a
 // package.json without a committed pnpm-lock.yaml is an actionable error, never
 // an npm install fallback.
@@ -132,17 +159,16 @@ func TestPlanWithPnpmLock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			requirePnpmWrapper(t, p)
 			requireOTelInstall(t, p)
 			want := plan.Deps{Files: []string{"package.json", "pnpm-lock.yaml"}, Install: pnpmInstall, Dir: "/app"}
 			if !p.Deps.Equal(want) {
 				t.Errorf("deps = %+v, want %+v", p.Deps, want)
 			}
-			// The dependency image invokes the copied CLI directly (no wrapper
-			// exists there yet), frozen and production-only, with dependency
-			// lifecycle scripts re-enabled.
+			// The dependency image invokes the standalone pnpm binary directly
+			// (materialized by the runtime artifact tool), frozen and
+			// production-only, with dependency lifecycle scripts re-enabled.
 			for _, want := range []string{
-				"node " + pnpmCLIPath + " install",
+				pnpmBin + " install",
 				"--prod",
 				"--frozen-lockfile",
 				"--config.dangerouslyAllowAllBuilds=true",
@@ -290,24 +316,9 @@ func requireInstall(t *testing.T, p plan.BuildPlan) string {
 	return ""
 }
 
-// requirePnpmWrapper returns the pnpm wrapper install command (the
-// /usr/local/bin/pnpm shell wrapper around the copied CLI), failing when the
-// plan omits it. Every Node image must expose a directly-executable pnpm so
-// build-time installs can invoke it.
-func requirePnpmWrapper(t *testing.T, p plan.BuildPlan) string {
-	t.Helper()
-	for _, cmd := range p.Install {
-		if strings.Contains(cmd, pnpmWrapperPath) {
-			return cmd
-		}
-	}
-	t.Fatalf("Install = %v, want the %s wrapper install", p.Install, pnpmWrapperPath)
-	return ""
-}
-
 // requireOTelInstall returns the managed OpenTelemetry API install command,
 // failing when the plan omits it. It is not necessarily the first Install entry:
-// the pnpm wrapper precedes it in every Node image.
+// a TypeScript build appends an esbuild step after it.
 func requireOTelInstall(t *testing.T, p plan.BuildPlan) string {
 	t.Helper()
 	for _, cmd := range p.Install {
@@ -335,7 +346,6 @@ func TestPlanJSHandlersNoBuild(t *testing.T) {
 				if err != nil {
 					t.Fatalf("plan(%v): %v", handlers, err)
 				}
-				requirePnpmWrapper(t, p)
 				requireOTelInstall(t, p)
 				if !p.Deps.IsZero() {
 					t.Errorf("handlers %v: Deps = %+v, want zero", handlers, p.Deps)
@@ -507,7 +517,6 @@ func TestPlanJSResolutionUnchanged(t *testing.T) {
 			if err != nil {
 				t.Fatalf("plan: %v", err)
 			}
-			requirePnpmWrapper(t, p)
 			requireOTelInstall(t, p)
 		})
 	}
@@ -571,8 +580,7 @@ func TestPlanSourceMountedPersistsEsbuildAndMountsSource(t *testing.T) {
 	if len(p.Entrypoint) != 3 || p.Entrypoint[0] != "node" || p.Entrypoint[1] != "/relay/bootstrap.mjs" || p.Entrypoint[2] != sourceMountFlag {
 		t.Errorf("entrypoint = %v, want [node /relay/bootstrap.mjs %s]", p.Entrypoint, sourceMountFlag)
 	}
-	// The wrapper, the managed OTel install, and one persistent esbuild install.
-	requirePnpmWrapper(t, p)
+	// The managed OTel install and one persistent esbuild install.
 	requireOTelInstall(t, p)
 	esb := requireInstall(t, p)
 	for _, want := range []string{

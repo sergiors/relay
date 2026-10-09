@@ -99,6 +99,12 @@ bundled by Relay — at build time for a baked image, or at container startup fr
 the live mount under `SOURCE_MOUNT` — so esbuild is never needed in your
 `package.json`.
 
+Relay materializes each runtime's pinned tool in every image it builds, so you
+never declare it: Python copies the uv binary from its official distroless
+image, and Node downloads the checksum-verified pnpm standalone binary for the
+image's target architecture (only Linux `amd64` and `arm64` are supported; any
+other architecture fails the build rather than installing a mismatched binary).
+
 ### Handlers
 
 `handler` has the form `module.function`, split at the **last** dot:

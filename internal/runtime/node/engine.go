@@ -62,7 +62,7 @@ const npmLockFile = "package-lock.json"
 const tsconfigFile = "tsconfig.json"
 
 // esbuildVersion pins the esbuild the Node engine transpiles TypeScript
-// handlers with. Package constant like runtime.PnpmImageTag: upgrades are a
+// handlers with. Package constant like runtime.PnpmVersion: upgrades are a
 // one-line change, never a floating "latest". Relay installs it per build with
 // pnpm into an ephemeral layer (removed again), so the user's package.json never
 // needs esbuild and the tooling stays out of the final execution layer.
@@ -85,37 +85,24 @@ const pnpmStoreDir = "/tmp/relay-pnpm-store"
 // its single package is linked into /app/node_modules (see otelInstall).
 const otelProjectDir = "/relay/otel"
 
-// pnpmCLIPath is the in-image path of the pnpm JavaScript CLI copied from the
-// official pnpm image (registry.PnpmImageTag). The dependency image invokes it
-// directly with node, before any wrapper exists; the app image also exposes it
-// through pnpmWrapperPath.
-const pnpmCLIPath = "/opt/pnpm/dist/pnpm.mjs"
-
-// pnpmWrapperPath is the directly-executable pnpm the runtime image exposes.
-const pnpmWrapperPath = "/usr/local/bin/pnpm"
-
-// pnpmWrapperInstall creates pnpmWrapperPath as a tiny POSIX shell wrapper
-// around the copied pnpm CLI. The official pnpm 11 image ships the CLI as a
-// non-executable, shebang-less ES module (dist/pnpm.mjs) that resolves its
-// worker relative to its own directory, so a plain COPY to /usr/local/bin/pnpm
-// is neither executable nor self-contained. Copying the whole dist directory
-// (the RuntimeTool) and adding this wrapper is the minimal fix using the
-// existing image-COPY tool and a normal build Install RUN. It runs BEFORE every
-// app-image install command that invokes `pnpm`.
-const pnpmWrapperInstall = "printf '%s\\n' '#!/bin/sh' 'exec node " + pnpmCLIPath + " \"$@\"' > " + pnpmWrapperPath + " && chmod 0755 " + pnpmWrapperPath
+// pnpmBin is the directly-executable pnpm the runtime image exposes. It is the
+// standalone musl binary materialized by the Node runtime's artifact
+// RuntimeTool (registry.pnpmTool) at /usr/local/bin/pnpm, so no wrapper and no
+// `node` invocation are needed.
+const pnpmBin = "/usr/local/bin/pnpm"
 
 // pnpmInstall installs an app's production dependency tree from the committed
-// pnpm lock, in the DEPENDENCY image (which has the copied CLI but no wrapper),
-// so it invokes the CLI directly with node. --frozen-lockfile fails the build if
-// package.json and pnpm-lock.yaml disagree instead of silently re-resolving, and
-// --prod drops devDependencies.
+// pnpm lock, in the DEPENDENCY image (and in a no-dependency app image, where
+// the same standalone binary was materialized). --frozen-lockfile fails the
+// build if package.json and pnpm-lock.yaml disagree instead of silently
+// re-resolving, and --prod drops devDependencies.
 // --config.dangerouslyAllowAllBuilds=true restores npm's long-standing behavior
 // of running dependency lifecycle (build) scripts: pnpm blocks them by default
 // (ERR_PNPM_IGNORED_BUILDS), which would leave any dependency with a
 // native/install step broken. The scratch store is removed in the same RUN so it
 // never bloats the layer (the node_modules entries are hardlinks and keep
 // working after the store directory is gone).
-const pnpmInstall = "node " + pnpmCLIPath + " install --prod --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --store-dir " + pnpmStoreDir +
+const pnpmInstall = pnpmBin + " install --prod --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --store-dir " + pnpmStoreDir +
 	" && rm -rf " + pnpmStoreDir
 
 // Ephemeral build-tooling paths. Both live under /tmp and are created AND
@@ -200,8 +187,8 @@ const (
 // one symlink is the whole install and the bootstrap's createRequire from /app
 // resolves the same singleton user modules do. The store is removed in the same
 // RUN. This preserves the previous npm `--no-save` behavior (the managed version
-// wins over a declared one) without touching the app's manifest. It runs AFTER
-// pnpmWrapperInstall, so `pnpm` is the wrapper.
+// wins over a declared one) without touching the app's manifest. It invokes the
+// standalone pnpm binary the runtime tool materialized at pnpmBin.
 //
 // The target package path is removed before the link is created: the app's
 // vendored node_modules may already carry a REAL @opentelemetry/api directory,
@@ -347,10 +334,10 @@ func (Engine) Plan(spec plan.Spec, fnDir string, handlers []string) (plan.BuildP
 	// mountMasks are the bounded in-container paths masked with an empty,
 	// read-only filesystem so the whole-directory bind cannot shadow them.
 	var mountMasks []string
-	// The app image always exposes an executable /usr/local/bin/pnpm (a wrapper
-	// around the copied CLI), then installs the managed API and any build
-	// tooling through it. The wrapper must be created first.
-	install := []string{pnpmWrapperInstall, otelInstall}
+	// The runtime tool materializes the standalone pnpm binary at pnpmBin before
+	// any Install RUN; the app image then installs the managed API and any build
+	// tooling through it.
+	install := []string{otelInstall}
 	if spec.SourceMounted {
 		entry = []string{"node", "/relay/bootstrap.mjs", sourceMountFlag}
 		mountTarget = SourceMountTarget

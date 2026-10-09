@@ -214,7 +214,7 @@ func TestDependencyBuildContextTempDirRemoved(t *testing.T) {
 				t.Fatalf("snapshot dependency: %v", err)
 			}
 
-			err = buildDependencyImage(context.Background(), cli, spec, deps, snap, depImageRef("fp"), "fp", nil)
+			err = buildDependencyImage(context.Background(), cli, spec, deps, snap, depImageRef("fp"), "fp", arch, nil)
 			if tc.wantErr && err == nil {
 				t.Fatal("expected the scripted dependency build failure to surface")
 			}

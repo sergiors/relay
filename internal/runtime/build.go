@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"relay/internal/app"
 	"relay/internal/observability/metrics"
@@ -50,8 +52,11 @@ func (m *Manager) buildContext() (context.Context, context.CancelFunc) {
 // renderDockerfile is the ONLY Dockerfile renderer, shared by every engine; an
 // engine must express its concerns as plan data rather than generate a
 // Dockerfile. It emits FROM/WORKDIR/COPY/RUN/USER/ENTRYPOINT from the plan, with
-// the app source copied into WorkDir (the historical baked-source image).
-func renderDockerfile(p plan.BuildPlan) string {
+// the app source copied into WorkDir (the historical baked-source image). It
+// fails for an artifact RuntimeTool with no variant for the plan's target
+// architecture, so an unsupported target is a build-time error, never a silently
+// missing tool.
+func renderDockerfile(p plan.BuildPlan) (string, error) {
 	return renderDockerfileWithSource(p, true)
 }
 
@@ -63,7 +68,7 @@ func renderDockerfile(p plan.BuildPlan) string {
 // is omitted. The build context still contains the selected source (it is the
 // same immutable snapshot the fingerprint was derived from), so the tag and the
 // mounted tree can never describe different bytes.
-func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) string {
+func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) (string, error) {
 	var b strings.Builder
 
 	b.WriteString("FROM " + p.BaseImage + "\n")
@@ -92,11 +97,13 @@ func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) string {
 		b.WriteString("COPY " + rel + " " + dir + "/\n")
 	}
 
-	// Runtime tools pull a pinned binary out of another image (e.g. the uv
-	// distroless image or the official pnpm image). They are emitted BEFORE the
-	// install RUN so the dependency install can already use the tool.
-	for _, tool := range p.RuntimeTools {
-		b.WriteString("COPY --from=" + tool.From + " " + tool.Source + " " + tool.Destination + "\n")
+	// Runtime tools materialize a pinned external binary. An image-copy tool
+	// (e.g. uv) is copied out of a pinned image; a remote-archive artifact (e.g.
+	// pnpm's standalone binary) is downloaded, checksum-verified, and extracted
+	// from its per-architecture archive. Both are emitted BEFORE the install RUN
+	// so the install can already use the tool.
+	if err := renderRuntimeTools(&b, p); err != nil {
+		return "", err
 	}
 
 	for _, cmd := range p.Install {
@@ -118,7 +125,161 @@ func renderDockerfileWithSource(p plan.BuildPlan, copySource bool) string {
 	if len(p.Entrypoint) > 0 {
 		b.WriteString("ENTRYPOINT " + quoteEntrypointJSON(p.Entrypoint) + "\n")
 	}
+	return b.String(), nil
+}
+
+// renderRuntimeTools writes the Dockerfile instructions for every runtime tool,
+// in plan order. An image-copy tool becomes a COPY --from; an artifact tool
+// becomes one fail-closed RUN that downloads the pinned archive, verifies its
+// SHA-256, extracts ONLY the validated member into a scratch dir, and moves it
+// to its destination.
+//
+// Download and extraction share ONE RUN deliberately: the archive is removed
+// before the layer is committed, so the final image never carries the download
+// as a dead layer (an ADD would retain it even though a later RUN deletes it).
+// Every command is `&&`-chained so a failed download, a bad checksum, a missing
+// member, or a tar failure aborts the build instead of producing an image with a
+// bogus tool. The archive is checksum-pinned and the member is a validated clean
+// relative path, so extraction cannot traverse outside the scratch directory;
+// only that one member is ever written.
+func renderRuntimeTools(b *strings.Builder, p plan.BuildPlan) error {
+	for i, tool := range p.RuntimeTools {
+		if err := tool.ValidateForm(); err != nil {
+			return fmt.Errorf("runtime tool %d: %w", i, err)
+		}
+		if tool.Artifact == nil {
+			// Image-copy form: pull the pinned binary out of another image.
+			if tool.From == "" || tool.Source == "" || tool.Destination == "" {
+				return fmt.Errorf("runtime tool %d: incomplete image copy (from=%q source=%q destination=%q)",
+					i, tool.From, tool.Source, tool.Destination)
+			}
+			b.WriteString("COPY --from=" + tool.From + " " + tool.Source + " " + tool.Destination + "\n")
+			continue
+		}
+		if p.TargetArch == "" {
+			return fmt.Errorf("runtime tool %q: artifact requires a target architecture", tool.Destination)
+		}
+		variant, ok := tool.Artifact.VariantForArch(p.TargetArch)
+		if !ok {
+			return fmt.Errorf("runtime tool %q: no artifact variant for architecture %q", tool.Destination, p.TargetArch)
+		}
+		if err := validateArtifactVariant(variant); err != nil {
+			return fmt.Errorf("runtime tool %q: %w", tool.Destination, err)
+		}
+		if tool.Destination == "" || !strings.HasPrefix(tool.Destination, "/") {
+			return fmt.Errorf("runtime tool: artifact destination %q must be an absolute path", tool.Destination)
+		}
+		b.WriteString(renderArtifactTool(i, tool.Destination, variant))
+	}
+	return nil
+}
+
+// renderArtifactTool renders one artifact tool as a single fail-closed RUN that
+// downloads the pinned archive, verifies the SHA-256, extracts exactly the
+// validated member, installs it at destination, and removes every scratch path
+// before the layer commits. i makes the scratch paths unique per tool so two
+// artifacts in one image cannot clash.
+//
+// The download tries wget then curl (a base image may ship either; the artifact
+// is only declared by runtimes whose base provides one). If neither succeeds the
+// RUN exits non-zero and the build fails closed.
+func renderArtifactTool(i int, destination string, variant plan.ArtifactVariant) string {
+	archive := fmt.Sprintf("/tmp/relay-tool-%d.tar.gz", i)
+	unpack := fmt.Sprintf("/tmp/relay-tool-%d.unpack", i)
+	destDir := path.Dir(destination)
+	url := dockerfileShellArg(variant.URL)
+	var b strings.Builder
+	b.WriteString("RUN ( wget -q -O " + dockerfileShellArg(archive) + " " + url + " || curl -fsSL -o " + dockerfileShellArg(archive) + " " + url + " )" +
+		" && echo " + dockerfileShellArg(variant.SHA256+"  "+archive) + " | sha256sum -c -" +
+		" && rm -rf " + dockerfileShellArg(unpack) +
+		" && mkdir -p " + dockerfileShellArg(unpack) +
+		" && tar -xzf " + dockerfileShellArg(archive) + " -C " + dockerfileShellArg(unpack) + " " + dockerfileShellArg(variant.Member) +
+		" && mkdir -p " + dockerfileShellArg(destDir) +
+		" && mv " + dockerfileShellArg(path.Join(unpack, variant.Member)) + " " + dockerfileShellArg(destination) +
+		" && chmod 0755 " + dockerfileShellArg(destination) +
+		" && rm -rf " + dockerfileShellArg(unpack) + " " + dockerfileShellArg(archive) + "\n")
 	return b.String()
+}
+
+// validateArtifactVariant rejects an artifact variant whose data could produce an
+// unsafe or non-deterministic Dockerfile: a non-HTTPS URL, a malformed digest, a
+// member that is not a clean relative path, or shell-hostile URL bytes. The
+// plan data is trusted (registry constants), but validation is defense-in-depth
+// against a future tool definition, and it makes path traversal impossible.
+func validateArtifactVariant(v plan.ArtifactVariant) error {
+	if v.Arch == "" {
+		return fmt.Errorf("artifact variant has no architecture")
+	}
+	if !strings.HasPrefix(v.URL, "https://") {
+		return fmt.Errorf("artifact variant for %s: url %q must be https", v.Arch, v.URL)
+	}
+	if strings.ContainsAny(v.URL, " \t\r\n\"'`\\") {
+		return fmt.Errorf("artifact variant for %s: url %q contains unsafe characters", v.Arch, v.URL)
+	}
+	if len(v.SHA256) != 64 {
+		return fmt.Errorf("artifact variant for %s: sha256 %q must be 64 hex characters", v.Arch, v.SHA256)
+	}
+	for _, c := range v.SHA256 {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return fmt.Errorf("artifact variant for %s: sha256 %q must be lowercase hex", v.Arch, v.SHA256)
+		}
+	}
+	return validateArtifactMember(v.Member)
+}
+
+// validateArtifactMember rejects a tar member that is not a clean, non-option
+// relative path, so a crafted member can never escape the extraction directory
+// or be mistaken for a tar flag: an empty member, an absolute path, a leading
+// "-", a backslash, or any "."/".." segment is an error.
+func validateArtifactMember(member string) error {
+	if member == "" {
+		return fmt.Errorf("artifact member is empty")
+	}
+	if strings.HasPrefix(member, "/") || strings.HasPrefix(member, "-") {
+		return fmt.Errorf("artifact member %q must be a relative path without a leading %q", member, string(member[0]))
+	}
+	if strings.Contains(member, "\\") {
+		return fmt.Errorf("artifact member %q must not contain a backslash", member)
+	}
+	if path.Clean(member) != member {
+		return fmt.Errorf("artifact member %q must be a clean relative path", member)
+	}
+	for _, seg := range strings.Split(member, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("artifact member %q must not contain an empty, \".\", or \"..\" segment", member)
+		}
+	}
+	return nil
+}
+
+// dockerfileShellArg renders s as exactly one POSIX shell word for a Dockerfile
+// RUN. A string made only of conservative shell-safe bytes is emitted bare so
+// ordinary paths and digests stay readable; anything else is single-quoted.
+// Plan data is validated to be safe before it reaches here; the quoting is
+// defense-in-depth so a future value cannot split or expand inside the RUN.
+func dockerfileShellArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if dockerfileShellSafe(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// dockerfileShellSafe reports whether every byte of s needs no quoting. It is
+// deliberately conservative: a byte outside the set always triggers quoting.
+func dockerfileShellSafe(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_', c == '@', c == '%', c == '+', c == '=', c == ':', c == ',', c == '.', c == '/', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // quoteEntrypointJSON renders an ENTRYPOINT as a JSON array so that arguments
@@ -177,7 +338,10 @@ func buildImage(
 		return err
 	}
 
-	dockerfile := renderDockerfileWithSource(p, copySource)
+	dockerfile, err := renderDockerfileWithSource(p, copySource)
+	if err != nil {
+		return fmt.Errorf("app %q: render dockerfile: %w", name, err)
+	}
 	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return fmt.Errorf("app %q: write dockerfile: %w", name, err)
 	}
@@ -324,6 +488,7 @@ func buildDependencyImage(
 	deps plan.Deps,
 	snap dependencySnapshot,
 	depRef, depFingerprint string,
+	targetArch string,
 	reg *metrics.Registry,
 ) error {
 	// snap is the immutable manifest snapshot the caller captured (see
@@ -348,8 +513,9 @@ func buildDependencyImage(
 	// uv), and the install command. No User/UserSetup/Env/Entrypoint — it is a
 	// base image.
 	depPlan := plan.BuildPlan{
-		BaseImage: spec.BaseImage,
-		WorkDir:   deps.Dir,
+		BaseImage:  spec.BaseImage,
+		WorkDir:    deps.Dir,
+		TargetArch: targetArch,
 		// The dependency base image is built FROM the raw runtime base (not the
 		// app image), so it must materialize the runtime's external tools
 		// itself: the app image inherits them through FROM, but the dependency
@@ -362,7 +528,10 @@ func buildDependencyImage(
 	if depPlan.Install[0] == "" {
 		return fmt.Errorf("dependency %s: empty install command", depRef)
 	}
-	dockerfile := renderDockerfile(depPlan)
+	dockerfile, err := renderDockerfile(depPlan)
+	if err != nil {
+		return fmt.Errorf("dependency %s: render dockerfile: %w", depRef, err)
+	}
 	if err := os.WriteFile(filepath.Join(ctxDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		return fmt.Errorf("dependency %s: write dockerfile: %w", depRef, err)
 	}
@@ -391,13 +560,32 @@ func buildDependencyImage(
 // so a failed build leaves its intermediate state in place for debugging.
 // ForceRemove is deliberately not used: it would also remove intermediates on
 // failure, which we do not want.
+//
+// Platform is set EXPLICITLY from the resolved target architecture instead of
+// letting the builder default to the daemon's own platform: the dependency
+// fingerprint and any artifact RuntimeTool variant are keyed on the same arch,
+// and an implicit default could let the built image and that key disagree (e.g.
+// a Relay process running under emulation on a differently-architected daemon).
+// Relay only ever builds LINUX container images (every base is a Linux image),
+// so the target OS is linux regardless of the Relay process host OS (a macOS
+// dev process talks to a Linux Docker VM); only the architecture varies.
 func buildImageOptions(image string, labels map[string]string) client.ImageBuildOptions {
 	return client.ImageBuildOptions{
 		Tags:       []string{image},
 		Dockerfile: "Dockerfile",
 		Remove:     true,
 		Labels:     labels,
+		Platforms:  []ocispec.Platform{buildTargetPlatform()},
 	}
+}
+
+// buildTargetPlatform is the OCI platform every Relay image is built for: Linux
+// at the resolved target architecture (the same `arch` key the dependency
+// fingerprint and artifact-tool variant selection use). It is the single source
+// of truth passed to Docker's ImageBuild, so the platform the builder targets
+// can never silently diverge from the architecture Relay keyed the build on.
+func buildTargetPlatform() ocispec.Platform {
+	return ocispec.Platform{OS: "linux", Architecture: arch}
 }
 
 // drainBuildResponse reads the JSON message stream returned by ImageBuild,

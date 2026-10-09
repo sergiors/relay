@@ -241,7 +241,7 @@ func TestPrepareRecordsDaemonVisibleSourcePath(t *testing.T) {
 		t.Fatalf("plan: %v", err)
 	}
 	present := fmt.Sprintf(`{"Id":"sha256:deadbeef","Config":{"Labels":{%q:%q}}}`,
-		labelBootstrap, bootstrapHash(builtPlan))
+		labelBootstrap, mustBootstrapHash(t, builtPlan))
 
 	const hostname = "abcdef012345"
 	cli := newScriptedDockerClient(t,

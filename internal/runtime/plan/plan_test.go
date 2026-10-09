@@ -71,3 +71,68 @@ func TestRuntimeToolCarriesPinnedReference(t *testing.T) {
 		t.Fatalf("RuntimeTool fields must be carried, got %+v", tool)
 	}
 }
+
+// TestRuntimeToolValidateForm pins the exactly-one-form invariant: an image
+// copy (From/Source) and an artifact (Artifact) are each valid alone, but a
+// tool mixing both forms — or declaring neither — is rejected so no resolver
+// silently picks one.
+func TestRuntimeToolValidateForm(t *testing.T) {
+	artifact := &RuntimeArtifact{Variants: []ArtifactVariant{{Arch: "amd64", URL: "https://example.test/x.tgz", SHA256: "aa", Member: "pnpm"}}}
+
+	valid := []struct {
+		name string
+		tool RuntimeTool
+	}{
+		{"image copy", RuntimeTool{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/uv"}},
+		{"artifact", RuntimeTool{Destination: "/usr/local/bin/pnpm", Artifact: artifact}},
+	}
+	for _, tc := range valid {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.tool.ValidateForm(); err != nil {
+				t.Errorf("ValidateForm(%+v) = %v, want nil", tc.tool, err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name string
+		tool RuntimeTool
+	}{
+		{"both forms", RuntimeTool{From: "ghcr.io/astral-sh/uv:0.12.17", Source: "/uv", Destination: "/usr/local/bin/pnpm", Artifact: artifact}},
+		{"from plus artifact", RuntimeTool{From: "ghcr.io/astral-sh/uv:0.12.17", Destination: "/usr/local/bin/pnpm", Artifact: artifact}},
+		{"source plus artifact", RuntimeTool{Source: "/uv", Destination: "/usr/local/bin/pnpm", Artifact: artifact}},
+		{"neither form", RuntimeTool{Destination: "/usr/local/bin/pnpm"}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.tool.ValidateForm(); err == nil {
+				t.Errorf("ValidateForm(%+v) = nil, want an error", tc.tool)
+			}
+		})
+	}
+}
+
+// TestRuntimeArtifactVariantForArch pins the target-architecture selection: a
+// matching variant is returned, and a nil artifact or an unknown architecture
+// reports false so the caller can fail unsupported rather than build a
+// wrong-architecture tool.
+func TestRuntimeArtifactVariantForArch(t *testing.T) {
+	amd64 := ArtifactVariant{Arch: "amd64", URL: "https://example.test/x.tgz", SHA256: "aa", Member: "pnpm"}
+	arm64 := ArtifactVariant{Arch: "arm64", URL: "https://example.test/y.tgz", SHA256: "bb", Member: "pnpm"}
+	artifact := &RuntimeArtifact{Variants: []ArtifactVariant{amd64, arm64}}
+
+	if got, ok := artifact.VariantForArch("amd64"); !ok || got != amd64 {
+		t.Errorf("VariantForArch(amd64) = %+v, %v; want %+v, true", got, ok, amd64)
+	}
+	if got, ok := artifact.VariantForArch("arm64"); !ok || got != arm64 {
+		t.Errorf("VariantForArch(arm64) = %+v, %v; want %+v, true", got, ok, arm64)
+	}
+	if _, ok := artifact.VariantForArch("riscv64"); ok {
+		t.Error("VariantForArch(riscv64) = true, want false for an unsupported architecture")
+	}
+
+	var nilArtifact *RuntimeArtifact
+	if _, ok := nilArtifact.VariantForArch("amd64"); ok {
+		t.Error("a nil artifact must report no variant")
+	}
+}

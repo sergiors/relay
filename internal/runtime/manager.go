@@ -1208,6 +1208,12 @@ func (m *Manager) prepare(
 	if err != nil {
 		return nil, fmt.Errorf("app %q: plan: %w", fn.Name, err)
 	}
+	// Stamp the resolved target architecture onto the plan. It selects a
+	// per-architecture artifact RuntimeTool variant and is passed to the Docker
+	// build as the target platform, so an unsupported architecture fails here
+	// (see the bootstrap hash and the renderer, which both resolve the tools)
+	// rather than baking a wrong-architecture tool.
+	planResult.TargetArch = arch
 
 	// mountTarget is the in-container path the live source is mounted at. An
 	// engine may place it OUTSIDE the workdir when dependencies or generated
@@ -1222,8 +1228,14 @@ func (m *Manager) prepare(
 	// embedded plan files) plus the entrypoint onto the image as a label. The
 	// fingerprint above covers ONLY the app dir, so the label is what
 	// lets the reuse path below detect an image built with a stale bootstrap
-	// (e.g. by an older Relay version) under the exact same tag.
-	bootstrapLabelHash := bootstrapHash(planResult)
+	// (e.g. by an older Relay version) under the exact same tag. It also covers
+	// the RESOLVED runtime tools (the artifact variant selected for this target
+	// architecture), so a tool change re-fingerprints the image even when the
+	// app source is unchanged; an unsupported target architecture is an error.
+	bootstrapLabelHash, err := bootstrapHash(planResult, arch)
+	if err != nil {
+		return nil, fmt.Errorf("app %q: %w", fn.Name, err)
+	}
 
 	// The dependency manifest snapshot is captured ONCE when the app declares
 	// deps, so the dependency fingerprint and the bytes staged into the
@@ -1267,7 +1279,11 @@ func (m *Manager) prepare(
 	// Prepared.Fingerprint).
 	imageFingerprint := fp
 	if mountSource {
-		imageFingerprint = sourceMountImageFingerprint(spec.Name, depRef, renderDockerfileWithSource(planResult, false))
+		rendered, rerr := renderDockerfileWithSource(planResult, false)
+		if rerr != nil {
+			return nil, fmt.Errorf("app %q: render dockerfile: %w", fn.Name, rerr)
+		}
+		imageFingerprint = sourceMountImageFingerprint(spec.Name, depRef, rendered)
 	}
 	image := ImageRef(fn.Name, imageFingerprint)
 
@@ -1664,7 +1680,7 @@ func (m *Manager) ensureDependencyImage(
 	// The dependency layer is a real build, so it is spanned like the app
 	// image build. The span nests under the preparing app's span.
 	_, depBuildSpan := startRuntimeSpan(ctx, "runtime.build", fn.Name, depRef)
-	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint, m.metrics); err != nil {
+	if err := buildDependencyImage(buildCtx, m.cli, spec, deps, snap, depRef, depFingerprint, arch, m.metrics); err != nil {
 		depBuildSpan.RecordError(err)
 		depBuildSpan.SetStatus(codes.Error, err.Error())
 		depBuildSpan.End()

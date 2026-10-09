@@ -119,7 +119,11 @@ func bootstrapForTest(t *testing.T, fn app.App) string {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	return bootstrapHash(p)
+	h, err := bootstrapHash(p, arch)
+	if err != nil {
+		t.Fatalf("bootstrap hash: %v", err)
+	}
+	return h
 }
 
 // imageInspectJSON renders a minimal ImageInspect response whose Config.Labels

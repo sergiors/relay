@@ -192,13 +192,16 @@ func dependencyFingerprintFrom(
 	hashField(h, platform)
 
 	// External build tools the install depends on (e.g. the pinned uv binary or
-	// the pinned pnpm JS CLI distribution). Hashed in plan order: RuntimeTools is
-	// a fixed registry-declared list, and the field boundaries keep distinct tool
-	// sets from colliding.
+	// the pinned pnpm artifact). Hashed by their RESOLVED identity for arch (the
+	// selected artifact variant), in plan order: RuntimeTools is a fixed
+	// registry-declared list, and the field boundaries plus the form
+	// discriminant keep distinct tool sets from colliding. An artifact with no
+	// variant for arch is an error, so an unsupported target never fingerprints
+	// as if it had the tool.
 	for _, tool := range spec.RuntimeTools {
-		hashField(h, tool.From)
-		hashField(h, tool.Source)
-		hashField(h, tool.Destination)
+		if err := hashRuntimeTool(h, tool, arch); err != nil {
+			return "", err
+		}
 	}
 
 	// Install procedure.
@@ -216,6 +219,39 @@ func dependencyFingerprintFrom(
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashRuntimeTool hashes a runtime tool's RESOLVED identity for arch into the
+// digest. The two forms are distinguished by a leading form field so an image
+// copy and an archive artifact can never hash to the same field sequence. An
+// image copy hashes its pinned source image, source path, and destination. An
+// archive artifact resolves the variant for arch and hashes its destination plus
+// the variant's architecture, URL, checksum, and extracted member, so the pinned
+// download and the selected architecture are part of the identity. An artifact
+// with no variant for arch is an error (fail unsupported), never an unresolved
+// hash.
+func hashRuntimeTool(h io.Writer, tool plan.RuntimeTool, arch string) error {
+	if err := tool.ValidateForm(); err != nil {
+		return err
+	}
+	if tool.Artifact == nil {
+		hashField(h, "image-copy")
+		hashField(h, tool.From)
+		hashField(h, tool.Source)
+		hashField(h, tool.Destination)
+		return nil
+	}
+	variant, ok := tool.Artifact.VariantForArch(arch)
+	if !ok {
+		return fmt.Errorf("runtime tool %q: no artifact variant for architecture %q", tool.Destination, arch)
+	}
+	hashField(h, "archive-artifact")
+	hashField(h, tool.Destination)
+	hashField(h, variant.Arch)
+	hashField(h, variant.URL)
+	hashField(h, variant.SHA256)
+	hashField(h, variant.Member)
+	return nil
 }
 
 // hashManifestBytes streams the staged manifest's bytes into the digest, framed

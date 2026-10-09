@@ -69,7 +69,7 @@ func TestDockerfileTemplateEmbedsAppSource(t *testing.T) {
 		Entrypoint: []string{"node", "/relay/bootstrap.mjs"},
 	}
 
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 
 	if !strings.Contains(df, "FROM node:24-alpine") {
 		t.Errorf("expected FROM line, got:\n%s", df)
@@ -96,7 +96,7 @@ func TestRenderDockerfileNoInstallNoEntrypoint(t *testing.T) {
 		BaseImage: "python:3.14-slim",
 		WorkDir:   "/app",
 	}
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 	if strings.Contains(df, "RUN ") {
 		t.Errorf("did not expect RUN instruction, got:\n%s", df)
 	}
@@ -130,7 +130,7 @@ func TestRenderDockerfileHardening(t *testing.T) {
 		Entrypoint: []string{"python", "/relay/bootstrap.py"},
 	}
 
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 
 	// The full expected shape, in order.
 	want := `FROM python:3.14-slim
@@ -175,7 +175,7 @@ func TestRenderDockerfileRuntimeTools(t *testing.T) {
 		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
 	}
 
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 	wantLine := "COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv"
 	if !strings.Contains(df, wantLine) {
 		t.Fatalf("expected runtime tool line %q, got:\n%s", wantLine, df)
@@ -211,7 +211,7 @@ func TestRenderDockerfileNoUser(t *testing.T) {
 		WorkDir:    "/app",
 		Entrypoint: []string{"node", "/relay/bootstrap.mjs"},
 	}
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 	if strings.Contains(df, "USER ") {
 		t.Errorf("did not expect USER line for unhardened plan, got:\n%s", df)
 	}
@@ -239,7 +239,7 @@ func TestRenderDockerfileDependencyBase(t *testing.T) {
 		}},
 		Install: []string{"uv pip install --system --no-cache -r requirements.txt"},
 	}
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 
 	if !strings.Contains(df, "FROM python:3.14-slim") {
 		t.Errorf("expected FROM base line, got:\n%s", df)
@@ -279,7 +279,7 @@ func TestRenderDockerfileAppFromDependency(t *testing.T) {
 		User:       "10001:10001",
 		Entrypoint: []string{"python", "/relay/bootstrap.py"},
 	}
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 
 	if !strings.Contains(df, "FROM relay-dep-abcdef1234567890") {
 		t.Errorf("function image must build FROM the dependency image, got:\n%s", df)
@@ -303,9 +303,203 @@ func TestRenderDockerfileEntrypointQuoting(t *testing.T) {
 		WorkDir:    "/app",
 		Entrypoint: []string{"program", "--flag value"},
 	}
-	df := renderDockerfile(p)
+	df := mustRenderDockerfile(t, p)
 	if !strings.Contains(df, `ENTRYPOINT ["program", "--flag value"]`) {
 		t.Errorf("expected argument with spaces preserved, got:\n%s", df)
+	}
+}
+
+// mustRenderDockerfile renders a plan and fails the test on a render error.
+func mustRenderDockerfile(t *testing.T, p plan.BuildPlan) string {
+	t.Helper()
+	df, err := renderDockerfile(p)
+	if err != nil {
+		t.Fatalf("renderDockerfile: %v", err)
+	}
+	return df
+}
+
+// artifactPnpmTool is a two-architecture artifact tool fixture for the renderer
+// tests. The member is nested ("bin/pnpm") so the extraction path is exercised.
+func artifactPnpmTool() plan.RuntimeTool {
+	return plan.RuntimeTool{
+		Destination: "/usr/local/bin/pnpm",
+		Artifact: &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{
+			{Arch: "amd64", URL: "https://example.test/pnpm-x64.tgz", SHA256: strings.Repeat("a", 64), Member: "bin/pnpm"},
+			{Arch: "arm64", URL: "https://example.test/pnpm-arm64.tgz", SHA256: strings.Repeat("b", 64), Member: "bin/pnpm"},
+		}},
+	}
+}
+
+// TestRenderDockerfileArtifactTool verifies an archive-artifact RuntimeTool is
+// materialized as one fail-closed RUN that downloads the pinned archive for the
+// TARGET architecture with wget (falling back to curl), verifies the SHA-256,
+// extracts only the validated member, and moves it to its destination BEFORE
+// the install RUN.
+func TestRenderDockerfileArtifactTool(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		WorkDir:      "/app",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+		Install:      []string{"pnpm install --prod"},
+	}
+	df := mustRenderDockerfile(t, p)
+
+	for _, want := range []string{
+		"wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-x64.tgz",
+		strings.Repeat("a", 64),
+		"sha256sum -c -",
+		"tar -xzf /tmp/relay-tool-0.tar.gz -C /tmp/relay-tool-0.unpack bin/pnpm",
+		"mv /tmp/relay-tool-0.unpack/bin/pnpm /usr/local/bin/pnpm",
+		"chmod 0755 /usr/local/bin/pnpm",
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("artifact Dockerfile missing %q:\n%s", want, df)
+		}
+	}
+	// The whole acquisition (download, verify, extract, install, cleanup) is ONE
+	// fail-closed RUN, so the downloaded archive never becomes a retained layer.
+	if strings.Count(df, "RUN ") != 2 { // the artifact RUN plus the install RUN
+		t.Errorf("artifact acquisition must be a single RUN:\n%s", df)
+	}
+	// Only the target architecture's artifact is referenced.
+	if strings.Contains(df, "pnpm-arm64.tgz") {
+		t.Errorf("amd64 render must not reference the arm64 artifact:\n%s", df)
+	}
+	fetchIdx := strings.Index(df, "wget -q -O /tmp/relay-tool-0.tar.gz")
+	installIdx := strings.Index(df, "RUN pnpm install")
+	if fetchIdx < 0 || installIdx < 0 || fetchIdx > installIdx {
+		t.Errorf("artifact acquisition must precede the install RUN (fetch=%d install=%d):\n%s", fetchIdx, installIdx, df)
+	}
+}
+
+// TestRenderDockerfileArtifactSelectsTargetArch verifies the same plan renders a
+// different (only) artifact when the target architecture changes, so the tool
+// and the image it is baked into can never disagree.
+func TestRenderDockerfileArtifactSelectsTargetArch(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "arm64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+	}
+	df := mustRenderDockerfile(t, p)
+	if !strings.Contains(df, "wget -q -O /tmp/relay-tool-0.tar.gz https://example.test/pnpm-arm64.tgz") {
+		t.Errorf("arm64 render must reference the arm64 artifact:\n%s", df)
+	}
+	if strings.Contains(df, "pnpm-x64.tgz") {
+		t.Errorf("arm64 render must not reference the amd64 artifact:\n%s", df)
+	}
+}
+
+// TestRenderDockerfileArtifactUnsupportedArch verifies an artifact tool with no
+// variant for the target architecture fails the render (fail unsupported),
+// never emits a tool-less image.
+func TestRenderDockerfileArtifactUnsupportedArch(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "riscv64",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+	}
+	if _, err := renderDockerfile(p); err == nil {
+		t.Fatal("renderDockerfile with an unsupported artifact architecture must fail")
+	}
+}
+
+// TestRenderDockerfileArtifactMissingTargetArch verifies a plan carrying an
+// artifact tool but no target architecture fails rather than rendering an
+// unresolved tool.
+func TestRenderDockerfileArtifactMissingTargetArch(t *testing.T) {
+	p := plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		RuntimeTools: []plan.RuntimeTool{artifactPnpmTool()},
+	}
+	if _, err := renderDockerfile(p); err == nil {
+		t.Fatal("renderDockerfile with an artifact tool and no target architecture must fail")
+	}
+}
+
+// TestRenderDockerfileArtifactRejectsMixedForm verifies the renderer rejects a
+// RuntimeTool that sets both image-copy fields and an Artifact, instead of
+// silently rendering the artifact form.
+func TestRenderDockerfileArtifactRejectsMixedForm(t *testing.T) {
+	mixed := artifactPnpmTool()
+	mixed.From = "ghcr.io/astral-sh/uv:0.12.17"
+	mixed.Source = "/uv"
+
+	p := plan.BuildPlan{
+		BaseImage:    "node:24-alpine",
+		TargetArch:   "amd64",
+		RuntimeTools: []plan.RuntimeTool{mixed},
+	}
+	if _, err := renderDockerfile(p); err == nil {
+		t.Fatal("renderDockerfile accepted a runtime tool mixing From/Source with Artifact")
+	}
+}
+
+// TestRenderDockerfileArtifactRejectsUnsafeData verifies the renderer fails
+// closed on an unsafe member or a malformed digest/url instead of emitting a
+// Dockerfile that could traverse or skip verification.
+func TestRenderDockerfileArtifactRejectsUnsafeData(t *testing.T) {
+	base := artifactPnpmTool()
+	v := base.Artifact.Variants[0]
+
+	cases := []struct {
+		name   string
+		mutate func(*plan.ArtifactVariant)
+	}{
+		{"traversal member", func(x *plan.ArtifactVariant) { x.Member = "../etc/passwd" }},
+		{"absolute member", func(x *plan.ArtifactVariant) { x.Member = "/etc/passwd" }},
+		{"option member", func(x *plan.ArtifactVariant) { x.Member = "--checkpoint=1" }},
+		{"backend member", func(x *plan.ArtifactVariant) { x.Member = `a\b` }},
+		{"non-https url", func(x *plan.ArtifactVariant) { x.URL = "http://example.test/x.tgz" }},
+		{"short digest", func(x *plan.ArtifactVariant) { x.SHA256 = "abc" }},
+		{"uppercase digest", func(x *plan.ArtifactVariant) { x.SHA256 = strings.Repeat("A", 64) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			x := v
+			tc.mutate(&x)
+			p := plan.BuildPlan{
+				BaseImage:    "node:24-alpine",
+				TargetArch:   "amd64",
+				RuntimeTools: []plan.RuntimeTool{{Destination: "/usr/local/bin/pnpm", Artifact: &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{x}}}},
+			}
+			if _, err := renderDockerfile(p); err == nil {
+				t.Fatalf("renderDockerfile accepted unsafe artifact data: %+v", x)
+			}
+		})
+	}
+}
+
+// TestValidateArtifactMember pins the member validator directly: clean relative
+// paths are accepted, traversal/absolute/option/backslash/empty-segment forms
+// are rejected.
+func TestValidateArtifactMember(t *testing.T) {
+	valid := []string{"pnpm", "bin/pnpm", "a/b/c"}
+	for _, m := range valid {
+		if err := validateArtifactMember(m); err != nil {
+			t.Errorf("validateArtifactMember(%q) = %v, want nil", m, err)
+		}
+	}
+	invalid := []string{"", "/pnpm", "-pnpm", `a\b`, ".", "..", "a/../b", "a//b", "a/./b", "a/", "./a"}
+	for _, m := range invalid {
+		if err := validateArtifactMember(m); err == nil {
+			t.Errorf("validateArtifactMember(%q) = nil, want an error", m)
+		}
+	}
+}
+
+// TestBuildImageOptionsSetsTargetPlatform verifies every build requests the
+// resolved target platform explicitly (linux at the resolved arch) instead of
+// letting the builder default to the daemon's platform.
+func TestBuildImageOptionsSetsTargetPlatform(t *testing.T) {
+	opts := buildImageOptions("relay-app-test:abc123", nil)
+	if len(opts.Platforms) != 1 {
+		t.Fatalf("Platforms = %+v, want exactly one", opts.Platforms)
+	}
+	if opts.Platforms[0].OS != "linux" || opts.Platforms[0].Architecture != arch {
+		t.Errorf("Platforms[0] = %+v, want {linux %s}", opts.Platforms[0], arch)
 	}
 }
 

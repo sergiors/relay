@@ -388,12 +388,49 @@ func TestDependencyFingerprintPnpmTool(t *testing.T) {
 		t.Fatalf("fingerprint: %v", err)
 	}
 
+	// The pnpm artifact's resolved identity is part of the layer: a bumped
+	// archive URL or digest must yield a different layer even with identical
+	// manifests.
 	bumped := base
-	bumped.RuntimeTools = []plan.RuntimeTool{{From: "ghcr.io/pnpm/pnpm:99.0.0", Source: "/opt/pnpm/dist", Destination: "/opt/pnpm/dist"}}
+	bumpedVariant, ok := pnpmTool.Artifact.VariantForArch("amd64")
+	if !ok {
+		t.Fatal("pnpm tool has no amd64 variant")
+	}
+	bumpedVariant.SHA256 = strings.Repeat("0", 64)
+	bumped.RuntimeTools = []plan.RuntimeTool{{
+		Destination: pnpmTool.Destination,
+		Artifact:    &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{bumpedVariant}},
+	}}
 	if got, err := DependencyFingerprint("amd64", "linux", bumped, dir, deps); err != nil {
 		t.Fatalf("fingerprint bumped: %v", err)
 	} else if got == orig {
-		t.Error("a changed pnpm tool image tag must change the dependency fingerprint")
+		t.Error("a changed pnpm artifact digest must change the dependency fingerprint")
+	}
+
+	// An artifact with no variant for the target architecture is an error, so an
+	// unsupported target never gets a cached layer for a tool it cannot install.
+	if _, err := DependencyFingerprint("riscv64", "linux", base, dir, deps); err == nil {
+		t.Error("an unsupported pnpm artifact architecture must fail the dependency fingerprint")
+	}
+}
+
+// TestDependencyFingerprintRejectsMixedRuntimeToolForm verifies the dependency
+// fingerprint resolver rejects a RuntimeTool that mixes image-copy fields with
+// an Artifact, so a malformed tool never gets a content-addressed layer.
+func TestDependencyFingerprintRejectsMixedRuntimeToolForm(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("six==1.16.0\n"), 0o644); err != nil {
+		t.Fatalf("write requirements.txt: %v", err)
+	}
+	mixed := pythonSpec()
+	mixed.RuntimeTools = []plan.RuntimeTool{{
+		From:        UvImageTag,
+		Source:      "/uv",
+		Destination: "/usr/local/bin/pnpm",
+		Artifact:    &plan.RuntimeArtifact{Variants: []plan.ArtifactVariant{{Arch: "amd64", URL: "https://example.test/x.tgz", SHA256: strings.Repeat("a", 64), Member: "pnpm"}}},
+	}}
+	if _, err := DependencyFingerprint("amd64", "linux", mixed, dir, pythonRequirementsDeps()); err == nil {
+		t.Fatal("DependencyFingerprint accepted a runtime tool mixing From/Source with Artifact")
 	}
 }
 

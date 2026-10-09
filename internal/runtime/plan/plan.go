@@ -5,7 +5,10 @@
 // cycle.
 package plan
 
-import "io/fs"
+import (
+	"fmt"
+	"io/fs"
+)
 
 type Engine string
 
@@ -35,14 +38,14 @@ type Spec struct {
 	// A false value means the historical baked-source image, byte-for-byte.
 	SourceMounted bool
 	// RuntimeTools are the external tools this runtime requires in every image
-	// it builds (e.g. a pinned binary such as uv). A RuntimeTool is an external
-	// dependency of the runtime, not a Dockerfile concept; the builder
-	// materializes each one (currently as a COPY --from, an implementation
-	// detail) and the type only names the tool's source reference, file, and
-	// destination. They are applied to BOTH the app image and its dependency
-	// base image, because the dependency image is built FROM BaseImage (not from
-	// the app image) and still needs the tool to run its install. Empty when the
-	// runtime needs no external tool.
+	// it builds (e.g. a pinned binary such as uv or pnpm). A RuntimeTool is an
+	// external dependency of the runtime, not a Dockerfile concept; the builder
+	// materializes each one (as an image COPY or, for a remote archive, a
+	// download/verify/extract RUN — an implementation detail) and the type names
+	// the tool's source and destination. They are applied to BOTH the app image
+	// and its dependency base image, because the dependency image is built FROM
+	// BaseImage (not from the app image) and still needs the tool to run its
+	// install. Empty when the runtime needs no external tool.
 	RuntimeTools []RuntimeTool
 }
 
@@ -56,22 +59,98 @@ type File struct {
 }
 
 // RuntimeTool is an external tool a runtime requires in its images (e.g. the
-// pinned uv binary or the pinned pnpm JS CLI distribution). It is how a runtime
-// acquires a versioned external tool without changing its base image: the tool
-// lives in an external image, and the single generic Dockerfile renderer
-// materializes it (currently as a COPY --from, an implementation detail of the
-// builder rather than part of this type's meaning), so engines express the tool
-// as plan data rather than a Dockerfile.
+// pinned uv binary or the pinned pnpm binary). It is how a runtime acquires a
+// versioned external tool without changing its base image. A tool is expressed
+// in exactly one of two forms, and the single generic Dockerfile renderer
+// materializes it (an implementation detail of the builder rather than part of
+// the type's meaning), so engines express the tool as plan data rather than a
+// Dockerfile:
+//
+//   - an image copy (From/Source set): the tool already exists in a pinned
+//     external image and is copied out of it (uv);
+//   - a remote archive artifact (Artifact set): the tool is a file inside a
+//     pinned, checksummed archive downloaded at build time (pnpm's standalone
+//     musl binary). Artifact is per-architecture because the archive differs by
+//     target GOARCH.
+//
+// Destination is common to both forms: the absolute path the tool is written to
+// in the image being built (e.g. "/usr/local/bin/uv").
 type RuntimeTool struct {
-	// From is the source image reference the tool is taken from. Callers
-	// should pin it (tag or digest); a moving tag would make otherwise
-	// identical builds differ.
+	// From is the source image reference the tool is taken from in the image-copy
+	// form. Callers should pin it (tag or digest); a moving tag would make
+	// otherwise identical builds differ. Empty in the artifact form.
 	From string
-	// Source is the path copied out of From (e.g. "/uv").
+	// Source is the path copied out of From in the image-copy form (e.g. "/uv").
+	// Empty in the artifact form.
 	Source string
 	// Destination is the path the tool is written to in the image being built
 	// (e.g. "/usr/local/bin/uv").
 	Destination string
+	// Artifact, when non-nil, is the remote-archive form: a pinned archive per
+	// target architecture whose Member is extracted to Destination. Mutually
+	// exclusive with From/Source.
+	Artifact *RuntimeArtifact
+}
+
+// ValidateForm reports whether the tool is expressed in exactly one of its two
+// forms: an image copy (From/Source set, Artifact nil) or a remote archive
+// artifact (Artifact set, From/Source empty). A tool that sets both forms — or
+// neither — is rejected rather than one form silently winning. It is checked
+// everywhere a tool is resolved (rendering, dependency fingerprinting, and the
+// bootstrap identity hash), so a malformed tool can never be rendered with one
+// form while it is hashed as another.
+func (t RuntimeTool) ValidateForm() error {
+	hasImage := t.From != "" || t.Source != ""
+	switch {
+	case t.Artifact != nil && hasImage:
+		return fmt.Errorf("runtime tool %q: From/Source and Artifact are mutually exclusive", t.Destination)
+	case t.Artifact == nil && !hasImage:
+		return fmt.Errorf("runtime tool %q: one of From/Source or Artifact must be set", t.Destination)
+	}
+	return nil
+}
+
+// RuntimeArtifact is the remote-archive form of a RuntimeTool: a pinned archive
+// per target architecture, downloaded and checksum-verified at image-build time.
+// The archive is a gzip-compressed tar (`.tar.gz`) and only its named Member is
+// extracted to the tool's Destination; the builder's renderer invokes
+// `tar -xzf`, so a plain (uncompressed) tar is not accepted.
+type RuntimeArtifact struct {
+	// Variants are the per-architecture artifacts, in plan order. Exactly one
+	// must match the build's target GOARCH; a tool with no matching variant
+	// fails the build (never silently omitted).
+	Variants []ArtifactVariant
+}
+
+// ArtifactVariant is one architecture's pinned archive artifact.
+type ArtifactVariant struct {
+	// Arch is the target GOARCH this variant serves (e.g. "amd64", "arm64").
+	Arch string
+	// URL is the pinned download URL of the archive. It should be immutable
+	// (a versioned release asset), because SHA256 is the integrity check.
+	URL string
+	// SHA256 is the lowercase hex SHA-256 of the downloaded archive. The build
+	// verifies it and fails closed on a mismatch.
+	SHA256 string
+	// Member is the path of the file to extract from the archive, relative to
+	// the archive root (e.g. "pnpm"). It must be a clean relative path; the
+	// renderer rejects traversal, absolute, and option-like members.
+	Member string
+}
+
+// VariantForArch returns the artifact variant for arch, reporting false when the
+// artifact declares none (an unsupported target architecture the caller must
+// fail on rather than build a wrong-architecture image).
+func (a *RuntimeArtifact) VariantForArch(arch string) (ArtifactVariant, bool) {
+	if a == nil {
+		return ArtifactVariant{}, false
+	}
+	for _, v := range a.Variants {
+		if v.Arch == arch {
+			return v, true
+		}
+	}
+	return ArtifactVariant{}, false
 }
 
 // BuildPlan is how an app directory becomes an image. Engines answer "what
@@ -118,6 +197,12 @@ func (d Deps) Equal(o Deps) bool {
 type BuildPlan struct {
 	BaseImage string
 	WorkDir   string
+	// TargetArch is the GOARCH the image is built for (e.g. "amd64", "arm64").
+	// It selects a RuntimeTool's artifact variant and is passed to the Docker
+	// build as the target platform, so an arch-specific tool and the image it is
+	// baked into can never disagree. Empty only for plans that carry no artifact
+	// tool (the renderer needs it only to resolve one).
+	TargetArch string
 	// Files are additional files for the builder to write (the bootstrap, an
 	// injected package.json, etc.).
 	Files []File

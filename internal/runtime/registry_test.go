@@ -72,8 +72,10 @@ func TestPythonSpecPinsUvTool(t *testing.T) {
 }
 
 // TestNodeSpecPinsPnpmTool verifies the Node runtime declares the pinned pnpm
-// runtime tool: the pnpm JS CLI distribution copied out of the official pnpm
-// image at a pinned, immutable tag. It also guards against a floating "latest".
+// runtime tool as a per-architecture remote archive artifact: the official
+// pnpm musl standalone binary, downloaded and checksum-verified at build time.
+// It pins the version (never a floating "latest"), the two supported
+// architectures (amd64/arm64), the extracted member, and the digest shape.
 func TestNodeSpecPinsPnpmTool(t *testing.T) {
 	spec, err := lookup("node24")
 	if err != nil {
@@ -83,21 +85,42 @@ func TestNodeSpecPinsPnpmTool(t *testing.T) {
 		t.Fatalf("node24 runtime tools = %+v, want exactly the pnpm tool", spec.RuntimeTools)
 	}
 	tool := spec.RuntimeTools[0]
-	if tool.From != PnpmImageTag {
-		t.Errorf("pnpm tool source = %q, want %q", tool.From, PnpmImageTag)
+	if tool.Artifact == nil {
+		t.Fatalf("pnpm tool = %+v, want the remote-archive artifact form", tool)
 	}
-	if tool.Source != "/opt/pnpm/dist" || tool.Destination != "/opt/pnpm/dist" {
-		t.Errorf("pnpm tool = %+v, want /opt/pnpm/dist -> /opt/pnpm/dist", tool)
+	if tool.From != "" || tool.Source != "" {
+		t.Errorf("pnpm artifact tool must not be an image copy (from=%q source=%q)", tool.From, tool.Source)
 	}
-	if !strings.HasPrefix(tool.From, "ghcr.io/pnpm/pnpm:") {
-		t.Errorf("pnpm tool source = %q, want the official ghcr.io/pnpm/pnpm source", tool.From)
+	if tool.Destination != "/usr/local/bin/pnpm" {
+		t.Errorf("pnpm tool destination = %q, want /usr/local/bin/pnpm", tool.Destination)
 	}
-	version := strings.TrimPrefix(tool.From, "ghcr.io/pnpm/pnpm:")
-	if version == "latest" || version == "" {
-		t.Errorf("pnpm tool version = %q, must be a pinned version, never latest", version)
+	if PnpmVersion == "latest" || PnpmVersion == "" || strings.Count(PnpmVersion, ".") != 2 {
+		t.Errorf("PnpmVersion = %q, want a full pinned major.minor.patch version", PnpmVersion)
 	}
-	if strings.Count(version, ".") != 2 {
-		t.Errorf("pnpm tool version = %q, want a full pinned major.minor.patch version", version)
+	want := map[string]string{
+		"amd64": pnpmReleaseBaseURL + "pnpm-linux-x64-musl.tar.gz",
+		"arm64": pnpmReleaseBaseURL + "pnpm-linux-arm64-musl.tar.gz",
+	}
+	if len(tool.Artifact.Variants) != len(want) {
+		t.Fatalf("pnpm artifact variants = %+v, want exactly %d", tool.Artifact.Variants, len(want))
+	}
+	for arch, url := range want {
+		variant, ok := tool.Artifact.VariantForArch(arch)
+		if !ok {
+			t.Fatalf("pnpm artifact has no variant for %s", arch)
+		}
+		if variant.URL != url {
+			t.Errorf("pnpm %s url = %q, want %q", arch, variant.URL, url)
+		}
+		if !strings.HasPrefix(variant.URL, "https://github.com/pnpm/pnpm/releases/download/v"+PnpmVersion+"/") {
+			t.Errorf("pnpm %s url = %q, want the pinned pnpm release download", arch, variant.URL)
+		}
+		if variant.Member != pnpmMember {
+			t.Errorf("pnpm %s member = %q, want %q", arch, variant.Member, pnpmMember)
+		}
+		if len(variant.SHA256) != 64 {
+			t.Errorf("pnpm %s sha256 = %q, want 64 hex characters", arch, variant.SHA256)
+		}
 	}
 }
 

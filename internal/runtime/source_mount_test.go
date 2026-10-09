@@ -208,7 +208,7 @@ func TestPrepareSourceMountReusesImageAcrossSourceOnlyChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	boot := bootstrapHash(builtPlan)
+	boot := mustBootstrapHash(t, builtPlan)
 
 	builds := 0
 	cli := newScriptedDockerClient(t,
@@ -736,7 +736,7 @@ func TestPrepareSourceMountSourceOnlyChangeDoesNotBuildDependency(t *testing.T) 
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	present := fmt.Sprintf(`{"Id":"sha256:deadbeef","Config":{"Labels":{%q:%q}}}`, labelBootstrap, bootstrapHash(builtPlan))
+	present := fmt.Sprintf(`{"Id":"sha256:deadbeef","Config":{"Labels":{%q:%q}}}`, labelBootstrap, mustBootstrapHash(t, builtPlan))
 
 	var second buildCounts
 	cli2 := newScriptedDockerClient(t,
